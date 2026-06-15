@@ -13,9 +13,54 @@ In our architecture, **Hydra** runs in a container on every host, leveraging a d
 1. **Consensus & Clustering**: The ScyllaDB/Cassandra instances on all three hosts auto-discover each other using Zookeeper/Odin and form a ring topology.
 2. **Replication & Consensus**: Data keyspaces use a replication factor of 3 (RF=3) with local quorum write/read consistency. This ensures metadata is consistent and partition-tolerant.
 3. **CQL HTTP Proxy**: To avoid the massive host CPU overhead of spawning containerized `cqlsh` python sessions repeatedly, a persistent **CQL HTTP Proxy** (`hydra-db-proxy.service`) runs inside the `systemd-hydra-db` container.
-   * **Port**: `9043` on `localhost` (bridged via `Network=host`).
-   * **Connection**: Maintains a single, persistent native python `cassandra-driver` connection to ScyllaDB.
-   * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, clients automatically fall back to executing `cqlsh` directly, ensuring zero-downtime database access.
+    * **Port**: `9043` on `localhost` (bridged via `Network=host`).
+    * **Connection**: Maintains a single, persistent native python `cassandra-driver` connection to ScyllaDB.
+    * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, clients automatically fall back to executing `cqlsh` directly, ensuring zero-downtime database access.
+
+---
+
+## CQL HTTP Proxy API Specification
+
+The CQL HTTP Proxy exposes a single lightweight endpoint on localhost for executing raw database queries without startup latency.
+
+### Execute Query Endpoint
+* **URL**: `http://127.0.0.1:9043/query`
+* **Method**: `POST`
+* **Headers**: `Content-Type: text/plain`
+* **Request Body**: Raw CQL statement string.
+
+#### Success Response (HTTP 200 OK)
+Returns a list of rows represented as dictionary objects mapping columns to values:
+```json
+{
+  "status": "success",
+  "rows": [
+    {
+      "key": "urbosa_enabled",
+      "value": "true"
+    },
+    {
+      "key": "dns_mtu",
+      "value": "1500"
+    }
+  ]
+}
+```
+
+#### Error Response (HTTP 400 Bad Request / 500 Internal Error)
+Returns error status with the ScyllaDB driver execution exception:
+```json
+{
+  "status": "error",
+  "error": "Error Message details (e.g., SyntaxException, KeyspaceNotDefined)"
+}
+```
+
+### Python Client Integration (`run_cql_query`)
+All internal python daemons call `run_cql_query(cql_query)` which encapsulates this HTTP REST API. It handles returned data formatting dynamically:
+1. **JSON Select Queries** (e.g., `SELECT JSON *`): Unpacks the raw `"json"` column value directly.
+2. **Standard Select Queries**: Joins row values with space separators (e.g., `key value`). If clients query settings (`SELECT key, value`), it falls back to space-separated lines (`urbosa_enabled true`).
+3. **Execution Fallback**: If the HTTP query fails, it encodes the CQL query in base64 and spawns `podman exec -i systemd-hydra-db cqlsh` as a secondary channel.
 
 ---
 
