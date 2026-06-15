@@ -1,6 +1,6 @@
 # Dagur (Task Scheduler Daemon)
 
-Dagur is the background central task runner and scheduler service for the HCI cluster.
+Dagur is the background central task runner and scheduler service for the HCI cluster. It is the direct equivalent of Nutanix **Chronos**.
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/dagur`) managed by systemd (`dagur.service`).
