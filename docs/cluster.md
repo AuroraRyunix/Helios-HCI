@@ -76,10 +76,8 @@ cluster destroy
 * Bifrost monitors the ZooKeeper leadership. The node elected as the ZooKeeper leader binds the VIP interface locally.
 * If the active leader goes offline, ZooKeeper consensus automatically triggers a new leader election. Bifrost on the newly elected leader host immediately claims the VIP using Gratuitous ARP (GARP) broadcasts, redirecting Spectrum Web Console traffic without manual intervention.
 
-### B. VM High Availability (HA) Failover
-> [!IMPORTANT]
-> **Current HA Failover Status**: **Not Implemented**
-> 
-> * **Active VM Management**: The Vali service is currently responsible for placement scheduling (`valcli vm.on`), manual live migrations (`valcli vm.migrate`), and periodic load rebalancing (DRS).
-> * **Host Death Detection**: Automatic VM restart failover (detecting a hypervisor host crash and immediately spawning its VMs on the remaining healthy hosts) is currently *not implemented* in the Vali daemon.
-> * **Manual Recovery**: If a host goes offline, administrators must manually update the VM's state and `host_ip` registry in ScyllaDB using `valcli` or re-register/define the VM XML templates on a healthy host to restart the workloads.
+### B. VM High Availability (HA) Failover via Mipha
+* **Active HA Orchestration**: High Availability is managed dynamically by the **Mipha** daemon. Mipha uses ZooKeeper to elect an active coordinator leader that monitors the cluster.
+* **Host Crash Detection**: The active Mipha leader polls all cluster nodes every 10 seconds using both network pings (ICMP) and the Spark mTLS API (`9099`). If a host is unreachable on both paths for 3 consecutive polls (30 seconds), it is marked as `DOWN` in ScyllaDB.
+* **Automatic Failover & Restart**: Mipha queries ScyllaDB for all virtual machines registered to the failed node, resets their database state, and submits automatic start tasks to the Catalyst task queue.
+* **Optimal Scheduling**: The **Vali** scheduler picks up the tasks and immediately schedules the VMs to boot on the healthiest remaining hosts based on available RAM and DRS rules, restoring VM availability automatically.
