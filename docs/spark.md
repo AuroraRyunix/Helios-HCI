@@ -1,0 +1,95 @@
+# Spark (Cluster Service & Bootstrap Manager)
+
+Spark is the host-level bootstrap manager and service state coordinator. It is the direct equivalent of Nutanix **Genesis**.
+
+## Nutanix Role (Genesis)
+In Nutanix, Genesis runs on every node and is responsible for managing the lifecycle of other services (starting, stopping, monitoring). It is the first service to start, running independently of cluster consensus, and is used to bootstrap the cluster initially.
+
+## Containerized & Host-Level HCI Approach
+In our architecture, **Spark** is split into two components:
+1.  **Spark CLI** (`/usr/local/bin/spark`): A host-level command-line utility used to query local container states, PIDs, and detect ZooKeeper leadership.
+2.  **Spark Daemon** (`/usr/local/bin/spark-daemon`): A secure, host-level HTTPS service running on port `9099`. It replaces legacy passwordless root SSH key distribution across nodes, allowing secure remote command orchestration.
+
+---
+
+## Spark Daemon mTLS API Spec
+
+The `spark-daemon` listens on port `9099` using **Mutual TLS (mTLS)** for secure authentication and authorization:
+* **Server Verification**: The daemon presents its node certificate (`node.crt`) and key (`node.key`). Clients verify it against the trusted CA.
+* **Client Verification**: The daemon requires clients to present a valid client certificate (`client.crt`) signed by the cluster CA (`ssl.CERT_REQUIRED`).
+
+### API Endpoints
+* `POST /api/v1/execute`
+  * **Description**: Executes a command locally on the host.
+  * **Request Body** (JSON):
+    ```json
+    {
+      "command": "systemctl restart hydra-db"
+    }
+    ```
+  * **Response Body** (JSON):
+    ```json
+    {
+      "returncode": 0,
+      "stdout": "...",
+      "stderr": ""
+    }
+    ```
+
+---
+
+## Directory & Certificate Layout
+
+### 1. Staging Directory (Node 1 only, post-provisioning)
+Path: `/var/lib/hci/certs_staging/`
+* Stores CA, client, and all individual node certificates/keys before cluster-wide distribution.
+* Automatically cleaned up after successful bootstrapping.
+
+### 2. Daemon Certificates (Restricted to Root)
+Path: `/etc/hci/spark/certs/`
+* `ca.crt`: Trusted Root CA certificate.
+* `node.crt`: Node certificate containing the host IP address in the Subject Alternative Name (SAN).
+* `node.key`: Node private key (`chmod 600`).
+
+### 3. Client Certificates (Used by `cluster` and `allssh`)
+Path: `/root/.certs/`
+* `ca.crt`: Trusted Root CA certificate.
+* `client.crt`: Signed client certificate.
+* `client.key`: Client private key (`chmod 600`).
+
+---
+
+## mTLS Bootstrapping & Security Lifecycle
+
+### 1. Staging (`provision.py`)
+* The local provisioning tool generates all certificates (CA, client, and host keys) and stages them in `/var/lib/hci/certs_staging/` on **Node 1** via SSH.
+* The `spark-daemon` systemd service files and binaries are copied to all nodes, but the service is kept inactive.
+
+### 2. Synchronization & SSH Hardening (`cluster create`)
+* Executing `cluster create` on Node 1 prompts the administrator for the root SSH password.
+* It uses `sshpass` to copy the staged certificates to `/etc/hci/spark/certs/` and `/root/.certs/` on all target nodes.
+* It starts the `spark-daemon` on each node.
+* It deletes the inter-node passwordless SSH keys (`/root/.ssh/id_rsa` and `/root/.ssh/id_rsa.pub`) on all nodes.
+* The local staging folder is then removed.
+
+### 3. Cleanup (`cluster destroy`)
+* Running `cluster destroy` executes a remote background command on all nodes to stop and disable `spark-daemon` and delete the `/etc/hci/spark/certs/` and `/root/.certs/` directories.
+
+---
+
+## Systemd Daemon Configuration (`/etc/systemd/system/spark-daemon.service`)
+
+```ini
+[Unit]
+Description=Spark Host Management Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spark-daemon
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
