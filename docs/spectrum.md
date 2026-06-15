@@ -2,6 +2,9 @@
 
 Spectrum is the cluster management gateway and web administration console. It is the direct equivalent of Nutanix **Prism**.
 
+> [!NOTE]
+> **Name Origin:** A **prism** splits light into a **spectrum** of colors. Since this component is the direct equivalent of Nutanix **Prism**, it is named **Spectrum** to represent the visual interface showing the full range of cluster states, workloads, and performance metrics.
+
 ## Nutanix Role (Prism)
 In Nutanix, Prism (both Prism Element and Prism Central) is the management interface. It exposes a HTML5 web UI, REST APIs, and command-line interfaces (nCLI) for VM creation, virtual disk provisioning, performance monitoring, cluster expansions, and hardware alerts.
 
