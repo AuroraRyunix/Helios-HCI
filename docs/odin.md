@@ -2,6 +2,9 @@
 
 Odin is the local cluster configuration gateway. It is the direct equivalent of Nutanix **Zeus**.
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology, **Odin** is the Allfather and king of Asgard, who sits at the head of the gods to govern order, consensus, and wisdom. In Helios-HCI, **Odin** (working with ZooKeeper) provides the centralized coordination, configuration store, and leader election for the entire cluster.
+
 ## Nutanix Role (Zeus)
 In Nutanix, Zeus is the software library/wrapper interface that all other local services (such as Stargate, Medusa, Curator) use to communicate with Zookeeper. Instead of services querying Zookeeper nodes directly, they interface with Zeus to read and update cluster-wide configurations.
 
