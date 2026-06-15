@@ -2,6 +2,9 @@
 
 Vali is the standalone VM management, placement scheduling, and DRS (load balancing) coordinator for the HCI cluster. It is the direct equivalent of Nutanix **Acropolis (AHV VM Management)**.
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology, **Váli** is a son of Odin destined to survive Ragnarok and avenge the death of his brother. Here, **Vali** avenges resource imbalances by dynamically migrating, balancing, and scheduling virtual machines across the cluster.
+
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/vali`) listening locally on port `9095`. Managed by systemd (`vali.service`).
 - **Leader Election**: All Vali instances run ZooKeeper leader election using ephemeral sequential nodes at `/vali/leader`. The elected Leader is responsible for consuming tasks and executing DRS checks.
