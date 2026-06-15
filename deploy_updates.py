@@ -25,6 +25,7 @@ local_catalyst = "catalyst.py"
 local_catcli = "catcli"
 local_gatoway = "gatoway.py"
 local_logos = "logos.py"
+local_mipha = "mipha.py"
 
 local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
@@ -54,6 +55,22 @@ After=zookeeper.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/gatoway
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=50
+MemoryMax=256M
+MemoryHigh=200M
+"""
+
+mipha_service_content = """[Unit]
+Description=Mipha HA Cluster Monitor Daemon
+After=zookeeper.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mipha
 Restart=always
 RestartSec=3
 User=root
@@ -310,6 +327,16 @@ for ip in nodes:
         f_log.write(logos_service_content)
         f_log.close()
 
+        # 2if. Copy mipha daemon
+        print(f"[{ip}] Uploading mipha daemon to /usr/local/bin/mipha...")
+        put_text_file(sftp, local_mipha, "/usr/local/bin/mipha")
+        
+        # 2ig. Write mipha systemd unit
+        print(f"[{ip}] Writing mipha.service unit...")
+        f_miph = sftp.open("/etc/systemd/system/mipha.service", "w")
+        f_miph.write(mipha_service_content)
+        f_miph.close()
+
         # 2j. Copy catalyst daemon
         print(f"[{ip}] Uploading catalyst daemon to /usr/local/bin/catalyst...")
         put_text_file(sftp, local_catalyst, "/usr/local/bin/catalyst")
@@ -370,7 +397,7 @@ for ip in nodes:
         
         # 4. Make executables runnable
         print(f"[{ip}] Setting executable permissions...")
-        ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/logos")
+        ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/logos /usr/local/bin/mipha")
         
         # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
         print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")
@@ -443,7 +470,8 @@ for ip in nodes:
             "systemctl is-active mimir && systemctl restart mimir || true",
             "systemctl is-active vali && systemctl restart vali || true",
             "systemctl enable gatoway && systemctl restart gatoway || true",
-            "systemctl enable logos && systemctl restart logos || true"
+            "systemctl enable logos && systemctl restart logos || true",
+            "systemctl enable mipha && systemctl restart mipha || true"
         ]:
             _, stdout, _ = ssh.exec_command(cmd)
             stdout.channel.recv_exit_status()
