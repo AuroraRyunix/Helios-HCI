@@ -90,3 +90,36 @@ We will register `logos` in the service listings across all nodes:
    Add `logos` to the `services` array so that:
    - `systemctl start/stop/status logos` is managed during `cluster start/stop` sequences.
    - It appears in the health console's status metrics and CLI outputs (`valcli host.list` / spark dashboards).
+
+---
+
+## 6. Command Examples & Syntax
+
+### A. Managing the Logos Service Daemon
+You can check, start, stop, or view logs for the Logos metrics daemon on any node using standard systemctl commands:
+```bash
+# Check service status (includes active state and MainPID)
+systemctl status logos
+
+# View metrics collection and ScyllaDB ingestion logs
+journalctl -u logos -n 30 --no-pager
+
+# Restart the service to apply configuration updates
+systemctl restart logos
+
+# Stop telemetry collection locally
+systemctl stop logos
+```
+
+### B. Querying Ingested Metrics via cqlsh
+To inspect the historical telemetry stored in ScyllaDB, execute CQL queries inside the database container. Use the local hypervisor IP as the target coordinator node:
+```bash
+# Fetch the 10 most recent cluster telemetry records
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT * FROM hydra.logos_metrics LIMIT 10;"
+
+# Fetch metrics for a specific node IP ordered by latest timestamp
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT timestamp, cpu_pct, mem_pct, net_rx_kbps FROM hydra.logos_metrics WHERE node_ip = '10.10.102.220' LIMIT 5;"
+
+# Check table metadata and TTL properties
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "DESCRIBE TABLE hydra.logos_metrics;"
+```
