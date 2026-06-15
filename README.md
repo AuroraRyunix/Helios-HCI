@@ -104,6 +104,26 @@ mcli health_checks list
 mcli health_checks run_all
 ```
 
+### E. Cluster Management CLI (`cluster`)
+Orchestrate cluster-wide lifecycle commands:
+```bash
+# Bootstrap a 3-node cluster with virtual IP 10.10.102.240
+cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
+
+# Query cluster-wide status (verbose logs GlusterFS bricks and daemons)
+cluster status --verbose
+
+# Start all containerized and native services across the cluster
+cluster start
+
+# Stop all containerized and native services and unmount GlusterFS volumes
+cluster stop
+
+# Wipe cluster configurations, databases, and formats claimed drives
+cluster destroy
+```
+For detailed creation workflows and HA failover policies, see [cluster.md](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/cluster.md).
+
 ---
 
 ## 3. Directory Layout (Configuration & Certs)
