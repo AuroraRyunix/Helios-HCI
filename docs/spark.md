@@ -2,6 +2,9 @@
 
 Spark is the host-level bootstrap manager and service state coordinator. It is the direct equivalent of Nutanix **Genesis**.
 
+> [!NOTE]
+> **Name Origin:** A **spark** is a tiny, fiery particle that initiates a fire or combustion. In Helios-HCI, **Spark** is the bootstrap manager and Genesis agent that ignites and starts all other cluster containers, services, and management nodes.
+
 ## Nutanix Role (Genesis)
 In Nutanix, Genesis runs on every node and is responsible for managing the lifecycle of other services (starting, stopping, monitoring). It is the first service to start, running independently of cluster consensus, and is used to bootstrap the cluster initially.
 
