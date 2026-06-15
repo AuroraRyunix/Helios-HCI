@@ -123,7 +123,7 @@ cluster stop
 # Wipe cluster configurations, databases, and formats claimed drives
 cluster destroy
 ```
-For detailed creation workflows and HA failover policies, see [cluster.md](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/cluster.md).
+For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md).
 
 ---
 
