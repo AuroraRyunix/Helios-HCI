@@ -23,4 +23,4 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | `mimir_diagnostics` | `mimir_health` | `0 * * * *` | 1 hour | `/usr/local/bin/mcli health_checks run_all` | Runs cluster health checks. |
 | `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-aether gluster volume status` | Verifies GlusterFS volume state. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
-| `storage_auto_heal` | `storage_auto_heal` | `* * * * *` | 1 minute | `/usr/local/bin/hci-auto-heal` | Fixes GlusterFS metadata mismatch attributes. |
+| `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `/usr/local/bin/hci-auto-heal` | Fixes GlusterFS metadata mismatch attributes. |
