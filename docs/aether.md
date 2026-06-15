@@ -28,30 +28,15 @@ Like Nutanix, FTT policies can be applied at the **Storage Container** level. A 
 
 ---
 
-## Underlying Distributed File System (DFS) Candidates
+## Underlying Distributed File System (DFS) Engine
 
-To avoid building a distributed transport and consensus protocol from scratch, the `Aether` container packages and runs a battle-tested open-source Distributed File System (DFS) acting as the underlying replication engine:
+To avoid building a distributed transport and consensus protocol from scratch, the `Aether` container packages and runs **GlusterFS** as the underlying software-defined storage and replication engine:
 
-### Candidate 1: GlusterFS (File-Based, Lightweight)
-*   **How it works**: GlusterFS groups local directories (bricks) across the hosts into cluster-wide "Volumes" (which represent our **Storage Containers**).
-*   **NFS Presentation**: GlusterFS has a native NFS server built-in or can be exported via NFS-Ganesha.
-*   **FTT Support**:
-    *   `FTT=1` matches a Gluster `replica 3` volume (replicated across all 3 nodes) or `replica 3 arbiter 1` (replicates to 2 nodes, 3rd node acts as metadata tie-breaker to prevent split-brain).
-*   **Resource footprint**: Low (~200MB RAM per host).
-
-### Candidate 2: SeaweedFS (Cloud-Native, High Performance)
-*   **How it works**: A Go-based distributed filesystem consisting of Master servers (consensus), Volume servers (data storage), and Filer servers (provides metadata and filesystem interface).
-*   **NFS Presentation**: SeaweedFS exposes WebDAV/S3 natively and can mount via FUSE, which NFS-Ganesha then exports as NFS to the host.
-*   **FTT Support**:
-    *   Replication is set at the bucket or directory level (e.g. `001` for RF2, `002` for RF3).
-*   **Resource footprint**: Extremely low (~50-100MB RAM per host).
-
-### Candidate 3: Ceph / CephFS (Enterprise-Standard, Resource Intensive)
-*   **How it works**: Object storage system (RADOS) with a file system layer (CephFS).
-*   **NFS Presentation**: NFS-Ganesha can integrate natively with CephFS using the `libcephfs` FSAL.
-*   **FTT Support**:
-    *   Controlled by CRUSH map replication rules (e.g. `size 3, min_size 2` for FTT=1).
-*   **Resource footprint**: High (~2-4GB RAM minimum per host for OSDs and Mons).
+### GlusterFS Implementation
+* **Architecture**: GlusterFS groups local drives/bricks across the nodes into unified cluster-wide volumes. These volumes correspond directly to our **Storage Containers**.
+* **Storage Mount Mechanism**: Each host's modular `libvirtd` system mounts the local Aether container's GlusterFS volume via a loopback interface (`localhost:/<volume_name>`) mounted at `/var/lib/hci/aether/volumes/<volume_name>`.
+* **Redundancy (FTT=1)**: Configured as a replicated volume across the three nodes (`replica 3` or `disperse` depending on the disk count and cluster settings), ensuring that any single host failure is tolerated without split-brain issues.
+* **Performance Tuning**: Volumes are configured with high-performance flags, including client-side caching (`performance.cache-size 256MB`), write-behind buffering (`performance.write-behind on`), metadata prefetching (`performance.stat-prefetch on`), and optimized parallel client threads.
 
 ---
 
