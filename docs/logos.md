@@ -31,10 +31,10 @@ graph TD
 ## 2. Component Interactions
 
 ### A. Telemetry Collection (Write Path)
-1. **Interval**: Every 5–10 seconds, the local `logos` collector daemon wakes up.
+1. **Interval**: Every 30 seconds, the local `logos` collector daemon wakes up (increased from 10s to minimize CPU impact).
 2. **Local Polling via Spark**: Logos queries the local hypervisor stats by sending an HTTP command to the local Spark daemon on localhost port `9099`.
    - *Why through Spark?* Reuses the existing secure, local Spark credentials and keeps host system access centralized.
-3. **Database Write**: The local collector writes the aggregated metrics record directly into ScyllaDB (`hydra.logos_metrics`).
+3. **Database Write**: The local collector batches all interface and host metric updates and writes them directly into ScyllaDB in a single query transaction via the local CQL HTTP proxy (`127.0.0.1:9043`).
 
 ### B. Metrics Query (Read Path)
 1. **Request**: The Spectrum WebUI sends a poll request to the local `/api/status` or `/api/metrics/history` endpoint in `spectrum_server.py`.
@@ -48,7 +48,7 @@ graph TD
 | Communication Flow | Channel | Purpose |
 | :--- | :--- | :--- |
 | **Logos Collector $\rightarrow$ Local Host Stats** | **Through Spark** (`127.0.0.1:9099`) | Reuses Spark to execute `virsh domstats` and read host disk partitions, avoiding separate root socket permissions. |
-| **Logos Collector $\rightarrow$ ScyllaDB** | **Direct** (TCP `9042`) | Collector writes metrics records directly to the `hydra.logos_metrics` table cluster-wide. |
+| **Logos Collector $\rightarrow$ ScyllaDB** | **Direct (via Proxy)** (HTTP `9043`) | Writes batched metrics records through the local CQL proxy to ScyllaDB (`hydra.logos_metrics`). |
 | **Logos (Node A) $\rightarrow$ Logos (Node B)** | **Through Spark Mesh** (mTLS `9099`) | If a Logos node needs coordination, it routes via Spark: `Logos (A) -> Spark (A) -> Spark (B) -> Logos (B)`. |
 | **Spectrum UI $\rightarrow$ Logos API** | **Direct** (Local HTTP / ScyllaDB) | Reads pre-populated historical metrics from the distributed database. |
 
