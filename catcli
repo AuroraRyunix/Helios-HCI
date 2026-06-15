@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import base64
+import subprocess
+import urllib.request
+import urllib.parse
+import argparse
+
+LOCAL_IP = "127.0.0.1"
+try:
+    with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                if k == "LOCAL_HYPERVISOR_IP":
+                    LOCAL_IP = v
+except Exception:
+    pass
+
+def run_cql_query(cql_query):
+    b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
+    cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {LOCAL_IP}'
+    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode, res.stdout.decode('utf-8', errors='ignore'), res.stderr.decode('utf-8', errors='ignore')
+
+def get_tasks():
+    cql = "SELECT JSON * FROM hydra.catalyst_tasks;"
+    rc, stdout, stderr = run_cql_query(cql)
+    if rc != 0:
+        print(f"Error querying database: {stderr or stdout}")
+        sys.exit(1)
+    
+    tasks = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                tasks.append(json.loads(line))
+            except Exception:
+                pass
+    try:
+        tasks.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+    except Exception:
+        pass
+    return tasks
+
+def cmd_list(args):
+    tasks = get_tasks()
+    if not tasks:
+        print("No tasks found in history.")
+        return
+        
+    print(f"{'TASK ID':<38} | {'SERVICE':<10} | {'ACTION':<12} | {'STATUS':<10} | {'PROGRESS':<8} | {'CREATED AT'}")
+    print("-" * 97)
+    for t in tasks:
+        tid = t.get("task_id", "")
+        svc = t.get("service", "")
+        act = t.get("action", "")
+        status = t.get("status", "")
+        progress = f"{t.get('progress', 0)}%"
+        created = t.get("created_at", 0)
+        
+        import datetime
+        dt = datetime.datetime.fromtimestamp(created / 1000.0) if created else datetime.datetime.now()
+        created_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+        
+        print(f"{tid:<38} | {svc:<10} | {act:<12} | {status:<10} | {progress:<8} | {created_str}")
+
+def cmd_status(args):
+    tasks = get_tasks()
+    task = None
+    for t in tasks:
+        if t.get("task_id") == args.task_id:
+            task = t
+            break
+            
+    if not task:
+        print(f"Task with ID {args.task_id} not found.")
+        sys.exit(1)
+        
+    print(json.dumps(task, indent=4))
+
+def cmd_submit(args):
+    payload_dict = {}
+    if args.payload:
+        try:
+            payload_dict = json.loads(args.payload)
+        except Exception as e:
+            print(f"Error: payload is not valid JSON: {e}")
+            sys.exit(1)
+            
+    url = "http://127.0.0.1:9091/api/v1/tasks/submit"
+    req_payload = {
+        "service": args.service,
+        "action": args.action,
+        "payload": payload_dict
+    }
+    
+    data = json.dumps(req_payload).encode('utf-8')
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urllib.request.urlopen(req) as resp:
+            resp_data = json.loads(resp.read().decode('utf-8'))
+            print(f"Task submitted successfully.")
+            print(f"Task ID: {resp_data.get('task_id')}")
+            print(f"Status: {resp_data.get('status')}")
+    except Exception as e:
+        print(f"Failed to submit task to Catalyst: {e}")
+        sys.exit(1)
+
+def cmd_cleanup(args):
+    tasks = get_tasks()
+    cleaned_count = 0
+    for t in tasks:
+        status = t.get("status")
+        tid = t.get("task_id")
+        if status in ["completed", "failed"] and tid:
+            rc, _, stderr = run_cql_query(f"DELETE FROM hydra.catalyst_tasks WHERE task_id = {tid};")
+            if rc == 0:
+                cleaned_count += 1
+            else:
+                print(f"Failed to delete task {tid}: {stderr}")
+    print(f"Successfully cleaned up {cleaned_count} completed/failed tasks.")
+
+def cmd_sync(args):
+    print("Syncing local configurations from ScyllaDB...")
+    rc, stdout, stderr = run_cql_query("SELECT JSON key, value FROM hydra.cluster_settings;")
+    if rc != 0:
+        print(f"Failed to query cluster settings: {stderr or stdout}")
+        sys.exit(1)
+        
+    settings = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                obj = json.loads(line)
+                k = obj.get("key")
+                v = obj.get("value")
+                if k:
+                    settings[k] = v
+            except:
+                pass
+                    
+    dns = settings.get("dns_servers", "")
+    ntp = settings.get("ntp_servers", "")
+    tz = settings.get("timezone", "")
+    
+    if dns:
+        print(f"Updating DNS servers: {dns}")
+        try:
+            with open("/etc/resolv.conf", "w") as f:
+                f.write("# Generated by catcli sync\n")
+                for ip in dns.split(","):
+                    ip = ip.strip()
+                    if ip:
+                        f.write(f"nameserver {ip}\n")
+            print("DNS configuration successfully updated.")
+        except Exception as e:
+            print(f"Failed to update /etc/resolv.conf: {e}")
+            
+    if ntp:
+        print(f"Updating NTP servers: {ntp}")
+        try:
+            with open("/etc/chrony.conf", "w") as f:
+                f.write("# Generated by catcli sync\n")
+                for srv in ntp.split(","):
+                    srv = srv.strip()
+                    if srv:
+                        f.write(f"server {srv} iburst\n")
+            subprocess.run("systemctl restart chronyd", shell=True)
+            print("NTP configuration successfully updated and chronyd restarted.")
+        except Exception as e:
+            print(f"Failed to update /etc/chrony.conf: {e}")
+            
+    if tz:
+        print(f"Updating System Timezone: {tz}")
+        try:
+            subprocess.run(f"timedatectl set-timezone {tz}", shell=True)
+            print("System Timezone successfully updated.")
+        except Exception as e:
+            print(f"Failed to update timezone: {e}")
+            
+    print("Sync process completed.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Catalyst Task Manager CLI (catcli)")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    subparsers.add_parser("list", help="List all catalyst tasks")
+    
+    parser_status = subparsers.add_parser("status", help="Get details of a task by ID")
+    parser_status.add_argument("task_id", help="UUID of the task")
+    
+    parser_submit = subparsers.add_parser("submit", help="Submit a task to Catalyst")
+    parser_submit.add_argument("--service", required=True, help="Target service queue (e.g. vali, spark, dagur)")
+    parser_submit.add_argument("--action", required=True, help="Task action (e.g. execute, migrate)")
+    parser_submit.add_argument("--payload", default="{}", help="JSON payload string")
+    
+    subparsers.add_parser("cleanup", help="Clear completed and failed tasks")
+    
+    subparsers.add_parser("sync", help="Synchronize local configuration settings from ScyllaDB")
+    
+    args = parser.parse_args()
+    
+    if args.command == "list":
+        cmd_list(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "submit":
+        cmd_submit(args)
+    elif args.command == "cleanup":
+        cmd_cleanup(args)
+    elif args.command == "sync":
+        cmd_sync(args)
+
+if __name__ == "__main__":
+    main()
