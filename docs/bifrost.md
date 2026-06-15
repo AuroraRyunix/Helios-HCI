@@ -1,6 +1,6 @@
 # Bifrost (Virtual IP Manager Daemon)
 
-Bifrost is the floating Virtual IP (VIP) manager service for the HCI cluster. It acts as a lightweight, consensus-aware IP router to ensure that the user-facing WebUI (Spectrum) is always reachable via a single, highly available virtual IP address.
+Bifrost is the floating Virtual IP (VIP) manager service for the HCI cluster. It is the direct equivalent of Nutanix **Vipmonitor**. It acts as a lightweight, consensus-aware IP router to ensure that the user-facing WebUI (Spectrum) is always reachable via a single, highly available virtual IP address.
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/bifrost`) managed by systemd (`bifrost.service`).
