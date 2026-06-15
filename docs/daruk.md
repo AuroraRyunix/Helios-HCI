@@ -21,10 +21,10 @@ To solve this:
 
 ```mermaid
 graph LR
-    Daemons[HCI Daemons / CLI] -->|HTTP POST query| Daruk[Daruk Proxy :9043]
-    Daruk -->|Persistent Connection| ScyllaDB[ScyllaDB Database :9042]
+    Daemons["HCI Daemons / CLI"] -->|HTTP POST query| Daruk["Daruk Proxy :9043"]
+    Daruk -->|Persistent Connection| ScyllaDB["ScyllaDB Database :9042"]
     
-    Daemons -.->|Fallback CLI Exec| cqlsh[cqlsh client]
+    Daemons -.->|Fallback CLI Exec| cqlsh["cqlsh client"]
     cqlsh -.-> ScyllaDB
 ```
 
