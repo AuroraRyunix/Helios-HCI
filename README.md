@@ -151,7 +151,49 @@ Helios-HCI uses a lightweight, secure network layout for inter-node orchestratio
 * **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Spectrum Web UI (`8443`).
 
 ### Cluster Network Flow Chart
-![Helios-HCI Cluster Network Flow Chart](./docs/network_chart.png)
+
+```mermaid
+flowchart TB
+    subgraph Host1 [hci-node01]
+        Spectrum1["Spectrum (WebUI/API)<br>Port 8443"]
+        Catalyst1["Catalyst (Orchestrator)<br>Port 9091 (Localhost)"]
+        Vali1["Vali (VM Scheduler/DRS)<br>Port 9095 (Localhost)"]
+        Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
+        ZK1["ZooKeeper (Consensus)<br>Port 2181"]
+        DB1["ScyllaDB (Metadata)<br>Port 9042"]
+        Aether1["Aether (GlusterFS Storage)<br>Port 24007"]
+    end
+
+    subgraph Host2 [hci-node02]
+        Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
+        ZK2["ZooKeeper (Consensus)<br>Port 2181"]
+        DB2["ScyllaDB (Metadata)<br>Port 9042"]
+        Aether2["Aether (GlusterFS Storage)<br>Port 24007"]
+    end
+
+    %% Internal service orchestration and query flows on Host1
+    Spectrum1 -.->|Local API Calls / Command Exec (Port 9099)| Spark1
+    Catalyst1 -.->|Submit Tasks / Local command (Port 9099)| Spark1
+    Vali1 -.->|Schedule VM / Run command (Port 9099)| Spark1
+    
+    %% Direct TCP status checks
+    Spectrum1 -.->|Check status (Port 2181)| ZK1
+    Catalyst1 -.->|Check status (Port 2181)| ZK1
+    Vali1 -.->|Check status (Port 2181)| ZK1
+
+    %% Local database access via spark execution
+    Spark1 -.->|Executes cqlsh (Port 9042)| DB1
+
+    %% Inter-node replication and consensus (Cluster Mesh)
+    DB1 <===>|ScyllaDB Gossip & Replication (Port 7000)| DB2
+    ZK1 <===>|Consensus Election & Sync (Ports 2888/3888)| ZK2
+    Aether1 <===>|GlusterFS Data Replication (Port 24007)| Aether2
+
+    %% Remote orchestration and fallbacks
+    Spark1 -.->|Orchestrate remote node (Port 9099)| Spark2
+    Vali1 -.->|Remote VM Run (Port 9099)| Spark2
+    DB1 -.->|cqlsh fallback query (Port 9042)| DB2
+```
 
 For a complete reference of network scopes, port allocations, and communication boundaries, see the [Network Architecture Documentation](./docs/network.md).
 
