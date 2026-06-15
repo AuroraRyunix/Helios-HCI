@@ -3,7 +3,9 @@
 Vali is the standalone VM management, placement scheduling, and DRS (load balancing) coordinator for the HCI cluster. It is the direct equivalent of Nutanix **Acropolis (AHV VM Management)**.
 
 > [!NOTE]
-> **Name Origin:** In Norse mythology, **Váli** is a son of Odin destined to survive Ragnarok and avenge the death of his brother. Here, **Vali** avenges resource imbalances by dynamically migrating, balancing, and scheduling virtual machines across the cluster.
+> **Name Origin:** A dual-purpose name:
+> 1. In Norse mythology, **Váli** is a son of Odin destined to survive Ragnarok and avenge the death of his brother, representing how Vali avenges host resource imbalances by dynamically migrating and scheduling virtual machines.
+> 2. It is also short for **Revali**, the Rito Champion in *The Legend of Zelda: Breath of the Wild* known for *Revali's Gale* (an upward draft that launches the hero into the air), representing the dynamic flight, placement, and live migration of virtual machines across hypervisor nodes.
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/vali`) listening locally on port `9095`. Managed by systemd (`vali.service`).
