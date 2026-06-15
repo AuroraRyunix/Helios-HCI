@@ -17,7 +17,8 @@ mapping = {
     "SPECTRUM_SERVER_B64": "spectrum_server.py",
     "SPECTRUM_DOCKERFILE_B64": "Dockerfile",
     "GATOWAY_B64": "gatoway.py",
-    "LOGOS_CLI_B64": "logos.py"
+    "LOGOS_CLI_B64": "logos.py",
+    "MIPHA_CLI_B64": "mipha.py"
 }
 
 print(f"Reading {provision_path}...")
@@ -37,6 +38,10 @@ if "VALCLI_CLI_B64 = " not in content:
 if "LOGOS_CLI_B64 = " not in content:
     print("Injecting LOGOS_CLI_B64 declaration...")
     content = content.replace('VALCLI_CLI_B64 = "', 'LOGOS_CLI_B64 = ""\n\nVALCLI_CLI_B64 = "', 1)
+
+if "MIPHA_CLI_B64 = " not in content:
+    print("Injecting MIPHA_CLI_B64 declaration...")
+    content = content.replace('LOGOS_CLI_B64 = "', 'MIPHA_CLI_B64 = ""\n\nLOGOS_CLI_B64 = "', 1)
 
 # 2. Inject deploy logic if missing
 if "Deploy Gatoway Daemon" not in content:
@@ -90,6 +95,33 @@ if "Deploy Logos Daemon" not in content:
         'MemoryHigh=200M\n'
         '"""\n'
         '            node.write_file("/etc/systemd/system/logos.service", logos_svc)'
+    )
+    content = content.replace(target_pattern, replacement, 1)
+
+if "Deploy Mipha Daemon" not in content:
+    print("Injecting Mipha deployment code...")
+    target_pattern = 'node.write_file("/etc/systemd/system/logos.service", logos_svc)'
+    replacement = (
+        'node.write_file("/etc/systemd/system/logos.service", logos_svc)\n\n'
+        '            # Deploy Mipha Daemon\n'
+        '            mipha_cli = base64.b64decode(MIPHA_CLI_B64).decode(\'utf-8\')\n'
+        '            node.write_file("/usr/local/bin/mipha", mipha_cli)\n'
+        '            node.execute("chmod +x /usr/local/bin/mipha")\n\n'
+        '            mipha_svc = """[Unit]\n'
+        'Description=Mipha HA Cluster Monitor Daemon\n'
+        'After=zookeeper.service\n\n'
+        '[Service]\n'
+        'Type=simple\n'
+        'ExecStart=/usr/local/bin/mipha\n'
+        'Restart=always\n'
+        'RestartSec=3\n'
+        'User=root\n'
+        'Environment=PYTHONUNBUFFERED=1\n'
+        'CPUWeight=50\n'
+        'MemoryMax=256M\n'
+        'MemoryHigh=200M\n'
+        '"""\n'
+        '            node.write_file("/etc/systemd/system/mipha.service", mipha_svc)'
     )
     content = content.replace(target_pattern, replacement, 1)
 
