@@ -93,3 +93,47 @@ User=root
 [Install]
 WantedBy=multi-user.target
 ```
+
+---
+
+## Command Examples & Syntax
+
+### A. Host CLI Tool (`spark`)
+The `spark` utility is run directly on the host console to check and control local cluster processes:
+```bash
+# Check status of all managed services (UP/DOWN with active MainPIDs)
+spark status
+
+# Output status details in machine-readable JSON format
+spark status --json
+
+# Start core bootstrap components (ZooKeeper and Spark Daemon)
+spark start
+
+# Stop core bootstrap components locally
+spark stop
+
+# Gracefully stop all containerized and native cluster services on this node
+spark stop all
+
+# Restart the local spark-daemon
+spark restart
+```
+
+### B. Remote Orchestration Command Execution (mTLS API)
+You can test the secure remote command endpoint from any node using `curl`. Since the daemon enforces Mutual TLS, you must supply the client certificate, client private key, and trust store:
+```bash
+# Execute a systemctl status command on a remote node via spark-daemon
+curl --cacert /root/.certs/ca.crt \
+     --cert /root/.certs/client.crt \
+     --key /root/.certs/client.key \
+     --header "Content-Type: application/json" \
+     --data '{"command": "systemctl is-active spectrum"}' \
+     https://10.10.102.222:9099/api/v1/execute
+
+# Query cluster-wide status from the Spark orchestration layer
+curl --cacert /root/.certs/ca.crt \
+     --cert /root/.certs/client.crt \
+     --key /root/.certs/client.key \
+     https://10.10.102.220:9099/api/v1/cluster/status
+```
