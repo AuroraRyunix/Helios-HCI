@@ -2,6 +2,9 @@
 
 Bifrost is the floating Virtual IP (VIP) manager service for the HCI cluster. It is the direct equivalent of Nutanix **Vipmonitor**. It acts as a lightweight, consensus-aware IP router to ensure that the user-facing WebUI (Spectrum) is always reachable via a single, highly available virtual IP address.
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology, **Bifröst** is the burning rainbow bridge that connects Midgard (the realm of humans) to Asgard (the realm of the gods). In Helios-HCI, the **Bifrost** daemon acts as a network bridge, dynamically routing management traffic to the active ZooKeeper leader node using a floating Virtual IP (VIP).
+
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/bifrost`) managed by systemd (`bifrost.service`).
 - **WebUI-Aligned VIP Binding**: Bifrost queries ZooKeeper status and verifies WebUI (Spectrum port `8443`) responsiveness. The node elected as the ZooKeeper leader that is actively serving the WebUI binds the cluster VIP to its physical interface. If the leader node's WebUI is restarting or down, the VIP manager dynamically falls back to an active follower node running Spectrum, ensuring zero-downtime failover.
