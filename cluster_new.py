@@ -308,7 +308,7 @@ def main():
 
         # 6. Start remaining services
         print("\n--- Phase 4: Starting Core Workload & Coordination Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
         service_ports = {
             "spectrum": 8443,
             "vali": 9095,
@@ -416,7 +416,7 @@ def main():
             
         # 4. Stop systemd services sequentially
         print("\n--- Step 4: Stopping systemd services sequentially ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "aether", "hydra-db", "zookeeper"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "aether", "hydra-db", "zookeeper"]
         for ip in get_cluster_ips():
             print(f"[{ip}] Stopping services...")
             for svc in services:
