@@ -2,6 +2,9 @@
 
 Dagur is the background central task runner and scheduler service for the HCI cluster. It is the direct equivalent of Nutanix **Chronos**.
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology and the Icelandic language, **Dagur** translates directly to **Day** (representing time and daily schedules). It serves as the clustered cron manager to orchestrate time-based background tasks.
+
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/dagur`) managed by systemd (`dagur.service`).
 - **Consensus Execution**: To prevent duplicate job runs, Dagur only executes tasks on the node elected as the ZooKeeper leader.
