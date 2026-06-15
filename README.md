@@ -20,6 +20,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
 | [Dagur](./docs/dagur.md) | **Scheduler** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
 | [Mimir](./docs/mimir.md) | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
+| [Gatoway](./docs/gato.md) | **Gato (OVS/Bridges)** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
 
 ---
 
