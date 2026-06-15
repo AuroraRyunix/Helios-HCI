@@ -137,3 +137,27 @@ curl --cacert /root/.certs/ca.crt \
      --key /root/.certs/client.key \
      https://10.10.102.220:9099/api/v1/cluster/status
 ```
+
+---
+
+## Service Bootstrap & Workload Autostart Sequence
+
+When `spark-daemon` starts up (e.g. during host boot), it spawns a background thread to orchestrate starting local workloads:
+
+1. **ZooKeeper Startup**: Starts the local ZooKeeper instance (`systemctl start zookeeper`) if it is not already active. (This executes unconditionally, even in maintenance mode, to preserve cluster quorum).
+2. **Maintenance Mode Check**: Checks if `/etc/hci/maintenance.state` exists. If the host is in maintenance mode, it halts the autostart thread here, leaving all other database, storage, and UI workloads stopped.
+3. **Quorum Consensus Verification**: Polls local ZooKeeper port `2181` until a quorum mode (`follower`, `leader`, or `standalone`) is established.
+4. **Cluster State Verification**: Queries the ZooKeeper database for `/cluster_state`. If the cluster state is set to `stopped` (e.g. administrator manually stopped the cluster), it skips starting the workloads.
+5. **Workload Autostart**: Starts the following local cluster services sequentially:
+   - `hydra-db` (ScyllaDB container)
+   - `aether` (GlusterFS storage container)
+   - `spectrum` (Management WebUI container)
+   - `bifrost` (Floating VIP Manager)
+   - `dagur` (Task Scheduler)
+   - `mimir` (Diagnostics/Health Monitoring)
+   - `vali` (VM Scheduler / DRS)
+   - `catalyst` (Task Coordinator)
+   - `gatoway` (L2 Network Sync)
+   - `logos` (Distributed Metrics)
+   - `mipha` (HA Cluster Monitor)
+
