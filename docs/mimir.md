@@ -2,6 +2,9 @@
 
 Mimir is the background cluster health diagnostics and checking service for the HCI cluster.
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology, **Mímir** is a renowned figure of wisdom who guards the well of knowledge. After he is beheaded in the Æsir–Vanir War, Odin carries around Mímir's embalmed head to recite secrets and advise him. Here, **Mimir** acts as the wise diagnostic check engine (equivalent to Nutanix NCC), auditing cluster health and advising administrators on system status and failures.
+
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/mimir`) managed by systemd (`mimir.service`).
 - **Consensus Execution**: Mimir queries ZooKeeper status and only triggers checks on the node elected as the ZooKeeper leader to prevent concurrent execution.
