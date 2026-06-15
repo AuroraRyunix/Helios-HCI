@@ -42,6 +42,50 @@ In our architecture, **Spectrum** runs as a containerized web application on eac
 - `/etc/hci/spectrum/spectrum.env` (Environment file for admin password, API ports, SSL certs).
 
 ### Sample REST API endpoints
-* `GET /api/v1/cluster/status`: Aggregated health of all services.
+* `GET /api/status`: Returns current hypervisor state, VM statistics, and cluster daemon status.
+* `GET /api/catalyst/tasks`: Returns recent Catalyst task execution queue states and progress.
+* `POST /api/host/reboot`: Initiates a graceful reboot task sequence for a cluster host (coordinates entering maintenance, evacuating/stopping VMs, invoking spark reboot, waiting for host lifecycle, and rejoining the cluster).
 * `POST /api/v1/vms/create`: Creates a new VM template, allocates virtual storage via `Hydra` & `Aether`, and registers the VM in `libvirt`.
 * `DELETE /api/v1/vms/<name>`: Destroys a VM and deletes its virtual disks from `Aether`.
+
+---
+
+## Technical Details & Resilience Fixes
+
+### 1. ScyllaDB Bootstrap Fallback
+During startup, the Spectrum container (`systemd-spectrum`) establishes a connection to the local database to verify keyspaces and tables. If the local ScyllaDB instance is bootstrapping or down (e.g. after a reboot/rejoin), Spectrum reads all cluster IP addresses from `/etc/hci/cluster.json` and automatically falls back to active database nodes. This prevents the WebUI from blocking or timing out during startup.
+
+### 2. Task Cache Fallback
+To ensure UI responsiveness, the `/api/catalyst/tasks` endpoint maintains an in-memory cache of recent tasks. If a database query fails due to temporary connection latency or quorum changes, Spectrum serves the cached task list rather than throwing an error, preventing the UI progress indicator from resetting to grey.
+
+---
+
+## Command Examples & Syntax
+
+### 1. Check Spectrum Service Status
+Spectrum is managed as a systemd service that wraps a Podman container:
+```bash
+systemctl status spectrum
+```
+
+### 2. View Container Logs
+Since Spectrum runs in a Podman container, you can check its logs directly:
+```bash
+# View recent logs from the container
+podman logs systemd-spectrum
+
+# View logs via journalctl
+journalctl -u spectrum -n 50 --no-pager
+```
+
+### 3. Restart Spectrum Service
+```bash
+systemctl restart spectrum
+```
+
+### 4. Query local API
+You can query the WebUI status endpoint directly using curl:
+```bash
+curl -k -s https://127.0.0.1:8443/api/status
+```
+
