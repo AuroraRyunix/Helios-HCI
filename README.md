@@ -14,6 +14,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Spark](./docs/spark.md) | **Genesis** | Native Python mTLS daemon | Host-level bootstrap manager, systemd coordinator, and remote orchestrator. |
 | [Odin](./docs/odin.md) / [ZooKeeper](./docs/zookeeper.md) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
+| [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + GlusterFS + NFS-Ganesha | Software-defined distributed storage engine. Mounted locally on host loopback. |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
