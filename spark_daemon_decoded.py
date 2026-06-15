@@ -293,7 +293,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    for svc_name in ["ZooKeeper", "HydraDB", "Aether", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Gatoway", "Logos"]:
+                    for svc_name in ["ZooKeeper", "HydraDB", "Aether", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Gatoway", "Logos", "Mipha"]:
                         svc_data = services.get(svc_name, {"status": "DOWN", "pids": []})
                         status = svc_data.get("status", "DOWN")
                         pids = svc_data.get("pids", [])
@@ -387,7 +387,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         if 'LAST_PIDS_CACHE_TIME' not in globals():
             globals()['LAST_PIDS_CACHE_TIME'] = 0
 
-        services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]
+        services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
         svc_map = {
             "zookeeper": "ZooKeeper",
             "hydra-db": "HydraDB",
@@ -400,7 +400,8 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             "vali": "Vali",
             "catalyst": "Catalyst",
             "gatoway": "Gatoway",
-            "logos": "Logos"
+            "logos": "Logos",
+            "mipha": "Mipha"
         }
         
         result = {
@@ -429,7 +430,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             new_cache = {}
             
             # Native services
-            native_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]
+            native_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
             cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
             try:
                 res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
