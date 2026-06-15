@@ -2,6 +2,9 @@
 
 Valkyrie is the foundation of our HCI cluster, serving as the hypervisor host operating system. It is the direct equivalent of Nutanix **AHV** (Acropolis Hypervisor).
 
+> [!NOTE]
+> **Name Origin:** In Norse mythology, the **Valkyries** ("choosers of the slain") are noble female figures who select who survives or perishes in battle, guiding them to Valhalla. In Helios-HCI, **Valkyrie** is the underlying host operating system that supports, hosts, and decides the placement/evacuation of the virtual machine workloads.
+
 ## Nutanix Role (AHV)
 In Nutanix, AHV is a customized hypervisor based on CentOS/RHEL KVM. It runs virtual machines, hosts the Controller VM (CVM) which is granted direct control of local storage controllers via PCI passthrough, and accesses storage via a local NFS mount routed to the CVM.
 
