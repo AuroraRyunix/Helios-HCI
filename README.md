@@ -22,6 +22,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Mimir](./docs/mimir.md) | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
 | [Mipha](./docs/mipha.md) | **Acropolis HA Manager** | Native Python service | High-Availability host liveness monitor and VM failover coordinator. |
 | [Gatoway](./docs/gato.md) | **Gato (OVS/Bridges)** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
+| [Bifrost](./docs/bifrost.md) | **Cluster Virtual IP (VIP)** | Native Python service | Floating VIP manager daemon ensuring API access high availability. |
 
 ---
 
@@ -124,7 +125,7 @@ cluster stop
 # Wipe cluster configurations, databases, and formats claimed drives
 cluster destroy
 ```
-For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md).
+For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md). For virtual networking, subnets, and VLAN management, see [network.md](./docs/network.md).
 
 ---
 
@@ -137,3 +138,32 @@ All configuration parameters and certificates reside under standardized director
 * `/etc/hci/spark/certs/` - Mutual TLS node certificates (`node.crt`, `node.key`, `ca.crt`) used by `spark-daemon` on port `9099`.
 * `/root/.certs/` - Client Mutual TLS certificates used by administrative utilities (`client.crt`, `client.key`).
 * `/var/lib/hci/aether/volumes/` - Mount directory where local virtual machine disk raw files are stored.
+
+---
+
+## 4. Cluster Network Architecture
+
+Helios-HCI uses a lightweight, secure network layout for inter-node orchestration, consensus, and storage replication:
+
+* **Localhost Bindings**: Internal service APIs (like Catalyst task queue on `9091` and Vali scheduler on `9095`) bind strictly to `127.0.0.1` to enforce local-only access.
+* **Mutual TLS (mTLS) Mesh**: All cross-node administrative tasks and remote executions run securely over port `9099` via the **Spark Daemon**.
+* **Consensus & Metadata Mesh**: Database gossip (ScyllaDB on `7000`) and consensus election (ZooKeeper on `2888`/`3888`) route over cluster-facing networks.
+* **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Spectrum Web UI (`8443`).
+
+### Cluster Network Flow Chart
+![Helios-HCI Cluster Network Flow Chart](./docs/network_chart.png)
+
+For a complete reference of network scopes, port allocations, and communication boundaries, see the [Network Architecture Documentation](./docs/network.md).
+
+---
+
+## 5. High-Availability & Robustness Enhancements
+
+The stack has been enhanced with enterprise-grade resiliency and health-based routing:
+
+* **Active WebUI VIP Failover**: The VIP manager (`bifrost`) evaluates active candidates on port `8443` (Spectrum) and enforces a local health guard. A node will only bind the VIP if it is the leader AND its local WebUI container is active and listening. If the local WebUI is down or bootstrapping, the VIP dynamically floats to a healthy node, ensuring zero client-facing downtime.
+* **Database Connection Resilience**: The WebUI (`spectrum`) establishes keyspace connection checks. If the local ScyllaDB instance is bootstrapping or down, Spectrum reads `/etc/hci/cluster.json` and falls back to other online database hosts.
+* **Task API Queue Cache**: If ScyllaDB encounters brief connection latency or quorum shifts, Spectrum serves Catalyst tasks from an in-memory fallback cache to prevent UI progress bars from flickering or resetting to grey.
+* **Streamlined Reboot Coordination**: Graceful VM evacuation and host transitions are fully isolated. The reboot sequence relies on the prior maintenance phase to gracefully migrate VMs, leaving the host-level `spark-daemon` active to process remote hardware reboot calls reliably.
+
+
