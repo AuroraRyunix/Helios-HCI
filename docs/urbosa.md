@@ -19,9 +19,9 @@ graph TD
     Urbosa -->|VXLAN overlay bridges| Seg[Overlay Segment Bridge: br-ov-10001]
     Urbosa -->|Micro-segmentation| DFW[iptables FORWARD Rules]
 
-    T0 <-->|Logical Transit Link| T1
-    T1 <-->|Enslaved interface| Seg
-    Seg <-->|VXLAN Port 4789| RemoteHost[Remote Host VXLAN Mesh]
+    T0 ---|Logical Transit Link| T1
+    T1 ---|Enslaved interface| Seg
+    Seg ---|VXLAN Port 4789| RemoteHost[Remote Host VXLAN Mesh]
 ```
 
 ### A. Tier-0 (T0) Logical Router (North-South Edge Gateway)
