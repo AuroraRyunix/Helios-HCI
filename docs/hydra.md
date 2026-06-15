@@ -2,6 +2,9 @@
 
 Hydra is the distributed metadata database and abstraction layer. It is the direct equivalent of Nutanix **Medusa**.
 
+> [!NOTE]
+> **Name Origin:** In Greek mythology, the **Hydra** is a multi-headed serpent that grows back heads when they are cut off, representing extreme resilience. **HydraDB** uses a multi-node ScyllaDB replication ring so that database access remains online and available even if individual nodes go offline.
+
 ## Nutanix Role (Medusa)
 In Nutanix, Medusa acts as the database proxy and abstraction layer sitting in front of **Cassandra** (a highly customized Apache Cassandra database running on the CVMs). Medusa manages metadata such as virtual disk locations, block maps, snapshots, and cluster configuration. It handles Paxos operations to ensure strict consistency.
 
