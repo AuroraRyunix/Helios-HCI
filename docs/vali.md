@@ -57,8 +57,8 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 2. **Overload Trigger**: A host is considered overloaded if its memory usage exceeds `85%` or if its usage is more than `15%` higher than the average cluster node utilization.
 3. **Rebalancing Action**: If an overloaded node is detected, Vali selects a running VM on that host and queues a `migrate` task to live-migrate it to the node with the highest available memory.
 4. **Live Migration**: Vali executes live migrations via libvirt:
-   `virsh -c qemu:///system migrate --live --unsafe <vm_name> qemu+ssh://root@<target_ip>/system`
-   And updates the VM's `host_ip` in ScyllaDB on completion.
+   `virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe <vm_name> qemu+ssh://root@<target_ip>/system`
+   And updates the VM's `host_ip` in ScyllaDB on completion. To enable compatibility during live migrations, VM guest CPUs are defined with `<cpu mode='host-passthrough'/>` when running under KVM.
 
 ---
 
@@ -97,7 +97,7 @@ valcli host.maintenance.leave hci-node01
 To execute manual VM live migrations outside `valcli` (useful for troubleshooting):
 ```bash
 # Live migrate 'my-linux-vm' to host 10.10.102.223 securely without shared storage requirement checks
-virsh -c qemu:///system migrate --live --unsafe my-linux-vm qemu+ssh://root@10.10.102.223/system
+virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe my-linux-vm qemu+ssh://root@10.10.102.223/system
 ```
 
 ### C. Direct Database Task Querying
