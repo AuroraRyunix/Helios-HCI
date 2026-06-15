@@ -72,8 +72,12 @@ CREATE TABLE IF NOT EXISTS hydra.urbosa_segments (
     vni int,           -- VXLAN VNI (e.g. 10001, 10002)
     t1_link_id uuid,   -- Link to parent T1 router
     subnet_cidr text,  -- CIDR block (e.g. 10.0.1.0/24)
-    gateway_ip text
+    gateway_ip text,
+    dhcp_enabled boolean,
+    dhcp_start text,
+    dhcp_end text
 );
+```
 
 -- Distributed Firewall Rules
 CREATE TABLE IF NOT EXISTS hydra.urbosa_firewall_rules (
@@ -138,3 +142,18 @@ Query active micro-segmentation rules on a hypervisor host:
 # List all iptables forward filtering rules
 iptables -L FORWARD -n -v --line-numbers
 ```
+
+---
+
+## 4. User Interface Layouts
+
+To ensure optimal usability on horizontal widescreen monitors and eliminate vertical scrollbars, the Urbosa SDN console uses expanded landscape-oriented modal designs:
+* **Modal Forms Dimension:** Creation and modification modals for Tier-0 Gateways, Tier-1 Routers, Overlay Segments, and Distributed Firewall Rules use a widescreen landscape overlay panel (`width: 1050px; max-width: 95vw; max-height: 95vh;`).
+* **Grid Formatting (3-Column Layout):** Form inputs are arranged in a clean, three-column grid (`display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;`) with elegant dividing borders:
+  * **Tier-0 Modals**: Segmented into Identification (Col 1), IP/NAT Settings (Col 2), and BGP Peering (Col 3).
+  * **Tier-1 Modals**: Arranged side-by-side with Name (Col 1), Parent T0 Select (Col 2), and DHCP Settings (Col 3).
+  * **Subnet (Segment) Modals**: Structured as Subnet/VNI info (Col 1), Backing Router (Col 2), and DHCP Ranges (Col 3).
+* **Scrollbar Elimination**: Increased modal viewport boundaries guarantee that forms fit on standard horizontal screens without scrollbar clipping.
+* **Full Segment Customization**: In the Overlay Segments edit modal, all attributes (Segment Name, VXLAN VNI, attached Tier-1 router link, subnet CIDR, Gateway IP, and DHCP IPAM lease ranges) are fully editable.
+
+
