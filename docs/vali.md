@@ -54,3 +54,43 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 4. **Live Migration**: Vali executes live migrations via libvirt:
    `virsh -c qemu:///system migrate --live --unsafe <vm_name> qemu+ssh://root@<target_ip>/system`
    And updates the VM's `host_ip` in ScyllaDB on completion.
+
+---
+
+## Command Examples & Syntax
+
+### A. Managing VMs via `valcli`
+The `valcli` CLI tool provides VM status management, power controls, and live migration:
+```bash
+# List all virtual machines in the cluster
+valcli vm.list
+
+# Power ON a virtual machine
+valcli vm.on my-linux-vm
+
+# Power OFF a virtual machine
+valcli vm.off my-linux-vm
+
+# Manually migrate a running VM to another cluster host IP address
+valcli vm.migrate my-linux-vm 10.10.102.222
+
+# Trigger a manual cluster memory load rebalancing check
+valcli vm.balance
+
+# View cluster load metrics and recent DRS migration events
+valcli drs.status
+```
+
+### B. Live Migration Command Syntax (libvirt)
+To execute manual VM live migrations outside `valcli` (useful for troubleshooting):
+```bash
+# Live migrate 'my-linux-vm' to host 10.10.102.223 securely without shared storage requirement checks
+virsh -c qemu:///system migrate --live --unsafe my-linux-vm qemu+ssh://root@10.10.102.223/system
+```
+
+### C. Direct Database Task Querying
+To check pending VM placement and migration tasks queued by Catalyst/Vali:
+```bash
+# Query tasks database table using cqlsh
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT task_id, vm_name, action, status FROM hydra.vali_tasks;"
+```
