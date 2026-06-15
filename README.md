@@ -18,11 +18,11 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
-| [Dagur](./docs/dagur.md) | **Scheduler** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
+| [Dagur](./docs/dagur.md) | **Chronos** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
 | [Mimir](./docs/mimir.md) | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
 | [Mipha](./docs/mipha.md) | **Acropolis HA Manager** | Native Python service | High-Availability host liveness monitor and VM failover coordinator. |
-| [Gatoway](./docs/gato.md) | **Gato (OVS/Bridges)** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
-| [Bifrost](./docs/bifrost.md) | **Cluster Virtual IP (VIP)** | Native Python service | Floating VIP manager daemon ensuring API access high availability. |
+| [Gatoway](./docs/flow.md) | **Flow** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
+| [Bifrost](./docs/bifrost.md) | **Vipmonitor** | Native Python service | Floating VIP manager daemon ensuring API access high availability. |
 
 ---
 
