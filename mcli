@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import ssl
+import urllib.request
+import urllib.parse
+import subprocess
+import uuid
+import socket
+import time
+import threading
+
+# ANSI Color definitions
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RED = "\033[91m"
+BOLD = "\033[1m"
+GRAY = "\033[90m"
+RESET = "\033[0m"
+
+CHECK_ID_TO_FUNC = {
+    "zookeeper_status": "database.zookeeper",
+    "hydra-db_status": "database.scylladb",
+    "spectrum_status": "service.spectrum",
+    "spark-daemon_status": "service.spark",
+    "libvirtd_status": "service.libvirtd",
+    "libvirt_responsiveness": "service.libvirtd.responsiveness",
+    "scylladb_ring_status": "database.ring",
+    "gluster_peers": "storage.peers",
+    "gluster_volume": "storage.volume",
+    "brick_mounts": "storage.bricks",
+    "storage_capacity": "storage.capacity",
+    "cpu_load": "hardware.cpu",
+    "ram_usage": "hardware.ram",
+    "disk_space": "hardware.disk",
+    "zookeeper_consensus": "database.zookeeper.consensus",
+    "scylladb_replication": "database.scylladb.replication",
+    "glusterfs_split_brain": "storage.glusterfs.split_brain",
+    "glusterfs_heal_pending": "storage.glusterfs.heal_pending",
+    "mtls_cert_expiration": "security.mtls.certs",
+    "spectrum_api_port": "service.spectrum.port",
+    "ntp_sync": "hardware.ntp",
+    "hostname_resolution": "service.network.hostname_resolution",
+    "brick_space_utilization": "storage.bricks.space",
+    "storage_mount_options": "storage.volume.mount_options",
+    "storage_volume_writable": "storage.volume.writable",
+    "spectrum_privilege_check": "service.spectrum.privileges",
+    "fstab_safety_check": "storage.fstab.safety",
+    "auth_seeding_check": "security.auth.seeding",
+    "dns_ntp_sync_check": "hardware.dns_ntp.sync",
+    "virsh_power_off_check": "service.libvirt.power_off",
+    "stuck_tasks_check": "service.catalyst.stuck_tasks",
+    "orphaned_disks_check": "storage.orphaned_disks",
+}
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+def get_cluster_nodes():
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            data = json.load(f)
+            return data.get("hosts", [])
+    except Exception:
+        return []
+
+def run_remote_spark(ip, command):
+    """Run command remotely using the spark-daemon mTLS API."""
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = False
+    
+    url = f"https://{ip}:9099/api/v1/execute"
+    data = json.dumps({"command": command}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=90) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            return res["returncode"], res["stdout"], res["stderr"]
+    except Exception as e:
+        return -1, "", str(e)
+
+def run_local_cmd(command):
+    res = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
+
+def run_cql_query(local_ip, cql_query):
+    # Escape single quotes and newlines for podman command wrapping
+    clean_query = cql_query.replace("\n", " ").strip().replace('"', '\\"')
+    cmd = f'podman exec -i systemd-hydra-db cqlsh {local_ip} -e "{clean_query}"'
+    return run_local_cmd(cmd)
+
+def run_node_checks(node, category, local_ip, results_dict):
+    ip = node["ip"]
+    results_dict[ip] = {
+        "status": "Initializing...",
+        "pct": 10,
+        "done": False,
+        "rc": -1,
+        "stdout": "",
+        "stderr": "",
+        "hostname": node["hostname"]
+    }
+    
+    # Spawn a local thread to update progress text dynamically while query is running
+    def update_progress():
+        # Setup specific list of checks depending on the category being run
+        checks_map = {
+            "services": [
+                "zookeeper_status", "hydra-db_status", "aether_status", "spectrum_status",
+                "spark-daemon_status", "libvirtd_status", "bifrost_status", "scylladb_ring_status",
+                "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
+                "mtls_cert_expiration", "libvirt_responsiveness", "hostname_resolution",
+                "spectrum_privilege_check", "auth_seeding_check", "vip_binding_status",
+                "maintenance_mode_check", "vali_leader_status", "scylladb_tasks_schema",
+                "security_config_audit", "virsh_power_off_check", "stuck_tasks_check"
+            ],
+            "storage": [
+                "gluster_peers", "gluster_volume", "glusterfs_split_brain",
+                "glusterfs_heal_pending", "brick_mounts", "brick_space_utilization",
+                "storage_capacity", "storage_mount_options", "storage_volume_writable",
+                "fstab_safety_check", "orphaned_disks_check"
+            ],
+            "hardware": [
+                "cpu_load", "ram_usage", "disk_space", "ntp_sync", "host_virtualization", "firmware_upgrades",
+                "dns_ntp_sync_check"
+            ]
+        }
+        
+        if category == "all":
+            checks_list = checks_map["services"] + checks_map["storage"] + checks_map["hardware"]
+        else:
+            checks_list = checks_map.get(category, [])
+            
+        if not checks_list:
+            return
+            
+        total_checks = len(checks_list)
+        
+        while not results_dict[ip]["done"]:
+            cmd = f"cat /tmp/mimir_check_{category}"
+            if ip == local_ip or ip == "127.0.0.1":
+                rc, stdout, stderr = run_local_cmd(cmd)
+            else:
+                rc, stdout, stderr = run_remote_spark(ip, cmd)
+                
+            if not results_dict[ip]["done"]:
+                if rc == 0 and stdout.strip():
+                    current_check = stdout.strip()
+                    if current_check in checks_list:
+                        idx = checks_list.index(current_check)
+                        pct = 10 + int((95 - 10) * idx / total_checks)
+                        results_dict[ip]["status"] = f"Checking {current_check}..."
+                        results_dict[ip]["pct"] = pct
+            time.sleep(0.08)
+            
+    t_prog = threading.Thread(target=update_progress)
+    t_prog.daemon = True
+    t_prog.start()
+    
+    cmd = f"/usr/local/bin/mcli-runner --category {category}"
+    if ip == local_ip or ip == "127.0.0.1":
+        rc, stdout, stderr = run_local_cmd(cmd)
+    else:
+        rc, stdout, stderr = run_remote_spark(ip, cmd)
+        
+    results_dict[ip]["done"] = True
+    results_dict[ip]["pct"] = 100
+    results_dict[ip]["status"] = "Writing results to DB..."
+    results_dict[ip]["rc"] = rc
+    results_dict[ip]["stdout"] = stdout
+    results_dict[ip]["stderr"] = stderr
+
+VERBOSE = False
+
+def execute_health_checks(category):
+    local_ip = get_local_ip()
+    nodes = get_cluster_nodes()
+    if not nodes:
+        print("[ERROR] No cluster nodes found in /etc/hci/cluster.json.")
+        sys.exit(1)
+        
+    execution_id = str(uuid.uuid4())
+    
+    # Initialize results dict
+    results_dict = {}
+    for node in nodes:
+        results_dict[node["ip"]] = {
+            "status": "Initializing...",
+            "pct": 10,
+            "done": False,
+            "rc": -1,
+            "stdout": "",
+            "stderr": "",
+            "hostname": node["hostname"]
+        }
+        
+    # Print initial newlines to occupy console rows for progress tracking
+    for _ in nodes:
+        print()
+        
+    threads = []
+    for node in nodes:
+        t = threading.Thread(target=run_node_checks, args=(node, category, local_ip, results_dict))
+        t.start()
+        threads.append(t)
+        
+    bar_width = 20
+    # Overwrite in-place loop
+    while any(not r["done"] for r in results_dict.values()):
+        sys.stdout.write(f"\033[{len(nodes)}A")
+        sys.stdout.flush()
+        for node in nodes:
+            ip = node["ip"]
+            r = results_dict[ip]
+            pct = r["pct"]
+            status = r["status"]
+            
+            filled = int(bar_width * pct / 100)
+            bar = "=" * filled + ">" + " " * (bar_width - filled - 1)
+            if filled == bar_width:
+                bar = "=" * bar_width
+            sys.stdout.write(f"\r\033[K{node['hostname']} ({ip}): [{bar}] {pct}% - {status}\n")
+            sys.stdout.flush()
+        time.sleep(0.1)
+        
+    # Clean output loop when completed
+    sys.stdout.write(f"\033[{len(nodes)}A")
+    sys.stdout.flush()
+    for node in nodes:
+        ip = node["ip"]
+        r = results_dict[ip]
+        bar = "=" * bar_width
+        sys.stdout.write(f"\r\033[K{node['hostname']} ({ip}): [{bar}] 100% - Finished\n")
+        sys.stdout.flush()
+    print() # spacing
+    
+    pass_cnt = 0
+    warn_cnt = 0
+    fail_cnt = 0
+    failed_checks = []
+    all_checks_results = []
+    cql_statements = []
+    
+    for node in nodes:
+        ip = node["ip"]
+        hostname = node["hostname"]
+        res = results_dict.get(ip)
+        
+        if not res or res["rc"] != 0:
+            err_msg = res["stderr"] if res else "No response"
+            fail_cnt += 1
+            err_output = f"Failed to execute Mimir checks on node: {err_msg}"
+            failed_checks.append({
+                "host": ip,
+                "hostname": hostname,
+                "check": "Host Connectivity",
+                "status": "FAIL",
+                "output": err_output
+            })
+            all_checks_results.append({
+                "host": ip,
+                "hostname": hostname,
+                "check": "Host Connectivity",
+                "status": "FAIL",
+                "output": err_output
+            })
+            continue
+            
+        try:
+            node_data = json.loads(res["stdout"])
+            for check_name, check_res in node_data.items():
+                status = check_res.get("status", "FAIL")
+                output = check_res.get("output", "")
+                
+                if status == "PASS":
+                    pass_cnt += 1
+                elif status == "WARN":
+                    warn_cnt += 1
+                    failed_checks.append({
+                        "host": ip,
+                        "hostname": hostname,
+                        "check": check_name,
+                        "status": "WARN",
+                        "output": output
+                    })
+                else:
+                    fail_cnt += 1
+                    failed_checks.append({
+                        "host": ip,
+                        "hostname": hostname,
+                        "check": check_name,
+                        "status": "FAIL",
+                        "output": output
+                    })
+                    
+                all_checks_results.append({
+                    "host": ip,
+                    "hostname": hostname,
+                    "check": check_name,
+                    "status": status,
+                    "output": output
+                })
+                    
+                # Store CQL statements for batch write
+                escaped_output = output.replace("'", "''")
+                cql = f"""
+                INSERT INTO hydra.mimir_results (category, check_name, node_ip, status, output, execution_id, timestamp)
+                VALUES ('{category}', '{check_name}', '{ip}', '{status}', '{escaped_output}', {execution_id}, toTimestamp(now()));
+                """
+                cql_statements.append(cql.strip())
+                
+        except Exception as e:
+            fail_cnt += 1
+            err_output = f"Failed to parse JSON response: {e}\nRaw stdout: {res['stdout'][:200]}"
+            failed_checks.append({
+                "host": ip,
+                "hostname": hostname,
+                "check": "JSON Parsing",
+                "status": "FAIL",
+                "output": err_output
+            })
+            all_checks_results.append({
+                "host": ip,
+                "hostname": hostname,
+                "check": "JSON Parsing",
+                "status": "FAIL",
+                "output": err_output
+            })
+            
+    # Batch execute ScyllaDB writes to eliminate the bottleneck completely
+    if cql_statements:
+        batch_cql = "BEGIN BATCH\n" + "\n".join(cql_statements) + "\nAPPLY BATCH;"
+        run_cql_query(local_ip, batch_cql)
+            
+    print("=" * 70)
+    print("Diagnostics Summary:")
+    print(f"  Total Succeeded: {GREEN}{pass_cnt}{RESET}")
+    total_failed = fail_cnt + warn_cnt
+    
+    if VERBOSE:
+        print(f"  Total Failed:    {RED if total_failed > 0 else GREEN}{total_failed}{RESET}")
+        print("\nAll Diagnostic Checks Details:")
+        print("-" * 70)
+        for check in all_checks_results:
+            status_colored = f"{GREEN}[ PASS ]{RESET}"
+            if check["status"] == "FAIL":
+                status_colored = f"{RED}[ FAIL ]{RESET}"
+            elif check["status"] == "WARN":
+                status_colored = f"{YELLOW}[ WARN ]{RESET}"
+                
+            func_name = CHECK_ID_TO_FUNC.get(check["check"], "unknown")
+            print(f"  {status_colored} {BOLD}{check['check']}{RESET} ({func_name}) on {check['hostname']} ({check['host']})")
+            indented_output = "\n           ".join(check["output"].splitlines())
+            print(f"           Description/Comment: {indented_output}\n")
+    else:
+        if total_failed > 0:
+            print(f"  Total Failed:    {RED}{total_failed}{RESET}")
+            print("\nFailed or Warned Checks (run with --verbose or -v to see passed checks):")
+            print("-" * 70)
+            for fc in failed_checks:
+                status_colored = f"{RED}[ FAIL ]{RESET}" if fc["status"] == "FAIL" else f"{YELLOW}[ WARN ]{RESET}"
+                func_name = CHECK_ID_TO_FUNC.get(fc["check"], "unknown")
+                print(f"  {status_colored} {BOLD}{fc['check']}{RESET} ({func_name}) on {fc['hostname']} ({fc['host']})")
+                indented_output = "\n           ".join(fc["output"].splitlines())
+                print(f"           Description/Comment: {indented_output}\n")
+        else:
+            print(f"  Total Failed:    {GREEN}{total_failed}{RESET}")
+            print(f"\n{GREEN}PASS{RESET}: All Mimir checks passed cluster-wide! No issues detected.")
+            
+    print("Results replicated globally in ScyllaDB.")
+
+
+def show_status():
+    local_ip = get_local_ip()
+    if VERBOSE:
+        cql = "SELECT JSON category, check_name, node_ip, status, output, timestamp FROM hydra.mimir_results;"
+    else:
+        cql = "SELECT JSON category, check_name, node_ip, status, timestamp FROM hydra.mimir_results;"
+        
+    rc, stdout, stderr = run_cql_query(local_ip, cql)
+    if rc != 0:
+        print(f"[ERROR] Failed to read database results: {stderr or stdout}")
+        sys.exit(1)
+        
+    records = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                pass
+                
+    if not records:
+        print("No diagnostic check records found in the database. Run 'mcli health_checks run_all' to trigger checks.")
+        return
+        
+    print(f"=====================================================================")
+    print(f"                     Helios Mimir Diagnostic Status                 ")
+    print(f"=====================================================================")
+    print(f"{'CATEGORY':12} {'CHECK NAME':25} {'NODE IP':15} {'STATUS':8} {'TIMESTAMP'}")
+    print(f"---------------------------------------------------------------------")
+    for r in sorted(records, key=lambda x: (x.get("category"), x.get("check_name"))):
+        t_str = r.get("timestamp", "")
+        status = r.get("status", "FAIL")
+        if status == "PASS":
+            status_colored = f"{GREEN}PASS{RESET}    "
+        elif status == "WARN":
+            status_colored = f"{YELLOW}WARN{RESET}    "
+        else:
+            status_colored = f"{RED}FAIL{RESET}    "
+        print(f"{r.get('category', 'N/A'):12} {r.get('check_name', 'N/A'):25} {r.get('node_ip', 'N/A'):15} {status_colored:8} {t_str}")
+        if VERBOSE and r.get("output"):
+            indented = "      " + "\n      ".join(r["output"].strip().splitlines())
+            print(f"{GRAY}{indented}{RESET}\n")
+    print(f"=====================================================================")
+
+def show_list():
+    print(f"{CYAN}Helios Diagnostics{RESET} {GREEN}[Mimir]{RESET} - Available Checks")
+    print("-" * 70)
+    
+    checks = [
+        ("database.zookeeper", "zookeeper_status", "Check systemd ZooKeeper state"),
+        ("database.zookeeper.consensus", "zookeeper_consensus", "Check ZooKeeper consensus role/participation"),
+        ("database.scylladb", "hydra-db_status", "Check systemd ScyllaDB state"),
+        ("database.scylladb.replication", "scylladb_replication", "Verify hydra keyspace replication factor config"),
+        ("service.spectrum", "spectrum_status", "Check systemd Spectrum UI state"),
+        ("service.spectrum.port", "spectrum_api_port", "Verify Spectrum API console port 8443 is open"),
+        ("service.spark", "spark-daemon_status", "Check systemd Spark Host Agent state"),
+        ("service.libvirtd", "libvirtd_status", "Check systemd Virtualization hypervisor state"),
+        ("service.libvirtd.responsiveness", "libvirt_responsiveness", "Verify virtualization hypervisor responds to queries"),
+        ("service.network.hostname_resolution", "hostname_resolution", "Verify cluster node hostnames resolve locally"),
+        ("database.ring", "scylladb_ring_status", "Verify ScyllaDB Node Clustered topology"),
+        ("storage.peers", "gluster_peers", "Verify peer connections inside storage container"),
+        ("storage.volume", "gluster_volume", "Check Aether volume state"),
+        ("storage.glusterfs.split_brain", "glusterfs_split_brain", "Check for split-brain files"),
+        ("storage.glusterfs.heal_pending", "glusterfs_heal_pending", "Check count of pending healing files"),
+        ("storage.bricks", "brick_mounts", "Verify partition brick mounts on host OS"),
+        ("storage.bricks.space", "brick_space_utilization", "Check physical brick disk capacity constraints"),
+        ("storage.capacity", "storage_capacity", "Verify space constraints on Aether volume mount"),
+        ("storage.volume.mount_options", "storage_mount_options", "Verify Aether volume is mounted read-write (rw)"),
+        ("storage_volume_writable", "storage_volume_writable", "Verify storage volume write-read loop functions"),
+        ("security.mtls.certs", "mtls_cert_expiration", "Verify Spark mTLS client cert validity & expiration"),
+        ("hardware.cpu", "cpu_load", "Verify average CPU processing load"),
+        ("hardware.ram", "ram_usage", "Check host RAM capacity constraints"),
+        ("hardware.disk", "disk_space", "Check root OS filesystem usage limits"),
+        ("hardware.ntp", "ntp_sync", "Verify chronyd synchronization status and clock offset limit"),
+        ("service.spectrum.privileges", "spectrum_privilege_check", "Verify Spectrum container is unprivileged with no host libvirt socket mount"),
+        ("storage.fstab.safety", "fstab_safety_check", "Verify /etc/fstab brick mounts use UUIDs and contain safe timeout flags"),
+        ("security.auth.seeding", "auth_seeding_check", "Verify ScyllaDB authentication users table is seeded"),
+        ("hardware.dns_ntp.sync", "dns_ntp_sync_check", "Verify DNS and NTP configurations are synchronized with cluster database"),
+    ]
+    
+    for func, check_id, desc in checks:
+        print(f"{YELLOW}Function:{RESET} {func:<25} {YELLOW}ID:{RESET} {BOLD}{check_id}{RESET}")
+        print(f"  Description: {desc}\n")
+ 
+def print_mcli_usage():
+    print("Helios Diagnostics CLI (mcli) - Mimir Host & Cluster Diagnostic Engine\n")
+    print("Usage:")
+    print("  mcli [--verbose|-v] health_checks run_all       Run all diagnostic checks cluster-wide")
+    print("  mcli [--verbose|-v] health_checks services      Run only service-related checks")
+    print("  mcli [--verbose|-v] health_checks hardware      Run only hardware-related checks")
+    print("  mcli [--verbose|-v] health_checks storage       Run only storage-related checks")
+    print("  mcli health_checks list                         List all available diagnostic checks")
+    print("  mcli [--verbose|-v] status                      Show the latest diagnostic results from ScyllaDB")
+    print("\nExamples:")
+    print("  mcli -v health_checks run_all    # Execute checks showing passed results")
+    print("  mcli -v status                   # View status report including outputs")
+
+def main():
+    global VERBOSE
+    # Handle global verbose argument anywhere
+    if "--verbose" in sys.argv:
+        VERBOSE = True
+        sys.argv.remove("--verbose")
+    if "-v" in sys.argv:
+        VERBOSE = True
+        sys.argv.remove("-v")
+        
+    if len(sys.argv) < 2 or sys.argv[1] in ["--help", "-h", "help"]:
+        print_mcli_usage()
+        sys.exit(1)
+        
+    cmd = sys.argv[1]
+    if cmd == "status":
+        show_status()
+    elif cmd == "health_checks":
+        if len(sys.argv) < 3:
+            print("Usage: mcli health_checks <run_all|services|hardware|storage|list>")
+            sys.exit(1)
+        sub = sys.argv[2]
+        if sub == "list":
+            show_list()
+        elif sub in ["run_all", "services", "hardware", "storage"]:
+            category = "all" if sub == "run_all" else sub
+            execute_health_checks(category)
+        else:
+            print(f"Unknown sub-command '{sub}'")
+            sys.exit(1)
+    else:
+        print(f"Unknown command '{cmd}'")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
