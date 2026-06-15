@@ -57,8 +57,6 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 
 ---
 
-## Command Examples & Syntax
-
 ### A. Managing VMs via `valcli`
 The `valcli` CLI tool provides VM status management, power controls, and live migration:
 ```bash
@@ -79,6 +77,15 @@ valcli vm.balance
 
 # View cluster load metrics and recent DRS migration events
 valcli drs.status
+
+# Place a node into maintenance mode (evacuates all running VMs to other hosts)
+valcli host.maintenance.enter hci-node01
+
+# Place a node into maintenance mode and force stop any VMs that cannot migrate
+valcli host.maintenance.enter hci-node01 --force
+
+# Restore a node from maintenance mode, starting services and re-syncing volumes
+valcli host.maintenance.leave hci-node01
 ```
 
 ### B. Live Migration Command Syntax (libvirt)
@@ -93,4 +100,11 @@ To check pending VM placement and migration tasks queued by Catalyst/Vali:
 ```bash
 # Query tasks database table using cqlsh
 podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT task_id, vm_name, action, status FROM hydra.vali_tasks;"
+
+# Query catalyst tasks for host reboot or maintenance operations
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT task_id, service, action, status, progress FROM hydra.catalyst_tasks;"
+
+# Check host status and maintenance mode flags
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT hostname, ip, status, maintenance_mode FROM hydra.nodes;"
 ```
+
