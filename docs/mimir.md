@@ -20,3 +20,30 @@ Mimir checks are triggered according to schedules defined in the database:
 | `hourly_checks` | `all` | 1 hour | `/usr/local/bin/mcli health_checks run_all` | Runs all diagnostic health checks cluster-wide. |
 
 The triggered execution calls `mcli` tool which performs node check evaluations (SSH connections, disk capacity, process health, mount checks, replica statuses) and records diagnostic output to `hydra.mimir_results`.
+
+---
+
+## Command Examples & Syntax
+
+### A. Health Diagnostic CLI (`mcli`)
+The `mcli` tool is executed locally to run health diagnostics and inspect cluster-wide results:
+```bash
+# Run all registered health diagnostics immediately
+mcli health_checks run_all
+
+# List all registered health checks and their description
+mcli health_checks list
+
+# Run a specific check category (e.g. storage)
+mcli health_checks run --check storage_capacity_check
+```
+
+### B. Checking Health Check Results in ScyllaDB
+You can query the results of the health runs directly using `cqlsh`:
+```bash
+# Query recent warnings or failures recorded by Mimir
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT category, check_name, node_ip, status, output FROM hydra.mimir_results WHERE status IN ('FAIL', 'WARNING') ALLOW FILTERING;"
+
+# Check the execution details of the hourly health checks schedule
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT * FROM hydra.mimir_schedules WHERE schedule_name = 'hourly_checks';"
+```
