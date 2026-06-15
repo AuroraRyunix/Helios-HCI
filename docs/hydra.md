@@ -12,7 +12,10 @@ In Nutanix, Medusa acts as the database proxy and abstraction layer sitting in f
 In our architecture, **Hydra** runs in a container on every host, leveraging a distributed **ScyllaDB** (a C++ rewritten, high-performance Cassandra-compatible database) or standard **Cassandra** container cluster.
 1. **Consensus & Clustering**: The ScyllaDB/Cassandra instances on all three hosts auto-discover each other using Zookeeper/Odin and form a ring topology.
 2. **Replication & Consensus**: Data keyspaces use a replication factor of 3 (RF=3) with local quorum write/read consistency. This ensures metadata is consistent and partition-tolerant.
-3. **Domain API Wrapper**: The Hydra service provides a REST API that sits in front of the local database port (`9042`). Other services query this local API to avoid linking full database driver layers everywhere.
+3. **CQL HTTP Proxy**: To avoid the massive host CPU overhead of spawning containerized `cqlsh` python sessions repeatedly, a persistent **CQL HTTP Proxy** (`hydra-db-proxy.service`) runs inside the `systemd-hydra-db` container.
+   * **Port**: `9043` on `localhost` (bridged via `Network=host`).
+   * **Connection**: Maintains a single, persistent native python `cassandra-driver` connection to ScyllaDB.
+   * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, clients automatically fall back to executing `cqlsh` directly, ensuring zero-downtime database access.
 
 ---
 
