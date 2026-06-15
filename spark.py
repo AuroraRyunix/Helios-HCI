@@ -60,7 +60,7 @@ def get_local_maintenance_status(ip_addr):
     return "NORMAL"
 
 def show_status_json():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]
+    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -73,7 +73,8 @@ def show_status_json():
         "vali": "Vali",
         "catalyst": "Catalyst",
         "gatoway": "Gatoway",
-        "logos": "Logos"
+        "logos": "Logos",
+        "mipha": "Mipha"
     }
     
     _, hostname, _ = run_local("hostname")
@@ -137,7 +138,7 @@ def show_status_json():
                 healthy = vm_mounted and img_mounted
  
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]:
+            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
@@ -160,7 +161,7 @@ def show_status_json():
     print(json.dumps(result))
  
 def show_status():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]
+    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -173,7 +174,8 @@ def show_status():
         "vali": "Vali",
         "catalyst": "Catalyst",
         "gatoway": "Gatoway",
-        "logos": "Logos"
+        "logos": "Logos",
+        "mipha": "Mipha"
     }
     
     _, hostname, _ = run_local("hostname")
@@ -246,7 +248,7 @@ def show_status():
                 healthy = vm_mounted and img_mounted
 
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]:
+            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
@@ -262,7 +264,7 @@ def show_status():
             print(f"                    {svc_map[svc]:<16}   {RED}DOWN{RESET}")
 
 def check_any_cluster_service_active():
-    services = ["spectrum", "aether", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos"]
+    services = ["spectrum", "aether", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
     for svc in services:
         rc, out, _ = run_local(f"systemctl is-active {svc}")
         if rc == 0 and out.strip() == "active":
@@ -310,7 +312,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["logos", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "aether", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "aether", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":
