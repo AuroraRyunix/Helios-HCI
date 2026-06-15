@@ -2,6 +2,9 @@
 
 **Logos** is the proposed time-series metrics aggregator and monitoring service for the Valkyrie HCI cluster. It replaces synchronous real-time hypervisor polling with a database-backed, background-aggregated telemetry loop, eliminating performance bottlenecks in the Spectrum console UI.
 
+> [!NOTE]
+> **Name Origin:** In Greek philosophy, **Logos** represents logic, reason, and order. In Helios-HCI, it is also a play on "logs" and metrics ingestion, serving as the central collector that logic-checks, aggregates, and stores historical telemetry and resource consumption statistics.
+
 ---
 
 ## 1. System Architecture
