@@ -10,16 +10,16 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 
 | Helios Service | Nutanix Equivalent | Technology Used | Description |
 | :--- | :--- | :--- | :--- |
-| **Valkyrie** | **AHV (Hypervisor)** | CentOS/RHEL KVM + libvirt | The physical host operating system. Runs VMs directly on host kernel. |
-| **Spark** | **Genesis** | Native Python mTLS daemon | Host-level bootstrap manager, systemd coordinator, and remote orchestrator. |
-| **Odin** (ZooKeeper) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
-| **HydraDB** | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
-| **Aether** | **Stargate** | Podman + GlusterFS + NFS-Ganesha | Software-defined distributed storage engine. Mounted locally on host loopback. |
-| **Spectrum** | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
-| **Vali** | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
-| **Logos** | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
-| **Dagur** | **Scheduler** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
-| **Mimir** | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
+| [Valkyrie](./docs/valkyrie.md) | **AHV (Hypervisor)** | CentOS/RHEL KVM + libvirt | The physical host operating system. Runs VMs directly on host kernel. |
+| [Spark](./docs/spark.md) | **Genesis** | Native Python mTLS daemon | Host-level bootstrap manager, systemd coordinator, and remote orchestrator. |
+| [Odin](./docs/odin.md) / [ZooKeeper](./docs/zookeeper.md) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
+| [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
+| [Aether](./docs/aether.md) | **Stargate** | Podman + GlusterFS + NFS-Ganesha | Software-defined distributed storage engine. Mounted locally on host loopback. |
+| [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
+| [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
+| [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
+| [Dagur](./docs/dagur.md) | **Scheduler** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
+| [Mimir](./docs/mimir.md) | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
 
 ---
 
