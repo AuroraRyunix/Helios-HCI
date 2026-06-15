@@ -35,6 +35,7 @@ graph TD
 
 ### C. Overlay Segments (VXLAN Tunnels)
 * **Overlay Isolation:** Creates logical bridges `br-ov-<vni>` and pairs them with static point-to-multipoint VXLAN interfaces (`vxlan-<vni>`) targeting the IPs of peer cluster hosts. This forms a full-mesh overlay fabric on UDP port `4789` without requiring physical multicast configurations.
+* **VM Network Integration:** When a VM is configured with an Urbosa overlay segment network ID, Vali automatically interfaces the VM's network interface with the corresponding `br-ov-{vni}` bridge on the host, granting the VM access to the software-defined overlay network.
 
 ### D. Distributed Firewall (Micro-segmentation)
 * **Stateful Security:** Installs iptables rule sets in the `FORWARD` chain of the host namespace, enforcing stateful `ALLOW` or `DROP` policies based on IP CIDRs, protocols, and destination ports.
