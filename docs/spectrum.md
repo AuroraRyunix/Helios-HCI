@@ -44,9 +44,11 @@ In our architecture, **Spectrum** runs as a containerized web application on eac
 ### Sample REST API endpoints
 * `GET /api/status`: Returns current hypervisor state, VM statistics, and cluster daemon status.
 * `GET /api/catalyst/tasks`: Returns recent Catalyst task execution queue states and progress.
+* `POST /api/mimir/run`: Submits a manual diagnostics task (`mimir_diagnostics`) to Catalyst to execute health checks.
 * `POST /api/host/reboot`: Initiates a graceful reboot task sequence for a cluster host (coordinates entering maintenance, evacuating/stopping VMs, invoking spark reboot, waiting for host lifecycle, and rejoining the cluster).
 * `POST /api/v1/vms/create`: Creates a new VM template, allocates virtual storage via `Hydra` & `Aether`, and registers the VM in `libvirt`.
 * `DELETE /api/v1/vms/<name>`: Destroys a VM and deletes its virtual disks from `Aether`.
+
 
 ---
 
