@@ -21,6 +21,6 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | Job Name | Task Type | Cron Expression | Interval | Command | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `mimir_diagnostics` | `mimir_health` | `0 * * * *` | 1 hour | `/usr/local/bin/mcli health_checks run_all` | Runs cluster health checks. |
-| `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-aether gluster volume status` | Verifies GlusterFS volume state. |
+| `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-linstor-controller linstor resource list` | Verifies Linstor/DRBD storage volume state. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
-| `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `/usr/local/bin/hci-auto-heal` | Fixes GlusterFS metadata mismatch attributes. |
+| `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `N/A (Native)` | DRBD kernel replication natively handles replication synchronization. |
