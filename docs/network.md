@@ -16,8 +16,9 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Spectrum Web UI** | `8443` | TCP (HTTPS) | Public / Management | Prism Web Console interface and REST API gateway. |
 | **Catalyst Manager** | `9091` | TCP (HTTP) | Localhost | Task Manager API. Mapped locally for scheduling and submission. |
 | **Vali Placement** | `9095` | TCP (HTTP) | Localhost | Acropolis VM placement, live migration, and DRS controls. |
-| **GlusterFS** (Aether) | `24007` | TCP | Cluster Mesh | GlusterFS Daemon (glusterd) storage management. |
-| **GlusterFS Bricks** | `49152`+ | TCP | Cluster Mesh | GlusterFS brick transport ports (dynamically allocated per drive). |
+| **Linstor Controller** | `3370` | TCP | Localhost & Cluster | Linstor Controller REST API and orchestration port. |
+| **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
+| **DRBD Replication** | `7788`-`7799` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
 
 ---
 
@@ -34,14 +35,15 @@ flowchart TB
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK1["ZooKeeper (Consensus)<br>Port 2181"]
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether1["Aether (GlusterFS Storage)<br>Port 24007"]
+        AetherCtrl1["Linstor Controller<br>Port 3370"]
+        AetherSat1["Linstor Satellite<br>Port 3376"]
     end
 
     subgraph Host2 [hci-node02]
         Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK2["ZooKeeper (Consensus)<br>Port 2181"]
         DB2["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether2["Aether (GlusterFS Storage)<br>Port 24007"]
+        AetherSat2["Linstor Satellite<br>Port 3376"]
     end
 
     %% Internal service orchestration and query flows on Host1
@@ -60,7 +62,9 @@ flowchart TB
     %% Inter-node replication and consensus (Cluster Mesh)
     DB1 <===>|"ScyllaDB Gossip & Replication (Port 7000)"| DB2
     ZK1 <===>|"Consensus Election & Sync (Ports 2888/3888)"| ZK2
-    Aether1 <===>|"GlusterFS Data Replication (Port 24007)"| Aether2
+    AetherSat1 <===>|"Linstor/DRBD Control & Sync (Ports 3376, 7788+)"| AetherSat2
+    AetherCtrl1 -.->|"Orchestrate Satellites (Port 3376)"| AetherSat1
+    AetherCtrl1 -.->|"Orchestrate Satellites (Port 3376)"| AetherSat2
 
     %% Remote orchestration and fallbacks
     Spark1 -.->|"Orchestrate remote node (Port 9099)"| Spark2
@@ -75,13 +79,14 @@ flowchart TB
 ### A. Localhost Bindings (No External Access)
 To ensure isolation and security, internal daemon API ports are bound exclusively to the loopback interface (`127.0.0.1`):
 * **Vali (`9095`) & Catalyst (`9091`)**: These services are not exposed externally. Access from Spectrum is routed locally through the `spark-daemon` mTLS wrapper to prevent unauthenticated commands.
-* **Storage Mounts (`localhost:/default-vm-container`)**: Hypervisor storage mounting of distributed GlusterFS volumes is done locally over `localhost` through mount helper configurations, preventing data exposure on external networks.
+* **Storage Mounts**: Hypervisor VMs access storage containers directly via block-level DRBD device mapping (e.g. `/dev/drbd/by-res/...`), bypassing network-attached filesystem shares entirely for localized guests.
 
 ### B. Mutual TLS Mesh (Port `9099`)
 * All node-to-node remote command execution is performed through the **Spark Daemon** over port `9099`.
 * The daemon requires valid mTLS certificates (`node.crt` and `client.crt` signed by the cluster CA) for every connection, replacing the need for inter-node root SSH keys.
 
-### C. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `24007`)
+### C. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7788`+)
 * **Gossip Database Layer**: ScyllaDB nodes talk to each other directly on port `7000` to share cluster metadata, tables partition maps, and telemetry stats.
 * **Consensus Sync Layer**: ZooKeeper nodes use ports `2888` and `3888` to elect Odin leaders and synchronize locks.
-* **Software-Defined Storage**: Aether storage pods communicate on port `24007` and brick ports (`49152`+) to replicate writes synchronously across the physical disks.
+* **Software-Defined Storage**: Linstor Satellites and Controller communicate over ports `3370` and `3376` for cluster resource provisioning, and DRBD volumes replicate synchronously across the physical disks using TCP ports `7788` to `7799`.
+
