@@ -2,6 +2,9 @@
 
 Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
 
+> [!NOTE]
+> **Name Origin:** In Greek mythology, **Aether** is the personification of the bright upper sky and the air breathed by gods. Historically in physics, the *aether* was a hypothetical space-filling medium postulated to support the propagation of electromagnetic waves. In Helios-HCI, **Aether** refers to the distributed storage fabric (Linstor + DRBD) that spans all physical nodes to form a single, unified virtual storage medium.
+
 ---
 
 ## Nutanix Role (Stargate)
