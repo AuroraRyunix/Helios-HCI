@@ -15,7 +15,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Odin](./docs/odin.md) / [ZooKeeper](./docs/zookeeper.md) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
-| [Aether](./docs/aether.md) | **Stargate** | Podman + GlusterFS + NFS-Ganesha | Software-defined distributed storage engine. Mounted locally on host loopback. |
+| [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed storage engine (transitioning from GlusterFS). |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
@@ -163,14 +163,14 @@ flowchart TB
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK1["ZooKeeper (Consensus)<br>Port 2181"]
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether1["Aether (GlusterFS Storage)<br>Port 24007"]
+        Aether1["Aether (Linstor/DRBD Storage)<br>Port 3366/3370"]
     end
 
     subgraph Host2 [hci-node02]
         Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK2["ZooKeeper (Consensus)<br>Port 2181"]
         DB2["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether2["Aether (GlusterFS Storage)<br>Port 24007"]
+        Aether2["Aether (Linstor/DRBD Storage)<br>Port 3366/3370"]
     end
 
     %% Internal service orchestration and query flows on Host1
@@ -189,7 +189,7 @@ flowchart TB
     %% Inter-node replication and consensus (Cluster Mesh)
     DB1 <===>|"ScyllaDB Gossip & Replication (Port 7000)"| DB2
     ZK1 <===>|"Consensus Election & Sync (Ports 2888/3888)"| ZK2
-    Aether1 <===>|"GlusterFS Data Replication (Port 24007)"| Aether2
+    Aether1 <===>|"DRBD Data Replication (Port 7889)"| Aether2
 
     %% Remote orchestration and fallbacks
     Spark1 -.->|"Orchestrate remote node (Port 9099)"| Spark2
