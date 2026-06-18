@@ -28,7 +28,7 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
 ```
 **Creation Workflow**:
 1. Creates the cluster configuration file `/etc/hci/cluster.json` on all nodes.
-2. Formats and claims raw disks $\ge 100\text{ GB}$ to construct the GlusterFS volumes (`default-vm-container` and `default-image-container`).
+2. Formats and claims raw disks $\ge 100\text{ GB}$ to construct the Aether storage resource pools (`default-vm-container` and `default-image-container`).
 3. Writes `/etc/hci/aether/storage-pools.json` on each host.
 4. Distributes environment parameters `/etc/hci/spectrum/spectrum.env`.
 5. Starts the core storage layer (`Aether`) and mounts containers locally over loopback.
@@ -42,7 +42,7 @@ Query cluster health and engine statistics.
 # Check basic status (shows whether cluster is started/stopped and online hosts)
 cluster status
 
-# View verbose status (includes Gluster volume layouts, bricks, and detailed daemon states)
+# View verbose status (includes storage resource layouts, node roles, and detailed daemon states)
 cluster status --verbose
 ```
 
@@ -56,7 +56,7 @@ cluster start
 ### D. Cluster Stop (`cluster stop`)
 Safely quiesce active virtual machines, unmount the filesystems, and put the services to rest.
 ```bash
-# Stop all cluster services and unmount GlusterFS storage volumes
+# Stop all cluster services and unmount Aether storage volumes
 cluster stop
 ```
 
