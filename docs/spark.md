@@ -153,7 +153,7 @@ When `spark-daemon` starts up (e.g. during host boot), it spawns a background th
 4. **Cluster State Verification**: Queries the ZooKeeper database for `/cluster_state`. If the cluster state is set to `stopped` (e.g. administrator manually stopped the cluster), it skips starting the workloads.
 5. **Workload Autostart**: Starts the following local cluster services sequentially:
    - `hydra-db` (ScyllaDB container)
-   - `aether` (GlusterFS storage container)
+   - `aether` (Linstor Satellite storage container)
    - `spectrum` (Management WebUI container)
    - `bifrost` (Floating VIP Manager)
    - `dagur` (Task Scheduler)
