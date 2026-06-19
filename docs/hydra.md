@@ -15,7 +15,7 @@ In our architecture, **Hydra** runs in a container on every host, leveraging a d
 3. **CQL HTTP Proxy (Daruk)**: To avoid the massive host CPU overhead of spawning containerized `cqlsh` python sessions repeatedly, a persistent **CQL HTTP Proxy (Daruk)** (`daruk.service`) runs inside the `systemd-hydra-db` container.
     * **Port**: `9043` on `localhost` (bridged via `Network=host`).
     * **Connection**: Maintains a single, persistent native python `cassandra-driver` connection to ScyllaDB.
-    * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, clients automatically fall back to executing `cqlsh` directly, ensuring zero-downtime database access.
+    * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, host-level processes automatically fall back to executing `cqlsh` directly via `podman exec`. Note that containerized services (like Spectrum) lack host `podman` command access and require Daruk to be online.
 
 ---
 
