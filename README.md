@@ -4,6 +4,10 @@ Helios-HCI is a lightweight, containerized Hyper-Converged Infrastructure (HCI) 
 
 It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, storage, configuration, and orchestration daemons inside lightweight Podman containers and native systemd daemons directly on host kernels.
 
+> [!WARNING]
+> **Secure Boot Requirement:** 
+> Because DRBD runs as an out-of-tree kernel module, **Secure Boot must be disabled** on all hypervisor hosts. Alternatively, the ELRepo secure boot public key (`/etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der`) must be imported into each host's MOK database (`mokutil --import`) and enrolled at boot. If Secure Boot is enabled without enrolling the key, loading the DRBD driver will fail with `Key was rejected by service`.
+
 ---
 
 ## 1. Component Mappings (Helios vs. Nutanix)
