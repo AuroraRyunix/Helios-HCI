@@ -13,7 +13,7 @@ To solve this:
 1. **Daruk** runs inside the `systemd-hydra-db` container.
 2. It maintains a single, persistent native python `cassandra-driver` connection to the local ScyllaDB instance.
 3. It listens on `127.0.0.1:9043` and handles incoming CQL queries via lightweight HTTP POST requests, completing queries in under 2ms.
-4. Clients fall back to raw `cqlsh` execution if **Daruk** is not active, providing resilient zero-downtime query routing.
+4. Clients fall back to raw `cqlsh` execution via host-level `podman exec` if **Daruk** is not active. Note that this fallback only works for host-level services; containerized services (like Spectrum) lack `podman` inside their environment and rely entirely on Daruk being online.
 
 ---
 
