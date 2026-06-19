@@ -2,6 +2,10 @@
 
 Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
 
+> [!WARNING]
+> **Secure Boot Requirement:** 
+> Because DRBD runs as an out-of-tree kernel module, **Secure Boot must be disabled** on all hypervisor hosts. Alternatively, the ELRepo secure boot public key (`/etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der`) must be imported into each host's MOK database (`mokutil --import`) and enrolled at boot. If Secure Boot is enabled without enrolling the key, loading the DRBD driver will fail with `Key was rejected by service`.
+
 > [!NOTE]
 > **Name Origin:** In Greek mythology, **Aether** is the personification of the bright upper sky and the air breathed by gods. Historically in physics, the *aether* was a hypothetical space-filling medium postulated to support the propagation of electromagnetic waves. In Helios-HCI, **Aether** refers to the distributed storage fabric (Linstor + DRBD) that spans all physical nodes to form a single, unified virtual storage medium.
 
@@ -36,7 +40,7 @@ FTT defines the redundancy level of the cluster, mapping directly to Nutanix Red
 To maximize storage I/O performance and support enterprise features, Aether runs **Linstor** and **DRBD** as the software-defined storage (SDS) replication engine:
 
 ### Linstor & DRBD Implementation
-* **Host Storage Pools**: Host storage `/dev/sdb` is configured as an LVM-Thin Pool (`thin_pool_aether` inside `vg_aether`). Lvm-thin natively handles space-saving snapshots, thin provisioning, and high-performance block allocations.
+* **Host Storage Pools**: Raw non-boot disks >= 100GB (e.g., `/dev/sdb`, `/dev/nvme0n1`) are dynamically scanned and claimed on each node during cluster creation, then configured as an LVM-Thin Pool (`thin_pool_aether` inside `vg_aether`). Lvm-thin natively handles space-saving snapshots, thin provisioning, and high-performance block allocations.
 * **Linstor Satellite**: Runs as a privileged Podman container on all nodes, communicating with the host kernel to provision block devices dynamically.
 * **Linstor Controller**: Runs as a manager service on the leader node, keeping track of volume definitions, resource allocation, and replication targets.
 * **Direct Block Access**: Instead of accessing a file on a shared mount, VMs are defined with direct block storage targets mapping to `/dev/drbd/by-res/<vm_name>/0`. This achieves near bare-metal I/O throughput.
