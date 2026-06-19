@@ -18,7 +18,7 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Vali Placement** | `9095` | TCP (HTTP) | Localhost | Acropolis VM placement, live migration, and DRS controls. |
 | **Linstor Controller** | `3370` | TCP | Localhost & Cluster | Linstor Controller REST API and orchestration port. |
 | **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
-| **DRBD Replication** | `7788`-`7799` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
+| **DRBD Replication** | `7700`-`7890` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
 
 ---
 
@@ -85,8 +85,8 @@ To ensure isolation and security, internal daemon API ports are bound exclusivel
 * All node-to-node remote command execution is performed through the **Spark Daemon** over port `9099`.
 * The daemon requires valid mTLS certificates (`node.crt` and `client.crt` signed by the cluster CA) for every connection, replacing the need for inter-node root SSH keys.
 
-### C. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7788`+)
+### C. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7700`-`7890`)
 * **Gossip Database Layer**: ScyllaDB nodes talk to each other directly on port `7000` to share cluster metadata, tables partition maps, and telemetry stats.
 * **Consensus Sync Layer**: ZooKeeper nodes use ports `2888` and `3888` to elect Odin leaders and synchronize locks.
-* **Software-Defined Storage**: Linstor Satellites and Controller communicate over ports `3370` and `3376` for cluster resource provisioning, and DRBD volumes replicate synchronously across the physical disks using TCP ports `7788` to `7799`.
+* **Software-Defined Storage**: Linstor Satellites and Controller communicate over ports `3370` and `3376` for cluster resource provisioning, and DRBD volumes replicate synchronously across the physical disks using TCP ports `7700` to `7890`.
 
