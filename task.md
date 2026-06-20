@@ -1,0 +1,8 @@
+- `[x]` Update `handle_cluster_destroy` in `spark_daemon_decoded.py` (parallel service stop, lazy unmounts, release DRBD before LVM wipe)
+- `[x]` Implement verbose client-side `cluster create` in `cluster_new.py` (dynamic disk setup, Linstor creation, database verification, Spectrum port 8443 validation)
+- `[x]` Update `cluster stop` in `cluster_new.py` (lazy unmounts, sequential service stopping)
+- `[x]` Run `sync_provision.py` to compile changes into `provision.py`
+- `[x]` Deploy updates using `deploy_updates.py`
+- `[x]` Update `docs/aether.md` to document dynamic disk setup and auto-claiming
+- `[x]` Verify robust destroy phase via CLI `cluster destroy`
+- `[x]` Verify verbose creation phase via CLI `cluster create` and nodetool state
