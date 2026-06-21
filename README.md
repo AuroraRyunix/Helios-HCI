@@ -21,6 +21,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed storage engine (transitioning from GlusterFS). |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
+| [Slate](./docs/slate.md) | **Edge Ingress / Reverse Proxy** | Podman + Traefik | High-performance edge reverse proxy routing WebUI, API, VNC, and SPICE console traffic same-origin on port 443. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
 | [Dagur](./docs/dagur.md) | **Chronos** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
@@ -154,14 +155,16 @@ Helios-HCI uses a lightweight, secure network layout for inter-node orchestratio
 * **Localhost Bindings**: Internal service APIs (like Catalyst task queue on `9091` and Vali scheduler on `9095`) bind strictly to `127.0.0.1` to enforce local-only access.
 * **Mutual TLS (mTLS) Mesh**: All cross-node administrative tasks and remote executions run securely over port `9099` via the **Spark Daemon**.
 * **Consensus & Metadata Mesh**: Database gossip (ScyllaDB on `7000`) and consensus election (ZooKeeper on `2888`/`3888`) route over cluster-facing networks.
-* **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Spectrum Web UI (`8443`).
+* **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Slate ingress on port `443`.
 
 ### Cluster Network Flow Chart
 
 ```mermaid
 flowchart TB
     subgraph Host1 [hci-node01]
+        Slate1["Slate (Edge Ingress)<br>Port 443"]
         Spectrum1["Spectrum (WebUI/API)<br>Port 8443"]
+        Agahnim1["Agahnim (Console Proxy)<br>Port 8081"]
         Catalyst1["Catalyst (Orchestrator)<br>Port 9091 (Localhost)"]
         Vali1["Vali (VM Scheduler/DRS)<br>Port 9095 (Localhost)"]
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
@@ -169,6 +172,8 @@ flowchart TB
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
         Aether1["Aether (Linstor/DRBD Storage)<br>Port 3366/3370"]
     end
+    Slate1 -->|"Proxy API/UI"| Spectrum1
+    Slate1 -->|"Proxy Consoles"| Agahnim1
 
     subgraph Host2 [hci-node02]
         Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
@@ -209,7 +214,7 @@ For a complete reference of network scopes, port allocations, and communication 
 
 The stack has been enhanced with enterprise-grade resiliency and health-based routing:
 
-* **Active WebUI VIP Failover**: The VIP manager (`bifrost`) evaluates active candidates on port `8443` (Spectrum) and enforces a local health guard. A node will only bind the VIP if it is the leader AND its local WebUI container is active and listening. If the local WebUI is down or bootstrapping, the VIP dynamically floats to a healthy node, ensuring zero client-facing downtime.
+* **Active WebUI VIP Failover**: The VIP manager (`bifrost`) evaluates active candidates on port `443` (Slate Ingress) and enforces a local health guard. A node will only bind the VIP if it is the leader AND its local Slate proxy container is active and listening. If the local Slate proxy is down or bootstrapping, the VIP dynamically floats to a healthy node, ensuring zero client-facing downtime.
 * **Database Connection Resilience**: The WebUI (`spectrum`) establishes keyspace connection checks. If the local ScyllaDB instance is bootstrapping or down, Spectrum reads `/etc/hci/cluster.json` and falls back to other online database hosts.
 * **Task API Queue Cache**: If ScyllaDB encounters brief connection latency or quorum shifts, Spectrum serves Catalyst tasks from an in-memory fallback cache to prevent UI progress bars from flickering or resetting to grey.
 * **Streamlined Reboot Coordination**: Graceful VM evacuation and host transitions are fully isolated. The reboot sequence relies on the prior maintenance phase to gracefully migrate VMs, leaving the host-level `spark-daemon` active to process remote hardware reboot calls reliably.
