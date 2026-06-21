@@ -1315,7 +1315,7 @@ def process_queue_task(task):
             }, method="POST")
             
             print(f"[Maintenance Catalyst Task] Starting services on host {hostname}...")
-            start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway urbosa logos mipha daruk"
+            start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway urbosa logos mipha daruk agahnim slate"
             run_remote_spark(target_ip, start_cmd)
             
             # Update task progress
