@@ -1565,10 +1565,14 @@ def metrics_and_cluster_monitor_loop():
                 for svc, sdata in ns.get("services", {}).items():
                     if sdata["status"] == "DOWN" and svc != "Spectrum" and svc != "Odin":
                         node_ip = ""
+                        is_maint = False
                         for n in nodes_info_local:
                             if n["name"] == ns.get("hostname"):
                                 node_ip = n["ip"]
+                                is_maint = n.get("maintenance_mode", False)
                                 break
+                        if is_maint:
+                            continue
                         svc_lower = svc.lower()
                         if svc_lower == "spark":
                             chk = "spark-daemon_status"
