@@ -587,7 +587,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Aether", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Gatoway", "Logos", "Mipha", "Agahnim"]
+                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Aether", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
                     if "Urbosa" in services:
                         svc_list.append("Urbosa")
                     for svc_name in svc_list:
