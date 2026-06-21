@@ -11,18 +11,21 @@ In Zelda lore, *Agahnim* is Ganon's shadow proxy in the Light World. Similarly, 
 ### Background
 Currently, WebSocket connections for VM consoles (VNC/SPICE) are handled by a synchronous, single-threaded Python `select.select()` loop in `spectrum_server.py`. This holds a thread open for the entire duration of the console session and incurs significant CPU and latency overhead under heavy packet traffic.
 
-### Architecture
-Agahnim will run as a local systemd service on each hypervisor node, listening on a dedicated port (e.g. `8081`).
+### Architecture (Direct Client-to-Daemon Bypass)
+To achieve maximum performance and zero-copy latency, the browser client **bypasses the Python backend (`Spectrum`) completely** for the transit of console frame data.
+
+Instead of reverse-proxying WebSocket traffic through the Python HTTP daemon, the WebUI client performs a direct connection to the native Rust daemon `Agahnim` running on port `8081` on the target hypervisor node.
 
 ```
-[ Browser Client ] 
-       │ (WebSocket)
-       ▼
-[ Spectrum Gateway (Python) ] ──(Reverse Proxy)──► [ Agahnim Daemon (Rust) ]
-                                                          │
-                                                          │ (TCP Bridge)
-                                                          ▼
-                                                   [ QEMU Guest VNC/SPICE ]
+[ Browser Client ] ──────────────────(WebSocket)──────────────────┐
+       │                                                          │
+       │ 1. Get connection coordinates                            │ 2. Direct Console Stream
+       ▼                                                          ▼
+[ Spectrum Gateway (Python) ]                                [ Agahnim Daemon (Rust) ]
+                                                                  │
+                                                                  │ (TCP Bridge on localhost)
+                                                                  ▼
+                                                       [ QEMU Guest VNC/SPICE ]
 ```
 
 ### Specifications
@@ -100,5 +103,13 @@ The standard SPICE client (`display.js`) uses a 2D HTML5 Canvas context. During 
    WantedBy=multi-user.target
    ```
 
-### Reverse Proxy Configuration (Spectrum Gateway)
-Modify `/api/vms/console/ws` endpoint in `spectrum_server.py` to upgrade the connection and forward traffic to `localhost:8081` using a minimal proxy forwarder, delegating the long-running socket connection to the Rust daemon.
+### Integration & Coordinate API (Spectrum Gateway)
+Rather than proxying, the `/api/vms/console/ws` route in `spectrum_server.py` is changed to a fast HTTP coordinate lookup endpoint. 
+1. The client requests the coordinates for a VM's console.
+2. The server queries the database/hypervisor, resolves the active VM host IP and the target port, and returns the direct WebSocket connection string:
+   ```json
+   {
+     "url": "ws://<host_ip>:8081/ws?name=VM_NAME&type=spice"
+   }
+   ```
+3. The browser client immediately opens a WebSocket connection directly to the resolved `Agahnim` daemon. This keeps Python completely out of the hot path.
