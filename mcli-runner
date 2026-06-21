@@ -23,6 +23,12 @@ def is_zookeeper_leader():
     except Exception:
         return False
 
+def get_drbd_role(resource_name):
+    rc, out, err = run_cmd(f"podman exec systemd-aether drbdadm role {resource_name}")
+    if rc == 0:
+        return out.strip()
+    return "Secondary"
+
 def update_current_check(category, check_name):
     try:
         with open(f"/tmp/mimir_check_{category}", "w") as f:
@@ -53,7 +59,7 @@ def check_services(category):
     
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
-    svcs = ["zookeeper", "hydra-db", "aether", "spectrum", "spark-daemon", "libvirtd", "bifrost", "gatoway", "agahnim"]
+    svcs = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
@@ -212,6 +218,56 @@ def check_services(category):
         status = "FAIL"
         msg = f"mTLS Client Certificate not found at {cert_path}."
     results["mtls_cert_expiration"] = {
+        "status": status,
+        "output": msg
+    }
+    
+    # 6b. Ingress Server Certificate Expiration Check
+    update_current_check(category, "ingress_cert_expiration")
+    cert_path = "/etc/hci/spectrum/certs/server.crt"
+    if os.path.exists(cert_path):
+        rc, out, err = run_cmd(f"openssl x509 -enddate -noout -in {cert_path}")
+        if rc == 0:
+            date_str = out.replace("notAfter=", "").strip()
+            try:
+                from datetime import datetime
+                clean_date = date_str.replace("GMT", "").strip()
+                expiry_dt = datetime.strptime(clean_date, "%b %d %H:%M:%S %Y")
+                diff = expiry_dt - datetime.utcnow()
+                if diff.days < 0:
+                    status = "FAIL"
+                    msg = f"Ingress Server Certificate is EXPIRED since {date_str}!"
+                elif diff.days < 30:
+                    status = "WARN"
+                    msg = f"Ingress Server Certificate is expiring soon (in {diff.days} days) on {date_str}."
+                else:
+                    status = "PASS"
+                    msg = f"Ingress Server Certificate is valid. Expires on {date_str} (in {diff.days} days)."
+            except Exception as ex:
+                status = "PASS"
+                msg = f"Ingress Server Certificate exists. Expiration date: {date_str} (parse error: {str(ex)})."
+        else:
+            status = "FAIL"
+            msg = f"Failed to check ingress certificate enddate: {err or out}"
+    else:
+        status = "FAIL"
+        msg = f"Ingress Server Certificate not found at {cert_path}."
+    results["ingress_cert_expiration"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 6c. Slate Ingress Configurations Check
+    update_current_check(category, "slate_config_status")
+    traefik_yml = "/etc/hci/slate/traefik.yml"
+    dynamic_yml = "/etc/hci/slate/dynamic.yml"
+    if os.path.exists(traefik_yml) and os.path.exists(dynamic_yml):
+        status = "PASS"
+        msg = f"Slate configuration files exist at /etc/hci/slate/."
+    else:
+        status = "FAIL"
+        msg = f"Slate configuration files missing! Checked {traefik_yml} and {dynamic_yml}."
+    results["slate_config_status"] = {
         "status": status,
         "output": msg
     }
@@ -451,7 +507,7 @@ def check_services(category):
                 running_vms = [v.strip() for v in out_v.strip().splitlines() if v.strip()]
             
             active_services = []
-            services_to_check = ["zookeeper", "hydra-db", "spectrum", "bifrost", "dagur", "mimir", "vali", "aether", "agahnim"]
+            services_to_check = ["spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "aether", "linstor-controller", "hydra-db", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim", "slate"]
             for svc in services_to_check:
                 rc_svc, out_svc, _ = run_cmd(f"systemctl is-active {svc}")
                 if rc_svc == 0 and out_svc.strip() == "active":
@@ -882,8 +938,29 @@ def check_storage(category):
         rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-linstor-controller linstor resource list")
         if rc == 0:
             failed = "ERROR" in out.upper() or "FATAL" in out.upper() or "DEVIATING" in out.upper()
-            status = "FAIL" if failed else "PASS"
-            msg = out
+            
+            vm_in_use = False
+            img_in_use = False
+            for line in out.splitlines():
+                if "default-vm-container" in line and "InUse" in line:
+                    vm_in_use = True
+                if "default-image-container" in line and "InUse" in line:
+                    img_in_use = True
+                    
+            if failed:
+                status = "FAIL"
+                msg = out
+            elif not vm_in_use or not img_in_use:
+                missing = []
+                if not vm_in_use:
+                    missing.append("default-vm-container")
+                if not img_in_use:
+                    missing.append("default-image-container")
+                status = "FAIL"
+                msg = f"CRITICAL: The following storage volumes are NOT active (InUse) on any node: {', '.join(missing)}\n\nLinstor Resource List:\n{out}"
+            else:
+                status = "PASS"
+                msg = out
         else:
             status = "FAIL"
             msg = f"Failed to query Aether resource list: {err or out}"
@@ -954,29 +1031,42 @@ def check_storage(category):
         
     # 4. Storage volume capacity check
     update_current_check(category, "storage_capacity")
-    vol_path = "/var/lib/hci/aether/volumes/default-vm-container"
-    if os.path.exists(vol_path):
-        try:
-            stat = os.statvfs(vol_path)
-            total = stat.f_blocks * stat.f_frsize
-            free = stat.f_bavail * stat.f_frsize
-            used = total - free
-            pct = (used / total) * 100 if total > 0 else 0
-            
-            status = "PASS"
-            if pct > 90.0:
-                status = "FAIL"
-            elif pct > 80.0:
-                status = "WARN"
-            
-            msg = f"Volume Path: {vol_path}\nTotal Space: {total // 1024**3} GB\nUsed Space: {used // 1024**3} GB ({pct:.1f}% used)\nFree Space: {free // 1024**3} GB"
-        except Exception as e:
-            status = "FAIL"
-            msg = f"Failed to check storage path statistics: {str(e)}"
-    else:
-        status = "FAIL"
-        msg = f"Volume path {vol_path} does not exist or is not mounted."
-        
+    volumes_cap = [
+        ("default-vm-container", "/var/lib/hci/aether/volumes/default-vm-container"),
+        ("default-image-container", "/var/lib/hci/aether/volumes/default-image-container")
+    ]
+    statuses_cap = []
+    messages_cap = []
+    for name, vol_path in volumes_cap:
+        if os.path.exists(vol_path):
+            try:
+                stat = os.statvfs(vol_path)
+                total = stat.f_blocks * stat.f_frsize
+                free = stat.f_bavail * stat.f_frsize
+                used = total - free
+                pct = (used / total) * 100 if total > 0 else 0
+                
+                vol_status = "PASS"
+                if pct > 90.0:
+                    vol_status = "FAIL"
+                elif pct > 80.0:
+                    vol_status = "WARN"
+                
+                statuses_cap.append(vol_status)
+                messages_cap.append(f"Volume: {name}\nPath: {vol_path}\nTotal Space: {total // 1024**3} GB\nUsed Space: {used // 1024**3} GB ({pct:.1f}% used)\nFree Space: {free // 1024**3} GB")
+            except Exception as e:
+                statuses_cap.append("FAIL")
+                messages_cap.append(f"{name}: Failed to check storage path statistics: {str(e)}")
+        else:
+            if dfs_engine == "linstor":
+                statuses_cap.append("PASS")
+                messages_cap.append(f"{name}: standby / not mounted locally on this host (Aether).")
+            else:
+                statuses_cap.append("FAIL")
+                messages_cap.append(f"{name}: path does not exist or is not mounted.")
+                
+    status = "FAIL" if "FAIL" in statuses_cap else ("WARN" if "WARN" in statuses_cap else "PASS")
+    msg = "\n\n".join(messages_cap)
     results["storage_capacity"] = {
         "status": status,
         "output": msg
@@ -1126,24 +1216,44 @@ def check_storage(category):
     
     # 8. Storage Mount Options Check
     update_current_check(category, "storage_mount_options")
-    vol_path = "/var/lib/hci/aether/volumes/default-vm-container"
-    rc_m, out_m, err_m = run_cmd(f"findmnt -o OPTIONS -n {vol_path}")
-    if rc_m != 0:
+    volumes = [
+        ("default-vm-container", "/var/lib/hci/aether/volumes/default-vm-container"),
+        ("default-image-container", "/var/lib/hci/aether/volumes/default-image-container")
+    ]
+    
+    statuses = []
+    messages = []
+    
+    for name, vol_path in volumes:
+        should_be_mounted = True
         if dfs_engine == "linstor":
-            status = "PASS"
-            msg = "Storage volume is standby / not mounted locally on this host (Aether)."
-        else:
-            status = "FAIL"
-            msg = f"Storage volume path {vol_path} is not mounted."
-    else:
-        options = [opt.strip() for opt in out_m.split(",")]
-        if "ro" in options:
-            status = "FAIL"
-            msg = f"CRITICAL: Storage volume {vol_path} is mounted READ-ONLY! Active options: {out_m}"
-        else:
-            status = "PASS"
-            msg = f"Storage volume is mounted read-write (rw). Options: {out_m}"
+            role = get_drbd_role(name)
+            should_be_mounted = (role == "Primary")
             
+        rc_m, out_m, err_m = run_cmd(f"findmnt -o OPTIONS -n {vol_path}")
+        if rc_m != 0:
+            if not should_be_mounted:
+                statuses.append("PASS")
+                messages.append(f"{name}: standby / not mounted locally (Secondary).")
+            else:
+                statuses.append("FAIL")
+                messages.append(f"{name}: CRITICAL: Primary volume is NOT mounted locally!")
+        else:
+            if not should_be_mounted:
+                statuses.append("WARN")
+                messages.append(f"{name}: WARNING: Secondary volume is mounted locally!")
+            else:
+                options = [opt.strip() for opt in out_m.split(",")]
+                if "ro" in options:
+                    statuses.append("FAIL")
+                    messages.append(f"{name}: CRITICAL: mounted READ-ONLY! Active options: {out_m}")
+                else:
+                    statuses.append("PASS")
+                    messages.append(f"{name}: mounted read-write (rw). Options: {out_m}")
+                
+    status = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
+    msg = "\n".join(messages)
+    
     results["storage_mount_options"] = {
         "status": status,
         "output": msg
@@ -1151,45 +1261,56 @@ def check_storage(category):
     
     # 9. Storage Volume Writable Check
     update_current_check(category, "storage_volume_writable")
-    vol_path = "/var/lib/hci/aether/volumes/default-vm-container"
-    test_file = os.path.join(vol_path, ".mimir_rw_check")
-    status = "PASS"
-    msg = "Successfully verified read-write operations on the storage volume."
+    statuses = []
+    messages = []
     
-    rc_m, _, _ = run_cmd(f"findmnt {vol_path}")
-    if rc_m != 0:
+    for name, vol_path in volumes:
+        test_file = os.path.join(vol_path, ".mimir_rw_check")
+        should_be_mounted = True
         if dfs_engine == "linstor":
-            status = "PASS"
-            msg = "Storage volume is standby / not mounted locally on this host (Aether)."
+            role = get_drbd_role(name)
+            should_be_mounted = (role == "Primary")
+            
+        rc_m, _, _ = run_cmd(f"findmnt {vol_path}")
+        if rc_m != 0:
+            if not should_be_mounted:
+                statuses.append("PASS")
+                messages.append(f"{name}: standby / not mounted locally.")
+            else:
+                statuses.append("FAIL")
+                messages.append(f"{name}: CRITICAL: Primary volume is not mounted, cannot write.")
         else:
-            status = "FAIL"
-            msg = f"Volume path {vol_path} does not exist or is not mounted."
-    else:
-        try:
-            import uuid
-            test_content = f"mimir-test-{uuid.uuid4()}"
-            with open(test_file, "w") as f:
-                f.write(test_content)
-                f.flush()
-                os.fsync(f.fileno())
-            
-            with open(test_file, "r") as f:
-                read_back = f.read().strip()
+            try:
+                import uuid
+                test_content = f"mimir-test-{uuid.uuid4()}"
+                with open(test_file, "w") as f:
+                    f.write(test_content)
+                    f.flush()
+                    os.fsync(f.fileno())
                 
-            if read_back != test_content:
-                status = "FAIL"
-                msg = f"Read-write verification failed: read data did not match written data."
-            
-            os.remove(test_file)
-        except Exception as e:
-            status = "FAIL"
-            msg = f"Failed to perform write-read check on storage volume: {str(e)}"
-            if os.path.exists(test_file):
-                try:
-                    os.remove(test_file)
-                except Exception:
-                    pass
+                with open(test_file, "r") as f:
+                    read_back = f.read().strip()
                     
+                if read_back != test_content:
+                    statuses.append("FAIL")
+                    messages.append(f"{name}: Read-write verification failed: read data did not match written data.")
+                else:
+                    statuses.append("PASS")
+                    messages.append(f"{name}: Successfully verified read-write operations.")
+                
+                os.remove(test_file)
+            except Exception as e:
+                statuses.append("FAIL")
+                messages.append(f"{name}: Failed to perform write-read check: {str(e)}")
+                if os.path.exists(test_file):
+                    try:
+                        os.remove(test_file)
+                    except Exception:
+                        pass
+                        
+    status = "FAIL" if "FAIL" in statuses else "PASS"
+    msg = "\n".join(messages)
+    
     results["storage_volume_writable"] = {
         "status": status,
         "output": msg
