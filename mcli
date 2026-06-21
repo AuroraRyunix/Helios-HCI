@@ -23,6 +23,8 @@ RESET = "\033[0m"
 CHECK_ID_TO_FUNC = {
     "zookeeper_status": "database.zookeeper",
     "hydra-db_status": "database.scylladb",
+    "daruk_status": "database.daruk",
+    "aether_status": "storage.aether",
     "spectrum_status": "service.spectrum",
     "spark-daemon_status": "service.spark",
     "libvirtd_status": "service.libvirtd",
@@ -40,6 +42,7 @@ CHECK_ID_TO_FUNC = {
     "glusterfs_split_brain": "storage.glusterfs.split_brain",
     "glusterfs_heal_pending": "storage.glusterfs.heal_pending",
     "mtls_cert_expiration": "security.mtls.certs",
+    "ingress_cert_expiration": "security.ingress.certs",
     "spectrum_api_port": "service.spectrum.port",
     "ntp_sync": "hardware.ntp",
     "hostname_resolution": "service.network.hostname_resolution",
@@ -53,10 +56,19 @@ CHECK_ID_TO_FUNC = {
     "virsh_power_off_check": "service.libvirt.power_off",
     "stuck_tasks_check": "service.catalyst.stuck_tasks",
     "orphaned_disks_check": "storage.orphaned_disks",
+    "catalyst_status": "service.catalyst",
+    "bifrost_status": "service.bifrost",
+    "dagur_status": "service.dagur",
+    "mimir_status": "service.mimir",
+    "vali_status": "service.vali",
     "gatoway_status": "service.gatoway",
     "urbosa_status": "service.urbosa",
     "urbosa_compliance": "service.urbosa.compliance",
-    "agahnim_status": "service.agahnim"
+    "logos_status": "service.logos",
+    "mipha_status": "service.mipha",
+    "agahnim_status": "service.agahnim",
+    "slate_status": "service.slate",
+    "slate_config_status": "service.slate.config"
 }
 
 def get_local_ip():
@@ -120,10 +132,11 @@ def run_node_checks(node, category, local_ip, results_dict):
         # Setup specific list of checks depending on the category being run
         checks_map = {
             "services": [
-                "zookeeper_status", "hydra-db_status", "aether_status", "spectrum_status",
-                "spark-daemon_status", "libvirtd_status", "bifrost_status", "gatoway_status", "urbosa_status", "agahnim_status", "scylladb_ring_status",
+                "zookeeper_status", "hydra-db_status", "daruk_status", "aether_status", "spectrum_status",
+                "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "vali_status",
+                "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "scylladb_ring_status",
                 "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
-                "mtls_cert_expiration", "libvirt_responsiveness", "hostname_resolution",
+                "mtls_cert_expiration", "ingress_cert_expiration", "slate_config_status", "libvirt_responsiveness", "hostname_resolution",
                 "spectrum_privilege_check", "auth_seeding_check", "vip_binding_status",
                 "maintenance_mode_check", "vali_leader_status", "scylladb_tasks_schema",
                 "security_config_audit", "virsh_power_off_check", "stuck_tasks_check", "urbosa_compliance"
