@@ -240,6 +240,7 @@ Volume=/lib/modules:/lib/modules:ro
 Volume=/run:/run
 Volume=/var/lib/linstor:/var/lib/linstor:z
 Volume=/etc/linstor:/etc/linstor:z
+Volume=/etc/drbd.d:/var/lib/linstor.d:z
 PodmanArgs=--privileged
 Exec=startSatellite
 
