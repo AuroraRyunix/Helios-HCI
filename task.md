@@ -1,8 +1,13 @@
-- `[x]` Update `handle_cluster_destroy` in `spark_daemon_decoded.py` (parallel service stop, lazy unmounts, release DRBD before LVM wipe)
-- `[x]` Implement verbose client-side `cluster create` in `cluster_new.py` (dynamic disk setup, Linstor creation, database verification, Spectrum port 8443 validation)
-- `[x]` Update `cluster stop` in `cluster_new.py` (lazy unmounts, sequential service stopping)
-- `[x]` Run `sync_provision.py` to compile changes into `provision.py`
-- `[x]` Deploy updates using `deploy_updates.py`
-- `[x]` Update `docs/aether.md` to document dynamic disk setup and auto-claiming
-- `[x]` Verify robust destroy phase via CLI `cluster destroy`
-- `[x]` Verify verbose creation phase via CLI `cluster create` and nodetool state
+- `[x]` Update task checklist to track execution progress
+- `[x]` Implement GET `/api/host/interfaces` endpoint in `spectrum_server.py`
+- `[x]` Implement DHCP leases collection and IP address resolution for VMs in `spectrum_server.py`
+- `[x]` Update `/api/status` and `/api/vms` routes in `spectrum_server.py` to populate VM IP addresses
+- `[x]` Implement `populateInterfaceDropdown` in `static/app.js` and integrate with T0 modals
+- `[x]` Replace T0/T1 emojis with vector router SVG symbols in `static/app.js`
+- `[x]` Clean up VM inspector details and update fields to show vCPUs, Memory, and Disk Size in `static/app.js`
+- `[x]` Disable moving dash animations on SVG links in `static/sdn.html`
+- `[x]` Run `sync_provision.py` to compile resources into `provision.py`
+- `[x]` Run `deploy_updates.py` to push changes to hosts and restart services
+- `[x]` Verify all fixes manual testing (themes, router icons, static links, interface dropdowns, VM inspector)
+- `[x]` Generate walkthrough.md summarizing changes and results
+
