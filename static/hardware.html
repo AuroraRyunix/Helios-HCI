@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helios Valkyrie - Node Hardware Specs</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css?v=1.1.1">
+    <script>
+        const theme = localStorage.getItem('helios-theme');
+        if (theme) document.documentElement.classList.add('theme-' + theme);
+    </script>
+    <style>
+        .nodes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        .node-card {
+            background: var(--bg-glass-card);
+            border: 1px solid var(--border-glass);
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: var(--shadow-glass);
+            backdrop-filter: blur(12px);
+            cursor: pointer;
+            transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .node-card:hover {
+            transform: translateY(-4px);
+            border-color: rgba(59, 130, 246, 0.4);
+            box-shadow: 0 8px 30px rgba(59, 130, 246, 0.1);
+        }
+        .node-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .node-name {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .node-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            text-transform: uppercase;
+            font-weight: 600;
+            padding: 4px 8px;
+            border-radius: 20px;
+        }
+        .status-online {
+            background: rgba(16, 185, 129, 0.15);
+            color: #10b981;
+        }
+        .status-offline {
+            background: rgba(239, 68, 68, 0.15);
+            color: #ef4444;
+        }
+        .node-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .node-summary-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 13px;
+        }
+        .node-summary-label {
+            color: var(--text-secondary);
+        }
+        .node-summary-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+        .card-expand-icon {
+            position: absolute;
+            bottom: 12px;
+            right: 12px;
+            color: var(--text-secondary);
+            transition: transform 0.2s ease;
+        }
+        
+        /* Expanded Overlay Panel Style */
+        .specs-panel {
+            display: none;
+            background: var(--bg-glass-card);
+            border: 1px solid var(--border-glass);
+            border-radius: 12px;
+            padding: 24px;
+            margin-top: 20px;
+            box-shadow: var(--shadow-glass);
+            backdrop-filter: blur(12px);
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .specs-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-glass);
+            padding-bottom: 16px;
+            margin-bottom: 20px;
+        }
+        .specs-panel-title {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 20px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        .specs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(48%, 1fr));
+            gap: 20px;
+        }
+        .specs-section {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .specs-section-title {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--color-primary);
+            margin-bottom: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 6px;
+        }
+        .specs-code {
+            font-family: 'Fira Code', monospace;
+            font-size: 11px;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 10px;
+            border-radius: 6px;
+            color: #d1d5db;
+            overflow-x: auto;
+            max-height: 240px;
+            overflow-y: auto;
+            white-space: pre;
+        }
+    </style>
+</head>
+<body>
+    <div class="glass-bg-decor decor-1"></div>
+    <div class="glass-bg-decor decor-2"></div>
+    
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="pe-logo-container">
+                    <svg viewBox="0 0 24 24" class="pe-logo-icon">
+                        <path d="M12 2L3 5v6c0 5.5 3.8 10.6 9 11 5.2-.4 9-5.5 9-11V5l-9-3z" />
+                        <path d="M12 17h.01M12 13.5a1.5 1.5 0 0 0 1-1.5V10" stroke="#fff" stroke-width="2" stroke-linecap="round" />
+                    </svg>
+                </div>
+                <div class="pe-cluster-name" id="cluster-name-brand-display">Helios Valkyrie</div>
+                
+                <!-- Console Dropdown Menu -->
+                <div class="console-dropdown">
+                    <button class="dropdown-trigger" id="console-dropdown-btn">
+                        <span id="current-console-label">Hardware</span>
+                        <svg viewBox="0 0 24 24" class="dropdown-arrow"><path d="M7 10l5 5 5-5z"/></svg>
+                    </button>
+                    <div class="dropdown-menu" id="console-dropdown-menu">
+                        <a href="index.html" class="dropdown-item">Home</a>
+                        <a href="vms.html" class="dropdown-item">VM</a>
+                        <a href="images.html" class="dropdown-item">Images</a>
+                        <a href="storage.html" class="dropdown-item">Storage</a>
+                        <a href="metrics.html" class="dropdown-item">Metrics</a>
+                        <a href="hardware.html" class="dropdown-item active">Hardware</a>
+                        <a href="health.html" class="dropdown-item">Health</a>
+                        <a href="settings.html" class="dropdown-item">Settings</a>
+                        <a href="tasks.html" class="dropdown-item">Tasks Log</a>
+                        <a href="lcm.html" class="dropdown-item">LCM</a>
+                        <a href="networking.html" class="dropdown-item">Networking</a>
+                        <a href="sdn.html" class="dropdown-item">Urbosa SDN</a>
+                    </div>
+                </div>
+
+                <!-- Tasks Dropdown Menu -->
+                <div class="tasks-dropdown" id="tasks-dropdown-container" style="display: flex; align-items: center;">
+                    <button class="tasks-trigger state-grey" id="tasks-dropdown-btn" title="Recent Tasks">
+                        <svg viewBox="0 0 24 24" class="tasks-progress-svg">
+                            <circle cx="12" cy="12" r="9" class="tasks-progress-bg"></circle>
+                            <circle cx="12" cy="12" r="9" class="tasks-progress-fill" id="tasks-progress-circle-fill"></circle>
+                        </svg>
+                        <span class="tasks-badge" id="tasks-badge-count">0</span>
+                        <span id="tasks-trigger-announcement" class="tasks-trigger-announcement"></span>
+                    </button>
+                    <span class="tasks-header-running-label" id="tasks-header-running-label" style="font-size: 11px; color: var(--color-primary); font-family: 'Space Grotesk', sans-serif; font-weight: 600; margin-left: 8px; vertical-align: middle; display: none; white-space: nowrap;"></span>
+                    <div class="tasks-menu" id="tasks-dropdown-menu">
+                        <div class="tasks-menu-header">Recent Tasks</div>
+                        <div class="tasks-menu-list" id="tasks-dropdown-list">
+                            <div class="tasks-menu-empty">No active tasks</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="header-right">
+                <button class="theme-toggle-btn" id="theme-toggle-btn" title="Toggle Theme">
+                    <svg viewBox="0 0 24 24" class="sun-icon"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                </button>
+                <div class="user-profile">
+                    <div class="avatar" id="user-profile-avatar-btn">H</div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Body -->
+        <main class="app-body">
+            <div class="page-header-row" style="margin-bottom: 24px;">
+                <div>
+                    <h1 class="page-title">Cluster Host Nodes</h1>
+                    <p class="page-subtitle">Interactive hardware profiles, disk topology, and network interface configurations.</p>
+                </div>
+                <div class="page-actions-row">
+                    <button class="pe-btn pe-btn-secondary" id="refresh-hardware-btn">
+                        <svg viewBox="0 0 24 24" class="btn-icon-svg" style="width:16px; height:16px;"><path d="M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+                        Refresh Nodes
+                    </button>
+                </div>
+            </div>
+
+            <!-- Nodes Cards Grid -->
+            <div class="nodes-grid" id="nodes-hardware-grid">
+                <div style="grid-column: 1 / -1; color: var(--text-secondary); text-align: center; padding: 40px 0;">
+                    Loading cluster nodes hardware specs...
+                </div>
+            </div>
+
+            <!-- Expanded Specs Panel -->
+            <div class="specs-panel" id="specs-dashboard-panel">
+                <div class="specs-panel-header">
+                    <div class="specs-panel-title" id="expanded-node-title">Node Specification Detail</div>
+                    <button class="pe-btn pe-btn-secondary" onclick="closeSpecsPanel()" style="padding: 4px 10px; font-size: 12px;">Close</button>
+                </div>
+                <div class="specs-grid">
+                    <!-- CPU Specification -->
+                    <div class="specs-section">
+                        <div class="specs-section-title">Processor (CPU)</div>
+                        <div style="margin-bottom: 8px; font-size: 13px; font-weight: 500;" id="expanded-cpu-model">Loading...</div>
+                        <div style="font-size: 12px; color: var(--text-secondary);" id="expanded-cpu-cores">Cores: --</div>
+                    </div>
+
+                    <!-- RAM Specification -->
+                    <div class="specs-section">
+                        <div class="specs-section-title">Memory (RAM)</div>
+                        <div style="margin-bottom: 8px; font-size: 13px; font-weight: 500;" id="expanded-ram-total">Total: -- GB</div>
+                        <div style="font-size: 12px; color: var(--text-secondary);" id="expanded-ram-usage">Used: -- | Free: --</div>
+                    </div>
+
+                    <!-- Block Storage Disks -->
+                    <div class="specs-section" style="grid-column: 1 / -1;">
+                        <div class="specs-section-title">Physical Disks & Partitions (lsblk)</div>
+                        <div class="specs-code" id="expanded-disks-code">Loading lsblk output...</div>
+                    </div>
+
+                    <!-- Network Interfaces -->
+                    <div class="specs-section" style="grid-column: 1 / -1;">
+                        <div class="specs-section-title">Interfaces & IPs (ip addr)</div>
+                        <div class="specs-code" id="expanded-network-code">Loading network configurations...</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Scripts -->
+    <script src="app.js?v=1.1.1"></script>
+    <script>
+        let cachedNodesData = [];
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        async function fetchHardwareData() {
+            const token = localStorage.getItem('helios-token');
+            const headers = {};
+            if (token) {
+                headers['Authorization'] = `Bearer ${token}`;
+            }
+
+            const grid = document.getElementById('nodes-hardware-grid');
+            try {
+                const response = await fetch('/api/cluster/nodes/hardware', { headers });
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                const data = await response.json();
+                
+                cachedNodesData = data.nodes || [];
+                grid.innerHTML = '';
+
+                if (cachedNodesData.length === 0) {
+                    grid.innerHTML = '<div style="grid-column: 1/-1; text-align: center; color: var(--text-secondary);">No nodes registered in the cluster.</div>';
+                    return;
+                }
+
+                cachedNodesData.forEach((node, index) => {
+                    const statusClass = node.status === 'online' ? 'status-online' : 'status-offline';
+                    const totalRam = node.ram ? formatBytes(node.ram.total) : 'Unknown';
+                    const usedRam = node.ram ? formatBytes(node.ram.used) : 'Unknown';
+                    const cpuCores = node.cpu ? node.cpu.cores : 'Unknown';
+                    const cpuModel = node.cpu ? node.cpu.model.replace(/\s+/g, ' ') : 'Unknown';
+
+                    const card = document.createElement('div');
+                    card.className = 'node-card';
+                    card.setAttribute('onclick', `expandNodeSpecs(${index})`);
+                    card.innerHTML = `
+                        <div class="node-card-header">
+                            <div class="node-name">${node.hostname}</div>
+                            <div class="node-status ${statusClass}">
+                                <div class="node-status-dot"></div>
+                                <span>${node.status}</span>
+                            </div>
+                        </div>
+                        <div class="node-summary-item">
+                            <span class="node-summary-label">Management IP</span>
+                            <span class="node-summary-value">${node.ip}</span>
+                        </div>
+                        <div class="node-summary-item">
+                            <span class="node-summary-label">CPU Cores</span>
+                            <span class="node-summary-value">${cpuCores} Cores</span>
+                        </div>
+                        <div class="node-summary-item">
+                            <span class="node-summary-label">RAM Capacity</span>
+                            <span class="node-summary-value">${totalRam}</span>
+                        </div>
+                        <div class="node-summary-item" style="margin-top: 15px; font-size: 11px; color: var(--text-secondary);">
+                            <span>CPU Model: ${cpuModel.length > 32 ? cpuModel.substring(0, 30) + '...' : cpuModel}</span>
+                        </div>
+                        <svg viewBox="0 0 24 24" class="card-expand-icon" style="width: 18px; height: 18px;"><path d="M16.59 8.59L12 13.17 7.41 8.59 6 10l6 6 6-6z" fill="currentColor"/></svg>
+                    `;
+                    grid.appendChild(card);
+                });
+            } catch (err) {
+                console.error(err);
+                grid.innerHTML = `<div style="grid-column: 1/-1; color: var(--color-error); text-align: center; padding: 40px 0;">Error fetching cluster nodes profiles: ${err.message}</div>`;
+            }
+        }
+
+        function expandNodeSpecs(index) {
+            const node = cachedNodesData[index];
+            if (!node) return;
+
+            document.getElementById('expanded-node-title').textContent = `Node Hardware Profile: ${node.hostname} (${node.ip})`;
+            document.getElementById('expanded-cpu-model').textContent = node.cpu ? node.cpu.model.trim() : 'Unknown CPU';
+            document.getElementById('expanded-cpu-cores').textContent = node.cpu ? `Logical cores: ${node.cpu.cores}` : 'Logical cores: Unknown';
+            
+            if (node.ram) {
+                document.getElementById('expanded-ram-total').textContent = `Total Memory: ${formatBytes(node.ram.total)}`;
+                document.getElementById('expanded-ram-usage').textContent = `Used: ${formatBytes(node.ram.used)} | Free: ${formatBytes(node.ram.free)}`;
+            } else {
+                document.getElementById('expanded-ram-total').textContent = `Total Memory: Unknown`;
+                document.getElementById('expanded-ram-usage').textContent = ``;
+            }
+
+            // Print formatted disks list
+            const disksCode = document.getElementById('expanded-disks-code');
+            if (node.disks && node.disks.length > 0) {
+                disksCode.textContent = JSON.stringify(node.disks, null, 4);
+            } else {
+                disksCode.textContent = 'No physical disk drives or layout details returned.';
+            }
+
+            // Print formatted network list
+            const netCode = document.getElementById('expanded-network-code');
+            if (node.network && node.network.length > 0) {
+                netCode.textContent = JSON.stringify(node.network, null, 4);
+            } else {
+                netCode.textContent = 'No network interfaces detected.';
+            }
+
+            const panel = document.getElementById('specs-dashboard-panel');
+            panel.style.display = 'block';
+            panel.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        function closeSpecsPanel() {
+            document.getElementById('specs-dashboard-panel').style.display = 'none';
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchHardwareData();
+            document.getElementById('refresh-hardware-btn').addEventListener('click', fetchHardwareData);
+        });
+    </script>
+</body>
+</html>
