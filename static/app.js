@@ -5654,12 +5654,20 @@ document.addEventListener('DOMContentLoaded', async () => {
             'spark-daemon_status',
             'zookeeper_status',
             'hydra-db_status',
+            'daruk_status',
             'aether_status',
             'spectrum_status',
+            'catalyst_status',
             'bifrost_status',
             'dagur_status',
             'mimir_status',
             'vali_status',
+            'gatoway_status',
+            'urbosa_status',
+            'logos_status',
+            'mipha_status',
+            'agahnim_status',
+            'slate_status',
             'libvirtd_status'
         ];
         
@@ -5667,12 +5675,20 @@ document.addEventListener('DOMContentLoaded', async () => {
             'spark-daemon_status': 'Spark',
             'zookeeper_status': 'ZooKeeper',
             'hydra-db_status': 'Hydra DB',
+            'daruk_status': 'Daruk DB Proxy',
             'aether_status': 'Aether Engine',
             'spectrum_status': 'Spectrum Web',
+            'catalyst_status': 'Catalyst Task',
             'bifrost_status': 'Bifrost VIP',
             'dagur_status': 'Dagur Cron',
             'mimir_status': 'Mimir Health',
             'vali_status': 'Vali DRS',
+            'gatoway_status': 'Gatoway Sync',
+            'urbosa_status': 'Urbosa SDN',
+            'logos_status': 'Logos Metrics',
+            'mipha_status': 'Mipha HA',
+            'agahnim_status': 'Agahnim Proxy',
+            'slate_status': 'Slate Ingress',
             'libvirtd_status': 'Libvirtd'
         };
         
