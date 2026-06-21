@@ -1,0 +1,873 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helios HCI - Urbosa SDN Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css?v=1.1.1">
+    <script>
+        const theme = localStorage.getItem('helios-theme');
+        if (theme) document.documentElement.classList.add('theme-' + theme);
+    </script>
+    <style>
+        /* Viewport-height constraint and individual scroll-zones to eliminate global scrollbars */
+        html, body {
+            height: 100vh !important;
+            overflow: hidden !important;
+        }
+        .app-container {
+            height: 100vh !important;
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+            padding: 0.75rem 1.25rem !important;
+        }
+        .app-workspace {
+            display: grid !important;
+            grid-template-columns: 350px 1fr !important;
+            gap: 1.25rem !important;
+            flex: 1 !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+        }
+        .workspace-sidebar {
+            height: 100% !important;
+            overflow-y: auto !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 1.25rem !important;
+            align-self: stretch !important;
+            padding-right: 4px;
+        }
+        .workspace-sidebar::-webkit-scrollbar {
+            width: 4px;
+        }
+        .workspace-sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+        .workspace-content {
+            height: 100% !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 0.5rem !important;
+        }
+        .tab-content {
+            min-height: 0 !important;
+            flex: 1 !important;
+            display: none !important;
+            flex-direction: column !important;
+        }
+        .tab-content.active {
+            display: flex !important;
+        }
+        .topology-grid {
+            height: 100% !important;
+            display: grid !important;
+            grid-template-columns: 3fr 1fr !important;
+            gap: 1.25rem !important;
+            min-height: 0 !important;
+            flex: 1 !important;
+        }
+        .topology-canvas-card {
+            height: 100% !important;
+            min-height: 0 !important;
+        }
+        .sdn-split-layout {
+            display: grid !important;
+            grid-template-columns: 1fr 2fr !important;
+            gap: 1.25rem !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            overflow: hidden !important;
+        }
+        .sdn-split-layout > .glass-card {
+            height: 100% !important;
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+            min-height: 0 !important;
+            padding: 1.25rem !important;
+        }
+        .sdn-split-layout > .glass-card > form {
+            flex: 1 !important;
+            overflow-y: auto !important;
+            min-height: 0 !important;
+            padding-right: 6px;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 12px !important;
+        }
+        .sdn-split-layout > .glass-card > form::-webkit-scrollbar {
+            width: 4px;
+        }
+        .sdn-split-layout > .glass-card > form::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+        .sdn-split-layout .table-scroll {
+            flex: 1 !important;
+            overflow-y: auto !important;
+            min-height: 0 !important;
+            border-radius: 8px !important;
+            border: 1px solid var(--border-color) !important;
+        }
+        .sdn-split-layout .table-scroll::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        .sdn-split-layout .table-scroll::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+
+        /* Urbosa SDN page specific styling */
+        .sdn-tabs-container {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+        
+        .sdn-tab-btn {
+            flex: 1;
+            min-width: 150px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            border-radius: var(--border-radius);
+            padding: 12px;
+            cursor: pointer;
+            transition: all var(--transition-speed);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+        }
+
+        .sdn-tab-btn:hover {
+            border-color: var(--color-primary-hover);
+            color: var(--text-primary);
+            background: var(--bg-nav-hover);
+            transform: translateY(-2px);
+        }
+
+        .sdn-tab-btn.active {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(99, 102, 241, 0.05));
+            border-color: var(--color-primary);
+            color: var(--text-primary);
+            box-shadow: 0 0 15px var(--color-primary-glow);
+        }
+
+        .sdn-tab-btn h4 {
+            margin: 0 0 4px 0;
+            font-size: 13px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 600;
+        }
+
+        .sdn-tab-btn p {
+            margin: 0;
+            font-size: 10px;
+            color: var(--text-muted);
+        }
+
+        .sdn-tab-btn.active p {
+            color: var(--text-secondary);
+        }
+
+        .sdn-split-layout {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 1.25rem;
+            align-items: start;
+        }
+
+        @media (max-width: 1024px) {
+            .sdn-split-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .topology-grid {
+            display: grid;
+            grid-template-columns: 3fr 1fr;
+            gap: 1.25rem;
+        }
+
+        @media (max-width: 1200px) {
+            .topology-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .topology-canvas-card {
+            background: var(--bg-card-solid);
+            border: 1px solid var(--border-color);
+            border-radius: var(--border-radius);
+            padding: 1.5rem;
+            position: relative;
+            overflow: hidden;
+            height: calc(100vh - 230px);
+            min-height: 480px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .topology-svg-container {
+            width: 100%;
+            flex: 1;
+            background: radial-gradient(circle at center, var(--bg-card-solid) 0%, var(--bg-main) 100%);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            position: relative;
+        }
+
+        .zoom-controls button:hover {
+            background: rgba(99, 102, 241, 0.25) !important;
+            border-color: var(--color-primary) !important;
+            box-shadow: 0 0 8px rgba(99, 102, 241, 0.4);
+        }
+
+        .inspector-placeholder {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            color: var(--text-muted);
+            padding: 2rem 1rem;
+        }
+
+        .inspector-prop {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 12px;
+        }
+
+        .inspector-prop span:first-child {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+
+        .inspector-prop span:last-child {
+            color: var(--text-primary);
+            font-family: 'Fira Code', monospace;
+        }
+
+        /* SVG styles */
+        .svg-node {
+            cursor: pointer;
+        }
+        
+        .svg-node circle {
+            transition: transform 0.2s;
+            transform-origin: center;
+            transform-box: fill-box;
+        }
+        
+        .svg-node:hover circle {
+            transform: scale(1.15);
+        }
+
+        .svg-link {
+            stroke-dasharray: 6 4;
+        }
+
+        .svg-link-inactive {
+            stroke-dasharray: 4 4;
+        }
+
+        @keyframes svg-flow-animation {
+            from {
+                stroke-dashoffset: 200;
+            }
+            to {
+                stroke-dashoffset: 0;
+            }
+        }
+
+        @keyframes pulseGlow {
+            0% { box-shadow: 0 0 0 0 rgba(224, 86, 36, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(224, 86, 36, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(224, 86, 36, 0); }
+        }
+
+        .form-check-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 13px;
+            color: var(--text-secondary);
+            user-select: none;
+            margin-top: 5px;
+        }
+
+        .form-check-input {
+            accent-color: var(--color-primary);
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+
+        .bgp-config-section {
+            border-top: 1px dashed var(--border-color);
+            margin-top: 10px;
+            padding-top: 12px;
+            display: none;
+        }
+
+        .badge-allow {
+            background: rgba(46, 204, 113, 0.15);
+            border: 1px solid var(--color-success);
+            color: var(--color-success);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+        }
+
+        .badge-deny {
+            background: rgba(231, 76, 60, 0.15);
+            border: 1px solid var(--color-danger);
+            color: var(--color-danger);
+            padding: 2px 6px;
+            font-size: 10px;
+            font-weight: 600;
+        }
+
+        #create-t1-form, #create-segment-form-sdn {
+            overflow-y: auto !important;
+        }
+    </style>
+</head>
+<body>
+    <!-- Background Decorative Glowing Orbs -->
+    <div class="glass-bg-decor decor-1"></div>
+    <div class="glass-bg-decor decor-2"></div>
+    
+    <div class="app-container">
+        
+        <!-- Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="pe-logo-container">
+                    <svg viewBox="0 0 24 24" class="pe-logo-icon">
+                        <path d="M12 2L3 5v6c0 5.5 3.8 10.6 9 11 5.2-.4 9-5.5 9-11V5l-9-3z" />
+                        <path d="M12 17h.01M12 13.5a1.5 1.5 0 0 0 1-1.5V10" stroke="#fff" stroke-width="2" stroke-linecap="round" />
+                    </svg>
+                </div>
+                <div class="pe-cluster-name" id="cluster-name-brand-display">Helios Valkyrie</div>
+                
+                <!-- Console Dropdown Menu -->
+                <div class="console-dropdown">
+                    <button class="dropdown-trigger" id="console-dropdown-btn">
+                        <span id="current-console-label">Urbosa SDN</span>
+                        <svg viewBox="0 0 24 24" class="dropdown-arrow"><path d="M7 10l5 5 5-5z"/></svg>
+                    </button>
+                    <div class="dropdown-menu" id="console-dropdown-menu">
+                        <a href="index.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+                            Home
+                        </a>
+                        <a href="vms.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9H9V9h10v2zm-4 4H9v-2h6v2zm4-8H9V5h10v2z"/></svg>
+                            VM
+                        </a>
+                        <a href="images.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2;"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+                            Images
+                        </a>
+                        <a href="storage.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon"><path d="M2 20h20v-4H2v4zm2-3h2v2H4v-2zM2 4v4h20V4H2zm4 3H4V5h2v2zm-4 7h20v-4H2v4zm2-3h2v2H4v-2z"/></svg>
+                            Storage
+                        </a>
+                        <a href="metrics.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2;"><path d="M3 3v18h18M18.7 8l-5.1 5.2-2.8-2.7L7 14.3"/></svg>
+                            Metrics
+                        </a>
+                        <a href="hardware.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2;"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+                            Hardware
+                        </a>
+                        <a href="health.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                            Health
+                        </a>
+                        <a href="settings.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                            Settings
+                        </a>
+                        <a href="tasks.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2;"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 17h6M9 12h6M9 7h6"/></svg>
+                            Tasks Log
+                        </a>
+                        <a href="lcm.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;"><path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                            LCM
+                        </a>
+                        <a href="networking.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M12 8v4M5 16v-4h14v4"/></svg>
+                            Networking
+                        </a>
+                        <a href="sdn.html" class="dropdown-item active">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                            Urbosa SDN
+                        </a>
+                    </div>
+                </div>
+                
+                <!-- Tasks Dropdown Menu -->
+                <div class="tasks-dropdown" id="tasks-dropdown-container" style="display: flex; align-items: center;">
+                    <button class="tasks-trigger state-grey" id="tasks-dropdown-btn" title="Recent Tasks">
+                        <svg viewBox="0 0 24 24" class="tasks-progress-svg">
+                            <circle cx="12" cy="12" r="9" class="tasks-progress-bg"></circle>
+                            <circle cx="12" cy="12" r="9" class="tasks-progress-fill" id="tasks-progress-circle-fill"></circle>
+                        </svg>
+                        <span class="tasks-badge" id="tasks-badge-count">0</span>
+                        <span id="tasks-trigger-announcement" class="tasks-trigger-announcement"></span>
+                    </button>
+                    <span class="tasks-header-running-label" id="tasks-header-running-label" style="font-size: 11px; color: var(--color-primary); font-family: 'Space Grotesk', sans-serif; font-weight: 600; margin-left: 8px; vertical-align: middle; display: none; white-space: nowrap;"></span>
+                    <div class="tasks-menu" id="tasks-dropdown-menu">
+                        <div class="tasks-menu-header">
+                            <span>Recent Tasks <span id="tasks-header-count"></span></span>
+                            <span id="tasks-running-text" style="font-size: 11px; color: var(--color-primary); font-weight: 500; margin-left: 8px; display: none;"></span>
+                            <button class="tasks-cleanup-btn" id="tasks-cleanup-btn">Clean Up</button>
+                        </div>
+                        <div class="tasks-menu-list" id="tasks-menu-list">
+                            <div class="tasks-empty-state">No recent tasks</div>
+                        </div>
+                        <div class="tasks-menu-footer">
+                            <a href="tasks.html" class="view-all-tasks-link">View All Tasks ></a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="header-right">
+                <div class="cluster-pill">
+                    <span id="cluster-name-display">unnamed-cluster</span>
+                </div>
+                <div class="connection-status">
+                    <span class="status-dot connected"></span>
+                    Odin Leader: <span id="leader-node-display">Connecting...</span>
+                </div>
+                <a href="settings.html" class="settings-btn" id="header-settings-link" title="System Settings">
+                    <svg viewBox="0 0 24 24" class="settings-icon"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                </a>
+                <div class="user-profile" style="opacity: 0; transition: opacity 0.2s;">
+                    <div class="avatar"></div>
+                    <span></span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Workspace Split Layout -->
+        <div class="app-workspace">
+            
+            <!-- Left Sidebar Widget Area -->
+            <aside class="workspace-sidebar">
+                
+                <!-- Urbosa SDN Summary -->
+                <div class="glass-card">
+                    <h3 class="panel-title">Urbosa SDN Engine</h3>
+                    <div class="network-bridge-layout" style="display: flex; flex-direction: column; gap: 10px;">
+                        <div class="bridge-info-item">
+                            <h5>Engine Status</h5>
+                            <p id="urbosa-sidebar-status"><span class="status-indicator status-green" style="font-size: 10px;">Active</span></p>
+                        </div>
+                        <div class="bridge-info-item">
+                            <h5>Fabric Protocol</h5>
+                            <p>VXLAN Mesh (UDP 4789)</p>
+                        </div>
+                        <div class="bridge-info-item">
+                            <h5>Transit IP Scope</h5>
+                            <p>100.64.0.0/16</p>
+                        </div>
+                        <div class="bridge-info-item">
+                            <h5>Overlay MTU Size</h5>
+                            <div style="display: flex; gap: 6px; margin-top: 4px; align-items: center;">
+                                <input type="number" id="urbosa-mtu-input" min="576" max="9000" style="width: 80px; font-size: 11px; padding: 4px 8px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-color); color: #fff; border-radius: 4px;" value="1500">
+                                <button id="btn-save-urbosa-mtu" class="btn btn-primary" style="padding: 4px 8px; font-size: 11px; min-width: auto; height: 26px; line-height: 1; display: flex; align-items: center; justify-content: center;">Save</button>
+                            </div>
+                            <span class="input-hint" style="font-size: 9px; color: var(--text-muted); display: block; margin-top: 4px;">Applies to overlay VXLAN & bridge devices (does not affect physical interfaces).</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Overlay Nodes Health -->
+                <div class="glass-card">
+                    <h3 class="panel-title">Overlay Fabric Nodes</h3>
+                    <div class="node-list" id="sdn-fabric-nodes-list">
+                        <!-- Will be updated dynamically by app.js -->
+                        <div class="node-item">
+                            <div class="node-left">
+                                <span class="node-status-dot status-dot-online"></span>
+                                <div class="node-meta">
+                                    <h4>hci-node01</h4>
+                                    <p>10.10.102.220</p>
+                                </div>
+                            </div>
+                            <span class="node-role-badge leader">LEADER</span>
+                        </div>
+                        <div class="node-item">
+                            <div class="node-left">
+                                <span class="node-status-dot status-dot-online"></span>
+                                <div class="node-meta">
+                                    <h4>hci-node02</h4>
+                                    <p>10.10.102.222</p>
+                                </div>
+                            </div>
+                            <span class="node-role-badge">ONLINE</span>
+                        </div>
+                        <div class="node-item">
+                            <div class="node-left">
+                                <span class="node-status-dot status-dot-online"></span>
+                                <div class="node-meta">
+                                    <h4>hci-node03</h4>
+                                    <p>10.10.102.223</p>
+                                </div>
+                            </div>
+                            <span class="node-role-badge">ONLINE</span>
+                        </div>
+                    </div>
+                </div>
+
+            </aside>
+
+            <!-- Right Main Content Area -->
+            <main class="workspace-content" style="position: relative;">
+                
+                <!-- Glassmorphic Warning Overlay (Shown when urbosa is disabled) -->
+                <div id="urbosa-disabled-overlay" style="display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(9, 11, 20, 0.85); backdrop-filter: blur(12px); z-index: 100; align-items: center; justify-content: center; border-radius: var(--border-radius); transition: all 0.3s ease;">
+                    <div class="glass-card" style="max-width: 500px; padding: 2.5rem; text-align: center; display: flex; flex-direction: column; align-items: center; border: 1px solid var(--border-color); box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);">
+                        <div style="width: 70px; height: 70px; background: rgba(224, 86, 36, 0.15); border-radius: 50%; display: flex; align-items: center; justify-content: center; border: 2px solid var(--color-warning); margin-bottom: 1.5rem; animation: pulseGlow 2s infinite;">
+                            <svg viewBox="0 0 24 24" style="width: 35px; height: 35px; fill: var(--color-warning);"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                        </div>
+                        <h2 style="font-family: 'Space Grotesk', sans-serif; font-size: 22px; color: #fff; margin-bottom: 0.75rem;">Urbosa SDN is Deactivated</h2>
+                        <p style="color: var(--text-secondary); line-height: 1.6; margin-bottom: 1.75rem; font-size: 13px;">
+                            Software Defined Networking (SDN) is currently disabled for this cluster. To create Tier-0 gateways, distributed Tier-1 routers, overlay VXLAN segments, and configure micro-segmentation firewall rules, you must enable urbosa in the settings.
+                        </p>
+                        <a href="settings.html" class="btn btn-primary" style="padding: 10px 24px; font-weight: 500; font-family: 'Space Grotesk', sans-serif; text-decoration: none;">Open Cluster Settings</a>
+                    </div>
+                </div>
+
+                <!-- Horizontal Tabs Bar -->
+                <div class="sdn-tabs-container">
+                    <button class="sdn-tab-btn active" data-sdn-tab="dashboard">
+                        <div class="btn-text">
+                            <h4>Dashboard Topology</h4>
+                            <p>Interactive logical map</p>
+                        </div>
+                    </button>
+                    <button class="sdn-tab-btn" data-sdn-tab="t0">
+                        <div class="btn-text">
+                            <h4>Tier-0 Gateways</h4>
+                            <p>North-South gateways</p>
+                        </div>
+                    </button>
+                    <button class="sdn-tab-btn" data-sdn-tab="t1">
+                        <div class="btn-text">
+                            <h4>Tier-1 Routers</h4>
+                            <p>Distributed routing</p>
+                        </div>
+                    </button>
+                    <button class="sdn-tab-btn" data-sdn-tab="segments">
+                        <div class="btn-text">
+                            <h4>Overlay Segments</h4>
+                            <p>VXLAN subnets & DHCP</p>
+                        </div>
+                    </button>
+
+                    <button class="sdn-tab-btn" data-sdn-tab="tunnels">
+                        <div class="btn-text">
+                            <h4>Tunnels & Host TEP Status</h4>
+                            <p>Overlay tunnel metrics & nodes</p>
+                        </div>
+                    </button>
+                    <button class="sdn-tab-btn" data-sdn-tab="firewall">
+                        <div class="btn-text">
+                            <h4>Distributed Firewall</h4>
+                            <p>Micro-segmentation rules</p>
+                        </div>
+                    </button>
+                </div>
+
+                <!-- 1. DASHBOARD TAB PANE -->
+                <div class="tab-content active" id="sdn-pane-dashboard">
+                    <div class="topology-grid">
+                        
+                        <!-- Topology SVG Map -->
+                        <div class="topology-canvas-card">
+                            <h3 class="panel-title" style="margin-bottom: 1rem;">SDN Logical Architecture Topology</h3>
+                            <div class="topology-svg-container" id="topology-svg-container">
+                                <!-- Floating Zoom Controls -->
+                                <div class="zoom-controls" style="position: absolute; top: 10px; right: 10px; display: flex; gap: 5px; z-index: 10; user-select: none;">
+                                    <button id="btn-zoom-in" title="Zoom In" style="padding: 0; font-size: 16px; width: 32px; height: 32px; background: rgba(10, 12, 30, 0.7); backdrop-filter: blur(4px); border: 1px solid rgba(255, 255, 255, 0.1); color: #fff; cursor: pointer; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">+</button>
+                                    <button id="btn-zoom-out" title="Zoom Out" style="padding: 0; font-size: 16px; width: 32px; height: 32px; background: rgba(10, 12, 30, 0.7); backdrop-filter: blur(4px); border: 1px solid rgba(255, 255, 255, 0.1); color: #fff; cursor: pointer; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">-</button>
+                                    <button id="btn-zoom-reset" title="Reset Zoom" style="padding: 0 10px; font-size: 11px; font-family: 'Space Grotesk', sans-serif; height: 32px; background: rgba(10, 12, 30, 0.7); backdrop-filter: blur(4px); border: 1px solid rgba(255, 255, 255, 0.1); color: #fff; cursor: pointer; border-radius: 6px; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">Reset</button>
+                                </div>
+                                <svg id="sdn-topology-svg" width="100%" height="100%" viewBox="0 0 800 550" style="display: block; cursor: grab;">
+                                    <!-- Definitions for patterns, gradients, markers -->
+                                    <defs>
+                                        <!-- Grid Pattern -->
+                                        <pattern id="topo-grid-pattern" width="30" height="30" patternUnits="userSpaceOnUse">
+                                            <path d="M 30 0 L 0 0 0 30" fill="none" stroke="rgba(255, 255, 255, 0.02)" stroke-width="1"/>
+                                        </pattern>
+                                        
+                                        <!-- Node Glow Gradients -->
+                                        <radialGradient id="glow-t0" cx="50%" cy="50%" r="50%">
+                                            <stop offset="0%" stop-color="rgba(180, 80, 255, 0.35)"/>
+                                            <stop offset="100%" stop-color="rgba(180, 80, 255, 0)"/>
+                                        </radialGradient>
+                                        <radialGradient id="glow-t1" cx="50%" cy="50%" r="50%">
+                                            <stop offset="0%" stop-color="rgba(56, 189, 248, 0.35)"/>
+                                            <stop offset="100%" stop-color="rgba(56, 189, 248, 0)"/>
+                                        </radialGradient>
+                                        <radialGradient id="glow-segment" cx="50%" cy="50%" r="50%">
+                                            <stop offset="0%" stop-color="rgba(46, 204, 113, 0.35)"/>
+                                            <stop offset="100%" stop-color="rgba(46, 204, 113, 0)"/>
+                                        </radialGradient>
+                                        
+                                        <!-- Arrow Markers for links -->
+                                        <marker id="arrow-start" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                                            <path d="M 0 2 L 10 5 L 0 8 z" fill="var(--text-muted)"/>
+                                        </marker>
+                                    </defs>
+                                    
+                                    <!-- Grid overlay -->
+                                    <rect width="100%" height="100%" fill="url(#topo-grid-pattern)"/>
+                                    
+                                    <!-- Viewport Group for Zooming & Panning -->
+                                    <g id="topology-viewport-group">
+                                        <!-- Links Group -->
+                                        <g id="topology-links-group"></g>
+                                        
+                                        <!-- Nodes Group -->
+                                        <g id="topology-nodes-group"></g>
+                                    </g>
+                                </svg>
+                            </div>
+                        </div>
+
+                        <!-- Inspector Sidebar -->
+                        <div class="glass-card" style="height: calc(100vh - 230px); min-height: 480px; display: flex; flex-direction: column;">
+                            <h3 class="panel-title" style="border-bottom: 1px solid rgba(255,255,255,0.05); padding-bottom: 0.75rem; margin-bottom: 0.75rem;">Details</h3>
+                            <div id="sdn-inspector-content" style="flex: 1; overflow-y: auto;">
+                                <div class="inspector-placeholder">
+                                    <svg viewBox="0 0 24 24" style="width: 45px; height: 45px; fill: rgba(255,255,255,0.1); margin-bottom: 1rem;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                                    <h4 style="font-size:13px; font-family:'Space Grotesk',sans-serif; color: var(--text-secondary);">No Element Selected</h4>
+                                    <p style="font-size:11px; color: var(--text-muted); margin-top: 5px;">Click on any logical gateway, router, segment, or VM node in the diagram to inspect properties and statistics.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 2. TIER-0 GATEWAYS TAB PANE -->
+                <div class="tab-content" id="sdn-pane-t0">
+                    <div class="glass-card" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                            <div>
+                                <h3 class="panel-title" style="margin: 0 0 5px 0;">Configured Tier-0 Logical Gateways</h3>
+                                <p class="storage-info-text" style="margin: 0;">T0 gateways connect virtual overlay networks to physical uplinks in Active-Passive High Availability mode.</p>
+                            </div>
+                            <button class="btn btn-primary" id="btn-open-create-t0" style="padding: 8px 16px; font-family: 'Space Grotesk', sans-serif;">Create Gateway</button>
+                        </div>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="t0-table">
+                                <thead>
+                                    <tr>
+                                        <th>Gateway Name</th>
+                                        <th>Uplink NIC</th>
+                                        <th>External IP</th>
+                                        <th>Default Gateway</th>
+                                        <th>NAT Masq</th>
+                                        <th>BGP Peering</th>
+                                        <th style="text-align: right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="t0-table-body">
+                                    <tr>
+                                        <td colspan="7" class="table-loading">Loading T0 logical routers...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 3. TIER-1 ROUTERS TAB PANE -->
+                <div class="tab-content" id="sdn-pane-t1">
+                    <div class="glass-card" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                            <div>
+                                <h3 class="panel-title" style="margin: 0 0 5px 0;">Configured Tier-1 Logical Routers</h3>
+                                <p class="storage-info-text" style="margin: 0;">T1 routers function as Distributed Logical Routers (DLR) to route East-West traffic locally on each hypervisor node.</p>
+                            </div>
+                            <button class="btn btn-primary" id="btn-open-create-t1" style="padding: 8px 16px; font-family: 'Space Grotesk', sans-serif;">Create Router</button>
+                        </div>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="t1-table">
+                                <thead>
+                                    <tr>
+                                        <th>Router Name</th>
+                                        <th>Linked Tier-0 Gateway</th>
+                                        <th>DHCP / IPAM</th>
+                                        <th>Distributed Status</th>
+                                        <th style="text-align: right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="t1-table-body">
+                                    <tr>
+                                        <td colspan="5" class="table-loading">Loading T1 distributed routers...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 4. OVERLAY SEGMENTS TAB PANE -->
+                <div class="tab-content" id="sdn-pane-segments">
+                    <div class="glass-card" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                            <div>
+                                <h3 class="panel-title" style="margin: 0 0 5px 0;">Configured VXLAN Overlay Segments</h3>
+                                <p class="storage-info-text" style="margin: 0;">Overlay segments isolate L2 broadcast domains across all cluster nodes using VXLAN VNI encapsulation.</p>
+                            </div>
+                            <button class="btn btn-primary" id="btn-open-create-segment" style="padding: 8px 16px; font-family: 'Space Grotesk', sans-serif;">Create Segment</button>
+                        </div>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="segments-table">
+                                <thead>
+                                    <tr>
+                                        <th>Segment Name</th>
+                                        <th>VXLAN VNI</th>
+                                        <th>Subnet CIDR</th>
+                                        <th>Gateway IP</th>
+                                        <th>Linked T1 Router</th>
+                                        <th>DHCP IPAM</th>
+                                        <th style="text-align: right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="segments-table-body">
+                                    <tr>
+                                        <td colspan="7" class="table-loading">Loading overlay segments...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 5. DISTRIBUTED FIREWALL TAB PANE -->
+                <div class="tab-content" id="sdn-pane-firewall">
+                    <div class="glass-card" style="width: 100%; height: 100%; display: flex; flex-direction: column;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem;">
+                            <div>
+                                <h3 class="panel-title" style="margin: 0 0 5px 0;">Active Security Micro-Segmentation Rules</h3>
+                                <p class="storage-info-text" style="margin: 0;">DFW rules enforce stateful micro-segmentation security directly on VM interfaces, regardless of underlying physical locations.</p>
+                            </div>
+                            <button class="btn btn-primary" id="btn-open-create-firewall" style="padding: 8px 16px; font-family: 'Space Grotesk', sans-serif;">Create Rule</button>
+                        </div>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="firewall-table">
+                                <thead>
+                                    <tr>
+                                        <th>Priority</th>
+                                        <th>Description</th>
+                                        <th>Source</th>
+                                        <th>Destination</th>
+                                        <th>Protocol</th>
+                                        <th>Port</th>
+                                        <th>Action</th>
+                                        <th style="text-align: right;">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="firewall-table-body">
+                                    <tr>
+                                        <td colspan="8" class="table-loading">Loading distributed firewall rules...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+
+
+                <!-- 7. TUNNELS & HOST STATUS TAB PANE -->
+                <div class="tab-content" id="sdn-pane-tunnels" style="overflow-y: auto !important; padding-right: 6px;">
+                    <!-- Host TEP Status Section -->
+                    <div class="glass-card" style="margin-bottom: 1.5rem; padding: 1.5rem;">
+                        <h3 class="panel-title" style="margin: 0 0 1rem 0;">Hypervisor Transport Nodes & Host TEP Status</h3>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="tep-table">
+                                <thead>
+                                    <tr>
+                                        <th>Transport Node</th>
+                                        <th>TEP IP</th>
+                                        <th>Status</th>
+                                        <th>Uplink</th>
+                                        <th>MTU</th>
+                                        <th>Overlay Rx Speed</th>
+                                        <th>Overlay Tx Speed</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tep-table-body">
+                                    <tr><td colspan="7" class="table-loading">Loading TEP statuses...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- VXLAN Active Tunnels Section -->
+                    <div class="glass-card" style="padding: 1.5rem;">
+                        <h3 class="panel-title" style="margin: 0 0 1rem 0;">Active Overlay Tunnels</h3>
+                        <div class="table-scroll">
+                            <table class="prism-table" id="tunnels-table">
+                                <thead>
+                                    <tr>
+                                        <th>VNI</th>
+                                        <th>Segment</th>
+                                        <th>Node IP</th>
+                                        <th>Interface</th>
+                                        <th>Status</th>
+                                        <th>Rx Throughput</th>
+                                        <th>Tx Throughput</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="tunnels-table-body">
+                                    <tr><td colspan="8" class="table-loading">Loading active overlay tunnels...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            </main>
+        </div>
+    </div>
+
+    <!-- Alert Notifications container -->
+    <div id="toast-container"></div>
+
+    <script src="app.js?v=1.1.2"></script>
+</body>
+</html>
