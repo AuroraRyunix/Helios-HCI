@@ -69,3 +69,27 @@ To prevent systemd boot dependency loops (where systemd tries to start the proxy
   "error": "Error details from Cassandra driver..."
 }
 ```
+
+---
+
+## Command Examples & Verification
+
+### A. Managing the Daruk Service
+Because Daruk runs as a systemd service inside the container/host context, you can check its status:
+```bash
+# Check service status
+systemctl status daruk
+
+# View proxy request execution logs
+journalctl -u daruk -n 20 --no-pager
+```
+
+### B. Verification via Curl Queries
+To test Daruk's responsiveness directly from the host shell, execute an HTTP POST query request:
+```bash
+# Query nodes table through Daruk API
+curl -X POST -H "Content-Type: text/plain" -d "SELECT hostname, ip, status FROM hydra.nodes;" http://127.0.0.1:9043/query
+
+# Query specific settings key
+curl -X POST -H "Content-Type: text/plain" -d "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';" http://127.0.0.1:9043/query
+```
