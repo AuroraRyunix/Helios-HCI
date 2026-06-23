@@ -691,6 +691,18 @@ To ensure compatibility across all hypervisor nodes:
 
 ---
 
+### VM Disk Resizing & Split-Brain Protection
+
+To guarantee data integrity and correct capacity detection across all states:
+* **Boot Disk Resizing**: When starting a VM, Vali checks its configured disk size in ScyllaDB. Before booting libvirt, it promotes (`drbdadm primary`) and resizes (`drbdadm resize`) the DRBD device on the hypervisor. This guarantees guest OS installers (like Windows Server) detect the updated size immediately.
+* **Live Disk Resizing**: When editing a running VM's disk capacity, Vali runs `drbdadm resize` on the host kernel block device, resolves the correct device prefix (`vd` vs `sd`) based on the bus type, and executes QEMU `blockresize` dynamically:
+  ```bash
+  virsh -c qemu:///system blockresize <vm_name> <target_dev> <new_size_in_kb>
+  ```
+* **Split-Brain VM Protection**: If a host suffers a network partition or hard crash, its VMs are failed over to other hosts. When the partitioned/crashed host returns online, a local Spectrum reconciliation loop (`db_reconcile_loop`) verifies all local VMs. If any local VM is assigned to another node (or stopped) in the ScyllaDB registry, it runs `virsh destroy` and `virsh undefine --keep-nvram` locally to kill the stale instance and protect DRBD block storage.
+
+---
+
 #### A. Managing VMs via `valcli`
 The `valcli` CLI tool provides VM status management, power controls, and live migration:
 ```bash
@@ -858,6 +870,13 @@ Mimir checks are triggered according to schedules defined in the database:
 | `hourly_checks` | `all` | 1 hour | `/usr/local/bin/mcli health_checks run_all` | Runs all diagnostic health checks cluster-wide. |
 
 The triggered execution calls `mcli` tool which performs node check evaluations (SSH connections, disk capacity, process health, mount checks, replica statuses) and records diagnostic output to `hydra.mimir_results`.
+
+---
+
+### Key Diagnostic Checks
+
+* **SSH Known Hosts Seeding (`ssh_known_hosts_seeding`)**: Verifies passwordless SSH connectivity and mutual host key trust between all nodes in the cluster. It runs `ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=yes {node_ip} exit` for each node IP to guarantee that libvirt live migrations won't fail due to SSH host key verification prompts.
+* **Certificate Seeding (`certs_seeding_check`)**: Audits the presence, key permissions (`600`/`400`), modulus matching, and CA signature trust of all cluster mTLS certificates (Client, Spark Daemon, and Ingress TLS groups).
 
 ---
 
@@ -1542,6 +1561,8 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 5. Registers nodes and storage pools inside Linstor.
 6. Defines and formats storage containers (`default-vm-container` and `default-image-container`).
 7. Distributes configuration files, starts consensus (ZooKeeper), databases (ScyllaDB), hypervisor agents (Vali), and orchestration engines (Bifrost, Dagur, Mimir, etc.).
+8. Executes secure SSH key seeding via `ssh-keyscan` and distributes public keys to `/root/.ssh/known_hosts` on all cluster nodes.
+9. Generates and distributes mTLS CA, node, and client certificates to `/etc/hci/spark/certs/` and `/root/.certs/`.
 
 ### 6.3 VM Creation & Startup
 1. Spectrum UI submits VM creation request to Catalyst / Bifrost.
@@ -1556,3 +1577,4 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 3. Mipha queries ScyllaDB (`hydra.vms`) to identify the virtual machines that were active on the failed host.
 4. Mipha updates the DRBD volume attachment parameters in Linstor to set the failed node attachment as orphaned.
 5. Mipha schedules VM boot requests on surviving hosts. The surviving hosts mount the replicated DRBD storage volumes locally and restart the VM domains.
+6. When the dead host boots back up, its local Spectrum `db_reconcile_loop` checks the cluster database. Since the database assigns the VMs to the surviving hosts, the returning node immediately destroys and undefines its local VM domains to prevent split-brain conflicts.
