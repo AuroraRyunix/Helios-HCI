@@ -58,3 +58,37 @@ To maximize storage I/O performance and support enterprise features, Aether runs
            ├───► Local Writes to vg_aether/thin_pool_aether (LVM Thin)
            └───► Synchronous network replication (TCP/RDMA) to Peer Host
 ```
+
+---
+
+## Command Examples & Storage Administration
+
+### A. Querying Linstor Controller Status
+Since Linstor Controller runs inside a container on the cluster leader, query node and storage layouts via podman:
+```bash
+# List all nodes registered in Linstor and their status (Online/Offline)
+podman exec systemd-linstor-controller linstor node list
+
+# List all storage pools defined on nodes and verify capacity/free-space
+podman exec systemd-linstor-controller linstor storage-pool list
+
+# List all replicated resources (virtual machine disks) in the cluster
+podman exec systemd-linstor-controller linstor resource list
+```
+
+### B. Checking DRBD Replication Status on Host
+Verify the synchronous replication state of individual VM disk resources directly from the hypervisor host:
+```bash
+# Check global DRBD status and connection state
+drbdadm status
+
+# Show detailed connection and replication progress for a specific resource
+drbdadm status res-img-virtio-win --statistics
+```
+
+### C. Monitoring LVM Thin Provisioning Pools
+Check capacity usage, thin pools, and volume allocations on the physical host OS:
+```bash
+# List LVM logical volumes and their allocated capacity percentage (data_percent)
+lvs -a -o lv_name,vg_name,lv_size,data_percent vg_aether
+```
