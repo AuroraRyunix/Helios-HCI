@@ -24,6 +24,24 @@ Mimir checks are triggered according to schedules defined in the database:
 
 The triggered execution calls `mcli` tool which performs node check evaluations (SSH connections, disk capacity, process health, mount checks, replica statuses) and records diagnostic output to `hydra.mimir_results`.
 
+### Key Diagnostic Checks
+
+- **SSH Known Hosts Seeding (`ssh_known_hosts_seeding`)**:
+  - **Category**: `services`
+  - **Description**: Verifies passwordless SSH connectivity and mutual host key trust between all nodes in the cluster. It runs `ssh -o BatchMode=yes -o ConnectTimeout=2 -o StrictHostKeyChecking=yes {node_ip} exit` for each node IP to guarantee that libvirt live migrations won't fail due to SSH host key verification prompts.
+
+- **Certificate Seeding (`certs_seeding_check`)**:
+  - **Category**: `services`
+  - **Description**: Audits the presence, cryptographic integrity, and configuration of all SSL/TLS and mTLS certificates across three primary service scopes:
+    1. **mTLS Client**: Client tools configuration files (`/root/.certs/ca.crt`, `client.crt`, `client.key`).
+    2. **Spark Daemon**: Host agent configurations (`/etc/hci/spark/certs/ca.crt`, `node.crt`, `node.key`).
+    3. **Spectrum Ingress**: Web console web server files (`/etc/hci/spectrum/certs/server.crt`, `server.key`).
+  - **Checks Executed**:
+    * **File Presence**: Confirms all CA certificates, client/server certificates, and private keys exist.
+    * **Private Key Permissions**: Verifies private key file permissions are secure (restricted to owner only, i.e. `600` or `400`).
+    * **Modulus Verification**: Checks that each private key matches its corresponding certificate by validating that their RSA/EC modulus matches using `openssl x509 -modulus` and `openssl pkey -modulus`.
+    * **Signature Trust**: Verifies client and node certificates are properly signed by their respective CAs using `openssl verify`.
+
 ---
 
 ## Command Examples & Syntax
