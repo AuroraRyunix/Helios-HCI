@@ -42,3 +42,47 @@ podman run -d \
 ```
 
 *(Note: The `:Z` flag on volume mounts ensures correct SELinux context labeling on EL 10.2).*
+
+---
+
+## Technical Coordination & ZNode Registry
+
+The cluster coordinators (Vali, Mipha, Bifrost) utilize the ZooKeeper ensemble for active leader elections and state lock coordination:
+* **Vali Leader Election**: Uses ephemeral sequential znodes at `/vali/leader/lock-`. The node holding the lowest sequence number is elected as the active scheduler leader.
+* **Mipha Coordinator**: Elects an active HA coordinator at `/mipha/leader/lock-` to monitor host heartbeats.
+* **Bifrost VIP Floating**: Monitors `/vali/leader` to bind the floating Virtual IP address locally to the ZooKeeper leader node.
+* **Cluster State**: Store the global cluster operational state at `/cluster_state` (can contain `started` or `stopped`).
+
+---
+
+## Command Examples & Verification
+
+### A. Querying Ensemble Status (Four-Letter Words)
+ZooKeeper supports simple network commands using four-letter words. You can query status and membership via netcat:
+```bash
+# Query server statistics, latency, and active mode (leader vs. follower)
+echo stat | nc 127.0.0.1 2181
+
+# Check client connections and active sessions
+echo cons | nc 127.0.0.1 2181
+
+# Verify server health state (should return 'imok')
+echo ruok | nc 127.0.0.1 2181
+```
+
+### B. Interactive ZooKeeper Shell (`zkCli.sh`)
+Use the interactive client tool inside the container to inspect znode trees and cluster states:
+```bash
+# Start the interactive ZK CLI session
+podman exec -it systemd-zookeeper zkCli.sh -server 127.0.0.1:2181
+
+# ZK Shell Command Examples:
+# 1. List root-level znode paths
+ls /
+
+# 2. Query cluster state
+get /cluster_state
+
+# 3. View active Vali leader candidates
+ls /vali/leader
+```
