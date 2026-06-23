@@ -81,3 +81,43 @@ cluster destroy
 * **Host Crash Detection**: The active Mipha leader polls all cluster nodes every 10 seconds using both network pings (ICMP) and the Spark mTLS API (`9099`). If a host is unreachable on both paths for 3 consecutive polls (30 seconds), it is marked as `DOWN` in ScyllaDB.
 * **Automatic Failover & Restart**: Mipha queries ScyllaDB for all virtual machines registered to the failed node, resets their database state, and submits automatic start tasks to the Catalyst task queue.
 * **Optimal Scheduling**: The **Vali** scheduler picks up the tasks and immediately schedules the VMs to boot on the healthiest remaining hosts based on available RAM and DRS rules, restoring VM availability automatically.
+
+---
+
+## 4. Cluster Security & Trust Seeding
+
+To guarantee passwordless SSH, secure inter-node KVM live migration, and encrypted mTLS command orchestration, the cluster configures and seeds security keys and certificates during bootstrapping.
+
+### A. SSH Key Seeding and Keyscan Automation
+During `cluster create` (orchestrated by `/usr/local/bin/provision.py`):
+1. **Public Key Gathering**: Node 1 executes `ssh-keyscan` across all nodes (including their IP addresses and hostname formats like `Valkyrie-XXXXXX`) to capture host keys securely:
+   ```bash
+   ssh-keyscan -H -t rsa,ecdsa,ed25519 10.10.102.120 10.10.102.121 10.10.102.122 Valkyrie-51C2B5 Valkyrie-232EB8 Valkyrie-DB225F >> /root/.ssh/known_hosts
+   ```
+2. **Distribution**: These gathered keys are written to `/root/.ssh/known_hosts` on all cluster nodes. This prevents live migrations from failing due to SSH host key verification warnings when libvirt executes:
+   ```bash
+   virsh migrate --live ... qemu+ssh://root@<node_ip>/system
+   ```
+
+### B. mTLS Certificate Seeding & Locations
+The provisioning engine generates and distributes TLS certificates signed by a custom cluster CA to enforce strict mTLS validation on port 9099.
+
+Seeding paths:
+* **Client mTLS Scope** (CLIs/tools):
+  * `/root/.certs/ca.crt`: Custom cluster CA certificate
+  * `/root/.certs/client.crt`: Client certificate for `valcli`/`mcli`
+  * `/root/.certs/client.key`: Client private key (permission `600`)
+* **Spark Daemon Scope** (Host Agent listener):
+  * `/etc/hci/spark/certs/ca.crt`: Custom cluster CA certificate
+  * `/etc/hci/spark/certs/node.crt`: Host agent node certificate
+  * `/etc/hci/spark/certs/node.key`: Host agent private key (permission `600`)
+* **Spectrum Ingress Scope** (Web interface / Traefik SSL):
+  * `/etc/hci/spectrum/certs/server.crt`: Ingress SSL certificate
+  * `/etc/hci/spectrum/certs/server.key`: Ingress SSL private key (permission `600`)
+
+### C. Manual Trust Synchronization Commands
+If a host key changes or a certificate needs manual synchronization, administrators can run:
+```bash
+# Scan and update keys for a host
+ssh-keyscan -H -t rsa,ecdsa,ed25519 <node_ip> >> /root/.ssh/known_hosts
+```
