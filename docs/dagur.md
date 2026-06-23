@@ -24,3 +24,47 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-linstor-controller linstor resource list` | Verifies Linstor/DRBD storage volume state. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
 | `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `N/A (Native)` | DRBD kernel replication natively handles replication synchronization. |
+
+---
+
+## Technical Execution & Scheduling Loop
+
+Every 60 seconds, the active Dagur coordinator (running on the ZooKeeper leader node) executes the following sequence:
+1. **Quorum check**: Queries ZooKeeper local status to ensure it is the active leader.
+2. **Retrieve Schedules**: Queries `hydra.dagur_schedules` to load all enabled schedule records.
+3. **Cron Evaluation**: Parses the cron expression of each job. If the current time matches the expression, it spawns a background thread to execute the command.
+4. **Execution & Logging**:
+   - Runs the task command locally or uses the Spark mTLS API for remote node runs.
+   - Captures `stdout`, `stderr`, and `exit_code`.
+   - Logs execution results to the `hydra.dagur_runs` history table.
+
+---
+
+## Command Examples & Syntax
+
+### A. Managing the Dagur Service
+Control the cron daemon on the host:
+```bash
+# Check service status
+systemctl status dagur
+
+# Follow scheduling daemon logs
+journalctl -u dagur -f --no-pager
+```
+
+### B. Querying Schedules and Runs in ScyllaDB
+You can inspect active cron schedules and execution history directly using `cqlsh`:
+```bash
+# View all configured background schedules
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT schedule_name, cron_expr, command, enabled FROM hydra.dagur_schedules;"
+
+# Query the last 5 execution runs logged by Dagur
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT run_id, schedule_name, status, exit_code, start_time, duration_ms FROM hydra.dagur_runs LIMIT 5;"
+```
+
+### C. Manually Adding a Scheduled Task
+To register a new background task, insert a new row into the `dagur_schedules` table:
+```bash
+# Example: Add a daily backup sync task at 2:00 AM
+podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "INSERT INTO hydra.dagur_schedules (schedule_name, task_type, cron_expr, command, enabled) VALUES ('daily_backup', 'backup', '0 2 * * *', '/usr/local/bin/backup_sync.sh', true);"
+```
