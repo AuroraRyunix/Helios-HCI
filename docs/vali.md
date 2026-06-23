@@ -70,6 +70,37 @@ To ensure compatibility across all hypervisor nodes:
 
 ---
 
+## VM Disk Management & Resizing
+
+To ensure guest OS virtual machines correctly recognize disk capacity increases (both while running and during initial boot), Vali orchestrates storage synchronization and device mapping resize operations.
+
+### A. Guest VM Boot Disk Synchronization
+If a virtual machine's disk is resized while the VM is stopped, the underlying DRBD block device exists in a `Secondary` role on the host hypervisor and cannot be directly queried or updated by the kernel automatically. To resolve this:
+1. During the VM power-on sequence, Vali parses the disk definitions from ScyllaDB.
+2. Vali prepends commands to promote (`drbdadm primary`) and sync/resize (`drbdadm resize`) the DRBD resource definition on the destination host before the VM is defined and booted:
+   ```bash
+   drbdadm primary res-img-virtio-win && drbdadm resize res-img-virtio-win
+   ```
+3. This updates the physical block device capacity in the host kernel before libvirt defines the domain, guaranteeing that the guest OS installer (e.g. Windows Server) detects the full resized capacity immediately upon boot.
+
+### B. Live VM Disk Resizing
+When a VM is running (`state = 'Running'`) and its disk is resized using `valcli vm.edit` or the Spectrum API:
+1. **Host Block Device Resize**: The hypervisor first updates the host kernel's block size mapping by running:
+   ```bash
+   drbdadm resize res-img-virtio-win
+   ```
+2. **Device Prefix Resolution**: The hypervisor dynamically resolves the correct disk prefix (`vd` for VirtIO controllers vs `sd` for SATA/SCSI controllers) based on the configured bus type in the VM metadata, avoiding hardcoded device guesses.
+3. **QEMU Notification**: Finally, the hypervisor sends a live block-resize notification to QEMU via libvirt:
+   ```bash
+   virsh -c qemu:///system blockresize <vm_name> <target_dev> <new_size_in_kb>
+   ```
+   For example:
+   ```bash
+   virsh -c qemu:///system blockresize server2022 vda 130000000
+   ```
+
+---
+
 ### A. Managing VMs via `valcli`
 The `valcli` CLI tool provides VM status management, power controls, and live migration:
 ```bash
