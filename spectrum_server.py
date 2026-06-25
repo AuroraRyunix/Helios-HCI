@@ -1340,6 +1340,11 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
     <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
       <listen type='address' address='0.0.0.0'/>
     </graphics>
+    <controller type='virtio-serial' index='0'/>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+      <address type='virtio-serial' controller='0' bus='0' port='1'/>
+    </channel>
     {video_xml}
 {sound_xml}  </devices>
   <seclabel type='none'/>

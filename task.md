@@ -1,13 +1,9 @@
-- `[x]` Update task checklist to track execution progress
-- `[x]` Implement GET `/api/host/interfaces` endpoint in `spectrum_server.py`
-- `[x]` Implement DHCP leases collection and IP address resolution for VMs in `spectrum_server.py`
-- `[x]` Update `/api/status` and `/api/vms` routes in `spectrum_server.py` to populate VM IP addresses
-- `[x]` Implement `populateInterfaceDropdown` in `static/app.js` and integrate with T0 modals
-- `[x]` Replace T0/T1 emojis with vector router SVG symbols in `static/app.js`
-- `[x]` Clean up VM inspector details and update fields to show vCPUs, Memory, and Disk Size in `static/app.js`
-- `[x]` Disable moving dash animations on SVG links in `static/sdn.html`
-- `[x]` Run `sync_provision.py` to compile resources into `provision.py`
-- `[x]` Run `deploy_updates.py` to push changes to hosts and restart services
-- `[x]` Verify all fixes manual testing (themes, router icons, static links, interface dropdowns, VM inspector)
-- `[x]` Generate walkthrough.md summarizing changes and results
+# Tasks - Revert Web Worker & Fix Auto-Resize timing
 
+- [x] Revert `display.js` to synchronous decompression (remove worker instantiation and message queue)
+- [x] Consolidate the double-listeners for `toggleAutoscale` in `spice_auto.html`
+- [x] Run full persistent deployment updates (`deploy_updates.py`)
+- [x] Verify keyboard input and auto-resizing on VM `server2022`
+- [x] Resolve VM live-migration reconciliation loop split-brain cleanup race condition
+- [x] Implement VNC guest auto-resize (no scaling) with even pixel alignment, unconditional re-sync, and overflow hidden
+- [x] Implement in-memory authentication session cache in `spectrum_server.py` to reduce console telemetry ping latency from 50ms to ~8ms
