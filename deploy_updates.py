@@ -269,6 +269,9 @@ Restart=always
 CPUWeight=500
 MemoryMax=1G
 MemoryHigh=900M
+ExecStartPre=-/usr/bin/mkdir -p /etc/systemd/system/drbd.service.d
+ExecStartPre=-/usr/bin/bash -c "printf '[Unit]\\\\nAfter=lvm2-monitor.service network-online.target\\\\nWants=lvm2-monitor.service network-online.target\\\\n\\\\n[Service]\\\\nRestart=always\\\\nRestartSec=5\\\\n' > /etc/systemd/system/drbd.service.d/override.conf"
+ExecStartPre=-/usr/bin/systemctl daemon-reload
 
 [Container]
 Image=quay.io/piraeusdatastore/piraeus-server:v1.31.0

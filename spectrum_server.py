@@ -1263,7 +1263,7 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         dev_letter = letters[idx % 26]
         disk_devices_xml += f"""
     <disk type='block' device='disk'>
-      <driver name='qemu' type='raw' cache='none' io='native'/>
+      <driver name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'/>
       <source dev='{d_path}'/>
       <target dev='vd{dev_letter}' bus='virtio'/>
     </disk>"""
@@ -1304,8 +1304,14 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         pass
 
     domain_type = "kvm" if has_kvm else "qemu"
-    cpu_xml = """<cpu mode='host-model'/>""" if has_kvm else """<cpu mode='custom' match='exact'>
+    if has_kvm:
+        cpu_xml = f"""<cpu mode='host-model'>
+    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
+  </cpu>"""
+    else:
+        cpu_xml = f"""<cpu mode='custom' match='exact'>
     <model>Haswell</model>
+    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
   </cpu>"""
 
     uuid_xml = f"<uuid>{uuid}</uuid>" if uuid else ""
@@ -1323,6 +1329,7 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
   {uuid_xml}
   <memory unit='MiB'>{memory}</memory>
   <vcpu placement='static'>{vcpu}</vcpu>
+  <iothreads>1</iothreads>
   <os>
     {os_boot_xml}
   </os>

@@ -760,9 +760,13 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     for idx, (d_path, bus) in enumerate(disk_paths_with_bus):
         dev_prefix = "vd" if bus == "virtio" else "sd"
         dev_letter = letters[idx % 26]
+        if bus == "virtio":
+            driver_opts = f"name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'"
+        else:
+            driver_opts = "name='qemu' type='raw' cache='none' io='native'"
         disk_devices_xml += f"""
     <disk type='block' device='disk'>
-      <driver name='qemu' type='raw' cache='none' io='native'/>
+      <driver {driver_opts}/>
       <source dev='{d_path}'/>
       <target dev='{dev_prefix}{dev_letter}' bus='{bus}'/>
     </disk>"""
@@ -831,17 +835,19 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     
     actual_cpu = cpu_model if cpu_model else ("host-model" if is_vmware else "host-passthrough")
     
-    if actual_cpu in ["host-model", "host-passthrough"]:
-        if actual_cpu == "host-passthrough" and is_vmware:
-            cpu_xml = f"""<cpu mode='host-passthrough'>
+    if actual_cpu == "host-passthrough" and is_vmware:
+        cpu_xml = f"""<cpu mode='host-passthrough'>
+    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
     <feature policy='disable' name='vmx'/>
   </cpu>"""
-        else:
-            cpu_xml = f"<cpu mode='{actual_cpu}'/>"
+    elif actual_cpu in ["host-model", "host-passthrough"]:
+        cpu_xml = f"""<cpu mode='{actual_cpu}'>
+    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
+  </cpu>"""
     else:
         cpu_xml = f"""<cpu mode='custom' match='exact'>
     <model>{actual_cpu}</model>
-    <topology sockets='1' dies='1' clusters='1' cores='{vcpu}' threads='1'/>
+    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
   </cpu>"""
 
     if is_vmware:
@@ -972,6 +978,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
   {uuid_xml}
   <memory unit='MiB'>{memory}</memory>
   <vcpu placement='static'>{vcpu}</vcpu>
+  <iothreads>1</iothreads>
   <os>
     {os_boot_xml}
   </os>
