@@ -1,0 +1,559 @@
+<!doctype html>
+<html>
+    <head>
+        <title>VNC Console</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" type="text/css" href="vnc.css?v=1.0.18" />
+
+        <script type="module" crossorigin="anonymous">
+            import RFB from './novnc/rfb.js?v=1.0.18';
+
+            // Global Fetch Interceptor in vnc_auto.html
+            const originalFetch = window.fetch;
+            window.fetch = async function(input, init) {
+                let options = init || {};
+                let token = null;
+                try {
+                    token = localStorage.getItem('helios_session_token');
+                } catch (e) {}
+                
+                // Rewrite relative endpoints to point to the cluster VIP when running locally
+                const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+                if (isLocal) {
+                    if (input instanceof Request) {
+                        try {
+                            const urlObj = new URL(input.url);
+                            if (urlObj.origin === window.location.origin) {
+                                const newUrl = 'https://10.10.102.130' + urlObj.pathname + urlObj.search;
+                                input = new Request(newUrl, input);
+                            }
+                        } catch (e) {}
+                    } else if (typeof input === 'string' && input.startsWith('/')) {
+                        input = 'https://10.10.102.130' + input;
+                    }
+                }
+
+                if (token) {
+                    if (input instanceof Request) {
+                        try {
+                            const newHeaders = new Headers(input.headers);
+                            newHeaders.set('Authorization', `Bearer ${token}`);
+                            input = new Request(input, { headers: newHeaders });
+                        } catch (e) {}
+                    } else {
+                        if (!options.headers) {
+                            options.headers = {};
+                        }
+                        if (options.headers instanceof Headers) {
+                            options.headers.set('Authorization', `Bearer ${token}`);
+                        } else if (Array.isArray(options.headers)) {
+                            let hasAuth = false;
+                            for (let i = 0; i < options.headers.length; i++) {
+                                if (options.headers[i][0].toLowerCase() === 'authorization') {
+                                    hasAuth = true;
+                                    break;
+                                }
+                            }
+                            if (!hasAuth) {
+                                options.headers.push(['Authorization', `Bearer ${token}`]);
+                            }
+                        } else {
+                            if (!options.headers['Authorization'] && !options.headers['authorization']) {
+                                options.headers['Authorization'] = `Bearer ${token}`;
+                            }
+                        }
+                    }
+                }
+                return originalFetch(input, options);
+            };
+
+            var host = null, port = null;
+            var rfb = null;
+            var vncRetryCount = 0;
+            var vncRetryTimeout = null;
+
+            function vnc_query_var(name, defvalue) {
+                var match = RegExp('[?&]' + name + '=([^&]*)')
+                                  .exec(window.location.search);
+                return match ?
+                    decodeURIComponent(match[1].replace(/\+/g, ' '))
+                    : defvalue;
+            }
+
+            var path = vnc_query_var('path', '');
+            var vmName = vnc_query_var('name', '');
+            if (path) {
+                var nameMatch = RegExp('[?&]name=([^&]*)').exec(path);
+                if (nameMatch) {
+                    vmName = decodeURIComponent(nameMatch[1]);
+                }
+            }
+
+            function display_hostname() {
+                var params = new URLSearchParams(window.location.search);
+                var titleVal = params.get('title') || params.get('name') || vmName || 'Host Console';
+                var cleanName = titleVal.split('(')[0].trim();
+                document.getElementById('hostname').textContent = cleanName;
+                document.title = cleanName + " - VNC Console";
+            }
+
+            // Performance tracking
+            let frameTimestamps = [];
+            let frameIntervals = [];
+            let latencyHistory = [];
+            let currentLatency = 0;
+            let metricIntervalId = null;
+            let pingIntervalId = null;
+
+            async function measureLatency() {
+                const start = performance.now();
+                try {
+                    await fetch(`/api/vms/console/ping?t=${Date.now()}`);
+                    currentLatency = performance.now() - start;
+                    latencyHistory.push(currentLatency);
+                    if (latencyHistory.length > 5) {
+                        latencyHistory.shift();
+                    }
+                } catch (e) {
+                    console.error("Latency check failed:", e);
+                }
+            }
+
+            function startMetricLogging() {
+                if (metricIntervalId) clearInterval(metricIntervalId);
+                if (pingIntervalId) clearInterval(pingIntervalId);
+                
+                // Clear state
+                frameTimestamps = [];
+                frameIntervals = [];
+                latencyHistory = [];
+                currentLatency = 0;
+
+                // Ping every 5 seconds
+                measureLatency();
+                pingIntervalId = setInterval(measureLatency, 5000);
+
+                // Send metrics to server every 10 seconds
+                metricIntervalId = setInterval(() => {
+                    if (!rfb || !vmName) return;
+
+                    // Calculate average FPS in the last 10 seconds
+                    const now = performance.now();
+                    const tenSecsAgo = now - 10000;
+                    frameTimestamps = frameTimestamps.filter(t => t >= tenSecsAgo);
+                    
+                    let avgFps = 0;
+                    if (frameTimestamps.length > 1) {
+                        const durationSec = (frameTimestamps[frameTimestamps.length - 1] - frameTimestamps[0]) / 1000;
+                        if (durationSec > 0) {
+                            avgFps = (frameTimestamps.length - 1) / durationSec;
+                        }
+                    }
+
+                    // Calculate 1% low FPS from intervals
+                    let lowFps = 0;
+                    if (frameIntervals.length > 0) {
+                        const sortedFps = frameIntervals.map(ms => 1000 / ms).sort((a, b) => a - b);
+                        const index = Math.floor(sortedFps.length * 0.01);
+                        lowFps = sortedFps[index];
+                    } else if (avgFps > 0) {
+                        lowFps = avgFps; // Fallback to avg
+                    }
+
+                    // Average latency
+                    let avgLatency = currentLatency;
+                    if (latencyHistory.length > 0) {
+                        avgLatency = latencyHistory.reduce((a, b) => a + b, 0) / latencyHistory.length;
+                    }
+
+                    // POST metrics to backend
+                    fetch('/api/vms/console/metrics', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            vm_name: vmName,
+                            avg_fps: avgFps,
+                            low_fps: lowFps,
+                            latency: avgLatency
+                        })
+                    }).catch(err => console.error("Failed to report console metrics:", err));
+
+                }, 10000);
+            }
+
+            function stopMetricLogging() {
+                if (pingIntervalId) {
+                    clearInterval(pingIntervalId);
+                    pingIntervalId = null;
+                }
+                if (metricIntervalId) {
+                    clearInterval(metricIntervalId);
+                    metricIntervalId = null;
+                }
+            }
+
+            function connect()
+            {
+                if (rfb) {
+                    try { rfb.disconnect(); } catch(e){}
+                }
+
+                stopMetricLogging();
+                document.getElementById('vnc-loading-overlay').style.display = 'flex';
+                document.getElementById('vnc-disconnected-overlay').style.display = 'none';
+
+                var token = '';
+                try {
+                    var queryToken = vnc_query_var('token', '');
+                    if (queryToken) {
+                        localStorage.setItem('helios_session_token', queryToken);
+                    }
+                    token = sessionStorage.getItem('helios_session_token') || localStorage.getItem('helios_session_token') || '';
+                } catch (e) {}
+
+                // Fetch a proper console token first
+                fetch(`/api/vms/console/token?name=${vmName}&type=vnc&token=${token}`)
+                .then(res => {
+                    if (!res.ok) throw new Error("VNC Token fetch failed");
+                    return res.json();
+                })
+                .then(data => {
+                    var wsHost = window.location.host;
+                    if (wsHost.startsWith('localhost') || wsHost.startsWith('127.0.0.1')) {
+                        wsHost = '10.10.102.130';
+                    }
+                    var protocol = wsHost === '10.10.102.130' ? 'wss:' : (window.location.protocol === 'https:' ? 'wss:' : 'ws:');
+                    var wsUrl = `${protocol}//${wsHost}/api/vms/console/ws?token=${data.token}`;
+
+                    console.log("Connecting VNC to url: " + wsUrl);
+                    var container = document.getElementById('vnc-screen');
+                    container.innerHTML = ''; // Clear canvas
+
+                    rfb = new RFB(container, wsUrl);
+                    rfb.scaleViewport = false;
+                    rfb.resizeSession = true;
+                    applyConnectionProfile();
+
+                    rfb.addEventListener('connect', () => {
+                        vncRetryCount = 0;
+                        document.getElementById('vnc-loading-overlay').style.display = 'none';
+                        startMetricLogging();
+                    });
+
+                    rfb.addEventListener('fbucomplete', () => {
+                        const now = performance.now();
+                        frameTimestamps.push(now);
+                        if (frameTimestamps.length > 1) {
+                            const interval = frameTimestamps[frameTimestamps.length - 1] - frameTimestamps[frameTimestamps.length - 2];
+                            frameIntervals.push(interval);
+                            if (frameIntervals.length > 100) {
+                                frameIntervals.shift();
+                            }
+                        }
+                    });
+
+                    rfb.addEventListener('disconnect', (e) => {
+                        stopMetricLogging();
+                        if (vncRetryCount < 6) {
+                            vncRetryCount++;
+                            var loaderText = document.getElementById('vnc-loader-text');
+                            if (loaderText) loaderText.textContent = `Retrying VNC Connection (${vncRetryCount}/6)...`;
+                            
+                            vncRetryTimeout = setTimeout(() => {
+                                connect();
+                            }, 2000);
+                        } else {
+                            showVncDisconnected("Session Disconnected", "VNC graphics connection closed by target or client request.");
+                        }
+                    });
+                })
+                .catch(err => {
+                    console.error("VNC token fetch failed:", err);
+                    showVncDisconnected("Authentication Failed", "Failed to fetch VNC console credentials: " + err.message);
+                });
+            }
+
+            function showVncDisconnected(title, desc) {
+                document.getElementById('vnc-loading-overlay').style.display = 'none';
+                document.getElementById('vnc-disconnected-overlay').style.display = 'flex';
+                document.getElementById('vnc-disconnect-reason').textContent = title;
+                document.getElementById('vnc-disconnect-desc').textContent = desc;
+            }
+
+            function updatePowerButtons() {
+                if (!vmName) return;
+                fetch('/api/status')
+                .then(res => res.json())
+                .then(data => {
+                    const vm = data.vms && data.vms.list ? data.vms.list.find(v => v.name === vmName) : null;
+                    const container = document.getElementById('console-power-controls');
+                    if (!container) return;
+                    container.innerHTML = '';
+                    
+                    if (!vm) return;
+                    
+                    if (vm.status === 'running') {
+                        const stopBtn = document.createElement('button');
+                        stopBtn.innerHTML = 'Stop';
+                        stopBtn.style.borderColor = 'var(--color-danger)';
+                        stopBtn.addEventListener('click', () => executePowerAction('stop'));
+                        
+                        const resetBtn = document.createElement('button');
+                        resetBtn.innerHTML = 'Reset';
+                        resetBtn.style.borderColor = 'var(--color-warning)';
+                        resetBtn.addEventListener('click', () => executePowerAction('reset'));
+                        
+                        container.appendChild(resetBtn);
+                        container.appendChild(stopBtn);
+                    } else {
+                        const startBtn = document.createElement('button');
+                        startBtn.innerHTML = 'Start';
+                        startBtn.style.borderColor = 'var(--color-success)';
+                        startBtn.addEventListener('click', () => executePowerAction('start'));
+                        container.appendChild(startBtn);
+                    }
+                })
+                .catch(err => console.error("Failed to fetch VM status:", err));
+            }
+
+            function executePowerAction(action) {
+                if (!vmName) return;
+                const container = document.getElementById('console-power-controls');
+                if (container) {
+                    Array.from(container.getElementsByTagName('button')).forEach(b => b.disabled = true);
+                }
+                
+                fetch('/api/vms/power', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: vmName, action: action })
+                })
+                .then(res => {
+                    if (!res.ok) return res.json().then(e => { throw new Error(e.error || 'Action failed') });
+                    return res.json();
+                })
+                .then(data => {
+                    if (action === 'start') {
+                        vncRetryCount = 0;
+                        setTimeout(() => {
+                            connect();
+                            updatePowerButtons();
+                        }, 2000);
+                    } else {
+                        updatePowerButtons();
+                    }
+                })
+                .catch(err => {
+                    alert("Power Action Failed: " + err.message);
+                    updatePowerButtons();
+                });
+            }
+
+            // Keyboard Layouts list
+            document.getElementById('novnc-kbd-close').addEventListener('click', () => { close_nav(); });
+
+            // Clipboard Sync
+            document.getElementById('novnc-clip-sync').addEventListener('click', () => {
+                const text = document.getElementById('novnc-clipboard-text').value;
+                if (rfb) {
+                    rfb.sendClipboard(text);
+                    alert("Clipboard text sent to VM!");
+                }
+            });
+
+            // CD-ROM Media mount
+            function loadCDROMImages() {
+                const select = document.getElementById('novnc-cdrom-select');
+                if (!select) return;
+                fetch('/api/images')
+                .then(res => res.json())
+                .then(data => {
+                    select.innerHTML = '<option value="">Empty Drive</option>';
+                    const isos = data.images || data;
+                    if (Array.isArray(isos)) {
+                        isos.forEach(img => {
+                            if (img.type === 'iso' || img.filename.endsWith('.iso')) {
+                                const opt = document.createElement('option');
+                                opt.value = img.name;
+                                opt.textContent = img.name;
+                                select.appendChild(opt);
+                            }
+                        });
+                    }
+                })
+                .catch(err => console.error("CD-ROM Fetch Error:", err));
+            }
+
+            document.getElementById('novnc-cdrom-mount').addEventListener('click', () => {
+                const isoVal = document.getElementById('novnc-cdrom-select').value;
+                fetch('/api/vms/cdrom', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: vmName, iso: isoVal })
+                })
+                .then(res => {
+                    if (!res.ok) throw new Error('CD-ROM command failed');
+                    return res.json();
+                })
+                .then(data => {
+                    alert("CD-ROM media mounted: " + data.message);
+                    close_nav();
+                })
+                .catch(err => {
+                    alert("CD-ROM Mount failed: " + err.message);
+                });
+            });
+
+            // Reconnect button
+            document.getElementById('vnc-btn-reconnect').addEventListener('click', () => {
+                vncRetryCount = 0;
+                connect();
+            });
+
+            // Window resize handler to trigger guest resolution changes
+            window.addEventListener('resize', () => {
+                if (rfb) {
+                    try {
+                        rfb._requestRemoteResize();
+                    } catch (e) {
+                        console.error("Failed to request remote resize:", e);
+                    }
+                }
+            });
+
+            function applyConnectionProfile() {
+                if (!rfb) return;
+                const select = document.getElementById('vnc-profile-select');
+                if (!select) return;
+                const val = select.value;
+                
+                let qLvl = 6;
+                let cLvl = 3;
+                let desc = "Balanced (Standard)";
+                
+                if (val === 'high-quality') {
+                    qLvl = 9;
+                    cLvl = 1;
+                    desc = "High Quality (Lossless, Low CPU)";
+                } else if (val === 'balanced') {
+                    qLvl = 6;
+                    cLvl = 4;
+                    desc = "Balanced (Medium Compression)";
+                } else if (val === 'performance') {
+                    qLvl = 3;
+                    cLvl = 9;
+                    desc = "High Performance (Max Compression)";
+                }
+                
+                rfb.qualityLevel = qLvl;
+                rfb.compressionLevel = cLvl;
+                
+                // Show status feedback
+                const statusDiv = document.getElementById('vnc-profile-status');
+                if (statusDiv) {
+                    statusDiv.textContent = `Applied: ${desc}`;
+                    statusDiv.style.opacity = '1';
+                    
+                    // Force fade out after 3 seconds
+                    if (window.profileStatusTimeout) {
+                        clearTimeout(window.profileStatusTimeout);
+                    }
+                    window.profileStatusTimeout = setTimeout(() => {
+                        statusDiv.style.opacity = '0';
+                    }, 3000);
+                }
+                console.log(`[VNC Profile] Set qualityLevel=${qLvl}, compressionLevel=${cLvl}`);
+            }
+
+            document.getElementById('vnc-profile-apply').addEventListener('click', applyConnectionProfile);
+
+            display_hostname();
+            updatePowerButtons();
+            setInterval(updatePowerButtons, 5000);
+            loadCDROMImages();
+            connect();
+
+            // Sidenav event bindings for click
+            document.getElementById('sendCtrlAltDel').addEventListener('click', function() {
+                if (rfb) {
+                    rfb.sendCtrlAltDel();
+                }
+            });
+        </script>
+
+        <script>
+            function open_nav() {
+                document.getElementById('Sidenav').className = 'SidenavOpen';
+            }
+            function close_nav() {
+                document.getElementById('Sidenav').className = 'SidenavClosed';
+            }
+        </script>
+    </head>
+    <body>
+        <div id="login">
+            <button onclick="open_nav()">&#9776; VNC</button>
+            <p id="hostname">Host Console</p>
+            <div id="console-power-controls" style="margin-left: auto; display: flex; gap: 8px;"></div>
+        </div>
+
+        <div id="Sidenav" class="SidenavClosed" style="width: 0;">
+            <p class="closebtn" onclick="close_nav()">&#10006;</p>
+            
+            <div class="sidenav-section">
+                <h4>System Actions</h4>
+                <button id="sendCtrlAltDel">Send Ctrl-Alt-Delete</button>
+            </div>
+
+            <div class="sidenav-section">
+                <h4>Connection Profile</h4>
+                <select id="vnc-profile-select" style="margin-bottom: 8px;">
+                    <option value="high-quality">High Quality (LAN)</option>
+                    <option value="balanced" selected>Balanced (Standard)</option>
+                    <option value="performance">High Performance (VPN)</option>
+                </select>
+                <button id="vnc-profile-apply" style="margin-bottom: 4px;">Apply Profile</button>
+                <div id="vnc-profile-status" style="font-size: 10px; color: var(--color-success); text-align: center; opacity: 0; transition: opacity 0.3s; margin-top: 4px; font-weight: 600;">Profile applied!</div>
+            </div>
+
+            <div class="sidenav-section">
+                <h4>CD-ROM Media</h4>
+                <select id="novnc-cdrom-select">
+                    <option value="">Empty Drive</option>
+                </select>
+                <button id="novnc-cdrom-mount">Mount CD-ROM</button>
+            </div>
+
+            <div class="sidenav-section">
+                <h4>Clipboard Sync</h4>
+                <textarea id="novnc-clipboard-text" placeholder="Type text to send to VM..."></textarea>
+                <button id="novnc-clip-sync">Send text</button>
+            </div>
+
+            <div class="sidenav-section">
+                <h4>Virtual Keyboard</h4>
+                <button id="novnc-kbd-close">Done</button>
+            </div>
+        </div>
+
+        <div id="vnc-area">
+            <div id="vnc-screen" class="vnc-screen"></div>
+
+            <!-- Loading overlay -->
+            <div class="vnc-overlay" id="vnc-loading-overlay">
+                <div class="vnc-spinner"></div>
+                <div style="font-family:'Space Grotesk',sans-serif; font-size:14px; font-weight:600; color:#fff;" id="vnc-loader-text">Connecting to VNC Console...</div>
+            </div>
+
+            <!-- Disconnect overlay -->
+            <div class="vnc-overlay" id="vnc-disconnected-overlay" style="display:none; background:#06080c; color:var(--text-muted);">
+                <svg viewBox="0 0 24 24" style="width:48px; height:48px; fill:var(--color-danger); opacity:0.6;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                <div style="font-family:'Space Grotesk',sans-serif; font-size:15px; font-weight:600; color:#fff; margin-top:10px;" id="vnc-disconnect-reason">VM is Powered Off</div>
+                <div style="font-size:12px; margin-top:5px; text-align:center; max-width:300px;" id="vnc-disconnect-desc">Please ensure the virtual machine is running.</div>
+                <button class="btn btn-primary" style="height:32px; font-size:11px; margin-top:15px; background:var(--color-primary); color:white; border:none; padding: 0 16px; border-radius: 6px; cursor:pointer;" id="vnc-btn-reconnect">Reconnect VNC</button>
+            </div>
+        </div>
+    </body>
+</html>
