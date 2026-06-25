@@ -121,6 +121,44 @@ def linstor_ha_loop():
                     if role == "Primary":
                         print("[Mipha HA] Follower State: Demoting linstor-db to Secondary...")
                         run_command_local("drbdadm secondary linstor-db || true")
+
+            # Align default storage containers (default-vm-container and default-image-container)
+            for container in ["default-vm-container", "default-image-container"]:
+                if os.path.exists(f"/etc/drbd.d/{container}.res"):
+                    mount_path = f"/var/lib/hci/aether/volumes/{container}"
+                    if is_leader:
+                        os.makedirs(mount_path, exist_ok=True)
+                        rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
+                        mounted = (rc_m == 0)
+                        role = get_local_drbd_role(container)
+                        
+                        if not mounted or role != "Primary":
+                            print(f"[Mipha HA] Leader State: {container} role={role}, mounted={mounted}. Aligning to active...")
+                            
+                            # Release on peer standby nodes
+                            hosts = get_cluster_hosts()
+                            for h in hosts:
+                                ip = h.get("ip")
+                                if ip and ip != LOCAL_IP:
+                                    if ping_host(ip):
+                                        stop_cmd = f"umount -l {mount_path} || true; drbdadm secondary {container} || true"
+                                        run_remote_spark(ip, stop_cmd)
+                                        
+                            if role != "Primary":
+                                run_command_local(f"drbdadm primary {container}")
+                            
+                            rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
+                            if rc_m != 0:
+                                run_command_local(f"mount -t xfs /dev/drbd/by-res/{container}/0 {mount_path}")
+                    else:
+                        rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
+                        if rc_m == 0:
+                            print(f"[Mipha HA] Follower State: Unmounting {container}...")
+                            run_command_local(f"umount -l {mount_path} || true")
+                        role = get_local_drbd_role(container)
+                        if role == "Primary":
+                            print(f"[Mipha HA] Follower State: Demoting {container} to Secondary...")
+                            run_command_local(f"drbdadm secondary {container} || true")
                         
         except Exception as ex:
             sys.stderr.write(f"[Mipha HA] Error in Linstor HA loop: {ex}\n")
