@@ -1127,7 +1127,8 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         followers = 0
         zk_healthy = True
         for ip in ips:
-            rc_zk, out_zk, _ = run_remote_spark(ip, "podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 stat 2>&1")
+            zk_cmd = "python3 -c \"import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 2181)); s.sendall(b'stat'); print(s.recv(1024).decode('utf-8', errors='ignore'))\""
+            rc_zk, out_zk, _ = run_remote_spark(ip, zk_cmd)
             if rc_zk == 0 and "Mode:" in out_zk:
                 mode = "unknown"
                 for line in out_zk.splitlines():
