@@ -2,6 +2,8 @@
 
 Slate is a Traefik-based edge reverse proxy and ingress service integrated into the container-hci cluster. It runs as a Quadlet-managed container on port `443` on every node.
 
+> **Name Origin:** Named after the **Sheikah Slate**, the ancient, multi-purpose hand-held tablet from *The Legend of Zelda: Breath of the Wild* that Link uses to activate towers, control runes, and interface with ancient technology. Similarly, **Slate** acts as the cluster's ingress gateway, bridging the client WebUI to internal VM consoles (VNC/SPICE) and cluster APIs.
+
 ## Purpose and Motivation
 
 Before Slate was introduced, browser security restrictions prevented direct connections to VM consoles:
