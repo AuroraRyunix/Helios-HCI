@@ -63,6 +63,22 @@ During startup, the Spectrum container (`systemd-spectrum`) establishes a connec
 ### 2. Task Cache Fallback
 To ensure UI responsiveness, the `/api/catalyst/tasks` endpoint maintains an in-memory cache of recent tasks. If a database query fails due to temporary connection latency or quorum changes, Spectrum serves the cached task list rather than throwing an error, preventing the UI progress indicator from resetting to grey.
 
+### 3. Guest Display Auto-Resize (Windows vgpusrv Service)
+When using the VirtIO-GPU display driver (`viogpu` / `viogpudo`) in Windows guests, dynamic resolution auto-resizing via the VNC standard `SetDesktopSize` command is supported only if the user-mode helper service (`vgpusrv.exe`) is registered and active in the guest. By default, standard Windows driver setup installs the kernel display driver but does not register this service.
+
+To resolve display auto-resize constraints inside Windows guests:
+1. Open PowerShell or Command Prompt as **Administrator** inside the guest OS.
+2. Locate `vgpusrv.exe` (on the mounted VirtIO CD-ROM under `viogpudo\2k12\amd64\vgpusrv.exe` or local path `C:\Program Files\Qemu-Ga\vgpusrv.exe`).
+3. Execute the service installer:
+   ```cmd
+   vgpusrv.exe -i
+   ```
+4. Start the service:
+   ```cmd
+   net start vgpusrv
+   ```
+This configures `vgpusrv` to start automatically on system boot, enabling the guest OS to dynamically adjust its display resolution when the VNC console's browser window is resized.
+
 ---
 
 ## Command Examples & Syntax
