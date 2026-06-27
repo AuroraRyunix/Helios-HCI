@@ -778,7 +778,7 @@ def deploy_to_node(ip):
                 
             # 11. Restart systemd-spectrum service
             print(f"[{ip}] Restarting spectrum service...")
-            stdin, stdout, stderr = ssh.exec_command("systemctl restart spectrum")
+            stdin, stdout, stderr = ssh.exec_command("systemctl stop spectrum && podman rm -f systemd-spectrum && systemctl start spectrum")
             exit_code = stdout.channel.recv_exit_status()
             if exit_code != 0:
                 print(f"[{ip}] Error restarting spectrum service: {stderr.read().decode()}")

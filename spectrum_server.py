@@ -1,5 +1,6 @@
 __build__ = "1.2.0-b4081"
 import os
+import uuid
 import sys
 import json
 import ssl
@@ -4082,7 +4083,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             if not filename:
                 filename = self.headers.get("X-File-Name", "uploaded_image.iso")
                 
-            import uuid
+            # import uuid
             task_id = str(uuid.uuid4())
             import datetime
             created_at_ms = int(datetime.datetime.now().timestamp() * 1000)
@@ -4982,7 +4983,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
 
-            import uuid
+            # import uuid
             net_id = str(uuid.uuid4())
             cql = f"INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id) VALUES ({net_id}, '{name}', '{net_type}', {vlan_val});"
             rc, stdout, stderr = run_cql_query(cql)
@@ -5066,7 +5067,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid Uplink CIDR or Gateway IP: {str(e)}"})
                 return
 
-            import uuid
+            # import uuid
             router_id = str(uuid.uuid4())
             cql = f"""
             INSERT INTO hydra.urbosa_t0_routers (router_id, name, uplink_interface, uplink_ip, gateway_ip, nat_rules)
@@ -5120,7 +5121,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            import uuid
+            # import uuid
             router_id = str(uuid.uuid4())
             cql = f"""
             INSERT INTO hydra.urbosa_t1_routers (router_id, name, t0_link_id, dhcp_enabled)
@@ -5202,7 +5203,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid CIDR network format, gateway IP, or DHCP range: {str(e)}"})
                 return
 
-            import uuid
+            # import uuid
             segment_id = str(uuid.uuid4())
             cql = f"""
             INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end)
@@ -5338,7 +5339,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            import uuid
+            # import uuid
             rule_id = str(uuid.uuid4())
             cql = f"""
             INSERT INTO hydra.urbosa_firewall_rules (rule_id, description, source_ip, dest_ip, protocol, port, action, priority)
