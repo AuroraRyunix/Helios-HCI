@@ -3484,7 +3484,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 # Save job state in ScyllaDB
                 manifest_json = json.dumps(manifest).replace("'", "''")
                 changelog_escaped = changelog_content.replace("'", "''")
-                nodes_list_str = str(target_nodes).replace("'", '"')
+                nodes_list_str = "[" + ", ".join([f"'{ip}'" for ip in target_nodes]) + "]"
                 
                 # Delete any old LCM jobs
                 hylia.run_cql_query("TRUNCATE hydra.hylia_jobs;")
