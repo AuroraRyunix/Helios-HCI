@@ -85,7 +85,7 @@ def get_dfs_engine():
     return "linstor"
 
 def show_status_json():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -97,6 +97,7 @@ def show_status_json():
         "mimir": "Mimir",
         "vali": "Vali",
         "catalyst": "Catalyst",
+        "hylia": "Hylia",
         "gatoway": "Gatoway",
         "logos": "Logos",
         "mipha": "Mipha",
@@ -169,7 +170,7 @@ def show_status_json():
                 healthy = check_tcp_port(3366, ip_addr)
  
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
+            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
@@ -192,7 +193,7 @@ def show_status_json():
     print(json.dumps(result))
  
 def show_status():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -204,6 +205,7 @@ def show_status():
         "mimir": "Mimir",
         "vali": "Vali",
         "catalyst": "Catalyst",
+        "hylia": "Hylia",
         "gatoway": "Gatoway",
         "logos": "Logos",
         "mipha": "Mipha",
@@ -286,7 +288,7 @@ def show_status():
                 healthy = check_tcp_port(3366, ip_addr)
 
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
+            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
@@ -350,7 +352,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "aether", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "aether", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":
