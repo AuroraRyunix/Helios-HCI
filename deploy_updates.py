@@ -66,6 +66,7 @@ local_logos = "logos.py"
 local_mipha = "mipha.py"
 local_urbosa_bootstrap = "urbosa_bootstrap.py"
 local_daruk = "daruk.py"
+local_yggdrasil = "hylia.py"
 
 local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
@@ -138,6 +139,26 @@ Environment=PYTHONUNBUFFERED=1
 CPUWeight=100
 MemoryMax=256M
 MemoryHigh=200M
+"""
+
+yggdrasil_service_content = """[Unit]
+Description=Hylia HA Life Cycle Management Daemon
+After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hylia
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
+
+[Install]
+WantedBy=multi-user.target
 """
 
 dagur_service_content = """[Unit]
@@ -475,6 +496,16 @@ def deploy_to_node(ip):
             f_miph = sftp.open("/etc/systemd/system/mipha.service", "w")
             f_miph.write(mipha_service_content)
             f_miph.close()
+
+            # Copy hylia daemon
+            print(f"[{ip}] Uploading hylia daemon to /usr/local/bin/hylia...")
+            put_text_file(sftp, local_yggdrasil, "/usr/local/bin/hylia")
+            
+            # Write hylia systemd unit
+            print(f"[{ip}] Writing hylia.service unit...")
+            f_ygg = sftp.open("/etc/systemd/system/hylia.service", "w")
+            f_ygg.write(yggdrasil_service_content)
+            f_ygg.close()
     
             # 2j. Copy catalyst daemon
             print(f"[{ip}] Uploading catalyst daemon to /usr/local/bin/catalyst...")
@@ -625,7 +656,7 @@ def deploy_to_node(ip):
             
             # 4. Make executables runnable
             print(f"[{ip}] Setting executable permissions...")
-            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/urbosa-bootstrap")
+            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap")
             
             # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
             print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")
@@ -770,6 +801,7 @@ def deploy_to_node(ip):
                 "systemctl enable urbosa && systemctl restart urbosa || true",
                 "systemctl enable logos && systemctl restart logos || true",
                 "systemctl enable mipha && systemctl restart mipha || true",
+                "systemctl enable hylia && systemctl restart hylia || true",
                 "systemctl stop helios-config-syncer || true",
                 "systemctl disable helios-config-syncer || true",
                 "rm -f /etc/systemd/system/helios-config-syncer.service || true",

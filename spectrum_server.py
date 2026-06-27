@@ -1,3 +1,4 @@
+__build__ = "1.2.0-b4081"
 import os
 import sys
 import json
@@ -1040,6 +1041,25 @@ def init_db():
     ) WITH CLUSTERING ORDER BY (timestamp DESC)
       AND default_time_to_live = 86400;
     """
+    create_yggdrasil_jobs = """
+    CREATE TABLE IF NOT EXISTS hydra.hylia_jobs (
+        job_id uuid PRIMARY KEY,
+        state text,
+        target_nodes list<text>,
+        current_node text,
+        build_number text,
+        manifest_json text,
+        changelog_md text
+    );
+    """
+    create_yggdrasil_logs = """
+    CREATE TABLE IF NOT EXISTS hydra.hylia_logs (
+        job_id uuid,
+        timestamp timestamp,
+        log_line text,
+        PRIMARY KEY (job_id, timestamp)
+    ) WITH CLUSTERING ORDER BY (timestamp ASC);
+    """
 
     # Retry loop since ScyllaDB may take a moment to bootstrap on boot
     for i in range(15):
@@ -1066,9 +1086,12 @@ def init_db():
             rc18, out18, err18 = run_cql_query(create_urbosa_tunnel_metrics)
             rc_nv, out_nv, err_nv = run_cql_query(create_vm_nvram)
             rc_cm, out_cm, err_cm = run_cql_query(create_console_metrics)
+            rc_yj, out_yj, err_yj = run_cql_query(create_yggdrasil_jobs)
+            rc_yl, out_yl, err_yl = run_cql_query(create_yggdrasil_logs)
             if (rc2 == 0 and rc3 == 0 and rc4 == 0 and rc5 == 0 and rc6 == 0 and 
                 rc7 == 0 and rc8 == 0 and rc9 == 0 and rc_cs == 0 and rc10 == 0 and rc11 == 0 and rc12 == 0 and rc13 == 0 and
-                rc14 == 0 and rc15 == 0 and rc16 == 0 and rc17 == 0 and rc18 == 0 and rc_nv == 0 and rc_cm == 0):
+                rc14 == 0 and rc15 == 0 and rc16 == 0 and rc17 == 0 and rc18 == 0 and rc_nv == 0 and rc_cm == 0 and
+                rc_yj == 0 and rc_yl == 0):
                 print("Tables checked/created successfully.")
                 run_cql_query(insert_default)
                 run_cql_query(insert_default_image_container)
@@ -1846,6 +1869,73 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"authenticated": True, "username": getattr(self, "current_user", "")})
             else:
                 self.send_json(200, {"authenticated": False})
+            return
+
+        elif path == "/api/lcm/upgrade/status":
+            try:
+                sys.path.append("/usr/local/bin")
+                sys.path.append(".")
+                try:
+                    import hylia
+                except ImportError:
+                    import hylia
+                    
+                rc, stdout, _ = run_cql_query("SELECT JSON job_id, state, target_nodes, current_node, build_number FROM hydra.hylia_jobs;")
+                if rc != 0 or not stdout or not stdout.strip():
+                    self.send_json(200, {"status": "IDLE", "logs": [], "progress": 0})
+                    return
+                
+                job = json.loads(stdout.splitlines()[0])
+                job_id = job.get("job_id")
+                state = job.get("state")
+                target_nodes = job.get("target_nodes", [])
+                current_node = job.get("current_node", "")
+                build_number = job.get("build_number", "")
+                
+                # Fetch logs
+                logs = []
+                rc_l, stdout_l, _ = run_cql_query(f"SELECT JSON timestamp, log_line FROM hydra.hylia_logs WHERE job_id = {job_id};")
+                if rc_l == 0 and stdout_l:
+                    for line in stdout_l.splitlines():
+                        if line.strip():
+                            log_entry = json.loads(line)
+                            logs.append(log_entry.get("log_line"))
+                            
+                # Calculate progress
+                progress = 0
+                if state == "COMPLETED":
+                    progress = 100
+                elif state == "FAILED":
+                    progress = 100
+                elif state == "UPGRADING" and target_nodes:
+                    if current_node in target_nodes:
+                        node_idx = target_nodes.index(current_node)
+                        progress = int(((node_idx) / len(target_nodes)) * 100)
+                        
+                        # Sub-progress estimation from log analysis
+                        sub_prog = 0
+                        for l in logs:
+                            if current_node in l or (current_node == "127.0.0.1" and "127.0.0.1" in l):
+                                if "maintenance" in l.lower():
+                                    sub_prog = 5
+                                elif "deploy" in l.lower() or "cop" in l.lower():
+                                    sub_prog = 15
+                                elif "reboot" in l.lower():
+                                    sub_prog = 25
+                                elif "restore" in l.lower():
+                                    sub_prog = 30
+                        progress += int(sub_prog * (1.0 / len(target_nodes)))
+                        
+                self.send_json(200, {
+                    "status": state,
+                    "current_node": current_node,
+                    "target_nodes": target_nodes,
+                    "build_number": build_number,
+                    "progress": min(progress, 100),
+                    "logs": logs
+                })
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
             return
 
         elif path == "/api/settings":
@@ -3334,6 +3424,123 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        elif path == "/api/lcm/upload":
+            try:
+                if content_length <= 0:
+                    self.send_json(400, {"error": "Content-Length must be greater than zero."})
+                    return
+                
+                zip_path = "/tmp/helios_update.zip"
+                extract_dir = "/tmp/yggdrasil_update"
+                
+                # Stream the upload in chunks of 64KB directly to the file
+                chunk_size = 64 * 1024
+                bytes_remaining = content_length
+                
+                with open(zip_path, "wb") as f_out:
+                    while bytes_remaining > 0:
+                        chunk_to_read = min(chunk_size, bytes_remaining)
+                        chunk = self.rfile.read(chunk_to_read)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+                        bytes_remaining -= len(chunk)
+                        
+                sys.path.append("/usr/local/bin")
+                sys.path.append(".")
+                try:
+                    import hylia
+                except ImportError:
+                    import hylia
+                    
+                manifest, changelog_content = hylia.validate_and_extract_zip(zip_path, extract_dir)
+                
+                # Check current version and build numbers
+                components_preview = []
+                components = manifest.get("components", {})
+                for comp_name, comp_info in components.items():
+                    comp_file = comp_info.get("file")
+                    target_path = comp_info.get("target_path", f"/usr/local/bin/{comp_name}")
+                    
+                    # Read current build number from host disk
+                    current_build = hylia.get_service_build_number(target_path)
+                    new_build = manifest.get("build", "Unknown")
+                    
+                    components_preview.append({
+                        "name": comp_name,
+                        "file": comp_file,
+                        "current_build": current_build,
+                        "new_build": new_build
+                    })
+                    
+                # Generate a UUID for the job
+                job_id = str(uuid.uuid4())
+                target_nodes = [h["ip"] for h in hylia.get_cluster_hosts()]
+                if not target_nodes:
+                    target_nodes = ["127.0.0.1"]
+                    
+                # Save job state in ScyllaDB
+                manifest_json = json.dumps(manifest).replace("'", "''")
+                changelog_escaped = changelog_content.replace("'", "''")
+                nodes_list_str = str(target_nodes).replace("'", '"')
+                
+                # Delete any old LCM jobs
+                hylia.run_cql_query("TRUNCATE hydra.hylia_jobs;")
+                hylia.run_cql_query("TRUNCATE hydra.hylia_logs;")
+                
+                cql = f"""
+                INSERT INTO hydra.hylia_jobs (
+                    job_id, state, target_nodes, current_node, build_number, manifest_json, changelog_md
+                ) VALUES (
+                    {job_id}, 'IDLE', {nodes_list_str}, '', '{manifest.get("version", "1.2.0")}-b{manifest.get("build", "0000")}', '{manifest_json}', '{changelog_escaped}'
+                );
+                """
+                rc, _, err_db = hylia.run_cql_query(cql)
+                if rc != 0:
+                    raise Exception(f"Database error saving upgrade job: {err_db}")
+                    
+                self.send_json(200, {
+                    "status": "success",
+                    "job_id": job_id,
+                    "build_number": manifest.get("version", "1.2.0") + "-b" + manifest.get("build", "0000"),
+                    "components": components_preview,
+                    "changelog": changelog_content
+                })
+            except Exception as e:
+                self.send_json(400, {"error": str(e)})
+            return
+
+        elif path == "/api/lcm/upgrade/start":
+            try:
+                sys.path.append("/usr/local/bin")
+                sys.path.append(".")
+                try:
+                    import hylia
+                except ImportError:
+                    import hylia
+                
+                rc, stdout, _ = run_cql_query("SELECT JSON job_id, state FROM hydra.hylia_jobs;")
+                if rc != 0 or not stdout or not stdout.strip():
+                    self.send_json(400, {"error": "No upgrade job loaded. Please upload an update package first."})
+                    return
+                
+                job = json.loads(stdout.splitlines()[0])
+                job_id = job.get("job_id")
+                job_state = job.get("state")
+                
+                if job_state in ["UPGRADING", "STARTING"]:
+                    self.send_json(200, {"status": "already_running", "job_id": job_id})
+                    return
+                
+                rc_up, _, err_up = run_cql_query(f"UPDATE hydra.hylia_jobs SET state = 'STARTING' WHERE job_id = {job_id};")
+                if rc_up != 0:
+                    raise Exception(f"Database error starting upgrade: {err_up}")
+                    
+                self.send_json(200, {"status": "success", "job_id": job_id, "message": "Rolling upgrade sequence started."})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
             return
 
         elif path == "/api/catalyst/tasks/cleanup":

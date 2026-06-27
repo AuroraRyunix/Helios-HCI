@@ -30,6 +30,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Gatoway](./docs/gatoway.md) | **Flow** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
 | [Urbosa](./docs/urbosa.md) | **Flow SDN** | Native Python service | Layer-3 software-defined overlay, distributed routing, and micro-segmentation daemon. |
 | [Bifrost](./docs/bifrost.md) | **Vipmonitor** | Native Python service | Floating VIP manager daemon ensuring API access high availability. |
+| [Hylia](./docs/hylia.md) | **Foundation (LCM)** | Native Python service | ZooKeeper-resumable rolling upgrade and Life Cycle Management (LCM) service. |
 
 ---
 
