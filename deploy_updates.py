@@ -592,6 +592,9 @@ def deploy_to_node(ip):
                 print(f"[{ip}] Uploading server.py for Spectrum build...")
                 put_text_file(sftp, local_server, "/tmp/spectrum_build/server.py")
                 
+                print(f"[{ip}] Uploading hylia.py for Spectrum build...")
+                put_text_file(sftp, local_yggdrasil, "/tmp/spectrum_build/hylia.py")
+                
                 # 3c. Upload all static assets for Spectrum build (recursively)
                 print(f"[{ip}] Uploading static assets for Spectrum build...")
                 for root, dirs, files in os.walk(local_static_dir):
