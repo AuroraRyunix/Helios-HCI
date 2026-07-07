@@ -16,11 +16,11 @@ mindmap
       Sets hostname Valkyrie-XXXXXX structures
     Container Management
       Quadlets template setup in /etc/containers/systemd
-      Defines ZooKeeper, HydraDB, Linstor, Spectrum, Slate
+      Defines ZooKeeper, HydraDB, Linstor, Spectrum, Slate, and all Python services
     Workload Distribution
       Extracts embedded base64 code components
       Copies bin scripts to /usr/local/bin/
-      Starts systemd-based container units
+      Starts systemd-based container units using Podman Quadlets
 ```
 
 ## Function & Logic Breakdown
@@ -42,8 +42,9 @@ mindmap
   - **`aether.container`**: Privileged Piraeus satellite running in host mode with `/dev` and `/lib/modules` mounts for DRBD kernel replication.
   - **`spectrum.container`**: Local UI admin portal mapping host libvirt socket and certificate stores.
   - **`slate.container`**: Traefik Edge proxy mapping certificate stores.
+  - **All Python services (`spark-daemon`, `bifrost`, `dagur`, `mimir`, `vali`, `gatoway`, `urbosa`, `logos`, `mipha`, `catalyst`, `hylia`)**: Executed inside `localhost/helios-base` containers mounting host `/usr/local/bin` and configuration directories.
 
 ### Utility Distribution (`main()`)
 - Extracts embedded scripts from base64 blocks (`URBOSA_B64`, `GATOWAY_B64`, `CATCLI_B64`, etc.).
 - Writes scripts to `/usr/local/bin/` on all target nodes.
-- Initiates Quadlet services: reloads systemd configurations and runs `systemctl start` on the container services.
+- Initiates Quadlet services: reloads systemd configurations (causing Podman to generate unit files) and runs `systemctl start/enable` on the container services.

@@ -655,20 +655,26 @@ def main():
 Description=Spark Host Management Daemon
 After=network.target
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/spark-daemon
-Restart=always
-RestartSec=3
-User=root
-CPUWeight=200
-MemoryMax=512M
-MemoryHigh=400M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:rw
+Volume=/etc/containers/systemd:/etc/containers/systemd:rw
+Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
+Volume=/dev:/dev:shared
+Volume=/run/systemd/system:/run/systemd/system:ro
+Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
+Volume=/root/.certs:/root/.certs:ro
+Exec=/usr/local/bin/spark-daemon
+AddCapability=CAP_SYS_ADMIN
+AddCapability=CAP_SYS_RAWIO
+AddCapability=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/spark-daemon.service", spark_svc)
+            node.write_file("/etc/containers/systemd/spark-daemon.container", spark_svc)
             node.execute("systemctl daemon-reload && systemctl enable spark-daemon")
 
             # Deploy Bifrost Daemon
@@ -678,24 +684,20 @@ WantedBy=multi-user.target
             bifrost_svc = '''[Unit]
 Description=Bifrost VM Lifecycle Management Service
 After=zookeeper.service
-ConditionPathExists=/etc/hci/cluster.json
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/bifrost
-Restart=always
-RestartSec=3
-User=root
-CPUWeight=100
-MemoryMax=512M
-MemoryHigh=400M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/bifrost
+AddCapability=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/bifrost.service", bifrost_svc)
-            node.execute("systemctl enable bifrost")
+            node.write_file("/etc/containers/systemd/bifrost.container", bifrost_svc)
+            node.execute("systemctl daemon-reload && systemctl enable bifrost")
 
             # Deploy Dagur task scheduler
             node.write_file("/usr/local/bin/dagur", base64.b64decode(DAGUR_CLI_B64).decode('utf-8'))
@@ -704,23 +706,19 @@ WantedBy=multi-user.target
             dagur_svc = '''[Unit]
 Description=Dagur HA Task Scheduler Service
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/dagur
-Restart=always
-RestartSec=3
-User=root
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/dagur
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/dagur.service", dagur_svc)
-            node.execute("systemctl enable dagur")
+            node.write_file("/etc/containers/systemd/dagur.container", dagur_svc)
+            node.execute("systemctl daemon-reload && systemctl enable dagur")
 
             # Deploy Mimir Daemon
             node.write_file("/usr/local/bin/mimir", base64.b64decode(MIMIR_CLI_B64).decode('utf-8'))
@@ -737,23 +735,19 @@ WantedBy=multi-user.target
             mimir_svc = '''[Unit]
 Description=Mimir Health Check and Diagnostics Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/mimir
-Restart=always
-RestartSec=3
-User=root
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/mimir
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/mimir.service", mimir_svc)
-            node.execute("systemctl enable mimir")
+            node.write_file("/etc/containers/systemd/mimir.container", mimir_svc)
+            node.execute("systemctl daemon-reload && systemctl enable mimir")
 
             # Deploy Vali Daemon
             node.write_file("/usr/local/bin/vali", base64.b64decode(VALI_CLI_B64).decode('utf-8'))
@@ -762,23 +756,20 @@ WantedBy=multi-user.target
             vali_svc = '''[Unit]
 Description=Vali Audit Log and Compliance Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/vali
-Restart=always
-RestartSec=3
-User=root
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
+Exec=/usr/local/bin/vali
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/vali.service", vali_svc)
-            node.execute("systemctl enable vali")
+            node.write_file("/etc/containers/systemd/vali.container", vali_svc)
+            node.execute("systemctl daemon-reload && systemctl enable vali")
 
             # Deploy Gatoway Daemon
             node.write_file("/usr/local/bin/gatoway", base64.b64decode(GATOWAY_B64).decode('utf-8'))
@@ -787,24 +778,20 @@ WantedBy=multi-user.target
             gatoway_svc = '''[Unit]
 Description=Gatoway L2 Network Sync Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/gatoway
-Restart=always
-RestartSec=3
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/gatoway
+AddCapability=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/gatoway.service", gatoway_svc)
-            node.execute("systemctl enable gatoway")
+            node.write_file("/etc/containers/systemd/gatoway.container", gatoway_svc)
+            node.execute("systemctl daemon-reload && systemctl enable gatoway")
 
             # Deploy Urbosa Daemon
             node.write_file("/usr/local/bin/urbosa", base64.b64decode(URBOSA_B64).decode('utf-8'))
@@ -813,24 +800,20 @@ WantedBy=multi-user.target
             urbosa_svc = '''[Unit]
 Description=Urbosa SDN Logical Router and Overlay Orchestrator
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/urbosa
-Restart=always
-RestartSec=3
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/urbosa
+AddCapability=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/urbosa.service", urbosa_svc)
-            node.execute("systemctl enable urbosa")
+            node.write_file("/etc/containers/systemd/urbosa.container", urbosa_svc)
+            node.execute("systemctl daemon-reload && systemctl enable urbosa")
 
             # Deploy Logos Daemon
             node.write_file("/usr/local/bin/logos", base64.b64decode(LOGOS_CLI_B64).decode('utf-8'))
@@ -839,24 +822,21 @@ WantedBy=multi-user.target
             logos_svc = '''[Unit]
 Description=Logos Distributed Metrics Service
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/logos
-Restart=always
-RestartSec=3
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Volume=/proc:/host/proc:ro
+Volume=/sys:/host/sys:ro
+Exec=/usr/local/bin/logos
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/logos.service", logos_svc)
-            node.execute("systemctl enable logos")
+            node.write_file("/etc/containers/systemd/logos.container", logos_svc)
+            node.execute("systemctl daemon-reload && systemctl enable logos")
 
             # Deploy Mipha Daemon
             node.write_file("/usr/local/bin/mipha", base64.b64decode(MIPHA_CLI_B64).decode('utf-8'))
@@ -865,23 +845,23 @@ WantedBy=multi-user.target
             mipha_svc = '''[Unit]
 Description=Mipha HA Cluster Monitor Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/mipha
-Restart=always
-RestartSec=3
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Volume=/dev:/dev:shared
+Volume=/var/run:/var/run:shared
+Volume=/run/systemd/system:/run/systemd/system:ro
+Exec=/usr/local/bin/mipha
+AddCapability=CAP_SYS_ADMIN
+AddCapability=CAP_SYS_RAWIO
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/mipha.service", mipha_svc)
+            node.write_file("/etc/containers/systemd/mipha.container", mipha_svc)
 
             # Deploy Urbosa Bootstrap Script
             urbosa_bootstrap_script = base64.b64decode(URBOSA_BOOTSTRAP_B64).decode('utf-8')
@@ -908,7 +888,7 @@ User=root
 Environment=PYTHONUNBUFFERED=1
 """
             node.write_file("/etc/systemd/system/daruk.service", daruk_svc)
-            node.execute("systemctl enable mipha")
+            node.execute("systemctl daemon-reload && systemctl enable mipha")
 
             # Deploy Catalyst Daemon
             node.write_file("/usr/local/bin/catalyst", base64.b64decode(CATALYST_CLI_B64).decode('utf-8'))
@@ -917,24 +897,19 @@ Environment=PYTHONUNBUFFERED=1
             catalyst_svc = '''[Unit]
 Description=Catalyst API Gateway Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/catalyst
-Restart=always
-RestartSec=3
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Exec=/usr/local/bin/catalyst
 
 [Install]
 WantedBy=multi-user.target
 '''
-            node.write_file("/etc/systemd/system/catalyst.service", catalyst_svc)
-            node.execute("systemctl enable catalyst")
+            node.write_file("/etc/containers/systemd/catalyst.container", catalyst_svc)
+            node.execute("systemctl daemon-reload && systemctl enable catalyst")
 
             # Deploy Hylia Daemon
             yggdrasil_cli = base64.b64decode(HYLIA_B64).decode('utf-8')
@@ -945,22 +920,20 @@ WantedBy=multi-user.target
 Description=Hylia Rolling Upgrade and Life Cycle Manager
 After=zookeeper.service
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hylia
-Restart=always
-RestartSec=5
-User=root
-Environment=PYTHONUNBUFFERED=1
-CPUWeight=100
-MemoryMax=256M
-MemoryHigh=200M
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Volume=/etc/hci:/etc/hci:ro
+Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
+Volume=/:/host:rw
+Exec=/usr/local/bin/hylia
 
 [Install]
 WantedBy=multi-user.target
 """
-            node.write_file("/etc/systemd/system/hylia.service", yggdrasil_svc)
-            node.execute("systemctl enable hylia")
+            node.write_file("/etc/containers/systemd/hylia.container", yggdrasil_svc)
+            node.execute("systemctl daemon-reload && systemctl enable hylia")
 
             # CLI helpers
             node.write_file("/usr/local/bin/catcli", base64.b64decode(CATCLI_B64).decode('utf-8'))

@@ -787,9 +787,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             new_cache = {}
             
             # Native services
-            native_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim"]
-            if "urbosa" in services:
-                native_svcs.append("urbosa")
+            native_svcs = ["daruk"]
             cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
             try:
                 res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -810,7 +808,9 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     new_cache[s_name] = []
                     
             # Containerized services
-            container_svcs = ["zookeeper", "hydra-db", "aether", "spectrum", "slate"]
+            container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
+            if "urbosa" in services:
+                container_svcs.append("urbosa")
             for s_name in container_svcs:
                 pids = []
                 if services_active.get(s_name):
