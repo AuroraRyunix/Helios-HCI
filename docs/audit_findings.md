@@ -255,5 +255,22 @@ To proactively detect and surface the architectural gaps identified in this audi
 2.  **Concurrent Migration Lock Auditor (`migration_lock_status`)**:
     *   **Logic**: Audit the ScyllaDB active VM tables to ensure that no live migrations are running concurrently without corresponding locks, flagging collisions.
 
+---
+
+## 14. Additional Hardcoded Constraints & Startup SPOFs
+
+### A. Air-Gap Registry Hardcoding
+*   **Location:** `provision.py` (lines 88, 109, 129, 153, 204)
+*   **The Issue:** Container image source registries are hardcoded to public hosts (`docker.io` and `quay.io`) for core system components (ScyllaDB, ZooKeeper, Linstor, Traefik).
+*   **Impact:** Enterprise installations are frequently deployed in secure, air-gapped data centers without external internet access. The lack of a configuration parameter to prefix custom local registries prevents container pulls and boots during provisioning.
+*   **Recommendation:** Add a registry configuration variable or CLI flag (e.g. `--registry <local-registry-ip>`) to prefix container images during Quadlet configuration generation.
+
+### B. Daruk Startup Connection SPOF
+*   **Location:** `daruk.py` (lines 21–25)
+*   **The Issue:** Daruk connects to the local ScyllaDB node at module load time (import phase) with a single connection attempt.
+*   **Impact:** During cluster boot, if the `daruk` service starts before ScyllaDB completes its replay log checks and opens port 9042, Daruk crashes and exits. Because all other services (Spectrum, Vali, Catalyst, Mimir) query ScyllaDB through the Daruk HTTP proxy, a Daruk startup failure cascades into a complete cluster orchestration freeze.
+*   **Recommendation:** Wrap Daruk's connection initialization in a retry loop with exponential backoff on startup, allowing it to wait for ScyllaDB to stabilize and begin responding.
+
+
 
 
