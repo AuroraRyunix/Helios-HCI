@@ -301,6 +301,49 @@ To proactively detect and surface the architectural gaps identified in this audi
         pass
     ```
 
+---
+
+## 16. Lanayru Kubernetes Engine (LKE) Refactoring & Gaps
+
+The guest Kubernetes orchestration engine (Lanayru) code was refactored out of `spectrum_server.py` into a dedicated [lanayru.py](file:///C:/Users/AuraFlight/Desktop/container-hci/lanayru.py) script. During this process, several critical architectural and logic bugs were identified:
+
+### A. Hardcoded Disk Size Allocation
+*   **Location:** `lanayru.py` (line 123)
+*   **The Issue:** The volume definition creation is hardcoded to `5GiB`:
+    `run_linstor_cmd(f"volume-definition create {res_name} 5GiB")`
+*   **Impact:** This completely overrides any custom provisioning size or the 50 GB minimum storage requirement defined in cluster pre-checks, causing guest control plane nodes to immediately run out of storage during typical cluster operations.
+*   **Recommendation:** Pass the disk size parameter dynamically from the Spectrum VM allocation payload to `deploy_lanayru_worker`.
+
+### B. Segment UUID Collision in Multi-Tenant Environments
+*   **Location:** `lanayru.py` (lines 35–36)
+*   **The Issue:** The UUIDs for Urbosa segments (`seg1_id` and `seg2_id`) are completely hardcoded:
+    `seg1_id = "22222222-2222-2222-2222-222222222222"`
+    `seg2_id = "33333333-3333-3333-3333-333333333333"`
+*   **Impact:** If a user attempts to deploy a second guest Kubernetes cluster, it will use the exact same segment IDs. The database inserts will overwrite the existing segment records, causing configuration corruption and cross-tenant network traffic leakage/partition.
+*   **Recommendation:** Generate random UUIDs dynamically for segments (`uuid.uuid4()`) and write them to the cluster record for retrieval during destruction.
+
+### C. Conflicting Hardcoded MAC Addresses
+*   **Location:** `lanayru.py` (line 144)
+*   **The Issue:** VM guest MAC addresses are derived using a hardcoded prefix and index:
+    `mac_addr = f"52:54:00:a1:b1:0{i+1}"`
+*   **Impact:** Creating a second Lanayru cluster on the same physical switches/VLANs will spawn VMs with duplicate MAC addresses. This causes MAC/ARP flapping, packet routing loops, and total network disruption for both guest environments.
+*   **Recommendation:** Generate random MAC addresses dynamically with the appropriate QEMU prefix (e.g., `52:54:00:...`) and store them in the database VM record.
+
+### D. Failed VIP Leader IP Lookup in DHCP Refresh
+*   **Location:** `lanayru.py` (lines 201–207)
+*   **The Issue:** The script queries the database for the host IP of the VIP leader using a hardcoded `console_token` check:
+    `rc_v, out_v, _ = run_cql_query(f"SELECT host_ip FROM hydra.console_sessions WHERE console_token = '{vip}' ALLOW FILTERING;")`
+*   **Impact:** The `console_sessions` table stores temporary browser VNC console session tokens, not cluster VIP lease states. The query will return empty, and `leader_ip` will fall back to `LOCAL_IP`. If the local host is not the current VIP leader, the task submit API request fails, preventing Urbosa DHCP server configuration from refreshing.
+*   **Recommendation:** Query active consensus leases or cluster settings to resolve the node holding the VIP, or query the local system network state to check if the VIP is bound locally.
+
+### E. Failed Linstor Resource Deletion on Destruction
+*   **Location:** `lanayru.py` (line 289)
+*   **The Issue:** The destruction sequence deletes resource definitions directly:
+    `run_linstor_cmd(f"resource-definition delete {res_name}")`
+*   **Impact:** In Linstor, a resource definition cannot be deleted if active resource instances exist on the physical nodes. The command will fail, leaving orphan replicated storage blocks on all nodes.
+*   **Recommendation:** Query and delete individual resource node instances first via `linstor resource delete <node> <res_name>` prior to removing the resource definition, or use `--force` if supported.
+
+
 
 
 
