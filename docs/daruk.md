@@ -93,3 +93,10 @@ curl -X POST -H "Content-Type: text/plain" -d "SELECT hostname, ip, status FROM 
 # Query specific settings key
 curl -X POST -H "Content-Type: text/plain" -d "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';" http://127.0.0.1:9043/query
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./daruk_technical.md).

@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Syntax Test</title>
+    <script type="module">
+        console.log("Starting syntax test...");
+        import("./novnc/rfb.js?v=1.0.18")
+        .then(() => {
+            console.log("SUCCESS: rfb.js loaded successfully!");
+        })
+        .catch((err) => {
+            console.error("FAILURE: failed to load rfb.js:", err);
+            console.error("Stack:", err.stack);
+        });
+    </script>
+</head>
+<body>
+    <h1>Syntax Test Page</h1>
+</body>
+</html>

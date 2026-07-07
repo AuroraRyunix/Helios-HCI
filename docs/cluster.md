@@ -121,3 +121,10 @@ If a host key changes or a certificate needs manual synchronization, administrat
 # Scan and update keys for a host
 ssh-keyscan -H -t rsa,ecdsa,ed25519 <node_ip> >> /root/.ssh/known_hosts
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./cluster_technical.md).

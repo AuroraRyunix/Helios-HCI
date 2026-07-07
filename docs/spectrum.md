@@ -110,3 +110,10 @@ You can query the WebUI status endpoint directly using curl:
 curl -k -s https://127.0.0.1:8443/api/status
 ```
 
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./spectrum_technical.md).

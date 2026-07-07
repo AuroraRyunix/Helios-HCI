@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+__build__ = "1.2.2"
 import sys
 import os
 import ssl
@@ -14,6 +15,23 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 socket.setdefaulttimeout(45.0)
 
 PORT = 9099
+
+def get_service_build_number(target_path):
+    if not os.path.exists(target_path):
+        return "Not Installed"
+    try:
+        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                cleaned = line.strip()
+                if cleaned.startswith("#"):
+                    cleaned = cleaned[1:].strip()
+                if cleaned.startswith("__build__") and "=" in line:
+                    parts = line.split("=", 1)
+                    val = parts[1].strip().strip("'\"")
+                    return val
+    except Exception:
+        pass
+    return "Unknown"
 
 def run_remote_spark(ip, command):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
@@ -146,22 +164,10 @@ def run_parallel_checked(ips, command, allow_already_exists=False):
     return results
 
 def check_urbosa_enabled():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(('10.255.255.255', 1))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local_ip = '127.0.0.1'
-        
-    cql = "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';"
-    b64_query = base64.b64encode(cql.encode('utf-8')).decode('utf-8')
-    cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdout, _ = p.communicate()
-    if p.returncode == 0 and stdout:
-        for line in stdout.decode('utf-8', errors='ignore').splitlines():
-            if "true" in line.strip().lower():
+    rc, stdout, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';")
+    if rc == 0 and stdout:
+        for line in stdout.splitlines():
+            if "true" in line.lower():
                 return True
     return False
 
@@ -444,6 +450,9 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/v1/node/status":
             self.handle_node_status()
             return
+        elif parsed.path == "/api/v1/node/binary-version":
+            self.handle_binary_version(parsed)
+            return
         elif parsed.path == "/api/v1/vm/drs":
             self.forward_to_vali("/api/v1/drs/status", method="GET")
             return
@@ -515,21 +524,6 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             return
 
         import os
-        if os.path.exists("/etc/hci/maintenance.state"):
-            blocked_services = ["zookeeper", "hydra-db", "aether", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "urbosa"]
-            is_start_or_restart = any(x in command for x in ["systemctl start", "systemctl restart", "service start", "service restart"])
-            if is_start_or_restart:
-                blocked = []
-                for svc in blocked_services:
-                    if svc in command:
-                        blocked.append(svc)
-                if blocked:
-                    self.send_json_response(200, {
-                        "returncode": 0,
-                        "stdout": f"Ignored start/restart command for {', '.join(blocked)} because the host is in maintenance mode.",
-                        "stderr": ""
-                    })
-                    return
 
         try:
             res = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
@@ -854,6 +848,16 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                 }
                 
         self.send_json_response(200, result)
+
+    def handle_binary_version(self, parsed):
+        import urllib.parse
+        query = urllib.parse.parse_qs(parsed.query)
+        path = query.get("path", [""])[0]
+        if not path:
+            self.send_json_response(400, {"error": "Missing path parameter"})
+            return
+        version = get_service_build_number(path)
+        self.send_json_response(200, {"version": version})
 
     def handle_urbosa_tunnels_metrics(self, parsed):
         import urllib.parse
@@ -1612,6 +1616,12 @@ def check_cluster_and_autostart():
     # Wait a few seconds to let systemd-spark finish starting up
     time.sleep(3)
     
+    # Unconditionally stop and undefine all local virtual machines on startup.
+    # Because hypervisors are stateless executors, Vali will dynamically define
+    # and start workloads when they are scheduled to run on this node.
+    print("[AUTOSTART] Cleaning up all local libvirt virtual machines to ensure clean compute startup...")
+    subprocess.run("for vm in $(virsh list --all --name); do virsh destroy $vm || true; virsh undefine $vm --nvram || true; done", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
     if os.path.exists("/run/hci/cluster_operation.lock"):
         print("[AUTOSTART] Cluster operation is in progress. Bypassing autostart checks.")
         return
@@ -1626,11 +1636,31 @@ def check_cluster_and_autostart():
         return
         
     if os.path.exists("/etc/hci/maintenance.state"):
-        print("[AUTOSTART] Host is in maintenance mode. Ensuring workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper", "agahnim", "slate"]
+        print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return
+        subprocess.run("systemctl start zookeeper", shell=True)
+        subprocess.run("systemctl start hydra-db", shell=True)
+        
+        # Start periodic watchdog loop directly to keep database/storage running during maintenance
+        print("[WATCHDOG] Starting service health watchdog in maintenance mode...")
+        while True:
+            try:
+                time.sleep(30)
+                if os.path.exists("/run/hci/cluster_operation.lock"):
+                    continue
+                if not os.path.exists("/etc/hci/maintenance.state"):
+                    print("[WATCHDOG] Host left maintenance mode. Exiting maintenance watchdog loop to resume normal checks.")
+                    break
+                for svc in ["zookeeper", "hydra-db", "aether"]:
+                    res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
+                    status_str = res.stdout.decode().strip()
+                    if status_str not in ["active", "activating"]:
+                        print(f"[WATCHDOG] Maintenance Node: Restarting critical service {svc} (current status: {status_str})...")
+                        subprocess.run(f"systemctl start {svc}", shell=True)
+            except Exception as wex:
+                print(f"[WATCHDOG] Error in maintenance service watchdog: {wex}")
 
     # 1. Start ZooKeeper unconditionally if it is not active
     print("[AUTOSTART] Ensuring local ZooKeeper is started...")
@@ -1710,6 +1740,73 @@ def check_cluster_and_autostart():
             time.sleep(1)
             
     print("[AUTOSTART] Autostart completed successfully.")
+    
+    # Start periodic watchdog loop
+    print("[WATCHDOG] Starting service health watchdog...")
+    while True:
+        try:
+            time.sleep(30)
+            if os.path.exists("/run/hci/cluster_operation.lock"):
+                continue
+            if not os.path.exists("/etc/hci/cluster.json"):
+                continue
+            if os.path.exists("/etc/hci/maintenance.state"):
+                for svc in ["zookeeper", "hydra-db", "aether"]:
+                    res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
+                    status_str = res.stdout.decode().strip()
+                    if status_str not in ["active", "activating"]:
+                        print(f"[WATCHDOG] Maintenance Node: Restarting critical service {svc} (current status: {status_str})...")
+                        subprocess.run(f"systemctl start {svc}", shell=True)
+                continue
+            
+            # Check Zookeeper quorum
+            quorum_established = False
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2)
+                s.connect(("127.0.0.1", 2181))
+                s.sendall(b"stat")
+                resp = s.recv(2048).decode('utf-8', errors='ignore')
+                s.close()
+                for line in resp.splitlines():
+                    if line.strip().lower().startswith("mode:"):
+                        mode = line.split(":", 1)[1].strip().lower()
+                        if mode in ["follower", "leader", "standalone"]:
+                            quorum_established = True
+                            break
+            except Exception:
+                pass
+                
+            if not quorum_established:
+                continue
+                
+            # Query ZooKeeper for cluster state
+            cluster_state = "stopped"
+            try:
+                res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state", 
+                                           shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_state = res_state.stdout.decode("utf-8", errors="ignore")
+                if "started" in out_state:
+                    cluster_state = "started"
+            except Exception:
+                pass
+                
+            if cluster_state == "started":
+                services = ["hydra-db", "daruk", "aether", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+                for svc in services:
+                    res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
+                    status_str = res.stdout.decode().strip()
+                    if status_str not in ["active", "activating"]:
+                        print(f"[WATCHDOG] Restarting failed/stopped service {svc} (current status: {status_str})...")
+                        subprocess.run(f"systemctl start {svc}", shell=True)
+                if check_urbosa_enabled():
+                    res = subprocess.run("systemctl is-active urbosa", shell=True, stdout=subprocess.PIPE)
+                    status_str = res.stdout.decode().strip()
+                    if status_str not in ["active", "activating"]:
+                        print(f"[WATCHDOG] Restarting failed/stopped service urbosa (current status: {status_str})...")
+                        subprocess.run("systemctl start urbosa", shell=True)
+        except Exception as wex:
+            print(f"[WATCHDOG] Error in service watchdog: {wex}")
 
 def main():
     ca_cert = "/etc/hci/spark/certs/ca.crt"

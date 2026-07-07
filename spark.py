@@ -45,6 +45,26 @@ def get_local_maintenance_status(ip_addr):
     # Query ScyllaDB container if active
     rc_db, out_db, _ = run_local("podman ps --filter name=systemd-hydra-db --format '{{.Status}}'")
     if "up" in out_db.lower():
+        # Try Daruk HTTP proxy first
+        try:
+            import urllib.request
+            import json
+            url = "http://127.0.0.1:9043/query"
+            cql = "SELECT ip, status FROM hydra.nodes;"
+            req = urllib.request.Request(url, data=cql.encode('utf-8'), headers={'Content-Type': 'text/plain'})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res = json.loads(response.read().decode('utf-8'))
+                if res.get("status") == "success":
+                    for row in res.get("rows", []):
+                        if row.get("ip") == ip_addr:
+                            status = row.get("status")
+                            if status in ["IN_MAINTENANCE", "ENTERING_MAINTENANCE"]:
+                                return status
+                    return "NORMAL"
+        except Exception:
+            pass
+
+        # Fallback to cqlsh via podman exec
         import base64
         cql = "SELECT ip, status FROM hydra.nodes;"
         b64_cql = base64.b64encode(cql.encode()).decode()
@@ -60,6 +80,24 @@ def get_local_maintenance_status(ip_addr):
     return "NORMAL"
 
 def check_urbosa_enabled():
+    # Try Daruk HTTP proxy first
+    try:
+        import urllib.request
+        import json
+        url = "http://127.0.0.1:9043/query"
+        cql = "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';"
+        req = urllib.request.Request(url, data=cql.encode('utf-8'), headers={'Content-Type': 'text/plain'})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            res = json.loads(response.read().decode('utf-8'))
+            if res.get("status") == "success":
+                for row in res.get("rows", []):
+                    if row.get("value") == "true":
+                        return True
+                return False
+    except Exception:
+        pass
+
+    # Fallback to cqlsh via podman exec
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)

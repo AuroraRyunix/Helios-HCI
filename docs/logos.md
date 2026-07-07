@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS hydra.logos_metrics (
     timestamp timestamp,
     cpu_pct float,
     mem_pct float,
+    mem_total_kb bigint,
+    cpu_cores int,
     disk_iops float,
     disk_bandwidth_kbps float,
     net_rx_kbps float,
@@ -126,3 +128,10 @@ podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT timestamp, cpu_pct, m
 # Check table metadata and TTL properties
 podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "DESCRIBE TABLE hydra.logos_metrics;"
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./logos_technical.md).

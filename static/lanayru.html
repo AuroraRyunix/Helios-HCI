@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helios HCI - Lanayru K8s Engine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css?v=1.1.2">
+    <style>
+        .portal-layout {
+            display: grid;
+            grid-template-columns: 1.2fr 1fr;
+            gap: 24px;
+            margin-top: 20px;
+        }
+        
+        .radio-tiles {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 8px;
+        }
+
+        .radio-tile {
+            position: relative;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            transition: all 0.2s ease;
+        }
+
+        .radio-tile input {
+            position: absolute;
+            opacity: 0;
+            cursor: pointer;
+        }
+
+        .radio-tile.active {
+            border-color: var(--color-warning);
+            background: rgba(224, 86, 36, 0.05);
+        }
+
+        .radio-title-label {
+            font-weight: 600;
+            font-size: 14px;
+            color: #fff;
+        }
+
+        .warning-tag {
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .radio-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+            line-height: 1.4;
+        }
+
+        .check-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .check-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: rgba(0, 0, 0, 0.15);
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            font-size: 13px;
+        }
+
+        .check-status {
+            font-weight: 600;
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 4px;
+            text-transform: uppercase;
+        }
+
+        .status-ready {
+            background: rgba(40, 167, 69, 0.15);
+            color: var(--color-success);
+            border: 1px solid rgba(40, 167, 69, 0.2);
+        }
+
+        .status-warn {
+            background: rgba(224, 86, 36, 0.15);
+            color: var(--color-warning);
+            border: 1px solid rgba(224, 86, 36, 0.2);
+        }
+
+        .console-log-box {
+            height: 220px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.25);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            font-family: monospace;
+            font-size: 12px;
+            color: #d4d4d4;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .log-info { color: var(--text-secondary); }
+        .log-success { color: var(--color-success); }
+        .log-warning { color: var(--color-warning); }
+        .log-error { color: #ff5f56; }
+    </style>
+    <script>
+        const theme = localStorage.getItem('helios-theme');
+        if (theme) document.documentElement.classList.add('theme-' + theme);
+    </script>
+</head>
+<body>
+    <div class="glass-bg-decor decor-1"></div>
+    <div class="glass-bg-decor decor-2"></div>
+    
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="pe-logo-container">
+                    <svg viewBox="0 0 24 24" class="pe-logo-icon">
+                        <path d="M12 2L3 5v6c0 5.5 3.8 10.6 9 11 5.2-.4 9-5.5 9-11V5l-9-3z" />
+                        <path d="M14 9.5a2.5 2.5 0 1 0 0 5" stroke-linecap="round" />
+                    </svg>
+                </div>
+                <div class="pe-cluster-name" id="cluster-name-brand-display">hci-cluster</div>
+                
+                <!-- Dropdown -->
+                <div class="console-dropdown">
+                    <button class="dropdown-trigger" id="console-dropdown-btn">
+                        <span id="current-console-label">Lanayru K8s</span>
+                        <svg viewBox="0 0 24 24" class="dropdown-arrow"><path d="M7 10l5 5 5-5z"/></svg>
+                    </button>
+                    <div class="dropdown-menu" id="console-dropdown-menu">
+                        <a href="index.html" class="dropdown-item">Home</a>
+                        <a href="vms.html" class="dropdown-item">VM</a>
+                        <a href="images.html" class="dropdown-item">Images</a>
+                        <a href="storage.html" class="dropdown-item">Storage</a>
+                        <a href="metrics.html" class="dropdown-item">Metrics</a>
+                        <a href="settings.html" class="dropdown-item">Settings</a>
+                        <a href="sdn.html" class="dropdown-item">Urbosa SDN</a>
+                        <a href="lanayru.html" class="dropdown-item active">Lanayru K8s</a>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main class="app-main-content">
+            <div class="page-header" style="margin-bottom: 20px;">
+                <h1 style="font-family: 'Space Grotesk', sans-serif; font-size: 24px; color: #fff; font-weight: 600;">Lanayru Kubernetes Engine</h1>
+                <p style="color: var(--text-secondary); font-size: 13px; margin-top: 4px;">Deploy managed Kubernetes guest clusters utilizing ScyllaDB (Hydra) data replication and native Urbosa overlay segments.</p>
+            </div>
+
+            <div class="portal-layout">
+                <!-- Settings Panel -->
+                <div class="glass-card">
+                    <h3 class="panel-title" style="margin-bottom: 16px;">Cluster Parameters</h3>
+                    
+                    <div class="form-row" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px;">
+                        <label class="input-label" style="font-size: 12px; font-weight: 500;">Cluster Name</label>
+                        <input type="text" id="input-cluster-name" class="btn" style="background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-color); color: #fff; border-radius: 6px; padding: 10px 14px; text-align: left; cursor: text;" value="lanayru-production">
+                    </div>
+
+                    <div class="form-row" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px;">
+                        <label class="input-label" style="font-size: 12px; font-weight: 500;">Control Plane Topology</label>
+                        <div class="radio-tiles">
+                            <div class="topo-tile radio-tile active" onclick="selectTopologyTile(this, 1)" id="tile-1">
+                                <span class="radio-title-label">1 Node (Dev)</span>
+                                <span class="warning-tag" style="color: var(--color-warning);">⚠️ Non-HA Setup</span>
+                                <span class="radio-desc">Provisions a single VM. Non-redundant database translation.</span>
+                            </div>
+                            <div class="topo-tile radio-tile" onclick="selectTopologyTile(this, 3)" id="tile-3">
+                                <span class="radio-title-label">3 Nodes (HA)</span>
+                                <span class="warning-tag" style="color: var(--color-success);">✓ Quorum Ready</span>
+                                <span class="radio-desc">Allocates 3 VMs spread across nodes via anti-affinity logic.</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-row" style="display: flex; flex-direction: column; gap: 6px; margin-bottom: 24px;">
+                        <label class="input-label" style="font-size: 12px; font-weight: 500;">Urbosa Network Attachment</label>
+                        <div class="radio-tiles">
+                            <div class="net-tile radio-tile active" onclick="selectNetworkTile(this, 'urbosa')" id="net-tile-urbosa">
+                                <span class="radio-title-label">Urbosa SDN Overlay</span>
+                                <span class="warning-tag" style="color: var(--color-success);">✓ Auto-Provisioned</span>
+                                <span class="radio-desc">Auto-provisions overlays (172.16.10.0/24 & 172.16.11.0/24) with DHCP/routing.</span>
+                            </div>
+                            <div class="net-tile radio-tile" onclick="selectNetworkTile(this, 'direct')" id="net-tile-direct">
+                                <span class="radio-title-label">Physical-Direct Bridge</span>
+                                <span class="warning-tag" style="color: var(--text-muted);">ℹ System Native</span>
+                                <span class="radio-desc">Direct layer-2 attachment to physical host network interface. Requires manual configuration.</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 12px; width: 100%;">
+                        <button class="btn btn-primary" id="btn-deploy-start" style="flex: 1; height: 44px; font-family: 'Space Grotesk', sans-serif; font-weight: 600;" onclick="startDeployment()">Deploy Cluster</button>
+                        <button class="btn" id="btn-destroy-start" style="flex: 1; height: 44px; font-family: 'Space Grotesk', sans-serif; font-weight: 600; background: rgba(255, 95, 86, 0.15); border: 1px solid rgba(255, 95, 86, 0.2); color: #ff5f56;" onclick="startDestruction()">Destroy Cluster</button>
+                    </div>
+                </div>
+
+                <!-- Pre-flight checks panel -->
+                <div class="glass-card">
+                    <h3 class="panel-title" style="margin-bottom: 16px;">Pre-flight Requirements</h3>
+                    <p style="color: var(--text-muted); font-size: 12px; line-height: 1.5; margin-bottom: 16px;">
+                        The system checks resource capacities and DB consensus status before permitting Kine orchestration deployment.
+                    </p>
+                    <ul class="check-list">
+                        <li class="check-item">
+                            <span>Hydra ScyllaDB Cluster Consensus</span>
+                            <span class="check-status" id="check-db">Checking...</span>
+                        </li>
+                        <li class="check-item">
+                            <span>Linstor Thin Storage Allocation</span>
+                            <span class="check-status" id="check-storage">Checking...</span>
+                        </li>
+                        <li class="check-item">
+                            <span>Physical Node Memory Reserves</span>
+                            <span class="check-status" id="check-compute">Checking...</span>
+                        </li>
+                        <li class="check-item">
+                            <span>Urbosa Segment Configuration</span>
+                            <span class="check-status" id="check-network">Checking...</span>
+                        </li>
+                    </ul>
+                </div>
+
+                <!-- Log Panel -->
+                <div class="glass-card" style="grid-column: span 2;">
+                    <h3 class="panel-title" style="margin-bottom: 12px;">Provisioning Logs</h3>
+                    <div class="console-log-box" id="log-box">
+                        <span class="log-info">[INFO] Lanayru deployment logs will print here upon starting.</span>
+                    </div>
+                </div>
+
+                <!-- Live Cluster Dashboard -->
+                <div class="glass-card" id="dashboard-card" style="grid-column: span 2; display: none;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px;">
+                        <div>
+                            <h3 class="panel-title" style="margin: 0;" id="dash-cluster-name">Cluster Live Status Dashboard</h3>
+                            <span style="font-size: 11px; color: var(--text-muted);" id="dash-cluster-id">ID: </span>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <span class="check-status" id="dash-k8s-ver" style="background: rgba(0, 191, 165, 0.15); color: #00bfa5; border: 1px solid rgba(0, 191, 165, 0.2);">v1.28.2</span>
+                            <span class="check-status" id="dash-health-badge" style="background: rgba(76, 175, 80, 0.15); color: #4caf50; border: 1px solid rgba(76, 175, 80, 0.2);">Healthy</span>
+                        </div>
+                    </div>
+
+                    <!-- Grid Layout for Nodes and Pods -->
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                        <!-- Left side: VMs Control Plane Nodes -->
+                        <div>
+                            <h4 style="color: #fff; font-size: 14px; margin-bottom: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #00bfa5;"></span>
+                                Control Plane Nodes (VMs)
+                            </h4>
+                            <div style="display: flex; flex-direction: column; gap: 10px;" id="dash-nodes-container">
+                                <!-- Dynamic VM rows here -->
+                            </div>
+                        </div>
+
+                        <!-- Right side: Running System Pods -->
+                        <div>
+                            <h4 style="color: #fff; font-size: 14px; margin-bottom: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px;">
+                                <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4a90e2;"></span>
+                                Active Kubernetes System Pods (via Kine translation)
+                            </h4>
+                            <div style="overflow-x: auto; background: rgba(0,0,0,0.2); border-radius: 6px; border: 1px solid var(--border-color);">
+                                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 12px;">
+                                    <thead>
+                                        <tr style="border-bottom: 1px solid var(--border-color); background: rgba(255,255,255,0.02);">
+                                            <th style="padding: 10px; color: var(--text-muted);">Namespace</th>
+                                            <th style="padding: 10px; color: var(--text-muted);">Pod Name</th>
+                                            <th style="padding: 10px; color: var(--text-muted);">Status</th>
+                                            <th style="padding: 10px; color: var(--text-muted);">IP</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="dash-pods-body">
+                                        <!-- Dynamic Pod rows here -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Access Credentials details -->
+                    <div style="margin-top: 20px; background: rgba(255, 255, 255, 0.02); border-radius: 6px; border: 1px solid var(--border-color); padding: 12px; font-size: 12px; color: var(--text-secondary); line-height: 1.6;">
+                        <h4 style="color: #fff; font-size: 13px; margin-bottom: 6px; font-weight: 600;">Control Plane Access Credentials</h4>
+                        <div><strong>Guest OS Image:</strong> cirros-0.6.2-x86_64 (Downloaded via cloud repository & cache-replicated across hosts)</div>
+                        <div><strong>SSH Access:</strong> <code>ssh cirros@[Guest VM IP]</code> | <strong>Password:</strong> <code style="background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; color: #fff;">gocirros</code></div>
+                        <div><strong>Kubeconfig API Server Endpoint:</strong> <code style="color: #00bfa5;">https://10.10.102.130:6443</code> (Spark-Proxy secure mTLS routing gateway to Kine translator)</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+
+        // Form Control Nodes Selection
+        let selectedNodes = 1;
+        function selectTopologyTile(element, nodesCount) {
+            document.querySelectorAll('.topo-tile').forEach(t => t.classList.remove('active'));
+            element.classList.add('active');
+            selectedNodes = nodesCount;
+        }
+
+        // Form Network Selection
+        let selectedNetwork = 'urbosa';
+        function selectNetworkTile(element, networkValue) {
+            document.querySelectorAll('.net-tile').forEach(t => t.classList.remove('active'));
+            element.classList.add('active');
+            selectedNetwork = networkValue;
+        }
+
+        // Fetch Pre-flight Checks
+        async function loadChecks() {
+            try {
+                const res = await fetch('/api/lanayru/checks');
+                if (res.ok) {
+                    const data = await res.json();
+                    updateCheckBadge('check-db', data.db);
+                    updateCheckBadge('check-storage', data.storage);
+                    updateCheckBadge('check-compute', data.compute);
+                    updateCheckBadge('check-network', data.network);
+                }
+            } catch (e) {
+                console.error("Failed to load pre-flight checks:", e);
+            }
+        }
+
+        async function loadClusterInfo() {
+            try {
+                const res = await fetch('/api/lanayru/cluster/info');
+                if (res.ok) {
+                    const data = await res.json();
+                    const card = document.getElementById('dashboard-card');
+                    if (data.active) {
+                        card.style.display = 'block';
+                        document.getElementById('dash-cluster-name').textContent = `Cluster: ${data.cluster_name}`;
+                        document.getElementById('dash-cluster-id').textContent = `ID: ${data.cluster_id}`;
+                        
+                        // Status badge styling
+                        const health = document.getElementById('dash-health-badge');
+                        health.textContent = data.status;
+                        if (data.status === 'Healthy') {
+                            health.style.background = 'rgba(76, 175, 80, 0.15)';
+                            health.style.color = '#4caf50';
+                            health.style.borderColor = 'rgba(76, 175, 80, 0.2)';
+                        } else {
+                            health.style.background = 'rgba(255, 152, 0, 0.15)';
+                            health.style.color = '#ff9800';
+                            health.style.borderColor = 'rgba(255, 152, 0, 0.2)';
+                        }
+                        
+                        document.getElementById('dash-k8s-ver').textContent = data.kubernetes_version;
+                        
+                        // Populate nodes
+                        const nodesContainer = document.getElementById('dash-nodes-container');
+                        nodesContainer.innerHTML = '';
+                        data.nodes.forEach(node => {
+                            const nodeDiv = document.createElement('div');
+                            nodeDiv.style.cssText = 'background: rgba(255,255,255,0.02); border: 1px solid var(--border-color); border-radius: 6px; padding: 12px; display: flex; justify-content: space-between; align-items: center;';
+                            
+                            const stateColor = node.state === 'Running' ? '#4caf50' : '#ff5f56';
+                            const stateBg = node.state === 'Running' ? 'rgba(76, 175, 80, 0.15)' : 'rgba(255, 95, 86, 0.15)';
+                            
+                            nodeDiv.innerHTML = `
+                                <div>
+                                    <div style="font-weight: 600; color: #fff; font-size: 13px;">${node.name}</div>
+                                    <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Host Hypervisor IP: ${node.host_ip}</div>
+                                    <div style="font-size: 11px; color: #00bfa5; margin-top: 2px;">Guest SDN IP: ${node.ip}</div>
+                                </div>
+                                <div style="text-align: right;">
+                                    <span class="check-status" style="background: ${stateBg}; color: ${stateColor}; border: 1px solid ${stateColor}2a; font-size: 11px; padding: 2px 6px;">${node.state}</span>
+                                    <div style="font-size: 11px; color: var(--text-secondary); margin-top: 6px;">CPU: ${node.cpu} | Mem: ${node.memory}</div>
+                                </div>
+                            `;
+                            nodesContainer.appendChild(nodeDiv);
+                        });
+                        
+                        // Populate pods
+                        const podsBody = document.getElementById('dash-pods-body');
+                        podsBody.innerHTML = '';
+                        if (data.pods && data.pods.length > 0) {
+                            data.pods.forEach(pod => {
+                                const tr = document.createElement('tr');
+                                tr.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+                                tr.innerHTML = `
+                                    <td style="padding: 10px; color: var(--text-secondary);">${pod.namespace}</td>
+                                    <td style="padding: 10px; font-weight: 500; color: #fff;">${pod.name}</td>
+                                    <td style="padding: 10px;"><span style="color: #4caf50;">● ${pod.status}</span></td>
+                                    <td style="padding: 10px; color: var(--text-muted); font-family: monospace;">${pod.ip}</td>
+                                `;
+                                podsBody.appendChild(tr);
+                            });
+                        } else {
+                            podsBody.innerHTML = '<tr><td colspan="4" style="padding: 16px; text-align: center; color: var(--text-muted);">No pods running. Control plane is offline.</td></tr>';
+                        }
+                    } else {
+                        card.style.display = 'none';
+                    }
+                }
+            } catch (err) {
+                console.error("Error loading cluster info:", err);
+            }
+        }
+
+        function updateCheckBadge(elementId, checkData) {
+            const el = document.getElementById(elementId);
+            if (!el || !checkData) return;
+            el.textContent = checkData.msg;
+            el.className = 'check-status'; // reset
+            el.removeAttribute('style'); // remove inline overrides
+            if (checkData.status === 'ready') {
+                el.classList.add('status-ready');
+            } else if (checkData.status === 'warning') {
+                el.classList.add('status-warn');
+            } else {
+                el.classList.add('status-warn');
+                el.style.background = 'rgba(255, 95, 86, 0.15)';
+                el.style.color = '#ff5f56';
+                el.style.borderColor = 'rgba(255, 95, 86, 0.2)';
+            }
+        }
+
+        // Initialize on page load
+        window.addEventListener('DOMContentLoaded', () => {
+            loadChecks();
+            loadClusterInfo();
+            setInterval(loadClusterInfo, 5000);
+            
+            // Get cluster name dynamically
+            fetch('/api/v1/cluster')
+                .then(r => r.json())
+                .then(data => {
+                    if (data && data.cluster_name) {
+                        document.getElementById('cluster-name-brand-display').textContent = data.cluster_name;
+                    }
+                }).catch(() => {});
+        });
+
+        // Deploy Cluster & Poll Logs
+        let pollInterval = null;
+
+        async function startDeployment() {
+            const btn = document.getElementById('btn-deploy-start');
+            const logBox = document.getElementById('log-box');
+            
+            const clusterName = document.getElementById('input-cluster-name').value.trim();
+            const networkSelect = selectedNetwork;
+            
+            if (!clusterName) {
+                alert("Please specify a Cluster Name before deployment.");
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = "Deploying Cluster...";
+            logBox.innerHTML = '<span class="log-info">[INFO] Connecting to Spectrum API and registering task...</span>';
+
+            try {
+                const res = await fetch('/api/lanayru/deploy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        cluster_name: clusterName,
+                        control_nodes: selectedNodes,
+                        overlay_segment_id: networkSelect
+                    })
+                });
+
+                if (!res.ok) {
+                    const errData = await res.json();
+                    throw new Error(errData.error || "Deployment request failed.");
+                }
+
+                const data = await res.json();
+                const taskId = data.task_id;
+                
+                const span = document.createElement('span');
+                span.className = 'log-success';
+                span.textContent = `[SUCCESS] Task scheduled successfully. Task ID: ${taskId}`;
+                logBox.appendChild(span);
+
+                // Start polling logs
+                let lastLogIndex = 0;
+                pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch(`/api/lanayru/status?task_id=${taskId}`);
+                        if (statusRes.ok) {
+                            const statusData = await statusRes.json();
+                            const remoteLogs = statusData.logs || [];
+                            
+                            // Append new log lines
+                            for (let i = lastLogIndex; i < remoteLogs.length; i++) {
+                                const logLine = remoteLogs[i];
+                                const logSpan = document.createElement('span');
+                                
+                                if (logLine.includes("[SUCCESS]")) logSpan.className = 'log-success';
+                                else if (logLine.includes("[ERROR]")) logSpan.className = 'log-error';
+                                else if (logLine.includes("[WARNING]")) logSpan.className = 'log-warning';
+                                else logSpan.className = 'log-info';
+                                
+                                logSpan.textContent = logLine;
+                                logBox.appendChild(logSpan);
+                                logBox.scrollTop = logBox.scrollHeight;
+                            }
+                            lastLogIndex = remoteLogs.length;
+
+                            if (statusData.status === 'completed' || statusData.status === 'failed') {
+                                clearInterval(pollInterval);
+                                btn.disabled = false;
+                                btn.textContent = "Deploy Cluster";
+                                
+                                if (statusData.status === 'completed') {
+                                    const finalSpan = document.createElement('span');
+                                    finalSpan.className = 'log-success';
+                                    finalSpan.textContent = "[SUCCESS] Lanayru cluster deployment complete. Ready to accept workloads!";
+                                    logBox.appendChild(finalSpan);
+                                    loadChecks();
+                                    loadClusterInfo();
+                                } else {
+                                    const finalSpan = document.createElement('span');
+                                    finalSpan.className = 'log-error';
+                                    finalSpan.textContent = `[ERROR] Deployment failed: ${statusData.error_msg || 'Unknown error'}`;
+                                    logBox.appendChild(finalSpan);
+                                }
+                                logBox.scrollTop = logBox.scrollHeight;
+                            }
+                        }
+                    } catch (err) {
+                        console.error("Error polling task status:", err);
+                    }
+                }, 1000);
+
+            } catch (error) {
+                const span = document.createElement('span');
+                span.className = 'log-error';
+                span.textContent = `[ERROR] Failed to initiate deployment: ${error.message}`;
+                logBox.appendChild(span);
+                btn.disabled = false;
+                btn.textContent = "Deploy Cluster";
+            }
+        }
+
+        async function startDestruction() {
+            const btn = document.getElementById('btn-destroy-start');
+            const logBox = document.getElementById('log-box');
+            const clusterName = document.getElementById('input-cluster-name').value.trim();
+
+            if (!clusterName) {
+                alert("Please specify a Cluster Name to destroy.");
+                return;
+            }
+
+            if (!confirm(`Are you sure you want to permanently destroy cluster '${clusterName}' and delete all its guest VMs?`)) {
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = "Destroying...";
+            logBox.innerHTML = '<span class="log-info">[INFO] Connecting to Spectrum API and registering destruction task...</span>';
+
+            try {
+                const res = await fetch('/api/lanayru/destroy', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ cluster_name: clusterName })
+                });
+
+                if (!res.ok) {
+                    const errData = await res.json();
+                    throw new Error(errData.error || "Destroy request failed.");
+                }
+
+                const data = await res.json();
+                const taskId = data.task_id;
+                
+                const span = document.createElement('span');
+                span.className = 'log-success';
+                span.textContent = `[SUCCESS] Destruction task scheduled. Task ID: ${taskId}`;
+                logBox.appendChild(span);
+
+                // Poll logs
+                let lastLogIndex = 0;
+                pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch(`/api/lanayru/status?task_id=${taskId}`);
+                        if (statusRes.ok) {
+                            const statusData = await statusRes.json();
+                            const remoteLogs = statusData.logs || [];
+                            
+                            for (let i = lastLogIndex; i < remoteLogs.length; i++) {
+                                const logLine = remoteLogs[i];
+                                const logSpan = document.createElement('span');
+                                if (logLine.includes("[SUCCESS]") || logLine.includes("complete")) logSpan.className = 'log-success';
+                                else if (logLine.includes("[ERROR]")) logSpan.className = 'log-error';
+                                else logSpan.className = 'log-info';
+                                
+                                logSpan.textContent = logLine;
+                                logBox.appendChild(logSpan);
+                                logBox.scrollTop = logBox.scrollHeight;
+                            }
+                            lastLogIndex = remoteLogs.length;
+
+                            if (statusData.status === 'completed' || statusData.status === 'failed') {
+                                clearInterval(pollInterval);
+                                btn.disabled = false;
+                                btn.textContent = "Destroy Cluster";
+                                loadChecks();
+                                loadClusterInfo();
+                            }
+                        }
+                    } catch (err) {
+                        console.error("Error polling task status:", err);
+                    }
+                }, 1000);
+
+            } catch (error) {
+                const span = document.createElement('span');
+                span.className = 'log-error';
+                span.textContent = `[ERROR] Failed to initiate destruction: ${error.message}`;
+                logBox.appendChild(span);
+                btn.disabled = false;
+                btn.textContent = "Destroy Cluster";
+            }
+        }
+    </script>
+    <script src="app.js?v=1.1.2"></script>
+</body>
+</html>

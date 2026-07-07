@@ -37,6 +37,7 @@ def get_cpu_stats():
     return None
 
 def get_mem_usage():
+    """Returns (mem_pct, mem_total_kb) for the current host."""
     try:
         meminfo = {}
         with open("/proc/meminfo", "r") as f:
@@ -57,10 +58,23 @@ def get_mem_usage():
             used = total - free - buffers - cached - sreclaim
             if used < 0:
                 used = total - free
-            return (used / total) * 100.0
+            return (used / total) * 100.0, int(total)
     except Exception:
         pass
-    return 0.0
+    return 0.0, 0
+
+def get_cpu_cores():
+    """Returns the number of logical CPU cores on this host."""
+    try:
+        count = 0
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.strip().startswith("processor"):
+                    count += 1
+        return count if count > 0 else 1
+    except Exception:
+        pass
+    return 1
 
 def is_disk(name):
     if re.match(r'^(sd|vd|hd|xvd)[a-z]+$', name):
@@ -207,7 +221,8 @@ def main():
             last_cpu = curr_cpu
 
             # Memory calculation
-            mem_pct = get_mem_usage()
+            mem_pct, mem_total_kb = get_mem_usage()
+            cpu_cores = get_cpu_cores()
 
             # Disk calculation
             curr_disk_ios, curr_disk_bytes = get_disk_stats()
@@ -269,10 +284,10 @@ def main():
 
             cql = f"""
             INSERT INTO hydra.logos_metrics (
-                node_ip, timestamp, cpu_pct, mem_pct,
+                node_ip, timestamp, cpu_pct, mem_pct, mem_total_kb, cpu_cores,
                 disk_iops, disk_bandwidth_kbps, net_rx_kbps, net_tx_kbps
             ) VALUES (
-                '{local_ip}', {timestamp_ms}, {cpu_pct:.4f}, {mem_pct:.4f},
+                '{local_ip}', {timestamp_ms}, {cpu_pct:.4f}, {mem_pct:.4f}, {mem_total_kb}, {cpu_cores},
                 {disk_iops:.4f}, {disk_bandwidth_kbps:.4f}, {net_rx_kbps:.4f}, {net_tx_kbps:.4f}
             );
             """

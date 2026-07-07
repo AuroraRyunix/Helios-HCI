@@ -164,3 +164,10 @@ When `spark-daemon` starts up (e.g. during host boot), it spawns a background th
    - `logos` (Distributed Metrics)
    - `mipha` (HA Cluster Monitor)
 
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./spark_technical.md).

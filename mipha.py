@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__build__ = "1.2.0-b4081"
+__build__ = "1.2.2"
 import sys
 import os
 import json
@@ -43,8 +43,15 @@ def get_all_drbd_resources():
         pass
     return resources
 
+def ensure_drbd_resource_up(resource_name):
+    rc, stdout, stderr = run_command_local(f"drbdadm status {resource_name}")
+    if rc != 0:
+        print(f"[Mipha HA] DRBD resource {resource_name} is not loaded. Loading with drbdadm up...")
+        run_command_local(f"drbdadm up {resource_name}")
+
 def resolve_drbd_standalone(resource_name):
     try:
+        ensure_drbd_resource_up(resource_name)
         rc, stdout, stderr = run_command_local(f"drbdadm status {resource_name}")
         if rc == 0:
             if "StandAlone" in stdout:
@@ -59,6 +66,68 @@ def resolve_drbd_standalone(resource_name):
     except Exception as e:
         sys.stderr.write(f"[Mipha HA] Error resolving DRBD standalone for {resource_name}: {e}\n")
 
+DRBD_SYNC_TRACKER = {}
+
+def check_and_resolve_stuck_resync():
+    global DRBD_SYNC_TRACKER
+    rc, stdout, stderr = run_command_local("drbdsetup status --json")
+    if rc != 0 or not stdout.strip():
+        return
+        
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return
+        
+    current_time = time.time()
+    current_keys = set()
+    
+    for resource in data:
+        rname = resource.get("name")
+        connections = resource.get("connections", [])
+        for conn in connections:
+            peer_name = conn.get("name")
+            peer_devices = conn.get("peer_devices", [])
+            for dev in peer_devices:
+                vol = dev.get("volume", 0)
+                repl_state = dev.get("replication-state", "")
+                out_of_sync = dev.get("out-of-sync", 0)
+                
+                if repl_state in ("SyncTarget", "SyncSource") and out_of_sync > 0:
+                    key = (rname, peer_name, vol)
+                    current_keys.add(key)
+                    
+                    tracker = DRBD_SYNC_TRACKER.get(key)
+                    if not tracker:
+                        DRBD_SYNC_TRACKER[key] = {
+                            "last_out_of_sync": out_of_sync,
+                            "stalled_count": 0,
+                            "last_check_time": current_time
+                        }
+                    else:
+                        # Check every 30 seconds
+                        if current_time - tracker["last_check_time"] >= 30:
+                            if out_of_sync == tracker["last_out_of_sync"]:
+                                tracker["stalled_count"] += 1
+                                print(f"[Mipha HA] DRBD resource {rname} resync with {peer_name} is stalled at {out_of_sync} bytes. Stalled count = {tracker['stalled_count']}/3.")
+                            else:
+                                tracker["stalled_count"] = 0
+                                tracker["last_out_of_sync"] = out_of_sync
+                            tracker["last_check_time"] = current_time
+                            
+                            if tracker["stalled_count"] >= 3:
+                                print(f"[Mipha HA] DRBD resource {rname} resync with {peer_name} is STUCK (no progress for 90s). Triggering self-heal disconnect/connect...")
+                                run_command_local(f"drbdadm disconnect {rname}")
+                                time.sleep(1)
+                                run_command_local(f"drbdadm connect {rname}")
+                                tracker["stalled_count"] = 0
+                                tracker["last_check_time"] = current_time
+                                
+    # Clean up keys that are no longer syncing
+    for k in list(DRBD_SYNC_TRACKER.keys()):
+        if k not in current_keys:
+            DRBD_SYNC_TRACKER.pop(k, None)
+
 def linstor_ha_loop():
     print("[Mipha HA] Linstor Controller HA Thread started.")
     while True:
@@ -66,6 +135,8 @@ def linstor_ha_loop():
             is_leader = is_zookeeper_leader()
             for r in get_all_drbd_resources():
                 resolve_drbd_standalone(r)
+            
+            check_and_resolve_stuck_resync()
             
             # Only manage database HA if the linstor-db resource definition exists on this node
             if os.path.exists("/etc/drbd.d/linstor-db.res"):
@@ -87,7 +158,17 @@ def linstor_ha_loop():
                             if ip and ip != LOCAL_IP:
                                 if ping_host(ip):
                                     print(f"[Mipha HA] Coordinating with standby node {h['hostname']} ({ip}) to release linstor-db...")
-                                    stop_cmd = "systemctl stop linstor-controller && umount -l /var/lib/linstor || true; drbdadm secondary linstor-db || true"
+                                    stop_cmd = (
+                                        "if mountpoint -q /var/lib/linstor || [ \"$(drbdadm role linstor-db 2>/dev/null)\" = \"Primary\" ]; then "
+                                        "systemctl stop linstor-controller || true; "
+                                        "systemctl stop aether || true; "
+                                        "umount -l /var/lib/linstor || true; "
+                                        "drbdadm secondary linstor-db || true; "
+                                        "systemctl start aether || true; "
+                                        "else "
+                                        "systemctl stop linstor-controller || true; "
+                                        "fi"
+                                    )
                                     run_remote_spark(ip, stop_cmd)
                                     
                         if role != "Primary":
@@ -114,14 +195,13 @@ def linstor_ha_loop():
                         print("[Mipha HA] Follower State: Stopping linstor-controller...")
                         run_command_local("systemctl stop linstor-controller")
                         
-                    if check_linstor_db_mount():
-                        print("[Mipha HA] Follower State: Unmounting /var/lib/linstor...")
-                        run_command_local("umount -l /var/lib/linstor || true")
-                        
                     role = get_local_drbd_role("linstor-db")
-                    if role == "Primary":
-                        print("[Mipha HA] Follower State: Demoting linstor-db to Secondary...")
+                    if check_linstor_db_mount() or role == "Primary":
+                        print("[Mipha HA] Follower State: Unmounting /var/lib/linstor and demoting to Secondary...")
+                        run_command_local("systemctl stop aether || true")
+                        run_command_local("umount -l /var/lib/linstor || true")
                         run_command_local("drbdadm secondary linstor-db || true")
+                        run_command_local("systemctl start aether || true")
 
             # Align default storage containers (default-vm-container and default-image-container)
             for container in ["default-vm-container", "default-image-container"]:
@@ -422,34 +502,16 @@ def submit_catalyst_task(leader_ip, service, action, payload):
     return None
 
 def ssh_fence_host(ip):
-    print(f"[Mipha HA] Initiating SSH fence for host {ip}...")
+    print(f"[Mipha HA] Initiating Spark-based fence for host {ip}...")
     fence_cmd = "systemctl stop libvirtd virtqemud || true; pkill -9 qemu-system-x86_64 || true; pkill -9 qemu || true"
     
-    # Try standard SSH keys first
-    key_paths = ["/root/.ssh/id_rsa", "/root/.ssh/id_ed25519"]
-    for kp in key_paths:
-        if os.path.exists(kp):
-            cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i {kp} root@{ip} '{fence_cmd}'"
-            rc, stdout, stderr = run_command_local(cmd)
-            if rc == 0:
-                print(f"[Mipha HA] Fenced host {ip} using SSH key {kp}")
-                return True
-                
-    # Try direct SSH (e.g. default identity keys)
-    cmd = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{ip} '{fence_cmd}'"
-    rc, stdout, stderr = run_command_local(cmd)
+    # Try fencing via mTLS Spark Daemon
+    rc, stdout, stderr = run_remote_spark(ip, fence_cmd)
     if rc == 0:
-        print(f"[Mipha HA] Fenced host {ip} using direct SSH")
+        print(f"[Mipha HA] Fenced host {ip} using Spark Daemon")
         return True
         
-    # Try sshpass with fallback password
-    cmd_pass = f"sshpass -p 'ArtPanCooking249!' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@{ip} '{fence_cmd}'"
-    rc, stdout, stderr = run_command_local(cmd_pass)
-    if rc == 0:
-        print(f"[Mipha HA] Fenced host {ip} using sshpass")
-        return True
-        
-    print(f"[Mipha HA] SSH Fencing failed for host {ip}")
+    print(f"[Mipha HA] Spark Fencing failed for host {ip}: {stderr}")
     return False
 
 def main():

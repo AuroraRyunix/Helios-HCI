@@ -10,9 +10,30 @@ def put_text_file(sftp, local_path, remote_path):
     with sftp.open(remote_path, "wb") as f_remote:
         f_remote.write(content.encode("utf-8"))
 
-nodes = ["10.10.102.120", "10.10.102.121", "10.10.102.122"]
+nodes_env = os.environ.get("HELIOS_NODES")
+if nodes_env:
+    nodes = [ip.strip() for ip in nodes_env.split(",") if ip.strip()]
+else:
+    try:
+        nodes_input = input("Enter cluster node IPs (comma separated): ").strip()
+        nodes = [ip.strip() for ip in nodes_input.split(",") if ip.strip()]
+    except (IOError, NameError):
+        nodes = []
+
+if not nodes:
+    print("Error: No cluster node IPs specified.")
+    sys.exit(1)
+
 username = "root"
-password = "ArtPanCooking249!"
+
+password = os.environ.get("HELIOS_PASSWORD")
+if not password:
+    import getpass
+    try:
+        password = getpass.getpass("Enter cluster root password: ").strip()
+    except (IOError, NameError):
+        print("Error: Password environment variable HELIOS_PASSWORD must be set in non-interactive environments.")
+        sys.exit(1)
 
 shared_cert = None
 shared_key = None
@@ -21,7 +42,11 @@ print("=== Ensuring a single shared SSL certificate exists on Node 1 ===")
 ssh_cert = paramiko.SSHClient()
 ssh_cert.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 try:
-    ssh_cert.connect(nodes[0], username=username, password=password, timeout=15)
+    key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
+    if os.path.exists(key_path):
+        ssh_cert.connect(nodes[0], username=username, key_filename=key_path, timeout=15)
+    else:
+        ssh_cert.connect(nodes[0], username=username, password=password, timeout=15)
     cmd_check = "test -f /etc/hci/spectrum/certs/server.crt && test -f /etc/hci/spectrum/certs/server.key"
     stdin_chk, stdout_chk, stderr_chk = ssh_cert.exec_command(cmd_check)
     if stdout_chk.channel.recv_exit_status() != 0:
@@ -55,6 +80,7 @@ local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
 local_mcli_runner = "mcli-runner"
+local_allssh = "allssh"
 local_dagur = "dagur.py"
 local_mimir_daemon = "mimir.py"
 local_vali = "vali.py"
@@ -67,6 +93,8 @@ local_mipha = "mipha.py"
 local_urbosa_bootstrap = "urbosa_bootstrap.py"
 local_daruk = "daruk.py"
 local_yggdrasil = "hylia.py"
+local_check_updates = "check_updates.py"
+local_nodetool = "nodetool"
 
 local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
@@ -144,7 +172,6 @@ MemoryHigh=200M
 yggdrasil_service_content = """[Unit]
 Description=Hylia HA Life Cycle Management Daemon
 After=zookeeper.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
 Type=simple
@@ -267,7 +294,6 @@ daruk_service_content = """[Unit]
 Description=Daruk Database Query Proxy Service
 After=hydra-db.service
 Requires=hydra-db.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
 Type=simple
@@ -283,7 +309,6 @@ CPUWeight=200
 aether_container_content = """[Unit]
 Description=Linstor Satellite Container (Aether Storage Engine Backend)
 After=hydra-db.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
 Restart=always
@@ -313,7 +338,6 @@ WantedBy=multi-user.target
 linstor_controller_content = """[Unit]
 Description=Linstor Controller Container (Aether Orchestrator)
 After=hydra-db.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
 Restart=always
@@ -380,7 +404,11 @@ def deploy_to_node(ip):
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
         try:
-            ssh.connect(ip, username=username, password=password, timeout=15)
+            key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
+            if os.path.exists(key_path):
+                ssh.connect(ip, username=username, key_filename=key_path, timeout=15)
+            else:
+                ssh.connect(ip, username=username, password=password, timeout=15)
             
             if not fast_mode:
                 # 1. Clean and recreate build directory for Spectrum
@@ -428,6 +456,10 @@ def deploy_to_node(ip):
             # 2e. Copy valcli CLI
             print(f"[{ip}] Uploading valcli to /usr/local/bin/valcli...")
             put_text_file(sftp, local_valcli, "/usr/local/bin/valcli")
+            
+            # 2ea. Copy allssh CLI
+            print(f"[{ip}] Uploading allssh to /usr/local/bin/allssh...")
+            put_text_file(sftp, local_allssh, "/usr/local/bin/allssh")
             
             # 2f. Copy Dagur and Mimir daemons
             print(f"[{ip}] Uploading dagur daemon to /usr/local/bin/dagur...")
@@ -501,6 +533,10 @@ def deploy_to_node(ip):
             print(f"[{ip}] Uploading hylia daemon to /usr/local/bin/hylia...")
             put_text_file(sftp, local_yggdrasil, "/usr/local/bin/hylia")
             
+            # Copy check-updates script
+            print(f"[{ip}] Uploading check-updates script to /usr/local/bin/check-updates...")
+            put_text_file(sftp, local_check_updates, "/usr/local/bin/check-updates")
+            
             # Write hylia systemd unit
             print(f"[{ip}] Writing hylia.service unit...")
             f_ygg = sftp.open("/etc/systemd/system/hylia.service", "w")
@@ -518,6 +554,10 @@ def deploy_to_node(ip):
             # 2jb. Copy Urbosa bootstrap script
             print(f"[{ip}] Uploading urbosa-bootstrap script to /usr/local/bin/urbosa-bootstrap...")
             put_text_file(sftp, local_urbosa_bootstrap, "/usr/local/bin/urbosa-bootstrap")
+            
+            # 2jc. Copy nodetool host wrapper
+            print(f"[{ip}] Uploading nodetool wrapper to /usr/local/bin/nodetool...")
+            put_text_file(sftp, local_nodetool, "/usr/local/bin/nodetool")
             
             # 2k. Write catalyst systemd unit
             print(f"[{ip}] Writing catalyst.service unit...")
@@ -659,7 +699,10 @@ def deploy_to_node(ip):
             
             # 4. Make executables runnable
             print(f"[{ip}] Setting executable permissions...")
-            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap")
+            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
+            
+            # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
+            ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
             
             # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
             print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")
@@ -718,6 +761,14 @@ def deploy_to_node(ip):
     
                 
             if not fast_mode:
+                # Ensure clang and lld are installed on target host
+                stdin_chk, stdout_chk, stderr_chk = ssh.exec_command("which clang && which lld")
+                if stdout_chk.channel.recv_exit_status() != 0:
+                    print(f"[{ip}] clang or lld not found. Installing clang and lld via dnf...")
+                    stdin_inst, stdout_inst, stderr_inst = ssh.exec_command("dnf install -y --nogpgcheck clang lld")
+                    if stdout_inst.channel.recv_exit_status() != 0:
+                        print(f"[{ip}] Error installing clang/lld: {stderr_inst.read().decode()}")
+                        
                 # Compile WebAssembly SPICE LZ decompressor
                 print(f"[{ip}] Compiling WebAssembly SPICE LZ decompressor...")
                 cmd_wasm = (

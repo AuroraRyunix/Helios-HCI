@@ -89,3 +89,10 @@ valcli db.query "SELECT * FROM hydra.gatoway_networks;"
 valcli db.query "INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id) VALUES (uuid(), 'Marketing-VLAN', 'vlan', 150);"
 ```
 Gatoway will detect the new database entry within 5 seconds and automatically bootstrap the required bridge (`br-vlan-150`) and sub-interface (`ens192.150`) on all cluster nodes.
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./gatoway_technical.md).

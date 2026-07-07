@@ -43,3 +43,10 @@ Query ScyllaDB directly to check the current state of a cluster upgrade:
 ```bash
 cqlsh -e "SELECT job_id, state, target_nodes, current_node, build_number FROM hydra.hylia_jobs;"
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./hylia_technical.md).

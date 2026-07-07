@@ -29,14 +29,13 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 
 ## Technical Execution & Scheduling Loop
 
-Every 60 seconds, the active Dagur coordinator (running on the ZooKeeper leader node) executes the following sequence:
-1. **Quorum check**: Queries ZooKeeper local status to ensure it is the active leader.
-2. **Retrieve Schedules**: Queries `hydra.dagur_schedules` to load all enabled schedule records.
-3. **Cron Evaluation**: Parses the cron expression of each job. If the current time matches the expression, it spawns a background thread to execute the command.
-4. **Execution & Logging**:
-   - Runs the task command locally or uses the Spark mTLS API for remote node runs.
-   - Captures `stdout`, `stderr`, and `exit_code`.
-   - Logs execution results to the `hydra.dagur_runs` history table.
+Dagur operates as a distributed execution worker by doing the following:
+1. **Quorum Check**: Queries ZooKeeper status to verify it is the active leader (only the leader executes jobs to prevent duplicate run conflicts).
+2. **Long-poll Catalyst**: Performs a long-poll request to Catalyst on `GET /api/v1/queues/dagur`.
+3. **Execute Job**: When Catalyst dispatches a task (scheduled by Catalyst's `scheduler_thread_loop` querying `hydra.dagur_schedules`), Dagur spawns a background thread `execute_dagur_job_thread` to execute the command using Spark mTLS on localhost.
+4. **Progress Updates & Logging**:
+   - Reports progress and status updates back to Catalyst via `POST /api/v1/tasks/update`.
+   - Inserts run results, exit codes, and output logs into `hydra.dagur_runs`.
 
 ---
 
@@ -68,3 +67,10 @@ To register a new background task, insert a new row into the `dagur_schedules` t
 # Example: Add a daily backup sync task at 2:00 AM
 podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "INSERT INTO hydra.dagur_schedules (schedule_name, task_type, cron_expr, command, enabled) VALUES ('daily_backup', 'backup', '0 2 * * *', '/usr/local/bin/backup_sync.sh', true);"
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./dagur_technical.md).

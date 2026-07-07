@@ -152,3 +152,10 @@ podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT task_id, service, act
 podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT hostname, ip, status, maintenance_mode FROM hydra.nodes;"
 ```
 
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./vali_technical.md).

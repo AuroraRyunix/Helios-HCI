@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workload Extras - Helios HCI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;700;900&family=Fredoka:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #06080e;
+            --card-bg: #12192c;
+            --card-border: #182238;
+            --text-primary: #f0f5fa;
+            --text-secondary: #a0aec0;
+            
+            --accent-cyan: #00f0ff;
+            --accent-magenta: #ff4bb0;
+            --accent-gold: #ffc83b;
+            --accent-green: #39e75f;
+            --accent-purple: #bd5eff;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: var(--text-primary);
+            font-family: 'Fredoka', sans-serif;
+            min-height: 100vh;
+            padding: 2rem;
+            position: relative;
+            overflow-x: hidden;
+            /* Cyberpunk blueprint network grid */
+            background-image: 
+                linear-gradient(rgba(0, 240, 255, 0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0, 240, 255, 0.02) 1px, transparent 1px);
+            background-size: 30px 30px;
+        }
+
+        #bg-canvas {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -2;
+            pointer-events: none;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: rgba(18, 25, 44, 0.65);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 4px solid var(--card-border);
+            border-radius: 24px;
+            padding: 3rem;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.9), inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+            position: relative;
+        }
+
+        .nav-back {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+            color: var(--accent-magenta);
+            background: rgba(255, 75, 176, 0.1);
+            font-weight: 700;
+            padding: 10px 20px;
+            border: 2px solid rgba(255, 75, 176, 0.3);
+            border-radius: 12px;
+            margin-bottom: 2.5rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            transition: all 0.2s ease;
+        }
+
+        .nav-back:hover {
+            background: rgba(255, 75, 176, 0.2);
+            transform: translateX(-4px);
+        }
+
+        .header-section {
+            margin-bottom: 3rem;
+            padding-bottom: 2.5rem;
+            border-bottom: 2px dashed var(--card-border);
+        }
+
+        .page-title {
+            font-size: 3.5rem;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--accent-magenta);
+            text-shadow: 0 0 25px rgba(255, 75, 176, 0.35);
+            margin-bottom: 0.5rem;
+        }
+
+        .page-subtitle {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+        }
+
+        .comparison-table-wrapper {
+            margin: 2.5rem 0;
+            overflow-x: auto;
+            border: 2px solid var(--card-border);
+            border-radius: 12px;
+            background: var(--bg-dark);
+            box-shadow: 4px 4px 0px rgba(0,0,0,0.5);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.95rem;
+        }
+
+        th {
+            background: rgba(0, 240, 255, 0.05);
+            color: var(--accent-cyan);
+            padding: 1rem;
+            font-weight: 700;
+            border-bottom: 2px solid var(--card-border);
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 1px;
+        }
+
+        td {
+            padding: 1.2rem 1rem;
+            border-bottom: 1px solid var(--card-border);
+            color: var(--text-primary);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .badge-recommended {
+            background: rgba(57, 231, 95, 0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(57, 231, 95, 0.3);
+            padding: 2px 8px;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .workload-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+        }
+
+        .workload-card {
+            background: rgba(18, 25, 44, 0.8);
+            border: 2px solid var(--card-border);
+            border-radius: 16px;
+            padding: 2rem;
+            transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.2);
+            position: relative;
+        }
+
+        .workload-card:hover {
+            transform: translateY(-4px);
+            border-color: var(--accent-cyan);
+            box-shadow: 0 8px 30px rgba(0, 240, 255, 0.15);
+        }
+
+        .card-header-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1rem;
+        }
+
+        .card-title {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.75rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .card-desc {
+            font-size: 1rem;
+            line-height: 1.7;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+        }
+
+        .code-block {
+            background: #000;
+            color: var(--accent-green);
+            padding: 1.2rem;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            border: 1px solid rgba(57, 231, 95, 0.2);
+            overflow-x: auto;
+            position: relative;
+        }
+
+        .code-block::before {
+            content: "SHELL";
+            position: absolute;
+            top: 4px;
+            right: 8px;
+            font-size: 0.65rem;
+            color: var(--text-secondary);
+            font-weight: bold;
+        }
+
+        .feature-list {
+            list-style: none;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.8rem;
+            margin-top: 1rem;
+        }
+
+        .feature-item {
+            font-size: 0.9rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .feature-item::before {
+            content: "✦";
+            color: var(--accent-cyan);
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="bg-canvas"></canvas>
+
+    <div class="container">
+        
+        <a href="index.html" class="nav-back">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg>
+            Back to Dashboard
+        </a>
+
+        <div class="header-section">
+            <h1 class="page-title">Workload Options</h1>
+            <p class="page-subtitle">Choose the best workload engine or Kubernetes distribution to deploy inside guest virtual machines on Helios HCI.</p>
+        </div>
+
+        <div class="workload-grid">
+            
+            <!-- K3S -->
+            <div class="workload-card" style="border-color: var(--accent-green);">
+                <div class="card-header-row">
+                    <h2 class="card-title" style="color: var(--accent-green);">K3s (Lightweight Kubernetes)</h2>
+                    <span class="badge-recommended">Easiest to Deploy</span>
+                </div>
+                <p class="card-desc">
+                    Developed by Rancher, <strong>K3s</strong> is a highly lightweight, fully compliant Kubernetes distribution packaged as a single binary. It reduces memory overhead to under 50MB per agent, making it the perfect workload hypervisor for Helios HCI guest VMs.
+                </p>
+                <div class="code-block">
+# Deploy K3s inside a guest VM in under 30 seconds:
+curl -sfL https://get.k3s.io | sh -
+                </div>
+                <ul class="feature-list">
+                    <li class="feature-item">Boots instantly using an embedded SQLite database</li>
+                    <li class="feature-item">Packaged with local path storage & Flannel CNI</li>
+                    <li class="feature-item">Extremely low memory footprint & resource usage</li>
+                    <li class="feature-item">Single binary orchestrating all Kubernetes elements</li>
+                </ul>
+            </div>
+
+            <!-- RKE2 -->
+            <div class="workload-card">
+                <div class="card-header-row">
+                    <h2 class="card-title" style="color: var(--accent-cyan);">RKE2 (Government-Grade K8s)</h2>
+                    <span style="font-size: 0.8rem; color: var(--accent-cyan); font-weight: bold; border: 1px solid rgba(0, 240, 255, 0.3); padding: 2px 8px; border-radius: 6px; text-transform: uppercase;">Highly Secure</span>
+                </div>
+                <p class="card-desc">
+                    Also known as Rancher Next-Generation Kubernetes, <strong>RKE2</strong> inherits VMware and RHEL parity compliance profiles. It focuses entirely on security, government compliance, and strict validation of system components.
+                </p>
+                <ul class="feature-list">
+                    <li class="feature-item">FIPS 140-2 compliance ready for secure datacenters</li>
+                    <li class="feature-item">Automated CIS benchmark checks applied out-of-the-box</li>
+                    <li class="feature-item">Runs components as rootless containerized processes</li>
+                    <li class="feature-item">Perfect for regulated multi-tenant production zones</li>
+                </ul>
+            </div>
+
+            <!-- TKG -->
+            <div class="workload-card">
+                <div class="card-header-row">
+                    <h2 class="card-title" style="color: var(--accent-purple);">Tanzu Kubernetes Grid (TKG)</h2>
+                    <span style="font-size: 0.8rem; color: var(--accent-purple); font-weight: bold; border: 1px solid rgba(189, 94, 255, 0.3); padding: 2px 8px; border-radius: 6px; text-transform: uppercase;">Enterprise Complex</span>
+                </div>
+                <p class="card-desc">
+                    VMware's flagship Kubernetes platform. While it provides enterprise-grade operations and native vSphere control plane parity, it carries high infrastructure complexity, requiring dedicated management clusters and control-plane controllers.
+                </p>
+                <ul class="feature-list">
+                    <li class="feature-item">Deep integration with multi-tenant storage policies</li>
+                    <li class="feature-item">High management overhead requiring a dedicated VM cluster</li>
+                    <li class="feature-item">Complex setup involving Tanzu CLI & bootstrap controllers</li>
+                    <li class="feature-item">Best suited for legacy enterprise app migrations</li>
+                </ul>
+            </div>
+
+        </div>
+
+        <h2 style="font-family: 'Outfit', sans-serif; font-size: 2rem; margin-top: 4rem; margin-bottom: 1.5rem; text-transform: uppercase; color: var(--accent-cyan); text-shadow: 0 0 15px rgba(0, 240, 255, 0.2);"> Workload Hypervisor Comparison</h2>
+        
+        <div class="comparison-table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Option</th>
+                        <th>Deployment Speed</th>
+                        <th>Memory Footprint</th>
+                        <th>Setup Complexity</th>
+                        <th>Recommended Use Case</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td style="font-weight: bold; color: var(--accent-green);">K3s</td>
+                        <td>30 Seconds (One-liner)</td>
+                        <td>&lt; 50 MB</td>
+                        <td>Very Low</td>
+                        <td>Edge cluster, dev testing, lightweight guest workloads</td>
+                    </tr>
+                    <tr>
+                        <td style="font-weight: bold; color: var(--accent-cyan);">RKE2</td>
+                        <td>5 - 10 Minutes</td>
+                        <td>~ 500 MB</td>
+                        <td>Medium</td>
+                        <td>Government, defense, and highly-secure enterprise zones</td>
+                    </tr>
+                    <tr>
+                        <td style="font-weight: bold; color: var(--accent-purple);">TKG</td>
+                        <td>30+ Minutes</td>
+                        <td>&gt; 2 GB (Mgmt VM)</td>
+                        <td>Very High</td>
+                        <td>Parity migrations from enterprise VMware vSphere</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+    </div>
+
+    <!-- Drifting Cartoon Bubbles background canvas -->
+    <script>
+        const canvas = document.getElementById('bg-canvas');
+        const ctx = canvas.getContext('2d');
+        let bubbles = [];
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        class Bubble {
+            constructor() {
+                this.reset(true);
+            }
+            reset(initial = false) {
+                this.x = Math.random() * canvas.width;
+                this.y = initial ? Math.random() * canvas.height : canvas.height + Math.random() * 50;
+                this.radius = Math.random() * 20 + 6;
+                this.speedY = Math.random() * 0.5 + 0.15;
+                this.wobbleSpeed = Math.random() * 0.02 + 0.01;
+                this.wobble = 0;
+                this.color = Math.random() > 0.6 
+                    ? 'rgba(0, 240, 255, 0.04)' 
+                    : (Math.random() > 0.5 ? 'rgba(255, 75, 176, 0.03)' : 'rgba(255, 200, 59, 0.02)');
+            }
+            update() {
+                this.y -= this.speedY;
+                this.wobble += this.wobbleSpeed;
+                this.x += Math.sin(this.wobble) * 0.15;
+                if (this.y < -this.radius) this.reset(false);
+            }
+            draw() {
+                ctx.fillStyle = this.color;
+                ctx.strokeStyle = this.color.replace('0.04', '0.1').replace('0.03', '0.08').replace('0.02', '0.05');
+                ctx.lineWidth = 1.2;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        function initBubbles() {
+            bubbles = [];
+            const count = Math.min(30, Math.floor(window.innerWidth / 40));
+            for (let i = 0; i < count; i++) bubbles.push(new Bubble());
+        }
+
+        function animateBubbles() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            bubbles.forEach(b => {
+                b.update();
+                b.draw();
+            });
+            requestAnimationFrame(animateBubbles);
+        }
+
+        initBubbles();
+        animateBubbles();
+    </script>
+</body>
+</html>

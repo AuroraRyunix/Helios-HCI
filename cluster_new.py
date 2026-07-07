@@ -330,9 +330,19 @@ def main():
                     if port in stdout:
                         print(f"[WARNING] Port {port} is already in use on {ip}. This may cause conflicts.")
 
+            # Validate Secure Boot and ELRepo module signing key
+            rc_sb, sb_out, _ = run_remote_spark(ip, "mokutil --is-sb-enabled")
+            if rc_sb == 0 and "secureboot enabled" in sb_out.lower():
+                rc_key, _, _ = run_remote_spark(ip, "mokutil --test-key /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
+                if rc_key != 0:
+                    print(f"[ERROR] Secure Boot is enabled on host {ip} and the ELRepo Secure Boot key is not enrolled.")
+                    print(f"[ERROR] Unsigned kernel modules like DRBD will fail to load under Secure Boot.")
+                    print(f"[ERROR] Please disable Secure Boot in the UEFI/BIOS settings of {ip}, or import the key ('mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der') and reboot to enroll it.")
+                    sys.exit(1)
+
         # Ensure any running core services are stopped to prevent them from interfering with boot (e.g. Mipha stopping Linstor Controller during creation)
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
         run_parallel(ips, f"systemctl stop {' '.join(cleanup_services)} || true")
 
         # 2. Hostname Resolution & Cluster JSON Config
@@ -753,7 +763,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
         
         # Check if urbosa enabled
         urbosa_enabled = False
@@ -953,6 +963,14 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print("[ERROR] Cannot start cluster: spark-daemon must be online on all nodes.")
             sys.exit(1)
 
+        # Identify nodes in maintenance mode
+        maintenance_ips = []
+        for ip in ips:
+            rc, _, _ = run_remote_spark(ip, "test -f /etc/hci/maintenance.state")
+            if rc == 0:
+                maintenance_ips.append(ip)
+                print(f"[{ip}] Note: Host is currently in maintenance mode.")
+
         # 2. Start ZooKeeper Service
         print("\n--- Phase 1: Starting ZooKeeper Service ---")
         for ip in ips:
@@ -1077,7 +1095,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start remaining services
         print("\n--- Phase 4: Starting Core Workload & Coordination Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
         if check_urbosa_enabled():
             services.append("urbosa")
         service_ports = {
@@ -1090,11 +1108,15 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         
         for svc in services:
             for ip in ips:
+                if ip in maintenance_ips:
+                    continue
                 print(f"[{ip}] Starting systemd service: {svc}...")
                 run_checked_cmd(ip, f"systemctl restart {svc}")
                 
         for svc in services:
             for ip in ips:
+                if ip in maintenance_ips:
+                    continue
                 print(f"[{ip}] Verifying service {svc} is active...")
                 for _ in range(30):
                     rc, out, _ = run_remote_spark(ip, f"systemctl is-active {svc}")
@@ -1145,39 +1167,33 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             sys.exit(1)
         print("  ZooKeeper quorum is healthy.")
 
-        # B. Wait for Mipha to promote linstor-db and start Linstor Controller on the leader node
-        print("Waiting for linstor-controller to become active on the ZooKeeper leader...")
-        zk_leader_ip = None
-        for ip in ips:
-            cmd_zk = "python3 -c 'import socket; s=socket.socket(); s.settimeout(0.5); s.connect((\"127.0.0.1\", 2181)); s.sendall(b\"stat\"); r=s.recv(1024).decode(); print(\"leader\" in r or \"standalone\" in r)' 2>/dev/null"
-            rc, out, _ = run_remote_spark(ip, cmd_zk)
-            if rc == 0 and out.strip() == "True":
-                zk_leader_ip = ip
-                break
-        if not zk_leader_ip:
-            zk_leader_ip = ips[0]
-            
-        print(f"  ZooKeeper leader is {zk_leader_ip}. Waiting up to 45 seconds for Linstor Controller...")
-        controller_active = False
+        # B. Wait for Mipha to promote linstor-db and start Linstor Controller on one of the nodes
+        print("Waiting for linstor-controller to become active on one of the nodes...")
+        controller_active_ip = None
         for _ in range(45):
-            rc_c, out_c, _ = run_remote_spark(zk_leader_ip, "systemctl is-active linstor-controller")
-            if rc_c == 0 and out_c.strip() == "active":
-                rc_p, out_p, _ = run_remote_spark(zk_leader_ip, "ss -tlnp | grep 3370")
-                if rc_p == 0 and "3370" in out_p:
-                    controller_active = True
-                    break
+            for ip in ips:
+                rc_c, out_c, _ = run_remote_spark(ip, "systemctl is-active linstor-controller")
+                if rc_c == 0 and out_c.strip() == "active":
+                    rc_p, out_p, _ = run_remote_spark(ip, "ss -tlnp | grep 3370")
+                    if rc_p == 0 and "3370" in out_p:
+                        controller_active_ip = ip
+                        break
+            if controller_active_ip:
+                break
             time.sleep(1)
-        if not controller_active:
-            print(f"[ERROR] Cluster start verification failed: Linstor Controller failed to start or become active on the leader node {zk_leader_ip}.")
+            
+        if not controller_active_ip:
+            print("[ERROR] Cluster start verification failed: Linstor Controller failed to start or become active on any node.")
             sys.exit(1)
-        print("  Linstor Controller is active.")
+            
+        print(f"  Linstor Controller is active on {controller_active_ip}.")
 
         # C. Verify Linstor Satellites are online
         print("Verifying Linstor satellite node connections...")
         linstor_healthy = False
         controllers_str = ",".join(ips)
         for i in range(15):
-            rc_l, out_l, _ = run_remote_spark(zk_leader_ip, f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list")
+            rc_l, out_l, _ = run_remote_spark(controller_active_ip, f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list")
             if rc_l == 0:
                 online_count = 0
                 for line in out_l.splitlines():
@@ -1297,33 +1313,67 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         else:
             print("Warning: Failed to set cluster state to stopped in ZooKeeper.")
             
-        # 3. Unmount default volumes
-        print("\n--- Step 3: Unmounting default volumes ---")
-        for ip in get_cluster_ips():
-            print(f"[{ip}] Unmounting default volume containers...")
-            run_remote_spark(ip, "umount -l /var/lib/hci/aether/volumes/default-vm-container || true")
-            run_remote_spark(ip, "umount -l /var/lib/hci/aether/volumes/default-image-container || true")
-            run_remote_spark(ip, "umount -l /var/lib/linstor || true")
-            run_remote_spark(ip, "drbdadm down all || true")
+        # 3. Stop workload and HA services in parallel
+        print("\n--- Step 3: Stopping workload and HA services in parallel across all nodes ---")
+        workload_services = ["hylia", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate"]
+        for svc in workload_services:
+            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
+            run_parallel(ips, f"systemctl stop {svc}")
             
-        # 4. Stop systemd services sequentially
-        print("\n--- Step 4: Stopping systemd services sequentially ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        # 3.5. Wait for DRBD replication sync to finish
+        print("\n--- Step 3.5: Ensuring all DRBD volumes finish syncing ---")
+        for attempt in range(60): # Wait up to 120 seconds
+            syncing = False
+            for ip in ips:
+                rc, stdout, _ = run_remote_spark(ip, "drbdsetup status --json")
+                if rc == 0 and stdout.strip():
+                    try:
+                        data = json.loads(stdout)
+                        for resource in data:
+                            for conn in resource.get("connections", []):
+                                for dev in conn.get("peer_devices", []):
+                                    if dev.get("replication-state") in ("SyncTarget", "SyncSource"):
+                                        syncing = True
+                                        break
+                    except Exception:
+                        pass
+            if not syncing:
+                print("All DRBD resources are fully synced.")
+                break
+            print("Some DRBD volumes are still syncing, waiting 2 seconds...")
+            time.sleep(2)
+        else:
+            print("Warning: Timeout waiting for DRBD resync to finish. Proceeding with shutdown.")
+            
+        # 4. Unmount default volumes in parallel
+        print("\n--- Step 4: Unmounting default volumes in parallel across all nodes ---")
+        run_parallel(ips, "umount -l /var/lib/hci/aether/volumes/default-vm-container || true")
+        run_parallel(ips, "umount -l /var/lib/hci/aether/volumes/default-image-container || true")
+        run_parallel(ips, "umount -l /var/lib/linstor || true")
+
+        # 5. Stop storage and controller services in parallel
+        print("\n--- Step 5: Stopping storage services in parallel across all nodes ---")
+        storage_services = ["linstor-controller", "aether", "daruk"]
         if check_urbosa_enabled():
-            services.insert(services.index("aether"), "urbosa")
-        for ip in get_cluster_ips():
-            print(f"[{ip}] Stopping services...")
-            for svc in services:
-                print(f"[{ip}] Stopping systemd service: {svc}...")
-                rc_svc, _, err_svc = run_remote_spark(ip, f"systemctl stop {svc}")
-                if rc_svc != 0:
-                    print(f"[{ip}] Warning: Failed to stop service '{svc}': {err_svc}")
-                    
-        # 5. Restart spark-daemon asynchronously
-        print("\n--- Step 5: Restarting spark-daemon asynchronously ---")
-        for ip in get_cluster_ips():
-            print(f"[{ip}] Restarting spark-daemon...")
-            run_remote_spark(ip, "(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &")
+            storage_services.insert(0, "urbosa")
+        for svc in storage_services:
+            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
+            run_parallel(ips, f"systemctl stop {svc}")
+
+        # 6. Bring down DRBD resources in parallel
+        print("\n--- Step 6: Bringing down DRBD resources in parallel across all nodes ---")
+        run_parallel(ips, "drbdadm down all || true")
+
+        # 7. Stop database and coordination services in parallel
+        print("\n--- Step 7: Stopping database and coordination services in parallel across all nodes ---")
+        db_services = ["hydra-db", "zookeeper"]
+        for svc in db_services:
+            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
+            run_parallel(ips, f"systemctl stop {svc}")
+            
+        # 8. Restart spark-daemon asynchronously in parallel
+        print("\n--- Step 8: Restarting spark-daemon asynchronously in parallel ---")
+        run_parallel(ips, "(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &")
             
         print("Stop command execution completed.")
 
@@ -1366,7 +1416,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
@@ -1464,6 +1514,9 @@ if "/dev/sdb" not in devs:
 print("Devices identified for signature wiping:", devs)
 for dev in devs:
     subprocess.run("pvremove -y " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.path.exists("/etc/lvm/devices/system.devices"):
+        dev_name = dev.split("/")[-1]
+        subprocess.run("sed -i '/" + dev_name + "/d' /etc/lvm/devices/system.devices", shell=True)
     subprocess.run("wipefs -a " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     res_sz = subprocess.run("blockdev --getsize64 " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

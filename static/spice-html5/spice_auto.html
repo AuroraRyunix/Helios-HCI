@@ -1,0 +1,427 @@
+<!--
+   Copyright (C) 2012 by Jeremy P. White <jwhite@codeweavers.com>
+
+   This file is part of spice-html5.
+
+   spice-html5 is free software: you can redistribute it and/or modify
+   it under the terms of the GNU Lesser General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   spice-html5 is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU Lesser General Public License for more details.
+
+   You should have received a copy of the GNU Lesser General Public License
+   along with spice-html5.  If not, see <http://www.gnu.org/licenses/>.
+
+   --------------------------------------------------
+    Spice Javascript client template.
+    Refer to main.js for more detailed information
+   --------------------------------------------------
+
+-->
+
+<!doctype html>
+<html>
+    <head>
+
+        <title>Spice Javascript client</title>
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" type="text/css" href="spice.css?v=1.0.4" />
+
+        <!-- ES2015/ES6 modules polyfill -->
+        <script type="module">
+            window._spice_has_module_support = true;
+        </script>
+        <script>
+            window.onerror = function(message, source, lineno, colno, error) {
+                var banner = document.getElementById('error-banner');
+                if (banner) {
+                    banner.style.display = 'block';
+                    banner.textContent = 'JS ERROR: ' + message + ' (' + source + ':' + lineno + ')';
+                }
+                return false;
+            };
+
+            window.addEventListener("load", function() {
+                if (window._spice_has_module_support) return;
+                var loader = document.createElement("script");
+                loader.src = "thirdparty/browser-es-module-loader/dist/" +
+                    "browser-es-module-loader.js";
+                document.head.appendChild(loader);
+            });
+        </script>
+
+        <script type="module" crossorigin="anonymous">
+            import * as SpiceHtml5 from './src/main.js';
+
+            // Global Fetch Interceptor in spice_auto.html
+            const originalFetch = window.fetch;
+            window.fetch = async function(input, init) {
+                let options = init || {};
+                let token = null;
+                try {
+                    token = sessionStorage.getItem('helios_session_token') || localStorage.getItem('helios_session_token');
+                } catch (e) {}
+                
+                if (token) {
+                    if (input instanceof Request) {
+                        try {
+                            const newHeaders = new Headers(input.headers);
+                            newHeaders.set('Authorization', `Bearer ${token}`);
+                            input = new Request(input, { headers: newHeaders });
+                        } catch (e) {}
+                    } else {
+                        if (!options.headers) {
+                            options.headers = {};
+                        }
+                        if (options.headers instanceof Headers) {
+                            options.headers.set('Authorization', `Bearer ${token}`);
+                        } else if (Array.isArray(options.headers)) {
+                            let hasAuth = false;
+                            for (let i = 0; i < options.headers.length; i++) {
+                                if (options.headers[i][0].toLowerCase() === 'authorization') {
+                                    hasAuth = true;
+                                    break;
+                                }
+                            }
+                            if (!hasAuth) {
+                                options.headers.push(['Authorization', `Bearer ${token}`]);
+                            }
+                        } else {
+                            if (!options.headers['Authorization'] && !options.headers['authorization']) {
+                                options.headers['Authorization'] = `Bearer ${token}`;
+                            }
+                        }
+                    }
+                }
+                return originalFetch(input, options);
+            };
+
+            var host = null, port = null;
+            var sc;
+
+            function spice_set_cookie(name, value, days) {
+                var date, expires;
+                date = new Date();
+                date.setTime(date.getTime() + (days*24*60*60*1000));
+                expires = "; expires=" + date.toGMTString();
+                document.cookie = name + "=" + value + expires + "; path=/";
+            };
+
+            function spice_query_var(name, defvalue) {
+                var match = RegExp('[?&]' + name + '=([^&]*)')
+                                  .exec(window.location.search);
+                return match ?
+                    decodeURIComponent(match[1].replace(/\+/g, ' '))
+                    : defvalue;
+            }
+
+            function spice_error(e)
+            {
+                disconnect();
+
+                var banner = document.getElementById('error-banner');
+                if (banner) {
+                    banner.style.display = 'block';
+                    var details = '';
+                    if (e) {
+                        var errMsg = e.message || e.toString();
+                        details += 'Message: ' + errMsg + '<br>';
+                        if (e.name) details += 'Name: ' + e.name + '<br>';
+                        if (e.code) details += 'Code: ' + e.code + '<br>';
+                        
+                        if (errMsg === '[object Event]') {
+                            details += '<br><strong style="color: #ffedd5;">Possible Cause: Self-Signed SSL Certificate Blocked by Browser</strong><br>';
+                            details += '<span style="font-size: 13px; font-weight: normal; color: #fecaca;">Modern browsers (like Chrome) block secure WebSockets (wss://) on self-signed certificates even after an HTTPS warning bypass.</span><br><br>';
+                            details += '<strong style="color: #ffedd5;">To fix this:</strong><br>';
+                            details += '<span style="font-size: 13px; font-weight: normal; color: #fecaca;">1. Click this link to authorize the endpoint in a new tab: <a href="https://' + window.location.host + '/api/vms/console/ws" target="_blank" style="color: #93c5fd; text-decoration: underline; font-weight: bold;">Authorize WebSocket Endpoint</a><br>';
+                            details += '2. If a certificate warning appears, click "Advanced" -> "Proceed" to bypass it.<br>';
+                            details += '3. Once authorized, close that tab and reload this console.</span><br><br>';
+                        }
+                    }
+                    banner.innerHTML = '<h3>SPICE Error Detected</h3>' +
+                                       '<p>' + details + '</p>' +
+                                       '<p style="font-size: 11px; color: #aaa;">Target WebSocket URI: <code>' + (window.last_uri || 'Unknown') + '</code><br>' +
+                                       'Query Search: <code>' + window.location.search + '</code></p>';
+                }
+                if (e !== undefined && e.message === "Permission denied.") {
+                  var pass = prompt("Password");
+                  connect(pass);
+                }
+            }
+
+            function connect(password)
+            {
+                var host, port, scheme = "ws://", uri;
+
+                // By default, use the host and port of server that served this file
+                host = spice_query_var('host', window.location.hostname);
+
+                // Note that using the web server port only makes sense
+                //  if your web server has a reverse proxy to relay the WebSocket
+                //  traffic to the correct destination port.
+                var default_port = window.location.port;
+                if (!default_port) {
+                    if (window.location.protocol == 'http:') {
+                        default_port = 80;
+                    }
+                    else if (window.location.protocol == 'https:') {
+                        default_port = 443;
+                    }
+                }
+                port = spice_query_var('port', default_port);
+                if (window.location.protocol == 'https:') {
+                    scheme = "wss://";
+                }
+
+                // If a token variable is passed in, set the parameter in a cookie.
+                // This is used by nova-spiceproxy.
+                var token = spice_query_var('token', null);
+                if (token) {
+                    spice_set_cookie('token', token, 1)
+                }
+
+                if (password === undefined) {
+                    password = spice_query_var('password', '');
+                }
+                var path = spice_query_var('path', 'websockify');
+
+                if ((!host) || (!port)) {
+                    console.log("must specify host and port in URL");
+                    return;
+                }
+
+                if (sc) {
+                    sc.stop();
+                }
+
+                uri = scheme + host + ":" + port;
+
+                if (path) {
+                  uri += path[0] == '/' ? path : ('/' + path);
+                }
+
+                window.last_uri = uri;
+
+                try
+                {
+                    sc = new SpiceHtml5.SpiceMainConn({uri: uri, screen_id: "spice-screen", dump_id: "debug-div",
+                                message_id: "message-div", password: password, onerror: spice_error, onagent: agent_connected });
+                }
+                catch (e)
+                {
+                    alert(e.toString());
+                    disconnect();
+                }
+
+            }
+
+            function disconnect()
+            {
+                console.log(">> disconnect");
+                document.body.classList.remove('agent-connected');
+                if (sc) {
+                    sc.stop();
+                }
+                if (window.File && window.FileReader && window.FileList && window.Blob)
+                {
+                    var spice_xfer_area = document.getElementById('spice-xfer-area');
+                    if (spice_xfer_area != null) {
+                      document.getElementById('spice-area').removeChild(spice_xfer_area);
+                    }
+                    document.getElementById('spice-area').removeEventListener('dragover', SpiceHtml5.handle_file_dragover, false);
+                    document.getElementById('spice-area').removeEventListener('drop', SpiceHtml5.handle_file_drop, false);
+                }
+                console.log("<< disconnect");
+            }
+
+            function agent_connected(sc)
+            {
+                document.body.classList.add('agent-connected');
+                window.addEventListener('resize', SpiceHtml5.handle_resize);
+                window.spice_connection = sc;
+
+                SpiceHtml5.resize_helper(sc);
+
+                if (window.File && window.FileReader && window.FileList && window.Blob)
+                {
+                    var spice_xfer_area = document.createElement("div");
+                    spice_xfer_area.setAttribute('id', 'spice-xfer-area');
+                    document.getElementById('spice-area').appendChild(spice_xfer_area);
+                    document.getElementById('spice-area').addEventListener('dragover', SpiceHtml5.handle_file_dragover, false);
+                    document.getElementById('spice-area').addEventListener('drop', SpiceHtml5.handle_file_drop, false);
+                }
+                else
+                {
+                    console.log("File API is not supported");
+                }
+            }
+
+            /* SPICE port event listeners
+            window.addEventListener('spice-port-data', function(event) {
+                // Here we convert data to text, but really we can obtain binary data also
+                var msg_text = arraybuffer_to_str(new Uint8Array(event.detail.data));
+                DEBUG > 0 && console.log('SPICE port', event.detail.channel.portName, 'message text:', msg_text);
+            });
+
+            window.addEventListener('spice-port-event', function(event) {
+                DEBUG > 0 && console.log('SPICE port', event.detail.channel.portName, 'event data:', event.detail.spiceEvent);
+            });
+            */
+
+            var path = spice_query_var('path', '');
+            var vmName = spice_query_var('name', '');
+            if (path && !vmName) {
+                var nameMatch = RegExp('[?&]name=([^&]*)').exec(path);
+                if (nameMatch) {
+                    vmName = decodeURIComponent(nameMatch[1]);
+                }
+            }
+
+            function updatePowerButtons() {
+                if (!vmName) return;
+                fetch('/api/status')
+                .then(res => res.json())
+                .then(data => {
+                    const vm = data.vms && data.vms.list ? data.vms.list.find(v => v.name === vmName) : null;
+                    const container = document.getElementById('console-power-controls');
+                    if (!container) return;
+                    container.innerHTML = '';
+                    
+                    if (!vm) return;
+                    
+                    if (vm.status === 'running') {
+                        const stopBtn = document.createElement('button');
+                        stopBtn.innerHTML = 'Stop';
+                        stopBtn.style.borderColor = 'var(--color-danger)';
+                        stopBtn.addEventListener('click', () => executePowerAction('stop'));
+                        
+                        const resetBtn = document.createElement('button');
+                        resetBtn.innerHTML = 'Reset';
+                        resetBtn.style.borderColor = 'var(--color-warning)';
+                        resetBtn.addEventListener('click', () => executePowerAction('reset'));
+                        
+                        container.appendChild(resetBtn);
+                        container.appendChild(stopBtn);
+                    } else {
+                        const startBtn = document.createElement('button');
+                        startBtn.innerHTML = 'Start';
+                        startBtn.style.borderColor = 'var(--color-success)';
+                        startBtn.addEventListener('click', () => executePowerAction('start'));
+                        container.appendChild(startBtn);
+                    }
+                })
+                .catch(err => console.error("Failed to fetch VM status:", err));
+            }
+
+            function executePowerAction(action) {
+                if (!vmName) return;
+                const container = document.getElementById('console-power-controls');
+                if (container) {
+                    Array.from(container.getElementsByTagName('button')).forEach(b => b.disabled = true);
+                }
+                
+                fetch('/api/vms/power', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: vmName, action: action })
+                })
+                .then(res => {
+                    if (!res.ok) return res.json().then(e => { throw new Error(e.error || 'Action failed') });
+                    return res.json();
+                })
+                .then(data => {
+                    if (action === 'start') {
+                        var banner = document.getElementById('error-banner');
+                        if (banner) banner.style.display = 'none';
+                        
+                        setTimeout(() => {
+                            connect(undefined);
+                            updatePowerButtons();
+                        }, 2000);
+                    } else {
+                        updatePowerButtons();
+                    }
+                })
+                .catch(err => {
+                    alert("Power Action Failed: " + err.message);
+                    updatePowerButtons();
+                });
+            }
+
+            updatePowerButtons();
+            setInterval(updatePowerButtons, 5000);
+
+            connect(undefined);
+            document.getElementById('sendCtrlAltDel').addEventListener('click', function(){ SpiceHtml5.sendCtrlAltDel(sc); });
+            document.getElementById('toggleAutoscale').addEventListener('click', function() {
+                document.body.classList.toggle('autoscale-enabled');
+                if (sc && document.body.classList.contains('autoscale-enabled')) {
+                    SpiceHtml5.resize_helper(sc);
+                }
+            });
+        </script>
+
+    </head>
+
+    <body class="autoscale-enabled">
+        <div id="error-banner" style="display:none; background:rgba(239,68,68,0.9); color:white; padding:12px; font-family:sans-serif; font-size:14px; font-weight:bold; text-align:center; position:absolute; top:0; left:0; width:100%; z-index:9999;"></div>
+
+        <div id="login">
+            <button onclick="open_nav()">&#9776; SPICE</button>
+            <p id="hostname">Host Console</p>
+            <div id="console-power-controls" style="margin-left: auto; display: flex; gap: 8px;"></div>
+        </div>
+
+        <div id="Sidenav" class="SidenavClosed" style="width: 0;">
+            <p class="closebtn" onclick="close_nav()">&#10006;</p>
+            <button id="sendCtrlAltDel">Send Ctrl-Alt-Delete</button>
+            <button id="toggleAutoscale">Toggle Auto Resize</button>
+            <button id="debugLogs">Toggle Debug Logs</button>
+            <div id="message-div" class="spice-message" style="display: none;"></div>
+
+            <div id="debug-div">
+            <!-- If DUMPXXX is turned on, dumped images will go here -->
+            </div>
+        </div>
+
+        <div id="spice-area">
+            <div id="spice-screen" class="spice-screen"></div>
+        </div>
+
+        <script>
+            function show_debug_Logs() {
+                var content = document.getElementById('message-div')
+                if (content.style.display === 'block') {
+                    content.style.display = 'none';
+                } else {
+                    content.style.display = 'block';
+                }
+            }
+
+            function display_hostname() {
+                var params = new URLSearchParams(window.location.search);
+                var titleVal = params.get('title') || params.get('name') || 'Host Console';
+                var cleanName = titleVal.split('(')[0].trim();
+                document.getElementById('hostname').textContent = cleanName;
+                document.title = cleanName + " - SPICE Console";
+            }
+
+            function open_nav() {
+                document.getElementById('Sidenav').className = 'SidenavOpen';
+            }
+
+            function close_nav() {
+                document.getElementById('Sidenav').className = 'SidenavClosed';
+            }
+
+            document.getElementById('debugLogs').addEventListener('click', function() { show_debug_Logs(); });
+            display_hostname();
+        </script>
+    </body>
+</html>

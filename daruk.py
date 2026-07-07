@@ -16,10 +16,13 @@ def get_local_ip():
         s.close()
     return IP
 
+from cassandra import ConsistencyLevel
+
 LOCAL_IP = get_local_ip()
 print(f"Daruk connecting to ScyllaDB at {LOCAL_IP}...")
 cluster = Cluster([LOCAL_IP])
 session = cluster.connect()
+session.default_consistency_level = ConsistencyLevel.QUORUM
 
 def make_serializable(obj):
     if isinstance(obj, dict):

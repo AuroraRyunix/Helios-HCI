@@ -1569,6 +1569,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const dnsSearchInput = document.getElementById('dns-search-input');
         const dnsMtuInput = document.getElementById('dns-mtu-input');
         const urbosaEnabledInput = document.getElementById('urbosa-enabled-input');
+        const drsEnabledInput = document.getElementById('drs-enabled-input');
         const ntpServersInput = document.getElementById('ntp-servers-input');
         const timezoneInput = document.getElementById('timezone-input');
         const clusterNameInput = document.getElementById('cluster-name-input');
@@ -1589,6 +1590,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (dnsSearchInput) dnsSearchInput.value = data.dns_search_domains || '';
             if (dnsMtuInput) dnsMtuInput.value = data.dns_mtu || '1500';
             if (urbosaEnabledInput) urbosaEnabledInput.value = data.urbosa_enabled || 'false';
+            if (drsEnabledInput) drsEnabledInput.checked = (data.drs_enabled === 'true');
             if (ntpServersInput) ntpServersInput.value = data.ntp_servers || '';
             if (timezoneInput) timezoneInput.value = data.timezone || 'UTC';
             if (clusterNameInput) clusterNameInput.value = data.cluster_name || 'hci-01';
@@ -1857,7 +1859,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 dns_servers: document.getElementById('dns-servers-input').value,
                 dns_search_domains: document.getElementById('dns-search-input').value,
                 dns_mtu: document.getElementById('dns-mtu-input') ? document.getElementById('dns-mtu-input').value : '1500',
-                urbosa_enabled: document.getElementById('urbosa-enabled-input').value
+                urbosa_enabled: document.getElementById('urbosa-enabled-input').value,
+                drs_enabled: document.getElementById('drs-enabled-input') ? (document.getElementById('drs-enabled-input').checked ? 'true' : 'false') : 'false'
             };
             
             if (payload.urbosa_enabled === 'true') {
@@ -3854,6 +3857,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             updateSharedHeader(data);
             updatePageSpecificContent(data);
             fetchDrsStatus();
+            const modal = document.getElementById('drs-details-modal');
+            if (modal && modal.style.display === 'flex') {
+                populateDrsModal();
+            }
         })
         .catch(err => {
             console.error('Error fetching cluster status:', err);
@@ -3879,7 +3886,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             const deviation = data.current_deviation !== undefined ? data.current_deviation : 0.0;
             const score = Math.max(0, Math.min(100, Math.round((1 - 2 * deviation) * 100)));
-            const status = data.status_str || 'Balanced (happy)';
+            let status = data.status_str || 'Balanced (happy)';
+            if (data.drs_enabled === false) {
+                status += ' (Disabled)';
+            }
 
             if (drsBalanceScore) drsBalanceScore.textContent = `${score}%`;
             if (drsBalanceScoreText) drsBalanceScoreText.textContent = `${score}%`;
@@ -3952,6 +3962,165 @@ document.addEventListener('DOMContentLoaded', async () => {
                 btnRebalance.textContent = 'Rebalance';
             });
         });
+    }
+
+    // Bind DRS Details Modal
+    const btnDrsDetails = document.getElementById('btn-drs-details');
+    const drsDetailsModal = document.getElementById('drs-details-modal');
+    const btnCloseDrsDetails = document.getElementById('btn-close-drs-details');
+
+    if (btnDrsDetails && drsDetailsModal) {
+        btnDrsDetails.addEventListener('click', () => {
+            drsDetailsModal.style.display = 'flex';
+            populateDrsModal();
+        });
+    }
+
+    if (btnCloseDrsDetails && drsDetailsModal) {
+        btnCloseDrsDetails.addEventListener('click', () => {
+            drsDetailsModal.style.display = 'none';
+        });
+        
+        drsDetailsModal.addEventListener('click', (e) => {
+            if (e.target === drsDetailsModal) {
+                drsDetailsModal.style.display = 'none';
+            }
+        });
+    }
+
+    function populateDrsModal() {
+        // Fetch current DRS stats
+        fetch(`${state.apiHost}/api/vms/drs`)
+        .then(response => response.ok ? response.json() : null)
+        .then(drsData => {
+            if (!drsData) return;
+            
+            const drsDetailsStatus = document.getElementById('drs-details-status');
+            const drsDetailsDeviation = document.getElementById('drs-details-deviation');
+            const drsActionLog = document.getElementById('drs-migration-history-log');
+
+            if (drsDetailsStatus) {
+                const isEnabled = drsData.drs_enabled !== false;
+                drsDetailsStatus.textContent = isEnabled ? 'Active' : 'Disabled';
+                drsDetailsStatus.style.color = isEnabled ? 'var(--color-success)' : 'var(--text-muted)';
+            }
+            if (drsDetailsDeviation) {
+                const deviation = drsData.current_deviation !== undefined ? drsData.current_deviation : 0.0;
+                drsDetailsDeviation.textContent = deviation.toFixed(4);
+            }
+
+            // Populate Action Log
+            if (drsActionLog) {
+                const history = drsData.history || [];
+                if (history.length > 0) {
+                    drsActionLog.innerHTML = history.map(item => {
+                        const timeStr = item.event_time ? new Date(item.event_time).toLocaleTimeString() : 'Recent';
+                        return `<div style="margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.03); padding-bottom: 2px;">
+                            <span style="color: var(--color-primary); font-weight:600;">[${timeStr}]</span> 
+                            ${item.vm_name} migrated: ${item.source_host} &rarr; ${item.target_host}
+                        </div>`;
+                    }).join('');
+                } else {
+                    drsActionLog.innerHTML = '<div style="color: var(--text-muted); font-style:italic;">No recent migrations.</div>';
+                }
+            }
+        });
+
+        // Populate Hosts list
+        const hostsListContainer = document.getElementById('drs-hosts-details-list');
+        if (hostsListContainer && state.nodes) {
+            hostsListContainer.innerHTML = state.nodes.map(node => {
+                const cpu = node.cpu_pct !== undefined ? node.cpu_pct : 0.0;
+                let memPct = 0;
+                if (node.ram_total_gb > 0) {
+                    memPct = Math.round((node.ram_used_gb / node.ram_total_gb) * 100);
+                }
+                const isOnline = node.status === 'ONLINE';
+                const statusColor = isOnline ? 'var(--color-success)' : 'var(--color-danger)';
+                
+                return `
+                <div style="background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 8px; padding: 10px; font-size: 12px; box-sizing: border-box;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+                        <strong>${node.hostname || node.name}</strong>
+                        <span style="font-size:10px; background:${statusColor}22; color:${statusColor}; border:1px solid ${statusColor}44; padding:1px 6px; border-radius:10px; font-weight:600;">${node.status}</span>
+                    </div>
+                    <!-- CPU usage bar -->
+                    <div style="margin-bottom: 6px;">
+                        <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-secondary); margin-bottom: 2px;">
+                            <span>CPU Usage</span>
+                            <span>${cpu.toFixed(1)}%</span>
+                        </div>
+                        <div style="height:4px; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden;">
+                            <div style="width:${cpu}%; height:100%; background:var(--color-primary); border-radius:2px;"></div>
+                        </div>
+                    </div>
+                    <!-- RAM usage bar -->
+                    <div>
+                        <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-secondary); margin-bottom: 2px;">
+                            <span>Memory Usage</span>
+                            <span>${memPct}% (${node.ram_used_gb.toFixed(1)} / ${node.ram_total_gb.toFixed(0)} GB)</span>
+                        </div>
+                        <div style="height:4px; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden;">
+                            <div style="width:${memPct}%; height:100%; background:#8B5CF6; border-radius:2px;"></div>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        // Populate VMs Placements & DRS Satisfaction
+        const vmsListContainer = document.getElementById('drs-vms-details-list');
+        if (vmsListContainer && state.vms) {
+            const sortedVms = [...state.vms].sort((a, b) => {
+                const aRunning = a.status === 'running';
+                const bRunning = b.status === 'running';
+                if (aRunning && !bRunning) return -1;
+                if (!aRunning && bRunning) return 1;
+                return a.name.localeCompare(b.name);
+            });
+
+            vmsListContainer.innerHTML = sortedVms.map(vm => {
+                const isRunning = vm.status === 'running';
+                const hostName = formatNodeName(vm.node);
+                const sat = vm.drs_satisfaction;
+                
+                let satHtml = '';
+                if (isRunning && sat !== undefined && sat !== null) {
+                    let satColor = 'var(--color-success)'; // Green
+                    if (sat < 50) {
+                        satColor = 'var(--color-danger)'; // Red
+                    } else if (sat < 80) {
+                        satColor = 'var(--color-warning)'; // Orange/Yellow
+                    }
+                    satHtml = `
+                    <div style="width: 140px; text-align: right; display:flex; flex-direction:column; gap: 3px;">
+                        <div style="display:flex; justify-content:space-between; font-size:10.5px; font-weight:600; color:${satColor};">
+                            <span>DRS Happy</span>
+                            <span>${sat}%</span>
+                        </div>
+                        <div style="height:4px; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden; width:100%;">
+                            <div style="width:${sat}%; height:100%; background:${satColor}; border-radius:2px;"></div>
+                        </div>
+                    </div>`;
+                } else {
+                    satHtml = `<span style="font-size:11px; color:var(--text-muted); font-style:italic;">Offline (N/A)</span>`;
+                }
+
+                const stateColor = isRunning ? 'var(--color-success)' : 'var(--text-muted)';
+
+                return `
+                <div style="display:flex; justify-content:space-between; align-items:center; background:rgba(255,255,255,0.01); border:1px solid rgba(255,255,255,0.03); border-radius:8px; padding: 10px 12px;">
+                    <div style="display:flex; flex-direction:column; gap:2px; text-align:left;">
+                        <div style="display:flex; align-items:center; gap:6px;">
+                            <span style="width:6px; height:6px; background:${stateColor}; border-radius:50%;"></span>
+                            <span style="font-weight:600; font-size:12.5px; color:#fff;">${vm.name}</span>
+                        </div>
+                        <span style="font-size:10.5px; color:var(--text-secondary);">Host: <strong style="color:var(--text-primary);">${hostName}</strong></span>
+                    </div>
+                    ${satHtml}
+                </div>`;
+            }).join('');
+        }
     }
 
     // Update Cluster status info in Header
@@ -4890,6 +5059,27 @@ document.addEventListener('DOMContentLoaded', async () => {
                     badge.style.background = "rgba(16, 185, 129, 0.15)";
                     badge.style.color = "var(--color-success)";
                     document.getElementById('vnc-header-status-dot').style.backgroundColor = "var(--color-success)";
+
+                    // Immediate remote resize request with retries to allow guest agent initialization
+                    let resizeAttempts = 0;
+                    const maxResizeAttempts = 10;
+                    const resizeInterval = 2000;
+
+                    function attemptResize() {
+                        if (activeRfb === rfbInstance) {
+                            try {
+                                console.log(`VNC connection established. Requesting remote resize (attempt ${resizeAttempts + 1}/${maxResizeAttempts})...`);
+                                activeRfb._requestRemoteResize();
+                            } catch (e) {
+                                console.error("Failed to request remote resize:", e);
+                            }
+                            resizeAttempts++;
+                            if (resizeAttempts < maxResizeAttempts) {
+                                setTimeout(attemptResize, resizeInterval);
+                            }
+                        }
+                    }
+                    attemptResize();
                 });
 
                 activeRfb.addEventListener('disconnect', (e) => {
@@ -4968,7 +5158,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (filteredVms.length === 0) {
             vmsTableBody.innerHTML = `
                 <tr>
-                    <td colspan="9" class="table-loading">No active virtual machines found.</td>
+                    <td colspan="10" class="table-loading">No active virtual machines found.</td>
                 </tr>
             `;
             return;
@@ -5048,6 +5238,31 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
             }
 
+            let drsSatisfactionHtml = '---';
+            if (isRunning) {
+                if (vm.drs_satisfaction !== undefined && vm.drs_satisfaction !== null) {
+                    const satVal = Math.round(vm.drs_satisfaction);
+                    let hue = 120;
+                    if (satVal >= 80) {
+                        hue = 120;
+                    } else if (satVal >= 50) {
+                        hue = 45;
+                    } else {
+                        hue = 0;
+                    }
+                    drsSatisfactionHtml = `
+                        <div class="drs-satisfaction-cell" style="display:flex; align-items:center; gap:8px; min-width:110px;">
+                            <div class="progress-bar-bg" style="flex-grow:1; height:6px; background:rgba(255,255,255,0.08); border-radius:3px; overflow:hidden;">
+                                <div class="progress-bar-fill" style="width:${satVal}%; height:100%; background:hsl(${hue}, 80%, 50%); border-radius:3px; transition: width 0.3s ease;"></div>
+                            </div>
+                            <span style="font-size:11px; font-weight:600; color:hsl(${hue}, 80%, 75%); width:32px; text-align:right;">${satVal}%</span>
+                        </div>
+                    `;
+                } else {
+                    drsSatisfactionHtml = '100%';
+                }
+            }
+
             const trHtml = `
                 <td><strong>${vm.name}</strong></td>
                 <td>
@@ -5056,6 +5271,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     </span>
                 </td>
                 <td>${formatNodeName(vm.node)}</td>
+                <td>${drsSatisfactionHtml}</td>
                 <td>${vm.vcpus} vCPU / ${(vm.memory / 1024).toFixed(1)} GB</td>
                 <td>${vm.disk} GB</td>
                 <td>${vmCpu}</td>
@@ -5084,17 +5300,47 @@ document.addEventListener('DOMContentLoaded', async () => {
                     bindRowButtons(tr, vm.name);
                 } else {
                     const cells = tr.cells;
-                    if (cells.length >= 9) {
+                    if (cells.length >= 10) {
                         const nodeText = formatNodeName(vm.node);
                         const hwText = `${vm.vcpus} vCPU / ${(vm.memory / 1024).toFixed(1)} GB`;
                         
                         const isTableHovered = vmsTableBody.matches(':hover');
                         if (!isTableHovered) {
                             if (cells[2].textContent !== nodeText) cells[2].textContent = nodeText;
-                            if (cells[3].textContent !== hwText) cells[3].textContent = hwText;
-                            if (cells[5].textContent !== vmCpu) cells[5].textContent = vmCpu;
-                            if (cells[6].textContent !== vmMemStr) cells[6].textContent = vmMemStr;
-                            if (cells[7].textContent !== vmIopsLatStr) cells[7].textContent = vmIopsLatStr;
+                            
+                            // Update DRS Satisfaction cell inline
+                            const currentSatCell = cells[3].querySelector('.drs-satisfaction-cell');
+                            if (isRunning && vm.drs_satisfaction !== undefined && vm.drs_satisfaction !== null) {
+                                const satVal = Math.round(vm.drs_satisfaction);
+                                if (currentSatCell) {
+                                    const percentSpan = currentSatCell.querySelector('span');
+                                    const fillBar = currentSatCell.querySelector('.progress-bar-fill');
+                                    const currentPctText = `${satVal}%`;
+                                    if (percentSpan && percentSpan.textContent !== currentPctText) {
+                                        percentSpan.textContent = currentPctText;
+                                        let hue = 120;
+                                        if (satVal >= 80) hue = 120;
+                                        else if (satVal >= 50) hue = 45;
+                                        else hue = 0;
+                                        percentSpan.style.color = `hsl(${hue}, 80%, 75%)`;
+                                        if (fillBar) {
+                                            fillBar.style.width = `${satVal}%`;
+                                            fillBar.style.backgroundColor = `hsl(${hue}, 80%, 50%)`;
+                                        }
+                                    }
+                                } else {
+                                    cells[3].innerHTML = drsSatisfactionHtml;
+                                }
+                            } else {
+                                if (cells[3].textContent !== drsSatisfactionHtml) {
+                                    cells[3].innerHTML = drsSatisfactionHtml;
+                                }
+                            }
+                            
+                            if (cells[4].textContent !== hwText) cells[4].textContent = hwText;
+                            if (cells[6].textContent !== vmCpu) cells[6].textContent = vmCpu;
+                            if (cells[7].textContent !== vmMemStr) cells[7].textContent = vmMemStr;
+                            if (cells[8].textContent !== vmIopsLatStr) cells[8].textContent = vmIopsLatStr;
                         }
                     }
                 }
@@ -5116,7 +5362,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             consoleBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 e.preventDefault();
-                openVmConsole(vmName);
+                const url = `vnc_auto.html?name=${vmName}`;
+                window.open(url, '_blank');
             });
         }
         
@@ -6659,7 +6906,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 });
             }
             
-            this.draw();
+            this.draw(true);
         }
         
         append(value) {
@@ -6670,10 +6917,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (this.history.length > 60) {
                 this.history.shift();
             }
-            this.draw();
+            this.draw(false);
         }
         
-        draw() {
+        draw(isInitial = false) {
             if (!this.canvas) return;
             const ctx = this.ctx;
             const width = this.canvas.clientWidth;
@@ -6712,11 +6959,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             
             // Update Current Val text
-            const currentVal = this.history[this.history.length - 1].value;
-            const displayId = this.options.valueDisplayId || ('pe-chart-' + baseId + '-val');
-            const valEl = document.getElementById(displayId);
-            if (valEl) {
-                valEl.textContent = `${(currentVal / this.options.divider).toFixed(this.options.fixedDecimals)}${this.options.suffix}`;
+            if (!isInitial) {
+                const currentVal = this.history[this.history.length - 1].value;
+                const displayId = this.options.valueDisplayId || ('pe-chart-' + baseId + '-val');
+                const valEl = document.getElementById(displayId);
+                if (valEl) {
+                    valEl.textContent = `${(currentVal / this.options.divider).toFixed(this.options.fixedDecimals)}${this.options.suffix}`;
+                }
             }
             
             const points = this.history.map((d, index) => {
@@ -9265,6 +9514,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const btnStartUpgrade = document.getElementById('btn-start-upgrade');
         const btnCancelUpgrade = document.getElementById('btn-cancel-upgrade');
         const btnScrollLock = document.getElementById('btn-scroll-lock');
+        const btnLcmAcknowledge = document.getElementById('btn-lcm-acknowledge');
 
         if (!fileInput || !dropzone) return;
 
@@ -9318,9 +9568,440 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Acknowledge & Clear button for completed/failed upgrades
+        if (btnLcmAcknowledge) {
+            btnLcmAcknowledge.addEventListener('click', async () => {
+                btnLcmAcknowledge.disabled = true;
+                btnLcmAcknowledge.textContent = 'Clearing...';
+                try {
+                    const res = await fetch(`${state.apiHost}/api/lcm/upgrade/abort`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + getStoredToken()
+                        }
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        showToast('Upgrade Cleared', 'Upgrade job reset successfully.', 'success');
+                        progressCard.style.display = 'none';
+                        consoleCard.style.display = 'none';
+                        uploadCard.style.display = 'flex';
+                        fileInput.value = '';
+                        pollLcmStatus();
+                    } else {
+                        showToast('Error', data.error || 'Failed to clear upgrade.', 'error');
+                    }
+                } catch (err) {
+                    console.error("Error clearing upgrade:", err);
+                    showToast('Connection Error', 'Could not connect to update orchestrator.', 'error');
+                } finally {
+                    btnLcmAcknowledge.disabled = false;
+                    btnLcmAcknowledge.textContent = 'Acknowledge & Clear';
+                }
+            });
+        }
+
+        function parseBuildNumber(versionStr) {
+            if (!versionStr) return 0;
+            const match = versionStr.match(/-b(\d+)/);
+            return match ? parseInt(match[1], 10) : 0;
+        }
+
+        function getComponentDifferentialChangelog(fullChangelog, componentName, currentVersion, targetVersion) {
+            if (!fullChangelog) return 'No changelog available.';
+            
+            const currentBuild = parseBuildNumber(currentVersion);
+            const targetBuild = parseBuildNumber(targetVersion);
+            
+            const lines = fullChangelog.split('\n');
+            let currentSectionVersion = null;
+            let currentSectionBuild = 0;
+            let inComponentSection = false;
+            
+            const versionEntries = {};
+            const versionOrder = [];
+            
+            for (let line of lines) {
+                const trimmed = line.trim();
+                
+                if (trimmed.startsWith('## [') && trimmed.endsWith(']')) {
+                    currentSectionVersion = trimmed.substring(4, trimmed.length - 1);
+                    currentSectionBuild = parseBuildNumber(currentSectionVersion);
+                    inComponentSection = false;
+                    continue;
+                }
+                
+                if (currentSectionVersion && trimmed.startsWith('### [') && trimmed.endsWith(']')) {
+                    const comp = trimmed.substring(5, trimmed.length - 1).toLowerCase();
+                    inComponentSection = (comp === componentName.toLowerCase());
+                    continue;
+                }
+                
+                if (trimmed.startsWith('### ') || trimmed.startsWith('## ') || trimmed.startsWith('# ')) {
+                    inComponentSection = false;
+                }
+                
+                if (inComponentSection && currentSectionVersion && currentSectionBuild > currentBuild && currentSectionBuild <= targetBuild) {
+                    if (trimmed) {
+                        if (!versionEntries[currentSectionVersion]) {
+                            versionEntries[currentSectionVersion] = [];
+                            versionOrder.push(currentSectionVersion);
+                        }
+                        versionEntries[currentSectionVersion].push(line);
+                    }
+                }
+            }
+            
+            if (versionOrder.length > 0) {
+                let html = `<strong>Differential Changelog for ${componentName} (${currentVersion} &rarr; ${targetVersion}):</strong><br><br>`;
+                for (let ver of versionOrder) {
+                    const verLines = versionEntries[ver];
+                    html += `<span style="font-weight:600; color:var(--color-primary); font-size:11px;">Build ${ver}:</span><br>`;
+                    html += verLines.join('\n').trim().replace(/\n/g, '<br>').replace(/\* /g, '&bull; ').replace(/- /g, '&bull; ') + '<br><br>';
+                }
+                return html.trim();
+            }
+            
+            let currentBuildScope = 0;
+            const mentionsByVersion = {};
+            const mentionOrder = [];
+            
+            for (let line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('## [') && trimmed.endsWith(']')) {
+                    const ver = trimmed.substring(4, trimmed.length - 1);
+                    currentBuildScope = parseBuildNumber(ver);
+                    if (currentBuildScope > currentBuild && currentBuildScope <= targetBuild) {
+                        if (!mentionsByVersion[ver]) {
+                            mentionsByVersion[ver] = [];
+                            mentionOrder.push(ver);
+                        }
+                    }
+                    continue;
+                }
+                
+                if (currentBuildScope > currentBuild && currentBuildScope <= targetBuild) {
+                    if (trimmed.toLowerCase().includes(componentName.toLowerCase())) {
+                        const currentVerStr = mentionOrder[mentionOrder.length - 1];
+                        if (currentVerStr) {
+                            mentionsByVersion[currentVerStr].push(line);
+                        }
+                    }
+                }
+            }
+            
+            const finalOrder = mentionOrder.filter(ver => mentionsByVersion[ver].length > 0);
+            if (finalOrder.length > 0) {
+                let html = `<strong>Mentions of ${componentName} in range (${currentVersion} &rarr; ${targetVersion}):</strong><br><br>`;
+                for (let ver of finalOrder) {
+                    html += `<span style="font-weight:600; color:var(--color-primary); font-size:11px;">Build ${ver}:</span><br>`;
+                    html += mentionsByVersion[ver].map(line => `&bull; ${line.trim().replace(/^\*\s*/, '').replace(/^-\s*/, '')}`).join('<br>') + '<br><br>';
+                }
+                return html.trim();
+            }
+            return `No changelog entries found for ${componentName} in version range ${currentVersion} &rarr; ${targetVersion}.`;
+        }
+
+        function renderLcmComponentsPreview(data) {
+            const tbody = document.getElementById('lcm-components-preview-tbody');
+            if (!tbody) return;
+            
+            state.currentChangelog = data.changelog || '';
+            state.currentComponents = data.components || [];
+            state.minHyliaVersion = data.min_hylia_version || data.build_number;
+            tbody.innerHTML = '';
+            
+            const COMPONENT_GROUPS = {
+                "spark": ["spark", "spark-daemon"],
+                "hydra-db": ["daruk", "cluster"],
+                "bifrost": ["bifrost"],
+                "vali": ["vali", "valcli"],
+                "mimir": ["mimir", "mcli", "mcli-runner"],
+                "dagur": ["dagur"],
+                "catalyst": ["catalyst", "catcli"],
+                "gatoway": ["gatoway"],
+                "urbosa": ["urbosa", "urbosa-bootstrap"],
+                "logos": ["logos"],
+                "mipha": ["mipha"],
+                "spectrum": ["spectrum", "Dockerfile"],
+                "hylia": ["hylia"]
+            };
+            
+            const grouped = [];
+            const processed = new Set();
+            
+            for (const [groupName, subNames] of Object.entries(COMPONENT_GROUPS)) {
+                const matchingComps = data.components.filter(c => subNames.includes(c.name));
+                if (matchingComps.length > 0) {
+                    const mainComp = matchingComps.find(c => c.name === groupName) || matchingComps[0];
+                    const groupNeedsUpgrade = matchingComps.some(c => c.current_build !== c.new_build);
+                    if (groupNeedsUpgrade) {
+                        grouped.push({
+                            name: groupName,
+                            sub_components: matchingComps.map(c => c.name),
+                            current_build: mainComp.current_build,
+                            new_build: mainComp.new_build,
+                            file: matchingComps.map(c => c.file).join(', ')
+                        });
+                    }
+                    matchingComps.forEach(c => processed.add(c.name));
+                }
+            }
+            
+            data.components.forEach(c => {
+                if (!processed.has(c.name)) {
+                    if (c.current_build !== c.new_build) {
+                        grouped.push({
+                            name: c.name,
+                            sub_components: [c.name],
+                            current_build: c.current_build,
+                            new_build: c.new_build,
+                            file: c.file
+                        });
+                    }
+                }
+            });
+            
+            if (grouped.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4" style="text-align: center; color: var(--text-muted); padding: 25px 15px; font-style: italic;">
+                            All components are up-to-date. No upgrade required.
+                        </td>
+                    </tr>
+                `;
+                const btnStartUpgrade = document.getElementById('btn-start-upgrade');
+                if (btnStartUpgrade) {
+                    btnStartUpgrade.disabled = true;
+                    btnStartUpgrade.textContent = 'All Components Up-to-Date';
+                }
+                const selectAllCheckbox = document.getElementById('lcm-select-all-components');
+                if (selectAllCheckbox) {
+                    selectAllCheckbox.checked = false;
+                }
+                
+                const modeBadge = document.getElementById('lcm-upgrade-mode-badge');
+                if (modeBadge) {
+                    modeBadge.textContent = 'All Components Up-to-Date';
+                    modeBadge.style.color = '#9ca3af';
+                    modeBadge.style.background = 'rgba(156, 163, 175, 0.1)';
+                    modeBadge.style.border = '1px solid rgba(156, 163, 175, 0.2)';
+                }
+                
+                const changelogBox = document.getElementById('lcm-changelog-container');
+                if (changelogBox) {
+                    changelogBox.innerHTML = '<div style="color: var(--text-muted); font-style: italic; padding: 10px;">All components are up-to-date. No changelog difference to display.</div>';
+                }
+                return;
+            } else {
+                const btnStartUpgrade = document.getElementById('btn-start-upgrade');
+                if (btnStartUpgrade) {
+                    btnStartUpgrade.disabled = false;
+                    btnStartUpgrade.textContent = 'Start Rolling Upgrade';
+                }
+            }
+            
+            grouped.forEach(comp => {
+                const tr = document.createElement('tr');
+                tr.style.cursor = 'pointer';
+                tr.style.transition = 'background 0.2s';
+                tr.setAttribute('data-comp-name', comp.name);
+                
+                tr.innerHTML = `
+                    <td style="text-align: center;" onclick="event.stopPropagation();">
+                        <input type="checkbox" class="lcm-comp-checkbox" data-name="${comp.name}" data-sub-components="${comp.sub_components.join(',')}" checked style="cursor: pointer;">
+                    </td>
+                    <td style="font-weight:600; color:#fff;">
+                        <strong>${comp.name}</strong> <span style="font-size:11px; color:var(--text-muted); font-weight:normal;">(${comp.file})</span>
+                    </td>
+                    <td><span style="font-family:monospace; background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">${comp.current_build}</span></td>
+                    <td><span style="font-family:monospace; color:var(--color-primary); background:rgba(59,130,246,0.1); padding:2px 6px; border-radius:4px;">${comp.new_build}</span></td>
+                `;
+                
+                tr.addEventListener('click', () => {
+                    Array.from(tbody.querySelectorAll('tr')).forEach(r => r.style.background = '');
+                    tr.style.background = 'rgba(59, 130, 246, 0.08)';
+                    
+                    const changelogBox = document.getElementById('lcm-changelog-container');
+                    if (changelogBox) {
+                        let combinedHtml = '';
+                        comp.sub_components.forEach(subName => {
+                            const subComp = data.components.find(c => c.name === subName);
+                            if (subComp) {
+                                const diffHtml = getComponentDifferentialChangelog(
+                                    state.currentChangelog, 
+                                    subComp.name, 
+                                    subComp.current_build, 
+                                    subComp.new_build
+                                );
+                                if (diffHtml && !diffHtml.includes('No changelog entry found')) {
+                                    combinedHtml += `<strong>${subComp.name}</strong>:<br>${diffHtml}<br><br>`;
+                                }
+                            }
+                        });
+                        
+                        if (!combinedHtml) {
+                            combinedHtml = '<div style="color: var(--text-muted); font-style: italic; padding: 10px;">No changelog entry found for this service.</div>';
+                        }
+                        changelogBox.innerHTML = combinedHtml;
+                    }
+                    
+                    const btnShowFull = document.getElementById('btn-show-full-changelog');
+                    if (btnShowFull) {
+                        btnShowFull.style.opacity = '1';
+                        btnShowFull.style.pointerEvents = 'auto';
+                    }
+                });
+                
+                const checkbox = tr.querySelector('.lcm-comp-checkbox');
+                if (checkbox) {
+                    checkbox.addEventListener('change', () => {
+                        updateUpgradeMode();
+                    });
+                }
+                
+                tbody.appendChild(tr);
+            });
+            
+            const selectAllCheckbox = document.getElementById('lcm-select-all-components');
+            if (selectAllCheckbox) {
+                selectAllCheckbox.checked = true;
+                const newSelectAll = selectAllCheckbox.cloneNode(true);
+                selectAllCheckbox.parentNode.replaceChild(newSelectAll, selectAllCheckbox);
+                newSelectAll.addEventListener('change', (e) => {
+                    const checked = e.target.checked;
+                    Array.from(tbody.querySelectorAll('.lcm-comp-checkbox')).forEach(cb => {
+                        cb.checked = checked;
+                    });
+                    updateUpgradeMode();
+                });
+            }
+            
+            const btnShowFull = document.getElementById('btn-show-full-changelog');
+            if (btnShowFull) {
+                const newShowFull = btnShowFull.cloneNode(true);
+                btnShowFull.parentNode.replaceChild(newShowFull, btnShowFull);
+                newShowFull.addEventListener('click', () => {
+                    Array.from(tbody.querySelectorAll('tr')).forEach(r => r.style.background = '');
+                    const changelogBox = document.getElementById('lcm-changelog-container');
+                    if (changelogBox && state.currentChangelog) {
+                        changelogBox.innerHTML = state.currentChangelog.replace(/\n/g, '<br>').replace(/\* /g, '&bull; ');
+                    }
+                    newShowFull.style.opacity = '0';
+                    newShowFull.style.pointerEvents = 'none';
+                });
+            }
+            
+            const changelogBox = document.getElementById('lcm-changelog-container');
+            if (changelogBox && state.currentChangelog) {
+                changelogBox.innerHTML = state.currentChangelog.replace(/\n/g, '<br>').replace(/\* /g, '&bull; ');
+            }
+            
+            function updateUpgradeMode() {
+                const rebootRequiredComponents = ['spark', 'gatoway', 'urbosa', 'Dockerfile'];
+                const selectedCheckboxes = Array.from(document.querySelectorAll('.lcm-comp-checkbox:checked'));
+                const selectedSubComps = [];
+                selectedCheckboxes.forEach(cb => {
+                    const subs = (cb.dataset.subComponents || '').split(',');
+                    subs.forEach(s => {
+                        if (s && !selectedSubComps.includes(s)) {
+                            selectedSubComps.push(s);
+                        }
+                    });
+                });
+                
+                const needsReboot = selectedSubComps.some(name => rebootRequiredComponents.includes(name));
+                const modeBadge = document.getElementById('lcm-upgrade-mode-badge');
+                if (modeBadge) {
+                    if (selectedCheckboxes.length === 0) {
+                        modeBadge.textContent = 'No Components Selected';
+                        modeBadge.style.color = '#9ca3af';
+                        modeBadge.style.background = 'rgba(156, 163, 175, 0.1)';
+                        modeBadge.style.border = '1px solid rgba(156, 163, 175, 0.2)';
+                    } else if (needsReboot) {
+                        modeBadge.textContent = 'Rolling Reboot';
+                        modeBadge.style.color = '#ef4444';
+                        modeBadge.style.background = 'rgba(239, 68, 68, 0.1)';
+                        modeBadge.style.border = '1px solid rgba(239, 68, 68, 0.2)';
+                    } else {
+                        modeBadge.textContent = 'Fast Patch (Zero Downtime)';
+                        modeBadge.style.color = '#10b981';
+                        modeBadge.style.background = 'rgba(16, 185, 129, 0.1)';
+                        modeBadge.style.border = '1px solid rgba(16, 185, 129, 0.2)';
+                    }
+                }
+            }
+            
+            updateUpgradeMode();
+        }
+ 
         // Start upgrade button
         if (btnStartUpgrade) {
             btnStartUpgrade.addEventListener('click', async () => {
+                const selectedCheckboxes = Array.from(document.querySelectorAll('.lcm-comp-checkbox:checked'));
+                if (selectedCheckboxes.length === 0) {
+                    showToast('No Selection', 'Please select at least one component to upgrade.', 'warning');
+                    return;
+                }
+                
+                const selectedComponents = [];
+                selectedCheckboxes.forEach(cb => {
+                    const subs = (cb.dataset.subComponents || '').split(',');
+                    subs.forEach(s => {
+                        if (s && !selectedComponents.includes(s)) {
+                            selectedComponents.push(s);
+                        }
+                    });
+                });
+                
+                // Client-side Hylia dependency check
+                if (state.currentComponents) {
+                    const hyliaComp = state.currentComponents.find(c => c.name === 'hylia');
+                    if (hyliaComp) {
+                        const targetVer = hyliaComp.new_build;
+                        const minVer = state.minHyliaVersion || targetVer;
+                        const currentVer = hyliaComp.current_build;
+                        
+                        function parseVer(v) {
+                            if (!v || v === 'Unknown' || v === 'Not Installed') return [0, 0, 0, 0];
+                            let main = v;
+                            let build = 0;
+                            if (v.includes('-')) {
+                                let parts = v.split('-');
+                                main = parts[0];
+                                if (parts[1].startsWith('b')) {
+                                    build = parseInt(parts[1].substring(1)) || 0;
+                                }
+                            }
+                            let sub = main.split('.');
+                            return [
+                                parseInt(sub[0]) || 0,
+                                parseInt(sub[1]) || 0,
+                                parseInt(sub[2]) || 0,
+                                build
+                            ];
+                        }
+                        
+                        function isLess(v1, v2) {
+                            let p1 = parseVer(v1);
+                            let p2 = parseVer(v2);
+                            for (let i = 0; i < 4; i++) {
+                                if (p1[i] < p2[i]) return true;
+                                if (p1[i] > p2[i]) return false;
+                            }
+                            return false;
+                        }
+                        
+                        if (isLess(currentVer, minVer)) {
+                            if (!selectedComponents.includes('hylia')) {
+                                showToast('Hylia Upgrade Required', `The currently installed Hylia version (${currentVer}) is below the minimum version (${minVer}) required for this update. Please select "hylia" to upgrade it.`, 'warning');
+                                return;
+                            }
+                        }
+                    }
+                }
+                
                 btnStartUpgrade.disabled = true;
                 btnStartUpgrade.textContent = 'Starting...';
                 
@@ -9330,7 +10011,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                         headers: {
                             'Content-Type': 'application/json',
                             'Authorization': 'Bearer ' + getStoredToken()
-                        }
+                        },
+                        body: JSON.stringify({
+                            components: selectedComponents
+                        })
                     });
                     
                     const data = await res.json();
@@ -9340,7 +10024,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                         progressCard.style.display = 'flex';
                         consoleCard.style.display = 'flex';
                         
-                        // Clear old console and start polling status
                         if (consoleLog) consoleLog.textContent = '';
                         startLcmStatusPolling();
                     } else {
@@ -9396,26 +10079,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                         const data = JSON.parse(xhr.responseText);
                         showToast('Package Uploaded', 'Upgrade package verified and parsed successfully.', 'success');
                         
-                        // Render components list
-                        const tbody = document.getElementById('lcm-components-preview-tbody');
-                        if (tbody) {
-                            tbody.innerHTML = '';
-                            data.components.forEach(comp => {
-                                const tr = document.createElement('tr');
-                                tr.innerHTML = `
-                                    <td style="font-weight:600; color:#fff;">${comp.name}</td>
-                                    <td><span style="font-family:monospace; background:rgba(255,255,255,0.05); padding:2px 6px; border-radius:4px;">${comp.current_build}</span></td>
-                                    <td><span style="font-family:monospace; color:var(--color-primary); background:rgba(59,130,246,0.1); padding:2px 6px; border-radius:4px;">${comp.new_build}</span></td>
-                                `;
-                                tbody.appendChild(tr);
-                            });
-                        }
-                        
-                        // Render changelog
-                        const changelogContainer = document.getElementById('lcm-changelog-container');
-                        if (changelogContainer) {
-                            changelogContainer.textContent = data.changelog || 'No changelog provided in this package.';
-                        }
+                        // Render components list and changelog
+                        renderLcmComponentsPreview(data);
                         
                         // Set build badge
                         const buildBadge = document.getElementById('lcm-target-build-badge');
@@ -9452,8 +10117,312 @@ document.addEventListener('DOMContentLoaded', async () => {
             xhr.send(file);
         }
 
+        // Download update handler
+        const btnDownloadUpdate = document.getElementById('btn-download-update');
+        if (btnDownloadUpdate) {
+            btnDownloadUpdate.addEventListener('click', async () => {
+                const downloadUrl = btnDownloadUpdate.dataset.url;
+                const sha256 = btnDownloadUpdate.dataset.sha256;
+                if (!downloadUrl) return;
+
+                btnDownloadUpdate.disabled = true;
+                btnDownloadUpdate.textContent = 'Downloading...';
+                
+                if (uploadProgressContainer) {
+                    uploadProgressContainer.style.display = 'block';
+                    if (uploadProgressBar) uploadProgressBar.style.width = '50%';
+                    if (uploadStatusText) uploadStatusText.textContent = 'Downloading and staging package...';
+                    if (uploadPercentText) uploadPercentText.textContent = '50%';
+                }
+
+                try {
+                    const res = await fetch(`${state.apiHost}/api/lcm/upgrade/download`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': 'Bearer ' + getStoredToken()
+                        },
+                        body: JSON.stringify({
+                            download_url: downloadUrl,
+                            sha256: sha256
+                        })
+                    });
+                    const data = await res.json();
+                    if (res.ok) {
+                        showToast('Package Staged', 'Update package downloaded and verified successfully.', 'success');
+                        
+                        if (uploadCard) uploadCard.style.display = 'none';
+                        const banner = document.getElementById('lcm-update-available-banner');
+                        if (banner) banner.style.display = 'none';
+                        
+                        if (previewCard) previewCard.style.display = 'flex';
+                        const targetBadge = document.getElementById('lcm-target-build-badge');
+                        if (targetBadge) targetBadge.textContent = 'Build ' + data.build_number;
+                        
+                        // Render components list and changelog
+                        renderLcmComponentsPreview(data);
+                        
+                        pollLcmStatus(false);
+                    } else {
+                        showToast('Download Failed', data.error || 'Failed to download update.', 'error');
+                    }
+                } catch (err) {
+                    console.error("Error downloading update:", err);
+                    showToast('Connection Error', 'Could not connect to update registry.', 'error');
+                } finally {
+                    btnDownloadUpdate.disabled = false;
+                    btnDownloadUpdate.textContent = 'Download & Stage Update';
+                    if (uploadProgressContainer) {
+                        uploadProgressContainer.style.display = 'none';
+                    }
+                }
+            });
+        }
+        // Refresh inventory button binding
+        const btnRefreshInventory = document.getElementById('btn-refresh-inventory');
+        if (btnRefreshInventory) {
+            btnRefreshInventory.addEventListener('click', () => {
+                loadLcmInventory();
+            });
+        }
+        
+        // Manual update checker button binding
+        const btnCheckUpdatesManual = document.getElementById('btn-check-updates-manual');
+        if (btnCheckUpdatesManual) {
+            btnCheckUpdatesManual.addEventListener('click', () => {
+                checkHeliosUpdates(true);
+            });
+        }
+        
         // Check if there is an active job running on load
         pollLcmStatus(true);
+    }
+
+    async function loadLcmInventory() {
+        const tbody = document.getElementById('lcm-inventory-tbody');
+        const thead = document.getElementById('lcm-inventory-thead');
+        if (!tbody || !thead) return;
+        
+        tbody.innerHTML = '<tr><td style="text-align: center; color: var(--text-secondary); padding: 20px;">Fetching versions from all cluster hosts...</td></tr>';
+        
+        try {
+            const res = await fetch(`${state.apiHost}/api/lcm/inventory`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': 'Bearer ' + getStoredToken()
+                }
+            });
+            
+            if (!res.ok) throw new Error('API request failed');
+            const data = await res.json();
+            
+            if (data.status !== 'success' || !data.inventory) {
+                tbody.innerHTML = `<tr><td style="text-align: center; color: #ef4444; padding: 20px;">Failed to load inventory: ${data.error || 'Unknown error'}</td></tr>`;
+                return;
+            }
+            
+            // Build headers
+            thead.innerHTML = `
+                <tr>
+                    <th style="text-align: left;">Component</th>
+                    <th style="text-align: center; width: 200px;">Installed Version</th>
+                </tr>
+            `;
+            
+            const hostnames = Object.keys(data.inventory).sort();
+            const firstHost = hostnames[0];
+            if (!firstHost) {
+                tbody.innerHTML = '<tr><td style="text-align: center; color: var(--text-muted); padding: 20px;">No hosts found in cluster.</td></tr>';
+                return;
+            }
+            
+            const COMPONENT_GROUPS = {
+                "spark": ["spark", "spark-daemon"],
+                "hydra-db": ["daruk", "cluster"],
+                "bifrost": ["bifrost"],
+                "vali": ["vali", "valcli"],
+                "mimir": ["mimir", "mcli", "mcli-runner"],
+                "dagur": ["dagur"],
+                "catalyst": ["catalyst", "catcli"],
+                "gatoway": ["gatoway"],
+                "urbosa": ["urbosa", "urbosa-bootstrap"],
+                "logos": ["logos"],
+                "mipha": ["mipha"],
+                "spectrum": ["spectrum", "Dockerfile"],
+                "hylia": ["hylia"]
+            };
+            
+            tbody.innerHTML = '';
+            
+            for (const [groupName, subNames] of Object.entries(COMPONENT_GROUPS)) {
+                let ver = 'N/A';
+                for (const subName of subNames) {
+                    const hostVer = data.inventory[firstHost].versions[subName];
+                    if (hostVer) {
+                        ver = hostVer;
+                        if (subName === groupName) {
+                            break;
+                        }
+                    }
+                }
+                
+                if (ver === 'Unknown') {
+                    ver = '1.2.0-b4081'; // Fallback to base build version of the cluster
+                }
+                
+                const tr = document.createElement('tr');
+                const colorStyle = 'color:var(--color-primary); background:rgba(59,130,246,0.08); font-weight:600;';
+                
+                tr.innerHTML = `
+                    <td style="font-weight:600; color:#fff; text-align: left;">${groupName}</td>
+                    <td style="text-align: center;">
+                        <span style="font-family:monospace; padding:2px 6px; border-radius:4px; ${colorStyle}">
+                            ${ver}
+                        </span>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            }
+            
+        } catch (err) {
+            console.error("Error loading LCM inventory:", err);
+            tbody.innerHTML = '<tr><td style="text-align: center; color: #ef4444; padding: 20px;">Connection error: Failed to connect to management API.</td></tr>';
+        }
+    }
+
+    async function checkHeliosUpdates(showToasts = false) {
+        const banner = document.getElementById('lcm-update-available-banner');
+        const manualBtn = document.getElementById('btn-check-updates-manual');
+        if (!banner) return;
+        
+        if (showToasts && manualBtn) {
+            manualBtn.disabled = true;
+            manualBtn.textContent = 'Triggering Online Check...';
+        }
+        
+        try {
+            if (showToasts) {
+                // 1. Submit the manual check task to Catalyst
+                const triggerRes = await fetch(`${state.apiHost}/api/lcm/upgrade/check`, {
+                    method: 'POST',
+                    headers: { 
+                        'Authorization': 'Bearer ' + getStoredToken(),
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (!triggerRes.ok) {
+                    throw new Error(`Failed to submit check task: ${triggerRes.statusText}`);
+                }
+                
+                const triggerData = await triggerRes.json();
+                const taskId = triggerData.task_id;
+                
+                // 2. Poll Catalyst task status
+                let attempts = 0;
+                const maxAttempts = 30; // 30 seconds max
+                
+                while (attempts < maxAttempts) {
+                    attempts++;
+                    manualBtn.textContent = `Checking Online... (${attempts}s)`;
+                    
+                    const tasksRes = await fetch(`${state.apiHost}/api/catalyst/tasks`, {
+                        headers: { 'Authorization': 'Bearer ' + getStoredToken() }
+                    });
+                    
+                    if (tasksRes.ok) {
+                        const tasksData = await tasksRes.json();
+                        const tasks = tasksData.tasks || [];
+                        const myTask = tasks.find(t => t.task_id === taskId);
+                        
+                        if (myTask) {
+                            if (myTask.status === 'completed') {
+                                break;
+                            } else if (myTask.status === 'failed') {
+                                throw new Error(myTask.error_msg || "Online update check task failed.");
+                            }
+                        }
+                    }
+                    
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                
+                if (attempts >= maxAttempts) {
+                    throw new Error("Update check timed out. Please try again.");
+                }
+            }
+            
+            // 3. Load the cached check results from ScyllaDB
+            const res = await fetch(`${state.apiHost}/api/lcm/upgrade/check`, {
+                headers: { 'Authorization': 'Bearer ' + getStoredToken() }
+            });
+            
+            if (res.ok) {
+                const data = await res.json();
+                if (data.error) {
+                    banner.style.display = 'none';
+                    const upToDateBanner = document.getElementById('lcm-up-to-date-banner');
+                    if (upToDateBanner) upToDateBanner.style.display = 'none';
+                    if (showToasts) {
+                        showToast('Registry Connection Failed', data.error, 'error');
+                    }
+                } else if (data.update_available) {
+                    document.getElementById('lcm-update-version-text').textContent = data.latest_version;
+                    document.getElementById('lcm-update-date-text').textContent = new Date(data.release_date).toLocaleString();
+                    document.getElementById('lcm-current-version-text').textContent = data.current_version;
+                    
+                    const changelogContainer = document.getElementById('lcm-update-changelog-preview');
+                    if (changelogContainer && data.changelog) {
+                        changelogContainer.innerHTML = data.changelog.replace(/\n/g, '<br>').replace(/\* /g, '&bull; ');
+                    }
+                    
+                    const downloadBtn = document.getElementById('btn-download-update');
+                    if (downloadBtn) {
+                        downloadBtn.dataset.url = data.download_url;
+                        downloadBtn.dataset.sha256 = data.sha256;
+                    }
+                    
+                    banner.style.display = 'flex';
+                    const upToDateBanner = document.getElementById('lcm-up-to-date-banner');
+                    if (upToDateBanner) upToDateBanner.style.display = 'none';
+                    
+                    if (showToasts) {
+                        showToast('Update Found', `Version ${data.latest_version} is available.`, 'success');
+                    }
+                } else {
+                    banner.style.display = 'none';
+                    const upToDateBanner = document.getElementById('lcm-up-to-date-banner');
+                    if (upToDateBanner) {
+                        upToDateBanner.style.display = 'flex';
+                        const verText = document.getElementById('lcm-up-to-date-version-text');
+                        if (verText) verText.textContent = data.current_version;
+                    }
+                    if (showToasts) {
+                        showToast('Up to Date', `Your cluster is running the latest version (${data.current_version}).`, 'success');
+                    }
+                }
+            } else {
+                banner.style.display = 'none';
+                const upToDateBanner = document.getElementById('lcm-up-to-date-banner');
+                if (upToDateBanner) upToDateBanner.style.display = 'none';
+                if (showToasts) {
+                    showToast('Update Check Failed', `Server returned status ${res.status}.`, 'error');
+                }
+            }
+        } catch (err) {
+            console.error("Error checking for updates:", err);
+            banner.style.display = 'none';
+            const upToDateBanner = document.getElementById('lcm-up-to-date-banner');
+            if (upToDateBanner) upToDateBanner.style.display = 'none';
+            if (showToasts) {
+                showToast('Update Check Failed', err.message, 'error');
+            }
+        } finally {
+            if (manualBtn) {
+                manualBtn.disabled = false;
+                manualBtn.textContent = 'Check for Updates Online';
+            }
+        }
     }
 
     function getNodeNameByIp(ip) {
@@ -9488,19 +10457,34 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const stepDescText = document.getElementById('lcm-step-description-text');
                 const stepperContainer = document.getElementById('lcm-hosts-stepper-container');
 
+                const banner = document.getElementById('lcm-update-available-banner');
+
                 if (data.status === 'IDLE') {
                     if (firstCheck) {
                         if (uploadCard) uploadCard.style.display = 'flex';
                         if (previewCard) previewCard.style.display = 'none';
                         if (progressCard) progressCard.style.display = 'none';
                         if (consoleCard) consoleCard.style.display = 'none';
+                        checkHeliosUpdates();
                     }
+                    const actionFooter = document.getElementById('lcm-progress-action-footer');
+                    if (actionFooter) actionFooter.style.display = 'none';
                 } else {
+                    if (banner) banner.style.display = 'none';
                     // VALIDATING, STARTING, UPGRADING, COMPLETED, FAILED
                     if (uploadCard) uploadCard.style.display = 'none';
                     if (previewCard) previewCard.style.display = 'none';
                     if (progressCard) progressCard.style.display = 'flex';
                     if (consoleCard) consoleCard.style.display = 'flex';
+                    
+                    const actionFooter = document.getElementById('lcm-progress-action-footer');
+                    if (actionFooter) {
+                        if (data.status === 'COMPLETED' || data.status === 'FAILED') {
+                            actionFooter.style.display = 'flex';
+                        } else {
+                            actionFooter.style.display = 'none';
+                        }
+                    }
                     
                     // Update main progress bar
                     if (progressBar) {

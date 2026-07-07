@@ -68,3 +68,10 @@ podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT category, check_name,
 # Check the execution details of the hourly health checks schedule
 podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "SELECT * FROM hydra.mimir_schedules WHERE schedule_name = 'hourly_checks';"
 ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./mimir_technical.md).

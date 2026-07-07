@@ -1,0 +1,11 @@
+.aider*
+__pycache__/
+*.log
+*.zip
+*.bak
+scratch/
+scratch_*
+diagnostics.log
+node2_scylla_full.log
+mcli-runner.bak
+spark_daemon_decoded.py.bak

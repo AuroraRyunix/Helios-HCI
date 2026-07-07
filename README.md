@@ -21,6 +21,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed storage engine (transitioning from GlusterFS). |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
+| [Catalyst](./docs/catalyst.md) | **Task Orchestrator** | Native Python service | Centralized task manager scheduling and tracking long-running asynchronous cluster operations. |
 | [Slate](./docs/slate.md) | **Edge Ingress / Reverse Proxy** | Podman + Traefik | High-performance edge reverse proxy routing WebUI, API, VNC, and SPICE console traffic same-origin on port 443. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
@@ -221,3 +222,10 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 * **Streamlined Reboot Coordination**: Graceful VM evacuation and host transitions are fully isolated. The reboot sequence relies on the prior maintenance phase to gracefully migrate VMs, leaving the host-level `spark-daemon` active to process remote hardware reboot calls reliably.
 
 
+
+## 4. System Architecture Maps & Flowcharts
+
+For a visual breakdown of the Helios-HCI system architecture, process boundaries, and execution flows:
+*   [Workspace File Mindmap](./file_mindmap.md) - Mindmap of the files and directories structure in the workspace.
+*   [Master Technical Mindmap](./docs/master_technical_mindmap.md) - High-level taxonomy map of all Helios-HCI components.
+*   [Master System Flowchart](./docs/master_flowchart.md) - System-wide flowchart illustrating database boundaries, mTLS API calls, and socket loops.

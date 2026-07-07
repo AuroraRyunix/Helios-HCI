@@ -89,6 +89,10 @@
                             <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
                             Urbosa SDN
                         </a>
+                        <a href="lanayru.html" class="dropdown-item">
+                            <svg viewBox="0 0 24 24" class="dropdown-icon" style="fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 17h6M9 12h6M9 7h6"/></svg>
+                            Lanayru K8s
+                        </a>
                     </div>
                 </div>
                 
@@ -144,6 +148,37 @@
             <!-- Main Grid Layout -->
             <div class="dashboard-grid" style="display: grid; grid-template-columns: 1fr; gap: 20px;">
                 
+                <!-- Update Registry Banner (Visible when update is available) -->
+                <div id="lcm-update-available-banner" class="glass-card" style="display: none; padding: 20px; border-color: var(--color-primary-glow); background: linear-gradient(135deg, rgba(120, 119, 198, 0.05) 0%, rgba(255, 255, 255, 0.01) 100%); margin-bottom: 5px; text-align: left; gap: 15px; flex-direction: column;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 15px;">
+                        <div>
+                             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
+                                 <span style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; background-color: var(--color-primary); box-shadow: 0 0 8px var(--color-primary);"></span>
+                                 <h3 style="font-family: 'Space Grotesk', sans-serif; font-size: 16px; font-weight: 700; color: #fff; margin: 0;">Software Updates Available</h3>
+                             </div>
+                             <p style="font-size: 12px; color: var(--text-secondary); margin: 0;">Target Release: <span id="lcm-update-version-text" style="color: var(--color-primary); font-family: monospace; font-weight: 600;">N/A</span> &bull; Release Date: <span id="lcm-update-date-text">N/A</span> &bull; Current Version: <span id="lcm-current-version-text">N/A</span></p>
+                        </div>
+                        <button id="btn-download-update" class="btn-primary" style="height: 34px; padding: 0 16px; font-size: 11.5px; font-family: 'Space Grotesk', sans-serif; font-weight: 600; align-self: center;">Download & Stage Update</button>
+                    </div>
+                    <div style="border-top: 1px solid rgba(255, 255, 255, 0.06); padding-top: 12px;">
+                        <h4 style="font-family: 'Space Grotesk', sans-serif; font-size: 11px; font-weight: 600; color: var(--text-muted); margin: 0 0 6px 0; text-transform: uppercase; letter-spacing: 0.05em;">Changelog Highlights</h4>
+                        <div id="lcm-update-changelog-preview" style="font-size: 11.5px; color: var(--text-secondary); line-height: 1.5; max-height: 80px; overflow-y: auto; background: rgba(0,0,0,0.15); border-radius: 6px; padding: 8px 12px; font-family: 'Outfit', sans-serif;">
+                            <!-- Changelog snippet -->
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Up to Date Banner (Visible when no updates are available) -->
+                <div id="lcm-up-to-date-banner" class="glass-card" style="display: none; padding: 15px 20px; align-items: center; gap: 12px; background: rgba(16, 185, 129, 0.05); border-color: rgba(16, 185, 129, 0.15); margin-bottom: 5px;">
+                    <svg viewBox="0 0 24 24" style="width: 20px; height: 20px; fill: none; stroke: #10b981; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0;">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                        <polyline points="22 4 12 14.01 9 11.01"/>
+                    </svg>
+                    <div style="flex-grow: 1; text-align: left;">
+                        <span style="font-size: 13px; font-weight: 600; color: #fff;">All cluster components are up-to-date (aligned with Release <span id="lcm-up-to-date-version-text" style="color: var(--color-primary); font-family: monospace;">1.2.0-b4083</span>).</span>
+                    </div>
+                </div>
+
                 <!-- Upload Zone Card (Visible when IDLE) -->
                 <div id="lcm-upload-card" class="glass-card" style="padding: 40px; text-align: center; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 20px; min-height: 250px;">
                     <div id="lcm-upload-dropzone" style="border: 2px dashed rgba(255, 255, 255, 0.15); border-radius: 12px; padding: 40px; width: 100%; max-width: 600px; cursor: pointer; transition: border-color 0.2s, background-color 0.2s; background: rgba(255, 255, 255, 0.01);">
@@ -153,6 +188,9 @@
                         </svg>
                         <h3 style="font-family: 'Space Grotesk', sans-serif; font-size: 18px; font-weight: 600; color: #fff; margin: 0 0 8px 0;">Upload Update Package</h3>
                         <p style="font-size: 13px; color: var(--text-muted); margin: 0;">Drag and drop your update <strong>.zip</strong> package here, or click to browse.</p>
+                    </div>
+                    <div style="display: flex; gap: 10px; align-items: center; margin-top: 5px;">
+                        <button id="btn-check-updates-manual" class="btn-secondary" style="height: 36px; padding: 0 20px; font-size: 12px; font-family: 'Space Grotesk', sans-serif; font-weight: 600;">Check for Updates Online</button>
                     </div>
                     <div id="upload-progress-container" style="display: none; width: 100%; max-width: 600px; margin-top: 10px;">
                         <div class="progress-bar-container" style="height: 6px; margin-bottom: 8px;">
@@ -169,7 +207,8 @@
                 <div id="lcm-preview-card" class="glass-card" style="display: none; padding: 25px; flex-direction: column; gap: 20px;">
                     <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.08); padding-bottom: 15px;">
                         <h3 style="font-family: 'Space Grotesk', sans-serif; font-size: 16px; font-weight: 600; color: #fff; margin: 0;">Upgrade Package Preview</h3>
-                        <div style="display: flex; gap: 10px; align-items: center;">
+                        <div style="display: flex; gap: 12px; align-items: center;">
+                            <span id="lcm-upgrade-mode-badge" style="font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 20px; font-family: 'Space Grotesk', sans-serif; display: inline-block;">Fast Patch</span>
                             <span class="status-dot connected" style="background-color: var(--color-primary); margin: 0;"></span>
                             <span style="font-size: 12px; font-weight: 600; color: var(--color-primary);" id="lcm-target-build-badge">Build 1.2.0-b4081</span>
                         </div>
@@ -183,6 +222,7 @@
                                 <table class="prism-table" style="width: 100%;">
                                     <thead>
                                         <tr>
+                                            <th style="width: 40px; text-align: center;"><input type="checkbox" id="lcm-select-all-components" checked style="cursor: pointer;"></th>
                                             <th>Component</th>
                                             <th>Current Version</th>
                                             <th>Target Version</th>
@@ -197,7 +237,10 @@
 
                         <!-- Changelog display -->
                         <div style="display: flex; flex-direction: column; gap: 8px;">
-                            <h4 style="font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 600; color: var(--text-muted); margin: 0;">CHANGELOG</h4>
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <h4 style="font-family: 'Space Grotesk', sans-serif; font-size: 13px; font-weight: 600; color: var(--text-muted); margin: 0;">CHANGELOG</h4>
+                                <button id="btn-show-full-changelog" style="background: none; border: none; color: var(--color-primary); font-size: 11px; font-family: 'Space Grotesk', sans-serif; font-weight: 600; cursor: pointer; transition: opacity 0.2s; opacity: 0; pointer-events: none;">Show Full</button>
+                            </div>
                             <div id="lcm-changelog-container" style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 8px; padding: 15px; font-size: 12px; line-height: 1.6; color: var(--text-secondary); max-height: 180px; overflow-y: auto; font-family: 'Outfit', sans-serif; text-align: left;">
                                 <!-- Changelog text -->
                             </div>
@@ -240,6 +283,11 @@
                             <!-- Node status blocks will be generated here -->
                         </div>
                     </div>
+
+                    <!-- Action footer (hidden by default, shown on completion/failure) -->
+                    <div id="lcm-progress-action-footer" style="display: none; justify-content: flex-end; border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 15px; margin-top: 10px;">
+                        <button id="btn-lcm-acknowledge" class="btn-primary" style="height: 36px; padding: 0 20px; font-size: 12px; font-family: 'Space Grotesk', sans-serif; font-weight: 600;">Acknowledge & Clear</button>
+                    </div>
                 </div>
 
                 <!-- Console Output Card (Visible when not IDLE) -->
@@ -253,6 +301,31 @@
                     </div>
                     <div id="lcm-console-log" style="background: rgba(0, 0, 0, 0.4); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 15px; font-family: 'Fira Code', monospace; font-size: 11.5px; line-height: 1.5; color: #34d399; height: 250px; overflow-y: auto; white-space: pre-wrap; text-align: left;">
                         <!-- Terminal lines -->
+                    </div>
+                </div>
+
+                <!-- Cluster Component Inventory Card (Always Visible) -->
+                <div id="lcm-inventory-card" class="glass-card" style="padding: 25px; display: flex; flex-direction: column; gap: 15px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255, 255, 255, 0.08); padding-bottom: 12px;">
+                        <h3 style="font-family: 'Space Grotesk', sans-serif; font-size: 15px; font-weight: 600; color: #fff; margin: 0; display: flex; align-items: center; gap: 8px;">
+                            <svg viewBox="0 0 24 24" style="width: 18px; height: 18px; fill: none; stroke: var(--color-primary); stroke-width: 2;"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                            Cluster Component Inventory
+                        </h3>
+                        <button id="btn-refresh-inventory" class="btn-secondary" style="height: 28px; padding: 0 12px; font-size: 11px; font-family: 'Space Grotesk', sans-serif;">Fetch Inventory</button>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="prism-table" style="width: 100%;">
+                            <thead id="lcm-inventory-thead">
+                                <tr>
+                                    <th>Component</th>
+                                </tr>
+                            </thead>
+                            <tbody id="lcm-inventory-tbody">
+                                <tr>
+                                    <td style="text-align: center; color: var(--text-muted); padding: 20px;">Click "Fetch Inventory" to retrieve component versions directly from the hosts.</td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
 

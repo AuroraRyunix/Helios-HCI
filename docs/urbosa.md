@@ -158,3 +158,10 @@ To ensure optimal usability on horizontal widescreen monitors and eliminate vert
 * **Full Segment Customization**: In the Overlay Segments edit modal, all attributes (Segment Name, VXLAN VNI, attached Tier-1 router link, subnet CIDR, Gateway IP, and DHCP IPAM lease ranges) are fully editable.
 
 
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./urbosa_technical.md).

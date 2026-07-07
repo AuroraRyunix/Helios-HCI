@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import sys
+import json
+import urllib.request
+import ssl
+
+def run_remote_api(ip, command):
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = False
+    
+    url = f"https://{ip}:9099/api/v1/execute"
+    data = json.dumps({"command": command}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=90) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            return res["returncode"], res["stdout"], res["stderr"]
+    except Exception as e:
+        return -1, "", f"mTLS Connection Error to {ip}:9099: {str(e)}"
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: allssh <command>")
+        sys.exit(1)
+        
+    cmd = " ".join(sys.argv[1:])
+    
+    # Load cluster.json to get node IPs
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            ips = [h["ip"] for h in cdata.get("hosts", [])]
+    except Exception as e:
+        print(f"Error loading /etc/hci/cluster.json: {e}")
+        sys.exit(1)
+        
+    for ip in ips:
+        print(f"================ {ip} ================")
+        rc, out, err = run_remote_api(ip, cmd)
+        if out:
+            print(out)
+        if err:
+            print(err)
+        print()
+
+if __name__ == "__main__":
+    main()

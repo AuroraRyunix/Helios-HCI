@@ -232,7 +232,7 @@
                     container.innerHTML = ''; // Clear canvas
 
                     rfb = new RFB(container, wsUrl);
-                    rfb.scaleViewport = false;
+                    rfb.scaleViewport = true;
                     rfb.resizeSession = true;
                     applyConnectionProfile();
 
@@ -240,6 +240,28 @@
                         vncRetryCount = 0;
                         document.getElementById('vnc-loading-overlay').style.display = 'none';
                         startMetricLogging();
+
+                        // Immediate remote resize request with retries to allow guest agent initialization
+                        const currentRfb = rfb;
+                        let resizeAttempts = 0;
+                        const maxResizeAttempts = 10;
+                        const resizeInterval = 2000;
+
+                        function attemptResize() {
+                            if (rfb === currentRfb) {
+                                try {
+                                    console.log(`VNC connection established. Requesting remote resize (attempt ${resizeAttempts + 1}/${maxResizeAttempts})...`);
+                                    rfb._requestRemoteResize();
+                                } catch (e) {
+                                    console.error("Failed to request remote resize:", e);
+                                }
+                                resizeAttempts++;
+                                if (resizeAttempts < maxResizeAttempts) {
+                                    setTimeout(attemptResize, resizeInterval);
+                                }
+                            }
+                        }
+                        attemptResize();
                     });
 
                     rfb.addEventListener('fbucomplete', () => {

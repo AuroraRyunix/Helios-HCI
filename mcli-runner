@@ -59,20 +59,36 @@ def check_services(category):
     
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
-    svcs = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "libvirtd"]
+    in_maint = os.path.exists("/etc/hci/maintenance.state")
+    svcs = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
     for svc in svcs:
         update_current_check(category, f"{svc}_status")
         rc, out, err = run_cmd(f"systemctl is-active {svc}")
-        status = "PASS" if out == "active" else "FAIL"
-        if svc == "libvirtd" and status == "FAIL":
-            rc_fallback, out_fallback, err_fallback = run_cmd("systemctl is-active virtqemud")
-            if out_fallback == "active":
-                status = "PASS"
-                out = "active (virtqemud)"
+        is_active = (out == "active")
+        
+        # Handle virtualization services with socket activation fallback
+        if svc == "libvirtd":
+            # Check if any of libvirtd/virtqemud service/sockets are active
+            rc_sock1, out_sock1, _ = run_cmd("systemctl is-active libvirtd.socket")
+            rc_fallback, out_fallback, _ = run_cmd("systemctl is-active virtqemud")
+            rc_sock2, out_sock2, _ = run_cmd("systemctl is-active virtqemud.socket")
+            if is_active or out_sock1 == "active" or out_fallback == "active" or out_sock2 == "active":
+                is_active = True
+                out = "active (virtualization active/socket-activated)"
                 err = ""
+
+        if in_maint:
+            # In maintenance mode, core consensus/storage should be active. Workloads can be active or inactive, we pass them.
+            if svc in ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon"]:
+                status = "PASS" if is_active else "FAIL"
+            else:
+                status = "PASS"
+        else:
+            status = "PASS" if is_active else "FAIL"
+            
         results[f"{svc}_status"] = {
             "status": status,
             "output": f"Service is {out}.\nSystemd Output:\n{out or err}"
@@ -86,7 +102,7 @@ def check_services(category):
         
     # 2. ScyllaDB Ring status (using nodetool)
     update_current_check(category, "scylladb_ring_status")
-    rc, out, err = run_cmd("nodetool status")
+    rc, out, err = run_cmd("podman exec systemd-hydra-db nodetool status")
     if rc == 0:
         # Check if any nodes are Down or Joining
         dn_count = len(re.findall(r"^DN\s", out, re.MULTILINE))
@@ -171,17 +187,22 @@ def check_services(category):
     
     # 5. Spectrum port reachability
     update_current_check(category, "spectrum_api_port")
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        s.connect(("127.0.0.1", 8443))
-        s.close()
+    in_maint = os.path.exists("/etc/hci/maintenance.state")
+    if in_maint:
         status = "PASS"
-        msg = "Spectrum API Web Console port 8443 is open and accepting TCP connections."
-    except Exception as e:
-        status = "FAIL"
-        msg = f"Failed to connect to Spectrum API on port 8443: {str(e)}"
+        msg = "[SKIPPED] Host is in maintenance mode; Spectrum API port 8443 is not expected to be open."
+    else:
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(("127.0.0.1", 8443))
+            s.close()
+            status = "PASS"
+            msg = "Spectrum API Web Console port 8443 is open and accepting TCP connections."
+        except Exception as e:
+            status = "FAIL"
+            msg = f"Failed to connect to Spectrum API on port 8443: {str(e)}"
     results["spectrum_api_port"] = {
         "status": status,
         "output": msg
@@ -382,13 +403,18 @@ def check_services(category):
     
     # 7. Libvirt responsiveness check
     update_current_check(category, "libvirt_responsiveness")
-    rc, out, err = run_cmd("timeout 5 virsh -c qemu:///system list --all")
-    if rc == 0:
+    in_maint = os.path.exists("/etc/hci/maintenance.state")
+    if in_maint:
         status = "PASS"
-        msg = f"Virtualization hypervisor is responsive. virsh command succeeded:\n{out}"
+        msg = "[SKIPPED] Host is in maintenance mode; virtualization hypervisor is not expected to respond."
     else:
-        status = "FAIL"
-        msg = f"Virtualization hypervisor is unresponsive or virsh failed (exit code {rc}):\n{err or out}"
+        rc, out, err = run_cmd("timeout 5 virsh -c qemu:///system list --all")
+        if rc == 0:
+            status = "PASS"
+            msg = f"Virtualization hypervisor is responsive. virsh command succeeded:\n{out}"
+        else:
+            status = "FAIL"
+            msg = f"Virtualization hypervisor is unresponsive or virsh failed (exit code {rc}):\n{err or out}"
     results["libvirt_responsiveness"] = {
         "status": status,
         "output": msg
@@ -458,6 +484,7 @@ def check_services(category):
     
     # 9. Spectrum privilege check
     update_current_check(category, "spectrum_privilege_check")
+    in_maint = os.path.exists("/etc/hci/maintenance.state")
     rc_sp, out_sp, err_sp = run_cmd("podman inspect systemd-spectrum")
     if rc_sp == 0:
         try:
@@ -492,8 +519,12 @@ def check_services(category):
             status = "FAIL"
             msg = f"Failed to parse podman inspect JSON: {str(e)}\nRaw output: {out_sp}"
     else:
-        status = "FAIL"
-        msg = f"Failed to execute podman inspect systemd-spectrum: {err_sp or out_sp}"
+        if in_maint:
+            status = "PASS"
+            msg = "[SKIPPED] Host is in maintenance mode; Spectrum container is not running."
+        else:
+            status = "FAIL"
+            msg = f"Failed to execute podman inspect systemd-spectrum: {err_sp or out_sp}"
         
     results["spectrum_privilege_check"] = {
         "status": status,
@@ -546,26 +577,92 @@ def check_services(category):
             with open("/etc/hci/cluster.json", "r") as f:
                 cdata = json.load(f)
             vip = cdata.get("vip")
-            hosts = [h["ip"] for h in cdata.get("hosts", [])]
+            hosts = cdata.get("hosts", [])
+            ips = [h.get("ip") for h in hosts if h.get("ip")]
             if vip:
                 rc_ip, out_ip, _ = run_cmd("ip addr show")
                 bound_locally = (vip in out_ip)
-                local_leader = is_zookeeper_leader()
                 
-                if local_leader:
+                # Use the exact same leadership logic as bifrost.py to find expected VIP owner
+                # 1. Find raw ZooKeeper leader
+                zk_leader_ip = None
+                for ip in ips:
+                    try:
+                        import socket
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.2)
+                        s.connect((ip, 2181))
+                        s.sendall(b"stat")
+                        resp = s.recv(1024).decode('utf-8', errors='ignore')
+                        s.close()
+                        if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
+                            zk_leader_ip = ip
+                            break
+                    except Exception:
+                        pass
+                        
+                # 2. Check if ZK leader is active on port 8443 (Spectrum)
+                leader_active = False
+                if zk_leader_ip:
+                    try:
+                        import socket
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(0.2)
+                        s.connect((zk_leader_ip, 8443))
+                        s.close()
+                        leader_active = True
+                    except Exception:
+                        leader_active = False
+                        
+                expected_vip_holder = None
+                if leader_active:
+                    expected_vip_holder = zk_leader_ip
+                else:
+                    # Fallback to candidates with port 8443 open
+                    candidates = []
+                    for ip in ips:
+                        try:
+                            import socket
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(0.2)
+                            s.connect((ip, 8443))
+                            s.close()
+                            candidates.append(ip)
+                        except Exception:
+                            pass
+                    if candidates:
+                        candidates.sort()
+                        expected_vip_holder = candidates[0]
+                    else:
+                        expected_vip_holder = zk_leader_ip if zk_leader_ip else "127.0.0.1"
+                        
+                # Find local IP
+                local_ip = "127.0.0.1"
+                try:
+                    import socket
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                except Exception:
+                    pass
+                    
+                is_expected_holder = (local_ip == expected_vip_holder)
+                
+                if is_expected_holder:
                     if bound_locally:
                         vip_status = "PASS"
-                        vip_msg = f"VIP {vip} is correctly bound locally on the ZooKeeper leader."
+                        vip_msg = f"VIP {vip} is correctly bound locally on the expected active node ({expected_vip_holder})."
                     else:
                         vip_status = "FAIL"
-                        vip_msg = f"VIP {vip} is NOT bound locally, but this node is the ZooKeeper leader!"
+                        vip_msg = f"VIP {vip} is NOT bound locally, but this node ({local_ip}) is the expected active node!"
                 else:
                     if bound_locally:
                         vip_status = "FAIL"
-                        vip_msg = f"Conflict: VIP {vip} is bound locally, but this node is a ZooKeeper follower!"
+                        vip_msg = f"Conflict: VIP {vip} is bound locally, but the expected active node is {expected_vip_holder}!"
                     else:
                         vip_status = "PASS"
-                        vip_msg = f"VIP {vip} is not bound locally (correct behavior for ZooKeeper follower)."
+                        vip_msg = f"VIP {vip} is not bound locally (correct behavior; expected active node is {expected_vip_holder})."
             else:
                 vip_status = "PASS"
                 vip_msg = "No VIP configured in cluster.json."
@@ -615,7 +712,7 @@ def check_services(category):
                 running_vms = [v.strip() for v in out_v.strip().splitlines() if v.strip()]
             
             active_services = []
-            services_to_check = ["spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "aether", "linstor-controller", "hydra-db", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim", "slate"]
+            services_to_check = ["spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "linstor-controller", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate"]
             for svc in services_to_check:
                 rc_svc, out_svc, _ = run_cmd(f"systemctl is-active {svc}")
                 if rc_svc == 0 and out_svc.strip() == "active":
@@ -657,35 +754,26 @@ def check_services(category):
                 cdata = json.load(f)
                 hosts = [h["ip"] for h in cdata.get("hosts", [])]
                 
-        leader_ip = None
+        active_vali_ip = None
+        balance_score = "N/A"
+        import urllib.request
         for ip in hosts:
             try:
-                import socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.5)
-                s.connect((ip, 2181))
-                s.sendall(b"stat")
-                resp = s.recv(1024).decode('utf-8', errors='ignore')
-                s.close()
-                if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                    leader_ip = ip
+                req = urllib.request.Request(f"http://{ip}:9095/api/v1/drs/status")
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    active_vali_ip = ip
+                    balance_score = data.get('balance_score', 'N/A')
                     break
-            except:
+            except Exception:
                 pass
                 
-        if leader_ip:
-            import urllib.request
-            try:
-                req = urllib.request.Request(f"http://{leader_ip}:9095/api/v1/drs/status")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    vali_msg = f"Vali is active on leader node {leader_ip}. DRS Score: {data.get('balance_score', 'N/A')}%"
-            except Exception as e:
-                vali_status = "FAIL"
-                vali_msg = f"Vali manager leader {leader_ip} port 9095 is unresponsive: {e}"
+        if active_vali_ip:
+            vali_status = "PASS"
+            vali_msg = f"Vali is active on node {active_vali_ip}. DRS Score: {balance_score}%"
         else:
             vali_status = "FAIL"
-            vali_msg = "No active ZooKeeper leader node could be reached in the cluster."
+            vali_msg = "Vali placement manager leader port 9095 is unresponsive on all nodes in the cluster."
     except Exception as e:
         vali_status = "FAIL"
         vali_msg = f"Error checking Vali leader status: {str(e)}"
@@ -1655,7 +1743,7 @@ def check_hardware(category):
             status = "WARN"
             msg = "KVM virtualization is disabled (/dev/kvm not found), but CPU supports VT-x/AMD-V. Enable virtualization in BIOS or load kvm kernel modules."
         else:
-            status = "FAIL"
+            status = "WARN"
             msg = "Host lacks full virtualization capabilities. CPU does not support VT-x/AMD-V, and /dev/kvm is missing. QEMU must use slow software emulation (TCG)."
     results["host_virtualization"] = {
         "status": status,

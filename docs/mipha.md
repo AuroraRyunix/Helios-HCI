@@ -103,3 +103,10 @@ To simulate a host crash and observe Mipha's recovery orchestration:
    ```bash
    valcli vm.list
    ```
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./mipha_technical.md).

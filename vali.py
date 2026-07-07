@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__build__ = "1.2.0-b4081"
+__build__ = "1.2.2"
 import sys
 import os
 import json
@@ -297,6 +297,10 @@ def submit_and_wait_task(service, action, task_payload, timeout_polls=3, parent_
                 return True, "", target_host
             elif t_status == "failed":
                 return False, res.get("error_msg", "Task failed."), ""
+            else:
+                import time
+                time.sleep(2)
+                continue
         elif status == 204:
             continue
         else:
@@ -322,7 +326,8 @@ def init_db_schema():
         cluster_name text PRIMARY KEY,
         current_deviation double,
         status_str text,
-        last_drs_run bigint
+        last_drs_run bigint,
+        drs_enabled boolean
     );
     """
     drs_history_table = """
@@ -345,6 +350,7 @@ def init_db_schema():
     """
     run_cql_query(tasks_table)
     run_cql_query(drs_status_table)
+    run_cql_query("ALTER TABLE hydra.vali_drs_status ADD drs_enabled boolean;")
     run_cql_query(drs_history_table)
     run_cql_query(nodes_table)
 
@@ -484,6 +490,19 @@ def run_drs_loop(aggressive=False):
     global last_migration_time
     now = time.time()
     
+    drs_enabled = True
+    try:
+        rc_set, out_set, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'drs_enabled';")
+        if rc_set == 0 and out_set:
+            for line in out_set.splitlines():
+                line = line.strip()
+                if line and not line.startswith('(') and not line.startswith('-') and line != 'value':
+                    if line.lower() == 'false':
+                        drs_enabled = False
+                    break
+    except Exception:
+        pass
+        
     hosts = get_cluster_hosts()
     if len(hosts) < 2:
         return
@@ -560,10 +579,13 @@ def run_drs_loop(aggressive=False):
         
     # Write status to ScyllaDB
     cql_status = f"""
-    INSERT INTO hydra.vali_drs_status (cluster_name, current_deviation, status_str, last_drs_run)
-    VALUES ('default', {std_dev}, '{status_str}', {int(now)});
+    INSERT INTO hydra.vali_drs_status (cluster_name, current_deviation, status_str, last_drs_run, drs_enabled)
+    VALUES ('default', {std_dev}, '{status_str}', {int(now)}, {str(drs_enabled).lower()});
     """
     run_cql_query(cql_status)
+    
+    if not drs_enabled:
+        return
     
     # 3. Check threshold and cooldown rules
     threshold = 0.02 if aggressive else 0.15
@@ -1734,6 +1756,7 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
                     "status_str": status_obj.get("status_str", "Balanced (happy)"),
                     "last_run": status_obj.get("last_drs_run", 0),
                     "last_drs_run": status_obj.get("last_drs_run", 0),
+                    "drs_enabled": status_obj.get("drs_enabled", True) if status_obj.get("drs_enabled") is not None else True,
                     "history": history[:15] # Return last 15 migrations
                 }
                 

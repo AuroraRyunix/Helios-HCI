@@ -59,3 +59,10 @@ Query the current ZooKeeper leader IP as resolved by Bifrost's active failover l
 python3 -c "import sys; sys.path.append('/usr/local/bin'); import bifrost; print(bifrost.get_zookeeper_leader_ip())"
 ```
 
+
+
+---
+
+## Technical Reference
+
+For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./bifrost_technical.md).

@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""
+nodetool - Host-level wrapper for Cassandra/ScyllaDB nodetool.
+Executes nodetool inside the running systemd-hydra-db container via podman exec.
+Automatically detects whether a TTY is available and passes -t accordingly.
+"""
+import sys
+import os
+import subprocess
+
+def main():
+    cmd = ["podman", "exec", "-i"]
+    # Only allocate a pseudo-TTY when stdin is a real terminal
+    if sys.stdin.isatty():
+        cmd.append("-t")
+    cmd.extend(["systemd-hydra-db", "nodetool"])
+    cmd.extend(sys.argv[1:])
+
+    try:
+        result = subprocess.run(cmd)
+        sys.exit(result.returncode)
+    except FileNotFoundError:
+        print("Error: podman not found. Is it installed?", file=sys.stderr)
+        sys.exit(127)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        print(f"Error executing nodetool: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
