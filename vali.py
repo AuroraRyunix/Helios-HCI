@@ -528,17 +528,18 @@ def run_drs_loop(aggressive=False):
     except Exception:
         pass
 
-    # 1. Fetch metrics from active hosts
-    for h in hosts:
+    # 1. Fetch metrics from active hosts in parallel
+    from concurrent.futures import ThreadPoolExecutor
+
+    def poll_host_metrics(h):
         ip = h["ip"]
         if ip in maintenance_ips:
-            continue
-        # Check status and verify all services are UP
+            return None
         rc_st, status_data, _ = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
         if rc_st == 0:
             try:
                 if status_data.get("maintenance_status", "NORMAL") != "NORMAL":
-                    continue
+                    return None
                 services = status_data.get("services", {})
                 all_up = True
                 for sname, sdata in services.items():
@@ -546,11 +547,23 @@ def run_drs_loop(aggressive=False):
                         all_up = False
                         break
                 if not all_up:
-                    continue
+                    return None
             except:
-                continue
+                return None
 
-            u_cpu, u_mem, mem_total, mem_used = get_node_utilization(ip, fetch_cpu=True)
+            try:
+                u_cpu, u_mem, mem_total, mem_used = get_node_utilization(ip, fetch_cpu=True)
+                return ip, u_cpu, u_mem, mem_total, mem_used
+            except Exception:
+                return None
+        return None
+
+    with ThreadPoolExecutor(max_workers=min(10, len(hosts))) as executor:
+        results = list(executor.map(poll_host_metrics, hosts))
+
+    for res in results:
+        if res:
+            ip, u_cpu, u_mem, mem_total, mem_used = res
             online_hosts.append(ip)
             # Combine Load Metric (Equal weight CPU & Memory)
             load_metrics[ip] = 0.5 * u_cpu + 0.5 * u_mem
@@ -674,6 +687,67 @@ def drs_thread_loop():
         except Exception as e:
             sys.stderr.write(f"Error in DRS loop thread: {e}\n")
         time.sleep(30)
+
+def get_vm_disk_size(vm_name):
+    vm_data = get_vm_xml_specs(vm_name)
+    if vm_data and vm_data.get("disks_list"):
+        res_name = vm_data["disks_list"].split(",")[0]
+        ips = []
+        try:
+            if os.path.exists("/etc/hci/cluster.json"):
+                with open("/etc/hci/cluster.json", "r") as f:
+                    ips = [h["ip"] for h in json.load(f).get("hosts", [])]
+        except Exception:
+            pass
+        if not ips:
+            ips = ["127.0.0.1"]
+        controllers_str = ",".join(ips)
+        cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume-definition list --resource-definition {res_name}"
+        rc, stdout, _ = run_remote_spark(LOCAL_IP, cmd)
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                parts = line.split("|")
+                for p in parts:
+                    if "gib" in p.lower():
+                        try:
+                            val = float(p.strip().split()[0])
+                            return int(val * 1024)
+                        except:
+                            pass
+    return 51200
+
+def get_linstor_free_space(target_ip):
+    ips = []
+    try:
+        if os.path.exists("/etc/hci/cluster.json"):
+            with open("/etc/hci/cluster.json", "r") as f:
+                ips = [h["ip"] for h in json.load(f).get("hosts", [])]
+    except Exception:
+        pass
+    if not ips:
+        ips = ["127.0.0.1"]
+    controllers_str = ",".join(ips)
+    cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor storage-pool list"
+    rc, stdout, _ = run_remote_spark(target_ip, cmd)
+    if rc == 0 and stdout:
+        for line in stdout.splitlines():
+            if "default-pool" in line or "lvm_thin" in line or "thin" in line:
+                parts = line.split("|")
+                for p in parts:
+                    if "/" in p:
+                        try:
+                            free_str = p.split("/")[0].strip()
+                            val = float(free_str.split()[0])
+                            unit = free_str.split()[1].lower()
+                            if "gib" in unit:
+                                return int(val * 1024)
+                            elif "tib" in unit:
+                                return int(val * 1024 * 1024)
+                            elif "mib" in unit:
+                                return int(val)
+                        except:
+                            pass
+    return 999999
 
 def get_vm_xml_specs(name):
     cql = f"SELECT JSON * FROM hydra.vms WHERE name = '{name}';"
@@ -1250,10 +1324,13 @@ def process_queue_task(task):
             if not vm_data:
                 return False, "VM not found in metadata database."
             src_host = vm_data.get("host_ip", "")
-            state = vm_data.get("state", "")
+            state = vm_data.get("status", "")
             
-            if not src_host or state != "Running":
-                return False, "VM must be running to migrate."
+            if not src_host or state.lower() != "running":
+                return False, f"VM must be running to migrate (current state: {state})."
+                
+            if state.lower() == "migrating":
+                return False, "VM is already in migrating state."
                 
             if src_host == target_ip:
                 return True, target_ip
@@ -1275,49 +1352,62 @@ def process_queue_task(task):
                 return False, f"Failed to parse target host status: {e}"
 
             # Memory availability check on target host
-            memory_needed = int(vm_data.get("memory", 1024))
+            memory_needed = int(vm_data.get("ram", 1024))
             _, _, total_mb, used_mb = get_node_utilization(target_ip, fetch_cpu=False)
             avail_mb = total_mb - used_mb
             if avail_mb < memory_needed:
                 return False, f"Target host {target_host} has insufficient free memory ({int(avail_mb)} MB available, needs {memory_needed} MB)."
 
-            # Storage mount check is handled by Linstor/DRBD statically
-            pass
-                
-            # 1. Force-backup NVRAM on source host to ScyllaDB
-            backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=False)
-            run_remote_spark(src_host, backup_cmd)
-            
-            # 2. Restore NVRAM on target host (ensuring directories exist and files are written)
-            restore_cmd = get_nvram_restore_cmd(vm_name)
-            run_remote_spark(target_ip, restore_cmd)
+            # Storage capacity gate check
+            disk_size = get_vm_disk_size(vm_name)
+            target_free = get_linstor_free_space(target_ip)
+            if target_free < disk_size:
+                return False, f"Target host {target_host} has insufficient free Linstor storage pool space ({target_free} MiB available, needs {disk_size} MiB)."
 
-            # 3. Pre-clean stale definition on target host
-            run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {vm_name} --keep-nvram || true")
-            
-            # 4. Live migrate command
-            cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe {vm_name} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
-            rc, stdout, stderr = run_remote_spark(src_host, cmd)
-            if rc != 0:
-                return False, f"Migration failed: {stderr.strip() or stdout.strip()}"
+            # Set migrating lock in database
+            print(f"Setting migrating status lock for VM '{vm_name}'...")
+            run_cql_query(f"UPDATE hydra.vms SET status = 'migrating' WHERE name = '{vm_name}';")
+
+            try:
+                # 1. Force-backup NVRAM on source host to ScyllaDB
+                backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=False)
+                run_remote_spark(src_host, backup_cmd)
                 
-            # 5. Clean up local NVRAM file on source host after successful migration
-            run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{vm_name}_vars.fd")
+                # 2. Restore NVRAM on target host (ensuring directories exist and files are written)
+                restore_cmd = get_nvram_restore_cmd(vm_name)
+                run_remote_spark(target_ip, restore_cmd)
+
+                # 3. Pre-clean stale definition on target host
+                run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {vm_name} --keep-nvram || true")
                 
-            # Update ScyllaDB VM record
-            cql = f"UPDATE hydra.vms SET host_ip = '{target_ip}' WHERE name = '{vm_name}';"
-            run_cql_query(cql)
-            
-            # Insert record in history
-            now = int(time.time() * 1000)
-            reason = task.get("error_msg", "Manual VM migration request") # Re-use error_msg for trigger reason
-            clean_reason = reason.replace("'", "''")
-            cql_history = f"""
-            INSERT INTO hydra.vali_drs_history (event_time, vm_name, source_host, target_host, reason)
-            VALUES ({now}, '{vm_name}', '{src_host}', '{target_ip}', '{clean_reason}');
-            """
-            run_cql_query(cql_history)
-            return True, target_ip
+                # 4. Live migrate command
+                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe {vm_name} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
+                rc, stdout, stderr = run_remote_spark(src_host, cmd)
+                if rc != 0:
+                    raise Exception(f"Migration command failed: {stderr.strip() or stdout.strip()}")
+                    
+                # 5. Clean up local NVRAM file on source host after successful migration
+                run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{vm_name}_vars.fd")
+                    
+                # Update ScyllaDB VM record (resets status back to running on target host)
+                cql = f"UPDATE hydra.vms SET host_ip = '{target_ip}', status = 'running' WHERE name = '{vm_name}';"
+                run_cql_query(cql)
+                
+                # Insert record in history
+                now = int(time.time() * 1000)
+                reason = task.get("error_msg", "Manual VM migration request") # Re-use error_msg for trigger reason
+                clean_reason = reason.replace("'", "''")
+                cql_history = f"""
+                INSERT INTO hydra.vali_drs_history (event_time, vm_name, source_host, target_host, reason)
+                VALUES ({now}, '{vm_name}', '{src_host}', '{target_ip}', '{clean_reason}');
+                """
+                run_cql_query(cql_history)
+                return True, target_ip
+            except Exception as migrate_err:
+                print(f"Migration error caught: {migrate_err}. Releasing status lock on source host...")
+                # Reset status back to running on the source host
+                run_cql_query(f"UPDATE hydra.vms SET status = 'running' WHERE name = '{vm_name}';")
+                return False, f"Migration failed: {str(migrate_err)}"
 
         elif action == "host_maintenance_enter":
             hostname = payload.get("hostname")

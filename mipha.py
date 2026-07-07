@@ -57,11 +57,18 @@ def resolve_drbd_standalone(resource_name):
             if "StandAlone" in stdout:
                 role = get_local_drbd_role(resource_name)
                 print(f"[Mipha HA] DRBD resource {resource_name} is in StandAlone state. Resolving (role={role})...")
-                if role != "Primary":
+                
+                # Check ZooKeeper leadership to decide which node yields during dual-Primary split-brain
+                zk_leader = is_zookeeper_leader()
+                
+                if role != "Primary" or not zk_leader:
+                    print(f"[Mipha HA] Node is not ZooKeeper leader or is Secondary. Demoting resource {resource_name} and discarding local writes to auto-heal...")
                     run_command_local(f"drbdadm disconnect {resource_name}")
-                    run_command_local(f"drbdadm secondary {resource_name} || true")
+                    run_command_local(f"drbdadm secondary {resource_name} --force || drbdadm secondary {resource_name} || true")
                     run_command_local(f"drbdadm connect --discard-my-data {resource_name}")
                 else:
+                    print(f"[Mipha HA] Node is ZooKeeper leader and holds Primary role. Keeping local writes for {resource_name}...")
+                    run_command_local(f"drbdadm disconnect {resource_name}")
                     run_command_local(f"drbdadm connect {resource_name}")
     except Exception as e:
         sys.stderr.write(f"[Mipha HA] Error resolving DRBD standalone for {resource_name}: {e}\n")
@@ -175,7 +182,10 @@ def linstor_ha_loop():
                             print("[Mipha HA] Promoting linstor-db to Primary...")
                             rc_p, stdout_p, stderr_p = run_command_local("drbdadm primary linstor-db")
                             if rc_p != 0:
-                                print(f"[Mipha HA] Warning: drbdadm primary failed: {stderr_p or stdout_p}")
+                                print(f"[Mipha HA] drbdadm primary failed ({stderr_p or stdout_p}). Attempting forced promotion to bypass unresponsive host locks...")
+                                rc_p, stdout_p, stderr_p = run_command_local("drbdadm primary --force linstor-db")
+                                if rc_p != 0:
+                                    print(f"[Mipha HA] CRITICAL: Forced promotion of linstor-db failed: {stderr_p or stdout_p}")
                                 
                         if not check_linstor_db_mount():
                             print("[Mipha HA] Mounting linstor-db volume at /var/lib/linstor...")

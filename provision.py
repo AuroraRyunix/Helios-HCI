@@ -89,7 +89,7 @@ Image=docker.io/library/zookeeper:3.9.2
 Network=host
 Volume=/var/lib/hci/zookeeper/data:/data:Z
 Volume=/var/lib/hci/zookeeper/log:/datalog:Z
-Environment=ZOO_MY_ID={node_id} "ZOO_SERVERS={zoo_servers}" ZOO_4LW_COMMANDS_WHITELIST=*
+Environment=ZOO_MY_ID={node_id} "ZOO_SERVERS={zoo_servers}" ZOO_4LW_COMMANDS_WHITELIST=*{peer_type}
 
 [Install]
 WantedBy=multi-user.target
@@ -1002,7 +1002,10 @@ Environment=PYTHONUNBUFFERED=1
             # Static configurations resolution
             zoo_servers_parts = []
             for i, ip in enumerate(HOSTS, start=1):
-                zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
+                if i > 3:
+                    zoo_servers_parts.append(f"server.{i}={ip}:2888:3888:observer;2181")
+                else:
+                    zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
             zoo_servers_str = " ".join(zoo_servers_parts)
             seed_ips = HOSTS[0]
 
@@ -1104,7 +1107,8 @@ WantedBy=multi-user.target
         # Phase 4: Deploying Podman Quadlets
         try:
             print(f"[{node.ip}] Writing Quadlet containers...")
-            zoo_quad = QUADLETS["zookeeper"].format(node_id=idx, zoo_servers=zoo_servers_str)
+            peer_type_str = " ZOO_PEER_TYPE=observer" if idx > 3 else ""
+            zoo_quad = QUADLETS["zookeeper"].format(node_id=idx, zoo_servers=zoo_servers_str, peer_type=peer_type_str)
             db_quad = QUADLETS["hydra-db"].format(seeds=seed_ips, node_ip=node.ip)
             aether_quad = QUADLETS["aether"]
             spec_quad = QUADLETS["spectrum"]

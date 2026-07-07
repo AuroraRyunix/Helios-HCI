@@ -17,12 +17,30 @@ def get_local_ip():
     return IP
 
 from cassandra import ConsistencyLevel
+import time
 
-LOCAL_IP = get_local_ip()
-print(f"Daruk connecting to ScyllaDB at {LOCAL_IP}...")
-cluster = Cluster([LOCAL_IP])
-session = cluster.connect()
-session.default_consistency_level = ConsistencyLevel.QUORUM
+cluster = None
+session = None
+
+def connect_db():
+    global cluster, session
+    LOCAL_IP = get_local_ip()
+    retries = 30
+    while retries > 0:
+        try:
+            print(f"Daruk connecting to ScyllaDB at {LOCAL_IP}...")
+            cluster = Cluster([LOCAL_IP])
+            session = cluster.connect()
+            session.default_consistency_level = ConsistencyLevel.QUORUM
+            print("Daruk successfully connected to ScyllaDB.")
+            return
+        except Exception as e:
+            print(f"ScyllaDB connection failed: {e}. Retrying in 2 seconds... ({retries} left)")
+            time.sleep(2)
+            retries -= 1
+    raise RuntimeError("Failed to connect to ScyllaDB after 30 attempts.")
+
+connect_db()
 
 def make_serializable(obj):
     if isinstance(obj, dict):
@@ -43,7 +61,17 @@ class CQLProxyHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length).decode('utf-8')
             try:
-                rows = session.execute(post_data)
+                try:
+                    rows = session.execute(post_data)
+                except Exception as e:
+                    # Dynamic fallback to ConsistencyLevel.ONE if QUORUM fails due to unavailable nodes
+                    if "unavailable" in str(e).lower() or "timeout" in str(e).lower() or "active" in str(e).lower():
+                        print("QUORUM consistency level failed or database degraded. Falling back to ConsistencyLevel.ONE...")
+                        from cassandra.query import SimpleStatement
+                        statement = SimpleStatement(post_data, consistency_level=ConsistencyLevel.ONE)
+                        rows = session.execute(statement)
+                    else:
+                        raise e
                 result = []
                 for row in rows:
                     if hasattr(row, '_asdict'):

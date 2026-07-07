@@ -263,9 +263,10 @@ def run_remote_spark(ip, command, timeout=45):
         return -1, "", str(e)
 
 def run_linstor_cmd(linstor_args):
-    """Executes a Linstor command against the cluster controllers, trying nodes sequentially."""
+    """Executes a Linstor command against the cluster controllers, trying active leader first and fast-failing offline nodes."""
     import json
     import os
+    import socket
     hosts = []
     try:
         if os.path.exists("/etc/hci/cluster.json"):
@@ -276,10 +277,29 @@ def run_linstor_cmd(linstor_args):
     ips = [h["ip"] for h in hosts] if hosts else ["127.0.0.1"]
     controllers_str = ",".join(ips)
     
-    # Try running the command on local node first, fallback to other nodes
-    candidate_ips = ["127.0.0.1"] + ips
+    leader_ip = get_zookeeper_leader_ip()
+    candidate_ips = []
+    if leader_ip:
+        candidate_ips.append(leader_ip)
+    candidate_ips += ["127.0.0.1"] + ips
+    
+    seen = set()
+    ordered_candidates = []
+    for ip in candidate_ips:
+        if ip not in seen:
+            seen.add(ip)
+            ordered_candidates.append(ip)
+            
     rc, stdout, stderr = -1, "", "No nodes available"
-    for cap_ip in candidate_ips:
+    for cap_ip in ordered_candidates:
+        if cap_ip != "127.0.0.1" and cap_ip != LOCAL_IP:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.2)
+                s.connect((cap_ip, 9099))
+                s.close()
+            except Exception:
+                continue
         cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor {linstor_args}"
         rc, stdout, stderr = run_remote_spark(cap_ip, cmd)
         if rc == 0:

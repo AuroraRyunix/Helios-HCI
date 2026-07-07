@@ -1370,12 +1370,16 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             else:
                 zoo_servers_parts = []
                 for i, ip in enumerate(servers, start=1):
-                    zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
+                    if i > 3:
+                        zoo_servers_parts.append(f"server.{i}={ip}:2888:3888:observer;2181")
+                    else:
+                        zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
                 zoo_servers_str = " ".join(zoo_servers_parts)
                 zoo_servers_env = f' ZOO_SERVERS="{zoo_servers_str}"'
 
             for idx, ip in enumerate(servers):
                 node_id = idx + 1
+                peer_type_env = " ZOO_PEER_TYPE=observer" if node_id > 3 else ""
                 zk_quad = (
                     "[Unit]\n"
                     "Description=ZooKeeper Cluster Consensus Service\n"
@@ -1390,7 +1394,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     "Network=host\n"
                     "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
                     "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
-                    f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env} ZOO_4LW_COMMANDS_WHITELIST=*\n\n"
+                    f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} ZOO_4LW_COMMANDS_WHITELIST=*\n\n"
                     "[Install]\n"
                     "WantedBy=multi-user.target\n"
                 )

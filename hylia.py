@@ -522,6 +522,21 @@ def hylia_rolling_upgrade(job_id):
                 log_upgrade(job_id, f"[{hostname}] All files successfully copied.")
                 
                 if needs_reboot:
+                    # Pre-flight check: Verify that other nodes are healthy and fully synced before taking this node offline
+                    log_upgrade(job_id, f"[{hostname}] Running pre-flight storage synchronization checks on remaining cluster nodes...")
+                    preflight_ok = True
+                    for other_node in target_nodes:
+                        o_ip = other_node["ip"]
+                        o_host = other_node["hostname"]
+                        if o_ip != node_ip:
+                            log_upgrade(job_id, f"[{hostname}] Checking storage replica sync status on {o_host}...")
+                            if not verify_node_storage_health(job_id, o_ip, o_host):
+                                log_upgrade(job_id, f"[{hostname}] ERROR: Storage replica on node {o_host} is degraded or unsynchronized. Cannot reboot safely.")
+                                preflight_ok = False
+                                break
+                    if not preflight_ok:
+                        raise Exception("Pre-flight storage health check failed. Aborting rolling upgrade reboot to prevent quorum storage loss.")
+
                     # Write marker file before rebooting
                     run_remote_spark(node_ip, f"mkdir -p /var/lib/hylia && touch /var/lib/hylia/upgrade_rebooted_{job_id}")
                     
