@@ -271,6 +271,24 @@ To proactively detect and surface the architectural gaps identified in this audi
 *   **Impact:** During cluster boot, if the `daruk` service starts before ScyllaDB completes its replay log checks and opens port 9042, Daruk crashes and exits. Because all other services (Spectrum, Vali, Catalyst, Mimir) query ScyllaDB through the Daruk HTTP proxy, a Daruk startup failure cascades into a complete cluster orchestration freeze.
 *   **Recommendation:** Wrap Daruk's connection initialization in a retry loop with exponential backoff on startup, allowing it to wait for ScyllaDB to stabilize and begin responding.
 
+---
+
+## 15. VNC Console Latency Bottlenecks
+
+### A. Lack of TCP_NODELAY on Proxy Sockets
+*   **Location:** `spectrum_server.py` (lines 3904–3918)
+*   **The Issue:** The WebSocket-to-VNC connection proxy loop does not apply `TCP_NODELAY` socket options to either the incoming client WebSocket socket (`self.connection`) or the outgoing target hypervisor VNC socket (`vnc_sock`).
+*   **Impact:** Because Nagle's algorithm is enabled by default, the operating system kernel buffers small outgoing TCP packets (like VNC mouse moves and keypresses of 1–5 bytes) and delays transmission for up to 40ms to optimize network utilization. This results in high input latency (averaging 15–20ms, peaking at 40ms) even over high-speed local area networks (LAN).
+*   **Recommendation:** Apply `socket.TCP_NODELAY` to both sockets during connection handshakes to disable Nagle's buffering:
+    ```python
+    try:
+        vnc_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
+    ```
+
+
 
 
 
