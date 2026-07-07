@@ -343,6 +343,19 @@ The guest Kubernetes orchestration engine (Lanayru) code was refactored out of `
 *   **Impact:** In Linstor, a resource definition cannot be deleted if active resource instances exist on the physical nodes. The command will fail, leaving orphan replicated storage blocks on all nodes.
 *   **Recommendation:** Query and delete individual resource node instances first via `linstor resource delete <node> <res_name>` prior to removing the resource definition, or use `--force` if supported.
 
+### F. Missing Guest OS Image Copy in VM Provisioning
+*   **Location:** `lanayru.py` (lines 148–188)
+*   **The Issue:** The refactored VM provisioning loop does not include any commands to copy or convert the cached guest OS template image (`cirros.img`) to the newly created Linstor DRBD block volume.
+*   **Impact:** When the VM is defined and powered on via libvirt, KVM reads from a completely blank storage volume. The boot sequence fails immediately with a "No bootable device" BIOS/UEFI error, freezing the guest VM deployment workflow.
+*   **Recommendation:** Re-integrate the image copy routine: promote the DRBD volume to `Primary` on the target host, use `qemu-img convert` to write the template image, and demote it back to `Secondary` before powering on the VM.
+
+### G. Missing Cloud-Init Metadata Source Mapping
+*   **Location:** `lanayru.py` (lines 175–210)
+*   **The Issue:** The generated libvirt domain XML configuration only contains a single block disk (`vda`) representing the root OS. It lacks a CD-ROM device mapping or virtual drive to host the cloud-init metadata ISO.
+*   **Impact:** Even if the OS image is correctly copied, the VM will boot up but fail to read user-data configurations. Without a data source, cloud-init cannot configure network interfaces, hostnames, SSH keys, or initialize internal container/Kine daemons, rendering the VM unreachable.
+*   **Recommendation:** Generate a cloud-init ISO dynamically on the target host using `genisoimage` (bundling `user-data` and `meta-data`), mount it as a read-only CD-ROM drive in the libvirt XML definition, and attach it to the VM guest.
+
+
 
 
 
