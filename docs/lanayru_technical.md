@@ -78,4 +78,4 @@ mindmap
 ---
 
 ## Technical Reference
-* For details on high-level architecture designs and the host NAT bypass solution, refer to the main [Nayru Design Guide](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/nayru.md).
+* For details on high-level architecture designs and the host NAT bypass solution, refer to the main [Lanayru Design Guide](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/lanayru.md).

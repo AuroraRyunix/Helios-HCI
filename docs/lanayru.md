@@ -1,15 +1,15 @@
-# Nayru (ScyllaDB-Backed Kubernetes Workload Engine)
+# Lanayru (ScyllaDB-Backed Kubernetes Workload Engine)
 
-**Nayru** is the guest Kubernetes orchestration engine for Helios HCI. It acts as the direct equivalent of VMware **Tanzu** (or Nutanix **Karbon**), allowing administrators to deploy fully-managed guest Kubernetes clusters directly from the Spectrum WebUI.
+**Lanayru** is the guest Kubernetes orchestration engine for Helios HCI. It acts as the direct equivalent of VMware **Tanzu** (or Nutanix **Karbon**), allowing administrators to deploy fully-managed guest Kubernetes clusters directly from the Spectrum WebUI.
 
 > [!NOTE]
-> **Name Origin:** Named after **Nayru**, the Golden Goddess of Wisdom from *The Legend of Zelda* who created the physical laws, routing logic, and cosmic order of the universe. In Helios-HCI, **Nayru** brings logical order and scheduling structure to guest container workloads.
+> **Name Origin:** Named after **Lanayru**, the Golden Goddess of Wisdom from *The Legend of Zelda* who created the physical laws, routing logic, and cosmic order of the universe. In Helios-HCI, **Lanayru** brings logical order and scheduling structure to guest container workloads.
 
 ---
 
 ## 1. System Architecture
 
-Unlike standard Kubernetes clusters that require dedicated, resource-heavy `etcd` database VMs, **Nayru** leverages **Kine** (Kubernetes-in-default-databases) to store guest cluster states directly inside the physical host's **ScyllaDB (Hydra)** cluster.
+Unlike standard Kubernetes clusters that require dedicated, resource-heavy `etcd` database VMs, **Lanayru** leverages **Kine** (Kubernetes-in-default-databases) to store guest cluster states directly inside the physical host's **ScyllaDB (Hydra)** cluster.
 
 ```mermaid
 graph TD
@@ -36,8 +36,8 @@ graph TD
 Cluster state is persisted inside the `hydra` keyspace under a dedicated table created only when a cluster is deployed:
 
 ```sql
--- Track metadata of active Kubernetes clusters managed by Nayru
-CREATE TABLE IF NOT EXISTS hydra.nayru_clusters (
+-- Track metadata of active Kubernetes clusters managed by Lanayru
+CREATE TABLE IF NOT EXISTS hydra.lanayru_clusters (
     cluster_id uuid PRIMARY KEY,
     name text,
     control_nodes int,
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS hydra.nayru_clusters (
 );
 
 -- Store Kubernetes etcd key-value pairs translated by Kine
-CREATE TABLE IF NOT EXISTS hydra.nayru_k8s_state (
+CREATE TABLE IF NOT EXISTS hydra.lanayru_k8s_state (
     cluster_id uuid,
     name text,
     value blob,
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS hydra.nayru_k8s_state (
 
 ## 2. Deployment Options
 
-Nayru allows administrators to provision guest control planes in two configurations:
+Lanayru allows administrators to provision guest control planes in two configurations:
 
 ### Option A: Single Control Node (1 VM)
 * **Description:** Provisions a single guest virtual machine running the control plane and API server.
@@ -91,6 +91,8 @@ Instead of exposing the guest Kubernetes API to the public network or configurin
 2. **Bridge Attachment:** The `veth-overlay` end is enslaved directly into the target segment's virtual bridge (`br-ov-{vni}`):
    ```bash
    ip link set veth-overlay up
+   ```
+   ```bash
    ip link set veth-overlay master br-ov-{vni}
    ```
 3. **Host Routing:** The `veth-host` end is assigned an unused IP address within the overlay subnet range (e.g. `10.244.0.254/24`) and left in the host namespace.
@@ -100,7 +102,7 @@ Instead of exposing the guest Kubernetes API to the public network or configurin
 
 ## 4. Deployment Pre-Checks & Requirements
 
-Before initiating a Nayru deployment, the Spectrum API executes a series of rigorous checks:
+Before initiating a Lanayru deployment, the Spectrum API executes a series of rigorous checks:
 
 1. **ScyllaDB Ring Verification:**
    * Query `nodetool status` via Spark on all nodes.
@@ -117,5 +119,4 @@ Before initiating a Nayru deployment, the Spectrum API executes a series of rigo
 ---
 
 ## Technical Reference
-* For details on internal state mapping tables, network bridging topologies, and anti-affinity scheduling configurations, refer to the [Nayru Technical Guide](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/nayru_technical.md).
-
+* For details on internal state mapping tables, network bridging topologies, and anti-affinity scheduling configurations, refer to the [Lanayru Technical Guide](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/lanayru_technical.md).

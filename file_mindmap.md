@@ -62,7 +62,7 @@ mindmap
         logos.md
         mimir.md
         mipha.md
-        nayru.md
+        lanayru.md
         network.md
         odin.md
         slate.md

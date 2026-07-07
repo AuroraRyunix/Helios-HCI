@@ -309,7 +309,7 @@
                         <h4 style="color: #fff; font-size: 13px; margin-bottom: 6px; font-weight: 600;">Control Plane Access Credentials</h4>
                         <div><strong>Guest OS Image:</strong> cirros-0.6.2-x86_64 (Downloaded via cloud repository & cache-replicated across hosts)</div>
                         <div><strong>SSH Access:</strong> <code>ssh cirros@[Guest VM IP]</code> | <strong>Password:</strong> <code style="background: rgba(255,255,255,0.08); padding: 2px 6px; border-radius: 4px; color: #fff;">gocirros</code></div>
-                        <div><strong>Kubeconfig API Server Endpoint:</strong> <code style="color: #00bfa5;">https://10.10.102.130:6443</code> (Spark-Proxy secure mTLS routing gateway to Kine translator)</div>
+                        <div><strong>Kubeconfig API Server Endpoint:</strong> <code style="color: #00bfa5;" id="dash-kubeconfig-endpoint">https://10.10.102.130:6443</code> (Spark-Proxy secure mTLS routing gateway to Kine translator)</div>
                     </div>
                 </div>
             </div>
@@ -450,6 +450,12 @@
             loadChecks();
             loadClusterInfo();
             setInterval(loadClusterInfo, 5000);
+            
+            // Dynamically set Kubeconfig Endpoint based on host serving the page
+            const kubeconfigEl = document.getElementById('dash-kubeconfig-endpoint');
+            if (kubeconfigEl) {
+                kubeconfigEl.textContent = "https://" + location.hostname + ":6443";
+            }
             
             // Get cluster name dynamically
             fetch('/api/v1/cluster')
