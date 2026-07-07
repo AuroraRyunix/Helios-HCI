@@ -152,6 +152,16 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
     *   **$N=1$:** Entering maintenance stops the only database node, crashing the cluster entirely.
 *   **Recommendation:** Gating maintenance mode to require $N \ge 3$ active nodes, or dynamically altering the DB consistency level/replication factor during maintenance transitions.
 
+### B. ScyllaDB Database Ring Membership on Maintenance
+*   **Location:** `vali.py` and `catalyst.py`
+*   **The Issue:** When a host enters maintenance, its ScyllaDB database container (`hydra-db`) is simply stopped. The remaining database nodes continue to treat it as an active member of the token ring, accumulating hinted handoffs (mutations) locally. If the maintenance is long-running (exceeding ScyllaDB's maximum hint window, typically 3 hours), the node becomes heavily out of sync, requiring a manual `nodetool repair` on recovery to prevent data consistency gaps.
+*   **Impact:** Stopping a node without decommissioning degrades query availability. For larger clusters (e.g. $N \ge 4$), the cluster remains vulnerable to subsequent node failures while a node is down.
+*   **Recommendation (ScyllaDB Ring Decommission/Rejoin via Catalyst Tasks):**
+    During host maintenance/upgrade cycles, rather than simply killing the database container, Catalyst should run a structured database migration task:
+    1.  **Clean Decommission on Enter**: When a host transitions to `IN_MAINTENANCE`, Catalyst runs a task executing `nodetool decommission` on the target host. This cleanly redistributes its token ranges to the surviving nodes, preserving full quorum capabilities and database reliability without storing hints.
+    2.  **Auto-Join on Leave**: When the host leaves maintenance, Catalyst triggers a task starting the container in join mode. The database automatically bootstraps, streams its assigned token ranges from peers, and transitions to `NORMAL` status once synchronization is complete.
+
+
 ---
 
 ## 10. Aether/Linstor Storage Auto-Heal Deficiencies
