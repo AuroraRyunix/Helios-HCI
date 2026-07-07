@@ -293,7 +293,11 @@ def main():
             """
             statements.append(cql.strip())
             
-            combined_cql = "\n".join(statements)
+            if len(statements) > 1:
+                combined_cql = "BEGIN BATCH\n" + "\n".join(statements) + "\nAPPLY BATCH;"
+            else:
+                combined_cql = statements[0]
+                
             rc, out, err = run_cql_query(combined_cql, local_ip)
             if rc != 0:
                 print(f"Failed to write batch metrics to ScyllaDB: {err.strip()}")

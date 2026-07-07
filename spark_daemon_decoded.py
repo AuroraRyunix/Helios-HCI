@@ -919,32 +919,30 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
         
-        cql_queries = []
+        metrics_map = {}
         for node in nodes:
             node_ip = node.get("ip")
+            if not node_ip:
+                continue
+            ifaces = []
             for seg in segments:
                 vni = seg.get("vni")
-                if not vni:
-                    continue
-                ifaces = [f"vxlan-{vni}", f"br-ov-{vni}"]
-                for iface in ifaces:
-                    cql_queries.append(f"SELECT JSON node_ip, interface_name, rx_kbps, tx_kbps, rx_packets, tx_packets, timestamp FROM hydra.urbosa_tunnel_metrics WHERE node_ip = '{node_ip}' AND interface_name = '{iface}' LIMIT 1;")
-        
-        metrics_map = {}
-        if cql_queries:
-            combined_cql = "\n".join(cql_queries)
-            rc_m, stdout_m, _ = run_cql_query(combined_cql)
-            if rc_m == 0 and stdout_m:
-                for line in stdout_m.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            m = json.loads(line)
-                            if "node_ip" in m and "interface_name" in m:
-                                key = (m["node_ip"], m["interface_name"])
-                                metrics_map[key] = m
-                        except Exception:
-                            pass
+                if vni:
+                    ifaces.extend([f"vxlan-{vni}", f"br-ov-{vni}"])
+            for iface in ifaces:
+                cql = f"SELECT JSON node_ip, interface_name, rx_kbps, tx_kbps, rx_packets, tx_packets, timestamp FROM hydra.urbosa_tunnel_metrics WHERE node_ip = '{node_ip}' AND interface_name = '{iface}' LIMIT 1;"
+                rc_m, stdout_m, _ = run_cql_query(cql)
+                if rc_m == 0 and stdout_m:
+                    for line in stdout_m.splitlines():
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                m = json.loads(line)
+                                if "node_ip" in m and "interface_name" in m:
+                                    key = (m["node_ip"], m["interface_name"])
+                                    metrics_map[key] = m
+                            except Exception:
+                                pass
         
         tunnel_stats = []
         for node in nodes:
