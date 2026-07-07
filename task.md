@@ -1,7 +1,7 @@
-# Tasks - Lanayru K8s Engine Refactoring & Audit
+# Task List - Podman Quadlet containerization
 
-- `[x]` Split Lanayru K8s Engine code out of `spectrum_server.py` into a new `lanayru.py` script.
-- `[x]` Audit the new `lanayru.py` script for bugs, hardcoded values, and scaling vulnerabilities.
-- `[x]` Integrate `lanayru.py` into `spectrum_server.py` (replace inline functions with calls to `lanayru.py`).
-- `[x]` Create `docs/lanayru_technical.md` documenting the new script.
-- `[x]` Verify changes and push all refactored code and documentation to GitHub.
+- `[x]` Refactor provisioner service creation (`provision.py`)
+- `[x]` Refactor updater service creation (`deploy_updates.py`)
+- `[x]` Refactor spark-daemon container list, service discovery, and PIDs (`spark_daemon_decoded.py`)
+- `[x]` Update technical and normal documentation markdown files
+- `[x]` Compile and verify all modified python scripts

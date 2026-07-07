@@ -1,6 +1,6 @@
 # Walkthrough - Comprehensive Architectural Bug Fixes
 
-We have successfully resolved every critical bug, performance bottleneck, and split-brain risk identified in our codebase audit.
+We have successfully resolved every critical bug, performance bottleneck, split-brain risk, and OS boundary constraint identified in our codebase audit.
 
 ## Summary of Code Modifications
 
@@ -10,7 +10,7 @@ We have successfully resolved every critical bug, performance bottleneck, and sp
     - Added database connection retries (up to 30 attempts, 2-second sleep) on proxy startup to handle ScyllaDB initialization delays.
 *   **ZooKeeper Ensemble Observer Scaling (`cluster_new.py`, `provision.py`, `spark_daemon_decoded.py`)**:
     - Refactored configurations in [cluster_new.py](file:///C:/Users/AuraFlight/Desktop/container-hci/cluster_new.py), [provision.py](file:///C:/Users/AuraFlight/Desktop/container-hci/provision.py), and [spark_daemon_decoded.py](file:///C:/Users/AuraFlight/Desktop/container-hci/spark_daemon_decoded.py) to cap the ZooKeeper voting ensemble size at a maximum of 3 members.
-    - Subsequent nodes (index 4 and onwards in large clusters) are automatically configured as `observer` nodes in `ZOO_SERVERS` and receive `ZOO_PEER_TYPE=observer` env flags in their Quadlet containers, preventing Zab consensus timeouts at scale ($N=40$).
+    - Subsequent nodes (index 4 and onwards in large clusters) are automatically configured as `observer` nodes in `ZOO_SERVERS` and receive `ZOO_PEER_TYPE=observer` env flags in their Quadlet environment settings, preventing Zab consensus timeouts at scale ($N=40$).
 
 ### 2. High Availability & Partition Resiliency
 *   **ZooKeeper-Tie-Breaker for DRBD StandAlone Resolution (`mipha.py`)**:
@@ -33,7 +33,7 @@ We have successfully resolved every critical bug, performance bottleneck, and sp
 *   **Hylia Pre-Flight Storage Sync Checks (`hylia.py`)**:
     - [hylia.py](file:///C:/Users/AuraFlight/Desktop/container-hci/hylia.py) now queries and verifies the DRBD storage replication status of **all other nodes** in the cluster before triggering a rolling reboot. If any other host contains a degraded replica, Hylia aborts the reboot to prevent data availability loss.
 
-### 5. New Findings & Patches (Post-Audit Bug Hunt)
+### 5. Post-Audit Bug Hunt Patches
 *   **NameError Resolution in CLI (`valcli.py`)**:
     - Resolved a `NameError` where `valcli.py` referenced `LOCAL_IP` inside the ZooKeeper leader check fallback block without defining it globally. Defined `LOCAL_IP` at the top of the file, loading it from environment configuration.
 *   **Consolidated Hardcoded IP Fallbacks (`bifrost.py`, `catalyst.py`, `dagur.py`, `mimir.py`, `spectrum_server.py`, `valcli.py`)**:
@@ -41,6 +41,16 @@ We have successfully resolved every critical bug, performance bottleneck, and sp
 *   **HTTP Query Proxy Bypass fixes (`logos.py`, `spark_daemon_decoded.py`)**:
     - In `logos.py`, wrapped multiple metric `INSERT` statements in `BEGIN BATCH ... APPLY BATCH;` blocks. Previously, sending raw multi-line inserts caused Daruk to raise a syntax error, forcing a slow 2-second CLI execution fallback.
     - In `spark_daemon_decoded.py`, refactored multiple `SELECT` queries to run individually inside a loop. This enables them to use the 2ms HTTP proxy path directly rather than triggering the slow container-level CLI execution.
+
+### 6. Containerized Services Architecture (Podman Quadlets)
+*   **Quadlet Container Configurations (`provision.py`, `deploy_updates.py`)**:
+    - Converted all host-level Python services (`spark-daemon`, `bifrost`, `dagur`, `mimir`, `vali`, `gatoway`, `urbosa`, `logos`, `mipha`, `catalyst`, `hylia`, `agahnim`) to run as isolated OCI containers via Podman Quadlets (`.container` files written to `/etc/containers/systemd/`).
+    - The containers run using the local unified base image `localhost/helios-base:latest`, mount `/usr/local/bin` as read-only to execute the scripts directly, and receive specific capabilities (e.g. `CAP_NET_ADMIN` for networking, `/var/run/libvirt/libvirt-sock` socket mounts for compute scheduling).
+*   **Service Discovery & PID Resolution (`spark_daemon_decoded.py`)**:
+    - Moved all Python Quadlet services from `native_svcs` to the `container_svcs` list.
+    - Process IDs are now resolved dynamically using `podman top systemd-<service> hpid` instead of looking up host-level systemctl MainPIDs, aligning telemetry with containerization boundary rules.
+*   **Documentation (`docs/provision_technical.md`, `docs/spark_technical.md`)**:
+    - Updated normal and technical guides to reflect container volumes, permissions, Quadlet unit naming, and systemctl integrations.
 
 ---
 
