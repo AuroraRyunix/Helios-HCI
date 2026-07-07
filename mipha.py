@@ -571,6 +571,10 @@ def main():
                             except:
                                 pass
 
+                if db_status in ["IN_MAINTENANCE", "ENTERING_MAINTENANCE"]:
+                    consecutive_failures[ip] = 0
+                    continue
+
                 # 2. Run Health checks on host
                 ping_ok = ping_host(ip)
                 spark_ok = False
