@@ -199,18 +199,18 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** The cluster has no logic to handle nodes experiencing partial software failures (e.g. ScyllaDB crashes, Linstor Satellite hangs, or physical disk I/O errors) while network connectivity and SSH remain active.
 *   **Impact:** If a host's storage or database daemon crashes, running VMs on that host will freeze or experience read/write failures. Because the host's operating system is still online, Mipha's ping checks see the host as healthy and do not trigger a failover, causing VMs to remain locked in a broken state indefinitely.
 *   **Recommendation (Software Failure Isolation & Self-Fencing):**
-    1.  **Software Fault Isolation (Watchdog-Initiated)**: If Spark's local watchdog thread detects that local database or storage services have failed, or are caught in a **restart/crash loop** (e.g. service restarts repeatedly and fails again more than 5 times in 10 minutes, hitting systemd start-limit limits):
-        - Spark should attempt basic remediation (clearing locks, killing zombie processes).
-        - If remediation fails, Spark triggers a **Host Isolation / Quarantine** state, notifying Catalyst to run the VM evacuation task.
-        - If Catalyst is unreachable (due to local database/network failure), the Spark daemon must execute **Self-Fencing**: immediately pausing/stopping all local VMs to protect them from disk write corruption.
-    2.  **Cluster-Level Fault Detection (Mipha-Initiated)**: If Mipha detects that a host's ping is active but its Spark API on port 9099 is unresponsive, reporting unresolvable storage failures, or reporting that critical services are in an active **crash loop**:
+    1.  **Software Fault Isolation & Local Self-Fencing (Watchdog-Initiated)**: If Spark's local watchdog thread detects that local database or storage services have failed, or are caught in a **restart/crash loop** (restarting repeatedly and failing again more than 5 times in 10 minutes, hitting systemd start-limit limits):
+        - Spark should attempt basic remediation (clearing locks, flushing sockets).
+        - If remediation fails, Spark triggers a **Host Isolation / Quarantine** state, notifying Catalyst to gracefully evacuate local VMs.
+        - If communication is lost (Catalyst or ZooKeeper unreachable), the Spark daemon must execute **Self-Fencing** by immediately pausing or force-stopping all local VMs. This acts as a critical safety gate: it ensures local VM instances are dead/suspended before the cluster attempts to spawn them elsewhere, preventing filesystem corruption from concurrent double-writes.
+    2.  **Cluster-Level Failover & Fencing (Mipha HA Coordinator)**: If Mipha detects that a host is unresponsive (or reporting critical crash loops):
         - Mipha transitions the host status to `DEGRADED` in ScyllaDB.
         - Vali stops scheduling new workloads to the host.
         - Catalyst queues a task to evacuate all VMs from the degraded host and decommissions the database node from the ring (if $N_{active} \ge 3$).
-        - If the host fails to cooperate within a timeout, Mipha triggers **Hard Fencing (STONITH)** to forcefully stop QEMU VMs on that host before starting them on surviving nodes, preventing duplicate execution.
-
+        - **Failover Boot Sequence**: Once Mipha confirms the degraded host is offline or fenced (either verified via Spark, or after executing an out-of-band IPMI STONITH power-off), Mipha coordinates with Vali and Catalyst to **safely spawn the VMs on healthy nodes**.
     3.  **Self-Fencing on Quorum Loss (Network Partition)**: If a host's local Spark daemon detects that it has lost connection to ZooKeeper consensus (or cannot contact ScyllaDB seeds) for more than 30 seconds:
         - The host must assume it is partitioned. To prevent split-brain writes on DRBD storage, it must automatically demote its local DRBD storage resources to `Secondary` and suspend all local running virtual machines.
+
 
 ---
 
