@@ -112,3 +112,45 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** DRS migrations run asynchronously. While a live migration is in progress (`virsh migrate --live ...`), there is no migration lock set in the database.
 *   **Impact:** If a DRS run initiates a migration and another scheduling task (e.g. manual VM move or Hylia node evacuation) executes concurrently, libvirt and QEMU will conflict, resulting in corrupted VM descriptors or duplicate running guest processes (split-brain execution).
 *   **Recommendation:** Implement a global `is_migrating` lock column in `hydra.vms` database table.
+
+---
+
+## 8. Runtime Service Watchdog / Auto-Restart Absence
+
+### A. Missing Service Watchdog
+*   **Location:** Host Systemd Services and Container Quadlets
+*   **The Issue:** While native systemd units define `Restart=always`, there is no cluster-wide or local node-level watchdog daemon to monitor the health of Spark, Vali, Catalyst, or containerized services (`zookeeper`, `hydra-db`, `aether`).
+*   **Impact:** If a daemon hangs, deadlocks, enters a `failed` state due to start-limit-burst, or becomes unresponsive without exiting its process, the systemd state remains "active" but the cluster service is dead. Nothing detects or restarts these silent failures, causing cluster operations to freeze.
+*   **Recommendation:** Implement a local watchdog daemon (or add functionality inside Spark/Genesis) that performs periodic HTTP health checks on local services and issues `systemctl restart` on failure.
+
+---
+
+## 9. Maintenance Mode Operational Bottlenecks
+
+### A. Database Freeze on 1-Node and 2-Node Clusters
+*   **Location:** `vali.py` (lines 1404–1414)
+*   **The Issue:** When a host enters maintenance mode, all local services—including the `hydra-db` (ScyllaDB) container—are shut down.
+*   **Impact:** 
+    *   **$N=2$:** When Node A enters maintenance, its ScyllaDB instance stops. The cluster has only 1 active database node left. Since consistency is hardcoded to `QUORUM`, any query submitted on the surviving Node B will immediately fail, freezing the entire cluster.
+    *   **$N=1$:** Entering maintenance stops the only database node, crashing the cluster entirely.
+*   **Recommendation:** Gating maintenance mode to require $N \ge 3$ active nodes, or dynamically altering the DB consistency level/replication factor during maintenance transitions.
+
+---
+
+## 10. Aether/Linstor Storage Auto-Heal Deficiencies
+
+### A. Lack of Active Storage Auto-Heal
+*   **Location:** `mipha.py` and `spectrum_server.py`
+*   **The Issue:** Aether has no automated recovery loops for physical disk errors, LVM thin pool exhaustion, or DRBD metadata corruption.
+*   **Impact:** If a drive fails or falls offline, or if a DRBD resource enters a degraded state, Aether does not attempt to reconstruct or migrate replica pools to surviving hosts. The storage remains degraded until manually resolved by an operator.
+*   **Recommendation:** Introduce a dedicated Storage Health Monitor to automatically trigger Linstor volume re-creation or replica moves when hardware faults are detected.
+
+---
+
+## 11. Missing Core Cluster Services
+
+### A. Backup & Disaster Recovery (DR) Manager
+*   **The Issue:** There is no service or utility to back up the cluster database (`hydra` keyspace) and Linstor configuration metadata to an external target.
+*   **Impact:** If ScyllaDB data corruption occurs or DRBD metadata is wiped across multiple nodes, the cluster cannot be restored, leading to complete VM data loss.
+*   **Recommendation:** Create a backup daemon that periodically snapshots the ScyllaDB database and copies it to a configured external NFS share or S3 target.
+
