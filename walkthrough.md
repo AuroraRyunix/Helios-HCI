@@ -33,6 +33,15 @@ We have successfully resolved every critical bug, performance bottleneck, and sp
 *   **Hylia Pre-Flight Storage Sync Checks (`hylia.py`)**:
     - [hylia.py](file:///C:/Users/AuraFlight/Desktop/container-hci/hylia.py) now queries and verifies the DRBD storage replication status of **all other nodes** in the cluster before triggering a rolling reboot. If any other host contains a degraded replica, Hylia aborts the reboot to prevent data availability loss.
 
+### 5. New Findings & Patches (Post-Audit Bug Hunt)
+*   **NameError Resolution in CLI (`valcli.py`)**:
+    - Resolved a `NameError` where `valcli.py` referenced `LOCAL_IP` inside the ZooKeeper leader check fallback block without defining it globally. Defined `LOCAL_IP` at the top of the file, loading it from environment configuration.
+*   **Consolidated Hardcoded IP Fallbacks (`bifrost.py`, `catalyst.py`, `dagur.py`, `mimir.py`, `spectrum_server.py`, `valcli.py`)**:
+    - Removed the hardcoded `10.10.102.x` IPs in `get_zookeeper_leader_ip` fallback blocks across 6 active scripts, replacing them with loopback (`127.0.0.1`) and `LOCAL_IP` arrays to guarantee compatibility in alternative subnets.
+*   **HTTP Query Proxy Bypass fixes (`logos.py`, `spark_daemon_decoded.py`)**:
+    - In `logos.py`, wrapped multiple metric `INSERT` statements in `BEGIN BATCH ... APPLY BATCH;` blocks. Previously, sending raw multi-line inserts caused Daruk to raise a syntax error, forcing a slow 2-second CLI execution fallback.
+    - In `spark_daemon_decoded.py`, refactored multiple `SELECT` queries to run individually inside a loop. This enables them to use the 2ms HTTP proxy path directly rather than triggering the slow container-level CLI execution.
+
 ---
 
 ## Verification & Compilation
