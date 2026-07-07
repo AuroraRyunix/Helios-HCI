@@ -190,4 +190,35 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
     3.  **Self-Fencing on Quorum Loss (Network Partition)**: If a host's local Spark daemon detects that it has lost connection to ZooKeeper consensus (or cannot contact ScyllaDB seeds) for more than 30 seconds:
         - The host must assume it is partitioned. To prevent split-brain writes on DRBD storage, it must automatically demote its local DRBD storage resources to `Secondary` and suspend all local running virtual machines.
 
+---
+
+## 13. Proposed Mimir/Mcli Diagnostic Health Checks
+
+To proactively detect and surface the architectural gaps identified in this audit, Mimir's health checking system (`mcli-runner` / `mcli`) should be extended with the following diagnostic checks:
+
+### A. Core services checks (Category: `services`)
+1.  **ZooKeeper Ensemble Scale Check (`zookeeper_ring_scale`)**:
+    *   **Logic**: Query the ZooKeeper server list configuration. If the number of voting nodes exceeds 5 or 7, trigger a warning recommending that secondary nodes be configured as ZK Observers.
+2.  **ScyllaDB 2-Node Quorum Check (`scylladb_quorum_safety`)**:
+    *   **Logic**: Query host counts and keyspace replication factor. If the cluster has exactly 2 nodes and SimpleStrategy replication is RF=2, verify database consistency level. If `QUORUM` is enforced, flag a critical warning indicating zero tolerance for node failure.
+3.  **mTLS Certificate Expiration Alert (`mtls_cert_expiry_warning`)**:
+    *   **Logic**: Parse CA, node, and client certificates (`/etc/hci/spark/certs/node.crt`) and compute the remaining lifetime. Flag a warning if the remaining lifetime is less than 30 days.
+4.  **Fencing SSH Keys & Out-of-Band Setup Check (`fencing_access_check`)**:
+    *   **Logic**: Verify that the dedicated fencing SSH key pair (`id_rsa_fencing`) exists on the host, that `/root/.ssh/authorized_keys` restricts execution to `/usr/local/bin/fence_node`, and that registered IPMI IP addresses are pingable.
+5.  **Service Watchdog Active Check (`watchdog_daemon_status`)**:
+    *   **Logic**: Query the status of Spark's background watchdog thread. Flag a failure if the watchdog loop has crashed or is not executing health probes.
+
+### B. Storage engine checks (Category: `storage`)
+1.  **DRBD Split-Brain Dual-Primary Check (`drbd_split_brain_check`)**:
+    *   **Logic**: Parse `drbdsetup status --json`. If any replication volumes are in `StandAlone` state while their roles are both `Primary`, trigger a critical failure alarm.
+2.  **Linstor Controller Query Latency Check (`linstor_latency_check`)**:
+    *   **Logic**: Execute a lightweight Linstor CLI query (e.g., `linstor node list`) and measure the execution time. If it exceeds 5 seconds, flag a latency warning indicating a possible database blocking hang or offline node.
+
+### C. Scheduler & DRS checks (Category: `drs`)
+1.  **DRS Storage Capacity Gate Check (`drs_storage_capacity_check`)**:
+    *   **Logic**: Verify that Vali's DRS balancer checks Linstor thin pool storage capacity before initiating migrations, alerting if DRS is running without storage capacity validation.
+2.  **Concurrent Migration Lock Auditor (`migration_lock_status`)**:
+    *   **Logic**: Audit the ScyllaDB active VM tables to ensure that no live migrations are running concurrently without corresponding locks, flagging collisions.
+
+
 
