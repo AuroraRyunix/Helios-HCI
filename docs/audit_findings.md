@@ -157,9 +157,19 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** When a host enters maintenance, its ScyllaDB database container (`hydra-db`) is simply stopped. The remaining database nodes continue to treat it as an active member of the token ring, accumulating hinted handoffs (mutations) locally. If the maintenance is long-running (exceeding ScyllaDB's maximum hint window, typically 3 hours), the node becomes heavily out of sync, requiring a manual `nodetool repair` on recovery to prevent data consistency gaps.
 *   **Impact:** Stopping a node without decommissioning degrades query availability. For larger clusters (e.g. $N \ge 4$), the cluster remains vulnerable to subsequent node failures while a node is down.
 *   **Recommendation (ScyllaDB Ring Decommission/Rejoin via Catalyst Tasks):**
-    During host maintenance/upgrade cycles, rather than simply killing the database container, Catalyst should run a structured database migration task:
-    1.  **Clean Decommission on Enter**: When a host transitions to `IN_MAINTENANCE`, Catalyst runs a task executing `nodetool decommission` on the target host. This cleanly redistributes its token ranges to the surviving nodes, preserving full quorum capabilities and database reliability without storing hints.
-    2.  **Auto-Join on Leave**: When the host leaves maintenance, Catalyst triggers a task starting the container in join mode. The database automatically bootstraps, streams its assigned token ranges from peers, and transitions to `NORMAL` status once synchronization is complete.
+    During host maintenance, upgrade, or failure-induced quarantine events, Catalyst should coordinate ring membership modifications under specific constraints:
+    1.  **Fast Rolling Upgrade vs. Long-Term Maintenance**:
+        - **Short-Term reboots (e.g. Hylia software updates < 3 hours)**: The node should **not** be decommissioned. Decommissioning streams gigabytes of data partitions across the network, generating heavy load. For quick rolling updates, let the node go offline, reboot, and catch up using ScyllaDB's built-in **hinted handoff** mechanism.
+        - **Long-Term maintenance or Hardware repairs**: Execute a full decommission to maintain cluster resilience.
+    2.  **Auto-Quarantine Trigger (Mipha Integration)**:
+        - If Mipha detects host software or hardware faults (Node Quarantine), it must automatically trigger the `host_maintenance_enter` Catalyst task, which handles VM evacuations and initiates the database decommissioning sequence to isolate the faulty node cleanly.
+    3.  **Single-Node ($N=1$) and Two-Node ($N=2$) Exclusions**:
+        - Decommissioning is mathematically impossible on a 1-node cluster (ScyllaDB requires at least one surviving node).
+        - Decommissioning a node in a 2-node cluster drops the active node count to 1. Since keyspace replication is RF=2, the surviving node will fail `QUORUM` checks.
+        - Therefore, the decommission task must be **bypassed** unless the active node count *before* entering maintenance is **at least 3** ($N_{active} \ge 3$).
+    4.  **Auto-Join on Reconnection**:
+        - When the host leaves maintenance or resolves its fault, Catalyst starts the ScyllaDB container in join mode, allowing it to bootstrap, stream its assigned tokens, and transition back to `NORMAL`.
+
 
 
 ---
