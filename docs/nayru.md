@@ -113,3 +113,9 @@ Before initiating a Nayru deployment, the Spectrum API executes a series of rigo
    * *Requirement:* Control VMs require **2 vCPUs** and **4 GB RAM** minimum each.
 4. **Urbosa SDN Status:**
    * Verify that the selected overlay segment is active and has a designated Tier-1 distributed router gateway configured.
+
+---
+
+## Technical Reference
+* For details on internal state mapping tables, network bridging topologies, and anti-affinity scheduling configurations, refer to the [Nayru Technical Guide](file:///C:/Users/AuraFlight/Desktop/container-hci/docs/nayru_technical.md).
+
