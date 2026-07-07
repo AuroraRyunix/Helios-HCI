@@ -121,7 +121,13 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **Location:** Host Systemd Services and Container Quadlets
 *   **The Issue:** While native systemd units define `Restart=always`, there is no cluster-wide or local node-level watchdog daemon to monitor the health of Spark, Vali, Catalyst, or containerized services (`zookeeper`, `hydra-db`, `aether`).
 *   **Impact:** If a daemon hangs, deadlocks, enters a `failed` state due to start-limit-burst, or becomes unresponsive without exiting its process, the systemd state remains "active" but the cluster service is dead. Nothing detects or restarts these silent failures, causing cluster operations to freeze.
-*   **Recommendation:** Implement a local watchdog daemon (or add functionality inside Spark/Genesis) that performs periodic HTTP health checks on local services and issues `systemctl restart` on failure.
+*   **Recommendation (Spark as "Genesis" Orchestrator):**
+    1. **Disable Service Autostart in Systemd**: All native Python and containerized services (except `spark-daemon` and `zookeeper`) should be configured as **disabled** in systemd by default (`systemctl disable`). Systemd should *never* start them directly on boot.
+    2. **Orchestrate Startups via Spark**: The `spark-daemon` (acting as the True Genesis equivalent) should own the cluster startup loop. When booting, Spark polls ZooKeeper consensus:
+       - If ZooKeeper is standalone or the local node is elected leader, Spark starts the core database (`hydra-db`), local storage (`aether`), and leader-specific management daemons (`catalyst`, `vali`, `mipha`, `bifrost`).
+       - If the local node is a follower, Spark only starts the database, storage, metrics collector (`logos`), and standby daemons, keeping management daemons stopped.
+    3. **Background Watchdog Loops**: Spark should spawn a background watchdog thread running periodic HTTP health and responsiveness checks on local services (e.g. GET `/api/status` on Spectrum, `/api/v1/hosts` on Vali, TCP port probes, and `podman ps` checks). If a service becomes unresponsive or enters a degraded state, Spark performs remediation (e.g., stops/starts the unit, clears transient lockfiles, or alerts the cluster Catalyst coordinator).
+
 
 ---
 
