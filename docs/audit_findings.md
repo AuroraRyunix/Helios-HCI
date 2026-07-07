@@ -49,7 +49,11 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **Location:** `mipha.py` (lines 504–516)
 *   **The Issue:** The SSH fencing helper function (`ssh_fence_host`) does not use actual SSH. Instead, it relies entirely on Spark Daemon's port 9099 mTLS execution API to stop libvirt and kill QEMU guest processes.
 *   **Impact:** If a node's software crashes (e.g. `spark-daemon` hangs, database freezes, or network partition occurs), Spark will be unresponsive on port 9099. Because passwordless root SSH keys are deleted from `/root/.ssh/` post-installation for security hardening, the coordinator has no alternative pathway (like passwordless SSH or IPMI power controls) to execute the fence. The fence fails, causing Vali to restart VMs on surviving hosts while they are still running on the unresponsive host. This dual-Primary execution will instantly corrupt VM virtual disks.
-*   **Recommendation:** Keep a restricted passwordless SSH key pair exclusively for the HA/fencing daemons, or implement IPMI/PDU (STONITH) fencing commands to hard power-off target nodes when software-based fencing fails.
+*   **Recommendation (Fencing Keys in Cluster Bootstrap):** 
+    During the `cluster create` bootstrap sequence (managed by `cluster_new.py`), instead of completely deleting all inter-node passwordless SSH keys, the system should generate and distribute a dedicated, restricted SSH key pair (e.g. `/root/.ssh/id_rsa_fencing`) for the HA/fencing daemons:
+    1.  **Restrict Authorized Keys Options**: Configure `/root/.ssh/authorized_keys` on each node to restrict the key's execution privileges (e.g., using `command="/usr/local/bin/fence_node"` and restricting the source IP to cluster nodes only). This prevents the key from being used for arbitrary root command execution while preserving passwordless access for host fencing.
+    2.  **IPMI/PDU Out-of-Band Fallback**: Implement out-of-band STONITH commands in `cluster create` (registering IPMI credentials in ScyllaDB) so that if the network-level SSH fence fails, the coordinator can directly power-cycle the server hardware.
+
 
 
 ---
