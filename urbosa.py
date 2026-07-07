@@ -363,7 +363,8 @@ def main():
                 rc_vx, _, _ = run_cmd(f"ip link show {vx_name}")
                 if rc_vx != 0:
                     print(f"Creating VXLAN tunnel interface {vx_name} (VNI {s['vni']})...")
-                    run_cmd(f"ip link add {vx_name} type vxlan id {s['vni']} dstport 4789 dev eth0 2>/dev/null || ip link add {vx_name} type vxlan id {s['vni']} dstport 4789")
+                    phys_if = get_uplink_interface("eth0")
+                    run_cmd(f"ip link add {vx_name} type vxlan id {s['vni']} dstport 4789 dev {phys_if} 2>/dev/null || ip link add {vx_name} type vxlan id {s['vni']} dstport 4789")
                     run_cmd(f"ip link set {vx_name} master {br_name} 2>/dev/null")
                     run_cmd(f"ip link set {vx_name} up")
                 

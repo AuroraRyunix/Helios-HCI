@@ -66,14 +66,28 @@ def run_cql_query(cql_query, *args, **kwargs):
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 def get_default_interface():
-    rc, stdout, _ = run_cmd("ip route show | grep default")
+    rc, stdout, _ = run_cmd("ip route show")
     if rc == 0 and stdout:
-        parts = stdout.split()
-        try:
-            dev_idx = parts.index("dev")
-            return parts[dev_idx + 1]
-        except ValueError:
-            pass
+        best_iface = None
+        lowest_metric = 999999
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("default"):
+                parts = line.split()
+                try:
+                    dev_idx = parts.index("dev")
+                    iface = parts[dev_idx + 1]
+                    metric = 0
+                    if "metric" in parts:
+                        metric_idx = parts.index("metric")
+                        metric = int(parts[metric_idx + 1])
+                    if metric < lowest_metric:
+                        lowest_metric = metric
+                        best_iface = iface
+                except (ValueError, IndexError):
+                    pass
+        if best_iface:
+            return best_iface
     return "ens192"
 
 def get_db_networks():

@@ -15,10 +15,11 @@ def get_local_net_info(hosts):
                 for addr in iface.get("addr_info", []):
                     local_ip = addr.get("local")
                     if local_ip in hosts:
-                        return iface["ifname"], local_ip
+                        prefixlen = addr.get("prefixlen", 24)
+                        return iface["ifname"], local_ip, prefixlen
     except Exception as e:
         sys.stderr.write(f"Error getting network info: {e}\n")
-    return "ens192", None
+    return "ens192", None, 24
 
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
@@ -59,6 +60,11 @@ def get_zookeeper_leader_ip():
             
     if leader_active:
         return leader_ip
+        
+    if not leader_ip and len(ips) > 1:
+        sys.stdout.write("ZooKeeper consensus lost or unreachable in multi-node cluster. Refusing split-brain candidate fallback.\n")
+        sys.stdout.flush()
+        return None
         
     # If leader is inactive, find active candidates with port 8443 open
     candidates = []
@@ -113,6 +119,7 @@ import signal
 running = True
 current_vip = None
 current_iface = None
+current_prefixlen = 24
 
 def signal_handler(signum, frame):
     global running
@@ -127,7 +134,7 @@ def signal_handler(signum, frame):
             if res.returncode == 0 and current_vip in res.stdout.decode('utf-8'):
                 sys.stdout.write(f"Releasing VIP {current_vip} from {current_iface} on shutdown...\n")
                 sys.stdout.flush()
-                cmd_del = f"ip addr del {current_vip}/24 dev {current_iface} label {current_iface}:vip"
+                cmd_del = f"ip addr del {current_vip}/{current_prefixlen} dev {current_iface} label {current_iface}:vip"
                 subprocess.run(cmd_del, shell=True)
         except Exception as e:
             sys.stderr.write(f"Error releasing VIP on signal: {e}\n")
@@ -169,7 +176,7 @@ def main():
                 time.sleep(2)
                 continue
             
-            iface, local_ip = get_local_net_info(hosts)
+            iface, local_ip, prefixlen = get_local_net_info(hosts)
             if not local_ip:
                 # Local IP not in cluster.json, wait
                 time.sleep(2)
@@ -178,6 +185,7 @@ def main():
             # Update global trackers for signal handler
             current_vip = vip
             current_iface = iface
+            current_prefixlen = prefixlen
             
             # 2. Check ZK leadership
             leader = is_zookeeper_leader(local_ip)
@@ -186,7 +194,7 @@ def main():
             if leader and is_local_spectrum_listening():
                 if not bound:
                     print(f"I am the ZooKeeper leader and Spectrum is active. Binding VIP {vip} to {iface}...")
-                    cmd_add = f"ip addr add {vip}/24 dev {iface} label {iface}:vip"
+                    cmd_add = f"ip addr add {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_add, shell=True)
                     # Broadcast Gratuitous ARP
                     print(f"Broadcasting GARP for VIP {vip} on {iface}...")
@@ -195,7 +203,7 @@ def main():
             else:
                 if bound:
                     print(f"Releasing VIP {vip} from {iface} (not leader or local Spectrum is inactive)...")
-                    cmd_del = f"ip addr del {vip}/24 dev {iface} label {iface}:vip"
+                    cmd_del = f"ip addr del {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_del, shell=True)
                     
         except Exception as e:

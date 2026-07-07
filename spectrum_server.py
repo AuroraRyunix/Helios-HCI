@@ -3673,6 +3673,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 try:
                     vnc_sock.connect((host_ip, vnc_port))
                     print(f"[WS Proxy] Connected successfully to target {host_ip}:{vnc_port}")
+                    try:
+                        vnc_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    except Exception as opt_err:
+                        print(f"[WS Proxy] Warning setting TCP_NODELAY: {opt_err}")
                 except Exception as e:
                     print(f"[WS Proxy] Connection failed to target {host_ip}:{vnc_port}: {str(e)}")
                     self.connection.close()

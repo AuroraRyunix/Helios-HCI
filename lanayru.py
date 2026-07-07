@@ -6,6 +6,8 @@ import datetime
 import urllib.parse
 import urllib.request
 import socket
+import hashlib
+import base64
 
 def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_id, created_at):
     from spectrum_server import (
@@ -14,6 +16,7 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         run_linstor_cmd,
         log_catalyst_task,
         get_cluster_nodes,
+        get_catalyst_target_ip,
         LOCAL_IP,
         LANAYRU_LOGS
     )
@@ -57,12 +60,10 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         log("ScyllaDB tables hydra.lanayru_clusters & hydra.lanayru_k8s_state are verified.", "success")
 
         # Network setup if Urbosa selected
-        seg1_id = "22222222-2222-2222-2222-222222222222"
-        seg2_id = "33333333-3333-3333-3333-333333333333"
+        seg1_id = str(uuid.uuid4())
+        seg2_id = str(uuid.uuid4())
         if overlay_segment_id.startswith("ov-"):
             log("Urbosa Overlay mode selected. Checking default routing elements...", "info")
-            seg1_id = "22222222-2222-2222-2222-222222222222"
-            seg2_id = "33333333-3333-3333-3333-333333333333"
 
             # Look up the first existing T0 — do NOT auto-generate one with hardcoded IPs.
             t0_id = None
@@ -100,18 +101,14 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             log(f"Using T0 router {t0_id} and T1 router {t1_id} for Lanayru overlay.", "success")
 
             # Check and create Segment 1 (172.16.10.0/24)
-            rc_s1, out_s1, _ = run_cql_query(f"SELECT segment_id FROM hydra.urbosa_segments WHERE segment_id = {seg1_id};")
-            if rc_s1 != 0 or not out_s1 or seg1_id not in out_s1:
-                log("Auto-generating Urbosa Segment 1 (172.16.10.0/24, VNI 10010)...", "info")
-                run_cql_query(f"INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end) VALUES ({seg1_id}, 'lanayru-segment-1', 10010, {t1_id}, '172.16.10.0/24', '172.16.10.254', true, '172.16.10.10', '172.16.10.100');")
-                time.sleep(0.5)
+            log(f"Auto-generating Urbosa Segment 1 ({cluster_name}-segment-1, VNI 10010)...", "info")
+            run_cql_query(f"INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end) VALUES ({seg1_id}, '{cluster_name}-segment-1', 10010, {t1_id}, '172.16.10.0/24', '172.16.10.254', true, '172.16.10.10', '172.16.10.100');")
+            time.sleep(0.5)
 
             # Check and create Segment 2 (172.16.11.0/24)
-            rc_s2, out_s2, _ = run_cql_query(f"SELECT segment_id FROM hydra.urbosa_segments WHERE segment_id = {seg2_id};")
-            if rc_s2 != 0 or not out_s2 or seg2_id not in out_s2:
-                log("Auto-generating Urbosa Segment 2 (172.16.11.0/24, VNI 10011)...", "info")
-                run_cql_query(f"INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end) VALUES ({seg2_id}, 'lanayru-segment-2', 10011, {t1_id}, '172.16.11.0/24', '172.16.11.254', true, '172.16.11.10', '172.16.11.100');")
-                time.sleep(0.5)
+            log(f"Auto-generating Urbosa Segment 2 ({cluster_name}-segment-2, VNI 10011)...", "info")
+            run_cql_query(f"INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end) VALUES ({seg2_id}, '{cluster_name}-segment-2', 10011, {t1_id}, '172.16.11.0/24', '172.16.11.254', true, '172.16.11.10', '172.16.11.100');")
+            time.sleep(0.5)
 
             # Setup Host Bridge Routing IP addresses on all cluster hosts
             log("Configuring host gateway virtual bridges (br-ov-10010 & br-ov-10011)...", "info")
@@ -155,11 +152,11 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             assigned_ip = f"172.16.10.{10 + i}" if seg_num == 1 else f"172.16.11.{10 + i}"
             vm_ips.append((vm_name, assigned_ip))
 
-            # 1. Create Linstor storage volumes
+            # 1. Create Linstor storage volumes (Allocating 50 GiB thin storage per Tanzu/LKE specifications)
             res_name = f"{vm_name}-disk0"
-            log(f"Creating Linstor storage resource definition '{res_name}'...", "info")
+            log(f"Creating Linstor storage resource definition '{res_name}' (50 GiB)...", "info")
             run_linstor_cmd(f"resource-definition create {res_name}")
-            run_linstor_cmd(f"volume-definition create {res_name} 5GiB")
+            run_linstor_cmd(f"volume-definition create {res_name} 50GiB")
             
             # Autoplace volume on target nodes
             target_host = hosts[i % len(hosts)]["ip"]
@@ -167,18 +164,80 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             run_linstor_cmd(f"resource create {res_name} --auto-place 3")
             time.sleep(0.5)
 
-            # 2. Write virtual VM XML config on target host
+            # Copy guest OS image to Linstor block device
             disk_path = f"/dev/drbd/by-res/{res_name}/0"
-            mac_addr = f"52:54:00:a1:b1:0{i+1}"
+            log(f"Copying OS template image to Linstor block device for VM '{vm_name}'...", "info")
+            run_remote_spark(target_host, f"drbdadm primary {res_name} || true")
+            run_remote_spark(target_host, f"qemu-img convert -O raw /var/lib/hci/aether/images/cirros.img {disk_path} || dd if=/var/lib/hci/aether/images/cirros.img of={disk_path} bs=4M conv=sparse || true")
+            run_remote_spark(target_host, f"drbdadm secondary {res_name} || true")
+
+            # Generate cloud-init configuration ISO dynamically on host
+            log(f"Generating cloud-init metadata ISO for VM '{vm_name}'...", "info")
+            ci_dir = f"/var/lib/hci/aether/cloudinit/{vm_name}"
+            run_remote_spark(target_host, f"mkdir -p {ci_dir}")
+            
+            user_data = f"""#cloud-config
+hostname: {vm_name}
+fqdn: {vm_name}.local
+manage_etc_hosts: true
+ssh_pwauth: true
+users:
+  - name: root
+    plain_text_pass: 'ArtPanCooking249!'
+    lock_passwd: false
+chpasswd:
+  list: |
+    root:ArtPanCooking249!
+  expire: False
+write_files:
+  - path: /etc/netplan/50-cloud-init.yaml
+    content: |
+      network:
+        version: 2
+        ethernets:
+          eth0:
+            addresses:
+              - {assigned_ip}/24
+            gateway4: 172.16.10.254
+            nameservers:
+              addresses: [8.8.8.8, 1.1.1.1]
+runcmd:
+  - netplan apply || systemctl restart systemd-networkd || true
+  - echo "Lanayru node bootstrap active"
+"""
+            meta_data = f"instance-id: {vm_name}\nlocal-hostname: {vm_name}\n"
+            b64_ud = base64.b64encode(user_data.encode()).decode()
+            b64_md = base64.b64encode(meta_data.encode()).decode()
+            
+            run_remote_spark(target_host, f"echo {b64_ud} | base64 -d > {ci_dir}/user-data")
+            run_remote_spark(target_host, f"echo {b64_md} | base64 -d > {ci_dir}/meta-data")
+            
+            iso_path = f"/var/lib/hci/aether/images/{vm_name}-cidata.iso"
+            run_remote_spark(target_host, f"genisoimage -output {iso_path} -volid cidata -joliet -rock {ci_dir}/user-data {ci_dir}/meta-data || mkisofs -output {iso_path} -volid cidata -joliet -rock {ci_dir}/user-data {ci_dir}/meta-data")
+
+            # 2. Write virtual VM XML config on target host (with Cloud-Init CD-ROM and unique MACs)
+            h_mac = hashlib.md5(vm_name.encode()).hexdigest()
+            mac_addr = f"52:54:00:{h_mac[0:2]}:{h_mac[2:4]}:{h_mac[4:6]}"
             vnc_port = 5910 + i
             
+            # Detect OVMF firmware path dynamically on host OS target
+            ovmf_code = "/usr/share/OVMF/OVMF_CODE.fd"
+            ovmf_vars = "/usr/share/OVMF/OVMF_VARS.fd"
+            _, test_ovmf, _ = run_remote_spark(target_host, "ls /usr/share/OVMF/OVMF_CODE.fd || ls /usr/share/qemu/OVMF.fd || echo 'none'")
+            if "none" in test_ovmf:
+                # Default to fallback paths
+                pass
+            elif "qemu/OVMF.fd" in test_ovmf:
+                ovmf_code = "/usr/share/qemu/OVMF.fd"
+                ovmf_vars = "/usr/share/qemu/OVMF.fd"
+
             xml_def = f"""<domain type='kvm'>
   <name>{vm_name}</name>
   <memory unit='KiB'>4194304</memory>
   <vcpu placement='static'>2</vcpu>
   <os>
     <type arch='x86_64' machine='q35'>hvm</type>
-    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>
+    <loader readonly='yes' type='pflash'>{ovmf_code}</loader>
     <nvram>/var/lib/hci/aether/nvram/{vm_name}_vars.fd</nvram>
     <boot dev='hd'/>
   </os>
@@ -194,6 +253,12 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
       <driver name='qemu' type='raw' cache='none' discard='unmap'/>
       <source dev='{disk_path}'/>
       <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{iso_path}'/>
+      <target dev='vdb' bus='virtio'/>
+      <readonly/>
     </disk>
     <interface type='bridge'>
       <mac address='{mac_addr}'/>
@@ -212,18 +277,17 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             # Write NVRAM vars file
             log(f"Writing UEFI NVRAM vars file for VM '{vm_name}'...", "info")
             nvram_file_path = f"/var/lib/hci/aether/nvram/{vm_name}_vars.fd"
-            run_remote_spark(target_host, f"mkdir -p /var/lib/hci/aether/nvram/ && cp /usr/share/OVMF/OVMF_VARS.fd {nvram_file_path}")
+            run_remote_spark(target_host, f"mkdir -p /var/lib/hci/aether/nvram/ && cp {ovmf_vars} {nvram_file_path} || cp /usr/share/OVMF/OVMF_VARS.fd {nvram_file_path} || true")
             
             # Set up metadata record in ScyllaDB
             cql_vm = f"""
             INSERT INTO hydra.vms (name, uuid, vcpus, ram, status, host_ip, guest_ip, disks_list, network_name, created_at)
-            VALUES ('{vm_name}', {str(uuid.uuid4())}, 2, 4096, 'stopped', '{target_host}', '{assigned_ip}', '{res_name}', 'lanayru-segment-{seg_num}', toTimestamp(now()));
+            VALUES ('{vm_name}', {str(uuid.uuid4())}, 2, 4096, 'stopped', '{target_host}', '{assigned_ip}', '{res_name}', '{cluster_name}-segment-{seg_num}', toTimestamp(now()));
             """
             run_cql_query(cql_vm)
             
             # Define and start VM inside target hypervisor
             log(f"Registering XML definition in libvirt and starting guest VM '{vm_name}' on {target_host}...", "info")
-            import base64
             b64_xml = base64.b64encode(xml_def.encode('utf-8')).decode('utf-8')
             run_remote_spark(target_host, f"echo {b64_xml} | base64 -d > /tmp/{vm_name}.xml")
             run_remote_spark(target_host, f"virsh -c qemu:///system define /tmp/{vm_name}.xml")
@@ -234,20 +298,10 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         log("Step 4: Waiting for guest network leases and DHCP initialization...", "info")
         time.sleep(2)
         
-        # Trigger DHCP lease sync on Urbosa leader
-        leader_ip = LOCAL_IP
-        vip = None
-        try:
-            import os
-            if os.path.exists("/etc/hci/cluster.json"):
-                with open("/etc/hci/cluster.json", "r") as f:
-                    vip = json.load(f).get("vip")
-        except Exception:
-            pass
-        if vip:
-            rc_v, out_v, _ = run_cql_query(f"SELECT host_ip FROM hydra.console_sessions WHERE console_token = '{vip}' ALLOW FILTERING;")
-            if rc_v == 0 and out_v:
-                leader_ip = out_v.splitlines()[1].strip() if len(out_v.splitlines()) > 1 else LOCAL_IP
+        # Trigger DHCP lease sync on Urbosa leader resolved dynamically via get_catalyst_target_ip
+        leader_ip = get_catalyst_target_ip()
+        if not leader_ip:
+            leader_ip = LOCAL_IP
 
         if leader_ip:
             try:
@@ -297,6 +351,7 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
         run_remote_spark,
         run_linstor_cmd,
         log_catalyst_task,
+        get_cluster_nodes,
         LOCAL_IP,
         LANAYRU_LOGS
     )
@@ -328,6 +383,10 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
                     except Exception:
                         pass
                         
+        hosts = get_cluster_nodes()
+        if not hosts:
+            hosts = [{"ip": LOCAL_IP, "hostname": "localhost"}]
+
         for vm_info in vms_to_delete:
             vm_name = vm_info["name"]
             host_ip = vm_info.get("host_ip", "")
@@ -338,15 +397,6 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
                 run_remote_spark(host_ip, f"virsh -c qemu:///system destroy {vm_name} || true")
                 run_remote_spark(host_ip, f"virsh -c qemu:///system undefine {vm_name} --keep-nvram || true")
                 
-            # Delete Linstor resources
-            num_disks = len(disks_list.split(",")) if disks_list else 1
-            for idx in range(num_disks):
-                res_name = f"{vm_name}-disk{idx}"
-                run_remote_spark(LOCAL_IP, f"drbdadm secondary {res_name} || true")
-                if host_ip:
-                    run_remote_spark(host_ip, f"drbdadm secondary {res_name} || true")
-                run_linstor_cmd(f"resource-definition delete {res_name}")
-                
             # Delete UEFI nvram vars file
             nvram_file_path = f"/var/lib/hci/aether/nvram/{vm_name}_vars.fd"
             if host_ip:
@@ -355,16 +405,50 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
                 run_remote_spark(LOCAL_IP, f"rm -f {nvram_file_path}")
             run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{vm_name}';")
             
+            # Clean up cloud-init files on target host
+            ci_dir = f"/var/lib/hci/aether/cloudinit/{vm_name}"
+            iso_path = f"/var/lib/hci/aether/images/{vm_name}-cidata.iso"
+            if host_ip:
+                run_remote_spark(host_ip, f"rm -rf {ci_dir} {iso_path}")
+            else:
+                run_remote_spark(LOCAL_IP, f"rm -rf {ci_dir} {iso_path}")
+
+            # Delete Linstor resources (clean order: node instances first, then resource-definition)
+            num_disks = len(disks_list.split(",")) if disks_list else 1
+            for idx in range(num_disks):
+                res_name = f"{vm_name}-disk{idx}"
+                run_remote_spark(LOCAL_IP, f"drbdadm secondary {res_name} || true")
+                if host_ip:
+                    run_remote_spark(host_ip, f"drbdadm secondary {res_name} || true")
+                
+                # Delete Linstor instances on all nodes
+                for h in hosts:
+                    node_name = h.get("hostname", "")
+                    if node_name:
+                        run_linstor_cmd(f"resource delete {node_name} {res_name}")
+                
+                # Delete resource definition
+                run_linstor_cmd(f"resource-definition delete {res_name}")
+            
             # Remove metadata record from ScyllaDB
             run_cql_query(f"DELETE FROM hydra.vms WHERE name = '{vm_name}';")
             time.sleep(0.5)
 
-        # Delete overlay segments if we auto-created them
-        seg1_id = "22222222-2222-2222-2222-222222222222"
-        seg2_id = "33333333-3333-3333-3333-333333333333"
+        # Delete overlay segments dynamically by pattern matching segment names in database
         log("Removing Lanayru-allocated Urbosa overlay segments...")
-        run_cql_query(f"DELETE FROM hydra.urbosa_segments WHERE segment_id = {seg1_id};")
-        run_cql_query(f"DELETE FROM hydra.urbosa_segments WHERE segment_id = {seg2_id};")
+        rc_seg, out_seg, _ = run_cql_query("SELECT JSON segment_id, name FROM hydra.urbosa_segments;")
+        if rc_seg == 0 and out_seg:
+            for line in out_seg.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        seg_info = json.loads(line)
+                        seg_name = seg_info.get("name", "")
+                        if seg_name.startswith(f"{cluster_name}-segment-"):
+                            seg_uuid = seg_info.get("segment_id")
+                            run_cql_query(f"DELETE FROM hydra.urbosa_segments WHERE segment_id = {seg_uuid};")
+                    except Exception:
+                        pass
 
         # Fetch cluster_id and delete registry entries
         rc_id, stdout_id, _ = run_cql_query(f"SELECT cluster_id FROM hydra.lanayru_clusters WHERE name = '{cluster_name}' ALLOW FILTERING;")

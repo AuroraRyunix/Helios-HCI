@@ -384,7 +384,7 @@ def get_zookeeper_leader_ip(hosts=None):
     if not hosts:
         hosts = get_cluster_hosts()
     if not hosts:
-        ips = ["10.10.102.220", "10.10.102.222", "10.10.102.223"]
+        ips = [LOCAL_IP]
     else:
         ips = [h.get("ip") for h in hosts if h.get("ip")]
         

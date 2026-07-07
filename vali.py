@@ -204,7 +204,7 @@ def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
     hosts = get_cluster_hosts()
     if not hosts:
-        ips = ["10.10.102.220", "10.10.102.222", "10.10.102.223"]
+        ips = [LOCAL_IP]
     else:
         ips = [h.get("ip") for h in hosts if h.get("ip")]
         
