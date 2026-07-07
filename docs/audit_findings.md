@@ -45,6 +45,13 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **Impact:** Both sides of a partitioned cluster will see their own Spectrum portal as active. If the partition splits the hosts, both nodes could bind the VIP locally, causing MAC address conflicts and routing issues.
 *   **Recommendation:** If ZooKeeper consensus is lost, Bifrost should immediately release the VIP and log a consensus warning rather than falling back to IP sorting.
 
+### C. Chicken-and-Egg Fencing Failure (Spark-Only Fallback)
+*   **Location:** `mipha.py` (lines 504–516)
+*   **The Issue:** The SSH fencing helper function (`ssh_fence_host`) does not use actual SSH. Instead, it relies entirely on Spark Daemon's port 9099 mTLS execution API to stop libvirt and kill QEMU guest processes.
+*   **Impact:** If a node's software crashes (e.g. `spark-daemon` hangs, database freezes, or network partition occurs), Spark will be unresponsive on port 9099. Because passwordless root SSH keys are deleted from `/root/.ssh/` post-installation for security hardening, the coordinator has no alternative pathway (like passwordless SSH or IPMI power controls) to execute the fence. The fence fails, causing Vali to restart VMs on surviving hosts while they are still running on the unresponsive host. This dual-Primary execution will instantly corrupt VM virtual disks.
+*   **Recommendation:** Keep a restricted passwordless SSH key pair exclusively for the HA/fencing daemons, or implement IPMI/PDU (STONITH) fencing commands to hard power-off target nodes when software-based fencing fails.
+
+
 ---
 
 ## 3. Upgrade Safety Gaps
