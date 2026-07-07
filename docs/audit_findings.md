@@ -28,6 +28,19 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **Impact:** If the cluster runs on a different subnet, has 1 node, or has 40 nodes, the fallback causes connection timeouts or queries invalid nodes.
 *   **Recommendation:** Replace hardcoded fallbacks with localhost queries or raise a clear configuration error if `cluster.json` cannot be loaded.
 
+### D. Hardcoded Subnet Masks for Virtual IP (VIP)
+*   **Location:** `bifrost.py` (lines 130, 189, 198)
+*   **The Issue:** Bifrost hardcodes `/24` subnet masks when adding or deleting the virtual IP (VIP) to physical network interfaces (`ip addr add {vip}/24 ...`).
+*   **Impact:** If the cluster network uses a different size (e.g. `/22` or `/16`), binding the VIP with `/24` will break routing to other hosts outside the `/24` range or cause IP subnet overlaps.
+*   **Recommendation:** Dynamically fetch the subnet mask of the host interface or read the netmask configuration from `/etc/hci/cluster.json` and apply it to the VIP binding command.
+
+### E. Fragile Default Interface Parsing
+*   **Location:** `gatoway.py` (lines 68–77)
+*   **The Issue:** The helper function `get_default_interface` performs a flat space split on the entire stdout of `ip route show | grep default` without handling multi-line outputs.
+*   **Impact:** If a host has multiple default routes configured, the function returns the interface associated with the first occurrence of the `"dev"` token in the combined output string. If this is a lower-priority metric route, the VLAN bridge will bind to the incorrect physical interface, breaking external VM connectivity.
+*   **Recommendation:** Iterate through the lines of the default route output, parse them individually, and select the interface belonging to the active default route with the lowest metric.
+
+
 ---
 
 ## 2. High Availability & Partition Failures
