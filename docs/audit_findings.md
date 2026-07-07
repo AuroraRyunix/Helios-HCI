@@ -271,6 +271,19 @@ To proactively detect and surface the architectural gaps identified in this audi
 *   **Impact:** During cluster boot, if the `daruk` service starts before ScyllaDB completes its replay log checks and opens port 9042, Daruk crashes and exits. Because all other services (Spectrum, Vali, Catalyst, Mimir) query ScyllaDB through the Daruk HTTP proxy, a Daruk startup failure cascades into a complete cluster orchestration freeze.
 *   **Recommendation:** Wrap Daruk's connection initialization in a retry loop with exponential backoff on startup, allowing it to wait for ScyllaDB to stabilize and begin responding.
 
+### C. Hardcoded Interface in VXLAN Creation
+*   **Location:** `urbosa.py` (line 366)
+*   **The Issue:** The command to create VXLAN overlay interfaces hardcodes the physical output device to `dev eth0`.
+*   **Impact:** If the cluster nodes use a different naming convention for their primary physical network interface (e.g. `ens192`, `bond0`, `enp3s0`), the command will fail, falling back to a dev-less VXLAN definition that can misroute tunnel traffic.
+*   **Recommendation:** Retrieve the active default interface dynamically using the route lookup helper (`get_uplink_interface`) and insert it into the VXLAN link creation command.
+
+### D. Head-End Replication (HER) Overhead in Large Clusters
+*   **Location:** `urbosa.py` (lines 370–385)
+*   **The Issue:** Urbosa populates the VXLAN forwarding database (FDB) with static flood entries (`bridge fdb append 00:00:00:00:00:00`) targeting all peer node IPs.
+*   **Impact:** In large clusters (e.g., $N=40$ nodes), this triggers Head-End Replication where every broadcast/multicast packet (e.g., ARP queries or DHCP requests) must be replicated 39 times by the sending host and sent to all peers, generating broadcast storms and network congestion.
+*   **Recommendation:** Transition the SDN control plane to use a centralized EVPN/BGP control plane (e.g. using FRRouting) or integrate ARP suppression tables to resolve MAC addresses locally without flooding tunnels.
+
+
 ---
 
 ## 15. VNC Console Latency Bottlenecks
