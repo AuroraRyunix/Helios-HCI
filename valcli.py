@@ -9,6 +9,17 @@ import time
 import os
 import threading
 
+LOCAL_IP = "127.0.0.1"
+try:
+    with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                if k == "LOCAL_HYPERVISOR_IP":
+                    LOCAL_IP = v
+except Exception:
+    pass
+
 def run_remote_spark(ip, command):
     """Executes a command on local/remote node via spark-daemon mTLS API."""
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
@@ -1221,7 +1232,7 @@ def get_zookeeper_leader_ip():
             cdata = json.load(f)
             ips = [h["ip"] for h in cdata.get("hosts", [])]
     except Exception:
-        ips = ["10.10.102.220", "10.10.102.222", "10.10.102.223"]
+        ips = [LOCAL_IP]
         
     leader_ip = None
     for ip in ips:

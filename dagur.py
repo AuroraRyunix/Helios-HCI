@@ -90,7 +90,7 @@ def get_zookeeper_leader_ip():
             cdata = json.load(f)
             ips = [h["ip"] for h in cdata.get("hosts", [])]
     except Exception:
-        ips = ["10.10.102.220", "10.10.102.222", "10.10.102.223"]
+        ips = [LOCAL_IP]
         
     leader_ip = None
     for ip in ips:
