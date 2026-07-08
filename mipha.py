@@ -616,7 +616,15 @@ def main():
                         
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
-                        start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway logos mipha"
+                        is_returning_witness = False
+                        returning_host = next((h for h in hosts if h.get("ip") == ip), None)
+                        if returning_host and returning_host.get("is_witness", False):
+                            is_returning_witness = True
+
+                        if is_returning_witness:
+                            start_cmd = "systemctl start zookeeper aether"
+                        else:
+                            start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway logos mipha"
                         run_remote_spark(ip, start_cmd)
                         
                         # Sleep 10 seconds to allow services (especially Aether/storage) to boot
@@ -732,13 +740,21 @@ def main():
                     # C. Active Polling for Vali Recovery
                     print("[Mipha HA] Verifying Vali VM Manager status...")
                     vali_ok = False
+                    
+                    target_vali_ip = zk_leader_ip
+                    leader_host = next((h for h in hosts if h.get("ip") == zk_leader_ip), None)
+                    if leader_host and leader_host.get("is_witness", False):
+                        non_witness_hosts = [h.get("ip") for h in hosts if not h.get("is_witness", False) and h.get("ip") != ip]
+                        if non_witness_hosts:
+                            target_vali_ip = non_witness_hosts[0]
+
                     for i in range(10): # Check if Vali is responsive
                         # Update progress: 30% to 45% during Vali check
                         val_progress = int(30 + (i / 10.0) * 15)
                         cql_up = f"UPDATE hydra.catalyst_tasks SET progress = {val_progress}, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
                         run_cql_query(cql_up)
                         
-                        if check_vali_health(zk_leader_ip):
+                        if check_vali_health(target_vali_ip):
                             vali_ok = True
                             print("[Mipha HA] Vali VM Manager is active and responding.")
                             break
@@ -747,7 +763,7 @@ def main():
                     if not vali_ok:
                         # Vali is down, trigger active restart on all surviving hosts
                         print("[Mipha HA] Vali is unresponsive. Initiating remote restart across surviving hosts...")
-                        surviving_hosts = [sh.get("ip") for sh in hosts if sh.get("ip") != ip]
+                        surviving_hosts = [sh.get("ip") for sh in hosts if sh.get("ip") != ip and not sh.get("is_witness", False)]
                         for sh_ip in surviving_hosts:
                             run_remote_spark(sh_ip, "systemctl restart vali")
                             
@@ -759,7 +775,7 @@ def main():
                             cql_up = f"UPDATE hydra.catalyst_tasks SET progress = {val_progress}, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
                             run_cql_query(cql_up)
                             
-                            if check_vali_health(zk_leader_ip):
+                            if check_vali_health(target_vali_ip):
                                 vali_ok = True
                                 print("[Mipha HA] Vali recovered and back online.")
                                 break

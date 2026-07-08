@@ -20,23 +20,33 @@ The `cluster` CLI utility (`/usr/local/bin/cluster`) is an administrative orches
 ### A. Cluster Creation (`cluster create`)
 Bootstrap a new cluster across a set of physical hosts.
 
-#### 1-Node, 2-Node, and 4+ Node Layouts
-- **1-Node / 2-Node**: All hosts are fully provisioned hypervisors and storage nodes.
-- **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members, and additional hosts are automatically configured as observers to scale the cluster cleanly.
+#### Node Layout Overview
+- **1-Node**: Single fully-provisioned hypervisor and storage node. No redundancy (RF=0 forced).
+- **2-Node**: Both hosts are fully provisioned hypervisors and storage nodes. Requires a `--witness` node (see below) to achieve quorum.
+- **3-Node**: All three hosts are fully provisioned hypervisors and storage nodes. Natural quorum is achieved with a 2/3 majority — **no witness needed**.
+- **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members; additional hosts are automatically configured as ZooKeeper observers to scale the cluster cleanly.
 
-#### 3-Node Layout (Witness Node Support)
-In a **3-node cluster layout**, the third host (Node 3, index 2 in the IP list) automatically acts as a low-overhead, diskless **Witness Node**.
-- **Role**: Serves as a quorum tie-breaker (ZooKeeper voter and DRBD diskless replica) to prevent split-brain conditions without requiring a third hypervisor or database license/hardware instance.
-- **Provisioned Services**: Runs only `spark-daemon`, `zookeeper`, and `aether` (Linstor satellite).
-- **Excluded Services**: Excludes virtualization layers (`libvirtd`/`qemu`), databases (`hydra-db`/ScyllaDB), Linstor controllers, API proxies (`daruk`), and user management or scheduling workloads.
-- **Storage**: Does not require physical storage claiming or LVM pool provisioning. Replicated database volumes (`linstor-db`) are automatically configured with `--diskless` on the witness host.
+#### 2-Node Layout (Witness Node Required)
+A **2-node cluster** cannot achieve quorum on its own — if one node goes down, the remaining node cannot safely determine whether it or the other node has the network partition. A lightweight **Witness Node** is required as a tie-breaker.
+
+- **Role**: Serves as a quorum tie-breaker (ZooKeeper voter and DRBD diskless replica) to prevent split-brain. Does **not** run hypervisor or database workloads.
+- **Provisioned Services**: Runs only `spark-daemon`, `zookeeper`, and `aether` (Linstor satellite, diskless).
+- **Excluded Services**: Excludes `libvirtd`/`qemu`, `hydra-db`/ScyllaDB, Linstor controllers, `daruk`, and all scheduling/management workloads.
+- **Storage**: No physical disk claiming or LVM pool provisioning. Linstor volumes are configured `--diskless` on the witness host.
+- **Hardware**: Can be any minimal machine or VM — does not need storage or significant compute.
 
 ```bash
 # Syntax
-cluster create -s <IP1,IP2,IP3,...> [-r <redundancy_factor>] [-v <virtual_ip>]
+cluster create -s <IP1,IP2,...> [-r <redundancy_factor>] [-v <virtual_ip>] [--witness <witness_ip>]
 
-# Example: Create a 3-node cluster with Node 3 acting automatically as the Witness node
+# Example: 3-node cluster — all 3 are full hypervisors, quorum is natural
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
+
+# Example: 2-node cluster with a lightweight witness node for quorum
+cluster create -s 10.10.102.220,10.10.102.222 -r 1 -v 10.10.102.240 --witness 10.10.102.223
+
+# Example: 4-node cluster — first 3 are ZK voters, 4th is a ZK observer
+cluster create -s 10.10.102.220,10.10.102.221,10.10.102.222,10.10.102.223 -r 2 -v 10.10.102.240
 ```
 **Creation Workflow**:
 1. Creates the cluster configuration file `/etc/hci/cluster.json` on all nodes.

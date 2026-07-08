@@ -795,20 +795,20 @@ def deploy_to_node(ip):
                 
             # Deploy/update systemd service unit
             agahnim_svc_cmd = """cat << 'EOF' > /etc/containers/systemd/agahnim.container
-    [Unit]
-    Description=Agahnim Console Proxy Daemon
-    After=network.target
-    
-    [Container]
-    Image=localhost/helios-base:latest
-    Network=host
-    Volume=/usr/local/bin:/usr/local/bin:ro
-    Exec=/usr/local/bin/agahnim 8081
-    
-    [Install]
-    WantedBy=multi-user.target
-    EOF
-    """
+[Unit]
+Description=Agahnim Console Proxy Daemon
+After=network.target
+
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Exec=/usr/local/bin/agahnim 8081
+
+[Install]
+WantedBy=multi-user.target
+EOF
+"""
             stdin, stdout, stderr = ssh.exec_command(agahnim_svc_cmd)
             stdout.channel.recv_exit_status()
                 
