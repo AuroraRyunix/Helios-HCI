@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
 # HCI - Cluster Provisioning Script (Pure Software Installer)
-This script runs locally to bootstrap Enterprise Linux (EL) 10.2 hosts with
-HCI software. It is a pure software installer — it does NOT seed cluster
-configuration, generate certificates, or form the cluster.
-It handles:
+This script runs locally to bootstrap Enterprise Linux (EL) 10.2 hosts with the
+complete HCI software stack, making each node ready to be used in a cluster.
+It does NOT set up anything that requires nodes to know about each other —
+no SSH mesh between nodes, no certificates, no cluster configuration, no
+witness/topology decisions. That is all seeded exclusively by `cluster create`.
+It handles, per host, over password-authenticated SSH:
   1. Parsing CLI arguments (--force, --fast)
-  2. SSH connection (attempts SSH key first, falls back to password credentials)
-  3. SSH public key exchange for passwordless authentication (if password used)
-  4. Copying private/public SSH keys to hosts to enable inter-node passwordless SSH mesh
-  5. Hostname check and auto-assignment (reboot if hostname not set to Valkyrie-XXXXXX)
-  6. Installation of KVM, libvirt, Podman, and NFS utilities on target hosts
-  7. Deployment of Podman Quadlets and service binaries to /etc/containers/systemd/
-  8. Copying the cluster creation utility to /usr/local/bin/cluster
-  9. Service startup and basic verification
+  2. Hostname check and auto-assignment (reboot if hostname not set to Valkyrie-XXXXXX)
+  3. Installation of KVM, libvirt, Podman, and NFS utilities on target hosts
+  4. Deployment of Podman Quadlets and service binaries to /etc/containers/systemd/
+  5. Copying the cluster creation utility to /usr/local/bin/cluster
+  6. Service startup and basic verification
 
 Witness-node topology (which host becomes a lightweight quorum tie-breaker) is
 decided entirely by `cluster create --witness <ip>`, not by this script — every
@@ -487,26 +486,9 @@ def main():
             zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
     zoo_servers_str = " ".join(zoo_servers_parts)
 
-    priv_key_path = os.path.expanduser("~/.ssh/id_rsa_hci")
-    if not os.path.exists(priv_key_path):
-        print(f"[*] Private SSH key not found. Generating a new key pair at {priv_key_path}...")
-        try:
-            os.makedirs(os.path.dirname(priv_key_path), exist_ok=True)
-            key = paramiko.RSAKey.generate(2048)
-            key.write_private_key_file(priv_key_path)
-            with open(priv_key_path + ".pub", "w") as f:
-                f.write(f"ssh-rsa {key.get_base64()} root@valkyrie\n")
-            print(f"[*] Successfully generated SSH key pair.")
-        except Exception as e:
-            print(f"[FATAL] Failed to generate SSH key pair: {e}")
-            sys.exit(1)
-        
-    try:
-        key = paramiko.RSAKey.from_private_key_file(priv_key_path)
-        pub_key_content = f"ssh-rsa {key.get_base64()} root@valkyrie"
-    except Exception as e:
-        print(f"[FATAL] Failed to load SSH key: {e}")
-        sys.exit(1)
+    # Node-to-node SSH mesh (id_rsa_hci key generation/seeding, used for qemu+ssh:// live
+    # migration) is seeded entirely by `cluster create`'s Phase 0A, not here — provisioning
+    # only ever authenticates to hosts via password.
 
     import threading
     import hashlib
@@ -877,18 +859,12 @@ WantedBy=multi-user.target
         # Connect to target_ip or fall back to DHCP IP using password credentials
         if node.connect(use_key=False):
             print(f"[{target_ip}] Connected successfully using password.")
-            node.execute("mkdir -p /root/.ssh && chmod 700 /root/.ssh")
-            node.execute(f"echo '{pub_key_content}' >> /root/.ssh/authorized_keys")
-            node.execute("chmod 600 /root/.ssh/authorized_keys")
         else:
             print(f"[{target_ip}] Target IP not reachable. Connecting to DHCP IP {dhcp_ip}...")
             node = RemoteNode(dhcp_ip, username, password)
             connected_ip = dhcp_ip
             if node.connect(use_key=False):
                 print(f"[{dhcp_ip}] Connected successfully using password.")
-                node.execute("mkdir -p /root/.ssh && chmod 700 /root/.ssh")
-                node.execute(f"echo '{pub_key_content}' >> /root/.ssh/authorized_keys")
-                node.execute("chmod 600 /root/.ssh/authorized_keys")
             else:
                 print(f"[FATAL] [{target_ip}] Could not connect to either target IP or DHCP IP {dhcp_ip}.")
                 return
@@ -990,14 +966,7 @@ WantedBy=multi-user.target
 
         # Phase 3: Synchronizing Configuration Files
         try:
-            print(f"[{node.ip}] Syncing configurations & keys...")
-            with open(priv_key_path, "r", encoding="utf-8") as f:
-                local_priv_key = f.read()
-            with open(priv_key_path + ".pub", "r", encoding="utf-8") as f:
-                local_pub_key = f.read()
-            node.write_file("/root/.ssh/id_rsa", local_priv_key)
-            node.write_file("/root/.ssh/id_rsa.pub", local_pub_key)
-            node.execute("chmod 600 /root/.ssh/id_rsa")
+            print(f"[{node.ip}] Syncing configurations...")
 
             # Copy binaries
             node.write_file("/usr/local/bin/spark", base64.b64decode(SPARK_CLI_B64).decode('utf-8'))
