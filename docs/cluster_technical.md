@@ -17,17 +17,17 @@ mindmap
       make_request (status endpoints via Spark)
     Lifecycle Operations (main command parsing)
       create
-        bootstrap cluster.json
-        format disk pools (linstor)
+        bootstrap cluster.json (witness-aware)
+        format disk pools (linstor) - skipped on witness
         generate certs (Odin/Zookeeper/ScyllaDB)
         seed ssh known_hosts
       start
-        starts container services via systemd
+        starts container services via systemd - filtered for workload services
       stop
-        graceful unmount and service teardown
+        graceful unmount and service teardown - filtered for workload services
       destroy
         podman container purge
-        LinStor pool deletion
+        LinStor pool deletion - skipped on witness
         data path wipe
 ```
 
@@ -68,9 +68,17 @@ mindmap
 
 #### `cluster start`
 - Sends API commands to activate systemd units: `linstor-controller`, `linstor-satellite`, `odin`, `hydra-db`, `spectrum`, `bifrost`, `dagur`, `mimir`, `vali`, `catalyst`, `gatoway`, `logos`.
+- Automatically filters out non-witness workloads (e.g. ScyllaDB, Daruk, and application services) to avoid service startup errors on the witness node.
 
 #### `cluster stop`
 - Safely shuts down virtual workloads, stops systemd daemons, and unmounts local directories.
+- Skips unmounting and stopping non-existent databases and application containers on the witness node.
 
 #### `cluster destroy`
-- Purges systemd unit templates, deletes Podman containers, removes storage targets, and cleans `/var/lib/hci` configuration directories to restore hosts to default state.
+- Purges systemd unit templates, deletes Podman containers, removes storage targets, and cleans `/var/lib/hci` configuration directories.
+- Skips LVM signatures removal and physical disks wiping on the witness node.
+
+### Witness Node Orchestration Logic
+- **`WITNESS_IP` Detection**: Loads host config from `/etc/hci/cluster.json` and evaluates the `is_witness` boolean (auto-flagged for the 3rd IP in a 3-node layout).
+- **Service & Volume Filtering**: Employs `non_witness_ips` lists to prevent SSH command execution for non-witness components (e.g. libvirt VM management, `hydra-db` nodetool checks, ScyllaDB cluster settings, and Spectrum UI reachability on port 8443).
+- **Linstor Client configuration**: Restricts client config `controllers` seeds list to `non_witness_ips` to avoid client request timeout attempts directed at the witness.

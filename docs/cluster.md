@@ -18,12 +18,24 @@ The `cluster` CLI utility (`/usr/local/bin/cluster`) is an administrative orches
 ## 2. Command Reference & Syntax
 
 ### A. Cluster Creation (`cluster create`)
-Bootstrap a new cluster across a set of physical hypervisor hosts.
+Bootstrap a new cluster across a set of physical hosts.
+
+#### 1-Node, 2-Node, and 4+ Node Layouts
+- **1-Node / 2-Node**: All hosts are fully provisioned hypervisors and storage nodes.
+- **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members, and additional hosts are automatically configured as observers to scale the cluster cleanly.
+
+#### 3-Node Layout (Witness Node Support)
+In a **3-node cluster layout**, the third host (Node 3, index 2 in the IP list) automatically acts as a low-overhead, diskless **Witness Node**.
+- **Role**: Serves as a quorum tie-breaker (ZooKeeper voter and DRBD diskless replica) to prevent split-brain conditions without requiring a third hypervisor or database license/hardware instance.
+- **Provisioned Services**: Runs only `spark-daemon`, `zookeeper`, and `aether` (Linstor satellite).
+- **Excluded Services**: Excludes virtualization layers (`libvirtd`/`qemu`), databases (`hydra-db`/ScyllaDB), Linstor controllers, API proxies (`daruk`), and user management or scheduling workloads.
+- **Storage**: Does not require physical storage claiming or LVM pool provisioning. Replicated database volumes (`linstor-db`) are automatically configured with `--diskless` on the witness host.
+
 ```bash
 # Syntax
-cluster create -s <IP1,IP2,IP3> [-r <redundancy_factor>] [-v <virtual_ip>]
+cluster create -s <IP1,IP2,IP3,...> [-r <redundancy_factor>] [-v <virtual_ip>]
 
-# Example: Create a 3-node cluster with Redundancy Factor 1 and VIP 10.10.102.240
+# Example: Create a 3-node cluster with Node 3 acting automatically as the Witness node
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
 ```
 **Creation Workflow**:
