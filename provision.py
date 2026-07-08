@@ -5,19 +5,21 @@ This script runs locally to bootstrap Enterprise Linux (EL) 10.2 hosts with
 HCI software. It is a pure software installer — it does NOT seed cluster
 configuration, generate certificates, or form the cluster.
 It handles:
-  1. Parsing CLI arguments (--force, --fast, --witness)
+  1. Parsing CLI arguments (--force, --fast)
   2. SSH connection (attempts SSH key first, falls back to password credentials)
   3. SSH public key exchange for passwordless authentication (if password used)
   4. Copying private/public SSH keys to hosts to enable inter-node passwordless SSH mesh
   5. Hostname check and auto-assignment (reboot if hostname not set to Valkyrie-XXXXXX)
   6. Installation of KVM, libvirt, Podman, and NFS utilities on target hosts
-     (or a lightweight package set on the --witness host, if designated)
   7. Deployment of Podman Quadlets and service binaries to /etc/containers/systemd/
-     (witness host only gets spark-daemon, ZooKeeper, and Aether/Linstor satellite)
   8. Copying the cluster creation utility to /usr/local/bin/cluster
   9. Service startup and basic verification
 
-To form the cluster after provisioning, run: cluster -s <ips> --redundancy_factor=1 --vip=<VIP> [--witness=<witness_ip>] create
+Witness-node topology (which host becomes a lightweight quorum tie-breaker) is
+decided entirely by `cluster create --witness <ip>`, not by this script — every
+host is provisioned identically here.
+
+To form the cluster after provisioning, run: cluster -s <ips> --redundancy_factor=1 --vip=<VIP> create
 """
 
 import os
@@ -358,7 +360,6 @@ def main():
                         help="Force provisioning even if the hostname format matches Valkyrie-XXXXXX")
     parser.add_argument("--fast", "-fast", action="store_true",
                         help="Fast mode: skip package installs and container builds, only re-upload binaries and quadlets")
-    parser.add_argument("--witness", required=False, help="Static IP of the witness node (lightweight quorum tie-breaker for 2-node clusters); must also appear in the static IPs list")
     args = parser.parse_args()
     force_provision = args.force
     fast_mode = args.fast
@@ -470,24 +471,14 @@ def main():
                     print("[ERROR] Non-interactive execution but HELIOS_GATEWAY is not set and auto-detection failed.")
                     sys.exit(1)
 
-    # VIP assignment and final ZooKeeper/hydra-db topology are handled by `cluster create`,
-    # not provision. The witness IP, however, determines which package set and Quadlets
-    # get installed on that node (light vs. full hypervisor), so it must be known here too.
-    global WITNESS_IP
-    WITNESS_IP = args.witness if args.witness else os.environ.get("HELIOS_WITNESS_IP")
-    if WITNESS_IP:
-        WITNESS_IP = WITNESS_IP.strip()
-        if WITNESS_IP not in HOSTS:
-            print(f"[ERROR] --witness IP {WITNESS_IP} is not present in the static IPs list ({', '.join(HOSTS)}).")
-            print("[ERROR] The witness node must be provisioned as one of the target hosts.")
-            sys.exit(1)
-        print(f"[*] Witness node designated: {WITNESS_IP} (will receive lightweight provisioning).")
+    # Witness-node topology (which host, if any, becomes a lightweight quorum tie-breaker)
+    # is decided entirely by `cluster create --witness <ip>`, not by this script — every
+    # host is provisioned identically here with the full software stack.
 
     # seed_ips and zoo_servers_str are still needed to populate the ZooKeeper and
     # hydra-db quadlet templates. cluster create will write the final cassandra.env
     # and myid files on top of these, so these are just valid placeholders.
-    non_witness_hosts = [ip for ip in HOSTS if ip != WITNESS_IP]
-    seed_ips = ",".join(non_witness_hosts[:3])
+    seed_ips = ",".join(HOSTS[:3])
     zoo_servers_parts = []
     for i, ip in enumerate(HOSTS, start=1):
         if i > 3:
@@ -524,7 +515,7 @@ def main():
     nodes_map = {}
     nodes_lock = threading.Lock()
 
-    def provision_non_witness_services(node, script_dir, idx, seed_ips):
+    def provision_services(node, script_dir, idx, seed_ips):
         # Deploy Bifrost Daemon
         node.write_file("/usr/local/bin/bifrost", base64.b64decode(BIFROST_B64).decode('utf-8'))
         node.execute("chmod +x /usr/local/bin/bifrost")
@@ -877,8 +868,7 @@ WantedBy=multi-user.target
         node.execute("rm -rf /tmp/spectrum_build")
 
     def provision_single_node(idx, target_ip, dhcp_ip):
-        is_witness = (target_ip == WITNESS_IP)
-        print(f"[{target_ip}] Starting provisioning thread (is_witness={is_witness})...")
+        print(f"[{target_ip}] Starting provisioning thread...")
         username = DEFAULT_USERNAME
         password = DEFAULT_PASSWORD
         connected_ip = target_ip
@@ -959,66 +949,40 @@ WantedBy=multi-user.target
 
         # Phase 2: Host Package Installation & Directory Setup
         try:
-            if is_witness:
-                print(f"[{node.ip}] Witness Node: Installing light packages (openssl, podman, iproute, grep, drbd9x)...")
-                dnf_cmds = [
-                    "rm -f /etc/yum.repos.d/*elrepo-release-10*.repo || true",
-                    "dnf install -y --nogpgcheck dnf-plugins-core || true",
-                    "dnf install -y --nogpgcheck https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm || true",
-                    "dnf install -y --nogpgcheck openssl podman iproute grep drbd9x-utils kmod-drbd9x"
-                ]
-                for cmd in dnf_cmds:
-                    node.execute(cmd, check_exit=True)
+            print(f"[{node.ip}] Installing repositories and packages (dnf-plugins-core, ELRepo, openssl, podman, qemu, libvirt, nfs, lvm2)...")
+            dnf_cmds = [
+                "rm -f /etc/yum.repos.d/*elrepo-release-10*.repo || true",
+                "dnf install -y --nogpgcheck dnf-plugins-core || true",
+                "dnf install -y --nogpgcheck https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm || true",
+                "dnf install -y --nogpgcheck openssl podman qemu-kvm libvirt nfs-utils lvm2 iproute grep drbd9x-utils kmod-drbd9x cargo clang lld"
+            ]
+            for cmd in dnf_cmds:
+                node.execute(cmd, check_exit=True)
 
-                print(f"[{node.ip}] Loading DRBD kernel module...")
-                node.execute("modprobe drbd || true")
+            print(f"[{node.ip}] Loading DRBD kernel module...")
+            node.execute("modprobe drbd || true")
 
-                print(f"[{node.ip}] Starting podman service...")
-                node.execute("systemctl enable podman && systemctl start podman")
+            print(f"[{node.ip}] Enabling KVM ignore_msrs for nested virtualization stability...")
+            node.execute("echo 'options kvm ignore_msrs=Y' > /etc/modprobe.d/kvm.conf")
+            node.execute("modprobe -r kvm_intel || true")
+            node.execute("modprobe -r kvm || true")
+            node.execute("modprobe kvm || true")
+            node.execute("modprobe kvm_intel || true")
 
-                print(f"[{node.ip}] Stopping firewalld...")
-                try:
-                    node.execute("systemctl stop firewalld && systemctl disable firewalld")
-                except:
-                    pass
+            print(f"[{node.ip}] Starting systemd services (podman, libvirtd, virtqemud, virtnetworkd)...")
+            for svc in ["podman", "libvirtd", "virtqemud", "virtnetworkd"]:
+                node.execute(f"systemctl enable {svc} && systemctl start {svc}")
 
-                print(f"[{node.ip}] Creating witness directories...")
-                node.execute("mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /etc/linstor /run/hci")
-            else:
-                print(f"[{node.ip}] Installing repositories and packages (dnf-plugins-core, ELRepo, openssl, podman, qemu, libvirt, nfs, lvm2)...")
-                dnf_cmds = [
-                    "rm -f /etc/yum.repos.d/*elrepo-release-10*.repo || true",
-                    "dnf install -y --nogpgcheck dnf-plugins-core || true",
-                    "dnf install -y --nogpgcheck https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm || true",
-                    "dnf install -y --nogpgcheck openssl podman qemu-kvm libvirt nfs-utils lvm2 iproute grep drbd9x-utils kmod-drbd9x cargo clang lld"
-                ]
-                for cmd in dnf_cmds:
-                    node.execute(cmd, check_exit=True)
+            print(f"[{node.ip}] Configuring firewalld rules...")
+            try:
+                node.execute("systemctl stop firewalld && systemctl disable firewalld")
+            except Exception as e:
+                print(f"[{node.ip}] Warning: firewalld setup failed: {e}")
 
-                print(f"[{node.ip}] Loading DRBD kernel module...")
-                node.execute("modprobe drbd || true")
-
-                print(f"[{node.ip}] Enabling KVM ignore_msrs for nested virtualization stability...")
-                node.execute("echo 'options kvm ignore_msrs=Y' > /etc/modprobe.d/kvm.conf")
-                node.execute("modprobe -r kvm_intel || true")
-                node.execute("modprobe -r kvm || true")
-                node.execute("modprobe kvm || true")
-                node.execute("modprobe kvm_intel || true")
-
-                print(f"[{node.ip}] Starting systemd services (podman, libvirtd, virtqemud, virtnetworkd)...")
-                for svc in ["podman", "libvirtd", "virtqemud", "virtnetworkd"]:
-                    node.execute(f"systemctl enable {svc} && systemctl start {svc}")
-
-                print(f"[{node.ip}] Configuring firewalld rules...")
-                try:
-                    node.execute("systemctl stop firewalld && systemctl disable firewalld")
-                except Exception as e:
-                    print(f"[{node.ip}] Warning: firewalld setup failed: {e}")
-
-                print(f"[{node.ip}] Creating host storage mount directories...")
-                node.execute("mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log "
-                             "/var/lib/hci/hydra/data /var/lib/linstor /etc/linstor /run/hci "
-                             "/etc/hci/spectrum/certs /etc/hci/slate /var/lib/hci/aether/volumes")
+            print(f"[{node.ip}] Creating host storage mount directories...")
+            node.execute("mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log "
+                         "/var/lib/hci/hydra/data /var/lib/linstor /etc/linstor /run/hci "
+                         "/etc/hci/spectrum/certs /etc/hci/slate /var/lib/hci/aether/volumes")
         except Exception as e:
             print(f"[{node.ip}] Package/Directory setup failed: {e}")
             node.close()
@@ -1039,44 +1003,13 @@ WantedBy=multi-user.target
             node.write_file("/usr/local/bin/spark", base64.b64decode(SPARK_CLI_B64).decode('utf-8'))
             node.execute("chmod +x /usr/local/bin/spark")
 
-            if is_witness:
-                # Witness node only gets spark-daemon and minimal configurations
-                node.write_file("/usr/local/bin/spark-daemon", base64.b64decode(SPARK_DAEMON_B64).decode('utf-8'))
-                node.execute("chmod +x /usr/local/bin/spark-daemon")
+            node.write_file("/usr/local/bin/cluster", base64.b64decode(CLUSTER_CLI_B64).decode('utf-8'))
+            node.execute("chmod +x /usr/local/bin/cluster")
 
-                spark_svc = '''[Unit]
-Description=Spark Host Management Daemon
-After=network.target
+            node.write_file("/usr/local/bin/spark-daemon", base64.b64decode(SPARK_DAEMON_B64).decode('utf-8'))
+            node.execute("chmod +x /usr/local/bin/spark-daemon")
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:rw
-Volume=/etc/containers/systemd:/etc/containers/systemd:rw
-Volume=/dev:/dev:shared
-Volume=/run/systemd/system:/run/systemd/system:ro
-Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
-Volume=/root/.certs:/root/.certs:ro
-Exec=/usr/local/bin/spark-daemon
-AddCapability=CAP_SYS_ADMIN
-AddCapability=CAP_SYS_RAWIO
-AddCapability=CAP_NET_ADMIN
-
-[Install]
-WantedBy=multi-user.target
-'''
-                node.write_file("/etc/containers/systemd/spark-daemon.container", spark_svc)
-                node.execute("systemctl daemon-reload && systemctl enable spark-daemon")
-
-            else:
-                node.write_file("/usr/local/bin/cluster", base64.b64decode(CLUSTER_CLI_B64).decode('utf-8'))
-                node.execute("chmod +x /usr/local/bin/cluster")
-
-                node.write_file("/usr/local/bin/spark-daemon", base64.b64decode(SPARK_DAEMON_B64).decode('utf-8'))
-                node.execute("chmod +x /usr/local/bin/spark-daemon")
-
-                spark_svc = '''[Unit]
+            spark_svc = '''[Unit]
 Description=Spark Host Management Daemon
 After=network.target
 
@@ -1099,10 +1032,10 @@ AddCapability=CAP_NET_ADMIN
 [Install]
 WantedBy=multi-user.target
 '''
-                node.write_file("/etc/containers/systemd/spark-daemon.container", spark_svc)
-                node.execute("systemctl daemon-reload && systemctl enable spark-daemon")
+            node.write_file("/etc/containers/systemd/spark-daemon.container", spark_svc)
+            node.execute("systemctl daemon-reload && systemctl enable spark-daemon")
 
-                provision_non_witness_services(node, script_dir, idx, seed_ips)
+            provision_services(node, script_dir, idx, seed_ips)
         except Exception as e:
             print(f"[{node.ip}] Config synchronization failed: {e}")
             node.close()
@@ -1118,17 +1051,16 @@ WantedBy=multi-user.target
             node.write_file("/etc/containers/systemd/zookeeper.container", zoo_quad)
             node.write_file("/etc/containers/systemd/aether.container", aether_quad)
 
-            if not is_witness:
-                db_quad = QUADLETS["hydra-db"].format(seeds=seed_ips, node_ip=node.ip)
-                spec_quad = QUADLETS["spectrum"]
-                slate_quad = QUADLETS["slate"]
-                controller_quad = QUADLETS["linstor-controller"]
-                
-                node.write_file("/etc/containers/systemd/hydra-db.container", db_quad)
-                node.write_file("/etc/containers/systemd/spectrum.container", spec_quad)
-                node.write_file("/etc/containers/systemd/slate.container", slate_quad)
-                node.write_file("/etc/containers/systemd/linstor-controller.container", controller_quad)
-            
+            db_quad = QUADLETS["hydra-db"].format(seeds=seed_ips, node_ip=node.ip)
+            spec_quad = QUADLETS["spectrum"]
+            slate_quad = QUADLETS["slate"]
+            controller_quad = QUADLETS["linstor-controller"]
+
+            node.write_file("/etc/containers/systemd/hydra-db.container", db_quad)
+            node.write_file("/etc/containers/systemd/spectrum.container", spec_quad)
+            node.write_file("/etc/containers/systemd/slate.container", slate_quad)
+            node.write_file("/etc/containers/systemd/linstor-controller.container", controller_quad)
+
             node.execute("rm -f /etc/containers/systemd/spark.container /etc/containers/systemd/odin.container")
             node.execute("systemctl daemon-reload")
         except Exception as e:
@@ -1139,15 +1071,12 @@ WantedBy=multi-user.target
         # Phase 5: Starting Core Platform Services
         try:
             print(f"[{node.ip}] Activating services via systemd...")
-            if not is_witness:
-                try:
-                    node.execute("systemctl start linstor-controller")
-                except Exception as e:
-                    print(f"[{node.ip}] Warning: linstor-controller failed to start: {e}")
-                        
-                services = ["zookeeper", "hydra-db", "aether", "slate"]
-            else:
-                services = ["zookeeper", "aether"]
+            try:
+                node.execute("systemctl start linstor-controller")
+            except Exception as e:
+                print(f"[{node.ip}] Warning: linstor-controller failed to start: {e}")
+
+            services = ["zookeeper", "hydra-db", "aether", "slate"]
 
             for svc in services:
                 try:
@@ -1200,8 +1129,7 @@ WantedBy=multi-user.target
     print("Nodes are provisioned with HCI software.")
     print("Next: run cluster create to form the cluster:")
     hosts_list_str = ",".join(HOSTS)
-    witness_flag_str = f" --witness={WITNESS_IP}" if WITNESS_IP else ""
-    print(f"  cluster -s {hosts_list_str} --redundancy_factor=1 --vip=<VIP>{witness_flag_str} create")
+    print(f"  cluster -s {hosts_list_str} --redundancy_factor=1 --vip=<VIP> [--witness=<witness_ip>] create")
     print("==========================================================")
 
 if __name__ == "__main__":
