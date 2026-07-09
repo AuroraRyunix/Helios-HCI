@@ -1360,10 +1360,27 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # group0..." with none willing to bootstrap it, deadlocking the whole cluster. The
         # leader must fully establish group0 (i.e. be listening on 9042) before any other
         # node starts, so the rest join an already-existing group0 instead of racing to create one.
+        #
+        # Starting the leader alone is not enough on its own: cassandra.env was already written
+        # in Phase 2 with the full multi-node seed list (HYDRA_DB_SEEDS), so even a solo leader
+        # boots believing its peers exist and just haven't answered yet. Raft's setup_group0
+        # can't distinguish "peer doesn't exist yet" from "peer is temporarily unreachable", so
+        # it hangs in "Discovering..." forever waiting to confirm those peers one way or another.
+        # The leader needs a self-only seed list for its first boot to actually self-bootstrap.
+        leader_only_env = f"HYDRA_DB_SEEDS={leader_ip}\nHYDRA_DB_LISTEN={leader_ip}\n"
+        leader_only_env_b64 = base64.b64encode(leader_only_env.encode()).decode()
+        run_checked_cmd(leader_ip, f"echo {leader_only_env_b64} | base64 -d > /etc/hci/hydra/cassandra.env")
+
         print(f"[{leader_ip}] Starting ScyllaDB Database Service on leader node (establishing Raft group0)...")
         run_checked_cmd(leader_ip, "systemctl restart hydra-db")
         _wait_hydra_db_active(leader_ip)
         _wait_hydra_db_cql(leader_ip)
+
+        # Restore the full cluster seed list for consistency with the rest of the nodes'
+        # config (Scylla itself doesn't re-read this after its initial group0 bootstrap).
+        full_seed_env = f"HYDRA_DB_SEEDS={seed_ips}\nHYDRA_DB_LISTEN={leader_ip}\n"
+        full_seed_env_b64 = base64.b64encode(full_seed_env.encode()).decode()
+        run_remote_spark(leader_ip, f"echo {full_seed_env_b64} | base64 -d > /etc/hci/hydra/cassandra.env")
 
         scylla_follower_ips = [ip for ip in non_witness_ips if ip != leader_ip]
         if scylla_follower_ips:
