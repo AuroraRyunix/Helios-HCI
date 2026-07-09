@@ -308,7 +308,22 @@ def run_destroy_flow(ips):
         rc, out, err = run_remote_spark(ip, f"systemctl stop --no-block {svc_non_witness_list} || true")
         if rc != 0:
             print(f"[{ip}] [WARNING] Failed to stop core services: {err}")
-            
+
+    # linstor-controller specifically must be *confirmed* stopped (not just fired via
+    # --no-block above) before Phase 3 unmounts /var/lib/linstor, since it holds that
+    # mount open. If it's still exiting when the unmount runs, the unmount is a no-op
+    # (lazy or not), which then poisons Phase 4's DRBD teardown: DRBD can't go down
+    # while its own backing filesystem is actively mounted.
+    for ip in non_witness_ips:
+        for attempt in range(15):
+            rc, out, _ = run_remote_spark(ip, "systemctl is-active linstor-controller 2>/dev/null || true")
+            if out.strip() != "active":
+                break
+            time.sleep(1)
+        else:
+            print(f"[{ip}] [WARNING] linstor-controller still active after waiting, forcing stop...")
+            run_remote_spark(ip, "podman kill systemd-linstor-controller 2>/dev/null || true")
+
     for ip in ips:
         print(f"[{ip}] Stopping zookeeper and storage services (no-block)...")
         rc, out, err = run_remote_spark(ip, f"systemctl stop --no-block {svc_all_list} || true")
@@ -325,6 +340,20 @@ def run_destroy_flow(ips):
         rc2, out2, err2 = run_remote_spark(ip, "umount -l /var/lib/hci/aether/volumes/default-image-container || true")
         if out2.strip() or err2.strip():
             print(f"[{ip}] Image Volume Unmount Output: {out2 or err2}")
+
+        # Unmount the Linstor Controller's own HA database volume (backed by the linstor-db
+        # DRBD resource). This must happen here, before Phase 4/5, not in the later Phase 6
+        # cleanup — DRBD/LVM teardown can never succeed while this stays mounted.
+        out_mnt = ""
+        for attempt in range(10):
+            run_remote_spark(ip, "umount -l /var/lib/linstor 2>/dev/null || true")
+            rc_mnt, out_mnt, _ = run_remote_spark(ip, "mount | grep -i linstor || true")
+            if not out_mnt.strip():
+                break
+            print(f"[{ip}] /var/lib/linstor still mounted, retrying (attempt {attempt + 1}/10)...")
+            time.sleep(2)
+        else:
+            print(f"[{ip}] [WARNING] /var/lib/linstor still mounted after retries: {out_mnt.strip()}")
 
     # 4. Bring down DRBD resources, then verify they're actually gone. A best-effort teardown
     # under a hard `timeout` can leave a resource half torn-down (device still held), which
