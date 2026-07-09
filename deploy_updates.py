@@ -724,7 +724,24 @@ def deploy_to_node(ip):
             exit_code = stdout.channel.recv_exit_status()
             if exit_code != 0:
                 print(f"[{ip}] Error enabling/restarting spark-daemon and bifrost: {stderr.read().decode()}")
-                
+
+            # 7b. zookeeper and hydra-db just had their [Install]/WantedBy sections stripped
+            # (step 5) and systemd reloaded against the new Quadlet definitions (step 6). If
+            # either container was running at that point, that reload can silently kill it
+            # with no failure reported anywhere -- confirmed live: a healthy zookeeper/hydra-db
+            # pair died right around this daemon-reload and nothing in this script ever
+            # restarted them, since unlike every other service touched here (spark-daemon,
+            # bifrost, aether, spectrum), these two never got an explicit post-reload check.
+            print(f"[{ip}] Verifying ZooKeeper and HydraDB survived the Quadlet reload...")
+            stdin, stdout, stderr = ssh.exec_command("systemctl is-active zookeeper")
+            if stdout.channel.recv_exit_status() != 0:
+                print(f"[{ip}] ZooKeeper did not survive the reload, restarting it...")
+                ssh.exec_command("systemctl restart zookeeper")
+            stdin, stdout, stderr = ssh.exec_command("systemctl is-active hydra-db")
+            if stdout.channel.recv_exit_status() != 0:
+                print(f"[{ip}] HydraDB did not survive the reload, restarting it...")
+                ssh.exec_command("systemctl restart hydra-db")
+
             # 8. Force unmount and remount Aether volume locally to clear any stale mount points immediately, but ONLY if no VMs are running to avoid storage disruption.
             stdin, stdout, stderr = ssh.exec_command("virsh -c qemu:///system list --name | grep -v '^$'")
             running_vms = stdout.read().decode().strip()
@@ -795,20 +812,20 @@ def deploy_to_node(ip):
                 
             # Deploy/update systemd service unit
             agahnim_svc_cmd = """cat << 'EOF' > /etc/containers/systemd/agahnim.container
-    [Unit]
-    Description=Agahnim Console Proxy Daemon
-    After=network.target
-    
-    [Container]
-    Image=localhost/helios-base:latest
-    Network=host
-    Volume=/usr/local/bin:/usr/local/bin:ro
-    Exec=/usr/local/bin/agahnim 8081
-    
-    [Install]
-    WantedBy=multi-user.target
-    EOF
-    """
+[Unit]
+Description=Agahnim Console Proxy Daemon
+After=network.target
+
+[Container]
+Image=localhost/helios-base:latest
+Network=host
+Volume=/usr/local/bin:/usr/local/bin:ro
+Exec=/usr/local/bin/agahnim 8081
+
+[Install]
+WantedBy=multi-user.target
+EOF
+"""
             stdin, stdout, stderr = ssh.exec_command(agahnim_svc_cmd)
             stdout.channel.recv_exit_status()
                 
