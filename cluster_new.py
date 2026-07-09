@@ -1395,26 +1395,27 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # leader must fully establish group0 (i.e. be listening on 9042) before any other
         # node starts, so the rest join an already-existing group0 instead of racing to create one.
         #
-        # Starting the leader alone is not enough on its own: cassandra.env was already written
-        # in Phase 2 with the full multi-node seed list (HYDRA_DB_SEEDS), so even a solo leader
-        # boots believing its peers exist and just haven't answered yet. Raft's setup_group0
-        # can't distinguish "peer doesn't exist yet" from "peer is temporarily unreachable", so
-        # it hangs in "Discovering..." forever waiting to confirm those peers one way or another.
-        # The leader needs a self-only seed list for its first boot to actually self-bootstrap.
-        leader_only_env = f"HYDRA_DB_SEEDS={leader_ip}\nHYDRA_DB_LISTEN={leader_ip}\n"
-        leader_only_env_b64 = base64.b64encode(leader_only_env.encode()).decode()
-        run_checked_cmd(leader_ip, f"echo {leader_only_env_b64} | base64 -d > /etc/hci/hydra/cassandra.env")
+        # Starting the leader alone is not enough on its own: the *actual* seed list Scylla
+        # boots with is baked directly into the hydra-db Quadlet's `Exec=` line (--seeds ...)
+        # by provision.py at provisioning time -- /etc/hci/hydra/cassandra.env is never read
+        # by anything and editing it has zero effect (confirmed live via `podman inspect`).
+        # A solo leader still starting with the full multi-node --seeds list believes its
+        # peers exist and just haven't answered yet. Raft's setup_group0 can't distinguish
+        # "peer doesn't exist yet" from "peer is temporarily unreachable", so it hangs in
+        # "Discovering..." forever waiting to confirm those peers one way or another. The
+        # Quadlet's --seeds argument itself must be rewritten to self-only for the leader's
+        # first boot, then daemon-reload'd for podman's systemd generator to pick it up.
+        run_checked_cmd(leader_ip, f"sed -i 's/--seeds [0-9.,]*/--seeds {leader_ip}/' /etc/containers/systemd/hydra-db.container && systemctl daemon-reload")
 
         print(f"[{leader_ip}] Starting ScyllaDB Database Service on leader node (establishing Raft group0)...")
         run_checked_cmd(leader_ip, "systemctl restart hydra-db")
         _wait_hydra_db_active(leader_ip)
         _wait_hydra_db_cql(leader_ip)
 
-        # Restore the full cluster seed list for consistency with the rest of the nodes'
-        # config (Scylla itself doesn't re-read this after its initial group0 bootstrap).
-        full_seed_env = f"HYDRA_DB_SEEDS={seed_ips}\nHYDRA_DB_LISTEN={leader_ip}\n"
-        full_seed_env_b64 = base64.b64encode(full_seed_env.encode()).decode()
-        run_remote_spark(leader_ip, f"echo {full_seed_env_b64} | base64 -d > /etc/hci/hydra/cassandra.env")
+        # Restore the full cluster seed list in the Quadlet for consistency with the rest of
+        # the nodes' config (Scylla itself doesn't re-read --seeds after its initial group0
+        # bootstrap, so this only matters for future restarts picking up the right unit file).
+        run_remote_spark(leader_ip, f"sed -i 's/--seeds [0-9.,]*/--seeds {seed_ips}/' /etc/containers/systemd/hydra-db.container && systemctl daemon-reload")
 
         scylla_follower_ips = [ip for ip in non_witness_ips if ip != leader_ip]
         if scylla_follower_ips:
@@ -1499,6 +1500,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         zk_healthy = True
         leaders = 0
         followers = 0
+        observers = 0
         for ip in ips:
             zk_cmd = "python3 -c \"import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 2181)); s.sendall(b'stat'); print(s.recv(1024).decode('utf-8', errors='ignore'))\""
             rc_zk, out_zk, _ = run_remote_spark(ip, zk_cmd)
@@ -1512,11 +1514,18 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     leaders += 1
                 elif mode == "follower":
                     followers += 1
+                elif mode == "observer":
+                    observers += 1
             else:
                 print(f"  [{ip}] [ERROR] ZooKeeper consensus check failed: {out_zk}")
                 zk_healthy = False
-        if not zk_healthy or leaders != 1 or followers != len(ips) - 1:
-            print(f"[ERROR] ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}")
+        # Only the first 3 nodes are voting ensemble members (leader + followers); any
+        # nodes beyond that are configured as non-voting observers, which is a healthy,
+        # expected state for 4+-node clusters, not a quorum problem.
+        expected_voters = min(len(ips), 3)
+        expected_observers = max(0, len(ips) - 3)
+        if not zk_healthy or leaders != 1 or followers != expected_voters - 1 or observers != expected_observers:
+            print(f"[ERROR] ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}, Observers: {observers}")
             sys.exit(1)
 
         print("Verifying Linstor satellite node connections...")
@@ -1831,6 +1840,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("Checking ZooKeeper consensus quorum...")
         leaders = 0
         followers = 0
+        observers = 0
         zk_healthy = True
         for ip in ips:
             zk_cmd = "python3 -c \"import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 2181)); s.sendall(b'stat'); print(s.recv(1024).decode('utf-8', errors='ignore'))\""
@@ -1844,10 +1854,16 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     leaders += 1
                 elif mode == "follower":
                     followers += 1
+                elif mode == "observer":
+                    observers += 1
             else:
                 zk_healthy = False
-        if not zk_healthy or leaders != 1 or followers != len(ips) - 1:
-            print(f"[ERROR] Cluster start verification failed: ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}")
+        # Only the first 3 nodes are voting ensemble members; nodes beyond that are
+        # configured as non-voting observers, a healthy state for 4+-node clusters.
+        expected_voters = min(len(ips), 3)
+        expected_observers = max(0, len(ips) - 3)
+        if not zk_healthy or leaders != 1 or followers != expected_voters - 1 or observers != expected_observers:
+            print(f"[ERROR] Cluster start verification failed: ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}, Observers: {observers}")
             sys.exit(1)
         print("  ZooKeeper quorum is healthy.")
 
