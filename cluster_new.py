@@ -326,10 +326,13 @@ def run_destroy_flow(ips):
         if out2.strip() or err2.strip():
             print(f"[{ip}] Image Volume Unmount Output: {out2 or err2}")
 
-    # 4. Bring down DRBD resources
+    # 4. Bring down DRBD resources, then verify they're actually gone. A best-effort teardown
+    # under a hard `timeout` can leave a resource half torn-down (device still held), which
+    # silently poisons the LVM wipe in Phase 5 with residue that a later `create` collides
+    # with as "Device or resource busy" on lvcreate.
     print("\n--- Phase 4: Bringing down DRBD Resources ---")
     drbd_down_cmd = (
-        "timeout 15 sh -c \""
+        "timeout 20 sh -c \""
         "drbdsetup status | grep -v '^[[:space:]]' | grep -v '^#' | while read -r line; do "
         "  res=\\$(echo \\\"\\$line\\\" | awk '{print \\$1}'); "
         "  if [ ! -z \\\"\\$res\\\" ]; then "
@@ -346,15 +349,51 @@ def run_destroy_flow(ips):
         if rc != 0:
             print(f"[{ip}] [WARNING] Failed to stop DRBD: {err}")
 
-    # 5. Wipe LVM vg/thin-pool and disk signatures dynamically - skipped on witness
+        out_chk = ""
+        for attempt in range(10):
+            rc_chk, out_chk, _ = run_remote_spark(ip, "ls /dev/drbd[0-9]* 2>/dev/null || true")
+            if not out_chk.strip():
+                break
+            print(f"[{ip}] DRBD devices still present ({out_chk.strip()}), forcing down (attempt {attempt + 1}/10)...")
+            run_remote_spark(ip, "drbdsetup down all || true")
+            time.sleep(2)
+        else:
+            print(f"[{ip}] [WARNING] DRBD devices still present after forced teardown: {out_chk.strip()}")
+
+    # 5. Wipe LVM vg/thin-pool and disk signatures dynamically - skipped on witness.
+    # Retries with verification because device release after a DRBD teardown can lag by a
+    # few seconds even once drbdsetup reports success, and a single-shot `|| true` chain
+    # would otherwise silently leave stale device-mapper entries behind.
     print("\n--- Phase 5: Wiping LVM Pools & Disk Signatures ---")
+    lvm_wipe_cmd = (
+        "lvchange -an -f /dev/vg_aether/* 2>/dev/null || true; "
+        "lvremove -y -f vg_aether 2>/dev/null || true; "
+        "vgremove -y -f vg_aether 2>/dev/null || true; "
+        "rm -rf /dev/vg_aether || true; "
+        "dmsetup ls 2>/dev/null | grep -Ei 'vg_aether|linstor' | awk '{print $1}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done"
+    )
     for ip in non_witness_ips:
         print(f"[{ip}] Removing LVM thin pool 'thin_pool_aether' and VG 'vg_aether'...")
-        rc, out, err = run_remote_spark(ip, "lvchange -an -f /dev/vg_aether/* || true; lvremove -y -f vg_aether || true; vgremove -y -f vg_aether || true; rm -rf /dev/vg_aether || true; dmsetup ls | grep vg_aether | awk '{print $1}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done")
-        if out.strip():
-            print(f"[{ip}] LVM VG removal log:\n{out}")
-        if rc != 0:
-            print(f"[{ip}] [WARNING] LVM VG removal failed: {err}")
+        out_dm = ""
+        for attempt in range(5):
+            rc, out, err = run_remote_spark(ip, lvm_wipe_cmd)
+            if out.strip():
+                print(f"[{ip}] LVM VG removal log:\n{out}")
+            if rc != 0:
+                print(f"[{ip}] [WARNING] LVM VG removal failed: {err}")
+            rc_dm, out_dm, _ = run_remote_spark(ip, "dmsetup ls 2>/dev/null | grep -Ei 'vg_aether|linstor' || true")
+            if not out_dm.strip():
+                break
+            print(f"[{ip}] Residual device-mapper entries found ({out_dm.strip()}), retrying wipe (attempt {attempt + 1}/5)...")
+            time.sleep(2)
+        else:
+            print(f"[{ip}] [ERROR] Could not fully clear stale LVM/device-mapper state: {out_dm.strip()}")
+            print(f"[{ip}] [ERROR] A subsequent 'create' would fail on lvcreate with 'Device or resource busy'. "
+                  f"Aborting now instead of wasting a full create attempt.")
+            print(f"[{ip}] [ERROR] Manual recovery: SSH in and run `dmsetup ls | grep -Ei 'vg_aether|linstor'` "
+                  f"to see what's still held, force-remove each with `dmsetup remove -f <name>`, "
+                  f"or reboot the node if the device stays wedged.")
+            sys.exit(1)
 
     wipe_devices_script = """
 import subprocess, json, sys, os
@@ -1289,27 +1328,23 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         if not zk_set:
             print("[WARNING] Could not write cluster state to ZooKeeper.")
 
-        print("Starting ScyllaDB Database Service on non-witness nodes in parallel...")
-        run_parallel_checked(non_witness_ips, "systemctl restart hydra-db")
-        for ip in non_witness_ips:
+        def _wait_hydra_db_active(ip):
             for _ in range(40):
                 rc, out, _ = run_remote_spark(ip, "systemctl is-active hydra-db")
                 if rc == 0 and out.strip() == "active":
-                    break
+                    return
                 time.sleep(1)
-            else:
-                print(f"[ERROR] hydra-db failed to start on {ip}")
-                sys.exit(1)
+            print(f"[ERROR] hydra-db failed to start on {ip}")
+            sys.exit(1)
 
-        print("Waiting for ScyllaDB to listen on port 9042 on non-witness nodes...")
-        for ip in non_witness_ips:
+        def _wait_hydra_db_cql(ip):
             print(f"[{ip}] Waiting for ScyllaDB to listen on port 9042...")
             last_progress = None
             for i in range(600):
                 rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9042")
                 if rc == 0 and "9042" in out:
-                    break
-                
+                    return
+
                 # Check and print bootstrap/repair progress every 10 seconds
                 if i % 10 == 0:
                     progress = get_scylla_bootstrap_progress(ip)
@@ -1317,9 +1352,29 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                         print(f"[{ip}] ScyllaDB Bootstrap Status: {progress}")
                         last_progress = progress
                 time.sleep(1)
-            else:
-                print(f"[ERROR] ScyllaDB port 9042 timeout on {ip}")
-                sys.exit(1)
+            print(f"[ERROR] ScyllaDB port 9042 timeout on {ip}")
+            sys.exit(1)
+
+        # ScyllaDB uses Raft to establish its internal "group0" management cluster on first
+        # boot. Starting every node's hydra-db simultaneously races them all into "Discovering
+        # group0..." with none willing to bootstrap it, deadlocking the whole cluster. The
+        # leader must fully establish group0 (i.e. be listening on 9042) before any other
+        # node starts, so the rest join an already-existing group0 instead of racing to create one.
+        print(f"[{leader_ip}] Starting ScyllaDB Database Service on leader node (establishing Raft group0)...")
+        run_checked_cmd(leader_ip, "systemctl restart hydra-db")
+        _wait_hydra_db_active(leader_ip)
+        _wait_hydra_db_cql(leader_ip)
+
+        scylla_follower_ips = [ip for ip in non_witness_ips if ip != leader_ip]
+        if scylla_follower_ips:
+            print("Starting ScyllaDB Database Service on remaining non-witness nodes in parallel...")
+            run_parallel_checked(scylla_follower_ips, "systemctl restart hydra-db")
+            for ip in scylla_follower_ips:
+                _wait_hydra_db_active(ip)
+
+            print("Waiting for ScyllaDB to listen on port 9042 on remaining non-witness nodes...")
+            for ip in scylla_follower_ips:
+                _wait_hydra_db_cql(ip)
 
         print("Starting Daruk query proxy service on non-witness nodes...")
         run_parallel_checked(non_witness_ips, "systemctl restart daruk")
