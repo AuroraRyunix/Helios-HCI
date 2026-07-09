@@ -378,14 +378,19 @@ def run_destroy_flow(ips):
         if rc != 0:
             print(f"[{ip}] [WARNING] Failed to stop DRBD: {err}")
 
+        # A backing-disk I/O error mid-teardown (thin-pool hiccups under repeated rapid
+        # wipe/create cycles) can make the kernel's own local-io-error -> Diskless -> StandAlone
+        # detach sequence take well over a minute to settle on its own. A short retry window
+        # gives up before that resolves and leaves a genuinely-clearing-itself device looking
+        # permanently stuck, so this polls generously (up to 90s) rather than failing fast here.
         out_chk = ""
-        for attempt in range(10):
+        for attempt in range(30):
             rc_chk, out_chk, _ = run_remote_spark(ip, "ls /dev/drbd[0-9]* 2>/dev/null || true")
             if not out_chk.strip():
                 break
-            print(f"[{ip}] DRBD devices still present ({out_chk.strip()}), forcing down (attempt {attempt + 1}/10)...")
-            run_remote_spark(ip, "drbdsetup down all || true")
-            time.sleep(2)
+            print(f"[{ip}] DRBD devices still present ({out_chk.strip()}), forcing down (attempt {attempt + 1}/30)...")
+            run_remote_spark(ip, "drbdsetup down all || true; drbdadm down all || true")
+            time.sleep(3)
         else:
             print(f"[{ip}] [WARNING] DRBD devices still present after forced teardown: {out_chk.strip()}")
 
