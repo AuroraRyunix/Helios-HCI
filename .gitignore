@@ -9,3 +9,14 @@ diagnostics.log
 node2_scylla_full.log
 mcli-runner.bak
 spark_daemon_decoded.py.bak
+
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.der
+
+# Rust build artifacts
+agahnim/target/

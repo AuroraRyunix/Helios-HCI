@@ -1,8 +1,8 @@
 # Helios-HCI: Containerized Hyper-Converged Infrastructure Stack
 
-Helios-HCI is a lightweight, containerized Hyper-Converged Infrastructure (HCI) software-defined datacenter stack inspired by Nutanix, built directly on Enterprise Linux (EL) 10.2 hypervisor hosts. 
+Helios-HCI is a self-hosted, containerized Hyper-Converged Infrastructure (HCI) / private-cloud stack inspired by Nutanix's architecture (every component below is named after a Nutanix subsystem analog), built directly on Enterprise Linux (EL) 10.2 hypervisor hosts.
 
-It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, storage, configuration, and orchestration daemons inside lightweight Podman containers and native systemd daemons directly on host kernels.
+It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, storage, configuration, and orchestration daemons inside lightweight Podman containers and native systemd daemons directly on host kernels, rather than running a separate management VM per node.
 
 > [!WARNING]
 > **Secure Boot Requirement:** 
@@ -10,7 +10,89 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 
 ---
 
-## 1. Component Mappings (Helios vs. Nutanix)
+## 1. Tech Stack
+
+* **Orchestration/control-plane code**: Python 3 (stdlib-heavy; no `requirements.txt` — dependencies, e.g. `paramiko` for `deploy_updates.py` and the `cassandra-driver` for `daruk.py`, are assumed present on the EL10.2 host image).
+* **Console proxy sidecar**: Rust (`agahnim/`, Tokio + `tokio-tungstenite` + `tokio-rustls`) — a native systemd service (not a container) that proxies VNC/SPICE WebSocket console traffic.
+* **Frontend**: Vanilla HTML/CSS/JS under `static/` (no build step), with vendored noVNC (`static/novnc/`), SPICE-HTML5 (`static/spice-html5/`), and pako (`static/vendor/pako/`).
+* **Deployment model**: Podman Quadlets — most services are defined as `.container` unit files that `provision.py` writes to `/etc/containers/systemd/` on each node; `agahnim` and `daruk` run as plain native `systemd` units instead (see [docs/deployment.md](./docs/deployment.md)).
+* **Data & consensus**: ScyllaDB ("Hydra", Cassandra-compatible, port `9042`) for cluster/VM metadata, and Apache ZooKeeper ("Odin"/"Zeus", port `2181`) for distributed consensus and leader election.
+* **Storage**: Linstor + DRBD ("Aether") for replicated block storage (this replaced an earlier GlusterFS-based design — no GlusterFS code remains in the current tree).
+* **Ingress**: Traefik ("Slate") terminating all client-facing WebUI/API/console traffic on port `443`.
+* **No CI**: there is no `.github/workflows` directory — tests and deploys are run manually (see [docs/setup-guide.md](./docs/setup-guide.md) and [TODO.md](./TODO.md)).
+
+---
+
+## 2. Quick Start (Provisioning a New Cluster)
+
+`provision.py` is the cluster bootstrapper. It SSHes into a set of nodes (currently reachable via temporary/DHCP IPs), assigns them static IPs, and pushes every Helios daemon/CLI plus the Podman Quadlet unit files needed to run the stack. It reads its inputs either interactively (it will prompt) or from environment variables, and supports one flag:
+
+```bash
+# Optional: force provisioning even if a node's hostname already matches
+# the "Valkyrie-XXXXXX" pattern (i.e. re-provision an already-named host)
+python3 provision.py --force
+```
+
+Non-interactive invocation (matches the environment variables `provision.py` actually reads):
+
+```bash
+export HELIOS_PASSWORD="<root password shared by all nodes>"
+export HELIOS_DHCP_IPS="192.168.1.50,192.168.1.51,192.168.1.52"   # current/temporary node IPs
+export HELIOS_STATIC_IPS="10.10.102.220,10.10.102.222,10.10.102.223"  # desired static IPs
+export HELIOS_VIP="10.10.102.130"     # floating cluster VIP
+export HELIOS_PREFIX="24"             # netmask prefix (auto-detected from the first DHCP node if omitted)
+export HELIOS_GATEWAY="10.10.102.1"   # default gateway (auto-detected if omitted)
+
+python3 provision.py
+```
+
+`provision.py` reassigns static IPs/hostnames, installs Podman/DRBD/Linstor packages, builds and installs `agahnim` (Rust) from source, base64-decodes and writes every daemon/CLI it embeds (see [docs/AGENTS.md](./docs/AGENTS.md) for the `*_B64` embedding mechanism), and writes the Quadlet unit files. On success it prints the exact follow-up command to run on the first node to actually bring the cluster online, e.g.:
+
+```bash
+ssh root@10.10.102.220
+cluster -s 10.10.102.220,10.10.102.222,10.10.102.223 --redundancy_factor=1 --vip=10.10.102.130 create
+```
+
+From there, use the `cluster` CLI (section 5.E below) for day-2 lifecycle operations (`status`, `start`, `stop`, `destroy`). For the full bootstrap sequence and HA failover policy, see [docs/cluster.md](./docs/cluster.md) and [docs/deployment.md](./docs/deployment.md).
+
+---
+
+## 3. Directory Structure
+
+```
+Helios-HCI/
+├── agahnim/              # Rust WebSocket console-proxy sidecar (Tokio), builds to /usr/local/bin/agahnim
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── docs/                 # Architecture guides, per-daemon narrative/technical docs, audit backlog
+│   └── history/          # Superseded point-in-time changelogs (walkthrough.md, task.md, readme_old.md)
+├── slate_config/         # Traefik ("Slate") static + dynamic config (traefik.yml, dynamic.yml)
+├── static/                # WebUI frontend (vanilla HTML/CSS/JS), no build step
+│   ├── novnc/            # Vendored noVNC client
+│   ├── spice-html5/       # Vendored SPICE-HTML5 client
+│   └── vendor/pako/       # Vendored pako (zlib) JS library
+├── Dockerfile             # Builds the Spectrum WebUI container image (see docs/AGENTS.md for the
+│                          #   server.py copy-rename indirection this depends on)
+├── provision.py           # Cluster bootstrap/provisioner CLI (embeds base64 copies of ~19 daemons/CLIs)
+├── sync_provision.py      # Re-encodes source files into provision.py's *_B64 constants (run after
+│                          #   editing any embedded daemon/CLI — never hand-edit the *_B64 strings)
+├── spectrum_server.py     # Main WebUI/REST API backend ("Spectrum")
+├── cluster_new.py         # `cluster` CLI (create/status/start/stop/destroy)
+├── valcli.py, catalyst.py, vali.py, dagur.py, mimir.py, spark.py,
+│   spark_daemon_decoded.py, gatoway.py, urbosa.py, urbosa_bootstrap.py,
+│   bifrost.py, mipha.py, hylia.py, logos.py, daruk.py, lanayru.py   # Daemons/CLIs, see component table below
+├── catcli, mcli, mcli-runner, nodetool, allssh   # Companion CLIs/wrappers (non-.py)
+├── check_updates.py, create_upgrade_zip.py,
+│   deploy_updates.py      # Update pipeline (check → build zip → roll out over SSH/paramiko)
+├── push_to_github.py       # Manual GitHub Contents-API uploader (reads GITHUB_TOKEN)
+├── test_hylia.py           # unittest suite for Hylia (`python -m unittest test_hylia.py`)
+├── TODO.md                 # Roadmap and technical-debt backlog
+└── README.md
+```
+
+---
+
+## 4. Component Mappings (Helios vs. Nutanix)
 
 | Helios Service | Nutanix Equivalent | Technology Used | Description |
 | :--- | :--- | :--- | :--- |
@@ -19,7 +101,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 | [Odin](./docs/odin.md) / [ZooKeeper](./docs/zookeeper.md) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
-| [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed storage engine (transitioning from GlusterFS). |
+| [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed replicated block storage engine (replaced an earlier GlusterFS-based design). |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Catalyst](./docs/catalyst.md) | **Task Orchestrator** | Native Python service | Centralized task manager scheduling and tracking long-running asynchronous cluster operations. |
 | [Slate](./docs/slate.md) | **Edge Ingress / Reverse Proxy** | Podman + Traefik | High-performance edge reverse proxy routing WebUI, API, VNC, and SPICE console traffic same-origin on port 443. |
@@ -35,7 +117,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 
 ---
 
-## 2. Command-Line Interface (CLI) Reference
+## 5. Command-Line Interface (CLI) Reference
 
 Helios-HCI exposes several CLI utilities on host consoles to manage, monitor, and query cluster components.
 
@@ -122,13 +204,13 @@ Orchestrate cluster-wide lifecycle commands:
 # Bootstrap a 3-node cluster with virtual IP 10.10.102.240
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
 
-# Query cluster-wide status (verbose logs GlusterFS bricks and daemons)
+# Query cluster-wide status (verbose includes Aether/Linstor peer and volume info)
 cluster status --verbose
 
 # Start all containerized and native services across the cluster
 cluster start
 
-# Stop all containerized and native services and unmount GlusterFS volumes
+# Stop all containerized and native services, wait for DRBD sync, and unmount Aether/Linstor volumes
 cluster stop
 
 # Wipe cluster configurations, databases, and formats claimed drives
@@ -138,7 +220,7 @@ For detailed creation workflows and HA failover policies, see [cluster.md](./doc
 
 ---
 
-## 3. Directory Layout (Configuration & Certs)
+## 6. Directory Layout (Configuration & Certs)
 
 All configuration parameters and certificates reside under standardized directories:
 * `/etc/hci/` - Root configuration directory.
@@ -150,11 +232,11 @@ All configuration parameters and certificates reside under standardized director
 
 ---
 
-## 4. Cluster Network Architecture
+## 7. Cluster Network Architecture
 
 Helios-HCI uses a lightweight, secure network layout for inter-node orchestration, consensus, and storage replication:
 
-* **Localhost Bindings**: Internal service APIs (like Catalyst task queue on `9091` and Vali scheduler on `9095`) bind strictly to `127.0.0.1` to enforce local-only access.
+* **Host-Network Service Ports**: Internal service APIs (Catalyst task queue on `9091`, Vali scheduler on `9095`) run in Quadlet containers with `Network=host` and bind to `0.0.0.0`, so they are reachable on the cluster network from any host that can route to them — there is no loopback-only restriction or request-level authentication in these handlers today (see [TODO.md](./TODO.md)).
 * **Mutual TLS (mTLS) Mesh**: All cross-node administrative tasks and remote executions run securely over port `9099` via the **Spark Daemon**.
 * **Consensus & Metadata Mesh**: Database gossip (ScyllaDB on `7000`) and consensus election (ZooKeeper on `2888`/`3888`) route over cluster-facing networks.
 * **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Slate ingress on port `443`.
@@ -167,8 +249,8 @@ flowchart TB
         Slate1["Slate (Edge Ingress)<br>Port 443"]
         Spectrum1["Spectrum (WebUI/API)<br>Port 8443"]
         Agahnim1["Agahnim (Console Proxy)<br>Port 8081"]
-        Catalyst1["Catalyst (Orchestrator)<br>Port 9091 (Localhost)"]
-        Vali1["Vali (VM Scheduler/DRS)<br>Port 9095 (Localhost)"]
+        Catalyst1["Catalyst (Orchestrator)<br>Port 9091 (host network)"]
+        Vali1["Vali (VM Scheduler/DRS)<br>Port 9095 (host network)"]
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK1["ZooKeeper (Consensus)<br>Port 2181"]
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
@@ -212,7 +294,7 @@ For a complete reference of network scopes, port allocations, and communication 
 
 ---
 
-## 5. High-Availability & Robustness Enhancements
+## 8. High-Availability & Robustness Enhancements
 
 The stack has been enhanced with enterprise-grade resiliency and health-based routing:
 
@@ -221,11 +303,17 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 * **Task API Queue Cache**: If ScyllaDB encounters brief connection latency or quorum shifts, Spectrum serves Catalyst tasks from an in-memory fallback cache to prevent UI progress bars from flickering or resetting to grey.
 * **Streamlined Reboot Coordination**: Graceful VM evacuation and host transitions are fully isolated. The reboot sequence relies on the prior maintenance phase to gracefully migrate VMs, leaving the host-level `spark-daemon` active to process remote hardware reboot calls reliably.
 
+---
 
+## 9. Documentation
 
-## 4. System Architecture Maps & Flowcharts
-
-For a visual breakdown of the Helios-HCI system architecture, process boundaries, and execution flows:
-*   [Workspace File Mindmap](./file_mindmap.md) - Mindmap of the files and directories structure in the workspace.
-*   [Master Technical Mindmap](./docs/master_technical_mindmap.md) - High-level taxonomy map of all Helios-HCI components.
-*   [Master System Flowchart](./docs/master_flowchart.md) - System-wide flowchart illustrating database boundaries, mTLS API calls, and socket loops.
+* [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
+* [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
+* [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
+* [docs/deployment.md](./docs/deployment.md) - The Podman Quadlet deployment model and the update-rollout pipeline.
+* [docs/setup-guide.md](./docs/setup-guide.md) - Local dev prerequisites and workflow.
+* [docs/hci_master_architecture_guide.md](./docs/hci_master_architecture_guide.md) - The deepest existing architecture reference (1500+ lines).
+* [docs/audit_findings.md](./docs/audit_findings.md) - Actively-maintained backlog of known architectural gaps and edge cases.
+* [Master Technical Mindmap](./docs/master_technical_mindmap.md) - High-level taxonomy map of all Helios-HCI components.
+* [Master System Flowchart](./docs/master_flowchart.md) - System-wide flowchart illustrating database boundaries, mTLS API calls, and socket loops.
+* [TODO.md](./TODO.md) - Roadmap and technical-debt backlog.
