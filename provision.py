@@ -677,7 +677,7 @@ AddCapability=CAP_NET_ADMIN
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/spark-daemon.container", spark_svc)
-            node.execute("systemctl daemon-reload && systemctl enable spark-daemon")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Bifrost Daemon
             node.write_file("/usr/local/bin/bifrost", base64.b64decode(BIFROST_B64).decode('utf-8'))
@@ -699,7 +699,7 @@ AddCapability=CAP_NET_ADMIN
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/bifrost.container", bifrost_svc)
-            node.execute("systemctl daemon-reload && systemctl enable bifrost")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Dagur task scheduler
             node.write_file("/usr/local/bin/dagur", base64.b64decode(DAGUR_CLI_B64).decode('utf-8'))
@@ -720,7 +720,7 @@ Exec=/usr/local/bin/dagur
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/dagur.container", dagur_svc)
-            node.execute("systemctl daemon-reload && systemctl enable dagur")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Mimir Daemon
             node.write_file("/usr/local/bin/mimir", base64.b64decode(MIMIR_CLI_B64).decode('utf-8'))
@@ -749,7 +749,7 @@ Exec=/usr/local/bin/mimir
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/mimir.container", mimir_svc)
-            node.execute("systemctl daemon-reload && systemctl enable mimir")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Vali Daemon
             node.write_file("/usr/local/bin/vali", base64.b64decode(VALI_CLI_B64).decode('utf-8'))
@@ -771,7 +771,7 @@ Exec=/usr/local/bin/vali
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/vali.container", vali_svc)
-            node.execute("systemctl daemon-reload && systemctl enable vali")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Gatoway Daemon
             node.write_file("/usr/local/bin/gatoway", base64.b64decode(GATOWAY_B64).decode('utf-8'))
@@ -793,7 +793,7 @@ AddCapability=CAP_NET_ADMIN
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/gatoway.container", gatoway_svc)
-            node.execute("systemctl daemon-reload && systemctl enable gatoway")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Urbosa Daemon
             node.write_file("/usr/local/bin/urbosa", base64.b64decode(URBOSA_B64).decode('utf-8'))
@@ -815,7 +815,7 @@ AddCapability=CAP_NET_ADMIN
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/urbosa.container", urbosa_svc)
-            node.execute("systemctl daemon-reload && systemctl enable urbosa")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Logos Daemon
             node.write_file("/usr/local/bin/logos", base64.b64decode(LOGOS_CLI_B64).decode('utf-8'))
@@ -838,7 +838,7 @@ Exec=/usr/local/bin/logos
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/logos.container", logos_svc)
-            node.execute("systemctl daemon-reload && systemctl enable logos")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Mipha Daemon
             node.write_file("/usr/local/bin/mipha", base64.b64decode(MIPHA_CLI_B64).decode('utf-8'))
@@ -894,7 +894,7 @@ User=root
 Environment=PYTHONUNBUFFERED=1
 """
             node.write_file("/etc/systemd/system/daruk.service", daruk_svc)
-            node.execute("systemctl daemon-reload && systemctl enable mipha")
+            node.execute("systemctl daemon-reload && systemctl enable daruk")
 
             # Deploy Catalyst Daemon
             node.write_file("/usr/local/bin/catalyst", base64.b64decode(CATALYST_CLI_B64).decode('utf-8'))
@@ -915,7 +915,7 @@ Exec=/usr/local/bin/catalyst
 WantedBy=multi-user.target
 '''
             node.write_file("/etc/containers/systemd/catalyst.container", catalyst_svc)
-            node.execute("systemctl daemon-reload && systemctl enable catalyst")
+            node.execute("systemctl daemon-reload")
 
             # Deploy Hylia Daemon
             yggdrasil_cli = base64.b64decode(HYLIA_B64).decode('utf-8')
@@ -944,7 +944,7 @@ Exec=/usr/local/bin/hylia
 WantedBy=multi-user.target
 """
             node.write_file("/etc/containers/systemd/hylia.container", yggdrasil_svc)
-            node.execute("systemctl daemon-reload && systemctl enable hylia")
+            node.execute("systemctl daemon-reload")
 
             # CLI helpers
             node.write_file("/usr/local/bin/catcli", base64.b64decode(CATCLI_B64).decode('utf-8'))
@@ -1268,7 +1268,6 @@ chmod 600 *.key
 
         print(f"[{node.ip}] Restarting services to pick up certificates...")
         try:
-            node.execute("systemctl enable spark-daemon")
             node.execute("systemctl restart spark-daemon")
         except Exception as e:
             print(f"[{node.ip}] Warning: Failed to restart spark-daemon: {e}")
