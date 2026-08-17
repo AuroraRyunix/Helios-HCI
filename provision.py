@@ -290,6 +290,39 @@ class RemoteNode:
         
         return exit_status, out_str, err_str
 
+    def check_secure_boot(self):
+        """Return 'enabled', 'disabled', or 'unknown' for this host's Secure Boot state.
+
+        DRBD is shipped as an out-of-tree kernel module (kmod-drbd9x from ELRepo). With
+        Secure Boot active and the ELRepo key not enrolled in the MOK database, the
+        module is refused at load time with "Key was rejected by service", which takes
+        the entire storage layer down. Detect it up front rather than discovering it
+        after the host has already been renamed, re-addressed and repackaged.
+        """
+        # Legacy/BIOS boot cannot have Secure Boot active at all.
+        _, firmware, _ = self.execute(
+            "test -d /sys/firmware/efi && echo efi || echo bios", check_exit=False)
+        if firmware.strip() == "bios":
+            return "disabled"
+
+        _, out, _ = self.execute("mokutil --sb-state 2>/dev/null", check_exit=False)
+        state = out.strip().lower()
+        if "disabled" in state:
+            return "disabled"
+        if "enabled" in state:
+            return "enabled"
+
+        # mokutil is not installed on a minimal image; read the EFI variable directly.
+        # The SecureBoot variable's final byte is 1 when enabled, 0 when disabled.
+        _, raw, _ = self.execute(
+            "od -An -t u1 /sys/firmware/efi/efivars/"
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -s ' '",
+            check_exit=False)
+        parts = raw.split()
+        if parts:
+            return "enabled" if parts[-1] == "1" else "disabled"
+        return "unknown"
+
     def write_file(self, path, content):
         """Write content to a file on the remote host using SFTP.
 
@@ -547,6 +580,27 @@ def main():
                 print(f"[FATAL] [{target_ip}] Could not connect to either target IP or DHCP IP {dhcp_ip}.")
                 return
 
+        # Pre-flight: refuse to provision a host that cannot load the DRBD module.
+        # This runs before the host is re-addressed, renamed or repackaged, so a failure
+        # here leaves the node exactly as it was found.
+        sb_state = node.check_secure_boot()
+        if sb_state == "enabled":
+            print(f"[FATAL] [{connected_ip}] Secure Boot is ENABLED on this host. Refusing to provision.")
+            print(f"[{connected_ip}]   DRBD ships as an out-of-tree kernel module (kmod-drbd9x). With Secure Boot")
+            print(f"[{connected_ip}]   active and the ELRepo key not enrolled, 'modprobe drbd' is refused with")
+            print(f"[{connected_ip}]   \"Key was rejected by service\" and the entire storage layer is dead.")
+            print(f"[{connected_ip}]   Resolve it in one of two ways, then re-run this provisioner:")
+            print(f"[{connected_ip}]     1. Disable Secure Boot in the host/VM firmware settings (simplest), or")
+            print(f"[{connected_ip}]     2. Enroll the ELRepo signing key and reboot to confirm at the console:")
+            print(f"[{connected_ip}]        mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
+            print(f"[{connected_ip}]   Nothing on this node has been modified.")
+            node.close()
+            return
+        elif sb_state == "unknown":
+            print(f"[{connected_ip}] [WARNING] Could not determine Secure Boot state (mokutil absent and EFI")
+            print(f"[{connected_ip}]           variable unreadable). Continuing, but if 'modprobe drbd' fails")
+            print(f"[{connected_ip}]           with \"Key was rejected by service\", Secure Boot is the cause.")
+
         # NMCLI static IP migration
         if connected_ip != target_ip:
             try:
@@ -614,7 +668,23 @@ def main():
                 node.execute(cmd, check_exit=True)
 
             print(f"[{node.ip}] Loading DRBD kernel module...")
-            node.execute("modprobe drbd || true")
+            # Not `|| true`: if the module will not load, every storage operation from
+            # here on is broken, and swallowing it only defers the failure to a much
+            # more confusing point. The Secure Boot pre-flight catches the common cause
+            # before provisioning starts; this catches the rest (missing kmod build for
+            # the running kernel, ELRepo install failure above, etc.).
+            rc_drbd, out_drbd, err_drbd = node.execute("modprobe drbd", check_exit=False)
+            if rc_drbd != 0:
+                detail = (err_drbd or out_drbd).strip()
+                print(f"[FATAL] [{node.ip}] Could not load the DRBD kernel module: {detail}")
+                if "key was rejected" in detail.lower():
+                    print(f"[{node.ip}]   This is Secure Boot rejecting the unsigned out-of-tree module.")
+                    print(f"[{node.ip}]   Disable Secure Boot in firmware, or enroll the ELRepo key with:")
+                    print(f"[{node.ip}]     mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
+                else:
+                    print(f"[{node.ip}]   Check that kmod-drbd9x matches the running kernel ({{uname -r}}):")
+                    print(f"[{node.ip}]     dnf install -y kmod-drbd9x && uname -r && rpm -q kmod-drbd9x")
+                raise Exception(f"DRBD kernel module failed to load on {node.ip}: {detail}")
 
             print(f"[{node.ip}] Enabling KVM ignore_msrs for nested virtualization stability...")
             node.execute("echo 'options kvm ignore_msrs=Y' > /etc/modprobe.d/kvm.conf")
