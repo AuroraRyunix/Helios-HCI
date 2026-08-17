@@ -1,5 +1,6 @@
 __build__ = "1.2.2"
 import os
+import re
 import uuid
 import sys
 import json
@@ -92,7 +93,14 @@ def is_authenticated(handler):
     if not session_token:
         print(f"[AUTH DEBUG] Path: {handler.path} | No session token found", flush=True)
         return False
-        
+
+    # Reject anything that is not a token this server could have issued, before
+    # it is ever interpolated into a CQL statement. This is pre-authentication,
+    # attacker-controlled input taken from a header, query string or cookie.
+    if not is_valid_session_token(session_token):
+        print(f"[AUTH DEBUG] Path: {handler.path} | Malformed session token rejected", flush=True)
+        return False
+
     # Check session cache first
     now = time.time()
     if session_token in SESSION_CACHE:
@@ -119,6 +127,11 @@ def is_authenticated(handler):
         print(f"[AUTH DEBUG] Path: {handler.path} | Exception in auth: {e}", flush=True)
     return False
 
+# Hosts that upgrade packages may be downloaded from. The official update
+# service is always allowed; an operator running an internal mirror can add
+# hosts with a comma-separated UPDATE_MIRROR_HOSTS entry in spectrum.env.
+UPDATE_HOST_ALLOWLIST = {"updates-helios.zerotwo.cloud"}
+
 # Load local environment settings if available
 try:
     with open("/etc/hci/spectrum/spectrum.env", "r") as f:
@@ -127,6 +140,11 @@ try:
                 k, v = line.strip().split("=", 1)
                 if k == "LOCAL_HYPERVISOR_IP":
                     LOCAL_IP = v
+                elif k == "UPDATE_MIRROR_HOSTS":
+                    for mirror_host in v.split(","):
+                        mirror_host = mirror_host.strip().lower()
+                        if mirror_host:
+                            UPDATE_HOST_ALLOWLIST.add(mirror_host)
 except Exception:
     pass
 
@@ -321,6 +339,114 @@ def slugify_image_name(filename):
     slug = re.sub(r'-+', '-', slug)
     slug = slug.strip('-')
     return slug[:28]
+
+# --------------------------------------------------------------------------
+# Input validation at the API boundary
+#
+# VM names are interpolated straight into root shell commands (linstor and
+# virsh, executed via spark-daemon's /api/v1/execute with shell=True) and into
+# CQL statements. Unlike image names, which slugify_image_name() rewrites, a VM
+# name is a user-visible identity: silently mangling it would leave operators
+# looking at a VM that is not the one they asked for. So names are validated
+# and rejected instead.
+# --------------------------------------------------------------------------
+_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+VM_NAME_ERROR = (
+    "Invalid VM name. A name must be 1-63 characters, start with a letter or "
+    "digit, and contain only letters, digits, '.', '-' and '_'."
+)
+
+def is_valid_vm_name(name):
+    """True only for VM names that are safe to interpolate into shell/CQL."""
+    if not isinstance(name, str):
+        return False
+    return _VM_NAME_RE.match(name) is not None
+
+# Session tokens are minted by secrets.token_hex(32) in the login handler, i.e.
+# exactly 64 lowercase hex characters. Anything else is rejected before it can
+# reach a query: run_cql_query() falls back to piping raw text into cqlsh when
+# Daruk is unreachable, and cqlsh does execute ';'-separated statements, so an
+# unvalidated pre-auth token is stacked-CQL during any Daruk outage.
+_SESSION_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def is_valid_session_token(token):
+    """True only for tokens matching the format this server generates."""
+    if not isinstance(token, str):
+        return False
+    return _SESSION_TOKEN_RE.match(token) is not None
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+def validate_update_download_url(download_url):
+    """Restrict upgrade downloads to https on an allowlisted host.
+
+    urlopen() otherwise accepts file://, http:// and any host the caller names,
+    which is an arbitrary-read and SSRF primitive on a root-privileged service.
+    """
+    if not isinstance(download_url, str) or not download_url.strip():
+        return False, "Missing download_url in payload"
+    try:
+        parsed = urllib.parse.urlparse(download_url.strip())
+    except Exception:
+        return False, "Malformed download_url"
+    if parsed.scheme.lower() != "https":
+        return False, f"download_url must use https (got '{parsed.scheme or 'none'}')"
+    if parsed.username or parsed.password:
+        return False, "download_url must not contain embedded credentials"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False, "download_url has no host"
+    if host not in UPDATE_HOST_ALLOWLIST:
+        allowed = ", ".join(sorted(UPDATE_HOST_ALLOWLIST))
+        return False, (
+            f"download_url host '{host}' is not an allowed update source "
+            f"(allowed: {allowed}). Add an internal mirror with "
+            f"UPDATE_MIRROR_HOSTS in /etc/hci/spectrum/spectrum.env."
+        )
+    return True, ""
+
+def get_vm_disk_res_names(vm_name):
+    """Linstor resource-definition names backing a VM's disks."""
+    disks_list = ""
+    try:
+        rc, stdout, _ = run_cql_query(
+            f"SELECT JSON disks_list FROM hydra.vms WHERE name = '{vm_name}';"
+        )
+        if rc == 0:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        disks_list = json.loads(line).get("disks_list") or ""
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    num_disks = 1
+    if disks_list and disks_list.strip().upper() != "NONE":
+        parsed_disks = [d for d in disks_list.split(",") if d.strip()]
+        if parsed_disks:
+            num_disks = len(parsed_disks)
+    return [f"{vm_name}-disk{idx}" for idx in range(num_disks)]
+
+def set_vm_disks_two_primaries(vm_name, enabled):
+    """Toggle DRBD dual-primary on every disk of a VM.
+
+    Dual-primary is only legitimate for the live-migration hand-over window,
+    when source and target qemu both hold the device open. Outside that window
+    it means two qemu processes can write one raw device, which corrupts it, so
+    it is enabled immediately before a migration and disabled immediately after
+    rather than being set permanently at VM creation time.
+    """
+    value = "yes" if enabled else "no"
+    failures = []
+    for res_name in get_vm_disk_res_names(vm_name):
+        rc, out, err = run_linstor_cmd(
+            f"resource-definition drbd-options --allow-two-primaries {value} {res_name}"
+        )
+        if rc != 0:
+            failures.append(f"{res_name}: {(err or out or '').strip()}")
+    return failures
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
@@ -808,7 +934,8 @@ def init_db():
         boot_device text,
         network_id text,
         cpu_model text,
-        audio_enabled boolean
+        audio_enabled boolean,
+        status text
     );
     """
     create_containers_table = """
@@ -1151,6 +1278,10 @@ def init_db():
                 run_cql_query("ALTER TABLE hydra.vms ADD network_id text;")
                 run_cql_query("ALTER TABLE hydra.vms ADD cpu_model text;")
                 run_cql_query("ALTER TABLE hydra.vms ADD audio_enabled boolean;")
+                # 'status' holds the transient lifecycle lock (e.g. 'migrating') that vali.py
+                # sets around live migration. It is distinct from 'state' (Running/Stopped).
+                # Without this column the UPDATE fails and vali's migration guard never engages.
+                run_cql_query("ALTER TABLE hydra.vms ADD status text;")
                 
                 # Seeding default user 'helios' if users table is empty
                 rc_users, out_users, err_users = run_cql_query("SELECT username FROM hydra.users;")
@@ -1343,7 +1474,8 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
                 # Query DB or fallback to slugified name
                 iso_path = None
                 try:
-                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec}';")
+                    spec_esc = spec.replace("'", "''")
+                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec_esc}';")
                     if rc_img == 0 and stdout_img:
                         for line in stdout_img.splitlines():
                             if "/dev/" in line:
@@ -3467,7 +3599,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                 "path": fpath,
                                 "created_at": created_at
                             }
-                            cql_ins = f"INSERT INTO hydra.valhalla_images JSON '{json.dumps(image_meta)}';"
+                            image_meta_json = json.dumps(image_meta).replace("'", "''")
+                            cql_ins = f"INSERT INTO hydra.valhalla_images JSON '{image_meta_json}';"
                             run_cql_query(cql_ins)
                             db_images.append(image_meta)
                 except Exception as e:
@@ -3513,6 +3646,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             console_type = query_params.get("type", ["vnc"])[0]
             if not vm_name:
                 self.send_json(400, {"error": "Missing VM name"})
+                return
+            if not is_valid_vm_name(vm_name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             db_vm = None
@@ -3626,6 +3762,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if not host_ip or vnc_port is None:
                     # Fallback to legacy name-based lookup
                     if not vm_name:
+                        self.connection.close()
+                        return
+                    # The name below reaches both CQL and a virsh shell command.
+                    # The 101 response is already sent, so drop the connection
+                    # rather than trying to send a JSON error.
+                    if not is_valid_vm_name(vm_name):
+                        print(f"[WS Proxy] Rejecting malformed VM name in console request", flush=True)
                         self.connection.close()
                         return
 
@@ -3764,6 +3907,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 vm_name = query_params.get("name", [None])[0]
                 if not vm_name:
                     self.send_json(400, {"error": "Missing VM name"})
+                    return
+                if not is_valid_vm_name(vm_name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
                     return
 
                 db_vm = None
@@ -3957,7 +4103,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             session_token = cookie["session_id"].value
                     except Exception:
                         pass
-            if session_token:
+            # Same boundary as is_authenticated(): never build a query from a
+            # token that does not match the format this server issues.
+            if session_token and is_valid_session_token(session_token):
+                SESSION_CACHE.pop(session_token, None)
                 delete_cql = f"DELETE FROM hydra.sessions WHERE session_token = '{session_token}';"
                 run_cql_query(delete_cql)
             self.send_response(200)
@@ -4106,11 +4255,25 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 payload = json.loads(content.decode('utf-8'))
                 download_url = payload.get("download_url")
                 expected_sha256 = payload.get("sha256")
-                
-                if not download_url:
-                    self.send_json(400, {"error": "Missing download_url in payload"})
+
+                # Only https, only an allowlisted update host. Without this the
+                # caller picks any URL urlopen understands, including file://.
+                url_ok, url_err = validate_update_download_url(download_url)
+                if not url_ok:
+                    self.send_json(400, {"error": url_err})
                     return
-                
+                download_url = download_url.strip()
+
+                # The package hash is mandatory. It used to be optional, so a
+                # request that simply omitted "sha256" had its download handed
+                # to the installer completely unverified.
+                if not isinstance(expected_sha256, str) or not _SHA256_HEX_RE.match(expected_sha256.strip()):
+                    self.send_json(400, {
+                        "error": "A valid sha256 digest (64 hex characters) is required to download an update package."
+                    })
+                    return
+                expected_sha256 = expected_sha256.strip()
+
                 zip_path = "/tmp/helios_update.zip"
                 extract_dir = "/tmp/helios_update"
                 
@@ -4127,15 +4290,21 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 sha256_verifier = hashlib.sha256()
                 
                 with urllib.request.urlopen(req, timeout=60) as response:
+                    # urlopen follows redirects, so re-check where we actually
+                    # landed before trusting a byte of the response.
+                    final_ok, final_err = validate_update_download_url(response.geturl())
+                    if not final_ok:
+                        self.send_json(400, {"error": f"Update download redirected to a disallowed location. {final_err}"})
+                        return
                     with open(zip_path, "wb") as f_out:
                         while chunk := response.read(65536):
                             f_out.write(chunk)
                             sha256_verifier.update(chunk)
-                            
+
                 actual_sha256 = sha256_verifier.hexdigest()
-                
-                # 2. Check hash
-                if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+
+                # 2. Check hash (always -- expected_sha256 is validated above)
+                if actual_sha256.lower() != expected_sha256.lower():
                     self.send_json(400, {
                         "error": f"Downloaded package hash mismatch. Expected: {expected_sha256}, Got: {actual_sha256}"
                     })
@@ -4912,7 +5081,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 for h in hosts:
                     run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                     
-                # Configure DRBD options (allow two primaries, auto-resync policies)
+                # Configure DRBD options (auto-resync policies).
+                # Dual-primary is intentionally kept for image resources only:
+                # the golden image is attached to guests as a read-only cdrom
+                # (see generate_vm_xml), so VMs on several hosts open it at the
+                # same time and each host must hold Primary to do so. It is
+                # written exactly once, here, while this node is the only
+                # Primary. VM disks are read-write and must NOT get this.
                 run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
                 run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                 
@@ -4949,11 +5124,30 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         if progress - last_progress >= 5:
                             log_catalyst_task("valhalla", "upload_image", "processing", progress, {"filename": filename, "size_bytes": content_length}, task_id=task_id, created_at=created_at_ms)
                             last_progress = progress
-                
-                # Adjust block device permissions
-                run_remote_spark("127.0.0.1", f"chmod 666 {block_dev_path}")
-                
-                # Demote back to Secondary
+
+                    # Push our own buffers into the block device before anything
+                    # downstream demotes it or reads from another node.
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # A client that disconnects mid-upload just ends the read loop.
+                # Without this check the partial image was registered as valid
+                # and every VM cloned from a truncated disk.
+                if bytes_remaining != 0:
+                    raise Exception(
+                        f"Upload truncated: {bytes_remaining} of {content_length} bytes were never "
+                        f"received (client disconnected)."
+                    )
+
+                # Adjust block device permissions. 0660 root:qemu, not 0666:
+                # qemu/libvirt is the only consumer that needs the device, and
+                # world-writable let any local user or mapped container corrupt
+                # the golden image every VM is cloned from.
+                run_remote_spark("127.0.0.1", f"chown root:qemu {block_dev_path}")
+                run_remote_spark("127.0.0.1", f"chmod 0660 {block_dev_path}")
+
+                # Flush kernel buffers for the device, then demote to Secondary
+                run_remote_spark("127.0.0.1", f"sync && blockdev --flushbufs {block_dev_path}")
                 run_remote_spark("127.0.0.1", f"drbdadm secondary {res_name}")
                 
                 created_at = int(datetime.datetime.now().timestamp() * 1000)
@@ -4965,7 +5159,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "path": block_dev_path,
                     "created_at": created_at
                 }
-                cql = f"INSERT INTO hydra.valhalla_images JSON '{json.dumps(image_meta)}';"
+                # json.dumps escapes double quotes and backslashes but NOT single quotes,
+                # so a filename containing ' would break out of the CQL string literal.
+                image_meta_json = json.dumps(image_meta).replace("'", "''")
+                cql = f"INSERT INTO hydra.valhalla_images JSON '{image_meta_json}';"
                 run_cql_query(cql)
                 
                 # Complete catalyst task
@@ -4991,6 +5188,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 latency = float(payload["latency"])
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(vm_name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             import datetime
@@ -5105,6 +5306,12 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
 
+            # Validate before anything is created or written: this name is
+            # interpolated into root linstor/virsh shell commands and into CQL.
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
+                return
+
             task_id, created_at = log_catalyst_task("vm", "create", "processing", 10, {"vm_name": name})
 
             disks_parsed = []
@@ -5156,8 +5363,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     for h in hosts:
                         run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                         
-                    # 4. Set DRBD options (allow two primaries, split-brain policies)
-                    run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
+                    # 4. Set DRBD options (split-brain policies).
+                    # Dual-primary is deliberately NOT set here. Two nodes
+                    # holding Primary on a read-write VM disk means two qemu
+                    # processes can write one raw device, which corrupts it.
+                    # Live migration needs it only for the hand-over window, so
+                    # /api/vms/migrate enables it around that call and turns it
+                    # back off afterwards.
                     run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                     
                     if idx == 0:
@@ -5224,7 +5436,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
                 
-            cql_select = f"SELECT JSON path FROM hydra.valhalla_images WHERE name = '{name}';"
+            name_esc = name.replace("'", "''")
+            cql_select = f"SELECT JSON path FROM hydra.valhalla_images WHERE name = '{name_esc}';"
             rc, stdout, stderr = run_cql_query(cql_select)
             path_to_delete = None
             if rc == 0:
@@ -5236,7 +5449,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
             
-            cql_delete = f"DELETE FROM hydra.valhalla_images WHERE name = '{name}';"
+            cql_delete = f"DELETE FROM hydra.valhalla_images WHERE name = '{name_esc}';"
             run_cql_query(cql_delete)
             
             res_name = f"img-{slugify_image_name(name)}"
@@ -5272,6 +5485,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 iso = payload.get("iso", "")
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             task_id, created_at = log_catalyst_task("vm", "cdrom", "processing", 10, {"vm_name": name, "iso": iso})
@@ -5360,10 +5577,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
                 action = payload["action"]  # "start", "stop", "reset", "reboot", "shutdown"
-                
+
+                if not is_valid_vm_name(name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
+                    return
+
                 # Map actions
                 mapped_action = "on" if action == "start" else "off" if action == "stop" else action
-                
+
                 rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/power", {"name": name, "action": mapped_action})
                 if rc == 0 and "error" not in res:
                     new_state = "Running" if mapped_action in ["on", "reset", "reboot", "shutdown"] else "Stopped"
@@ -5393,8 +5614,44 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
                 target_host = payload["target_host"]
-                
-                rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
+
+                if not is_valid_vm_name(name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
+                    return
+
+                # Live migration is the one case where source and target qemu
+                # legitimately hold the same disk open at once, so DRBD
+                # dual-primary is enabled for exactly this window and turned
+                # back off as soon as the call returns. VM disks are no longer
+                # created with it permanently set.
+                enable_failures = set_vm_disks_two_primaries(name, True)
+                if enable_failures:
+                    self.send_json(500, {
+                        "error": "Failed to enable DRBD dual-primary for the migration window: "
+                                 + "; ".join(enable_failures)
+                    })
+                    return
+
+                two_primaries_still_on = False
+                rc, res, err = -1, {}, ""
+                try:
+                    rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
+                finally:
+                    # rc == -1 with an empty result means the mTLS call itself
+                    # failed or timed out; the migration may still be running on
+                    # the hypervisor, and revoking dual-primary underneath it
+                    # would break it. Leave it on in that case and say so.
+                    if rc == -1 and not res:
+                        two_primaries_still_on = True
+                        print(f"[MIGRATE] No definitive result for VM '{name}'; leaving DRBD dual-primary enabled. "
+                              f"Disable it manually once the migration settles.", flush=True)
+                    else:
+                        disable_failures = set_vm_disks_two_primaries(name, False)
+                        if disable_failures:
+                            two_primaries_still_on = True
+                            print(f"[MIGRATE] Failed to disable DRBD dual-primary for VM '{name}': "
+                                  f"{'; '.join(disable_failures)}", flush=True)
+
                 if rc == 0 and "error" not in res:
                     EVENT_LOGS.append({
                         "desc": f"VM '{name}' migration to node '{target_host}' initiated.",
@@ -5402,10 +5659,21 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     })
                     invalidate_status_cache()
 
+                    if two_primaries_still_on:
+                        res = dict(res)
+                        res["warning"] = ("DRBD dual-primary could not be disabled after migration. "
+                                          "Clear it manually before the VM is started elsewhere.")
                     self.send_json(200, res)
                 else:
                     err_msg = res.get("error", err)
-                    self.send_json(500, {"error": f"Failed to migrate VM: {err_msg}"})
+                    error_body = {"error": f"Failed to migrate VM: {err_msg}"}
+                    if two_primaries_still_on:
+                        error_body["warning"] = (
+                            "DRBD dual-primary is still enabled on this VM's disks because the migration "
+                            "result was indeterminate. If the migration is not still running, clear it with: "
+                            "linstor resource-definition drbd-options --allow-two-primaries no <vm>-disk<N>."
+                        )
+                    self.send_json(500, error_body)
                 return
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -5438,6 +5706,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 name = payload["name"]
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             task_id, created_at = log_catalyst_task("vm", "update", "processing", 10, {"vm_name": name})
@@ -5623,7 +5895,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             for h in hosts:
                                 run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                                 
-                            run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
+                            # No dual-primary here either: a disk added to a VM
+                            # is read-write and gets the same treatment as one
+                            # created by /api/vms/create.
                             run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                             
                             # Attach disk live to the running VM
@@ -5737,6 +6011,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 name = payload["name"]
             except Exception as e:
                 self.send_json(400, {"error": "Invalid payload"})
+                return
+
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             task_id, created_at = log_catalyst_task("vm", "delete", "processing", 10, {"vm_name": name})

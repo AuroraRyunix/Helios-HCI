@@ -6,6 +6,13 @@ import subprocess
 import base64
 import sys
 import os
+import ipaddress
+import tempfile
+
+# Distributed firewall rules live in their own chain so they can be rebuilt
+# wholesale each pass instead of being appended to FORWARD forever.
+FW_CHAIN = "URBOSA-FWD"
+FW_PROTOCOLS = ("ANY", "TCP", "UDP", "ICMP")
 
 def run_cmd(cmd):
     p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -88,6 +95,47 @@ def get_vip():
         pass
     return None
 
+def get_local_addresses():
+    """Returns the exact addresses configured on this host, one entry each.
+
+    Parsed rather than substring-matched: VIP 10.10.102.13 is a substring of
+    the unrelated host address 10.10.102.130, and a false leadership claim
+    stands up a duplicate T0 macvlan uplink IP on the physical network.
+    """
+    addrs = []
+    rc, stdout, _ = run_cmd("ip -json addr show")
+    if rc == 0 and stdout:
+        try:
+            for entry in json.loads(stdout):
+                for addr in entry.get("addr_info", []):
+                    local = addr.get("local")
+                    if local:
+                        addrs.append(local)
+        except Exception as e:
+            sys.stderr.write(f"Error parsing 'ip -json addr show': {e}\n")
+    return addrs
+
+def get_iface_addresses(iface, ns_name=None):
+    """Returns the exact addresses on one interface, optionally inside a namespace.
+
+    Same substring hazard as get_local_addresses(): a segment gateway 10.0.0.1 is
+    a substring of 10.0.0.10, so a plain `in` test reports the gateway as already
+    assigned and the segment is left without one.
+    """
+    prefix = f"ip netns exec {ns_name} " if ns_name else ""
+    addrs = []
+    rc, stdout, _ = run_cmd(f"{prefix}ip -json addr show {iface}")
+    if rc == 0 and stdout:
+        try:
+            for entry in json.loads(stdout):
+                for addr in entry.get("addr_info", []):
+                    local = addr.get("local")
+                    if local:
+                        addrs.append(local)
+        except Exception as e:
+            sys.stderr.write(f"Error parsing addresses for {iface}: {e}\n")
+    return addrs
+
 def is_leader():
     vip = get_vip()
     if not vip:
@@ -104,8 +152,43 @@ def is_leader():
         except Exception:
             pass
         return False
-    rc, stdout, _ = run_cmd("ip addr show")
-    return rc == 0 and vip in stdout
+    return vip in get_local_addresses()
+
+def read_proc_argv(pid):
+    """Returns the argv list of pid, or [] if it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read().decode("utf-8", errors="ignore")
+        return [a for a in raw.split("\0") if a]
+    except Exception:
+        return []
+
+def netns_dnsmasq_pids(ns_name, iface):
+    """PIDs of the dnsmasq bound to iface inside network namespace ns_name.
+
+    'ip netns exec <ns> pgrep dnsmasq' is not namespace aware: netns exec
+    changes only the NETWORK namespace, so the process table is still the
+    host-wide one and pgrep matches dnsmasq processes owned by every other
+    namespace. 'ip netns pids' filters by actual namespace membership, and the
+    argv comparison below is exact-token so --interface=veth-t1-10 never
+    matches --interface=veth-t1-100.
+    """
+    pids = []
+    rc, stdout, _ = run_cmd(f"ip netns pids {ns_name}")
+    if rc != 0 or not stdout:
+        return pids
+    for pid in stdout.split():
+        if not pid.isdigit():
+            continue
+        argv = read_proc_argv(pid)
+        if not argv:
+            continue
+        if "dnsmasq" not in os.path.basename(argv[0]):
+            continue
+        if f"--interface={iface}" not in argv:
+            continue
+        pids.append(pid)
+    return pids
 
 def get_uplink_interface(preferred_if):
     rc, _, _ = run_cmd(f"ip link show {preferred_if}")
@@ -169,19 +252,243 @@ def get_db_segments():
                     pass
     return items
 
+# Last firewall-table read failure logged, so a sustained outage does not
+# repeat the same message on every 15s pass.
+fw_read_error = None
+
 def get_db_firewall_rules():
+    """Reads the firewall table.
+
+    Returns None if the read failed and a list (possibly empty) if it
+    succeeded. The chain is rebuilt from this result, so a partial read would
+    silently DELETE the rules that failed to parse - the caller must skip the
+    rebuild entirely rather than act on an incomplete ruleset.
+    """
+    global fw_read_error
     cql = "SELECT JSON * FROM hydra.urbosa_firewall_rules;"
-    rc, stdout, _ = run_cql_query(cql)
+    rc, stdout, stderr = run_cql_query(cql)
+    err = None
     items = []
-    if rc == 0 and stdout:
+    if rc != 0:
+        err = f"Read of hydra.urbosa_firewall_rules failed (rc={rc}): {stderr or stdout}."
+    else:
         for line in stdout.splitlines():
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 try:
                     items.append(json.loads(line))
-                except Exception:
-                    pass
+                except Exception as e:
+                    err = f"Unparseable row in hydra.urbosa_firewall_rules ({e}); treating this read as untrustworthy."
+                    break
+
+    # Logged on change only: this runs every 15s.
+    if err != fw_read_error:
+        if err:
+            print(f"{err} Skipping firewall rebuild; leaving {FW_CHAIN} as-is.")
+        elif fw_read_error is not None:
+            print(f"Read of hydra.urbosa_firewall_rules recovered; resuming {FW_CHAIN} rebuild.")
+        fw_read_error = err
+
+    if err:
+        return None
     return items
+
+# Last notice logged per firewall rule id. The control loop re-validates every
+# rule every 15s, so warnings are logged on change rather than on every pass.
+fw_rule_notices = {}
+
+def note_fw_rule(rule_id, message):
+    """Logs message for rule_id only when it differs from the previous pass."""
+    key = str(rule_id)
+    if fw_rule_notices.get(key) != message:
+        if message:
+            print(message)
+        fw_rule_notices[key] = message
+
+def validate_fw_address(value, field):
+    """Validates an address field. Returns (normalized_or_ANY, error_message)."""
+    if value is None:
+        return "ANY", None
+    value = str(value).strip()
+    if not value or value.upper() == "ANY":
+        return "ANY", None
+    try:
+        # strict=True: '10.0.0.5/24' is rejected rather than silently widened
+        # to the whole 10.0.0.0/24 subnet.
+        net = ipaddress.ip_network(value, strict=True)
+    except ValueError as e:
+        return None, f"{field} '{value}' is not a valid IPv4 address or CIDR ({e})"
+    if net.version != 4:
+        return None, f"{field} '{value}' is IPv6; only IPv4 rules are supported"
+    return str(net), None
+
+def build_firewall_rule_specs(rule):
+    """Validates one DB row into iptables argument strings.
+
+    Returns (list_of_arg_strings, None) or (None, reason). Every field here is
+    operator input arriving through the web API and is interpolated into a
+    command run as root, so nothing is trusted: addresses must parse via
+    ipaddress, protocol must be in the allowlist, port must be 0 (any) or
+    1-65535, action must be ALLOW or DENY. A rule that fails any check is never
+    executed.
+    """
+    src, err = validate_fw_address(rule.get("source_ip"), "source_ip")
+    if err:
+        return None, err
+    dst, err = validate_fw_address(rule.get("dest_ip"), "dest_ip")
+    if err:
+        return None, err
+
+    proto = str(rule.get("protocol") or "ANY").strip().upper()
+    if proto not in FW_PROTOCOLS:
+        return None, f"protocol '{proto}' is not one of {'/'.join(FW_PROTOCOLS)}"
+
+    raw_port = rule.get("port")
+    if raw_port is None or raw_port == "":
+        raw_port = 0
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        return None, f"port '{raw_port}' is not an integer"
+    if port != 0 and not (1 <= port <= 65535):
+        return None, f"port {port} is outside the valid range 1-65535"
+
+    act = str(rule.get("action") or "").strip().upper()
+    if act not in ("ALLOW", "DENY"):
+        return None, f"action '{act}' is not ALLOW or DENY"
+
+    target = "ACCEPT" if act == "ALLOW" else "DROP"
+    match = ""
+    if src != "ANY":
+        match += f"-s {src} "
+    if dst != "ANY":
+        match += f"-d {dst} "
+
+    if port and proto == "ICMP":
+        return None, f"port {port} is set but protocol is ICMP, which has no ports"
+
+    if port and proto == "ANY":
+        # iptables cannot express --dport without -p. The old code dropped the
+        # port silently, turning 'any protocol, port 443' into a rule matching
+        # ALL traffic. Expand into explicit tcp+udp instead: it preserves the
+        # admin's intent and can only ever narrow the match, never widen it.
+        note_fw_rule(rule.get("rule_id"), f"Urbosa firewall: rule {rule.get('rule_id')} specifies protocol ANY with port {port}; iptables cannot match a port without a protocol, so expanding it into explicit tcp and udp rules.")
+        return [f"{match}-p tcp --dport {port} -j {target}",
+                f"{match}-p udp --dport {port} -j {target}"], None
+
+    note_fw_rule(rule.get("rule_id"), None)
+
+    if proto == "ANY":
+        return [f"{match}-j {target}"], None
+
+    spec = f"{match}-p {proto.lower()} "
+    if port:
+        spec += f"--dport {port} "
+    return [f"{spec}-j {target}"], None
+
+def firewall_rule_sort_key(rule):
+    """Deterministic ordering, identical on every node.
+
+    'SELECT JSON *' returns rows in token order, which differs per node, so
+    appending in row order gave each host a different first-match-wins policy
+    from the same ruleset. priority is the operator-visible ordering column
+    (the WebUI sorts ascending); rule_id breaks ties.
+    """
+    try:
+        priority = int(rule.get("priority"))
+    except (TypeError, ValueError):
+        priority = 1 << 30
+    return (priority, str(rule.get("rule_id", "")))
+
+def ensure_firewall_chain():
+    """Creates FW_CHAIN and installs exactly one jump to it from FORWARD."""
+    rc, _, _ = run_cmd(f"iptables -n -L {FW_CHAIN}")
+    if rc != 0:
+        print(f"Creating distributed firewall chain {FW_CHAIN}...")
+        run_cmd(f"iptables -N {FW_CHAIN}")
+    rc_jump, _, _ = run_cmd(f"iptables -C FORWARD -j {FW_CHAIN}")
+    if rc_jump != 0:
+        print(f"Installing FORWARD jump to {FW_CHAIN}...")
+        run_cmd(f"iptables -I FORWARD 1 -j {FW_CHAIN}")
+
+# Last iptables-restore fallback reason logged, so a permanently unavailable
+# iptables-restore does not repeat the same warning every pass.
+fw_restore_warned = None
+
+def count_chain_rules(chain):
+    """Number of rules currently in chain, or -1 if it cannot be read."""
+    rc, stdout, _ = run_cmd(f"iptables -S {chain}")
+    if rc != 0:
+        return -1
+    return len([l for l in stdout.splitlines() if l.strip().startswith("-A ")])
+
+def apply_firewall_rules(firewall_rules):
+    """Rebuilds FW_CHAIN from the database ruleset.
+
+    Owning a dedicated chain means a rule deleted from the database actually
+    disappears from the host, instead of living in FORWARD forever. Validation
+    of every rule happens before anything is touched, so a bad row can never
+    leave the chain half-applied.
+    """
+    global fw_restore_warned
+    ensure_firewall_chain()
+
+    specs = []
+    seen_ids = set()
+    for rule in sorted(firewall_rules, key=firewall_rule_sort_key):
+        seen_ids.add(str(rule.get("rule_id")))
+        rule_specs, err = build_firewall_rule_specs(rule)
+        if err:
+            note_fw_rule(rule.get("rule_id"), f"Urbosa firewall: SKIPPING invalid rule {rule.get('rule_id')} ({rule.get('description')}): {err}")
+            continue
+        specs.extend(rule_specs)
+
+    # Forget notices for rules that no longer exist in the database.
+    for stale in [k for k in fw_rule_notices if k not in seen_ids]:
+        del fw_rule_notices[stale]
+
+    # Preferred path: one iptables-restore transaction replaces the whole
+    # chain atomically, so traffic never sees a partially built ruleset.
+    # --noflush keeps every other chain (including the FORWARD jump) intact.
+    payload = ["*filter", f":{FW_CHAIN} - [0:0]", f"-F {FW_CHAIN}"]
+    payload.extend(f"-A {FW_CHAIN} {spec}" for spec in specs)
+    payload.append("COMMIT")
+
+    restored = False
+    fallback_reason = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix="urbosa-fw-", suffix=".rules")
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join(payload) + "\n")
+        rc_r, _, err_r = run_cmd(f"iptables-restore -n {tmp_path}")
+        if rc_r != 0:
+            fallback_reason = f"iptables-restore failed ({err_r})"
+        elif count_chain_rules(FW_CHAIN) != len(specs):
+            fallback_reason = f"iptables-restore left {FW_CHAIN} with an unexpected rule count"
+        else:
+            restored = True
+    except Exception as e:
+        fallback_reason = f"could not stage iptables-restore ({e})"
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    if not restored:
+        # Non-atomic fallback: brief window where the chain is empty.
+        if fallback_reason != fw_restore_warned:
+            print(f"Urbosa firewall: {fallback_reason}; falling back to flush and append.")
+            fw_restore_warned = fallback_reason
+        run_cmd(f"iptables -F {FW_CHAIN}")
+        for spec in specs:
+            rc_a, _, err_a = run_cmd(f"iptables -A {FW_CHAIN} {spec}")
+            if rc_a != 0:
+                print(f"Urbosa firewall: failed to install rule '{spec}': {err_a}")
+    else:
+        fw_restore_warned = None
 
 def main():
     print("Urbosa SDN logical router and overlay orchestrator started.")
@@ -230,9 +537,8 @@ def main():
                     
                     # Assign IP inside netns
                     if ext_ip:
-                        _, ip_out, _ = run_cmd(f"ip netns exec {ns_name} ip addr show {mv_name}")
                         ip_clean = ext_ip.split('/')[0]
-                        if ip_clean not in ip_out:
+                        if ip_clean not in get_iface_addresses(mv_name, ns_name):
                             run_cmd(f"ip netns exec {ns_name} ip addr add {ext_ip} dev {mv_name}")
                     
                     # Set default route inside netns
@@ -269,9 +575,10 @@ def main():
                 
                 # Check DHCP status
                 if r.get("dhcp_enabled"):
-                    # Check if dnsmasq is running inside the namespace
-                    rc_dns, _, _ = run_cmd(f"ip netns exec {ns_name} pgrep dnsmasq")
-                    if rc_dns != 0:
+                    # Check for a dnsmasq bound to lo INSIDE this namespace.
+                    # A bare 'ip netns exec ... pgrep dnsmasq' saw every other
+                    # namespace's dnsmasq, so this server never started.
+                    if not netns_dnsmasq_pids(ns_name, "lo"):
                         print(f"Starting DHCP server (dnsmasq) inside {ns_name}...")
                         # Run dnsmasq inside namespace (dummy start, catches error if sandbox blocks)
                         run_cmd(f"ip netns exec {ns_name} dnsmasq --bind-interfaces --interface=lo --dhcp-range=100.64.0.2,100.64.0.254,12h")
@@ -306,13 +613,11 @@ def main():
                         t1_ip = f"100.64.{octet2}.{octet3 + 2}/30"
                         
                         # Assign transit IP to T1 interface
-                        _, t1_ip_out, _ = run_cmd(f"ip netns exec {ns_name} ip addr show {veth_t1}")
-                        if f"100.64.{octet2}.{octet3 + 2}" not in t1_ip_out:
+                        if t1_ip.split('/')[0] not in get_iface_addresses(veth_t1, ns_name):
                             run_cmd(f"ip netns exec {ns_name} ip addr add {t1_ip} dev {veth_t1}")
-                            
+
                         # Assign transit IP to T0 interface
-                        _, t0_ip_out, _ = run_cmd(f"ip netns exec {t0_ns} ip addr show {veth_t0}")
-                        if f"100.64.{octet2}.{octet3 + 1}" not in t0_ip_out:
+                        if t0_ip.split('/')[0] not in get_iface_addresses(veth_t0, t0_ns):
                             run_cmd(f"ip netns exec {t0_ns} ip addr add {t0_ip} dev {veth_t0}")
                         
                         # Configure default gateway route in T1 namespace pointing to T0
@@ -419,8 +724,7 @@ def main():
                         mask = subnet.split('/')[-1] if '/' in subnet else '24'
                         if gw_ip:
                             # Check if already assigned
-                            _, out_ip, _ = run_cmd(f"ip netns exec {ns_name} ip addr show {veth_ns}")
-                            if gw_ip not in out_ip:
+                            if gw_ip not in get_iface_addresses(veth_ns, ns_name):
                                 print(f"Assigning gateway IP {gw_ip}/{mask} to interface {veth_ns} inside {ns_name}...")
                                 run_cmd(f"ip netns exec {ns_name} ip addr add {gw_ip}/{mask} dev {veth_ns} 2>/dev/null || true")
 
@@ -430,36 +734,27 @@ def main():
                         dhcp_end = s.get("dhcp_end")
                         
                         if dhcp_enabled and dhcp_start and dhcp_end:
-                            # Check if dnsmasq is already running for this interface/segment
-                            rc_dns, _, _ = run_cmd(f"ip netns exec {ns_name} pgrep -f 'dnsmasq.*{veth_ns}'")
-                            if rc_dns != 0:
+                            # Namespace-scoped, exact-interface match.
+                            if not netns_dnsmasq_pids(ns_name, veth_ns):
                                 print(f"Starting DHCP server (dnsmasq) inside {ns_name} for segment interface {veth_ns}...")
                                 run_cmd(f"ip netns exec {ns_name} dnsmasq --bind-interfaces --except-interface=lo --interface={veth_ns} --dhcp-range={dhcp_start},{dhcp_end},12h --dhcp-option=option:router,{gw_ip}")
                         else:
-                            # Kill any running dnsmasq for this interface
-                            _, dns_pids, _ = run_cmd(f"ip netns exec {ns_name} pgrep -f 'dnsmasq.*{veth_ns}'")
+                            # Only kill PIDs proven to live in THIS namespace and
+                            # to be bound to THIS interface. PIDs are host-global
+                            # (netns does not isolate the process table), so the
+                            # kill runs directly rather than via netns exec.
+                            dns_pids = netns_dnsmasq_pids(ns_name, veth_ns)
                             if dns_pids:
                                 print(f"Stopping DHCP server inside {ns_name} for segment interface {veth_ns}...")
-                                for pid in dns_pids.split():
-                                    run_cmd(f"ip netns exec {ns_name} kill -9 {pid}")
+                                for pid in dns_pids:
+                                    run_cmd(f"kill -9 {pid}")
 
             # 4. Reconcile Distributed Firewall (iptables micro-segmentation)
-            for rule in firewall_rules:
-                src = rule.get("source_ip", "ANY")
-                dst = rule.get("dest_ip", "ANY")
-                proto = rule.get("protocol", "ANY")
-                port = rule.get("port", 0)
-                act = rule.get("action", "ALLOW")
-                
-                rule_action = "-j ACCEPT" if act == "ALLOW" else "-j DROP"
-                rule_proto = "" if proto == "ANY" else f"-p {proto.lower()}"
-                rule_port = "" if (port == 0 or proto == "ANY") else f"--dport {port}"
-                rule_src = "" if src == "ANY" else f"-s {src}"
-                rule_dst = "" if dst == "ANY" else f"-d {dst}"
-                
-                # Apply rule to FORWARD chain on host
-                cmd = f"iptables -C FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action} 2>/dev/null || iptables -A FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action}"
-                run_cmd(cmd)
+            # firewall_rules is None when the read failed; the chain is left
+            # untouched rather than rebuilt from an incomplete ruleset.
+            # get_db_firewall_rules() has already logged the reason.
+            if firewall_rules is not None:
+                apply_firewall_rules(firewall_rules)
 
         except Exception as e:
             sys.stderr.write(f"Error in Urbosa control loop: {e}\n")

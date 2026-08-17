@@ -1,11 +1,13 @@
 import os
 import json
+import stat
 import hashlib
 import zipfile
 import shutil
 
 VERSION = "1.2.3-stable"
-ZIP_NAME = "upgrade_1.2.3-stable.zip"
+# Derived from VERSION so the package name can never drift from the build it carries.
+ZIP_NAME = f"upgrade_{VERSION}.zip"
 BUILD_DIR = "upgrade_build"
 
 components_map = {
@@ -16,6 +18,8 @@ components_map = {
     "valcli": {"src": "valcli.py", "target": "/usr/local/bin/valcli"},
     "mcli": {"src": "mcli", "target": "/usr/local/bin/mcli"},
     "mcli-runner": {"src": "mcli-runner", "target": "/usr/local/bin/mcli-runner"},
+    "nodetool": {"src": "nodetool", "target": "/usr/local/bin/nodetool"},
+    "allssh": {"src": "allssh", "target": "/usr/local/bin/allssh"},
     "dagur": {"src": "dagur.py", "target": "/usr/local/bin/dagur"},
     "mimir": {"src": "mimir.py", "target": "/usr/local/bin/mimir"},
     "vali": {"src": "vali.py", "target": "/usr/local/bin/vali"},
@@ -26,9 +30,16 @@ components_map = {
     "logos": {"src": "logos.py", "target": "/usr/local/bin/logos"},
     "mipha": {"src": "mipha.py", "target": "/usr/local/bin/mipha"},
     "urbosa-bootstrap": {"src": "urbosa_bootstrap.py", "target": "/usr/local/bin/urbosa-bootstrap"},
+    # daruk keeps its .py suffix on purpose: cluster_new.py copies /usr/local/bin/daruk.py
+    # into the hydra-db volume and the unit runs `python3 /var/lib/scylla/daruk.py`.
     "daruk": {"src": "daruk.py", "target": "/usr/local/bin/daruk.py"},
     "hylia": {"src": "hylia.py", "target": "/usr/local/bin/hylia"},
+    # check_updates is installed under its hyphenated name (provision.py deploys it as
+    # /usr/local/bin/check-updates and the scheduler runs `python3 /usr/local/bin/check-updates`).
+    "check-updates": {"src": "check_updates.py", "target": "/usr/local/bin/check-updates"},
     "spectrum": {"src": "spectrum_server.py", "target": "/usr/local/bin/spectrum_server"},
+    # lanayru is imported as a module by spectrum_server, so it must keep its .py suffix.
+    "lanayru": {"src": "lanayru.py", "target": "/usr/local/bin/lanayru.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 
@@ -75,13 +86,36 @@ changelog_content = """# Helios-HCI Update Package Changelog History
 - Resolved noVNC and WebGL console loading dependencies.
 """
 
+def source_mode(src_path, content):
+    """Permissions to give the packaged copy.
+
+    The build copy is written from scratch, which would otherwise hand every
+    component the default 0644 and silently drop the exec bit from mcli,
+    mcli-runner, catcli and friends. Filesystems without POSIX permissions
+    (Windows build hosts) report no exec bit at all, so anything carrying a
+    shebang is marked executable regardless of what the source claims.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(src_path).st_mode)
+    except OSError:
+        mode = 0o644
+    # Windows reports 0o666; never ship anything group/world writable into /usr/local/bin.
+    mode &= ~0o022
+    if content.startswith("#!"):
+        mode |= 0o111
+    return mode
+
 def main():
+    if f"## [{VERSION}]" not in changelog_content:
+        raise SystemExit(f"Changelog has no '## [{VERSION}]' section; update changelog_content to match VERSION before building.")
+
     if os.path.exists(BUILD_DIR):
         shutil.rmtree(BUILD_DIR)
     os.makedirs(BUILD_DIR)
-    
+
     components_manifest = {}
-    
+    file_modes = {}
+
     for comp_name, info in components_map.items():
         src_path = info["src"]
         dest_filename = comp_name
@@ -113,10 +147,15 @@ def main():
             
         modified_content = content
         
-        # Write modified file
+        # Write modified file, preserving the source permissions
         with open(dest_path, "w", encoding="utf-8", newline="\n") as f_out:
             f_out.write(modified_content)
-            
+        file_modes[dest_filename] = source_mode(src_path, modified_content)
+        try:
+            os.chmod(dest_path, file_modes[dest_filename])
+        except OSError:
+            pass
+
         # Calculate SHA-256
         sha256 = hashlib.sha256()
         with open(dest_path, "rb") as f_bin:
@@ -151,10 +190,16 @@ def main():
         os.remove(ZIP_NAME)
         
     with zipfile.ZipFile(ZIP_NAME, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
-        for file in os.listdir(BUILD_DIR):
+        for file in sorted(os.listdir(BUILD_DIR)):
             file_path = os.path.join(BUILD_DIR, file)
-            zip_ref.write(file_path, arcname=file)
-            
+            # The mode is stamped onto the entry explicitly: os.chmod is a no-op on
+            # Windows build hosts, so zipfile.write() would archive 0644 there.
+            zinfo = zipfile.ZipInfo.from_file(file_path, arcname=file)
+            zinfo.compress_type = zipfile.ZIP_DEFLATED
+            zinfo.external_attr = (file_modes.get(file, 0o644) & 0xFFFF) << 16
+            with open(file_path, "rb") as f_src, zip_ref.open(zinfo, "w") as f_dst:
+                shutil.copyfileobj(f_src, f_dst)
+
     shutil.rmtree(BUILD_DIR)
     print(f"Successfully created {ZIP_NAME} with version {VERSION}!")
 

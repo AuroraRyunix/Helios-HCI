@@ -4,6 +4,7 @@ import sys
 import os
 import json
 import time
+import stat
 import socket
 import urllib.request
 import ssl
@@ -49,27 +50,196 @@ def ensure_drbd_resource_up(resource_name):
         print(f"[Mipha HA] DRBD resource {resource_name} is not loaded. Loading with drbdadm up...")
         run_command_local(f"drbdadm up {resource_name}")
 
+def get_drbd_resource_state(resource_name):
+    # Per-resource view (local role, devices and peer connections) taken from drbdsetup JSON
+    rc, stdout, stderr = run_command_local("drbdsetup status --json")
+    if rc != 0 or not stdout.strip():
+        return None
+
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return None
+
+    for resource in data:
+        if resource.get("name") != resource_name:
+            continue
+        return {
+            "role": resource.get("role", "Unknown"),
+            "devices": resource.get("devices", []),
+            "connections": resource.get("connections", [])
+        }
+    return None
+
+def get_drbd_device_holders(resource_name, devices):
+    # Returns a list of everything currently holding the DRBD device(s) of this resource open:
+    # a mounted filesystem, a stacked block device, or a live process (qemu keeps the raw device
+    # open for as long as the guest runs). A resource with holders must never discard its writes.
+    holders = []
+    rdev_map = {}
+
+    for dev in devices:
+        vol = dev.get("volume", 0)
+        minor = dev.get("minor")
+        candidates = []
+        if minor is not None:
+            candidates.append(f"/dev/drbd{minor}")
+        candidates.append(f"/dev/drbd/by-res/{resource_name}/{vol}")
+        for path in candidates:
+            try:
+                st = os.stat(path)
+            except Exception:
+                continue
+            if stat.S_ISBLK(st.st_mode):
+                rdev_map[st.st_rdev] = (candidates[0], minor)
+
+    if not rdev_map:
+        return holders
+
+    # Mounted filesystems on top of the device
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2 or not parts[0].startswith("/dev/"):
+                    continue
+                try:
+                    st = os.stat(parts[0])
+                except Exception:
+                    continue
+                if stat.S_ISBLK(st.st_mode) and st.st_rdev in rdev_map:
+                    holders.append(f"{rdev_map[st.st_rdev][0]} is mounted at {parts[1]}")
+    except Exception:
+        pass
+
+    # Stacked block devices (LVM/md/dm layered on top of the DRBD device)
+    for dev_path, minor in rdev_map.values():
+        if minor is None:
+            continue
+        try:
+            for h in os.listdir(f"/sys/block/drbd{minor}/holders"):
+                holders.append(f"{dev_path} is stacked under /dev/{h}")
+        except Exception:
+            pass
+
+    # Processes with the device open (running guest, dd, rsync, ...)
+    try:
+        pids = os.listdir("/proc")
+    except Exception:
+        pids = []
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                st = os.stat(f"/proc/{pid}/fd/{fd}")
+            except Exception:
+                continue
+            if stat.S_ISBLK(st.st_mode) and st.st_rdev in rdev_map:
+                pname = "unknown"
+                try:
+                    with open(f"/proc/{pid}/comm", "r") as f:
+                        pname = f.read().strip()
+                except Exception:
+                    pass
+                holders.append(f"{rdev_map[st.st_rdev][0]} is open by pid {pid} ({pname})")
+                break
+
+    return holders
+
+def get_peer_drbd_role(resource_name, connections, probe_peers=False):
+    # Peer role for THIS resource. DRBD reports peer-role Unknown while the connection is
+    # StandAlone, so optionally fall back to asking the reachable cluster peers over spark-daemon.
+    # Returns "Primary", "Secondary" or "Unknown" (Unknown means: do not auto-discard).
+    roles = set()
+    for conn in connections:
+        peer_role = (conn.get("peer-role") or "").strip()
+        if peer_role and peer_role != "Unknown":
+            roles.add(peer_role)
+
+    if len(roles) == 1:
+        return roles.pop()
+    if len(roles) > 1:
+        return "Unknown"
+    if not probe_peers:
+        return "Unknown"
+
+    answered = 0
+    for h in get_cluster_hosts():
+        ip = h.get("ip")
+        if not ip or ip == LOCAL_IP:
+            continue
+        if not ping_host(ip):
+            continue
+        rc, stdout, stderr = run_remote_spark(ip, f"drbdadm role {resource_name}")
+        if rc != 0 or not stdout.strip():
+            # Peer is unreachable or does not host this resource
+            continue
+        answered += 1
+        roles.add(stdout.strip().splitlines()[-1].split("/", 1)[0].strip())
+
+    if answered == 0 or len(roles) != 1:
+        return "Unknown"
+    return roles.pop()
+
 def resolve_drbd_standalone(resource_name):
     try:
         ensure_drbd_resource_up(resource_name)
         rc, stdout, stderr = run_command_local(f"drbdadm status {resource_name}")
-        if rc == 0:
-            if "StandAlone" in stdout:
-                role = get_local_drbd_role(resource_name)
-                print(f"[Mipha HA] DRBD resource {resource_name} is in StandAlone state. Resolving (role={role})...")
-                
-                # Check ZooKeeper leadership to decide which node yields during dual-Primary split-brain
-                zk_leader = is_zookeeper_leader()
-                
-                if role != "Primary" or not zk_leader:
-                    print(f"[Mipha HA] Node is not ZooKeeper leader or is Secondary. Demoting resource {resource_name} and discarding local writes to auto-heal...")
-                    run_command_local(f"drbdadm disconnect {resource_name}")
-                    run_command_local(f"drbdadm secondary {resource_name} --force || drbdadm secondary {resource_name} || true")
-                    run_command_local(f"drbdadm connect --discard-my-data {resource_name}")
-                else:
-                    print(f"[Mipha HA] Node is ZooKeeper leader and holds Primary role. Keeping local writes for {resource_name}...")
-                    run_command_local(f"drbdadm disconnect {resource_name}")
-                    run_command_local(f"drbdadm connect {resource_name}")
+        if rc != 0 or "StandAlone" not in stdout:
+            return
+
+        # The victim of a split-brain is a per-resource question: ZooKeeper leadership is a single
+        # cluster-wide property and says nothing about which node holds the authoritative copy of
+        # this resource, so it must never gate a --discard-my-data.
+        state = get_drbd_resource_state(resource_name)
+        if not state:
+            print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone but drbdsetup returned no usable state for it. NOT discarding anything. Leaving {resource_name} StandAlone for manual resolution.")
+            return
+
+        role = state["role"]
+        if role in ("", "Unknown"):
+            role = get_local_drbd_role(resource_name)
+
+        # A live holder (running guest, mounted filesystem, stacked device) means the local copy is
+        # being served right now, so it must never be thrown away. Only a Primary can hold the device
+        # open, and a Primary is never the victim, so the peer only has to be probed when we are not
+        # Primary and could therefore end up discarding.
+        holders = []
+        if role != "Primary":
+            holders = get_drbd_device_holders(resource_name, state["devices"])
+            if holders:
+                print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone with role={role} but its device still has a live holder ({'; '.join(holders)}). Refusing to touch the connection so nothing can discard local writes. Operator intervention required for {resource_name}.")
+                return
+
+        peer_role = get_peer_drbd_role(resource_name, state["connections"], probe_peers=(role != "Primary"))
+        print(f"[Mipha HA] DRBD resource {resource_name} is in StandAlone state. Resolving (role={role}, peer role={peer_role})...")
+
+        if role == "Secondary" and peer_role == "Primary":
+            # Local is Secondary, nothing is using the device and the peer serves the resource,
+            # so the local copy is the safe victim.
+            print(f"[Mipha HA] Local node is Secondary on {resource_name} while the peer holds Primary. Discarding local writes to auto-heal...")
+            run_command_local(f"drbdadm disconnect {resource_name}")
+            rc_s, stdout_s, stderr_s = run_command_local(f"drbdadm secondary {resource_name}")
+            if rc_s != 0:
+                print(f"[Mipha HA] CRITICAL: Failed to demote {resource_name} to Secondary ({stderr_s or stdout_s}). Aborting discard. Operator intervention required for {resource_name}.")
+                return
+            run_command_local(f"drbdadm connect --discard-my-data {resource_name}")
+            return
+
+        if role == "Primary" and peer_role != "Primary":
+            print(f"[Mipha HA] Local node holds Primary on {resource_name} (peer role={peer_role}). Keeping local writes and reconnecting without discard...")
+        else:
+            # Both Primary, both Secondary or peer role undeterminable: no safe victim can be picked
+            # here. Reconnect without discarding anything and let the resource-definition split-brain
+            # policy (after-sb-0pri/1pri/2pri) settle it, or stay StandAlone for the operator.
+            print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone with local role={role} and peer role={peer_role}. No safe victim can be determined, so local writes are NOT discarded. Reconnecting without discard - operator intervention may be required for {resource_name}.")
+        run_command_local(f"drbdadm disconnect {resource_name}")
+        run_command_local(f"drbdadm connect {resource_name}")
     except Exception as e:
         sys.stderr.write(f"[Mipha HA] Error resolving DRBD standalone for {resource_name}: {e}\n")
 

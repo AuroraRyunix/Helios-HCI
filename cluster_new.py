@@ -419,14 +419,16 @@ for line in res_lsblk.stdout.decode().splitlines():
         try: size_bytes = int(parts[1])
         except ValueError: continue
         dev_path = "/dev/" + name
+        # A claimed disk is wiped, so skip any disk with ANY non-empty mountpoint anywhere in
+        # its tree (system path, /srv, /data, swap, ...) -- an in-use disk is never a candidate.
         res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        is_sys = False
+        is_in_use = False
         for m in res_m.stdout.decode().splitlines():
             m = m.strip()
-            if m in ["/", "/boot", "/boot/efi", "/var", "/usr", "/home"] or "swap" in m.lower():
-                is_sys = True
+            if (m and m != "-") or "swap" in m.lower():
+                is_in_use = True
                 break
-        if is_sys: continue
+        if is_in_use: continue
         res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if "part" in res_p.stdout.decode().splitlines(): continue
         if size_bytes >= 100 * 10**9:
@@ -1471,10 +1473,54 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             if rc != 0:
                 print(f"[{ip}] [WARNING] LVM VG removal failed: {err}")
 
-        # Python script to dynamically scan for any physical disks used by LVM or qualifying as non-system candidate disks, and zero them
+        # Python script to dynamically discover the physical disks this cluster actually claimed
+        # (pool disks recorded in storage-pools.json, vg_aether/orphaned PVs, and qualifying raw
+        # disks) and zero them. There is deliberately NO hardcoded device fallback: a disk that
+        # none of the discovery sources returns is never touched, and an empty result is a no-op.
         wipe_devices_script = """
 import subprocess, json, sys, os
 devs = []
+reasons = {}
+skipped = []
+
+def add_dev(dev, reason):
+    if dev and dev not in devs:
+        devs.append(dev)
+        reasons[dev] = reason
+
+def mountpoints_of(dev):
+    mounts = []
+    res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for m in res_m.stdout.decode().splitlines():
+        m = m.strip()
+        if m and m != "-" and m not in mounts:
+            mounts.append(m)
+    return mounts
+
+def size_of(dev):
+    res_sz = subprocess.run("blockdev --getsize64 " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res_sz.returncode == 0:
+        try: return int(res_sz.stdout.decode().strip())
+        except ValueError: return -1
+    return -1
+
+def signatures_of(dev):
+    sigs = []
+    res_w = subprocess.run("wipefs " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for line in res_w.stdout.decode().splitlines()[1:]:
+        cols = line.split()
+        if len(cols) >= 3 and cols[2] not in sigs:
+            sigs.append(cols[2])
+    return sigs
+
+# 0. Disks this node recorded as its own Aether storage pool members (authoritative)
+try:
+    with open("/etc/hci/aether/storage-pools.json", "r") as f:
+        spdata = json.load(f)
+    for disk in spdata.get("local_disks", []):
+        add_dev(disk.get("device"), "configured in storage-pools.json")
+except Exception:
+    pass
 
 # 1. Find PVs of vg_aether or orphaned PVs
 res_pvs = subprocess.run("pvs --noheadings -o pv_name,vg_name", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1485,10 +1531,9 @@ if res_pvs.returncode == 0:
             pv = parts[0].strip()
             vg = parts[1].strip() if len(parts) >= 2 else ""
             if vg in ["vg_aether", ""]:
-                if pv not in devs:
-                    devs.append(pv)
+                add_dev(pv, "LVM PV (vg=" + (vg if vg else "orphaned") + ")")
 
-# 2. Scan for candidate disks >= 100GB (non-system, no partitions)
+# 2. Scan for candidate disks >= 100GB (unmounted, no partitions)
 res_lsblk = subprocess.run("lsblk -b -d -n -o NAME,SIZE,TYPE,ROTA", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 if res_lsblk.returncode == 0:
     for line in res_lsblk.stdout.decode().splitlines():
@@ -1498,24 +1543,61 @@ if res_lsblk.returncode == 0:
             try: size_bytes = int(parts[1])
             except ValueError: continue
             dev_path = "/dev/" + name
-            res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            is_sys = False
-            for m in res_m.stdout.decode().splitlines():
-                m = m.strip()
-                if m in ["/", "/boot", "/boot/efi", "/var", "/usr", "/home"] or "swap" in m.lower():
-                    is_sys = True
-                    break
-            if is_sys: continue
-            res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if "part" in res_p.stdout.decode().splitlines(): continue
-            if size_bytes >= 100 * 10**9:
-                if dev_path not in devs:
-                    devs.append(dev_path)
+            if dev_path in devs: continue
+            # Skip any disk carrying ANY non-empty mountpoint anywhere in its tree, not just
+            # recognised system paths: a disk mounted at /srv or /data is in use, not a candidate.
+            skip_reason = ""
+            for m in mountpoints_of(dev_path):
+                if "swap" in m.lower():
+                    skip_reason = "active swap (" + m + ")"
+                else:
+                    skip_reason = "mounted at " + m
+                break
+            if not skip_reason:
+                res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if "part" in res_p.stdout.decode().splitlines():
+                    skip_reason = "disk has partitions"
+            if not skip_reason and size_bytes < 100 * 10**9:
+                skip_reason = "smaller than 100GB (" + ("%.1f" % (size_bytes / 10.0**9)) + " GB)"
+            if skip_reason:
+                skipped.append((dev_path, skip_reason))
+                continue
+            add_dev(dev_path, "unpartitioned unmounted disk >= 100GB")
 
-if "/dev/sdb" not in devs:
-    devs.append("/dev/sdb")
+# 3. Final veto: never touch a device that is missing or still has anything mounted on it,
+#    whichever source proposed it.
+vetted = []
+for dev in devs:
+    if not os.path.exists(dev):
+        skipped.append((dev, "device not present on this host"))
+        continue
+    mounts = mountpoints_of(dev)
+    swap_mounts = [m for m in mounts if "swap" in m.lower()]
+    if swap_mounts:
+        skipped.append((dev, "active swap (" + ",".join(swap_mounts) + ") -- refusing to wipe"))
+        continue
+    if mounts:
+        skipped.append((dev, "still mounted at " + ",".join(mounts) + " -- refusing to wipe"))
+        continue
+    vetted.append(dev)
+devs = vetted
 
-print("Devices identified for signature wiping:", devs)
+# 4. Print the exact wipe set (and every rejection) before destroying anything
+print("=== cluster destroy: disk wipe plan for this host ===")
+for dev, why in skipped:
+    print("  SKIP  " + dev + " -- " + why)
+if not devs:
+    print("  No qualifying devices found. Nothing will be wiped on this host.")
+    print("=== end of wipe plan (no-op) ===")
+    sys.exit(0)
+for dev in devs:
+    size_bytes = size_of(dev)
+    size_str = ("%.1f GB" % (size_bytes / 10.0**9)) if size_bytes > 0 else "unknown"
+    sigs = signatures_of(dev)
+    mounts = mountpoints_of(dev)
+    print("  WIPE  " + dev + " -- size=" + size_str + " signatures=" + (",".join(sigs) if sigs else "none") + " mountpoints=" + (",".join(mounts) if mounts else "none") + " reason=" + reasons.get(dev, "unknown"))
+print("=== wiping " + str(len(devs)) + " device(s): " + ", ".join(devs) + " ===")
+
 for dev in devs:
     subprocess.run("pvremove -y " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if os.path.exists("/etc/lvm/devices/system.devices"):
@@ -1523,15 +1605,14 @@ for dev in devs:
         subprocess.run("sed -i '/" + dev_name + "/d' /etc/lvm/devices/system.devices", shell=True)
     subprocess.run("wipefs -a " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    res_sz = subprocess.run("blockdev --getsize64 " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res_sz.returncode == 0:
-        try:
-            size_bytes = int(res_sz.stdout.decode().strip())
-            seek_val = (size_bytes // 1048576) - 1024
-            if seek_val > 0:
-                subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            print("Failed to zero end of dev " + dev + ": " + str(e))
+    size_bytes = size_of(dev)
+    if size_bytes > 0:
+        seek_val = (size_bytes // 1048576) - 1024
+        if seek_val > 0:
+            subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        print("Failed to determine size of " + dev + "; skipped zeroing end of device")
+    print("Wiped " + dev)
 """
         wipe_script_b64 = base64.b64encode(wipe_devices_script.strip().encode()).decode()
         cmd_wipe = f"python3 -c \"import base64; exec(base64.b64decode('{wipe_script_b64}').decode())\""

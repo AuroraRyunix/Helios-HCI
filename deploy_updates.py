@@ -10,6 +10,43 @@ def put_text_file(sftp, local_path, remote_path):
     with sftp.open(remote_path, "wb") as f_remote:
         f_remote.write(content.encode("utf-8"))
 
+# Blindly accepting unknown host keys (paramiko.AutoAddPolicy) means every rollout
+# re-trusts whatever currently answers on the node IP -- and what this script pushes
+# is root-executed code, so a MITM here owns the whole cluster. Verify against
+# known_hosts by default; set HELIOS_SSH_TRUST_NEW_HOSTS=1 only for first contact on
+# a trusted provisioning network (provision.py seeds /root/.ssh/known_hosts).
+trust_new_hosts = os.environ.get("HELIOS_SSH_TRUST_NEW_HOSTS", "").strip().lower() in ("1", "true", "yes")
+
+def new_ssh_client():
+    client = paramiko.SSHClient()
+    try:
+        client.load_system_host_keys()
+    except Exception:
+        pass
+    user_known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+    if os.path.exists(user_known_hosts):
+        try:
+            client.load_host_keys(user_known_hosts)
+        except Exception as e:
+            print(f"Warning: could not read {user_known_hosts}: {e}")
+    if trust_new_hosts:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    return client
+
+def explain_host_key_failure(ip, err):
+    if isinstance(err, paramiko.BadHostKeyException):
+        print(f"[{ip}] HOST KEY MISMATCH -- the key presented does not match known_hosts.")
+        print(f"[{ip}] Refusing to push root-executed code. Investigate before retrying.")
+        return True
+    if isinstance(err, paramiko.SSHException) and "not found in known_hosts" in str(err):
+        print(f"[{ip}] Host key is not in known_hosts, so it cannot be verified.")
+        print(f"[{ip}] Add it with: ssh-keyscan -H {ip} >> ~/.ssh/known_hosts")
+        print(f"[{ip}] Or, for first contact on a trusted network, re-run with HELIOS_SSH_TRUST_NEW_HOSTS=1")
+        return True
+    return False
+
 nodes_env = os.environ.get("HELIOS_NODES")
 if nodes_env:
     nodes = [ip.strip() for ip in nodes_env.split(",") if ip.strip()]
@@ -39,8 +76,7 @@ shared_cert = None
 shared_key = None
 
 print("=== Ensuring a single shared SSL certificate exists on Node 1 ===")
-ssh_cert = paramiko.SSHClient()
-ssh_cert.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_cert = new_ssh_client()
 try:
     key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
     if os.path.exists(key_path):
@@ -69,7 +105,8 @@ try:
     sftp_cert.close()
     print("=== Shared SSL certificate loaded successfully ===")
 except Exception as e:
-    print(f"Error ensuring shared SSL certificate: {e}")
+    if not explain_host_key_failure(nodes[0], e):
+        print(f"Error ensuring shared SSL certificate: {e}")
 finally:
     ssh_cert.close()
 
@@ -398,9 +435,8 @@ User=root
 
 def deploy_to_node(ip):
         print(f"================ Deploying to {ip} ================")
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
+        ssh = new_ssh_client()
+
         try:
             key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
             if os.path.exists(key_path):
@@ -861,7 +897,8 @@ def deploy_to_node(ip):
             print(f"[{ip}] Deployment and storage recovery successful.\n")
             
         except Exception as e:
-            print(f"[{ip}] Failed to deploy: {e}\n")
+            if not explain_host_key_failure(ip, e):
+                print(f"[{ip}] Failed to deploy: {e}\n")
         finally:
             ssh.close()
 

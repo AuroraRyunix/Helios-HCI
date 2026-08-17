@@ -1,9 +1,44 @@
 #!/usr/bin/env python3
 import urllib.request
+import urllib.parse
 import json
 import time
 import sys
 import hashlib
+
+# Build string reported when an installed component carries no __build__ tag.
+# This script is deployed standalone as /usr/local/bin/check-updates, so the value
+# cannot be imported from hylia; it is the single source of truth within this file.
+FALLBACK_BUILD = "1.2.0-b4081"
+
+def cql_escape(value):
+    """Escape a value for embedding inside a single-quoted CQL string literal.
+    Everything written here originates from a remote update server, so no value
+    may be interpolated raw."""
+    if value is None:
+        return ""
+    return str(value).replace("'", "''")
+
+def cql_int(value, default=0):
+    """Coerce a remote-supplied numeric field to an integer literal. A non-numeric
+    value would otherwise be injected into the statement unquoted."""
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            coerced = int(float(str(value).strip()))
+        except (TypeError, ValueError, OverflowError):
+            return default
+    return coerced if coerced >= 0 else default
+
+def validate_download_url(url):
+    """The download URL is fetched (and shown in the UI) later on, so only accept a
+    plain https:// URL from the update server."""
+    url = "" if url is None else str(url).strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise Exception(f"Update server returned an invalid download_url: {url!r}")
+    return url
 
 def run_cql_query(cql_query):
     try:
@@ -133,6 +168,10 @@ def collect_inventory():
             "daruk": "/usr/local/bin/daruk.py",
             "cluster": "/usr/local/bin/cluster",
             "hylia": "/usr/local/bin/hylia",
+            "lanayru": "/usr/local/bin/lanayru.py",
+            "check-updates": "/usr/local/bin/check-updates",
+            "nodetool": "/usr/local/bin/nodetool",
+            "allssh": "/usr/local/bin/allssh",
             "spectrum": "/usr/local/bin/spectrum_server",
             "Dockerfile": "/usr/local/bin/Dockerfile"
         }
@@ -174,7 +213,7 @@ def collect_inventory():
         """
         run_cql_query(cql_schema)
         
-        inventory_escaped = json.dumps(inventory).replace("'", "''")
+        inventory_escaped = cql_escape(json.dumps(inventory))
         cql_insert = f"""
         INSERT INTO hydra.lcm_inventory (key, inventory_json, last_updated) VALUES (
             'latest', '{inventory_escaped}', toTimestamp(now())
@@ -191,7 +230,7 @@ def main():
     sys.path.append("/usr/local/bin")
     sys.path.append(".")
     
-    current_version = "1.2.0-b4083"
+    current_version = FALLBACK_BUILD
     try:
         import importlib.util
         import importlib.machinery
@@ -202,10 +241,10 @@ def main():
             spec = importlib.util.spec_from_loader("hylia", loader)
             hylia_mod = importlib.util.module_from_spec(spec)
             loader.exec_module(hylia_mod)
-            current_version = getattr(hylia_mod, "__build__", "1.2.0-b4081")
+            current_version = getattr(hylia_mod, "__build__", FALLBACK_BUILD)
         else:
             import hylia
-            current_version = getattr(hylia, "__build__", "1.2.0-b4081")
+            current_version = getattr(hylia, "__build__", FALLBACK_BUILD)
     except Exception:
         try:
             with open("/usr/local/bin/hylia", "r") as f:
@@ -231,9 +270,9 @@ def main():
             
         latest_version = data.get("latest_version")
         release_date = data.get("release_date")
-        download_url = data.get("download_url")
+        download_url = validate_download_url(data.get("download_url"))
         sha256 = data.get("sha256")
-        size = data.get("size", 0)
+        size = cql_int(data.get("size", 0))
         changelog = data.get("changelog", "")
         latest_components = data.get("components", {})
         
@@ -249,7 +288,7 @@ def main():
                 for comp_name, target_ver in latest_components.items():
                     installed_ver = host_info.get("versions", {}).get(comp_name)
                     if installed_ver == "Unknown" or not installed_ver:
-                        installed_ver = "1.2.0-b4081"
+                        installed_ver = FALLBACK_BUILD
                     if installed_ver != target_ver:
                         update_available = True
                         break
@@ -274,15 +313,17 @@ def main():
         """
         run_cql_query(cql_schema)
         
-        # Insert update state
-        changelog_escaped = changelog.replace("'", "''")
+        # Insert update state. Every value below comes from the remote update server,
+        # so all of them are escaped and 'size' is coerced to an integer literal.
         cql_insert = f"""
         INSERT INTO hydra.lcm_update_state (
             key, latest_version, release_date, download_url, sha256, size,
             changelog, current_version, update_available, last_checked, error_msg
         ) VALUES (
-            'latest', '{latest_version}', '{release_date}', '{download_url}', '{sha256}', {size},
-            '{changelog_escaped}', '{current_version}', {update_available}, {now_ms}, ''
+            'latest', '{cql_escape(latest_version)}', '{cql_escape(release_date)}',
+            '{cql_escape(download_url)}', '{cql_escape(sha256)}', {size},
+            '{cql_escape(changelog)}', '{cql_escape(current_version)}',
+            {'true' if update_available else 'false'}, {now_ms}, ''
         );
         """
         rc, _, err = run_cql_query(cql_insert)
@@ -294,8 +335,8 @@ def main():
         sys.exit(0)
         
     except Exception as e:
-        error_msg = str(e).replace("'", "''")
-        print(f"Error checking updates: {error_msg}")
+        error_msg = cql_escape(e)
+        print(f"Error checking updates: {e}")
         
         # Write error state to database
         cql_schema = """

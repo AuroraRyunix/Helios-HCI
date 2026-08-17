@@ -107,28 +107,43 @@ def main():
                     except Exception:
                         pass
         
-        # Build iptables cleanup commands
-        iptables_cleanup = []
+        # Build iptables cleanup commands.
+        #
+        # urbosa.py manages its rules inside a dedicated URBOSA-FWD chain that it
+        # flushes and rebuilds each pass, with a single jump installed from FORWARD.
+        # Tearing that down is therefore chain-scoped and does not depend on
+        # reconstructing each rule's exact spec from the database -- which also means
+        # cleanup no longer silently misses rules whose DB rows were already deleted.
+        #
+        # The legacy per-rule deletes against FORWARD are kept as a second step so a
+        # host provisioned before the chain existed is still cleaned up on downgrade.
+        iptables_cleanup = [
+            "while iptables -C FORWARD -j URBOSA-FWD 2>/dev/null; do "
+            "  iptables -D FORWARD -j URBOSA-FWD || break; "
+            "done",
+            "iptables -F URBOSA-FWD 2>/dev/null || true",
+            "iptables -X URBOSA-FWD 2>/dev/null || true",
+        ]
         for rule in fw_rules:
             src = rule.get("source_ip", "ANY")
             dst = rule.get("dest_ip", "ANY")
             proto = rule.get("protocol", "ANY")
             port = rule.get("port", 0)
             act = rule.get("action", "ALLOW")
-            
+
             rule_action = "-j ACCEPT" if act == "ALLOW" else "-j DROP"
             rule_proto = "" if proto == "ANY" else f"-p {proto.lower()}"
             rule_port = "" if (port == 0 or proto == "ANY") else f"--dport {port}"
             rule_src = "" if src == "ANY" else f"-s {src}"
             rule_dst = "" if dst == "ANY" else f"-d {dst}"
-            
+
             iptables_cleanup.append(
                 f"while iptables -C FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action} 2>/dev/null; do "
                 f"  iptables -D FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action} || break; "
                 f"done"
             )
-        
-        iptables_cmd_str = " && ".join(iptables_cleanup) if iptables_cleanup else "true"
+
+        iptables_cmd_str = " ; ".join(iptables_cleanup) if iptables_cleanup else "true"
         
         # 2. Iterate hosts to clean up namespaces, processes, links, and firewall rules
         for ip in hosts:

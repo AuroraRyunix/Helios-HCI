@@ -114,6 +114,10 @@ Helios-HCI/
 | [Urbosa](./docs/urbosa.md) | **Flow SDN** | Native Python service | Layer-3 software-defined overlay, distributed routing, and micro-segmentation daemon. |
 | [Bifrost](./docs/bifrost.md) | **Vipmonitor** | Native Python service | Floating VIP manager daemon ensuring API access high availability. |
 | [Hylia](./docs/hylia.md) | **Foundation (LCM)** | Native Python service | ZooKeeper-resumable rolling upgrade and Life Cycle Management (LCM) service. |
+| [Lanayru](./docs/lanayru.md) | **Karbon / NKE** | Native Python service + Kine | Guest Kubernetes workload engine. Stores guest cluster state in ScyllaDB (Hydra) via Kine instead of dedicated `etcd` VMs. |
+| [Agahnim](./docs/agahnim.md) | **Prism console proxy** | Native Rust systemd service (Tokio) | WebSocket console-proxy sidecar bridging browser clients to VM VNC/SPICE TCP sockets on port `8081`. |
+
+Each component above links to its narrative document. Most also have a `*_technical.md` companion covering internals (call flow, data structures, failure modes) — see [docs/README.md](./docs/README.md) for the complete index of both sets, plus the docs for the non-daemon tooling (`provision.py`, `sync_provision.py`, `deploy_updates.py`, `check_updates.py`, `create_upgrade_zip.py`, `valcli`, `test_hylia.py`) and the [scale-out add-on designs](./docs/add_ons_design.md).
 
 ---
 
@@ -298,7 +302,7 @@ For a complete reference of network scopes, port allocations, and communication 
 
 The stack has been enhanced with enterprise-grade resiliency and health-based routing:
 
-* **Active WebUI VIP Failover**: The VIP manager (`bifrost`) evaluates active candidates on port `443` (Slate Ingress) and enforces a local health guard. A node will only bind the VIP if it is the leader AND its local Slate proxy container is active and listening. If the local Slate proxy is down or bootstrapping, the VIP dynamically floats to a healthy node, ensuring zero client-facing downtime.
+* **Active WebUI VIP Failover**: The VIP manager (`bifrost`) evaluates active candidates on port `443` (Slate Ingress) and enforces a local health guard. A node will only bind the VIP if it is the leader AND **both** its local Slate ingress (`443`) and the Spectrum backend it proxies to (`8443`) are listening. Both are required because `slate_config/dynamic.yml` points Slate at exactly one backend — a node with `443` up but `8443` down returns `502` to every request, which is no better for clients than the blackhole the guard exists to prevent. If either layer is down or bootstrapping, the VIP floats to a healthy node, and the daemon logs which layer failed. Addresses are compared exactly rather than by substring, so a VIP of `10.10.102.13` is not confused with a host address of `10.10.102.130`.
 * **Database Connection Resilience**: The WebUI (`spectrum`) establishes keyspace connection checks. If the local ScyllaDB instance is bootstrapping or down, Spectrum reads `/etc/hci/cluster.json` and falls back to other online database hosts.
 * **Task API Queue Cache**: If ScyllaDB encounters brief connection latency or quorum shifts, Spectrum serves Catalyst tasks from an in-memory fallback cache to prevent UI progress bars from flickering or resetting to grey.
 * **Streamlined Reboot Coordination**: Graceful VM evacuation and host transitions are fully isolated. The reboot sequence relies on the prior maintenance phase to gracefully migrate VMs, leaving the host-level `spark-daemon` active to process remote hardware reboot calls reliably.

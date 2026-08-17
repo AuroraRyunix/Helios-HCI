@@ -4,6 +4,8 @@ import sys
 import os
 import json
 import time
+import re
+import shlex
 import socket
 import urllib.request
 import ssl
@@ -32,6 +34,17 @@ def get_dfs_engine():
 
 def get_default_container():
     return "default-pool"
+
+# VM names and host names arrive from the unauthenticated API on port 9095 and are interpolated
+# into root shell commands and CQL statements, so they are validated at every entry point.
+# \Z instead of $ because $ would also accept a trailing newline.
+OBJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
+OBJECT_NAME_ERROR = "must start with a letter or digit and contain only letters, digits, '_', '.' or '-' (max 63 characters)"
+
+def is_valid_object_name(name):
+    if not name or not isinstance(name, str):
+        return False
+    return bool(OBJECT_NAME_RE.match(name))
 
 
 
@@ -274,6 +287,14 @@ def call_catalyst_api(path, payload=None, method="GET"):
     except Exception as e:
         return -1, str(e)
 
+POLL_INTERVAL_SEC = 2
+# Live migration of a multi-GB guest routinely runs for minutes. The previous ceiling
+# of 3 polls (~6s) meant callers almost always got "Task timed out" while the migration
+# was still running -- indistinguishable from real failure, and it leaves the caller
+# unable to safely revoke the dual-primary window it opened for the hand-over.
+MIGRATE_TIMEOUT_POLLS = 300   # ~10 minutes
+POWER_TIMEOUT_POLLS = 60      # ~2 minutes
+
 def submit_and_wait_task(service, action, task_payload, timeout_polls=3, parent_task_id=None):
     if parent_task_id:
         task_payload = dict(task_payload)
@@ -299,13 +320,18 @@ def submit_and_wait_task(service, action, task_payload, timeout_polls=3, parent_
                 return False, res.get("error_msg", "Task failed."), ""
             else:
                 import time
-                time.sleep(2)
+                time.sleep(POLL_INTERVAL_SEC)
                 continue
         elif status == 204:
+            # No content yet (task not visible to Catalyst). This must also back off:
+            # continuing without sleeping burns the whole poll budget in microseconds
+            # and turns any timeout_polls value into an effectively instant give-up.
+            import time
+            time.sleep(POLL_INTERVAL_SEC)
             continue
         else:
             return False, f"Error polling status: {res}", ""
-    return False, "Task timed out.", ""
+    return False, f"Task timed out after ~{timeout_polls * POLL_INTERVAL_SEC}s (it may still be running in Catalyst).", ""
 
 # Initialize Database Schema
 def init_db_schema():
@@ -421,6 +447,9 @@ def init_db_schema():
     run_cql_query(insert_default_network)
     run_cql_query("ALTER TABLE hydra.vms ADD network_id text;")
     run_cql_query("ALTER TABLE hydra.vms ADD cpu_model text;")
+    # Transient lifecycle lock column ('migrating'), distinct from 'state' (Running/Stopped).
+    # Without it the migration guard below silently never engages.
+    run_cql_query("ALTER TABLE hydra.vms ADD status text;")
 
     # Seed nodes from cluster.json
     try:
@@ -1235,7 +1264,14 @@ def process_queue_task(task):
     payload = task.get("payload") or {}
     
     print(f"[Vali Queue] Processing task {task_id}: {action} on {vm_name}")
-    
+
+    # Reject unsafe names before they reach any shell command or CQL statement
+    if vm_name or action in ["start", "stop", "poweroff", "reboot", "shutdown", "reset", "migrate"]:
+        if not is_valid_object_name(vm_name):
+            return False, f"Invalid VM name '{vm_name}': {OBJECT_NAME_ERROR}."
+    if target_host and not is_valid_object_name(target_host):
+        return False, f"Invalid target host '{target_host}': {OBJECT_NAME_ERROR}."
+
     vm_data = None
     if action in ["start", "stop", "poweroff", "reboot", "shutdown", "reset"]:
         vm_data = get_vm_xml_specs(vm_name)
@@ -1264,17 +1300,27 @@ def process_queue_task(task):
             
             # 3. Define and start VM via host spark-daemon
             restore_cmd = get_nvram_restore_cmd(vm_name)
-            
-            # Ensure DRBD devices are primary and resized on the destination host before boot
-            drbd_cmds = []
+            q_vm = shlex.quote(vm_name)
+
+            # Promote the DRBD devices on the destination host as a separate CHECKED step before the
+            # VM is defined or started. A promotion failure means the peer still holds Primary (the
+            # VM is probably still running there behind a stale host_ip row), and booting anyway
+            # would put two qemu processes on the same raw device.
+            promoted = []
             if disks_list and disks_list != "NONE":
                 for idx, entry in enumerate(disks_list.split(",")):
                     res_name = f"{vm_name}-disk{idx}"
-                    drbd_cmds.append(f"drbdadm primary {res_name} || true")
-                    drbd_cmds.append(f"drbdadm resize {res_name} || true")
-            drbd_prep = " && ".join(drbd_cmds) + " && " if drbd_cmds else ""
-            
-            cmd = f"{drbd_prep}{restore_cmd} && virsh -c qemu:///system undefine {vm_name} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{vm_name}.xml && virsh -c qemu:///system define /tmp/{vm_name}.xml && rm /tmp/{vm_name}.xml && virsh -c qemu:///system start {vm_name}"
+                    q_res = shlex.quote(res_name)
+                    rc_d, stdout_d, stderr_d = run_remote_spark(selected_host, f"drbdadm primary {q_res}")
+                    if rc_d != 0:
+                        # Release the resources we already promoted so this host does not sit on them
+                        for done in promoted:
+                            run_remote_spark(selected_host, f"drbdadm secondary {shlex.quote(done)} || true")
+                        return False, f"Refusing to start {vm_name}: DRBD resource {res_name} could not be promoted to Primary on {selected_host} ({(stderr_d or stdout_d).strip()}). The peer node may still hold Primary for this resource (the VM may still be running there)."
+                    promoted.append(res_name)
+                    run_remote_spark(selected_host, f"drbdadm resize {q_res} || true")
+
+            cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
             if rc != 0:
                 return False, f"Failed to execute start on target host {selected_host}: {stderr.strip() or stdout.strip()}"
@@ -1294,7 +1340,8 @@ def process_queue_task(task):
                 
             # Run destroy/undefine and backup NVRAM
             backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=True)
-            cmd = f"virsh -c qemu:///system destroy {vm_name} || true && virsh -c qemu:///system undefine {vm_name} --keep-nvram || true && {backup_cmd}"
+            q_vm = shlex.quote(vm_name)
+            cmd = f"virsh -c qemu:///system destroy {q_vm} || true && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true && {backup_cmd}"
             run_remote_spark(host_ip, cmd)
             
             cql = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{vm_name}';"
@@ -1305,7 +1352,7 @@ def process_queue_task(task):
             host_ip = vm_data.get("host_ip", "")
             if not host_ip:
                 return False, "VM is not running."
-            cmd = f"virsh -c qemu:///system {action} {vm_name}"
+            cmd = f"virsh -c qemu:///system {action} {shlex.quote(vm_name)}"
             rc, stdout, stderr = run_remote_spark(host_ip, cmd)
             if rc != 0:
                 return False, f"Failed to execute {action} on host: {stderr.strip()}"
@@ -1319,7 +1366,9 @@ def process_queue_task(task):
             target_ip = get_node_ip(target_host)
             if not target_ip:
                 return False, f"Could not resolve target host {target_host} to IP address."
-                
+            if not is_valid_object_name(target_ip):
+                return False, f"Invalid target host address '{target_ip}': {OBJECT_NAME_ERROR}."
+
             vm_data = get_vm_xml_specs(vm_name)
             if not vm_data:
                 return False, "VM not found in metadata database."
@@ -1364,30 +1413,36 @@ def process_queue_task(task):
             if target_free < disk_size:
                 return False, f"Target host {target_host} has insufficient free Linstor storage pool space ({target_free} MiB available, needs {disk_size} MiB)."
 
-            # Set migrating lock in database
+            # Set migrating lock in database. This must be checked: if the column is missing
+            # (older schema) or the write otherwise fails, the guard above silently never
+            # engages and concurrent migrations of the same VM are no longer prevented.
             print(f"Setting migrating status lock for VM '{vm_name}'...")
-            run_cql_query(f"UPDATE hydra.vms SET status = 'migrating' WHERE name = '{vm_name}';")
+            rc_lock, _, err_lock = run_cql_query(f"UPDATE hydra.vms SET status = 'migrating' WHERE name = '{vm_name}';")
+            if rc_lock != 0:
+                return False, f"Refusing to migrate {vm_name}: could not set the migration lock ({err_lock.strip() or 'database write failed'}). Without it a concurrent migration of the same VM would not be detected."
 
             try:
+                q_vm = shlex.quote(vm_name)
+
                 # 1. Force-backup NVRAM on source host to ScyllaDB
                 backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=False)
                 run_remote_spark(src_host, backup_cmd)
-                
+
                 # 2. Restore NVRAM on target host (ensuring directories exist and files are written)
                 restore_cmd = get_nvram_restore_cmd(vm_name)
                 run_remote_spark(target_ip, restore_cmd)
 
                 # 3. Pre-clean stale definition on target host
-                run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {vm_name} --keep-nvram || true")
-                
+                run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {q_vm} --keep-nvram || true")
+
                 # 4. Live migrate command
-                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe {vm_name} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
+                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe {q_vm} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
                 rc, stdout, stderr = run_remote_spark(src_host, cmd)
                 if rc != 0:
                     raise Exception(f"Migration command failed: {stderr.strip() or stdout.strip()}")
-                    
+
                 # 5. Clean up local NVRAM file on source host after successful migration
-                run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{vm_name}_vars.fd")
+                run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{q_vm}_vars.fd")
                     
                 # Update ScyllaDB VM record (resets status back to running on target host)
                 cql = f"UPDATE hydra.vms SET host_ip = '{target_ip}', status = 'running' WHERE name = '{vm_name}';"
@@ -1414,7 +1469,7 @@ def process_queue_task(task):
             target_ip = payload.get("target_ip")
             force_stop = payload.get("force_stop", False)
             
-            if not hostname or not target_ip:
+            if not is_valid_object_name(hostname) or not is_valid_object_name(target_ip):
                 return False, "Invalid payload parameters for host_maintenance_enter."
                 
             # Perform VM evacuation
@@ -1447,7 +1502,7 @@ def process_queue_task(task):
                     if not dest_host:
                         if force_stop:
                             print(f"[Maintenance Catalyst Task] No migration target host for {vm_name}. Force stopping VM.")
-                            stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=5, parent_task_id=task_id)
+                            stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=POWER_TIMEOUT_POLLS, parent_task_id=task_id)
                             if not stop_success:
                                 print(f"[Maintenance Catalyst Task] Force stopping failed for {vm_name}: {stop_err}")
                                 success = False
@@ -1461,12 +1516,12 @@ def process_queue_task(task):
                             break
                     else:
                         # Submit a migrate task to Catalyst and wait for it
-                        task_success, task_err, _ = submit_and_wait_task("vali", "migrate", {"vm_name": vm_name, "target_host": dest_host}, timeout_polls=5, parent_task_id=task_id)
+                        task_success, task_err, _ = submit_and_wait_task("vali", "migrate", {"vm_name": vm_name, "target_host": dest_host}, timeout_polls=MIGRATE_TIMEOUT_POLLS, parent_task_id=task_id)
                         
                         if not task_success:
                             if force_stop:
                                 print(f"[Maintenance Catalyst Task] Migration failed for {vm_name}: {task_err}. Force stopping VM.")
-                                stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=5, parent_task_id=task_id)
+                                stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=POWER_TIMEOUT_POLLS, parent_task_id=task_id)
                                 if not stop_success:
                                     print(f"[Maintenance Catalyst Task] Force stopping failed for {vm_name}: {stop_err}")
                             else:
@@ -1514,7 +1569,7 @@ def process_queue_task(task):
             hostname = payload.get("hostname")
             target_ip = payload.get("target_ip")
             
-            if not hostname or not target_ip:
+            if not is_valid_object_name(hostname) or not is_valid_object_name(target_ip):
                 return False, "Invalid payload parameters for host_maintenance_leave."
                 
             # Remove state file and start services on the target host
@@ -1736,7 +1791,7 @@ def evacuate_host_thread(hostname, target_ip, force_stop):
             if not dest_host:
                 if force_stop:
                     print(f"[Maintenance] No migration target host for {vm_name}. Force stopping VM.")
-                    stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=5)
+                    stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=POWER_TIMEOUT_POLLS)
                     if not stop_success:
                         print(f"[Maintenance] Force stopping failed for {vm_name}: {stop_err}")
                         success = False
@@ -1750,12 +1805,12 @@ def evacuate_host_thread(hostname, target_ip, force_stop):
                     break
             else:
                 # Submit a migrate task to Catalyst and wait for it
-                task_success, task_err, _ = submit_and_wait_task("vali", "migrate", {"vm_name": vm_name, "target_host": dest_host}, timeout_polls=5)
+                task_success, task_err, _ = submit_and_wait_task("vali", "migrate", {"vm_name": vm_name, "target_host": dest_host}, timeout_polls=MIGRATE_TIMEOUT_POLLS)
                 
                 if not task_success:
                     if force_stop:
                         print(f"[Maintenance] Migration failed for {vm_name}: {task_err}. Force stopping VM.")
-                        stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=5)
+                        stop_success, stop_err, _ = submit_and_wait_task("vali", "stop", {"vm_name": vm_name}, timeout_polls=POWER_TIMEOUT_POLLS)
                         if not stop_success:
                             print(f"[Maintenance] Force stopping failed for {vm_name}: {stop_err}")
                     else:
@@ -1873,9 +1928,12 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             if not name or not action:
                 self.send_json(400, {"error": "Parameters name and action required."})
                 return
-                
+            if not is_valid_object_name(name):
+                self.send_json(400, {"error": f"Invalid VM name: {OBJECT_NAME_ERROR}."})
+                return
+
             db_action = "start" if action == "on" else ("stop" if action == "off" else action)
-            success, err_msg, target = submit_and_wait_task("vali", db_action, {"vm_name": name})
+            success, err_msg, target = submit_and_wait_task("vali", db_action, {"vm_name": name}, timeout_polls=POWER_TIMEOUT_POLLS)
             if success:
                 self.send_json(200, {"name": name, "status": action + "ed", "node": target})
             else:
@@ -1887,8 +1945,14 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             if not name or not target_host:
                 self.send_json(400, {"error": "Parameters name and target_host required."})
                 return
-                
-            success, err_msg, _ = submit_and_wait_task("vali", "migrate", {"vm_name": name, "target_host": target_host})
+            if not is_valid_object_name(name):
+                self.send_json(400, {"error": f"Invalid VM name: {OBJECT_NAME_ERROR}."})
+                return
+            if not is_valid_object_name(target_host):
+                self.send_json(400, {"error": f"Invalid target_host: {OBJECT_NAME_ERROR}."})
+                return
+
+            success, err_msg, _ = submit_and_wait_task("vali", "migrate", {"vm_name": name, "target_host": target_host}, timeout_polls=MIGRATE_TIMEOUT_POLLS)
             if success:
                 self.send_json(200, {"name": name, "status": "migrated", "node": target_host})
             else:
@@ -1907,7 +1971,10 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             if not hostname or not action:
                 self.send_json(400, {"error": "Parameters hostname and action required."})
                 return
-                
+            if not is_valid_object_name(hostname):
+                self.send_json(400, {"error": f"Invalid hostname: {OBJECT_NAME_ERROR}."})
+                return
+
             # Query host info from ScyllaDB
             rc, stdout, _ = run_cql_query(f"SELECT JSON hostname, ip, status, maintenance_mode FROM hydra.nodes WHERE hostname = '{hostname}';")
             host_info = None

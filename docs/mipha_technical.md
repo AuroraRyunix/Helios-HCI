@@ -37,7 +37,16 @@ mindmap
 - **`check_linstor_db_mount()`**: Returns True if `/var/lib/linstor` is mounted.
 - **`get_local_drbd_role(resource_name)`**: Reads `drbdadm role <res>` to determine if the local resource is in `Primary` or `Secondary` state.
 - **`get_all_drbd_resources()`**: Scans `/etc/drbd.d/*.res` to list all configured DRBD targets.
-- **`resolve_drbd_standalone(resource_name)`**: Disconnects, marks secondary, and connects with `--discard-my-data` to resolve split-brain `StandAlone` conditions.
+- **`resolve_drbd_standalone(resource_name)`**: Resolves split-brain `StandAlone` conditions using a **per-resource** decision. ZooKeeper leadership is deliberately *not* consulted here: leadership is a single cluster-wide property, but "which node holds the authoritative copy" is a question about one resource, and using the former to answer the latter caused a node running a VM to discard its own live writes and resync from a stale peer.
+
+  The policy, evaluated per resource:
+  1. Not `StandAlone`, or `drbdsetup status --json` unreadable → no action.
+  2. Local role is not `Primary` **and** the device has a live holder (mounted filesystem, stacked device, or a process holding it open) → refuse to touch the connection; log the resource and the holder for the operator.
+  3. Local `Secondary` + peer `Primary` + no holders → the local copy is the safe victim: `disconnect`, then a **checked** `drbdadm secondary` (no `--force`, no `|| true`), then `connect --discard-my-data`. This is the only site in the daemon that discards data.
+  4. Local `Primary`, peer not `Primary` → keep local writes; plain `disconnect`/`connect`.
+  5. Both `Primary`, both `Secondary`, or peer role undeterminable → never discard; plain `disconnect`/`connect` and log for operator intervention.
+
+  Because a `StandAlone` connection reports `peer-role: Unknown`, the peer role is resolved by querying reachable peers over the Spark mTLS path, and only when the local node is not `Primary` (i.e. only when it could be the victim). A result is accepted only if at least one peer answered and all answers agree.
 - **`check_and_resolve_stuck_resync()`**: Parses JSON output from `drbdsetup status --json`. If resync progress is stalled for 3 checks (90 seconds), triggers connection self-heal.
 - **`linstor_ha_loop()`**: Separate thread. Coordinates storage HA:
   - If node is the ZooKeeper leader: promotes `linstor-db` to Primary, mounts `/var/lib/linstor` locally, stops linstor-controllers on remote nodes, and starts the local controller. Also mounts virtual VM/image containers.

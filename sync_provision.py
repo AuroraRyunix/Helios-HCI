@@ -1,8 +1,12 @@
 import re
 import base64
 import os
+import sys
 
-provision_path = "provision.py"
+# Resolve everything against this script's own directory: run from anywhere else and
+# a CWD-relative "provision.py" would silently sync nothing (or the wrong tree).
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+provision_path = os.path.join(SCRIPT_DIR, "provision.py")
 
 mapping = {
     "CATCLI_B64": "catcli",
@@ -25,38 +29,72 @@ mapping = {
     "BIFROST_B64": "bifrost.py",
     "MCLI_B64": "mcli",
     "MCLI_RUNNER_B64": "mcli-runner",
-    "HYLIA_B64": "hylia.py"
+    "NODETOOL_B64": "nodetool",
+    "ALLSSH_CLI_B64": "allssh",
+    "CHECK_UPDATES_B64": "check_updates.py",
+    "HYLIA_B64": "hylia.py",
+    "LANAYRU_B64": "lanayru.py"
 }
+
+# Any constant provision.py embeds must be listed above, otherwise editing its source
+# file and running this script silently ships the previously embedded copy.
+B64_CONSTANT_RE = re.compile(r'^([A-Z_]+_B64)\s*=', re.MULTILINE)
+
+errors = []
 
 print(f"Reading {provision_path}...")
 with open(provision_path, "r", encoding="utf-8") as f:
     content = f.read()
 
 # Base64-encode files and replace their declarations
-for var_name, file_path in mapping.items():
+for var_name, file_name in mapping.items():
+    file_path = os.path.join(SCRIPT_DIR, file_name)
     if not os.path.exists(file_path):
-        print(f"Warning: File {file_path} not found. Skipping...")
+        errors.append(f"Source file {file_name} not found, so {var_name} could not be re-embedded.")
+        print(f"Error: File {file_path} not found. Skipping...")
         continue
 
-    print(f"Encoding {file_path} into {var_name}...")
+    print(f"Encoding {file_name} into {var_name}...")
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
     b64_str = base64.b64encode(file_bytes).decode("utf-8")
 
     # Replace the variable definition in provision.py
-    pattern = rf'{var_name}\s*=\s*".*?"'
+    pattern = rf'^{var_name}\s*=\s*".*?"'
     replacement = f'{var_name} = "{b64_str}"'
 
-    content, count = re.subn(pattern, replacement, content, count=1, flags=re.DOTALL)
+    content, count = re.subn(pattern, replacement, content, count=1, flags=re.DOTALL | re.MULTILINE)
     if count == 0:
+        errors.append(f"Could not find the definition of {var_name} in provision.py; {file_name} was not embedded.")
         print(f"Error: Could not find definition of {var_name} in provision.py!")
     else:
         print(f"Successfully updated {var_name} ({count} replacement)")
+
+# Detect drift: every *_B64 constant provision.py declares must be covered above.
+declared = set(B64_CONSTANT_RE.findall(content))
+unmapped = sorted(declared - set(mapping))
+if unmapped:
+    for var_name in unmapped:
+        print(f"Error: provision.py declares {var_name} but the mapping does not cover it.")
+    errors.append(f"Unmapped provision.py constants: {', '.join(unmapped)}. Add them to 'mapping' so their source files are embedded.")
+
+stale = sorted(set(mapping) - declared)
+if stale:
+    for var_name in stale:
+        print(f"Error: mapping references {var_name}, which provision.py no longer declares.")
+    errors.append(f"Stale mapping entries: {', '.join(stale)}.")
+
+if errors:
+    print()
+    print("Synchronization ABORTED; provision.py was left unchanged:")
+    for err in errors:
+        print(f"  - {err}")
+    sys.exit(1)
 
 # Write back to provision.py
 print(f"Writing updated content back to {provision_path}...")
 with open(provision_path, "w", encoding="utf-8", newline="\n") as f:
     f.write(content)
 
-print("Synchronization complete!")
+print(f"Synchronization complete! ({len(mapping)} constants embedded)")

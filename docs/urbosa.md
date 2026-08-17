@@ -38,7 +38,7 @@ graph TD
 * **VM Network Integration:** When a VM is configured with an Urbosa overlay segment network ID, Vali automatically interfaces the VM's network interface with the corresponding `br-ov-{vni}` bridge on the host, granting the VM access to the software-defined overlay network.
 
 ### D. Distributed Firewall (Micro-segmentation)
-* **Stateful Security:** Installs iptables rule sets in the `FORWARD` chain of the host namespace, enforcing stateful `ALLOW` or `DROP` policies based on IP CIDRs, protocols, and destination ports.
+* **Stateful Security:** Installs iptables rule sets into a dedicated `URBOSA-FWD` chain in the host namespace, reached by a single jump from `FORWARD`, enforcing stateful `ALLOW` or `DROP` policies based on IP CIDRs, protocols, and destination ports. The chain is flushed and rebuilt from the database on every pass through a single atomic `iptables-restore` transaction, so a rule deleted from the database is actually withdrawn from the host — appending directly to `FORWARD` left deleted rules in place forever. Rules are ordered by `(priority, rule_id)`, matching the ascending `priority` sort the WebUI already applies, so every node derives an identical chain from the same ruleset. All rule fields are validated (CIDRs parsed, protocol allowlisted, port range-checked) before anything is applied; invalid rules are skipped and logged, never executed. A failed or partial database read skips the rebuild entirely rather than flushing the chain against incomplete data.
 
 ---
 
@@ -140,7 +140,8 @@ bridge fdb show dev vxlan-10001
 ### C. Firewall Rule Verification
 Query active micro-segmentation rules on a hypervisor host:
 ```bash
-# List all iptables forward filtering rules
+# List Urbosa's managed firewall rules (and the jump installed from FORWARD)
+iptables -L URBOSA-FWD -n -v --line-numbers
 iptables -L FORWARD -n -v --line-numbers
 ```
 
