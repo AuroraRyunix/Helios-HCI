@@ -13,6 +13,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [deployment.md](./deployment.md) | The Podman Quadlet deployment model, the update-rollout paths, ingress. |
 | [setup-guide.md](./setup-guide.md) | Local dev prerequisites, what runs standalone vs. what needs a real cluster. |
 | [hci_master_architecture_guide.md](./hci_master_architecture_guide.md) | The deepest existing architecture reference (1500+ lines). |
+| [cluster_state.md](./cluster_state.md) | How desired cluster state and per-node actual state are held in ZooKeeper, the ephemeral-znode liveness model, and the direct-probe fallback. |
 | [network.md](./network.md) | Full network scope/port allocation reference. |
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |

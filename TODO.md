@@ -53,6 +53,37 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
+**Cluster state (2026-08-17, later session)**
+* **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;
+  each node's spark-daemon publishes an ephemeral `/helios/nodes/<ip>` znode every 5s and
+  converges local services toward the desired state. `cluster status` reads that tree in
+  one connection and renders locally (adds `--json`), falling back to the direct mTLS
+  probe with an explicit notice. `cluster start` now waits for the cluster to report its
+  own convergence, printing which services are still pending. See
+  [docs/cluster_state.md](./docs/cluster_state.md).
+* **`helios_zk.py` (new)**: minimal stdlib ZooKeeper 3.x wire-protocol client, since the
+  repo has no third-party dependencies and the existing code only spoke the read-only
+  four-letter-word commands. Wired into all five deployment paths.
+* **Crash-looping services no longer report UP.** `hylia` had failed 31 consecutive times
+  while `systemctl is-active` returned `active` during each restart window, so status
+  sampled it as healthy. Restart counts are now published and a unit that is active with
+  no main PID after repeated restarts reports `FLAPPING`.
+* **Autostart deadlock broken.** Cluster state lives in ZooKeeper, but autostart read it,
+  failed when ZooKeeper was down, defaulted to "stopped", and then stopped ZooKeeper --
+  a latch that never reopened. ZooKeeper is now treated as infrastructure: started
+  unconditionally, removed from every stop list, and "unreadable" is no longer conflated
+  with "stopped".
+* **The abandoned Quadlet migration reverted.** Eleven daemons pointed at
+  `localhost/helios-base:latest`, an image no commit ever built, so none could start. The
+  migration had also dropped the maintenance interlock from nine units and most cgroup
+  limits, and never updated `spark.py`. `deploy_updates.py` carried the same broken
+  definitions and would have re-broken every node on the next rollout.
+* **Secure Boot pre-flight.** `provision.py` now refuses to provision a host with Secure
+  Boot enabled (DRBD is an out-of-tree module), checked before the node is modified, and
+  `modprobe drbd` no longer hides failure behind `|| true`.
+* **CRLF corruption of every deployed script fixed** at three layers (`.gitattributes`,
+  `sync_provision.py` normalization, `write_file` normalization).
+
 **Correctness bugs found while fixing the above**
 * **The migration lock had never worked.** `vali.py` wrote `SET status = 'migrating'` to a column that
   does not exist on `hydra.vms` (there is only `state`), and the read side `vm_data.get("status", "")`
@@ -142,6 +173,11 @@ discipline, the ring lifecycle, and the store abstraction.
   migration system, so two daemon versions can race to define different schemas.
 * **No ring lifecycle management.** Nutanix auto-detaches an unhealthy node from the ring. Helios has no
   quorum gate on maintenance entry and no decommission/rejoin sequencing.
+* **Convergence is one-shot, not continuous.** The reconcile loop acts on desired-state
+  *changes*; it does not restart a service that dies afterwards while the desired state is
+  unchanged. systemd's `Restart=always` covers the common case, but a unit that exhausts
+  its restart limit stays down until the desired state is rewritten. A periodic re-assert
+  would close this.
 
 Suggested shape: keep `/query` working, add typed endpoints (`/v1/vm/claim`, `/v1/vm/migrate-lock`)
 backed by prepared LWT statements, migrate invariant-critical writes first, move schema ownership into

@@ -15,7 +15,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 * **Orchestration/control-plane code**: Python 3 (stdlib-heavy; no `requirements.txt` — dependencies, e.g. `paramiko` for `deploy_updates.py` and the `cassandra-driver` for `daruk.py`, are assumed present on the EL10.2 host image).
 * **Console proxy sidecar**: Rust (`agahnim/`, Tokio + `tokio-tungstenite` + `tokio-rustls`) — a native systemd service (not a container) that proxies VNC/SPICE WebSocket console traffic.
 * **Frontend**: Vanilla HTML/CSS/JS under `static/` (no build step), with vendored noVNC (`static/novnc/`), SPICE-HTML5 (`static/spice-html5/`), and pako (`static/vendor/pako/`).
-* **Deployment model**: Podman Quadlets — most services are defined as `.container` unit files that `provision.py` writes to `/etc/containers/systemd/` on each node; `agahnim` and `daruk` run as plain native `systemd` units instead (see [docs/deployment.md](./docs/deployment.md)).
+* **Deployment model**: a deliberate split (see [docs/deployment.md](./docs/deployment.md)). Third-party services with real dependency trees run as **Podman Quadlets** (`.container` files in `/etc/containers/systemd/`): ZooKeeper, ScyllaDB, Aether/Linstor, the Linstor controller, Spectrum, and Slate. The Helios daemons themselves are **native `systemd` units** (`/etc/systemd/system/*.service`) — they are stdlib-only Python whose job is to configure the host (network namespaces, VLAN bridges, IP addresses, DRBD), so a container boundary would isolate nothing while adding an image to build and version.
 * **Data & consensus**: ScyllaDB ("Hydra", Cassandra-compatible, port `9042`) for cluster/VM metadata, and Apache ZooKeeper ("Odin"/"Zeus", port `2181`) for distributed consensus and leader election.
 * **Storage**: Linstor + DRBD ("Aether") for replicated block storage (this replaced an earlier GlusterFS-based design — no GlusterFS code remains in the current tree).
 * **Ingress**: Traefik ("Slate") terminating all client-facing WebUI/API/console traffic on port `443`.
@@ -314,6 +314,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
+* [docs/cluster_state.md](./docs/cluster_state.md) - ZooKeeper-backed cluster state: desired state, ephemeral per-node liveness, convergence, and the probe fallback.
 * [docs/deployment.md](./docs/deployment.md) - The Podman Quadlet deployment model and the update-rollout pipeline.
 * [docs/setup-guide.md](./docs/setup-guide.md) - Local dev prerequisites and workflow.
 * [docs/hci_master_architecture_guide.md](./docs/hci_master_architecture_guide.md) - The deepest existing architecture reference (1500+ lines).
