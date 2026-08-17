@@ -113,6 +113,7 @@ finally:
 local_spark = "spark.py"
 local_cluster = "cluster_new.py"
 local_daemon = "spark_daemon_decoded.py"
+local_helios_zk = "helios_zk.py"
 local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
@@ -141,15 +142,18 @@ local_static_dir = os.path.join(local_dir, "static")
 logos_service_content = """[Unit]
 Description=Logos Distributed Metrics Service
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/proc:/host/proc:ro
-Volume=/sys:/host/sys:ro
-Exec=/usr/local/bin/logos
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/logos
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -158,14 +162,18 @@ WantedBy=multi-user.target
 gatoway_service_content = """[Unit]
 Description=Gatoway L2 Network Sync Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/gatoway
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatoway
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -174,14 +182,18 @@ WantedBy=multi-user.target
 urbosa_service_content = """[Unit]
 Description=Urbosa SDN Logical Router and Overlay Orchestrator
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/urbosa
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/urbosa
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -190,112 +202,134 @@ WantedBy=multi-user.target
 mipha_service_content = """[Unit]
 Description=Mipha HA Cluster Monitor Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/dev:/dev:shared
-Volume=/var/run:/var/run:shared
-Volume=/run/systemd/system:/run/systemd/system:ro
-Exec=/usr/local/bin/mipha
-AddCapability=CAP_SYS_ADMIN
-AddCapability=CAP_SYS_RAWIO
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mipha
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 yggdrasil_service_content = """[Unit]
-Description=Hylia HA Life Cycle Management Daemon
+Description=Hylia Rolling Upgrade and Life Cycle Manager
 After=zookeeper.service
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
-Volume=/:/host:rw
-Exec=/usr/local/bin/hylia
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hylia
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 dagur_service_content = """[Unit]
-Description=Dagur Task Scheduler Daemon
+Description=Dagur HA Task Scheduler Service
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/dagur
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dagur
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 mimir_service_content = """[Unit]
-Description=Mimir Health Checker Daemon
+Description=Mimir Health Check and Diagnostics Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/mimir
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mimir
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 vali_service_content = """[Unit]
-Description=Vali VM Placement and DRS Daemon
+Description=Vali Audit Log and Compliance Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
-Exec=/usr/local/bin/vali
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vali
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 catalyst_service_content = """[Unit]
-Description=Catalyst Task Management Service
+Description=Catalyst API Gateway Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/catalyst
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/catalyst
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 bifrost_service_content = """[Unit]
-Description=Bifrost Floating VIP Manager Daemon
+Description=Bifrost VM Lifecycle Management Service
 After=zookeeper.service
+ConditionPathExists=/etc/hci/cluster.json
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/bifrost
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bifrost
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=512M
+MemoryHigh=400M
 
 [Install]
 WantedBy=multi-user.target
@@ -305,21 +339,15 @@ daemon_service_content = """[Unit]
 Description=Spark Host Management Daemon
 After=network.target
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:rw
-Volume=/etc/containers/systemd:/etc/containers/systemd:rw
-Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
-Volume=/dev:/dev:shared
-Volume=/run/systemd/system:/run/systemd/system:ro
-Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
-Volume=/root/.certs:/root/.certs:ro
-Exec=/usr/local/bin/spark-daemon
-AddCapability=CAP_SYS_ADMIN
-AddCapability=CAP_SYS_RAWIO
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spark-daemon
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=200
+MemoryMax=512M
+MemoryHigh=400M
 
 [Install]
 WantedBy=multi-user.target
@@ -462,6 +490,10 @@ def deploy_to_node(ip):
             # 2. Copy Spark Daemon
             print(f"[{ip}] Uploading spark-daemon to /usr/local/bin/spark-daemon...")
             put_text_file(sftp, local_daemon, "/usr/local/bin/spark-daemon")
+
+            # Shared ZooKeeper client, imported by spark-daemon and the cluster CLI.
+            print(f"[{ip}] Uploading helios_zk to /usr/local/bin/helios_zk.py...")
+            put_text_file(sftp, local_helios_zk, "/usr/local/bin/helios_zk.py")
             
             # 2a. Copy Bifrost CLI
             print(f"[{ip}] Uploading bifrost to /usr/local/bin/bifrost...")
@@ -469,13 +501,13 @@ def deploy_to_node(ip):
             
             # 2b. Write bifrost.container Quadlet
             print(f"[{ip}] Writing bifrost.container Quadlet...")
-            f_bif = sftp.open("/etc/containers/systemd/bifrost.container", "w")
+            f_bif = sftp.open("/etc/systemd/system/bifrost.service", "w")
             f_bif.write(bifrost_service_content)
             f_bif.close()
             
             # 2ba. Write spark-daemon.container Quadlet
             print(f"[{ip}] Writing spark-daemon.container Quadlet...")
-            f_sd = sftp.open("/etc/containers/systemd/spark-daemon.container", "w")
+            f_sd = sftp.open("/etc/systemd/system/spark-daemon.service", "w")
             f_sd.write(daemon_service_content)
             f_sd.close()
     
@@ -504,12 +536,12 @@ def deploy_to_node(ip):
             
             # 2g. Write Dagur and Mimir Quadlets
             print(f"[{ip}] Writing dagur.container Quadlet...")
-            f_dag = sftp.open("/etc/containers/systemd/dagur.container", "w")
+            f_dag = sftp.open("/etc/systemd/system/dagur.service", "w")
             f_dag.write(dagur_service_content)
             f_dag.close()
             
             print(f"[{ip}] Writing mimir.container Quadlet...")
-            f_mim = sftp.open("/etc/containers/systemd/mimir.container", "w")
+            f_mim = sftp.open("/etc/systemd/system/mimir.service", "w")
             f_mim.write(mimir_service_content)
             f_mim.close()
             
@@ -519,7 +551,7 @@ def deploy_to_node(ip):
             
             # 2i. Write vali Quadlet
             print(f"[{ip}] Writing vali.container Quadlet...")
-            f_val = sftp.open("/etc/containers/systemd/vali.container", "w")
+            f_val = sftp.open("/etc/systemd/system/vali.service", "w")
             f_val.write(vali_service_content)
             f_val.close()
     
@@ -529,7 +561,7 @@ def deploy_to_node(ip):
             
             # 2ic. Write gatoway Quadlet
             print(f"[{ip}] Writing gatoway.container Quadlet...")
-            f_gate = sftp.open("/etc/containers/systemd/gatoway.container", "w")
+            f_gate = sftp.open("/etc/systemd/system/gatoway.service", "w")
             f_gate.write(gatoway_service_content)
             f_gate.close()
     
@@ -539,7 +571,7 @@ def deploy_to_node(ip):
             
             # 2icb. Write urbosa Quadlet
             print(f"[{ip}] Writing urbosa.container Quadlet...")
-            f_urb = sftp.open("/etc/containers/systemd/urbosa.container", "w")
+            f_urb = sftp.open("/etc/systemd/system/urbosa.service", "w")
             f_urb.write(urbosa_service_content)
             f_urb.close()
     
@@ -549,7 +581,7 @@ def deploy_to_node(ip):
             
             # 2ie. Write logos Quadlet
             print(f"[{ip}] Writing logos.container Quadlet...")
-            f_log = sftp.open("/etc/containers/systemd/logos.container", "w")
+            f_log = sftp.open("/etc/systemd/system/logos.service", "w")
             f_log.write(logos_service_content)
             f_log.close()
     
@@ -559,7 +591,7 @@ def deploy_to_node(ip):
             
             # 2ig. Write mipha Quadlet
             print(f"[{ip}] Writing mipha.container Quadlet...")
-            f_miph = sftp.open("/etc/containers/systemd/mipha.container", "w")
+            f_miph = sftp.open("/etc/systemd/system/mipha.service", "w")
             f_miph.write(mipha_service_content)
             f_miph.close()
  
@@ -573,7 +605,7 @@ def deploy_to_node(ip):
             
             # Write hylia Quadlet
             print(f"[{ip}] Writing hylia.container Quadlet...")
-            f_ygg = sftp.open("/etc/containers/systemd/hylia.container", "w")
+            f_ygg = sftp.open("/etc/systemd/system/hylia.service", "w")
             f_ygg.write(yggdrasil_service_content)
             f_ygg.close()
     
@@ -595,7 +627,7 @@ def deploy_to_node(ip):
             
             # 2k. Write catalyst Quadlet
             print(f"[{ip}] Writing catalyst.container Quadlet...")
-            f_cat = sftp.open("/etc/containers/systemd/catalyst.container", "w")
+            f_cat = sftp.open("/etc/systemd/system/catalyst.service", "w")
             f_cat.write(catalyst_service_content)
             f_cat.close()
             
@@ -830,23 +862,29 @@ def deploy_to_node(ip):
                     print(f"[{ip}] Error compiling Agahnim: {stderr.read().decode()}")
                 
             # Deploy/update systemd service unit
-            agahnim_svc_cmd = """cat << 'EOF' > /etc/containers/systemd/agahnim.container
-    [Unit]
-    Description=Agahnim Console Proxy Daemon
-    After=network.target
-    
-    [Container]
-    Image=localhost/helios-base:latest
-    Network=host
-    Volume=/usr/local/bin:/usr/local/bin:ro
-    Exec=/usr/local/bin/agahnim 8081
-    
-    [Install]
-    WantedBy=multi-user.target
-    EOF
-    """
-            stdin, stdout, stderr = ssh.exec_command(agahnim_svc_cmd)
-            stdout.channel.recv_exit_status()
+            # Agahnim is a compiled Rust binary, so it is a native systemd unit -- not a
+            # container. The previous heredoc here also never terminated: its EOF marker was
+            # indented, which `<< 'EOF'` (unquoted delimiter position) does not match.
+            f_agah = sftp.open("/etc/systemd/system/agahnim.service", "w")
+            f_agah.write("""[Unit]
+Description=Agahnim Console Proxy Daemon
+After=network.target
+ConditionPathExists=/etc/hci/cluster.json
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agahnim 8081
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+""")
+            f_agah.close()
                 
             if not fast_mode:
                 # 10. Rebuild the spectrum container image locally
@@ -879,7 +917,9 @@ def deploy_to_node(ip):
                 "systemctl is-active mimir && systemctl restart mimir || true",
                 "systemctl is-active vali && systemctl restart vali || true",
                 "systemctl daemon-reload && systemctl enable agahnim && systemctl restart agahnim || true",
-                "systemctl daemon-reload && systemctl enable slate && systemctl restart slate || true",
+                # slate is a genuine Quadlet; generated units cannot be enabled (their [Install]
+                # section is what the generator acts on), so reload and restart only.
+                "systemctl daemon-reload && systemctl restart slate || true",
                 "systemctl enable gatoway && systemctl restart gatoway || true",
                 "systemctl enable urbosa && systemctl restart urbosa || true",
                 "systemctl enable logos && systemctl restart logos || true",

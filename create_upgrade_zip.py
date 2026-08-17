@@ -40,6 +40,7 @@ components_map = {
     "spectrum": {"src": "spectrum_server.py", "target": "/usr/local/bin/spectrum_server"},
     # lanayru is imported as a module by spectrum_server, so it must keep its .py suffix.
     "lanayru": {"src": "lanayru.py", "target": "/usr/local/bin/lanayru.py"},
+    "helios-zk": {"src": "helios_zk.py", "target": "/usr/local/bin/helios_zk.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 

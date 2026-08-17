@@ -318,6 +318,385 @@ def settings_sync_loop():
             print(f"[SPARK] settings_sync_loop error: {e}")
         time.sleep(60)
 
+# ---------------------------------------------------------------------------
+# ZooKeeper-backed cluster state (Odin/Zeus).
+#
+# Each node holds an *ephemeral* znode under ZK_NODES_PATH describing itself. Because
+# the znode's lifetime is bound to the ZooKeeper session, a node that dies has its entry
+# removed by the ensemble rather than by anyone polling for it -- liveness stops being a
+# sample and becomes a fact. `cluster status` then reads this tree instead of fanning
+# out mTLS calls to every host on every invocation.
+#
+# Desired cluster state lives at ZK_CLUSTER_STATE; each node's reconcile loop converges
+# its local services toward it, so `cluster start` sets an intent rather than driving
+# each node imperatively.
+ZK_ROOT = "/helios"
+ZK_NODES_PATH = ZK_ROOT + "/nodes"
+# Desired cluster state. This is the path cluster_new.py and spectrum already write via
+# zkCli.sh ("started"/"stopped"), so the reconcile loop reads the existing source of
+# truth rather than introducing a competing one.
+ZK_CLUSTER_STATE = "/cluster_state"
+ZK_PUBLISH_INTERVAL = 5          # seconds between state refreshes
+ZK_SESSION_TIMEOUT_MS = 15000
+FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as FLAPPING
+
+# Services this node manages when converging toward the desired cluster state, in start
+# order. Stop order is the reverse. ZooKeeper is deliberately absent: it is the store the
+# desired state lives in, so it is started before convergence begins and stopped last.
+MANAGED_SERVICE_ORDER = ["hydra-db", "daruk", "aether", "linstor-controller", "spectrum",
+                         "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
+                         "mimir", "logos", "mipha", "gatoway", "urbosa", "hylia"]
+
+
+def _load_helios_zk():
+    """Import the helios_zk module from wherever it was deployed."""
+    try:
+        import helios_zk
+        return helios_zk
+    except ImportError:
+        pass
+    import importlib.util
+    import importlib.machinery
+    for candidate in ("/usr/local/bin/helios_zk.py", "/usr/local/bin/helios_zk"):
+        if os.path.exists(candidate):
+            loader = importlib.machinery.SourceFileLoader("helios_zk", candidate)
+            spec = importlib.util.spec_from_loader("helios_zk", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise ImportError("helios_zk module not found")
+
+
+def get_zk_hosts():
+    """Cluster ZooKeeper endpoints, local first so a healthy node prefers itself."""
+    hosts = []
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            hosts = [h["ip"] for h in json.load(f).get("hosts", []) if h.get("ip")]
+    except Exception:
+        pass
+    return ["127.0.0.1"] + [h for h in hosts if h != "127.0.0.1"]
+
+
+def zk_publisher_loop():
+    """Maintain this node's ephemeral znode, reconnecting whenever the session drops."""
+    try:
+        zkmod = _load_helios_zk()
+    except ImportError as exc:
+        print(f"[ZK] helios_zk unavailable ({exc}); node state will not be published.", flush=True)
+        return
+
+    client = None
+    node_path = None
+    while True:
+        try:
+            if client is None:
+                client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
+                client.ensure_path(ZK_NODES_PATH)
+                print(f"[ZK] Publisher connected to {client.connected_host}.", flush=True)
+                node_path = None
+
+            status = build_node_status()
+            status["ts"] = int(time.time())
+            status["build"] = globals().get("__build__", "unknown")
+            if node_path is None:
+                node_path = ZK_NODES_PATH + "/" + str(status.get("ip") or "unknown")
+            client.upsert_ephemeral(node_path, json.dumps(status).encode("utf-8"))
+        except Exception as exc:
+            print(f"[ZK] Publisher error ({exc}); reconnecting.", flush=True)
+            try:
+                if client:
+                    client.close()
+            except Exception:
+                pass
+            client = None
+            node_path = None
+        time.sleep(ZK_PUBLISH_INTERVAL)
+
+
+def read_desired_cluster_state(client):
+    """Return the desired cluster state ('started'/'stopped'), or None if unreadable.
+
+    None is meaningfully different from 'stopped': it means we could not determine
+    intent, and the correct response is to change nothing. Treating "unknown" as
+    "stopped" is what deadlocked the old autostart path -- ZooKeeper down meant the
+    state could not be read, which was read as 'stopped', which stopped ZooKeeper.
+    """
+    try:
+        raw = client.get(ZK_CLUSTER_STATE)
+        if raw is None:
+            return None
+        value = raw.decode("utf-8", "replace").strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def zk_reconcile_loop():
+    """Converge local services toward the desired cluster state published in ZooKeeper.
+
+    This is what makes `cluster start` a declaration rather than an imperative drive: the
+    CLI records intent once, and every node moves itself toward it and republishes what
+    it actually achieved.
+    """
+    try:
+        zkmod = _load_helios_zk()
+    except ImportError:
+        return
+
+    client = None
+    applied = None
+    while True:
+        try:
+            if client is None:
+                client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
+                print("[ZK] Reconcile loop connected.", flush=True)
+            # Read inline rather than through a helper that swallows errors: a dead
+            # socket must propagate to the handler below so the client is rebuilt.
+            # Swallowing it returns None forever, which looks like "no desired state"
+            # and silently wedges the loop against a socket that will never recover.
+            try:
+                raw = client.get(ZK_CLUSTER_STATE)
+                desired = raw.decode("utf-8", "replace").strip() or None
+            except zkmod.ZKNoNode:
+                desired = None      # state genuinely unset; nothing to converge toward
+            if desired and desired != applied:
+                if os.path.exists("/etc/hci/maintenance.state"):
+                    print(f"[ZK] Desired state '{desired}' ignored: host is in maintenance.", flush=True)
+                else:
+                    print(f"[ZK] Converging local services toward '{desired}'.", flush=True)
+                    running = desired.startswith("start")
+                    order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
+                    action = "start" if running else "stop"
+                    for svc in order:
+                        subprocess.run(f"systemctl {action} {svc}", shell=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    applied = desired
+        except Exception as exc:
+            print(f"[ZK] Reconcile error ({exc}); reconnecting.", flush=True)
+            try:
+                if client:
+                    client.close()
+            except Exception:
+                pass
+            client = None
+        time.sleep(ZK_PUBLISH_INTERVAL)
+
+
+def build_node_status():
+    """Collect this node's service and liveness state.
+
+    Module-level so the /api/v1/node/status handler and the ZooKeeper publisher
+    share one implementation. spark.py and this daemon previously derived service
+    state separately and could disagree about the same host.
+    """
+    import json
+    import subprocess
+    import socket
+    import os
+    
+    ip_addr = "127.0.0.1"
+    hostname = socket.gethostname()
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            hosts = cdata.get("hosts", [])
+            for h in hosts:
+                if h.get("hostname") == hostname:
+                    ip_addr = h.get("ip")
+                    break
+            if ip_addr == "127.0.0.1" and hosts:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                    for h in hosts:
+                        if h.get("ip") == local_ip:
+                            ip_addr = local_ip
+                            hostname = h.get("hostname")
+                            break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+        
+    is_leader = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.1)
+        s.connect(("127.0.0.1", 2181))
+        s.sendall(b"stat")
+        resp = s.recv(1024).decode('utf-8', errors='ignore')
+        s.close()
+        is_leader = "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
+    except Exception:
+        pass
+        
+    maint_status = "NORMAL"
+    if os.path.exists("/etc/hci/maintenance.state"):
+        maint_status = "IN_MAINTENANCE"
+        
+    global NODE_DISKS_CACHE
+    if 'NODE_DISKS_CACHE' not in globals():
+        globals()['NODE_DISKS_CACHE'] = None
+        
+    disks_count = globals()['NODE_DISKS_CACHE']
+    if disks_count is None:
+        try:
+            res_d = subprocess.run("lsblk -d -n -o TYPE", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_d.returncode == 0:
+                disks_count = sum(1 for line in res_d.stdout.decode().splitlines() if line.strip() == "disk")
+                globals()['NODE_DISKS_CACHE'] = disks_count
+            else:
+                disks_count = 1
+        except Exception:
+            disks_count = 1
+
+    global SERVICE_PIDS_CACHE, LAST_PIDS_CACHE_TIME
+    if 'SERVICE_PIDS_CACHE' not in globals():
+        globals()['SERVICE_PIDS_CACHE'] = {}
+    if 'LAST_PIDS_CACHE_TIME' not in globals():
+        globals()['LAST_PIDS_CACHE_TIME'] = 0
+
+    services = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    svc_map = {
+        "zookeeper": "ZooKeeper",
+        "hydra-db": "HydraDB",
+        "daruk": "Daruk",
+        "aether": "Aether",
+        "spark-daemon": "Spark",
+        "spectrum": "Spectrum",
+        "bifrost": "Bifrost",
+        "dagur": "Dagur",
+        "mimir": "Mimir",
+        "vali": "Vali",
+        "catalyst": "Catalyst",
+        "hylia": "Hylia",
+        "gatoway": "Gatoway",
+        "logos": "Logos",
+        "mipha": "Mipha",
+        "agahnim": "Agahnim",
+        "slate": "Slate"
+    }
+    if check_urbosa_enabled():
+        services.append("urbosa")
+        svc_map["urbosa"] = "Urbosa"
+    
+    result = {
+        "ip": ip_addr,
+        "hostname": hostname,
+        "zk_leader": is_leader,
+        "maintenance_status": maint_status,
+        "disks": disks_count,
+        "services": {}
+    }
+    
+    cmd = f"systemctl is-active {' '.join(services)}"
+    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = res.stdout.decode().splitlines()
+    
+    services_active = {}
+    for idx, svc in enumerate(services):
+        is_active = False
+        if idx < len(lines):
+            is_active = (lines[idx].strip() == "active")
+        services_active[svc] = is_active
+
+    # Refresh PIDs cache if 10 seconds elapsed
+    now = time.time()
+    if now - globals()['LAST_PIDS_CACHE_TIME'] > 10 or not globals()['SERVICE_PIDS_CACHE']:
+        new_cache = {}
+        
+        # Native services
+        native_svcs = ["daruk"]
+        cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
+        try:
+            res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_nat.returncode == 0:
+                nat_lines = [l.strip() for l in res_nat.stdout.decode().splitlines() if l.strip()]
+                for s_idx, s_name in enumerate(native_svcs):
+                    pids = []
+                    if s_idx < len(nat_lines):
+                        val = nat_lines[s_idx]
+                        if val and val != "0":
+                            pids = [int(val)]
+                    new_cache[s_name] = pids
+            else:
+                for s_name in native_svcs:
+                    new_cache[s_name] = []
+        except Exception:
+            for s_name in native_svcs:
+                new_cache[s_name] = []
+                
+        # Containerized services
+        container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
+        if "urbosa" in services:
+            container_svcs.append("urbosa")
+        for s_name in container_svcs:
+            pids = []
+            if services_active.get(s_name):
+                try:
+                    res_cont = subprocess.run(f"podman top systemd-{s_name} hpid", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if res_cont.returncode == 0:
+                        cont_lines = res_cont.stdout.decode().strip().splitlines()
+                        if len(cont_lines) > 1:
+                            for line in cont_lines[1:]:
+                                val = line.strip()
+                                if val and val != "?":
+                                    try:
+                                        pids.append(int(val))
+                                    except ValueError:
+                                        pids.append(val)
+                except Exception:
+                    pass
+            new_cache[s_name] = pids
+            
+        globals()['SERVICE_PIDS_CACHE'] = new_cache
+        globals()['LAST_PIDS_CACHE_TIME'] = now
+
+    pids_cache = globals()['SERVICE_PIDS_CACHE']
+    
+    # Restart counters, so a crash-looping service is not reported as healthy.
+    # `systemctl is-active` returns "active" during each restart window of a unit with
+    # Restart=always, so a unit that has failed 30 times in a row samples as UP roughly
+    # as often as not. NRestarts makes the flapping visible instead of invisible.
+    restarts = {}
+    try:
+        res_nr = subprocess.run(
+            "systemctl show -p NRestarts --value " + " ".join(services),
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        nr_lines = res_nr.stdout.decode().splitlines()
+        for idx, svc in enumerate(services):
+            if idx < len(nr_lines):
+                try:
+                    restarts[svc] = int(nr_lines[idx].strip() or 0)
+                except ValueError:
+                    restarts[svc] = 0
+    except Exception:
+        pass
+
+    for svc in services:
+        n_restarts = restarts.get(svc, 0)
+        if services_active[svc]:
+            svc_pids = pids_cache.get(svc, [])
+            # Active with no main PID and a restart history is a unit caught mid-respawn,
+            # not a healthy one. Report it as FLAPPING so the operator sees the truth.
+            flapping = n_restarts >= FLAP_RESTART_THRESHOLD and not svc_pids
+            result["services"][svc_map[svc]] = {
+                "status": "FLAPPING" if flapping else "UP",
+                "pids": svc_pids,
+                "restarts": n_restarts
+            }
+        else:
+            result["services"][svc_map[svc]] = {
+                "status": "DOWN",
+                "pids": [],
+                "restarts": n_restarts
+            }
+
+    return result
+
 class SparkDaemonHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -668,186 +1047,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         self.send_json_response(200, response)
 
     def handle_node_status(self):
-        import json
-        import subprocess
-        import socket
-        import os
-        
-        ip_addr = "127.0.0.1"
-        hostname = socket.gethostname()
-        try:
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-                for h in hosts:
-                    if h.get("hostname") == hostname:
-                        ip_addr = h.get("ip")
-                        break
-                if ip_addr == "127.0.0.1" and hosts:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    try:
-                        s.connect(("8.8.8.8", 80))
-                        local_ip = s.getsockname()[0]
-                        s.close()
-                        for h in hosts:
-                            if h.get("ip") == local_ip:
-                                ip_addr = local_ip
-                                hostname = h.get("hostname")
-                                break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-            
-        is_leader = False
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            s.connect(("127.0.0.1", 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            is_leader = "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
-        except Exception:
-            pass
-            
-        maint_status = "NORMAL"
-        if os.path.exists("/etc/hci/maintenance.state"):
-            maint_status = "IN_MAINTENANCE"
-            
-        global NODE_DISKS_CACHE
-        if 'NODE_DISKS_CACHE' not in globals():
-            globals()['NODE_DISKS_CACHE'] = None
-            
-        disks_count = globals()['NODE_DISKS_CACHE']
-        if disks_count is None:
-            try:
-                res_d = subprocess.run("lsblk -d -n -o TYPE", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res_d.returncode == 0:
-                    disks_count = sum(1 for line in res_d.stdout.decode().splitlines() if line.strip() == "disk")
-                    globals()['NODE_DISKS_CACHE'] = disks_count
-                else:
-                    disks_count = 1
-            except Exception:
-                disks_count = 1
-
-        global SERVICE_PIDS_CACHE, LAST_PIDS_CACHE_TIME
-        if 'SERVICE_PIDS_CACHE' not in globals():
-            globals()['SERVICE_PIDS_CACHE'] = {}
-        if 'LAST_PIDS_CACHE_TIME' not in globals():
-            globals()['LAST_PIDS_CACHE_TIME'] = 0
-
-        services = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
-        svc_map = {
-            "zookeeper": "ZooKeeper",
-            "hydra-db": "HydraDB",
-            "daruk": "Daruk",
-            "aether": "Aether",
-            "spark-daemon": "Spark",
-            "spectrum": "Spectrum",
-            "bifrost": "Bifrost",
-            "dagur": "Dagur",
-            "mimir": "Mimir",
-            "vali": "Vali",
-            "catalyst": "Catalyst",
-            "hylia": "Hylia",
-            "gatoway": "Gatoway",
-            "logos": "Logos",
-            "mipha": "Mipha",
-            "agahnim": "Agahnim",
-            "slate": "Slate"
-        }
-        if check_urbosa_enabled():
-            services.append("urbosa")
-            svc_map["urbosa"] = "Urbosa"
-        
-        result = {
-            "ip": ip_addr,
-            "hostname": hostname,
-            "zk_leader": is_leader,
-            "maintenance_status": maint_status,
-            "disks": disks_count,
-            "services": {}
-        }
-        
-        cmd = f"systemctl is-active {' '.join(services)}"
-        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        lines = res.stdout.decode().splitlines()
-        
-        services_active = {}
-        for idx, svc in enumerate(services):
-            is_active = False
-            if idx < len(lines):
-                is_active = (lines[idx].strip() == "active")
-            services_active[svc] = is_active
-
-        # Refresh PIDs cache if 10 seconds elapsed
-        now = time.time()
-        if now - globals()['LAST_PIDS_CACHE_TIME'] > 10 or not globals()['SERVICE_PIDS_CACHE']:
-            new_cache = {}
-            
-            # Native services
-            native_svcs = ["daruk"]
-            cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
-            try:
-                res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res_nat.returncode == 0:
-                    nat_lines = [l.strip() for l in res_nat.stdout.decode().splitlines() if l.strip()]
-                    for s_idx, s_name in enumerate(native_svcs):
-                        pids = []
-                        if s_idx < len(nat_lines):
-                            val = nat_lines[s_idx]
-                            if val and val != "0":
-                                pids = [int(val)]
-                        new_cache[s_name] = pids
-                else:
-                    for s_name in native_svcs:
-                        new_cache[s_name] = []
-            except Exception:
-                for s_name in native_svcs:
-                    new_cache[s_name] = []
-                    
-            # Containerized services
-            container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
-            if "urbosa" in services:
-                container_svcs.append("urbosa")
-            for s_name in container_svcs:
-                pids = []
-                if services_active.get(s_name):
-                    try:
-                        res_cont = subprocess.run(f"podman top systemd-{s_name} hpid", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        if res_cont.returncode == 0:
-                            cont_lines = res_cont.stdout.decode().strip().splitlines()
-                            if len(cont_lines) > 1:
-                                for line in cont_lines[1:]:
-                                    val = line.strip()
-                                    if val and val != "?":
-                                        try:
-                                            pids.append(int(val))
-                                        except ValueError:
-                                            pids.append(val)
-                    except Exception:
-                        pass
-                new_cache[s_name] = pids
-                
-            globals()['SERVICE_PIDS_CACHE'] = new_cache
-            globals()['LAST_PIDS_CACHE_TIME'] = now
-
-        pids_cache = globals()['SERVICE_PIDS_CACHE']
-        
-        for svc in services:
-            if services_active[svc]:
-                result["services"][svc_map[svc]] = {
-                    "status": "UP",
-                    "pids": pids_cache.get(svc, [])
-                }
-            else:
-                result["services"][svc_map[svc]] = {
-                    "status": "DOWN",
-                    "pids": []
-                }
-                
-        self.send_json_response(200, result)
+        self.send_json_response(200, build_node_status())
 
     def handle_binary_version(self, parsed):
         import urllib.parse
@@ -1769,6 +1969,12 @@ def check_cluster_and_autostart():
     print("[AUTOSTART] Cleaning up all local libvirt virtual machines to ensure clean compute startup...")
     subprocess.run("for vm in $(virsh list --all --name); do virsh destroy $vm || true; virsh undefine $vm --nvram || true; done", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
+    # ZooKeeper is infrastructure, not a workload: it holds the desired cluster state,
+    # so it must be running before that state can be read. Start it unconditionally and
+    # never stop it as part of "the cluster is stopped".
+    subprocess.run("systemctl start zookeeper", shell=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     if os.path.exists("/run/hci/cluster_operation.lock"):
         print("[AUTOSTART] Cluster operation is in progress. Bypassing autostart checks.")
         return
@@ -1777,7 +1983,7 @@ def check_cluster_and_autostart():
     # Check if cluster configuration exists
     if not os.path.exists("/etc/hci/cluster.json"):
         print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return
@@ -1858,7 +2064,7 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
@@ -2009,7 +2215,18 @@ def main():
 
     t_nvram = threading.Thread(target=nvram_watcher_loop, daemon=True)
     t_nvram.start()
-    
+
+    # Publish this node's state into ZooKeeper as an ephemeral znode, and converge local
+    # services toward the desired cluster state recorded there. Both loops tolerate
+    # ZooKeeper being absent (they retry), so the daemon still serves its mTLS API on a
+    # host where ZooKeeper has not started yet -- which is what the direct-probe fallback
+    # in `cluster status` relies on.
+    t_zk_pub = threading.Thread(target=zk_publisher_loop, daemon=True)
+    t_zk_pub.start()
+
+    t_zk_rec = threading.Thread(target=zk_reconcile_loop, daemon=True)
+    t_zk_rec.start()
+
     server_address = ('', PORT)
     httpd = SecureHTTPServer(server_address, SparkDaemonHandler, context)
     print(f"Spark Daemon listening on port {PORT} with mTLS...")

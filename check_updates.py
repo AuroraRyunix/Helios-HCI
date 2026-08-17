@@ -169,6 +169,7 @@ def collect_inventory():
             "cluster": "/usr/local/bin/cluster",
             "hylia": "/usr/local/bin/hylia",
             "lanayru": "/usr/local/bin/lanayru.py",
+            "helios-zk": "/usr/local/bin/helios_zk.py",
             "check-updates": "/usr/local/bin/check-updates",
             "nodetool": "/usr/local/bin/nodetool",
             "allssh": "/usr/local/bin/allssh",

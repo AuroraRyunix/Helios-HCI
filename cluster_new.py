@@ -25,6 +25,178 @@ def run_parallel(ips, cmd):
     return results
 
 
+# --- ZooKeeper-backed cluster state -----------------------------------------
+#
+# Each node's spark-daemon publishes an ephemeral znode under ZK_NODES_PATH. Reading
+# that tree gives the whole cluster's state from a single connection, instead of fanning
+# mTLS calls out to every host on every invocation -- and because the znodes are
+# ephemeral, a dead node's entry is removed by the ensemble rather than inferred from a
+# failed probe. Rendering happens here in the CLI, so presentation is not baked into the
+# daemon and `--json` is possible.
+ZK_NODES_PATH = "/helios/nodes"
+ZK_CLUSTER_STATE = "/cluster_state"
+NODE_STALE_AFTER = 30      # seconds; a znode older than this is reported as stale
+
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BOLD = "\033[1m"
+GRAY = "\033[90m"
+RESET = "\033[0m"
+
+SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Aether", "Spark", "Spectrum",
+                         "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia",
+                         "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa"]
+
+
+def load_helios_zk():
+    """Import the shared ZooKeeper client, or return None if it is not deployed."""
+    try:
+        import helios_zk
+        return helios_zk
+    except ImportError:
+        pass
+    try:
+        import importlib.util
+        import importlib.machinery
+        for candidate in ("/usr/local/bin/helios_zk.py", "/usr/local/bin/helios_zk"):
+            if os.path.exists(candidate):
+                loader = importlib.machinery.SourceFileLoader("helios_zk", candidate)
+                spec = importlib.util.spec_from_loader("helios_zk", loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                return mod
+    except Exception:
+        pass
+    return None
+
+
+def zk_read_cluster_state():
+    """Read (nodes, desired_state) from ZooKeeper. Returns None if ZK is unreachable."""
+    zkmod = load_helios_zk()
+    if zkmod is None:
+        return None
+    hosts = ["127.0.0.1"] + [ip for ip in get_cluster_ips() if ip != "127.0.0.1"]
+    client = None
+    try:
+        client = zkmod.connect(hosts, timeout=3.0)
+        nodes = {}
+        try:
+            for name in client.get_children(ZK_NODES_PATH):
+                try:
+                    nodes[name] = json.loads(client.get(ZK_NODES_PATH + "/" + name).decode("utf-8"))
+                except Exception:
+                    pass
+        except Exception:
+            pass  # tree not created yet -- an empty result is still a successful read
+        desired = None
+        try:
+            raw = client.get(ZK_CLUSTER_STATE)
+            desired = raw.decode("utf-8", "replace").strip() or None
+        except Exception:
+            pass
+        return {"nodes": nodes, "desired": desired, "via": client.connected_host}
+    except Exception:
+        return None
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def render_node_block(ip, data, use_color=True):
+    """Render one node's services. The CLI owns presentation, not the daemon."""
+    g, r, y, b, gr, x = (GREEN, RED, YELLOW, BOLD, GRAY, RESET) if use_color else ("",) * 6
+    hostname = data.get("hostname", "")
+    leader = ", OdinLeader" if data.get("zk_leader") else ""
+    maint = data.get("maintenance_status", "NORMAL")
+    maint_str = f" {y}[{maint.replace('_', ' ')}]{x}" if maint != "NORMAL" else ""
+
+    age = int(time.time()) - int(data.get("ts", 0) or 0)
+    stale_str = f" {y}[STALE {age}s]{x}" if age > NODE_STALE_AFTER else ""
+
+    lines = [f"\n        Host: {b}{ip}{x} {g}Up{x} {gr}({hostname}){leader}{x}{maint_str}{stale_str}"]
+    services = data.get("services", {})
+    for name in SERVICE_DISPLAY_ORDER:
+        if name not in services:
+            continue
+        svc = services[name]
+        status = svc.get("status", "DOWN")
+        pids = svc.get("pids", [])
+        restarts = svc.get("restarts", 0)
+        pid_str = f"{gr}[{', '.join(map(str, pids))}]{x}" if pids else ""
+        if status == "UP":
+            note = f" {y}({restarts} restarts){x}" if restarts else ""
+            lines.append(f"                    {name:<16}   {g}UP{x}       {pid_str}{note}")
+        elif status == "FLAPPING":
+            lines.append(f"                    {name:<16}   {y}FLAPPING{x} {gr}restarting, {restarts} restarts{x}")
+        else:
+            note = f" {gr}({restarts} restarts){x}" if restarts else ""
+            lines.append(f"                    {name:<16}   {r}DOWN{x}{note}")
+    return "\n".join(lines)
+
+
+# Services expected to be running on a healthy node once the cluster is started.
+# Urbosa is excluded: it is gated behind the urbosa_enabled cluster setting.
+EXPECTED_SERVICES = [s for s in SERVICE_DISPLAY_ORDER if s != "Urbosa"]
+
+
+def wait_for_cluster_convergence(expected_ips, timeout=300, poll=3):
+    """Poll ZooKeeper until every node reports every expected service up.
+
+    The cluster reports its own convergence rather than the CLI declaring success the
+    moment it has finished issuing start commands. Each node's spark-daemon republishes
+    its state every few seconds, so this reflects what actually came up.
+    """
+    deadline = time.time() + timeout
+    last_line = None
+    while time.time() < deadline:
+        state = zk_read_cluster_state()
+        if state is None:
+            line = "Waiting for ZooKeeper to become reachable..."
+            if line != last_line:
+                print(f"  {line}")
+                last_line = line
+            time.sleep(poll)
+            continue
+
+        nodes = state["nodes"]
+        missing = [ip for ip in expected_ips if ip not in nodes]
+        pending = {}
+        for ip in expected_ips:
+            data = nodes.get(ip)
+            if not data:
+                continue
+            services = data.get("services", {})
+            not_up = [n for n in EXPECTED_SERVICES
+                      if n in services and services[n].get("status") != "UP"]
+            if not_up:
+                pending[ip] = not_up
+
+        if not missing and not pending:
+            elapsed = int(timeout - (deadline - time.time()))
+            print(f"  {GREEN}All nodes converged.{RESET}")
+            return True
+
+        parts = []
+        if missing:
+            parts.append("nodes not reporting: " + ", ".join(sorted(missing)))
+        for ip in sorted(pending):
+            shown = pending[ip][:6]
+            more = f" (+{len(pending[ip]) - len(shown)} more)" if len(pending[ip]) > len(shown) else ""
+            parts.append(f"{ip}: {', '.join(shown)}{more}")
+        line = "Waiting for " + "; ".join(parts)
+        if line != last_line:
+            print(f"  {line}")
+            last_line = line
+        time.sleep(poll)
+
+    print(f"  {YELLOW}Timed out after {timeout}s waiting for convergence.{RESET}")
+    return False
+
+
 def get_cluster_ips():
     try:
         with open("/etc/hci/cluster.json", "r") as f:
@@ -275,6 +447,7 @@ def main():
     parser.add_argument("-r", "--redundancy_factor", type=int, default=None, help="Fault Tolerance to Tolerate (FTT) / Redundancy Factor (e.g. 0, 1, or 2)")
     parser.add_argument("-v", "--vip", required=False, help="Floating Cluster Virtual IP (VIP)")
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
     parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy"], help="Action to perform")
     
     args = parser.parse_args()
@@ -906,10 +1079,45 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("==========================================================")
 
     elif args.command == "status":
+        # Preferred path: read the state ZooKeeper already holds. One connection, no
+        # fan-out, and liveness comes from ephemeral znode presence rather than a probe
+        # that cannot distinguish "running" from "restarting".
+        zk_state = zk_read_cluster_state()
+        if zk_state is not None and zk_state["nodes"]:
+            if getattr(args, "json", False):
+                print(json.dumps({
+                    "cluster_state": zk_state["desired"] or "unknown",
+                    "source": "zookeeper",
+                    "nodes": zk_state["nodes"],
+                }, indent=2))
+                sys.exit(0)
+            print("==========================================================")
+            print("                 HCI Cluster Status                       ")
+            print("==========================================================")
+            print(f"The state of the cluster: {zk_state['desired'] or 'unknown'}")
+            print("Lockdown mode: Disabled")
+            print(f"{GRAY}Source: ZooKeeper via {zk_state['via']}{RESET}")
+
+            print("\n--- Cluster Services Status ---")
+            configured = set(get_cluster_ips())
+            for ip in sorted(zk_state["nodes"], key=lambda a: [int(p) for p in a.split(".")] if a.count(".") == 3 and all(p.isdigit() for p in a.split(".")) else [999]):
+                print(render_node_block(ip, zk_state["nodes"][ip]))
+            # A configured node with no znode is not reporting: either it is down, or its
+            # spark-daemon is not running. Ephemeral znodes make this unambiguous.
+            for ip in sorted(configured - set(zk_state["nodes"])):
+                print(f"\n        Host: {BOLD}{ip}{RESET} {RED}Down{RESET} {GRAY}(no ZooKeeper registration){RESET}")
+            print("==========================================================")
+            sys.exit(0)
+
+        if zk_state is None:
+            print(f"{YELLOW}ZooKeeper unreachable; probing nodes directly over mTLS.{RESET}")
+        else:
+            print(f"{YELLOW}ZooKeeper reachable but no nodes registered; probing directly.{RESET}")
+
         print("==========================================================")
         print("                 HCI Cluster Status                       ")
         print("==========================================================")
-        
+
         path = "/api/v1/cluster/status"
         if args.verbose:
             path += "?verbose=true"
@@ -1146,8 +1354,27 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                         print(f"[{ip}] ERROR: Service {svc} failed to listen on port {port}.")
                         sys.exit(1)
                         
-        # 7. Post-Start Health Verification Checks
-        print("\n--- Phase 5: Cluster Health Verification ---")
+        # 7. Wait for every node to report convergence through ZooKeeper. The desired
+        # state was recorded in Phase 1; each node's spark-daemon converges toward it and
+        # republishes what it actually achieved, so this observes the cluster rather than
+        # assuming the start commands above were sufficient.
+        print("\n--- Phase 5: Waiting for Cluster Convergence ---")
+        converged = wait_for_cluster_convergence(ips)
+
+        print("\n--- Cluster Services Status ---")
+        final_state = zk_read_cluster_state()
+        if final_state and final_state["nodes"]:
+            for ip in sorted(final_state["nodes"]):
+                print(render_node_block(ip, final_state["nodes"][ip]))
+        else:
+            print("  (ZooKeeper unreachable; run 'cluster status' for a direct probe)")
+        print("==========================================================")
+
+        if not converged:
+            print(f"{YELLOW}Cluster started but did not fully converge. See the table above.{RESET}")
+
+        # 8. Post-Start Health Verification Checks
+        print("\n--- Phase 6: Cluster Health Verification ---")
         
         # A. ZooKeeper Consensus Check
         print("Checking ZooKeeper consensus quorum...")
