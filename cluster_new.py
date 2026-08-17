@@ -769,7 +769,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
         
         # Check if urbosa enabled
         urbosa_enabled = False
@@ -1101,7 +1101,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start remaining services
         print("\n--- Phase 4: Starting Core Workload & Coordination Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
         if check_urbosa_enabled():
             services.append("urbosa")
         service_ports = {
