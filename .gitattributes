@@ -1,0 +1,39 @@
+# Every daemon/CLI in this repo is executed on Linux hosts, and most are embedded
+# byte-for-byte into provision.py by sync_provision.py. A CRLF working tree (which is
+# what git core.autocrlf=true produces on a Windows checkout) therefore ships CRLF into
+# /usr/local/bin on every node, and `#!/usr/bin/env python3\r` fails with:
+#   /usr/bin/env: 'python3\r': No such file or directory
+# Pin these to LF in the working tree regardless of platform or autocrlf setting.
+
+*.py            text eol=lf
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.md            text eol=lf
+*.rs            text eol=lf
+*.toml          text eol=lf
+Dockerfile      text eol=lf
+
+# Extensionless CLIs and wrappers -- same reason, no extension to match on.
+catcli          text eol=lf
+mcli            text eol=lf
+mcli-runner     text eol=lf
+nodetool        text eol=lf
+allssh          text eol=lf
+
+# Frontend assets are served to browsers, but keep them consistent anyway.
+*.js            text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.woff          binary
+*.woff2         binary
+*.zip           binary
+*.gz            binary
+*.wasm          binary

@@ -58,6 +58,18 @@ for var_name, file_name in mapping.items():
     with open(file_path, "rb") as f:
         file_bytes = f.read()
 
+    # Normalize CRLF -> LF before embedding. These payloads are decoded straight into
+    # /usr/local/bin on Linux hosts, so a CRLF working tree on the workstation (which is
+    # exactly what git core.autocrlf=true produces on a Windows checkout) would ship
+    # scripts whose shebang reads `#!/usr/bin/env python3\r`, failing at exec with
+    # "/usr/bin/env: 'python3\r': No such file or directory". .gitattributes pins these
+    # files to LF as the primary defence; this is the backstop for a working tree that
+    # predates it or was created by other tooling.
+    normalized = file_bytes.replace(b"\r\n", b"\n")
+    if normalized != file_bytes:
+        print(f"  Normalized CRLF line endings in {file_name} before embedding.")
+    file_bytes = normalized
+
     b64_str = base64.b64encode(file_bytes).decode("utf-8")
 
     # Replace the variable definition in provision.py
