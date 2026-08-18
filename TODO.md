@@ -84,6 +84,28 @@ already-fixed when it had never worked.
 * **CRLF corruption of every deployed script fixed** at three layers (`.gitattributes`,
   `sync_provision.py` normalization, `write_file` normalization).
 
+**Follow-up pass (2026-08-18)**
+* **RF changes now replicate.** `ALTER KEYSPACE` only changes the replication strategy;
+  existing data is not copied to new replicas until a repair runs, so the cluster reported
+  full fault tolerance while a partition still lived on one node. Both ALTER sites now go
+  through `alter_keyspace_rf()`, which runs `nodetool repair -pr hydra` in the background
+  whenever the factor increases (or when the previous factor could not be determined).
+  `get_actual_replication_factor()` no longer returns a reassuring `"3"` on error -- it
+  returns `"unknown"`, which is visibly wrong in the UI, which is the point.
+* **`mipha --auto-heal` implemented** and the Dagur cron repointed at it. Runs the slow
+  storage work that must not sit in a 10-second liveness loop: `drbdadm verify` scrubs,
+  Linstor pool usage with thin-pool metadata pressure, and under-replicated resource
+  detection. Chosen over a new daemon so the DRBD logic keeps a single owner and no fifth
+  deployment list is created. Note the pre-existing `insert_storage_auto_heal` was defined
+  but **never executed**, so the job had never been registered at all -- it was not failing
+  nightly, it did not exist. Now wired up, with a migration for any cluster carrying the
+  old `/usr/local/bin/hci-auto-heal` command.
+* **Convergence is now continuous.** The reconcile loop re-asserts desired state every 30s,
+  comparing actual against desired and acting only on drifted units -- so the steady state
+  costs one batched `systemctl is-active` and issues no commands. Verified: a service
+  stopped out from under the daemon returns in ~25s, a service started while the desired
+  state is `stopped` is re-stopped in ~30s, and a quiet cluster logs nothing.
+
 **Correctness bugs found while fixing the above**
 * **The migration lock had never worked.** `vali.py` wrote `SET status = 'migrating'` to a column that
   does not exist on `hydra.vms` (there is only `state`), and the read side `vm_data.get("status", "")`
@@ -150,13 +172,6 @@ daemon's `run_cql_query` talks to — but it is a pass-through that executes raw
 provides the storage-engine work Nutanix hand-built into Cassandra; what is missing is the consistency
 discipline, the ring lifecycle, and the store abstraction.
 
-* **RF changes never replicate.** `spectrum_server.py` runs `ALTER KEYSPACE ... replication_factor: N` and
-  there is **no `nodetool repair` anywhere in the repo** — only `cleanup` and `compact`. Scylla accepts the
-  ALTER instantly and the UI reports the new RF, but existing data is never copied to the new replicas.
-  The cluster believes it is fault-tolerant while a partition still lives on one node. Compounding it,
-  `get_actual_replication_factor()` returns `"3"` as its *error* fallback, so a failed query reports the
-  reassuring answer, and `init_db()` computes `min(3, node_count)` under `CREATE KEYSPACE IF NOT EXISTS`,
-  freezing RF at first boot. **Silent, and it defeats the entire fault-tolerance story.**
 * **Daruk silently downgrades writes from QUORUM to ONE.** `daruk.py:68` downgrades on any error
   containing `"unavailable"`, `"timeout"`, or `"active"` — the last matching an enormous range of
   unrelated messages. Downgrading *writes* during a partition is how two nodes end up both believing they
@@ -173,11 +188,6 @@ discipline, the ring lifecycle, and the store abstraction.
   migration system, so two daemon versions can race to define different schemas.
 * **No ring lifecycle management.** Nutanix auto-detaches an unhealthy node from the ring. Helios has no
   quorum gate on maintenance entry and no decommission/rejoin sequencing.
-* **Convergence is one-shot, not continuous.** The reconcile loop acts on desired-state
-  *changes*; it does not restart a service that dies afterwards while the desired state is
-  unchanged. systemd's `Restart=always` covers the common case, but a unit that exhausts
-  its restart limit stays down until the desired state is rewritten. A periodic re-assert
-  would close this.
 
 Suggested shape: keep `/query` working, add typed endpoints (`/v1/vm/claim`, `/v1/vm/migrate-lock`)
 backed by prepared LWT statements, migrate invariant-critical writes first, move schema ownership into
@@ -188,14 +198,6 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## P2 — Storage / DFS
 
-* **`hci-auto-heal` is still referenced but missing.** `spectrum_server.py` registers a daily Dagur task
-  invoking `/usr/local/bin/hci-auto-heal`, which does not exist — it fails every night.
-  **Recommended: add a `--auto-heal` subcommand to `mipha` and repoint the cron row at it.** The healing
-  logic already exists and is already owned (Mipha for DRBD, `valcli storage.cleanup_orphaned` for
-  orphans); a new daemon would be a third owner of DRBD state racing the other two, and every new
-  component needs an entry in four separate deployment lists that have already been shown to drift.
-  What a daily job should add is the slow work that does not belong in a liveness loop: `drbdadm verify`
-  scrubs, thin-pool overcommit reporting, and re-placing under-replicated resources.
 * **No maintenance-mode quorum gate.** Entering maintenance stops the local `hydra-db` unconditionally.
   On a 1- or 2-node cluster with QUORUM this can freeze all queries cluster-wide.
 * **No out-of-band fencing path.** `mipha.py` `ssh_fence_host` relies entirely on Spark's mTLS API. If a

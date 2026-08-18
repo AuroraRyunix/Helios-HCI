@@ -694,6 +694,155 @@ def ssh_fence_host(ip):
     print(f"[Mipha HA] Spark Fencing failed for host {ip}: {stderr}")
     return False
 
+# ---------------------------------------------------------------------------
+# Scheduled storage auto-heal.
+#
+# Invoked by the Dagur cron entry as `mipha --auto-heal`. This is deliberately a
+# subcommand on the existing daemon rather than a separate service: the DRBD healing
+# logic already lives here, and a second owner of DRBD state would race the HA loop.
+# It also avoids a fifth place for a component to drift out of (provision embedding,
+# sync_provision mapping, upgrade package, LCM inventory, deploy_updates).
+#
+# What belongs here is the slow work that must not run in a liveness loop: verify
+# scrubs, capacity reporting, and detecting under-replicated resources.
+LINSTOR_EXEC = "podman exec systemd-aether linstor"
+
+
+def _heal_log(msg):
+    print(f"[AutoHeal] {msg}", flush=True)
+
+
+def auto_heal_drbd_verify():
+    """Run an online verify pass over every DRBD resource.
+
+    `drbdadm verify` checksums the peers against each other and marks any differing
+    blocks out-of-sync so the next resync repairs them. It is read-only with respect to
+    application data, but it is I/O heavy -- which is exactly why it belongs in a nightly
+    job rather than in Mipha's 10-second control loop.
+    """
+    resources = get_all_drbd_resources()
+    if not resources:
+        _heal_log("No DRBD resources configured; skipping verify pass.")
+        return 0
+    failures = 0
+    for res in resources:
+        rc, out, err = run_command_local(f"drbdadm status {res}")
+        if rc != 0:
+            _heal_log(f"{res}: not loaded, skipping verify.")
+            continue
+        if "Connected" not in out and "UpToDate" not in out:
+            _heal_log(f"{res}: not in a connected/UpToDate state, skipping verify to avoid noise.")
+            continue
+        rc_v, out_v, err_v = run_command_local(f"drbdadm verify {res}")
+        if rc_v == 0:
+            _heal_log(f"{res}: verify started.")
+        else:
+            detail = (err_v or out_v).strip()
+            # A single-node resource has no peer to verify against; that is not a fault.
+            if "peer" in detail.lower() or "no connection" in detail.lower():
+                _heal_log(f"{res}: no peer to verify against (single-node resource).")
+            else:
+                _heal_log(f"{res}: verify FAILED: {detail}")
+                failures += 1
+    return failures
+
+
+def auto_heal_report_capacity():
+    """Report Linstor storage-pool usage, flagging thin-pool overcommit."""
+    rc, out, err = run_command_local(f"{LINSTOR_EXEC} --machine-readable storage-pool list")
+    if rc != 0:
+        _heal_log(f"Could not read storage pools: {(err or out).strip()[:200]}")
+        return 0
+    warnings = 0
+    try:
+        data = json.loads(out)
+        rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else data
+        for entry in rows if isinstance(rows, list) else []:
+            name = entry.get("storage_pool_name", "?")
+            node = entry.get("node_name", "?")
+            # Diskless pools carry no real capacity -- Linstor reports INT64_MAX for them,
+            # which would otherwise render as a meaningless 0.0% used line.
+            if entry.get("provider_kind") == "DISKLESS":
+                continue
+            free = entry.get("free_capacity")
+            total = entry.get("total_capacity")
+            if not total or total >= 2 ** 62:
+                continue
+            used_pct = 100.0 * (total - (free or 0)) / total
+            total_gib = total / (1024.0 * 1024.0)
+            level = "WARNING" if used_pct >= 85 else "ok"
+            _heal_log(f"pool {name} on {node}: {used_pct:.1f}% used of {total_gib:.0f} GiB ({level})")
+            if used_pct >= 85:
+                warnings += 1
+            # Thin pools overcommit: allocated volumes can exceed the backing pool, so
+            # report the metadata pressure Linstor tracks separately.
+            meta = (entry.get("props") or {}).get("StorDriver/internal/lvmthin/thinPoolMetadataPercent")
+            if meta:
+                try:
+                    if float(meta) >= 80.0:
+                        _heal_log(f"pool {name} on {node}: thin-pool metadata {float(meta):.1f}% used -- WARNING")
+                        warnings += 1
+                except ValueError:
+                    pass
+    except Exception as exc:
+        _heal_log(f"Could not parse storage-pool output: {exc}")
+    return warnings
+
+
+def auto_heal_check_replicas():
+    """Flag resources with fewer replicas than the cluster's redundancy factor."""
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cfg = json.load(f)
+        rf = int(cfg.get("redundancy_factor", 0))
+        node_count = len(cfg.get("hosts", []))
+    except Exception as exc:
+        _heal_log(f"Could not read cluster.json: {exc}")
+        return 0
+    # FTT 0 on a single node means one copy is the intended state.
+    expected = rf + 1
+    if expected <= 1 or node_count <= 1:
+        _heal_log(f"Redundancy factor {rf} on {node_count} node(s): single-copy is expected, skipping replica check.")
+        return 0
+    rc, out, err = run_command_local(f"{LINSTOR_EXEC} --machine-readable resource list")
+    if rc != 0:
+        _heal_log(f"Could not read resource list: {(err or out).strip()[:200]}")
+        return 0
+    warnings = 0
+    try:
+        data = json.loads(out)
+        rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else data
+        counts = {}
+        for entry in rows if isinstance(rows, list) else []:
+            counts[entry.get("name", "?")] = counts.get(entry.get("name", "?"), 0) + 1
+        for name, have in sorted(counts.items()):
+            if have < expected:
+                _heal_log(f"resource {name}: {have} replica(s), expected {expected} -- UNDER-REPLICATED")
+                warnings += 1
+    except Exception as exc:
+        _heal_log(f"Could not parse resource list: {exc}")
+    return warnings
+
+
+def run_auto_heal():
+    """Entry point for `mipha --auto-heal`. Exit code 0 = clean, 1 = attention needed."""
+    _heal_log("Starting scheduled storage auto-heal pass.")
+    issues = 0
+    for step, fn in (("DRBD verify", auto_heal_drbd_verify),
+                     ("capacity report", auto_heal_report_capacity),
+                     ("replica check", auto_heal_check_replicas)):
+        try:
+            issues += fn()
+        except Exception as exc:
+            _heal_log(f"{step} raised: {exc}")
+            issues += 1
+    if issues:
+        _heal_log(f"Completed with {issues} item(s) needing attention.")
+        return 1
+    _heal_log("Completed cleanly.")
+    return 0
+
+
 def main():
     print("Mipha High-Availability Host Monitor and VM Failover Coordinator started.")
     
@@ -1043,4 +1192,8 @@ def main():
         time.sleep(10)
 
 if __name__ == "__main__":
+    # `mipha --auto-heal` runs the nightly storage pass and exits; with no arguments the
+    # HA daemon runs as normal.
+    if "--auto-heal" in sys.argv:
+        sys.exit(run_auto_heal())
     main()

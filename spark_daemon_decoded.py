@@ -337,6 +337,7 @@ ZK_NODES_PATH = ZK_ROOT + "/nodes"
 # truth rather than introducing a competing one.
 ZK_CLUSTER_STATE = "/cluster_state"
 ZK_PUBLISH_INTERVAL = 5          # seconds between state refreshes
+ZK_DRIFT_CHECK_INTERVAL = 30     # seconds between drift re-assertions
 ZK_SESSION_TIMEOUT_MS = 15000
 FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as FLAPPING
 
@@ -432,6 +433,52 @@ def read_desired_cluster_state(client):
         return None
 
 
+def converge_to_desired_state(desired, full=False):
+    """Bring local services into line with the desired cluster state.
+
+    `full=True` (the desired state just changed) walks the whole set in dependency order.
+    Otherwise this is a periodic drift check: it only touches units that are not already
+    in the intended state, so the common case costs one `systemctl is-active` batch and
+    issues no commands at all.
+
+    The drift check exists because acting only on state *changes* leaves a hole: a service
+    that dies later, while the desired state is unchanged, is left to systemd's
+    Restart=always -- and a unit that exhausts its restart limit stays down until someone
+    rewrites the desired state.
+    """
+    running = desired.startswith("start")
+    order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
+    action = "start" if running else "stop"
+
+    if full:
+        print(f"[ZK] Converging local services toward '{desired}'.", flush=True)
+        targets = order
+    else:
+        # Batch one query for all managed units and act only on the mismatches.
+        res = subprocess.run("systemctl is-active " + " ".join(order),
+                             shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        states = res.stdout.decode().splitlines()
+        targets = []
+        for idx, svc in enumerate(order):
+            state = states[idx].strip() if idx < len(states) else ""
+            is_active = state == "active"
+            # "activating" is in-flight, not drift; leave it alone rather than restarting
+            # a unit that is already on its way to the right state.
+            if state == "activating":
+                continue
+            if running and not is_active:
+                targets.append(svc)
+            elif not running and is_active:
+                targets.append(svc)
+        if not targets:
+            return
+        print(f"[ZK] Drift detected against '{desired}': {', '.join(targets)}", flush=True)
+
+    for svc in targets:
+        subprocess.run(f"systemctl {action} {svc}", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def zk_reconcile_loop():
     """Converge local services toward the desired cluster state published in ZooKeeper.
 
@@ -446,6 +493,7 @@ def zk_reconcile_loop():
 
     client = None
     applied = None
+    last_drift_check = 0.0
     while True:
         try:
             if client is None:
@@ -460,18 +508,19 @@ def zk_reconcile_loop():
                 desired = raw.decode("utf-8", "replace").strip() or None
             except zkmod.ZKNoNode:
                 desired = None      # state genuinely unset; nothing to converge toward
-            if desired and desired != applied:
+            if desired:
                 if os.path.exists("/etc/hci/maintenance.state"):
-                    print(f"[ZK] Desired state '{desired}' ignored: host is in maintenance.", flush=True)
+                    if desired != applied:
+                        print(f"[ZK] Desired state '{desired}' ignored: host is in maintenance.", flush=True)
+                        applied = desired
                 else:
-                    print(f"[ZK] Converging local services toward '{desired}'.", flush=True)
-                    running = desired.startswith("start")
-                    order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
-                    action = "start" if running else "stop"
-                    for svc in order:
-                        subprocess.run(f"systemctl {action} {svc}", shell=True,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    applied = desired
+                    changed = desired != applied
+                    now = time.time()
+                    due = (now - last_drift_check) >= ZK_DRIFT_CHECK_INTERVAL
+                    if changed or due:
+                        last_drift_check = now
+                        converge_to_desired_state(desired, full=changed)
+                        applied = desired
         except Exception as exc:
             print(f"[ZK] Reconcile error ({exc}); reconnecting.", flush=True)
             try:

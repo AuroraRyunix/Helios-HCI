@@ -529,7 +529,54 @@ def get_actual_replication_factor():
                     return str(rep["replication_factor"])
     except Exception as e:
         print(f"Error fetching actual replication factor: {e}")
-    return "3"
+    # Deliberately not "3": returning a plausible-looking RF when the query failed makes
+    # a broken cluster report full fault tolerance. "unknown" is the honest answer and is
+    # visibly wrong in the UI, which is the point.
+    return "unknown"
+
+def run_nodetool_repair(reason=""):
+    """Run a full repair so an RF increase actually replicates.
+
+    ALTER KEYSPACE only changes the replication *strategy*: Scylla accepts it instantly
+    and system_schema reports the new factor, but existing data is not copied to the new
+    replicas until a repair runs. Without this the cluster reports RF=3 while a partition
+    still lives on a single node, and losing that node loses the data -- fault tolerance
+    that exists only on paper. Repair is idempotent and safe to re-run.
+    """
+    label = f" ({reason})" if reason else ""
+    print(f"[REPAIR] Starting nodetool repair{label}. This can take a while on a large keyspace.")
+    rc, out, err = run_remote_spark(
+        LOCAL_IP, "podman exec systemd-hydra-db nodetool repair -pr hydra", timeout=3600)
+    if rc == 0:
+        print(f"[REPAIR] Completed successfully{label}.")
+        return True
+    print(f"[REPAIR] FAILED{label}: {(err or out).strip()[:400]}")
+    print("[REPAIR] Replicas may be under-populated. Re-run: "
+          "podman exec systemd-hydra-db nodetool repair -pr hydra")
+    return False
+
+
+def alter_keyspace_rf(desired_rf, reason=""):
+    """Change the keyspace replication factor, then repair if it increased."""
+    before = get_actual_replication_factor()
+    alter = ("ALTER KEYSPACE hydra WITH replication = "
+             "{'class': 'SimpleStrategy', 'replication_factor': %d};" % desired_rf)
+    rc, _, err = run_cql_query(alter)
+    if rc != 0:
+        print(f"[REPAIR] ALTER KEYSPACE to RF={desired_rf} failed: {err}")
+        return False
+    try:
+        increased = int(before) < int(desired_rf)
+    except (TypeError, ValueError):
+        increased = True   # unknown previous RF: repair rather than assume it was enough
+    if increased:
+        import threading
+        # Repair can run for a long time; do not block startup or an API request on it.
+        threading.Thread(target=run_nodetool_repair,
+                         args=(reason or f"RF {before} -> {desired_rf}",),
+                         daemon=True).start()
+    return True
+
 
 def get_container_node_ip(container_name):
     """Finds which node in the cluster has the specified storage container mounted. Returns '127.0.0.1' as fallback."""
@@ -1017,7 +1064,7 @@ def init_db():
     """
     insert_storage_auto_heal = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('storage_auto_heal', 'storage_auto_heal', '0 1 * * *', 86400, true, 0, '/usr/local/bin/hci-auto-heal') IF NOT EXISTS;
+    VALUES ('storage_auto_heal', 'storage_auto_heal', '0 1 * * *', 86400, true, 0, '/usr/local/bin/mipha --auto-heal') IF NOT EXISTS;
     """
     insert_system_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
@@ -1268,6 +1315,13 @@ def init_db():
                 run_cql_query(insert_diagnostics)
                 run_cql_query(insert_storage_scrub)
                 run_cql_query("UPDATE hydra.dagur_schedules SET command = 'drbdadm status || true' WHERE job_name = 'storage_scrub';")
+                run_cql_query(insert_storage_auto_heal)
+                # Migrate clusters provisioned before this job pointed at a real command.
+                # The INSERT above is IF NOT EXISTS, so it cannot repair an existing row --
+                # and /usr/local/bin/hci-auto-heal never existed in the first place.
+                run_cql_query(
+                    "UPDATE hydra.dagur_schedules SET command = '/usr/local/bin/mipha --auto-heal' "
+                    "WHERE job_name = 'storage_auto_heal' IF command = '/usr/local/bin/hci-auto-heal';")
                 run_cql_query(insert_db_compaction)
                 run_cql_query(insert_mimir_default)
                 run_cql_query(insert_system_cleanup)
@@ -1314,8 +1368,7 @@ def init_db():
                         if rf_lines:
                             configured_rf = int(rf_lines[0])
                     desired_rf = min(configured_rf, len(get_cluster_nodes()) if get_cluster_nodes() else 1)
-                    alter_keyspace = f"ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {desired_rf}}};"
-                    run_cql_query(alter_keyspace)
+                    alter_keyspace_rf(desired_rf, reason="startup reconcile")
                 except Exception as e:
                     print(f"Error altering keyspace replication on startup: {e}")
                     
@@ -4775,8 +4828,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         user_rf = int(data["replication_factor"])
                         node_count = len(get_cluster_nodes()) if get_cluster_nodes() else 1
                         capped_rf = min(user_rf, node_count)
-                        alter_cql = f"ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {capped_rf}}};"
-                        run_cql_query(alter_cql)
+                        alter_keyspace_rf(capped_rf, reason="operator changed replication_factor")
                     except Exception as e:
                         print(f"Error altering keyspace replication: {e}")
 
