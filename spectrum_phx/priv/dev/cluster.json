@@ -1,0 +1,13 @@
+{
+    "cluster_name": "hci-01",
+    "redundancy_factor": 0,
+    "dfs_engine": "linstor",
+    "vip": "10.10.102.45",
+    "hosts": [
+        {
+            "node_id": 1,
+            "ip": "10.10.102.41",
+            "hostname": "Valkyrie-997A49"
+        }
+    ]
+}

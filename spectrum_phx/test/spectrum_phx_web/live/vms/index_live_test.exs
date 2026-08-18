@@ -203,7 +203,7 @@ defmodule SpectrumPhxWeb.Vms.IndexLiveTest do
     test "a poll tick re-reads the VM list", %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/vms")
 
-      updated = Enum.map(@vms, fn vm -> %Vm{vm | state: "Stopped", host_ip: ""} end)
+      updated = Enum.map(@vms, fn %Vm{} = vm -> %Vm{vm | state: "Stopped", host_ip: ""} end)
       Application.put_env(:spectrum_phx, :vms_source, {:static, updated})
 
       send(view.pid, :poll)

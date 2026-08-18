@@ -165,6 +165,11 @@ Exec=startSatellite
 WantedBy=multi-user.target
 """,
 
+    # NOTE: /etc/hci/spectrum is mounted :z (shared label), not :Z (private MCS category).
+# :Z relabels recursively, which includes /etc/hci/spectrum/certs -- and slate.container
+# mounts that same certs directory to serve TLS. A private category there is unreadable
+# by any other container, so Slate would fail to load its certificate. It only works
+# today because these hosts run SELinux in Permissive mode; under Enforcing it breaks.
     "spectrum": """[Unit]
 Description=Spectrum (Prism) Web Console & Management UI
 After=hydra-db.service aether.service
@@ -179,7 +184,7 @@ MemoryHigh=800M
 Image=localhost/spectrum:latest
 Pull=never
 Network=host
-Volume=/etc/hci/spectrum:/etc/hci/spectrum:Z
+Volume=/etc/hci/spectrum:/etc/hci/spectrum:z
 Volume=/etc/hci:/etc/hci:ro
 Volume=/root/.certs:/root/.certs:ro
 Volume=/var/lib/hci/aether/volumes:/var/lib/hci/aether/volumes:rslave

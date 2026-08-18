@@ -59,9 +59,16 @@ defmodule SpectrumPhx.Vms do
   # still what the caller believed it was when it decided to start the VM.
   @claim_host_cql "UPDATE hydra.vms SET host_ip = ?, state = ? WHERE name = ? IF host_ip = ?"
 
-  # `IF status != ?` rather than a read-then-write check. A null `status` (every VM
-  # created before the lock column was used) satisfies `!=`, so an unlocked VM is claimable
-  # and a locked one is not, with no window between the test and the write.
+  # `IF status != ?` rather than a read-then-write check: the condition and the write are
+  # one Paxos round, so there is no window between the test and the act.
+  #
+  # This relies on a null `status` satisfying `!=`. That matters because `status` *is* null
+  # for every VM `/api/vms/create` ever registered -- it inserts JSON without the column --
+  # so the common case is the null case. Cassandra handles EQ and NEQ against a null row
+  # value explicitly (only the ordering operators are an error there) and Scylla documents
+  # LWT conditions as Cassandra-compatible. Verify it against a live Scylla before relying
+  # on it: if it turned out that a null never satisfies `!=`, the lock would refuse every
+  # first migration rather than allow a concurrent one -- loud, not silent, but wrong.
   @set_migration_lock_cql "UPDATE hydra.vms SET status = ? WHERE name = ? IF status != ?"
 
   # Only the holder may release it: conditional on the lock actually being held, so a

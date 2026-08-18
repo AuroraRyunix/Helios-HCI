@@ -35,3 +35,13 @@ spectrum_phx-*.tar
 npm-debug.log
 /assets/node_modules/
 
+# Digested static assets produced by `mix assets.deploy`. Only /priv/static/assets/ and
+# cache_manifest.json were covered, so a `git add -A` after a release build would commit
+# generated output.
+/priv/static/favicon-*.ico
+/priv/static/images/logo-*.svg
+/priv/static/images/logo-*.svg.gz
+/priv/static/robots-*.txt
+/priv/static/robots-*.txt.gz
+/priv/static/robots.txt.gz
+/priv/static/favicon-*.ico.gz

@@ -48,7 +48,17 @@ defmodule SpectrumPhx.Hydra do
   end
 
   @doc """
-  Run a prepared statement and return `{:ok, [map]}` or `{:error, reason}`.
+  Run a statement with bound parameters and return `{:ok, [map]}` or `{:error, reason}`.
+
+  The statement is genuinely *prepared* (Xandra caches prepared statements per
+  connection and re-prepares automatically on schema change), so values travel as bound
+  parameters and never as text spliced into CQL. That is the point of this layer: the
+  Python tier built CQL by string interpolation in six copy-pasted `run_cql_query`
+  implementations, which is why injection had to be patched at each call site.
+
+  Parameters may be given as plain values, or as `{type, value}` tuples for callers that
+  were written against the simple-query API. The type tag is redundant once a statement
+  is prepared -- the server supplies the parameter metadata -- so it is unwrapped here.
 
   `consistency` is chosen per call rather than set globally with a silent downgrade:
   `daruk.py` fell back from QUORUM to ONE on any error whose message contained
@@ -58,12 +68,28 @@ defmodule SpectrumPhx.Hydra do
   def query(statement, params \\ [], opts \\ []) do
     consistency = Keyword.get(opts, :consistency, :quorum)
 
-    case Xandra.Cluster.execute(@pool, statement, params, consistency: consistency) do
-      {:ok, %Xandra.Page{} = page} -> {:ok, Enum.to_list(page)}
-      {:ok, _other} -> {:ok, []}
+    with {:ok, prepared} <- Xandra.Cluster.prepare(@pool, statement),
+         {:ok, result} <-
+           Xandra.Cluster.execute(@pool, prepared, strip_types(params), consistency: consistency) do
+      case result do
+        %Xandra.Page{} = page -> {:ok, Enum.to_list(page)}
+        _other -> {:ok, []}
+      end
+    else
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # Accept both `["v"]` and `[{"text", "v"}]`. Prepared statements carry their own
+  # parameter metadata, so an explicit type tag is unnecessary and would be rejected.
+  defp strip_types(params) when is_list(params) do
+    Enum.map(params, fn
+      {type, value} when is_binary(type) -> value
+      other -> other
+    end)
+  end
+
+  defp strip_types(params), do: params
 
   @doc "Like `query/3` but raises on error. For call sites where failure is a bug."
   def query!(statement, params \\ [], opts \\ []) do
@@ -83,22 +109,23 @@ defmodule SpectrumPhx.Hydra do
   def apply_lwt(statement, params \\ [], opts \\ []) do
     consistency = Keyword.get(opts, :consistency, :quorum)
 
-    case Xandra.Cluster.execute(@pool, statement, params,
-           consistency: consistency,
-           serial_consistency: :serial
-         ) do
-      {:ok, %Xandra.Page{} = page} ->
-        applied =
-          page
-          |> Enum.to_list()
-          |> List.first()
-          |> case do
-            %{"[applied]" => value} -> value
-            _ -> true
-          end
+    with {:ok, prepared} <- Xandra.Cluster.prepare(@pool, statement),
+         {:ok, %Xandra.Page{} = page} <-
+           Xandra.Cluster.execute(@pool, prepared, strip_types(params),
+             consistency: consistency,
+             serial_consistency: :serial
+           ) do
+      applied =
+        page
+        |> Enum.to_list()
+        |> List.first()
+        |> case do
+          %{"[applied]" => value} -> value
+          _ -> true
+        end
 
-        {:ok, applied}
-
+      {:ok, applied}
+    else
       {:error, reason} ->
         {:error, reason}
     end

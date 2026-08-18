@@ -47,3 +47,10 @@ allssh          text eol=lf
 *.eex           text eol=lf
 *.lock          text eol=lf
 .formatter.exs  text eol=lf
+
+# Container build and Podman Quadlet files. These are read inside Linux containers and
+# by systemd's Quadlet generator; CRLF breaks both.
+.dockerignore   text eol=lf
+*.container     text eol=lf
+*.txt           text eol=lf
+*.svg           text eol=lf

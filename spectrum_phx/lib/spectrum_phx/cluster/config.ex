@@ -9,8 +9,16 @@ defmodule SpectrumPhx.Cluster.Config do
   use Agent
   require Logger
 
-  @cluster_json "/etc/hci/cluster.json"
-  @spectrum_env "/etc/hci/spectrum/spectrum.env"
+  # Overridable so the app can be exercised off-node during development. In the container
+  # these stay at their real paths, which are bind-mounted in.
+  @default_cluster_json "/etc/hci/cluster.json"
+  @default_spectrum_env "/etc/hci/spectrum/spectrum.env"
+
+  defp cluster_json_path,
+    do: Application.get_env(:spectrum_phx, :cluster_json_path, @default_cluster_json)
+
+  defp spectrum_env_path,
+    do: Application.get_env(:spectrum_phx, :spectrum_env_path, @default_spectrum_env)
 
   def start_link(_opts \\ []), do: Agent.start_link(fn -> load() end, name: __MODULE__)
 
@@ -45,20 +53,20 @@ defmodule SpectrumPhx.Cluster.Config do
 
   defp load do
     cluster =
-      case File.read(@cluster_json) do
+      case File.read(cluster_json_path()) do
         {:ok, body} ->
           case Jason.decode(body) do
             {:ok, map} ->
               map
 
             {:error, reason} ->
-              Logger.warning("Could not parse #{@cluster_json}: #{inspect(reason)}")
+              Logger.warning("Could not parse #{cluster_json_path()}: #{inspect(reason)}")
               %{}
           end
 
         {:error, reason} ->
           # Absent during local development; the app must still boot.
-          Logger.info("#{@cluster_json} unavailable (#{inspect(reason)}); using empty config.")
+          Logger.info("#{cluster_json_path()} unavailable (#{inspect(reason)}); using empty config.")
           %{}
       end
 
@@ -72,7 +80,7 @@ defmodule SpectrumPhx.Cluster.Config do
   end
 
   defp read_local_ip do
-    with {:ok, body} <- File.read(@spectrum_env),
+    with {:ok, body} <- File.read(spectrum_env_path()),
          [_ | _] = lines <- String.split(body, "\n") do
       Enum.find_value(lines, fn line ->
         case String.split(String.trim(line), "=", parts: 2) do

@@ -598,6 +598,18 @@ defmodule SpectrumPhx.Zk.Client do
   # Local node first, so a healthy node prefers itself; this mirrors `get_zk_hosts()` in
   # spark-daemon and the host list `cluster status` builds.
   defp default_hosts do
+    # An explicit override wins outright, so the app can be pointed at a remote ensemble
+    # during development without a local /etc/hci/cluster.json.
+    case Application.get_env(:spectrum_phx, :zk_hosts) do
+      hosts when is_list(hosts) and hosts != [] ->
+        normalize_hosts(hosts)
+
+      _ ->
+        default_hosts_from_cluster()
+    end
+  end
+
+  defp default_hosts_from_cluster do
     ips =
       try do
         SpectrumPhx.Cluster.Config.node_ips()

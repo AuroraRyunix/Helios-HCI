@@ -71,7 +71,9 @@ defmodule SpectrumPhx.MixProject do
       # string-interpolation injection class the Python tier had to patch per call site.
       {:xandra, "~> 0.19"},
       # Optional Xandra dependency, required at compile time for CQL decimal/varint types.
-      {:decimal, "~> 2.0"},
+      # Pinned to 3.x: decimal 2.4.1 carries EEF-CVE-2026-32686 (unbounded exponent,
+      # unauthenticated DoS). Xandra accepts ~> 1.7 or ~> 2.0 or ~> 3.0.
+      {:decimal, "~> 3.0"},
       # HTTP client used for the mTLS control-plane calls to spark-daemon on :9099.
       {:req, "~> 0.5"}
     ]

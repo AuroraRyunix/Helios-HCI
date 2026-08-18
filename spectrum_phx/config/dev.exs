@@ -62,3 +62,9 @@ config :phoenix_live_view,
   debug_attributes: true,
   # Enable helpful, but potentially expensive runtime checks
   enable_expensive_runtime_checks: true
+
+# Development against the live Helios cluster. These paths and hosts only exist on a
+# hypervisor; overriding them lets the dashboard be exercised from a workstation.
+config :spectrum_phx,
+  cluster_json_path: Path.expand("../priv/dev/cluster.json", __DIR__),
+  zk_hosts: ["10.10.102.41"]
