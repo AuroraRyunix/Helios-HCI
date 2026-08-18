@@ -26,11 +26,29 @@ finish that pattern and stop routing around it.
    Exposing the verbs would reproduce `/execute` with extra steps.
 2. **No caller-supplied command fragments.** Parameters are values (a VM name, a resource
    name, a path from a fixed allowlist), never flags or shell text.
-3. **Validate at the boundary.** Names match `\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\z`. Paths
-   must resolve under an allowlisted root. Reject rather than sanitize.
+3. **Validate at the boundary.** Names match `\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z`
+   (`\Z`, not `$` -- `$` also matches before a trailing newline). Paths must resolve under
+   an allowlisted root. Reject rather than sanitize.
+
+   One carve-out is required and was found during implementation: `/dev/drbd/by-res/<res>/<vol>`
+   is a symlink to `/dev/drbdNNNN`, so a plain `realpath`-must-be-under-an-allowed-root rule
+   rejects *every* DRBD device and makes the storage endpoints unusable. The rule is
+   therefore: the literal path must be under an allowed root **and** the realpath must be
+   under an allowed root, *except* that a literal path under `/dev/drbd/` may resolve to
+   `\A/dev/drbd[0-9]+\Z`. An aether-rooted symlink pointing at `/etc/shadow` is still rejected.
 4. **Structured responses.** Return parsed JSON, not captured stdout. A caller that has to
    regex stdout is still coupled to the command.
-5. **`/api/v1/execute` stays** during migration, and shrinks as call sites move. It is not
+
+   Note the two pass-through documents keep their upstream shape: `/storage/drbd/status`
+   returns the top-level **array** from `drbdsetup status --json`, and `/host/disks` returns
+   the `{"blockdevices": [...]}` **object** from `lsblk -J`.
+
+5. **Error codes.** `400` for a rejected parameter, `404` for an unknown domain or resource,
+   `409` when an operation did not take. A `409` still carries the state key so the caller
+   learns the actual value: `/storage/drbd/role` returns `{"role": "<actual>", "error": ...}`
+   and names the peer when one holds Primary; `/vm/{name}/power` returns
+   `{"state": "<actual>", "error": ...}`.
+6. **`/api/v1/execute` stays** during migration, and shrinks as call sites move. It is not
    removed until the raw-call count reaches zero.
 
 ## Endpoints
@@ -73,7 +91,7 @@ that previously allowed a VM to start twice.
 
 | Method | Path | Body / Query | Returns |
 | :-- | :-- | :-- | :-- |
-| GET | `/api/v1/host/network` | -- | `{"default_interface","default_gateway","addresses":[...]}` |
+| GET | `/api/v1/host/network` | -- | `{"default_interface","default_gateway","addresses":[{"interface","family","address","prefixlen","scope"}]}` |
 | GET | `/api/v1/host/memory` | -- | `{"total_mb","used_mb","free_mb","available_mb"}` |
 | GET | `/api/v1/host/disks` | -- | parsed `lsblk -J` |
 | GET | `/api/v1/host/capabilities` | -- | `{"kvm":bool,"drbd_module":bool,"secure_boot":bool}` |

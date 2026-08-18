@@ -1875,7 +1875,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
  
             # Start linstor-controller
-            run_checked_cmd(hosts[0], "systemctl start linstor-controller")
+            # run_checked_cmd is defined in cluster_new.py, not here -- calling it raised
+            # NameError and broke this path. run_parallel_checked has identical semantics
+            # (checked remote exec, raises on failure) and takes a list.
+            run_parallel_checked([hosts[0]], "systemctl start linstor-controller")
             for ip in hosts[1:]:
                 run_remote_spark(ip, "systemctl stop linstor-controller")
             # Wait for Linstor controller
@@ -1993,7 +1996,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             
             # Start storage engine (linstor-controller and satellite/aether on all)
             run_parallel_checked(servers, "systemctl start aether")
-            run_checked_cmd(servers[0], "systemctl start linstor-controller")
+            run_parallel_checked([servers[0]], "systemctl start linstor-controller")
             for ip in servers[1:]:
                 run_remote_spark(ip, "systemctl stop linstor-controller")
             # Wait for Linstor controller API to start listening on port 3370 on the leader server
