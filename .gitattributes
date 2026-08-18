@@ -37,3 +37,13 @@ allssh          text eol=lf
 *.zip           binary
 *.gz            binary
 *.wasm          binary
+
+# Elixir / Phoenix sources. These are compiled into an OTP release inside a Linux
+# container; a CRLF working tree would carry through into the image, and .sh/.eex
+# release scripts must be LF to execute at all.
+*.ex            text eol=lf
+*.exs           text eol=lf
+*.heex          text eol=lf
+*.eex           text eol=lf
+*.lock          text eol=lf
+.formatter.exs  text eol=lf
