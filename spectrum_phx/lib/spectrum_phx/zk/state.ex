@@ -82,6 +82,38 @@ defmodule SpectrumPhx.Zk.State do
   end
 
   @doc """
+  IP of the current ZooKeeper leader, or `nil` if it cannot be determined.
+
+  This is leader *discovery*, not leader election. Spectrum never needs to become the
+  leader -- it needs to know which node is, because Catalyst's task queue is in-memory on
+  the leader, so a task submitted to any other node is dispatched nowhere.
+
+  No new ZooKeeper primitive is required: each node's spark-daemon already publishes
+  `zk_leader` in its ephemeral status document, derived from the server's own `stat`
+  four-letter-word output. Reading it is strictly better than running a second election,
+  which could disagree with the ensemble's.
+
+  Stale documents are ignored: a node that stopped publishing may well be the node that
+  stopped being the leader.
+  """
+  def leader_ip(client \\ Client) do
+    case read_cluster_state(client) do
+      {:ok, %{nodes: nodes}} ->
+        nodes
+        |> Enum.find(fn {_ip, doc} ->
+          doc["zk_leader"] == true and not node_stale?(doc)
+        end)
+        |> case do
+          {ip, _doc} -> ip
+          nil -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  @doc """
   Whether a node's document is older than #{@stale_after_seconds} seconds.
 
   A document with no usable `ts` is stale: it cannot be shown to be current, and the
