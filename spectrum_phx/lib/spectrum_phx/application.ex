@@ -13,6 +13,9 @@ defmodule SpectrumPhx.Application do
       # Cluster configuration is read once and cached; Hydra connects lazily so the
       # web tier boots and reports ScyllaDB as down rather than failing alongside it.
       SpectrumPhx.Cluster.Config,
+      # Zk.Client must start after Config: it derives its host list from the cluster
+      # configuration. It connects in handle_continue, so it never blocks boot.
+      SpectrumPhx.Zk.Client,
       SpectrumPhx.Hydra,
       {Phoenix.PubSub, name: SpectrumPhx.PubSub},
       # Start a worker by calling: SpectrumPhx.Worker.start_link(arg)

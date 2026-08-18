@@ -48,7 +48,9 @@ defmodule SpectrumPhx.Cluster.Config do
       case File.read(@cluster_json) do
         {:ok, body} ->
           case Jason.decode(body) do
-            {:ok, map} -> map
+            {:ok, map} ->
+              map
+
             {:error, reason} ->
               Logger.warning("Could not parse #{@cluster_json}: #{inspect(reason)}")
               %{}

@@ -8,17 +8,22 @@ defmodule SpectrumPhx.Hydra do
   at each call site (VM names, session tokens, image filenames, update-server values).
   Parameter binding removes that class of bug structurally rather than per-site.
   """
-  require Logger
 
   @keyspace "hydra"
   @pool __MODULE__.Pool
 
   def child_spec(_opts) do
-    nodes = contact_points()
+    # Resolve contact points inside start_link, NOT here. Supervisor.start_link/2 builds
+    # every child spec before starting any child, so calling Cluster.Config at spec-build
+    # time reaches an Agent that does not exist yet and the whole application fails to
+    # boot with "(EXIT) no process".
+    %{id: __MODULE__, start: {__MODULE__, :start_link, []}, type: :supervisor}
+  end
 
-    Xandra.Cluster.child_spec(
+  def start_link(_opts \\ []) do
+    Xandra.Cluster.start_link(
       name: @pool,
-      nodes: nodes,
+      nodes: contact_points(),
       pool_size: 4,
       # Never block application boot on the database: Spectrum must come up and report
       # that Scylla is down rather than failing to start alongside it.
@@ -29,7 +34,14 @@ defmodule SpectrumPhx.Hydra do
 
   @doc "Contact points: the cluster's own nodes on the CQL port."
   def contact_points do
-    case SpectrumPhx.Cluster.Config.node_ips() do
+    ips =
+      try do
+        SpectrumPhx.Cluster.Config.node_ips()
+      catch
+        :exit, _ -> []
+      end
+
+    case ips do
       [] -> ["127.0.0.1:9042"]
       ips -> Enum.map(ips, fn ip -> ip <> ":9042" end)
     end

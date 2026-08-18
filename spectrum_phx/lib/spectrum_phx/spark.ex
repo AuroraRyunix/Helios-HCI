@@ -9,7 +9,6 @@ defmodule SpectrumPhx.Spark do
   never build a command from unvalidated input; `escape/1` is provided for the cases that
   genuinely need to interpolate a value.
   """
-  require Logger
 
   @port 9099
   @ca "/etc/hci/spark/certs/ca.crt"
@@ -39,7 +38,10 @@ defmodule SpectrumPhx.Spark do
     timeout = Keyword.get(opts, :timeout, 15)
     url = "https://" <> ip <> ":" <> Integer.to_string(@port) <> path
 
-    case Req.get(url, connect_options: [transport_opts: tls_opts()], receive_timeout: timeout * 1000) do
+    case Req.get(url,
+           connect_options: [transport_opts: tls_opts()],
+           receive_timeout: timeout * 1000
+         ) do
       {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
       {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
       {:error, reason} -> {:error, reason}
@@ -68,10 +70,14 @@ defmodule SpectrumPhx.Spark do
   Single-quote a value for safe inclusion in a shell command.
 
   POSIX shells have no escape inside single quotes, so an embedded quote is emitted by
-  closing the quote, adding an escaped quote, and reopening it.
+  closing the quote, adding a backslash-escaped quote, and reopening it.
+
+  The replacement literal must be `"'\\''"`. Writing `"'\''"` looks equivalent but
+  Elixir resolves `\'` to a bare quote, yielding `'''` -- which closes the quoting and
+  leaves the remainder of the value as live shell input. Spark runs it as root.
   """
   def escape(value) when is_binary(value) do
-    "'" <> String.replace(value, "'", "'\''") <> "'"
+    "'" <> String.replace(value, "'", "'\\''") <> "'"
   end
 
   defp post(url, body, timeout) do

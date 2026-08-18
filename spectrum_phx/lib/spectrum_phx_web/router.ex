@@ -17,7 +17,12 @@ defmodule SpectrumPhxWeb.Router do
   scope "/", SpectrumPhxWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", Cluster.OverviewLive, :overview
+    live "/hosts", Cluster.HostsLive, :hosts
+    live "/vms", Vms.IndexLive, :index
+    # Before "/vms/:name", which would otherwise match "new" as a VM name.
+    live "/vms/new", Vms.NewLive, :new
+    live "/vms/:name", Vms.ShowLive, :show
   end
 
   # Other scopes may use custom stacks.

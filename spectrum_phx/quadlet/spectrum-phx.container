@@ -1,0 +1,142 @@
+## Spectrum (Phoenix) -- strangler-migration sibling of spectrum.container.
+##
+## Install to /etc/containers/systemd/spectrum-phx.container, then
+## `systemctl daemon-reload && systemctl start spectrum-phx`.
+##
+## This unit deliberately runs ALONGSIDE the Python spectrum.container: different
+## unit name, different container name, different port, different image. Nothing
+## here touches the Python tier, and Slate keeps routing to it until
+## slate_config/dynamic.yml is changed.
+##
+## Note there are no `{}` placeholders anywhere in this file. Everything that
+## varies per cluster lives in /etc/hci/spectrum/spectrum-phx.env, so the unit is
+## byte-identical on every node and can be embedded in provision.py's QUADLETS
+## dict without tripping over str.format().
+
+[Unit]
+Description=Spectrum (Phoenix) Web Console -- migration target, runs beside spectrum.service
+After=network-online.target hydra-db.service zookeeper.service
+Wants=network-online.target
+## SECRET_KEY_BASE lives in this file. Without it the release raises on boot, and
+## Restart=always would turn that into a crash loop; a failed condition leaves the
+## unit cleanly inactive instead.
+ConditionPathExists=/etc/hci/spectrum/spectrum-phx.env
+## Same maintenance gate slate.container and spectrum.container carry.
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=180
+## Same budget as spectrum.service. Both tiers are up at once during the
+## migration, so this is not the moment to widen the memory envelope.
+CPUWeight=500
+MemoryMax=1.0G
+MemoryHigh=800M
+
+[Container]
+ContainerName=spectrum-phx
+Image=localhost/spectrum-phx:latest
+Pull=never
+LogDriver=journald
+
+## Host networking, for the same reason the Python tier uses it: Slate reaches the
+## backend on 127.0.0.1, and the app dials every node's spark-daemon on :9099 and
+## Scylla on :9042.
+Network=host
+
+## 8444, not 8443. 8443 is held by the Python spectrum container and is what
+## slate_config/dynamic.yml still points at. Cutting over is then a one-line change
+## to that file (or a second Traefik router in front of the ported routes only)
+## with no restart of the Python tier.
+## Changing this port means changing HealthCmd= at the bottom of this file too.
+## It is spelled out literally there rather than as ${PORT}, because that string
+## passes through systemd on its way to podman.
+Environment=PORT=8444
+Environment=PHX_SERVER=true
+
+## Per-cluster values, mode 0600, written by provision.py:
+##   SECRET_KEY_BASE=<64+ random chars, IDENTICAL on every node -- it signs the
+##                    session cookie, and Slate can land the next request from the
+##                    same browser on a different hypervisor>
+##   PHX_HOST=<cluster VIP or its DNS name>
+##   PHX_EXTRA_ORIGINS=<comma-separated extra hostnames/IPs the console is opened by>
+EnvironmentFile=/etc/hci/spectrum/spectrum-phx.env
+
+## --- Mounts --------------------------------------------------------------
+##
+## SpectrumPhx.Cluster.Config reads /etc/hci/cluster.json and
+## /etc/hci/spectrum/spectrum.env; SpectrumPhx.Spark reads
+## /etc/hci/spark/certs/ca.crt and /root/.certs/client.{crt,key}.
+##
+## `:z` (shared label) everywhere, never `:Z` (private label). A private label can
+## only ever be held by one container, and these paths are shared: slate.container
+## mounts /etc/hci/spectrum/certs, and the Python spectrum.container mounts all of
+## these too. deploy_updates.py already ships `ro,z` for /etc/hci and /root/.certs,
+## so the relabels below are the status quo on any cluster that has taken an
+## update, not a new side effect.
+Volume=/etc/hci/spectrum:/etc/hci/spectrum:z
+Volume=/etc/hci:/etc/hci:ro,z
+Volume=/root/.certs:/root/.certs:ro,z
+
+## rslave so per-VM volume mounts appearing on the host propagate in.
+##
+## Deliberately NOT relabelled: this tree holds live VM disk images carrying
+## svirt_image_t, and rewriting those to container_file_t would stop libvirt
+## opening them. Nothing ported so far reads or writes here, so a confined
+## container simply gets EACCES if it tries. When image/ISO upload is ported, the
+## fix is a targeted `semanage fcontext` rule or SecurityLabelDisable=true on this
+## unit -- not a `:z` on this line.
+Volume=/var/lib/hci/aether/volumes:/var/lib/hci/aether/volumes:rslave
+
+## --- Privileges ----------------------------------------------------------
+##
+## No PodmanArgs=--privileged. Deliberately, and it is not needed.
+##
+## The app makes outbound TLS calls, reads config and certificates, and binds one
+## port above 1024. It never manipulates the host: no devices, no kernel modules,
+## no mounts, no namespaces, no writes to /sys. That needs zero capabilities, so
+## all of them are dropped -- including the default set podman would otherwise
+## grant. (Reading root's 0600 client key needs no capability either: the process
+## is uid 0, so it matches the file owner and DAC_OVERRIDE never comes into it.)
+##
+## Raising PORT above is safe; lowering it below 1024 is not -- that would need
+## AddCapability=NET_BIND_SERVICE back.
+DropCapability=ALL
+NoNewPrivileges=true
+
+## uid 0 in the container, because /root/.certs/client.key is mode 0600 owned by
+## root on the host (provision.py chmods it). The image's own default user is the
+## unprivileged `spectrum` (uid 10001), so a bare `podman run` of the image is not
+## root; this line is the deployment-specific exception.
+User=root
+
+## SELinux confinement stays ON -- this is the one thing --privileged silently
+## turns off, and the `:z` relabels above are what make it unnecessary. If a
+## cluster cannot tolerate relabelling /etc/hci and /root/.certs, the fallback is
+## to drop the `,z` from those two mounts and add:
+##
+##   SecurityLabelDisable=true
+##
+## which is still far weaker than --privileged: capabilities, device access,
+## seccomp and the masked /proc paths all stay enforced.
+
+## Nothing is written inside the image; RELEASE_TMP points at /tmp, which podman
+## backs with a tmpfs when ReadOnly is set. (The release start script writes its
+## resolved sys.config under RELEASE_TMP on every boot, so this is load-bearing --
+## see rel/env.sh.eex.) Flip to false if a ported feature needs to write into the
+## container filesystem.
+ReadOnly=true
+
+## /robots.txt, not "/": it is served by Plug.Static out of the release, so this
+## stays a liveness probe for the web tier rather than quietly becoming a
+## readiness probe for ScyllaDB and ZooKeeper. force_ssl in config/prod.exs
+## excludes the host 127.0.0.1, so this gets a 200 and not a redirect.
+HealthCmd=/usr/bin/wget -q -O /dev/null http://127.0.0.1:8444/robots.txt
+HealthInterval=30s
+HealthTimeout=5s
+HealthStartPeriod=20s
+HealthRetries=3
+
+[Install]
+WantedBy=multi-user.target
