@@ -1101,7 +1101,7 @@ def init_db():
     """
     insert_db_compaction = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('db_compaction', 'db_compaction', '0 */12 * * *', 43200, true, 0, 'nodetool compact || true') IF NOT EXISTS;
+    VALUES ('db_compaction', 'db_compaction', '0 */12 * * *', 43200, false, 0, 'nodetool compact || true') IF NOT EXISTS;
     """
     insert_storage_auto_heal = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
@@ -1364,6 +1364,14 @@ def init_db():
                     "UPDATE hydra.dagur_schedules SET command = '/usr/local/bin/mipha --auto-heal' "
                     "WHERE job_name = 'storage_auto_heal' IF command = '/usr/local/bin/hci-auto-heal';")
                 run_cql_query(insert_db_compaction)
+                # Scheduled major compaction is an anti-pattern on size-tiered compaction:
+                # it rewrites everything into one enormous SSTable that then never compacts
+                # again, and it does heavy IO on a host that is also serving VM disks.
+                # Scylla's own guidance is not to schedule it. Disabled rather than deleted
+                # so an operator can see it and re-enable deliberately if they mean to.
+                run_cql_query(
+                    "UPDATE hydra.dagur_schedules SET enabled = false "
+                    "WHERE job_name = 'db_compaction' IF enabled = true;")
                 run_cql_query(insert_mimir_default)
                 run_cql_query(insert_system_cleanup)
                 run_cql_query(insert_orphaned_disks_cleanup)

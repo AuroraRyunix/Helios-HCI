@@ -37,20 +37,6 @@ def probe_tcp(host, port, timeout):
             except Exception:
                 pass
 
-def ip_sort_key(ip):
-    """Sorts IPv4 addresses by parsed octets so 10.10.102.9 precedes 10.10.102.100.
-
-    A plain string sort is lexicographic and orders those two the wrong way
-    round; every node must agree on the same first candidate.
-    """
-    try:
-        octets = [int(o) for o in str(ip).split(".")]
-        if len(octets) == 4 and all(0 <= o <= 255 for o in octets):
-            return (0, octets, "")
-    except (ValueError, AttributeError):
-        pass
-    return (1, [], str(ip))
-
 def get_iface_addresses(iface):
     """Returns the exact addresses configured on iface, one entry per address.
 
@@ -121,10 +107,31 @@ def get_zookeeper_leader_ip():
     if leader_active:
         return leader_ip
 
+    # No leader in a multi-node cluster means consensus is lost. Binding the VIP on the
+    # strength of a local guess is how both sides of a partition end up advertising it.
     if not leader_ip and len(ips) > 1:
         sys.stdout.write("ZooKeeper consensus lost or unreachable in multi-node cluster. Refusing split-brain candidate fallback.\n")
         sys.stdout.flush()
         return None
+
+    # Single node: there is no peer to conflict with, so this node may hold the VIP as
+    # long as it is actually serving the ingress port.
+    if not leader_ip:
+        local = ips[0] if ips else "127.0.0.1"
+        return local if probe_tcp(local, INGRESS_PORT, REMOTE_PROBE_TIMEOUT) else None
+
+    # A leader exists but is not serving. Deliberately do NOT pick a replacement by sort
+    # order: that is a second, independent election which can disagree with the
+    # ensemble's, and in a partition each side would choose the lowest candidate it can
+    # see -- so both could bind the VIP and produce an address conflict.
+    #
+    # Releasing is the safe outcome: the WebUI is briefly unreachable, which is visible
+    # and recoverable, rather than duplicated, which is neither.
+    sys.stdout.write(
+        "ZooKeeper leader " + str(leader_ip) + " is not serving the ingress port. "
+        "Refusing to elect a replacement independently; releasing the VIP.\n")
+    sys.stdout.flush()
+    return None
 
     # If leader is inactive, find active candidates serving the ingress port
     candidates = []
@@ -135,8 +142,20 @@ def get_zookeeper_leader_ip():
     if not candidates:
         return leader_ip if leader_ip else "127.0.0.1"
 
-    candidates.sort(key=ip_sort_key)
-    return candidates[0]
+    # Deliberately do NOT fall back to "lowest reachable candidate" here.
+    #
+    # Reaching this point means ZooKeeper named a leader but that leader is not serving.
+    # Picking a different node by sort order is a second, independent election that can
+    # disagree with the ensemble's -- and in a partition each side would pick the lowest
+    # candidate *it* can see, so both could bind the VIP and produce an address conflict.
+    #
+    # Releasing the VIP is the safe outcome: the WebUI is briefly unreachable, which is
+    # visible and recoverable, rather than duplicated, which is neither.
+    sys.stdout.write(
+        "ZooKeeper leader is not serving on the ingress port. Refusing to elect a "
+        "replacement independently; releasing the VIP until consensus resolves.\n")
+    sys.stdout.flush()
+    return None
 
 def is_zookeeper_leader(local_ip=None):
     if not local_ip:

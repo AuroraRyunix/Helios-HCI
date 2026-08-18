@@ -1436,7 +1436,12 @@ def process_queue_task(task):
                 run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {q_vm} --keep-nvram || true")
 
                 # 4. Live migrate command
-                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe {q_vm} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
+                # --unsafe was needed when VM disks carried --allow-two-primaries permanently:
+                # libvirt refuses a live migration it believes is cache-incoherent. The
+                # two-primaries window is now opened and closed around the migration
+                # itself, so the check libvirt performs is the one we actually want, and
+                # suppressing it would only hide a genuinely unsafe migration.
+                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource {q_vm} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
                 rc, stdout, stderr = run_remote_spark(src_host, cmd)
                 if rc != 0:
                     raise Exception(f"Migration command failed: {stderr.strip() or stdout.strip()}")

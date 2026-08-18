@@ -16,7 +16,8 @@ def get_local_ip():
         s.close()
     return IP
 
-from cassandra import ConsistencyLevel
+from cassandra import ConsistencyLevel, Unavailable, ReadTimeout, OperationTimedOut
+from cassandra.cluster import NoHostAvailable
 import time
 
 cluster = None
@@ -52,6 +53,34 @@ def make_serializable(obj):
     else:
         return obj
 
+# Statements that only read. Anything else -- INSERT, UPDATE, DELETE, BATCH, TRUNCATE,
+# and every DDL form -- mutates and must never be silently retried at a weaker
+# consistency level.
+_READ_PREFIXES = ("select",)
+
+# Lightweight transactions carry an IF clause and are resolved by Paxos at SERIAL. A
+# retry at ONE would defeat the compare-and-swap entirely, so they are never degraded
+# even though some are syntactically writes and some reads.
+def _is_lwt(statement):
+    lowered = statement.lower()
+    return " if " in lowered or lowered.rstrip().endswith(" if exists")
+
+
+def _is_read(statement):
+    return statement.lstrip().lower().startswith(_READ_PREFIXES)
+
+
+def _is_degradable_failure(exc):
+    """True only for genuine availability failures, identified by driver exception type.
+
+    The previous check matched the substrings "unavailable", "timeout" and "active"
+    anywhere in the exception text. "active" in particular matches a large range of
+    unrelated errors, so ordinary failures were being retried at a weaker consistency
+    level rather than surfaced.
+    """
+    return isinstance(exc, (Unavailable, ReadTimeout, OperationTimedOut, NoHostAvailable))
+
+
 class CQLProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -64,14 +93,31 @@ class CQLProxyHandler(BaseHTTPRequestHandler):
                 try:
                     rows = session.execute(post_data)
                 except Exception as e:
-                    # Dynamic fallback to ConsistencyLevel.ONE if QUORUM fails due to unavailable nodes
-                    if "unavailable" in str(e).lower() or "timeout" in str(e).lower() or "active" in str(e).lower():
-                        print("QUORUM consistency level failed or database degraded. Falling back to ConsistencyLevel.ONE...")
-                        from cassandra.query import SimpleStatement
-                        statement = SimpleStatement(post_data, consistency_level=ConsistencyLevel.ONE)
-                        rows = session.execute(statement)
-                    else:
-                        raise e
+                    # A read may be answered from a single replica when the cluster is
+                    # degraded: the caller gets possibly-stale data, which is recoverable.
+                    #
+                    # A write may not. Retrying a mutation at ONE during a partition lets
+                    # both sides accept conflicting writes, reconciled afterwards by
+                    # last-write-wins timestamp -- which is exactly how two hosts come to
+                    # believe they own the same VM. The same applies to lightweight
+                    # transactions, whose whole purpose is the compare-and-swap that a
+                    # weaker consistency level would discard.
+                    if not _is_degradable_failure(e):
+                        raise
+                    if not _is_read(post_data) or _is_lwt(post_data):
+                        print(
+                            "QUORUM failed for a mutating statement; refusing to retry at "
+                            "ConsistencyLevel.ONE. Surfacing the failure instead: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        raise
+                    print(
+                        "QUORUM failed for a read; retrying at ConsistencyLevel.ONE. "
+                        f"Results may be stale. ({type(e).__name__})"
+                    )
+                    from cassandra.query import SimpleStatement
+                    statement = SimpleStatement(post_data, consistency_level=ConsistencyLevel.ONE)
+                    rows = session.execute(statement)
                 result = []
                 for row in rows:
                     if hasattr(row, '_asdict'):
