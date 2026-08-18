@@ -10,6 +10,12 @@ import urllib.request
 import threading
 import time
 import base64
+import re
+import stat
+import glob
+import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 socket.setdefaulttimeout(45.0)
@@ -746,6 +752,600 @@ def build_node_status():
 
     return result
 
+# ---------------------------------------------------------------------------
+# Typed API (docs/spark_api.md)
+#
+# These endpoints exist so callers stop handing this daemon shell strings. No
+# caller value is ever interpolated into a command: parameters are validated at
+# the boundary and then passed as individual argv elements with shell=False, so
+# nothing a caller sends can change the shape of a command. Parsing lives in
+# module-level functions so it stays testable without an HTTP server.
+# ---------------------------------------------------------------------------
+
+# A name is a value, never a fragment. \Z rather than $ on purpose: $ also matches
+# just before a trailing newline, so "vm1\n" would pass and then be handed to virsh.
+NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
+
+# Paths must resolve under one of these roots. /dev/drbd/by-res/<res>/<vol> is a
+# symlink to the minor device, so realpath legitimately lands on /dev/drbdNNNN --
+# that one target is accepted as well, but only when the path as written was
+# already under /dev/drbd/. Everything else (traversal, a symlink out of the
+# aether tree) is rejected by the realpath check.
+ALLOWED_PATH_ROOTS = ("/dev/drbd/", "/var/lib/hci/aether/")
+DRBD_MINOR_RE = re.compile(r"\A/dev/drbd[0-9]+\Z")
+
+ALLOWED_OWNERS = ("root:qemu", "root:root")
+ALLOWED_MODES = ("0600", "0640", "0644", "0660", "0664", "0666", "0700", "0750", "0755", "0770")
+
+AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
+VIRSH = ["virsh", "-c", "qemu:///system"]
+HYDRA_DB_CONTAINER = "systemd-hydra-db"
+VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
+DRBD_ROLES = ("primary", "secondary")
+
+DNSMASQ_LEASE_FILES = ("/var/lib/dnsmasq/dnsmasq.leases", "/var/lib/misc/dnsmasq.leases")
+LIBVIRT_LEASE_GLOB = "/var/lib/libvirt/dnsmasq/*.leases"
+SECURE_BOOT_EFIVAR = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+
+def run_argv(argv, timeout=45):
+    """Run a command as an argv list with shell=False.
+
+    Every typed endpoint goes through here. subprocess.run() with a list never
+    involves a shell, so a value in argv is always exactly one argument no matter
+    what characters it contains.
+    """
+    try:
+        res = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % argv[0]
+    except subprocess.TimeoutExpired:
+        return -1, "", "%s: timed out after %ss" % (argv[0], timeout)
+    except OSError as exc:
+        return -1, "", str(exc)
+    return (res.returncode,
+            res.stdout.decode("utf-8", errors="ignore"),
+            res.stderr.decode("utf-8", errors="ignore"))
+
+
+def valid_name(value):
+    """True when value is a name safe to pass as a single argument."""
+    return isinstance(value, str) and NAME_RE.match(value) is not None
+
+
+def validate_path(value):
+    """Resolve and allowlist a caller-supplied path.
+
+    Returns (realpath, None) or (None, error_message). Rejects rather than
+    sanitizes: nothing is stripped or rewritten to make a path acceptable.
+    """
+    if not isinstance(value, str) or not value:
+        return None, "path must be a non-empty string"
+    if "\x00" in value:
+        return None, "path must not contain a null byte"
+    if not value.startswith("/"):
+        return None, "path must be absolute"
+
+    literal = os.path.normpath(value)
+    real = os.path.realpath(value)
+
+    def under_root(candidate):
+        for root in ALLOWED_PATH_ROOTS:
+            if candidate.startswith(root) and len(candidate) > len(root):
+                return True
+        return False
+
+    if not under_root(literal):
+        return None, "path must be under " + " or ".join(ALLOWED_PATH_ROOTS)
+    if not under_root(real):
+        # A /dev/drbd/by-res/... symlink resolves to the bare minor device.
+        if not (literal.startswith("/dev/drbd/") and DRBD_MINOR_RE.match(real)):
+            return None, "path resolves outside " + " or ".join(ALLOWED_PATH_ROOTS)
+    return real, None
+
+
+def validate_owner(value):
+    """Owner comes from a fixed allowlist, never from caller text."""
+    if value in ALLOWED_OWNERS:
+        return value, None
+    return None, "owner must be one of " + ", ".join(ALLOWED_OWNERS)
+
+
+def validate_mode(value):
+    """Mode is an octal string from a fixed allowlist."""
+    if value in ALLOWED_MODES:
+        return value, None
+    return None, "mode must be one of " + ", ".join(ALLOWED_MODES)
+
+
+def virsh_status_for(stderr):
+    """404 when libvirt says the domain does not exist, 500 otherwise."""
+    lowered = (stderr or "").lower()
+    if "not found" in lowered or "no domain" in lowered:
+        return 404
+    return 500
+
+
+def parse_virsh_domiflist(text):
+    """Parse `virsh domiflist` into [{"mac","type","source","model"}].
+
+    Columns are Interface, Type, Source, Model, MAC. The MAC is taken from the
+    last column so an unexpected extra column cannot shift it.
+    """
+    interfaces = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if set(line) <= set("- "):          # the ---- separator row
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[0].lower() == "interface" and parts[-1].lower() == "mac":
+            continue                        # header row
+        def cell(value):
+            return "" if value == "-" else value
+        interfaces.append({
+            "mac": cell(parts[-1]),
+            "type": cell(parts[1]),
+            "source": cell(parts[2]),
+            "model": cell(parts[3]),
+        })
+    return interfaces
+
+
+def parse_virsh_dominfo(text):
+    """Parse `virsh dominfo` into {"state","vcpus","memory_kib","autostart"}."""
+    fields = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+
+    vcpus = None
+    try:
+        vcpus = int(fields.get("cpu(s)", "").strip())
+    except (TypeError, ValueError):
+        vcpus = None
+
+    memory_kib = None
+    mem_raw = fields.get("max memory", "")
+    if mem_raw:
+        try:
+            memory_kib = int(mem_raw.split()[0])
+        except (IndexError, ValueError):
+            memory_kib = None
+
+    return {
+        "state": fields.get("state", ""),
+        "vcpus": vcpus,
+        "memory_kib": memory_kib,
+        "autostart": fields.get("autostart", "").lower() == "enable",
+    }
+
+
+def parse_domain_graphics(xml_text):
+    """Pull the first vnc/spice <graphics> element out of a domain XML.
+
+    Returns {"graphics","port","listen"} or None when the domain has no console.
+    port is -1 for an autoport device that has not been allocated yet, which is a
+    fact the caller needs rather than an error.
+    """
+    root = ET.fromstring(xml_text)
+    for graphics in root.findall("./devices/graphics"):
+        gtype = graphics.get("type")
+        if gtype not in ("vnc", "spice"):
+            continue
+        try:
+            port = int(graphics.get("port", "-1"))
+        except (TypeError, ValueError):
+            port = -1
+        listen = graphics.get("listen") or ""
+        if not listen:
+            listen_el = graphics.find("./listen")
+            if listen_el is not None:
+                listen = listen_el.get("address") or ""
+        return {"graphics": gtype, "port": port, "listen": listen}
+    return None
+
+
+def parse_domain_name(xml_text):
+    """The <name> of a domain XML document, or None."""
+    root = ET.fromstring(xml_text)
+    name_el = root.find("./name")
+    if name_el is None or name_el.text is None:
+        return None
+    return name_el.text.strip()
+
+
+def virsh_domain_state(name):
+    """Current libvirt state of a domain, or None when it cannot be read."""
+    rc, stdout, _ = run_argv(VIRSH + ["domstate", name], timeout=20)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+_NODETOOL_STATUS = {"U": "Up", "D": "Down", "?": "Unknown"}
+_NODETOOL_STATE = {"N": "Normal", "L": "Leaving", "J": "Joining", "M": "Moving", "?": "Unknown"}
+_LOAD_UNITS = ("bytes", "B", "KB", "MB", "GB", "TB", "PB",
+               "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def parse_nodetool_status(text):
+    """Parse `nodetool status` into [{"address","status","state","load","tokens"}].
+
+    Data rows begin with a two-character status/state code (UN, DN, UJ, ...);
+    every header and banner line fails that test and is skipped.
+    """
+    nodes = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        code = parts[0]
+        if len(code) != 2:
+            continue
+        if code[0] not in _NODETOOL_STATUS or code[1] not in _NODETOOL_STATE:
+            continue
+        if len(parts) < 3:
+            continue
+
+        address = parts[1]
+        rest = parts[2:]
+        load = rest[0] if rest else ""
+        consumed = 1 if rest else 0
+        if len(rest) >= 2 and rest[1] in _LOAD_UNITS:
+            load = rest[0] + " " + rest[1]
+            consumed = 2
+
+        tokens = None
+        if len(rest) > consumed:
+            try:
+                tokens = int(rest[consumed])
+            except ValueError:
+                tokens = None
+
+        nodes.append({
+            "address": address,
+            "status": _NODETOOL_STATUS[code[0]],
+            "state": _NODETOOL_STATE[code[1]],
+            "load": load,
+            "tokens": tokens,
+        })
+    return nodes
+
+
+def parse_meminfo(text):
+    """Derive {"total_mb","used_mb","free_mb","available_mb"} from /proc/meminfo.
+
+    Same arithmetic free(1) does (used = total - free - buffers - cache), read
+    from the file free(1) itself reads, so there is no subprocess and no exposure
+    to procps output-format drift between releases.
+    """
+    values = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parts = value.split()
+        if not parts:
+            continue
+        try:
+            values[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+
+    total = values.get("MemTotal", 0)
+    free = values.get("MemFree", 0)
+    available = values.get("MemAvailable", free)
+    buffers = values.get("Buffers", 0)
+    cached = values.get("Cached", 0) + values.get("SReclaimable", 0)
+    used = total - free - buffers - cached
+    if used < 0:
+        used = 0
+    return {
+        "total_mb": total // 1024,
+        "used_mb": used // 1024,
+        "free_mb": free // 1024,
+        "available_mb": available // 1024,
+    }
+
+
+def parse_dnsmasq_leases(text):
+    """Parse a dnsmasq lease file into [{"mac","ip","hostname","expires"}].
+
+    Line format: <expiry-epoch> <mac> <ip> <hostname> <client-id>.
+    """
+    leases = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            expires = int(parts[0])
+        except ValueError:
+            continue
+        hostname = parts[3]
+        if hostname == "*":
+            hostname = ""
+        leases.append({
+            "mac": parts[1],
+            "ip": parts[2],
+            "hostname": hostname,
+            "expires": expires,
+        })
+    return leases
+
+
+def parse_ip_route_json(text):
+    """(interface, gateway) of the default route from `ip -j route`."""
+    try:
+        routes = json.loads(text)
+    except Exception:
+        return None, None
+    if not isinstance(routes, list):
+        return None, None
+    for route in routes:
+        if isinstance(route, dict) and route.get("dst") == "default":
+            return route.get("dev"), route.get("gateway")
+    return None, None
+
+
+def parse_proc_net_route(text):
+    """(interface, gateway) of the default route from /proc/net/route.
+
+    Fallback for an iproute2 without JSON support. The gateway column is a
+    little-endian hex word.
+    """
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if parts[1] != "00000000":
+            continue
+        try:
+            raw = int(parts[2], 16)
+        except ValueError:
+            continue
+        gateway = ".".join(str((raw >> (8 * i)) & 0xFF) for i in range(4))
+        return parts[0], gateway
+    return None, None
+
+
+def parse_ip_addr_json(text):
+    """Addresses from `ip -j addr` as a flat list of dicts."""
+    addresses = []
+    try:
+        links = json.loads(text)
+    except Exception:
+        return addresses
+    if not isinstance(links, list):
+        return addresses
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        ifname = link.get("ifname")
+        for addr in link.get("addr_info") or []:
+            if not isinstance(addr, dict):
+                continue
+            addresses.append({
+                "interface": ifname,
+                "family": addr.get("family"),
+                "address": addr.get("local"),
+                "prefixlen": addr.get("prefixlen"),
+                "scope": addr.get("scope"),
+            })
+    return addresses
+
+
+def _unescape_mount_field(field):
+    """/proc/self/mounts escapes space, tab, newline and backslash as \\OOO."""
+    out = []
+    i = 0
+    while i < len(field):
+        char = field[i]
+        if char == "\\" and i + 3 < len(field) and field[i + 1:i + 4].isdigit():
+            try:
+                out.append(chr(int(field[i + 1:i + 4], 8)))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def parse_proc_mounts(text):
+    """The set of mount points in a /proc/self/mounts document."""
+    points = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            points.add(_unescape_mount_field(parts[1]))
+    return points
+
+
+def path_is_mounted(path):
+    """True when path is a mount point.
+
+    Checks the mount table first, then falls back to the st_dev comparison
+    mountpoint(1) uses, so a bind mount inside the same table is still caught.
+    """
+    try:
+        with open("/proc/self/mounts", "r") as handle:
+            if path in parse_proc_mounts(handle.read()):
+                return True
+    except Exception:
+        pass
+    try:
+        here = os.stat(path)
+        parent = os.stat(os.path.join(path, ".."))
+        return here.st_dev != parent.st_dev
+    except OSError:
+        return False
+
+
+def device_size_bytes(path, st_result):
+    """Size of a block device or a regular file, without shelling out."""
+    if stat.S_ISBLK(st_result.st_mode):
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            return 0
+        try:
+            return os.lseek(fd, 0, os.SEEK_END)
+        except OSError:
+            return 0
+        finally:
+            os.close(fd)
+    return st_result.st_size
+
+
+def drbd_local_role(resource):
+    """Local role of a DRBD resource, or None when it cannot be read.
+
+    DRBD 8 prints "Primary/Secondary", DRBD 9 prints just the local role.
+    """
+    rc, stdout, _ = run_argv(["drbdadm", "role", resource], timeout=20)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    role = lines[0]
+    if "/" in role:
+        role = role.split("/", 1)[0]
+    return role or None
+
+
+def drbd_peer_roles(resource):
+    """Peer roles of a DRBD resource from drbdsetup, [] when unknown.
+
+    This is what makes "the peer already holds Primary" visible to the caller
+    instead of surfacing as a generic promotion failure.
+    """
+    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json", resource], timeout=20)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return []
+    roles = []
+    if isinstance(data, list):
+        for resource_entry in data:
+            if not isinstance(resource_entry, dict):
+                continue
+            for connection in resource_entry.get("connections") or []:
+                if isinstance(connection, dict) and connection.get("peer-role"):
+                    roles.append(connection["peer-role"])
+    return roles
+
+
+def read_dhcp_leases():
+    """Every dnsmasq lease this host knows about, deduplicated by (mac, ip)."""
+    files = list(DNSMASQ_LEASE_FILES)
+    try:
+        files.extend(sorted(glob.glob(LIBVIRT_LEASE_GLOB)))
+    except Exception:
+        pass
+
+    leases = []
+    seen = set()
+    for lease_file in files:
+        try:
+            with open(lease_file, "r", errors="ignore") as handle:
+                content = handle.read()
+        except OSError:
+            continue
+        for lease in parse_dnsmasq_leases(content):
+            key = (lease["mac"], lease["ip"])
+            if key in seen:
+                continue
+            seen.add(key)
+            leases.append(lease)
+    return leases
+
+
+def read_host_capabilities():
+    """{"kvm","drbd_module","secure_boot"} read straight from the kernel."""
+    kvm = os.path.exists("/dev/kvm")
+
+    drbd_module = os.path.exists("/proc/drbd")
+    if not drbd_module:
+        try:
+            with open("/proc/modules", "r") as handle:
+                for line in handle:
+                    if line.split(" ", 1)[0] == "drbd":
+                        drbd_module = True
+                        break
+        except OSError:
+            pass
+
+    secure_boot = False
+    try:
+        with open(SECURE_BOOT_EFIVAR, "rb") as handle:
+            data = handle.read()
+        # 4-byte EFI attribute prefix followed by the one-byte value.
+        if data:
+            secure_boot = data[-1] == 1
+    except OSError:
+        secure_boot = False
+
+    return {"kvm": kvm, "drbd_module": drbd_module, "secure_boot": secure_boot}
+
+
+DB_REPAIR_LOCK = threading.Lock()
+DB_REPAIR_THREAD = None
+
+
+def _run_db_repair(argv):
+    print("[REPAIR] Starting %s. This can take a long time on a large keyspace." % " ".join(argv))
+    rc, stdout, stderr = run_argv(argv, timeout=86400)
+    if rc == 0:
+        print("[REPAIR] Completed successfully.")
+    else:
+        print("[REPAIR] Failed with exit code %s: %s" % (rc, (stderr or stdout).strip()))
+
+
+def start_db_repair(keyspace, primary_range):
+    """Start a nodetool repair in the background.
+
+    Returns True when a repair was started, False when one is already running. A
+    repair outlives any reasonable HTTP timeout, so it never runs inline.
+    """
+    global DB_REPAIR_THREAD
+    argv = ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "repair"]
+    if primary_range:
+        argv.append("-pr")
+    argv.append(keyspace)
+
+    with DB_REPAIR_LOCK:
+        if DB_REPAIR_THREAD is not None and DB_REPAIR_THREAD.is_alive():
+            return False
+        thread = threading.Thread(target=_run_db_repair, args=(argv,), daemon=True)
+        DB_REPAIR_THREAD = thread
+        thread.start()
+        return True
+
+
+def schedule_host_reboot(delay=2):
+    """Reboot after the HTTP response has been written."""
+    def worker():
+        time.sleep(delay)
+        rc, _, stderr = run_argv(["systemctl", "reboot"], timeout=60)
+        if rc != 0:
+            print("[REBOOT] systemctl reboot failed: %s" % stderr.strip())
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 class SparkDaemonHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -893,7 +1493,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/v1/urbosa/tunnels/status":
             self.handle_urbosa_tunnels_status()
             return
-        
+
+        if self.route_typed_get(parsed):
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -927,6 +1530,9 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/v1/cluster/sync-settings":
             self.handle_sync_settings()
+            return
+
+        if self.route_typed_post(urllib.parse.urlparse(self.path).path):
             return
 
         self.send_response(404)
@@ -2002,6 +2608,539 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             t.start()
             
         self.send_json_response(200, {"message": "Cluster destroyed successfully."})
+
+    # ------------------------------------------------------------------
+    # Typed API (docs/spark_api.md)
+    # ------------------------------------------------------------------
+
+    def read_json_payload(self):
+        """Read the request body as a JSON object. Returns (payload, error)."""
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+        except (TypeError, ValueError):
+            return None, "Invalid Content-Length header"
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return {}, None
+        try:
+            payload = json.loads(raw.decode('utf-8'))
+        except Exception:
+            return None, "Invalid JSON body"
+        if not isinstance(payload, dict):
+            return None, "JSON body must be an object"
+        return payload, None
+
+    def reject(self, message, status=400):
+        """Every rejection has the same shape: {"error": "..."}."""
+        self.send_json_response(status, {"error": message})
+
+    def query_param(self, parsed, key):
+        values = urllib.parse.parse_qs(parsed.query).get(key, [])
+        return values[0] if values else None
+
+    def route_typed_get(self, parsed):
+        """Dispatch the typed read endpoints. True when the request was handled."""
+        path = parsed.path
+
+        if path == "/api/v1/storage/drbd/status":
+            self.handle_storage_drbd_status(parsed)
+            return True
+        if path == "/api/v1/storage/device":
+            self.handle_storage_device(parsed)
+            return True
+        if path == "/api/v1/storage/container/mounted":
+            self.handle_storage_container_mounted(parsed)
+            return True
+        if path == "/api/v1/host/network":
+            self.handle_host_network()
+            return True
+        if path == "/api/v1/host/memory":
+            self.handle_host_memory()
+            return True
+        if path == "/api/v1/host/disks":
+            self.handle_host_disks()
+            return True
+        if path == "/api/v1/host/capabilities":
+            self.handle_host_capabilities()
+            return True
+        if path == "/api/v1/host/dhcp-leases":
+            self.handle_host_dhcp_leases()
+            return True
+        if path == "/api/v1/db/ring":
+            self.handle_db_ring()
+            return True
+
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"]:
+            action = segments[4]
+            if action not in ("interfaces", "console", "info"):
+                return False
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            if action == "interfaces":
+                self.handle_vm_interfaces(name)
+            elif action == "console":
+                self.handle_vm_console(name)
+            else:
+                self.handle_vm_info(name)
+            return True
+
+        return False
+
+    def route_typed_post(self, path):
+        """Dispatch the typed write endpoints. True when the request was handled."""
+        if path == "/api/v1/vm/define":
+            self.handle_vm_define()
+            return True
+        if path == "/api/v1/vm/undefine":
+            self.handle_vm_undefine()
+            return True
+        if path == "/api/v1/storage/drbd/role":
+            self.handle_storage_drbd_role()
+            return True
+        if path == "/api/v1/storage/device/prepare":
+            self.handle_storage_device_prepare()
+            return True
+        if path == "/api/v1/storage/device/flush":
+            self.handle_storage_device_flush()
+            return True
+        if path == "/api/v1/storage/container/ensure":
+            self.handle_storage_container_ensure()
+            return True
+        if path == "/api/v1/host/reboot":
+            self.handle_host_reboot()
+            return True
+        if path == "/api/v1/db/repair":
+            self.handle_db_repair()
+            return True
+
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "power":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_power(name)
+            return True
+
+        return False
+
+    # -- VM ------------------------------------------------------------
+
+    def handle_vm_interfaces(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["domiflist", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh domiflist failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, {"interfaces": parse_virsh_domiflist(stdout)})
+
+    def handle_vm_console(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["dumpxml", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh dumpxml failed",
+                        virsh_status_for(stderr))
+            return
+        try:
+            graphics = parse_domain_graphics(stdout)
+        except ET.ParseError as exc:
+            self.reject("Could not parse domain XML: %s" % exc, 500)
+            return
+        if graphics is None:
+            self.reject("Domain %s has no vnc or spice console" % name, 404)
+            return
+        self.send_json_response(200, graphics)
+
+    def handle_vm_info(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["dominfo", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh dominfo failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, parse_virsh_dominfo(stdout))
+
+    def handle_vm_define(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid VM name")
+            return
+
+        xml_b64 = payload.get("xml_b64")
+        if not isinstance(xml_b64, str) or not xml_b64.strip():
+            self.reject("Missing xml_b64")
+            return
+        try:
+            xml_bytes = base64.b64decode("".join(xml_b64.split()), validate=True)
+        except Exception:
+            self.reject("xml_b64 is not valid base64")
+            return
+        try:
+            xml_text = xml_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self.reject("xml_b64 must decode to UTF-8 domain XML")
+            return
+        try:
+            xml_name = parse_domain_name(xml_text)
+        except ET.ParseError as exc:
+            self.reject("Domain XML is not well formed: %s" % exc)
+            return
+        if xml_name != name:
+            self.reject("Domain XML declares name '%s', which does not match '%s'"
+                        % (xml_name, name))
+            return
+
+        # The XML reaches virsh as a file path, never as a shell argument, so no
+        # part of the document can be read as command syntax.
+        fd, temp_path = tempfile.mkstemp(prefix="spark-domain-", suffix=".xml")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(xml_bytes)
+            rc, stdout, stderr = run_argv(VIRSH + ["define", temp_path], timeout=60)
+        except OSError as exc:
+            self.reject("Could not stage domain XML: %s" % exc, 500)
+            return
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh define failed", 500)
+            return
+        self.send_json_response(200, {"defined": True})
+
+    def handle_vm_undefine(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid VM name")
+            return
+        keep_nvram = payload.get("keep_nvram", False)
+        if not isinstance(keep_nvram, bool):
+            self.reject("keep_nvram must be a boolean")
+            return
+
+        argv = VIRSH + ["undefine", name, "--keep-nvram" if keep_nvram else "--nvram"]
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh undefine failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, {"undefined": True})
+
+    def handle_vm_power(self, name):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        action = payload.get("action")
+        if action not in VM_POWER_ACTIONS:
+            self.reject("action must be one of " + ", ".join(VM_POWER_ACTIONS))
+            return
+
+        rc, stdout, stderr = run_argv(VIRSH + [action, name], timeout=120)
+        state = virsh_domain_state(name)
+        if rc != 0:
+            message = (stderr or stdout).strip() or ("virsh %s failed" % action)
+            if virsh_status_for(stderr) == 404:
+                self.reject(message, 404)
+                return
+            # The domain exists but did not take the transition. Report the state
+            # it is actually in alongside the failure.
+            self.send_json_response(409, {"state": state or "", "error": message})
+            return
+        self.send_json_response(200, {"state": state or ""})
+
+    # -- Storage -------------------------------------------------------
+
+    def handle_storage_drbd_status(self, parsed):
+        resource = self.query_param(parsed, "resource")
+        argv = ["drbdsetup", "status", "--json"]
+        if resource is not None:
+            if not valid_name(resource):
+                self.reject("Invalid resource name")
+                return
+            argv.append(resource)
+
+        rc, stdout, stderr = run_argv(argv, timeout=30)
+        if rc != 0:
+            # A named resource that drbdsetup does not know is a 404, not a
+            # server fault: DRBD resources exist only on the nodes that back them.
+            self.reject((stderr or stdout).strip() or "drbdsetup status failed",
+                        404 if resource is not None else 500)
+            return
+        try:
+            status = json.loads(stdout.strip() or "[]")
+        except Exception:
+            self.reject("Could not parse drbdsetup status output", 500)
+            return
+        self.send_json_response(200, status)
+
+    def handle_storage_drbd_role(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        role = payload.get("role")
+        if not isinstance(role, str) or role.lower() not in DRBD_ROLES:
+            self.reject("role must be one of " + ", ".join(DRBD_ROLES))
+            return
+        role = role.lower()
+        force = payload.get("force", False)
+        if not isinstance(force, bool):
+            self.reject("force must be a boolean")
+            return
+
+        argv = ["drbdadm", role]
+        if force and role == "primary":
+            argv.append("--force")
+        argv.append(resource)
+
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        resulting = drbd_local_role(resource)
+        if resulting is None and rc == 0:
+            # drbdadm confirmed the transition; only the read-back was unavailable.
+            resulting = role.capitalize()
+
+        if resulting is not None and resulting.lower() == role:
+            self.send_json_response(200, {"role": resulting})
+            return
+
+        message = (stderr or stdout).strip() or ("Could not read the role of " + resource)
+        if any(peer.lower() == "primary" for peer in drbd_peer_roles(resource)):
+            message = "Peer already holds Primary for %s. %s" % (resource, message)
+        self.send_json_response(409, {"role": resulting or "Unknown", "error": message})
+
+    def handle_storage_device(self, parsed):
+        raw_path = self.query_param(parsed, "path")
+        if raw_path is None:
+            self.reject("Missing path parameter")
+            return
+        real, error = validate_path(raw_path)
+        if error:
+            self.reject(error)
+            return
+
+        try:
+            st_result = os.stat(real)
+        except FileNotFoundError:
+            self.send_json_response(200, {"exists": False, "is_block": False, "size_bytes": 0})
+            return
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+
+        self.send_json_response(200, {
+            "exists": True,
+            "is_block": stat.S_ISBLK(st_result.st_mode),
+            "size_bytes": device_size_bytes(real, st_result),
+        })
+
+    def handle_storage_device_prepare(self):
+        import pwd
+        import grp
+
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        real, error = validate_path(payload.get("path"))
+        if error:
+            self.reject(error)
+            return
+        owner, error = validate_owner(payload.get("owner"))
+        if error:
+            self.reject(error)
+            return
+        mode, error = validate_mode(payload.get("mode"))
+        if error:
+            self.reject(error)
+            return
+
+        user_name, _, group_name = owner.partition(":")
+        try:
+            uid = pwd.getpwnam(user_name).pw_uid
+            gid = grp.getgrnam(group_name).gr_gid
+        except KeyError:
+            self.reject("Owner '%s' does not exist on this host" % owner, 500)
+            return
+
+        try:
+            os.chown(real, uid, gid)
+            os.chmod(real, int(mode, 8))
+        except FileNotFoundError:
+            self.reject("No such path: " + real, 404)
+            return
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+        self.send_json_response(200, {"prepared": True})
+
+    def handle_storage_device_flush(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        real, error = validate_path(payload.get("path"))
+        if error:
+            self.reject(error)
+            return
+        if not os.path.exists(real):
+            self.reject("No such path: " + real, 404)
+            return
+
+        rc, stdout, stderr = run_argv(["blockdev", "--flushbufs", real], timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "blockdev --flushbufs failed", 500)
+            return
+        self.send_json_response(200, {"flushed": True})
+
+    def handle_storage_container_mounted(self, parsed):
+        raw_path = self.query_param(parsed, "path")
+        if raw_path is None:
+            self.reject("Missing path parameter")
+            return
+        real, error = validate_path(raw_path)
+        if error:
+            self.reject(error)
+            return
+        self.send_json_response(200, {"mounted": path_is_mounted(real)})
+
+    def handle_storage_container_ensure(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid container name")
+            return
+
+        path = os.path.join(AETHER_VOLUMES_ROOT, name)
+        existed = os.path.isdir(path)
+        try:
+            os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+        self.send_json_response(200, {"path": path, "created": not existed})
+
+    # -- Host ----------------------------------------------------------
+
+    def handle_host_network(self):
+        interface = None
+        gateway = None
+        rc, stdout, _ = run_argv(["ip", "-j", "route"], timeout=20)
+        if rc == 0:
+            interface, gateway = parse_ip_route_json(stdout)
+        if interface is None:
+            try:
+                with open("/proc/net/route", "r") as handle:
+                    interface, gateway = parse_proc_net_route(handle.read())
+            except OSError:
+                pass
+
+        addresses = []
+        rc_addr, stdout_addr, _ = run_argv(["ip", "-j", "addr"], timeout=20)
+        if rc_addr == 0:
+            addresses = parse_ip_addr_json(stdout_addr)
+
+        self.send_json_response(200, {
+            "default_interface": interface,
+            "default_gateway": gateway,
+            "addresses": addresses,
+        })
+
+    def handle_host_memory(self):
+        try:
+            with open("/proc/meminfo", "r") as handle:
+                content = handle.read()
+        except OSError as exc:
+            self.reject("Could not read /proc/meminfo: %s" % exc, 500)
+            return
+        self.send_json_response(200, parse_meminfo(content))
+
+    def handle_host_disks(self):
+        columns = "NAME,PATH,SIZE,TYPE,MOUNTPOINT,FSTYPE,ROTA,MODEL,SERIAL"
+        rc, stdout, stderr = run_argv(["lsblk", "-J", "-b", "-o", columns], timeout=30)
+        if rc != 0:
+            # An older lsblk without one of those columns still answers the plain form.
+            rc, stdout, stderr = run_argv(["lsblk", "-J", "-b"], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "lsblk failed", 500)
+            return
+        try:
+            disks = json.loads(stdout.strip() or "{}")
+        except Exception:
+            self.reject("Could not parse lsblk output", 500)
+            return
+        self.send_json_response(200, disks)
+
+    def handle_host_capabilities(self):
+        self.send_json_response(200, read_host_capabilities())
+
+    def handle_host_dhcp_leases(self):
+        self.send_json_response(200, {"leases": read_dhcp_leases()})
+
+    def handle_host_reboot(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        if payload.get("confirm") is not True:
+            self.reject('Reboot requires {"confirm": true}')
+            return
+        schedule_host_reboot()
+        self.send_json_response(200, {"rebooting": True})
+
+    # -- Database ------------------------------------------------------
+
+    def handle_db_ring(self):
+        rc, stdout, stderr = run_argv(
+            ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "status"], timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "nodetool status failed", 500)
+            return
+        self.send_json_response(200, {"nodes": parse_nodetool_status(stdout)})
+
+    def handle_db_repair(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        keyspace = payload.get("keyspace", "hydra")
+        if not valid_name(keyspace):
+            self.reject("Invalid keyspace name")
+            return
+        primary_range = payload.get("primary_range", True)
+        if not isinstance(primary_range, bool):
+            self.reject("primary_range must be a boolean")
+            return
+
+        if not start_db_repair(keyspace, primary_range):
+            self.reject("A repair is already running on this node", 409)
+            return
+        self.send_json_response(200, {"started": True})
 
 class SecureHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, ssl_context):

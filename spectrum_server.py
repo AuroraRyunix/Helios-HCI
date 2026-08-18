@@ -9,6 +9,7 @@ import socket
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 import time
 import random
 import threading
@@ -462,8 +463,41 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         with urllib.request.urlopen(req, context=context, timeout=120) as response:
             res = json.loads(response.read().decode("utf-8"))
             return 0, res, ""
+    except urllib.error.HTTPError as e:
+        # The typed endpoints report failure as {"error": "..."} with a 4xx/5xx
+        # status, which urllib raises. Without reading the body here the caller
+        # only ever sees "HTTP Error 500", and every migrated call site loses the
+        # message that the raw execute path used to hand back in stderr.
+        detail = ""
+        try:
+            body = json.loads(e.read().decode("utf-8", errors="replace"))
+            if isinstance(body, dict):
+                detail = str(body.get("error", "")).strip()
+                return -1, body, detail or str(e)
+        except Exception:
+            pass
+        return -1, {"error": detail or str(e)}, detail or str(e)
     except Exception as e:
         return -1, {}, str(e)
+
+def demote_drbd_secondary(res_name):
+    """Demote a DRBD resource to Secondary, reporting a demotion that did not take.
+
+    Failure here is not fatal -- the caller is either finishing or already
+    unwinding -- but it used to be invisible, because the shell form ran with
+    `|| true` and its result was discarded. The typed endpoint returns the
+    resulting role, so a node left holding Primary is at least logged.
+    """
+    rc, res, err = run_mtls_spark_api(
+        "127.0.0.1",
+        "/api/v1/storage/drbd/role",
+        {"resource": res_name, "role": "secondary", "force": False})
+    if rc != 0 or str(res.get("role", "")).strip().lower() != "secondary":
+        print(f"[VALHALLA] DRBD resource {res_name} was not demoted to Secondary "
+              f"(role is '{str(res.get('role', '')).strip() or 'unknown'}'): "
+              f"{(res.get('error') or err or '').strip()}", flush=True)
+        return False
+    return True
 
 def run_cql_query(cql_query, *args, **kwargs):
     import urllib.request
@@ -545,12 +579,15 @@ def run_nodetool_repair(reason=""):
     """
     label = f" ({reason})" if reason else ""
     print(f"[REPAIR] Starting nodetool repair{label}. This can take a while on a large keyspace.")
-    rc, out, err = run_remote_spark(
-        LOCAL_IP, "podman exec systemd-hydra-db nodetool repair -pr hydra", timeout=3600)
-    if rc == 0:
-        print(f"[REPAIR] Completed successfully{label}.")
+    rc, res, err = run_mtls_spark_api(
+        LOCAL_IP, "/api/v1/db/repair", {"keyspace": "hydra", "primary_range": True})
+    if rc == 0 and "error" not in res and res.get("started"):
+        # The typed endpoint starts the repair and returns immediately, so this
+        # reports "started", not "finished". Completion is no longer observable
+        # from here; the repair continues on the node after this returns.
+        print(f"[REPAIR] Started successfully{label}. It runs asynchronously on the node.")
         return True
-    print(f"[REPAIR] FAILED{label}: {(err or out).strip()[:400]}")
+    print(f"[REPAIR] FAILED to start{label}: {(res.get('error') or err or '').strip()[:400]}")
     print("[REPAIR] Replicas may be under-populated. Re-run: "
           "podman exec systemd-hydra-db nodetool repair -pr hydra")
     return False
@@ -600,8 +637,12 @@ def get_container_node_ip(container_name):
                 if rc_m == 0:
                     return nip
             else:
-                rc_m, _, _ = run_remote_spark(nip, f"mountpoint -q {container_path}")
-                if rc_m == 0:
+                rc_m, res_m, _ = run_mtls_spark_api(
+                    nip,
+                    "/api/v1/storage/container/mounted?path=" + urllib.parse.quote(container_path, safe=""),
+                    None,
+                    method="GET")
+                if rc_m == 0 and res_m.get("mounted"):
                     return nip
     except Exception:
         pass
@@ -839,13 +880,12 @@ def get_consolidated_dhcp_leases():
         for n in nodes:
             n_ip = n.get("ip")
             if n_ip:
-                rc_l, out_l, _ = run_remote_spark(n_ip, "cat /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || cat /var/lib/misc/dnsmasq.leases 2>/dev/null")
-                if rc_l == 0 and out_l:
-                    for line in out_l.splitlines():
-                        parts = line.strip().split()
-                        if len(parts) >= 3:
-                            mac = parts[1].lower().strip()
-                            lease_ip = parts[2].strip()
+                rc_l, res_l, _ = run_mtls_spark_api(n_ip, "/api/v1/host/dhcp-leases", None, method="GET")
+                if rc_l == 0 and "error" not in res_l:
+                    for lease in res_l.get("leases", []):
+                        mac = str(lease.get("mac", "")).strip().lower()
+                        lease_ip = str(lease.get("ip", "")).strip()
+                        if mac and lease_ip:
                             dhcp_leases[mac] = lease_ip
     except Exception as e:
         print(f"Error fetching DHCP leases: {e}")
@@ -854,16 +894,17 @@ def get_consolidated_dhcp_leases():
 def resolve_vm_ip(host_ip, vm_name, vm_status, dhcp_leases):
     if vm_status == "running" and host_ip:
         try:
-            rc_mac, out_mac, _ = run_remote_spark(host_ip, f"virsh -c qemu:///system domiflist {vm_name}")
+            rc_mac, res_mac, _ = run_mtls_spark_api(
+                host_ip,
+                "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/interfaces",
+                None,
+                method="GET")
             macs = []
-            if rc_mac == 0 and out_mac:
-                for line in out_mac.splitlines():
-                    if ":" in line:
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            mac = parts[4].strip().lower()
-                            if len(mac) == 17:
-                                macs.append(mac)
+            if rc_mac == 0 and "error" not in res_mac:
+                for iface in res_mac.get("interfaces", []):
+                    mac = str(iface.get("mac", "")).strip().lower()
+                    if mac:
+                        macs.append(mac)
             for mac in macs:
                 if mac in dhcp_leases:
                     return dhcp_leases[mac]
@@ -1549,8 +1590,8 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
 
     has_kvm = False
     try:
-        rc, _, _ = run_remote_spark("127.0.0.1", "test -e /dev/kvm")
-        has_kvm = (rc == 0)
+        rc, res_caps, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/capabilities", None, method="GET")
+        has_kvm = (rc == 0 and bool(res_caps.get("kvm")))
     except Exception:
         pass
 
@@ -2095,19 +2136,22 @@ def get_network_details(net_id):
 
 def hotplug_vm_nic(host_ip, vm_name, old_net_id, new_net_id):
     # 1. Get current MAC address using domiflist
-    rc, stdout, _ = run_remote_spark(host_ip, f"virsh -c qemu:///system domiflist {vm_name}")
-    if rc != 0 or not stdout:
+    rc, res_if, _ = run_mtls_spark_api(
+        host_ip,
+        "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/interfaces",
+        None,
+        method="GET")
+    if rc != 0 or "error" in res_if:
         return False, "Failed to query active interfaces on guest VM."
         
     mac = None
     iface_type = "bridge"
-    for line in stdout.splitlines():
-        if "virtio" in line or "vnet" in line or "macvtap" in line or "direct" in line:
-            parts = line.split()
-            if len(parts) >= 5:
-                iface_type = parts[1]
-                mac = parts[4]
-                break
+    for iface in res_if.get("interfaces", []):
+        candidate = str(iface.get("mac", "")).strip()
+        if candidate:
+            iface_type = str(iface.get("type", "")).strip() or "bridge"
+            mac = candidate
+            break
                 
     if not mac:
         return False, "Could not locate active interface MAC address."
@@ -2124,13 +2168,9 @@ def hotplug_vm_nic(host_ip, vm_name, old_net_id, new_net_id):
     # Dynamically detect default route interface on the host for direct/flat network
     uplink_dev = "ens192"
     try:
-        rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route get 8.8.8.8 | grep -oP 'dev \\K\\S+'")
-        if rc_dev == 0 and stdout_dev.strip():
-            uplink_dev = stdout_dev.strip()
-        else:
-            rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route | grep default | awk '{print $5}'")
-            if rc_dev == 0 and stdout_dev.strip():
-                uplink_dev = stdout_dev.strip().splitlines()[0]
+        rc_dev, res_dev, _ = run_mtls_spark_api(host_ip, "/api/v1/host/network", None, method="GET")
+        if rc_dev == 0 and str(res_dev.get("default_interface", "")).strip():
+            uplink_dev = str(res_dev["default_interface"]).strip()
     except Exception:
         pass
         
@@ -2549,7 +2589,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
-                            run_remote_spark("127.0.0.1", f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                            run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
                             cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
                             run_cql_query(cql_update)
@@ -2660,14 +2700,17 @@ class SpectrumHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/lanayru/checks":
             # Real DB check checking consensus via nodetool
-            rc_db, stdout_db, _ = run_remote_spark(LOCAL_IP, "podman exec systemd-hydra-db nodetool status || true")
+            rc_db, res_ring, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/db/ring", None, method="GET")
             db_status = "error"
             db_msg = "ScyllaDB cluster offline or unreachable."
-            if rc_db == 0 and stdout_db:
-                # Count UN nodes
+            if rc_db == 0 and "error" not in res_ring and res_ring.get("nodes"):
+                # Count nodes that are Up and Normal -- nodetool's "UN" pair,
+                # now reported as separate status/state fields.
                 un_nodes = 0
-                for line in stdout_db.splitlines():
-                    if line.strip().startswith("UN"):
+                for ring_node in res_ring.get("nodes", []):
+                    ring_status = str(ring_node.get("status", "")).strip().upper()
+                    ring_state = str(ring_node.get("state", "")).strip().upper()
+                    if ring_status.startswith("U") and ring_state.startswith("N"):
                         un_nodes += 1
                 expected_nodes = len(get_cluster_nodes()) if get_cluster_nodes() else 3
                 if un_nodes >= expected_nodes:
@@ -2691,21 +2734,18 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     storage_msg = "Linstor pools online but thin provisioning not found."
             
             # Node memory check using LOCAL_IP
-            rc_mem, stdout_mem, _ = run_remote_spark(LOCAL_IP, "free -m")
+            rc_mem, res_mem, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/host/memory", None, method="GET")
             compute_status = "warning"
             compute_msg = "Host compute resources warning or unverified."
-            if rc_mem == 0 and stdout_mem:
+            if rc_mem == 0 and "error" not in res_mem:
                 try:
-                    lines = stdout_mem.splitlines()
-                    for line in lines:
-                        if line.startswith("Mem:"):
-                            free_mem = int(line.split()[3])
-                            if free_mem >= 2048:
-                                compute_status = "ready"
-                                compute_msg = f"Host RAM capacity check passed ({free_mem}MB free on node)"
-                            else:
-                                compute_status = "warning"
-                                compute_msg = f"Host RAM capacity warning: only {free_mem}MB free on node"
+                    free_mem = int(float(res_mem.get("free_mb", 0)))
+                    if free_mem >= 2048:
+                        compute_status = "ready"
+                        compute_msg = f"Host RAM capacity check passed ({free_mem}MB free on node)"
+                    else:
+                        compute_status = "warning"
+                        compute_msg = f"Host RAM capacity warning: only {free_mem}MB free on node"
                 except:
                     pass
             
@@ -2908,19 +2948,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             default_gateway = None
             suggested_ip = None
             
-            rc_route, out_route, _ = run_remote_spark("127.0.0.1", "ip route show | grep default")
-            if rc_route == 0 and out_route:
-                parts = out_route.strip().split()
-                try:
-                    via_idx = parts.index("via")
-                    default_gateway = parts[via_idx + 1]
-                except ValueError:
-                    pass
-                try:
-                    dev_idx = parts.index("dev")
-                    default_interface = parts[dev_idx + 1]
-                except ValueError:
-                    pass
+            rc_route, res_route, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/network", None, method="GET")
+            if rc_route == 0 and "error" not in res_route:
+                default_gateway = str(res_route.get("default_gateway", "")).strip() or None
+                default_interface = str(res_route.get("default_interface", "")).strip() or None
             
             if default_interface:
                 rc_ip, out_ip, _ = run_remote_spark("127.0.0.1", f"ip addr show {default_interface} | grep 'inet '")
@@ -3088,7 +3119,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
-                            run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                            run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
                             cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
                             run_cql_query(cql_update)
@@ -3464,38 +3495,28 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             model = line.split(":", 1)[1].strip()
                     cpu_data = {"cores": cores, "model": model}
                 
-                rc_ram, out_ram, err_ram = run_remote_spark(node_ip, "free -b")
+                rc_ram, res_ram, err_ram = run_mtls_spark_api(node_ip, "/api/v1/host/memory", None, method="GET")
                 ram_data = {"total": 0, "used": 0, "free": 0}
-                if rc_ram == 0:
-                    lines = out_ram.splitlines()
-                    for line in lines:
-                        if line.strip().startswith("Mem:"):
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                try:
-                                    ram_data = {
-                                        "total": int(parts[1]),
-                                        "used": int(parts[2]),
-                                        "free": int(parts[3])
-                                    }
-                                except:
-                                    pass
+                if rc_ram == 0 and "error" not in res_ram:
+                    try:
+                        # The endpoint reports MiB; this view renders bytes.
+                        ram_data = {
+                            "total": int(float(res_ram.get("total_mb", 0)) * 1024 * 1024),
+                            "used": int(float(res_ram.get("used_mb", 0)) * 1024 * 1024),
+                            "free": int(float(res_ram.get("free_mb", 0)) * 1024 * 1024)
+                        }
+                    except:
+                        pass
                 
-                rc_disk, out_disk, err_disk = run_remote_spark(node_ip, "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT -J")
+                rc_disk, res_disk, err_disk = run_mtls_spark_api(node_ip, "/api/v1/host/disks", None, method="GET")
                 disks_data = []
-                if rc_disk == 0:
-                    try:
-                        disks_data = json.loads(out_disk).get("blockdevices", [])
-                    except:
-                        pass
+                if rc_disk == 0 and isinstance(res_disk, dict):
+                    disks_data = res_disk.get("blockdevices", []) or []
                 
-                rc_net, out_net, err_net = run_remote_spark(node_ip, "ip -j addr show")
+                rc_net, res_net, err_net = run_mtls_spark_api(node_ip, "/api/v1/host/network", None, method="GET")
                 network_data = []
-                if rc_net == 0:
-                    try:
-                        network_data = json.loads(out_net)
-                    except:
-                        pass
+                if rc_net == 0 and isinstance(res_net, dict):
+                    network_data = res_net.get("addresses", []) or []
                 
                 status = "online" if rc_cpu == 0 else "offline"
                 
@@ -3725,31 +3746,26 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 host_ip = LOCAL_IP
 
             vnc_port = None
-            if console_type == "spice":
-                cmd = f"virsh -c qemu:///system domdisplay {vm_name} --type spice"
-            else:
-                cmd = f"virsh -c qemu:///system vncdisplay {vm_name}"
+            console_ip = "127.0.0.1"
+            if host_ip and host_ip != LOCAL_IP and host_ip != "127.0.0.1":
+                console_ip = host_ip
 
-            if host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "":
-                rc, stdout, stderr = run_remote_spark("127.0.0.1", cmd)
-            else:
-                rc, stdout, stderr = run_remote_spark(host_ip, cmd)
-
-            if rc == 0:
-                display = stdout.strip()
-                if console_type == "spice":
-                    if ":" in display:
-                        try:
-                            vnc_port = int(display.split(":")[-1])
-                        except ValueError:
-                            pass
-                else:
-                    if ":" in display:
-                        try:
-                            display_num = int(display.split(":")[-1])
-                            vnc_port = 5900 + display_num
-                        except ValueError:
-                            pass
+            rc, res_con, _ = run_mtls_spark_api(
+                console_ip,
+                "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
+                None,
+                method="GET")
+            # The endpoint reports the graphics device the domain actually has,
+            # and the listening port directly -- no display-number arithmetic.
+            # Asking virsh for a spice display on a VNC-only domain used to fail,
+            # so a mismatch stays a failure here rather than handing the client a
+            # console of the protocol it did not ask for.
+            if (rc == 0 and "error" not in res_con
+                    and str(res_con.get("graphics", "")).strip().lower() == console_type):
+                try:
+                    vnc_port = int(res_con.get("port"))
+                except (TypeError, ValueError):
+                    pass
 
             if vnc_port is None:
                 self.send_json(500, {"error": "Could not resolve VM console port"})
@@ -3846,31 +3862,24 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     if not host_ip:
                         host_ip = LOCAL_IP
 
-                    if console_type == "spice":
-                        cmd = f"virsh -c qemu:///system domdisplay {vm_name} --type spice"
-                    else:
-                        cmd = f"virsh -c qemu:///system vncdisplay {vm_name}"
+                    console_ip = "127.0.0.1"
+                    if host_ip and host_ip != LOCAL_IP and host_ip != "127.0.0.1":
+                        console_ip = host_ip
 
-                    if host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "":
-                        rc, stdout, stderr = run_remote_spark("127.0.0.1", cmd)
-                    else:
-                        rc, stdout, stderr = run_remote_spark(host_ip, cmd)
-
-                    if rc == 0:
-                        display = stdout.strip()
-                        if console_type == "spice":
-                            if ":" in display:
-                                try:
-                                    vnc_port = int(display.split(":")[-1])
-                                except ValueError:
-                                    pass
-                        else:
-                            if ":" in display:
-                                try:
-                                    display_num = int(display.split(":")[-1])
-                                    vnc_port = 5900 + display_num
-                                except ValueError:
-                                    pass
+                    rc, res_con, _ = run_mtls_spark_api(
+                        console_ip,
+                        "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
+                        None,
+                        method="GET")
+                    # Same contract as the HTTP handler above: structured
+                    # graphics type and port, and a protocol mismatch is a
+                    # failure rather than a silent downgrade.
+                    if (rc == 0 and "error" not in res_con
+                            and str(res_con.get("graphics", "")).strip().lower() == console_type):
+                        try:
+                            vnc_port = int(res_con.get("port"))
+                        except (TypeError, ValueError):
+                            pass
 
                 if not vm_name:
                     vm_name = "Session (via token)"
@@ -5146,16 +5155,35 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 # Wait up to 10 seconds for the block device to appear locally
                 found = False
                 for _ in range(20):
-                    rc_chk, _, _ = run_remote_spark("127.0.0.1", f"test -b {block_dev_path}")
-                    if rc_chk == 0:
+                    rc_chk, res_chk, _ = run_mtls_spark_api(
+                        "127.0.0.1",
+                        "/api/v1/storage/device?path=" + urllib.parse.quote(block_dev_path, safe=""),
+                        None,
+                        method="GET")
+                    if rc_chk == 0 and res_chk.get("is_block"):
                         found = True
                         break
                     time.sleep(0.5)
                 if not found:
                     raise Exception(f"DRBD block device {block_dev_path} did not appear on local host.")
                 
-                # Promote to Primary locally on host to write the data
-                run_remote_spark("127.0.0.1", f"drbdadm primary {res_name}")
+                # Promote to Primary locally on host to write the data.
+                # The typed endpoint returns the role the resource actually ends
+                # up in. A promotion that did not take -- typically because the
+                # peer still holds Primary -- must abort the upload: writing the
+                # block device from a Secondary is exactly the split-brain the
+                # role check exists to prevent, and the old fire-and-forget call
+                # could not see it.
+                rc_pri, res_pri, err_pri = run_mtls_spark_api(
+                    "127.0.0.1",
+                    "/api/v1/storage/drbd/role",
+                    {"resource": res_name, "role": "primary", "force": False})
+                role_now = str(res_pri.get("role", "")).strip().lower() if rc_pri == 0 else ""
+                if role_now != "primary":
+                    raise Exception(
+                        f"Failed to promote DRBD resource {res_name} to Primary "
+                        f"(role is '{role_now or 'unknown'}'; the peer may still hold Primary): "
+                        f"{(res_pri.get('error') or err_pri or '').strip()}")
                 
                 # Stream the upload in chunks of 1MB directly to the block device
                 chunk_size = 1024 * 1024
@@ -5195,12 +5223,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 # qemu/libvirt is the only consumer that needs the device, and
                 # world-writable let any local user or mapped container corrupt
                 # the golden image every VM is cloned from.
-                run_remote_spark("127.0.0.1", f"chown root:qemu {block_dev_path}")
-                run_remote_spark("127.0.0.1", f"chmod 0660 {block_dev_path}")
+                run_mtls_spark_api(
+                    "127.0.0.1",
+                    "/api/v1/storage/device/prepare",
+                    {"path": block_dev_path, "owner": "root:qemu", "mode": "0660"})
 
                 # Flush kernel buffers for the device, then demote to Secondary
-                run_remote_spark("127.0.0.1", f"sync && blockdev --flushbufs {block_dev_path}")
-                run_remote_spark("127.0.0.1", f"drbdadm secondary {res_name}")
+                run_mtls_spark_api("127.0.0.1", "/api/v1/storage/device/flush", {"path": block_dev_path})
+                demote_drbd_secondary(res_name)
                 
                 created_at = int(datetime.datetime.now().timestamp() * 1000)
                 image_meta = {
@@ -5223,7 +5253,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"message": "Image uploaded successfully", "image": image_meta, "task_id": task_id})
             except Exception as e:
                 # Ensure we attempt to demote back to secondary on failure
-                run_remote_spark("127.0.0.1", f"drbdadm secondary {res_name} || true")
+                demote_drbd_secondary(res_name)
                 # Cleanup Linstor definition on failure
                 run_linstor_cmd(f"resource-definition delete {res_name}")
                 log_catalyst_task("valhalla", "upload_image", "failed", 100, {"filename": filename, "size_bytes": content_length}, error_msg=str(e), task_id=task_id, created_at=created_at_ms)
@@ -5876,7 +5906,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     # Ensure all target containers directories exist
                     for d_info in new_parsed:
                         t_ip = get_container_node_ip(d_info['container'])
-                        run_remote_spark(t_ip, f"mkdir -p /var/lib/hci/aether/volumes/{d_info['container']}")
+                        run_mtls_spark_api(t_ip, "/api/v1/storage/container/ensure", {"name": d_info['container']})
 
                     import string
                     letters = string.ascii_lowercase
@@ -6091,8 +6121,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
 
                 # 1. Stop and undefine VM if it is active on a host
                 if host_ip:
-                    run_remote_spark(host_ip, f"virsh -c qemu:///system destroy {name} || true")
-                    run_remote_spark(host_ip, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                    run_mtls_spark_api(
+                        host_ip,
+                        "/api/v1/vm/" + urllib.parse.quote(name, safe="") + "/power",
+                        {"action": "destroy"})
+                    run_mtls_spark_api(host_ip, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
 
                 # 2. Delete Linstor resources and NVRAM files
                 num_disks = len(disks_list.split(",")) if disks_list else 1
@@ -7179,7 +7212,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     # 2. Reboot the host
                     print(f"[REBOOT TASK] Rebooting host {target_hostname}...")
                     log_catalyst_task("host", "reboot", "processing", 50, {"hostname": target_hostname}, task_id=task_id, created_at=created_at)
-                    run_remote_spark(target_ip, "reboot || true")
+                    run_mtls_spark_api(target_ip, "/api/v1/host/reboot", {"confirm": True})
                     
                     # 4. Wait for host to go offline
                     time.sleep(10)
@@ -7351,7 +7384,7 @@ def db_reconcile_loop():
                                 live_state = libvirt_vms.get(name, "Stopped")
                                 if live_state == "Stopped":
                                     if name in libvirt_vms:
-                                        run_remote_spark("127.0.0.1", f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                                        run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                                     if db_state != "Stopped" or host_ip != "":
                                         cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
                                         run_cql_query(cql_update)
@@ -7366,8 +7399,11 @@ def db_reconcile_loop():
                                     live_state = libvirt_vms[name]
                                     print(f"[Reconcile] VM '{name}' is running/defined locally (state: {live_state}) but database assigns it to remote host {host_ip or 'None'}. Cleaning up locally to prevent split-brain...")
                                     if live_state == "Running":
-                                        run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system destroy {name} || true")
-                                    run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                                        run_mtls_spark_api(
+                                            LOCAL_IP,
+                                            "/api/v1/vm/" + urllib.parse.quote(name, safe="") + "/power",
+                                            {"action": "destroy"})
+                                    run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         except Exception:
                             pass
         except Exception:

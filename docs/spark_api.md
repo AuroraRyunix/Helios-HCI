@@ -100,6 +100,33 @@ Each call site moves from `run_remote_spark(ip, "<shell string>")` to
 Note this work is not contingent on the Phoenix rewrite: it improves the Python tier
 directly, and the Elixir client consumes the same contract.
 
+## Known gaps (v2 candidates)
+
+Identified while migrating `spectrum_server.py`; these call sites deliberately still use
+`/api/v1/execute` because no typed endpoint covers them. Listed with the count of raw
+calls each would retire.
+
+| Missing endpoint | Raw calls | Why it is needed |
+| :-- | --: | :-- |
+| `GET /api/v1/vms` (list defined domains) | 3 | The reconcile loop must *enumerate* locally-defined VMs to find ones the database assigns elsewhere. A per-name lookup cannot substitute: a 404 conflates "not defined" with a transient error. |
+| `GET /api/v1/vm/{name}/stats` | 2 | `cpu.time`, `balloon.rss`, `block.*` counters. `/vm/{name}/info` carries none of them. |
+| VM media (CD-ROM change/eject) | 10 | `virsh change-media`, `qemu-monitor-command`. The largest single group remaining. |
+| VM device hotplug (attach/detach NIC and disk) | 5 | `virsh attach-device`, `detach-interface`, `attach-disk`, `detach-disk`. |
+| `POST /api/v1/vm/{name}/disk/resize` | 1 | `virsh blockresize`. |
+| `drbdadm resize` on `/storage/drbd/` | 1 | `/storage/drbd/role` covers only primary/secondary. |
+| Linstor resource operations | 3 | `resource-definition`/`volume-definition`/`resource create`. Blocks moving VM disk allocation out of the web tier. |
+| `GET /api/v1/host/cpu` | 1 | Core count and model. |
+| `GET /api/v1/host/ping` | 2 | A liveness probe for the reboot task. Currently `echo 1`, and not migrated because `run_mtls_spark_api` has a 120s timeout against `run_remote_spark`'s 60s, which would change reboot detection timing. |
+
+Two shape ambiguities in v1 worth tightening when these land: the element shape of
+`/host/network`'s `addresses` array was left unspecified (a caller needing a per-interface
+CIDR had to keep shelling out), and `/host/disks` returning `{"blockdevices": [...]}`
+follows `lsblk -J` rather than being stated in the contract.
+
+Remaining by design: `rm`, `echo >`, `mkdir` and base64-decode calls in the LCM
+file-transfer and config-sync paths. Exposing file verbs as endpoints would reproduce
+`/execute` with a JSON wrapper.
+
 ## Related
 
 * [spark.md](./spark.md) / [spark_technical.md](./spark_technical.md) -- the daemon
