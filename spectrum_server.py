@@ -16,6 +16,7 @@ import threading
 import hashlib
 import secrets
 import base64
+import http.client
 import http.cookies
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -5193,39 +5194,69 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         f"(role is '{role_now or 'unknown'}'; the peer may still hold Primary): "
                         f"{(res_pri.get('error') or err_pri or '').strip()}")
                 
-                # Stream the upload in chunks of 1MB directly to the block device
-                chunk_size = 1024 * 1024
-                bytes_remaining = content_length
-                last_progress = 0
-                
-                with open(block_dev_path, "wb") as f:
-                    while bytes_remaining > 0:
-                        chunk_to_read = min(chunk_size, bytes_remaining)
-                        chunk = self.rfile.read(chunk_to_read)
+                # Stream the upload through Spark rather than writing the device here.
+                #
+                # The web tier must not touch the data path. Its container mounts no /dev,
+                # so opening a DRBD device failed with ENOENT and image upload never
+                # worked in this deployment -- but mounting /dev would be the wrong fix.
+                # Spark owns host storage, the way Stargate rather than Prism owns it on
+                # Nutanix, so the bytes are proxied to it and it performs the write.
+                # http.client rather than urllib: urllib does not reliably stream a
+                # file-like body, and the framing it produced was rejected mid-transfer.
+                ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+                ctx.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+                ctx.check_hostname = False
+
+                progress_state = {"sent": 0, "reported": 0}
+
+                class _UploadRelay:
+                    """Feeds the client's upload straight through without buffering it."""
+
+                    def __init__(self, stream, total):
+                        self.stream = stream
+                        self.remaining = total
+
+                    def read(self, size=-1):
+                        if self.remaining <= 0:
+                            return b""
+                        want = self.remaining if size is None or size < 0 else min(size, self.remaining)
+                        chunk = self.stream.read(want)
                         if not chunk:
-                            break
-                        f.write(chunk)
-                        bytes_remaining -= len(chunk)
-                        
-                        # Update task progress every 5%
-                        progress = int(((content_length - bytes_remaining) / content_length) * 100) if content_length > 0 else 100
-                        if progress - last_progress >= 5:
-                            log_catalyst_task("valhalla", "upload_image", "processing", progress, {"filename": filename, "size_bytes": content_length}, task_id=task_id, created_at=created_at_ms)
-                            last_progress = progress
+                            return b""
+                        self.remaining -= len(chunk)
+                        progress_state["sent"] += len(chunk)
+                        pct = int((progress_state["sent"] / content_length) * 100) if content_length else 100
+                        if pct - progress_state["reported"] >= 5:
+                            progress_state["reported"] = pct
+                            log_catalyst_task("valhalla", "upload_image", "processing", pct,
+                                              {"filename": filename, "size_bytes": content_length},
+                                              task_id=task_id, created_at=created_at_ms)
+                        return chunk
 
-                    # Push our own buffers into the block device before anything
-                    # downstream demotes it or reads from another node.
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                # A client that disconnects mid-upload just ends the read loop.
-                # Without this check the partial image was registered as valid
-                # and every VM cloned from a truncated disk.
-                if bytes_remaining != 0:
-                    raise Exception(
-                        f"Upload truncated: {bytes_remaining} of {content_length} bytes were never "
-                        f"received (client disconnected)."
+                conn = http.client.HTTPSConnection(LOCAL_IP, 9099, context=ctx, timeout=3600)
+                try:
+                    conn.request(
+                        "POST",
+                        "/api/v1/storage/device/write?device=" + urllib.parse.quote(block_dev_path, safe=""),
+                        body=_UploadRelay(self.rfile, content_length),
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(content_length),
+                        },
                     )
+                    write_resp = conn.getresponse()
+                    write_body = write_resp.read().decode("utf-8", "replace")
+                    if write_resp.status != 200:
+                        raise Exception("Spark refused the image write: " + write_body[:300])
+                    write_result = json.loads(write_body)
+                finally:
+                    conn.close()
+
+                written = write_result.get("written", 0)
+                if written != content_length:
+                    raise Exception(
+                        "Image upload was truncated: Spark wrote %d of %d bytes."
+                        % (written, content_length))
 
                 # Adjust block device permissions. 0660 root:qemu, not 0666:
                 # qemu/libvirt is the only consumer that needs the device, and

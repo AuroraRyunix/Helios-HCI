@@ -78,6 +78,7 @@ temp file and calls `virsh define` on that path.
 | POST | `/api/v1/storage/drbd/role` | `{"resource","role":"primary"\|"secondary","force":bool}` | `{"role":str}` |
 | GET | `/api/v1/storage/device` | `?path=` | `{"exists":bool,"is_block":bool,"size_bytes":int}` |
 | POST | `/api/v1/storage/device/prepare` | `{"path","owner","mode"}` | `{"prepared":true}` |
+| POST | `/api/v1/storage/device/write` | `?device=` + **raw body** | `{"written":int}` |
 | POST | `/api/v1/storage/device/flush` | `{"path"}` | `{"flushed":true}` |
 | GET | `/api/v1/storage/container/mounted` | `?path=` | `{"mounted":bool}` |
 | POST | `/api/v1/storage/container/ensure` | `{"name"}` | `{"path":str,"created":bool}` |
@@ -86,6 +87,16 @@ temp file and calls `virsh define` on that path.
 (`root:qemu`, `root:root`), `mode` an octal string from an allowlist. Promotion returns the
 resulting role so a caller can detect the peer already holding Primary -- the condition
 that previously allowed a VM to start twice.
+
+`device/write` streams the request body straight onto the device. It exists because the
+web tier must not touch the data path at all: Spectrum's container mounts no `/dev`, so
+opening a DRBD device failed with `ENOENT` and image upload had never worked in this
+deployment. Mounting `/dev` into the web tier would have been the wrong fix -- Spark owns
+host storage, the way Stargate rather than Prism owns it on Nutanix. Spectrum receives the
+upload and proxies the bytes here, so it needs neither `/dev` nor a storage mount.
+
+A short write returns 400 with the byte count rather than 200, so a client that
+disconnects mid-upload cannot leave a truncated image registered as valid.
 
 ### Host
 

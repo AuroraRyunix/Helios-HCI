@@ -1532,7 +1532,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             self.handle_sync_settings()
             return
 
-        if self.route_typed_post(urllib.parse.urlparse(self.path).path):
+        if self.route_typed_post(urllib.parse.urlparse(self.path)):
             return
 
         self.send_response(404)
@@ -2692,8 +2692,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
 
         return False
 
-    def route_typed_post(self, path):
+    def route_typed_post(self, parsed):
         """Dispatch the typed write endpoints. True when the request was handled."""
+        path = parsed.path
         if path == "/api/v1/vm/define":
             self.handle_vm_define()
             return True
@@ -2705,6 +2706,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/storage/device/prepare":
             self.handle_storage_device_prepare()
+            return True
+        if path == "/api/v1/storage/device/write":
+            self.handle_storage_device_write(parsed)
             return True
         if path == "/api/v1/storage/device/flush":
             self.handle_storage_device_flush()
@@ -2997,6 +3001,66 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject(str(exc), 500)
             return
         self.send_json_response(200, {"prepared": True})
+
+    def handle_storage_device_write(self, parsed):
+        """Stream the request body directly onto a block device.
+
+        The web tier must not touch storage at all -- not the device, and not a staging
+        file on a mounted volume. It receives the upload and proxies the bytes here; this
+        daemon owns the data path, the same way Stargate does on Nutanix rather than
+        Prism. Spectrum's container consequently needs no /dev and no storage mount.
+
+        The device is taken from the query string and validated against the allowlist; the
+        payload is the raw body, so nothing the caller sends can influence a command.
+        """
+        params = urllib.parse.parse_qs(parsed.query or "")
+        device = (params.get("device") or [None])[0]
+
+        ok, err = validate_path(device)
+        if not ok:
+            self.send_json_response(400, {"error": err})
+            return
+        if not str(device).startswith("/dev/drbd/"):
+            self.send_json_response(400, {"error": "device must be under /dev/drbd/"})
+            return
+        if not os.path.exists(device):
+            self.send_json_response(404, {"error": "device does not exist: " + str(device)})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            self.send_json_response(400, {"error": "Content-Length required and must be > 0"})
+            return
+
+        written = 0
+        try:
+            with open(device, "r+b") as dst:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(4 * 1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except Exception as exc:
+            self.send_json_response(500, {"error": "write failed: " + str(exc)})
+            return
+
+        if written != length:
+            # A short write means the client disconnected mid-upload. Say so rather than
+            # reporting success, which previously let a truncated image be registered.
+            self.send_json_response(400, {
+                "error": "short write: %d of %d bytes" % (written, length),
+                "written": written})
+            return
+
+        self.send_json_response(200, {"written": written})
 
     def handle_storage_device_flush(self):
         payload, error = self.read_json_payload()
