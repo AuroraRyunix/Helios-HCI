@@ -1,6 +1,6 @@
 defmodule SpectrumPhx.Images do
   @moduledoc """
-  The Valhalla image catalogue: reads from `hydra.valhalla_images`, and delete.
+  The Valhalla image catalogue: list, upload, and delete.
 
   ## Reads are parameterised and columns are named
 
@@ -30,16 +30,21 @@ defmodule SpectrumPhx.Images do
   LINSTOR resource, never with `rm`) or a file under the image container directory.
   Anything else is refused and reported rather than deleted.
 
-  ## Upload is deliberately absent
+  ## Upload never touches the data path
 
-  See `upload_note/0`.
+  The bytes go from the browser to the host that owns the storage without this tier ever
+  opening the device or staging a file. `prepare_upload/2`, `finish_upload/2`,
+  `rollback_upload/1` and `register/1` are the ordered steps;
+  `SpectrumPhx.Images.UploadWriter` streams the bytes between them. See `upload_note/0`
+  for why it is built this way.
 
   ## Test seam
 
-  Reads go through `source/0` (`:hydra` or `{:static, rows}`) and the destructive half of
-  `delete_image/1` goes through `backing_remover/0`. Under a static source the row is not
-  written anywhere, matching `SpectrumPhx.Vms.create_vm/1`: an in-memory stand-in for the
-  database would test the stand-in.
+  Reads go through `source/0` (`:hydra` or `{:static, rows}`), the destructive half of
+  `delete_image/1` goes through `backing_remover/0`, and the upload's host calls go
+  through `uploader/0`. Under a static source no row is written anywhere, matching
+  `SpectrumPhx.Vms.create_vm/1`: an in-memory stand-in for the database would test the
+  stand-in.
   """
 
   alias SpectrumPhx.Cluster.Config
@@ -54,6 +59,8 @@ defmodule SpectrumPhx.Images do
   @list_cql "SELECT #{@columns} FROM hydra.valhalla_images"
   @get_cql "SELECT #{@columns} FROM hydra.valhalla_images WHERE name = ?"
   @delete_cql "DELETE FROM hydra.valhalla_images WHERE name = ?"
+  @insert_cql "INSERT INTO hydra.valhalla_images " <>
+                "(name, filename, size_bytes, type, path, created_at) VALUES (?, ?, ?, ?, ?, ?)"
 
   # Where `/api/images` scans for files and where upload writes stage. Only paths under
   # this prefix are eligible for removal with `rm`.
@@ -320,10 +327,321 @@ defmodule SpectrumPhx.Images do
   # -- upload --------------------------------------------------------------------------
 
   @doc """
-  Why there is no upload here, and what an implementation has to do.
+  Allocate the replicated storage an image will be written into, and take Primary on it.
 
-  **Not implemented.** Listing and deleting are; uploading is not, and the gap is
-  deliberate rather than an oversight.
+  Everything up to the first byte: the LINSTOR resource, the volume definition sized from
+  the image, placement on every node, dual-primary, and promotion of the local node. On
+  success the device named in the result is a block device this node holds Primary and may
+  be written; on failure nothing is left behind.
+
+  `size_bytes` has to be known here, because a DRBD volume is defined with a size and
+  cannot be grown into as bytes arrive. It comes from the browser's report of the file
+  size; the byte count actually written is checked against it in `finish_upload/1`, so a
+  client that under-reports produces a failed upload rather than a truncated image.
+
+  Returns `{:ok, %{resource: ..., device: ..., created: boolean}}` or `{:error, reason}`.
+  `created: false` means the resource was already there and was adopted -- which for an
+  image the catalogue has never seen means a previous upload died before registering it.
+  """
+  @spec prepare_upload(String.t(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
+  def prepare_upload(name, size_bytes) when is_integer(size_bytes) and size_bytes > 0 do
+    with {:ok, name} <- validate_name(name),
+         :ok <- refuse_if_catalogued(name) do
+      resource = resource_name(name)
+      ip = local_ip()
+
+      # Round up: a volume has to hold every byte, and the last partial KiB is a byte the
+      # image needs. The daemon aligns further to DRBD's 4 KiB.
+      size_kib = div(size_bytes + 1023, 1024)
+
+      with {:ok, _created_info} <- allocate(ip, resource, size_kib),
+           {:ok, device} <- await_device(ip, resource),
+           :ok <- promote(ip, resource) do
+        {:ok, %{resource: resource, device: device, node: ip, size_bytes: size_bytes}}
+      else
+        {:error, reason} ->
+          # Nothing this call created may survive it. A half-built resource holds storage
+          # on every node and is invisible to the catalogue, so it is never reclaimed.
+          rollback_upload(%{resource: resource, node: ip})
+          {:error, reason}
+      end
+    end
+  end
+
+  def prepare_upload(_name, _size_bytes), do: {:error, {:upload, "The image size is unknown."}}
+
+  defp refuse_if_catalogued(name) do
+    case get_image(name) do
+      {:error, :not_found} -> :ok
+      {:ok, _image} -> {:error, {:exists, name}}
+      # The catalogue could not be read. Refusing is the safe direction: continuing would
+      # promote and write a device that may be a live image's, on nothing more than a
+      # failed read.
+      {:error, reason} -> {:error, {:catalogue, reason}}
+    end
+  end
+
+  defp allocate(ip, resource, size_kib) do
+    case uploader().linstor_create(ip, resource, size_kib) do
+      {:ok, info} -> {:ok, info}
+      {:error, {409, message}} -> {:error, {:size_conflict, message}}
+      {:error, reason} -> {:error, {:allocate, describe(reason)}}
+    end
+  end
+
+  # The device is created by DRBD a moment after LINSTOR reports the resource placed, so
+  # this polls rather than assuming. Ten seconds by default, as the Python path used; the
+  # bound is configurable only so a test that exercises the give-up path need not take ten
+  # seconds to do it.
+  defp device_poll_attempts,
+    do: Application.get_env(:spectrum_phx, :images_device_poll_attempts, 20)
+
+  defp device_poll_interval_ms,
+    do: Application.get_env(:spectrum_phx, :images_device_poll_interval_ms, 500)
+
+  defp await_device(ip, resource), do: await_device(ip, resource, device_poll_attempts())
+
+  defp await_device(ip, resource, attempts) do
+    device = "/dev/drbd/by-res/" <> resource <> "/0"
+
+    case uploader().device_info(ip, device) do
+      {:ok, %{"is_block" => true}} ->
+        {:ok, device}
+
+      _other when attempts > 1 ->
+        Process.sleep(device_poll_interval_ms())
+        await_device(ip, resource, attempts - 1)
+
+      _other ->
+        {:error, {:device, "The DRBD device #{device} did not appear on #{ip}."}}
+    end
+  end
+
+  # The role that comes back is checked, not the call's exit status. A promotion that did
+  # not take means a peer still holds Primary, and writing the device from a Secondary is
+  # the split-brain this exists to prevent -- so it aborts the upload rather than logging.
+  defp promote(ip, resource) do
+    case uploader().drbd_role(ip, resource, "primary") do
+      {:ok, %{"role" => role}} ->
+        if String.downcase(to_string(role)) == "primary" do
+          :ok
+        else
+          {:error,
+           {:promote,
+            "#{resource} is #{role}, not Primary, after a promotion request. " <>
+              "Another node may still hold Primary."}}
+        end
+
+      {:error, reason} ->
+        {:error, {:promote, describe(reason)}}
+    end
+  end
+
+  @doc """
+  Complete an upload whose bytes have all been written: permissions, flush, demote.
+
+  `written` is compared with the size the volume was defined for. A short write is a
+  truncated image, so it fails here rather than being catalogued -- the case that
+  previously produced an image that existed, mounted, and was incomplete.
+
+  The device is left `root:qemu 0660`, not `0666`: qemu is the only consumer that needs
+  it, and world-writable lets any local user corrupt the golden image every VM is cloned
+  from.
+  """
+  @spec finish_upload(map(), non_neg_integer()) :: :ok | {:error, term()}
+  def finish_upload(
+        %{resource: resource, device: device, node: ip, size_bytes: expected},
+        written
+      ) do
+    if written != expected do
+      {:error,
+       {:truncated,
+        "The image was truncated: #{written} of #{expected} bytes reached the device."}}
+    else
+      uploader().device_prepare(ip, device, "root:qemu", "0660")
+      uploader().device_flush(ip, device)
+      demote(ip, resource)
+      :ok
+    end
+  end
+
+  @doc """
+  Undo a prepared upload: demote this node and delete the resource.
+
+  Called on every failure path, including one where the browser vanished mid-transfer.
+  Both steps are best-effort and neither can fail the caller -- there is nothing useful a
+  caller can do about a rollback that did not work, and the failure it is rolling back is
+  the one worth reporting. A resource that will not delete is logged, because it is
+  holding storage on every node that nothing will ever reclaim automatically.
+  """
+  @spec rollback_upload(map()) :: :ok
+  def rollback_upload(%{resource: resource, node: ip}) do
+    unwind(ip, resource, rollback_attempts())
+  end
+
+  # Retried, because the device is released asynchronously. spark-daemon holds the block
+  # device open for the life of the write request, so an abandoned upload -- a cancelled
+  # transfer, a truncated body, a browser that vanished -- leaves the device busy for a
+  # moment after this tier has given up on it. The first demote and delete then fail with
+  # "resource is still in use", and a rollback that gives up there leaks a DRBD resource
+  # holding storage on every node, which is the thing it exists to prevent.
+  defp unwind(ip, resource, attempts) do
+    demote(ip, resource)
+
+    case uploader().linstor_delete(ip, resource) do
+      {:ok, _result} ->
+        :ok
+
+      {:error, _reason} when attempts > 1 ->
+        Process.sleep(rollback_interval_ms())
+        unwind(ip, resource, attempts - 1)
+
+      {:error, reason} ->
+        require Logger
+
+        Logger.error(
+          "[images] Could not delete #{resource} while rolling back an upload: " <>
+            "#{describe(reason)}. It is holding storage on every node and must be " <>
+            "removed by hand."
+        )
+
+        :ok
+    end
+  end
+
+  defp rollback_attempts, do: Application.get_env(:spectrum_phx, :images_rollback_attempts, 6)
+
+  defp rollback_interval_ms,
+    do: Application.get_env(:spectrum_phx, :images_rollback_interval_ms, 1_000)
+
+  defp demote(ip, resource) do
+    uploader().drbd_role(ip, resource, "secondary")
+    :ok
+  end
+
+  @doc """
+  Register a completed image in the catalogue.
+
+  Last, deliberately. A row is a claim that the image is usable, so it is written only
+  once the bytes are on the device and the device has been flushed and demoted. The
+  reverse order is what let `/api/images` list images whose upload had failed.
+  """
+  @spec register(map()) :: {:ok, map()} | {:error, term()}
+  def register(%{name: name, size_bytes: size_bytes, device: device}) do
+    image = %{
+      name: name,
+      filename: name,
+      size_bytes: size_bytes,
+      type: image_type(name),
+      path: device,
+      created_at: DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+    }
+
+    case source() do
+      {:static, _rows} ->
+        broadcast({:image_registered, name})
+        {:ok, from_row(stringify(image))}
+
+      :hydra ->
+        params = [
+          {"text", image.name},
+          {"text", image.filename},
+          {"bigint", image.size_bytes},
+          {"text", image.type},
+          {"text", image.path},
+          {"timestamp", image.created_at}
+        ]
+
+        case Hydra.query(@insert_cql, params) do
+          {:ok, _rows} ->
+            broadcast({:image_registered, name})
+            {:ok, from_row(stringify(image))}
+
+          {:error, reason} ->
+            {:error, {:catalogue, reason}}
+        end
+    end
+  end
+
+  defp stringify(image) do
+    Map.new(image, fn {key, value} -> {Atom.to_string(key), value} end)
+  end
+
+  defp image_type(name) do
+    if String.ends_with?(String.downcase(name), ".iso"), do: "iso", else: "template"
+  end
+
+  @doc """
+  A human-readable sentence for an upload failure.
+
+  Every clause names the subsystem that refused, because the old console reported
+  everything as one message and sent operators to the wrong place.
+  """
+  def describe_upload_error({:exists, name}),
+    do: "An image named #{name} is already in the catalogue. Delete it first."
+
+  def describe_upload_error({:size_conflict, message}),
+    do: "The storage for this image already exists at a different size: #{message}"
+
+  def describe_upload_error({:allocate, detail}),
+    do: "The cluster could not allocate storage for this image: #{detail}"
+
+  def describe_upload_error({:device, detail}), do: detail
+  def describe_upload_error({:promote, detail}), do: detail
+  def describe_upload_error({:truncated, detail}), do: detail
+
+  def describe_upload_error({:transport, detail}),
+    do: "The upload could not be streamed to the host: #{detail}"
+
+  def describe_upload_error({:write, detail}), do: "The host refused the image write: #{detail}"
+
+  def describe_upload_error({:catalogue, reason}),
+    do:
+      "The image was written but could not be registered: #{describe(reason)}. " <>
+        "Its storage is allocated and no catalogue row points at it."
+
+  def describe_upload_error({:upload, detail}), do: detail
+  def describe_upload_error(:invalid_name), do: "That is not a usable image name."
+  def describe_upload_error(other), do: "The upload failed: #{describe(other)}"
+
+  defp describe(reason) when is_binary(reason), do: reason
+  defp describe({_status, message}) when is_binary(message), do: message
+  defp describe(reason), do: inspect(reason)
+
+  @doc """
+  Where the upload's host calls go: `SpectrumPhx.Images.SparkUploader` by default.
+
+  The DRBD sequence is six calls against a real host holding real storage, so a test
+  drives it through a stand-in. This is the seam for that, and the only one -- the writer
+  streams bytes through Mint and is exercised separately.
+  """
+  def uploader, do: Application.get_env(:spectrum_phx, :images_uploader, __MODULE__.SparkUploader)
+
+  defmodule SparkUploader do
+    @moduledoc """
+    The real host calls behind an image upload, one function per Spark endpoint.
+
+    Exists so `SpectrumPhx.Images` can be tested without a cluster while still running the
+    ordering, the role check and the rollback that matter.
+    """
+    alias SpectrumPhx.Spark
+
+    def linstor_create(ip, resource, size_kib) do
+      Spark.linstor_resource_create(ip, resource, {:kib, size_kib},
+        allow_two_primaries: true,
+        timeout: 240
+      )
+    end
+
+    def linstor_delete(ip, resource), do: Spark.linstor_resource_delete(ip, resource)
+    def device_info(ip, device), do: Spark.device_info(ip, device)
+    def drbd_role(ip, resource, role), do: Spark.drbd_role(ip, resource, role)
+    def device_prepare(ip, device, owner, mode), do: Spark.device_prepare(ip, device, owner, mode)
+    def device_flush(ip, device), do: Spark.device_flush(ip, device)
+  end
+
+  @doc """
+  How upload works, and why it is shaped this way.
 
   ## The constraint
 
@@ -338,60 +656,55 @@ defmodule SpectrumPhx.Images do
 
   ## What the sequence is
 
-  Per `/api/images/upload`, in order, with the size known up front because the volume
-  has to be defined before there is anywhere to write:
+  In order, with the size known up front because a DRBD volume is defined with a size and
+  cannot be grown into as bytes arrive:
 
-    1. `linstor resource-definition create img-<slug>`, then
-       `volume-definition create img-<slug> <bytes rounded up to KiB>KiB`.
-    2. `resource create <hostname> img-<slug> --storage-pool default-pool` on every host.
-    3. `drbd-options --allow-two-primaries yes` -- correct *only* for images, which are
-       attached read-only to guests on several hosts at once -- plus the split-brain
-       recovery policy.
-    4. Poll `Spark.device_info/2` until `/dev/drbd/by-res/img-<slug>/0` is a block device
-       on the local host, up to about ten seconds.
-    5. `Spark.drbd_role/4` to Primary, and **check the role that comes back**. A
-       promotion that did not take means the peer still holds Primary; writing the device
-       from a Secondary is the split-brain the check exists to prevent, and it must abort
-       the upload rather than be logged.
-    6. Stream the bytes to `POST /api/v1/storage/device/write?device=<path>` over the
-       mTLS client, and verify the `written` count equals the content length -- a short
-       write is a truncated image, not a successful upload.
-    7. `Spark.device_prepare/4` to `root:qemu` `0660` (not `0666`: world-writable lets
-       any local user corrupt the golden image every VM is cloned from), then
-       `Spark.device_flush/2`, then demote back to Secondary.
-    8. Insert the catalogue row.
-    9. On any failure: demote to Secondary and `resource-definition delete img-<slug>`,
-       or the half-built resource holds storage forever.
+    1. `prepare_upload/2` -- resource definition, volume definition sized in KiB,
+       placement on every node, and `--allow-two-primaries` (correct *only* for images,
+       which guests on several hosts attach read-only at the same time; never for a VM
+       disk). Then poll until the device appears, and promote this node to Primary,
+       **checking the role that comes back**. A promotion that did not take means a peer
+       still holds Primary, and writing from a Secondary is the split-brain that check
+       exists to prevent.
+    2. `UploadWriter` streams each chunk onto `POST /api/v1/storage/device/write`.
+    3. `finish_upload/2` -- verify the byte count, set `root:qemu 0660`, flush, demote.
+    4. `register/1` -- the catalogue row, last, because a row is a claim that the image
+       is usable.
+    5. `rollback_upload/1` on every failure, or the half-built resource holds storage on
+       every node forever.
 
-  ## Why it is a design task, not a port
+  ## Why the preparation runs on the first chunk, not in `init/1`
 
-  In LiveView the bytes arrive through `allow_upload/3` as chunks written by a
-  `Phoenix.LiveView.UploadWriter`. The default writer spools to a temporary file, which
-  reintroduces exactly the "stage it in the web tier" problem this split exists to avoid
-  -- for a file that may be several gibibytes. A correct implementation needs a custom
-  writer that opens the connection to Spark in `init/2`, pushes each chunk in `write/2`
-  as it arrives, and closes and verifies the byte count in `close/2`, with backpressure
-  so a slow host slows the browser rather than filling memory.
+  `Phoenix.LiveView.UploadWriter.init/1` runs inside the upload channel's `join`. The
+  browser joins that channel with no explicit timeout, so it uses the socket default of
+  ten seconds -- and on timeout it *rejoins*, which would run the whole DRBD sequence a
+  second time and leak the first attempt's connection. Waiting for a DRBD device can take
+  most of that budget on its own.
 
-  That interacts with the DRBD sequence above in ways worth designing rather than
-  guessing at: the resource has to exist before the first chunk arrives (so steps 1-5 run
-  in `init/2`, where a failure has to cancel the upload cleanly), and the rollback in
-  step 9 has to run from `close/2` on the error path *and* from the LiveView if the
-  socket dies mid-upload. Getting that wrong leaks DRBD resources or leaves a resource
-  Primary on a node that is no longer writing to it.
+  `write_chunk/2` is bounded by `:chunk_timeout` instead, which `allow_upload/3` accepts
+  as an option, so the preparation happens there on the first chunk under a limit this
+  code actually controls. `init/1` does no network work at all.
 
-  Until then, uploads continue to work through the Python tier's `/api/images/upload`,
-  which is the path that was just fixed. Images it creates appear in this list
-  immediately, and can be deleted from here.
+  ## Why the writer holds a Mint connection rather than using Req
+
+  Every other call in `SpectrumPhx.Spark` is one request and one response, which `Req`
+  covers. An upload is neither: chunks arrive over a channel and have to be pushed onto a
+  request that is already open, so the connection has to survive across `write_chunk/2`
+  calls. Mint is the layer that allows that -- `stream_request_body/3` per chunk, in
+  passive mode so no socket messages land in the channel's mailbox.
+
+  It also gives backpressure for free: the send blocks until the socket accepts the data,
+  so a slow host slows the browser rather than filling this node's memory with a
+  multi-gibibyte image. That is the whole reason not to use the default writer, which
+  spools to a temporary file and puts the web tier back on the data path -- exactly what
+  the split above exists to prevent.
   """
   def upload_note do
-    "Image upload is not implemented in the Phoenix tier. Uploads still go through the " <>
-      "Python endpoint POST /api/images/upload, which streams the body to spark-daemon's " <>
-      "/api/v1/storage/device/write so the web tier never touches the data path: this " <>
-      "container mounts no /dev, and staging the file on a storage mount would be the " <>
-      "web tier writing cluster storage just the same. Images uploaded there appear in " <>
-      "this list immediately and can be deleted from here. See the documentation of " <>
-      "SpectrumPhx.Images.upload_note/0 for what a LiveView implementation must do."
+    "Uploads stream straight through to the host that owns the storage: the browser " <>
+      "sends chunks over the LiveView channel, and each one is pushed onto an open " <>
+      "request to spark-daemon's /api/v1/storage/device/write. Nothing is staged here. " <>
+      "The web tier never opens the device, which is why this container needs no /dev " <>
+      "and no storage mount."
   end
 
   # -- seams ---------------------------------------------------------------------------

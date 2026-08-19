@@ -56,6 +56,15 @@ config :logger, :default_formatter,
 # Use Jason for JSON parsing in Phoenix
 config :phoenix, :json_library, Jason
 
+# Disk-image extensions, so `allow_upload(accept: ~w(.iso .qcow2 .img))` can resolve them.
+# The MIME database ships none of these, and LiveView validates the accept list against it
+# at mount, so without this the images page raises rather than rejecting a bad file.
+config :mime, :types, %{
+  "application/x-iso9660-image" => ["iso"],
+  "application/x-qemu-disk" => ["qcow2"],
+  "application/x-raw-disk-image" => ["img"]
+}
+
 # Import environment specific config. This must remain at the bottom
 # of this file so it overrides the configuration defined above.
 import_config "#{config_env()}.exs"

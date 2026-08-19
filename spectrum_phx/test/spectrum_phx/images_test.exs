@@ -247,12 +247,12 @@ defmodule SpectrumPhx.ImagesTest do
   end
 
   describe "upload_note/0" do
-    test "says where uploading still works and why it is not here" do
+    test "says the bytes never land in this tier" do
       note = Images.upload_note()
 
-      assert note =~ "/api/images/upload"
       assert note =~ "/api/v1/storage/device/write"
-      assert note =~ "never touches the data path"
+      assert note =~ "Nothing is staged here"
+      refute note =~ "not implemented"
     end
   end
 end

@@ -26,11 +26,19 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   returns the daemon's own message on failure; this view puts that message on screen and
   leaves the row where it is.
 
-  ## Upload is not here
+  ## Upload streams past this tier
 
-  See `SpectrumPhx.Images.upload_note/0`. The note is rendered on the page rather than
-  left in a comment, because an operator looking for the upload button needs to know
-  where uploading still works.
+  The browser's chunks go straight onto the block device through
+  `SpectrumPhx.Images.UploadWriter`; nothing is staged here and no temporary file is
+  written. `auto_upload: false` is deliberate -- the transfer starts on submit, so
+  selecting a file cannot allocate storage, and an image is only ever registered because
+  an operator asked for it.
+
+  The chunk size is raised from the 64 KB default to 1 MiB: an install ISO at 64 KB a
+  time is sixteen thousand round trips per gibibyte. `chunk_timeout` is raised because
+  the *first* chunk is the one that waits for the DRBD resource to be created and the
+  device to appear -- see `SpectrumPhx.Images.upload_note/0` for why that work is there
+  and not in the writer's `init/1`.
 
   ## Route
 
@@ -46,6 +54,14 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
 
   @refresh_interval_ms 10_000
 
+  # 64 KB would be sixteen thousand round trips per gibibyte. Kept under the endpoint's
+  # 8 MB frame cap with room for the channel envelope.
+  @chunk_bytes 1_048_576
+  # The first chunk waits for a DRBD resource to be created on every node and its device
+  # to appear, so this is not a transfer timeout -- it is a provisioning one.
+  @chunk_timeout_ms 120_000
+  @max_image_bytes 64 * 1024 * 1024 * 1024
+
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
@@ -56,7 +72,20 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
     socket =
       socket
       |> assign(page_title: "Images", confirming: nil, db_error: nil, delete_error: nil)
-      |> assign(upload_note: Images.upload_note())
+      |> assign(upload_note: Images.upload_note(), upload_error: nil)
+      |> assign(max_image_bytes: @max_image_bytes)
+      |> allow_upload(:image,
+        accept: ~w(.iso .qcow2 .img),
+        max_entries: 1,
+        max_file_size: @max_image_bytes,
+        chunk_size: @chunk_bytes,
+        chunk_timeout: @chunk_timeout_ms,
+        auto_upload: false,
+        writer: fn _name, entry, _socket ->
+          {SpectrumPhx.Images.UploadWriter,
+           [name: entry.client_name, size_bytes: entry.client_size]}
+        end
+      )
       |> load_images()
 
     {:ok, socket}
@@ -69,6 +98,44 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
 
   @impl true
   def handle_event("refresh", _params, socket), do: {:noreply, load_images(socket)}
+
+  # Selecting a file only validates it. Nothing is allocated and nothing is transferred
+  # until "upload" -- `auto_upload: false` is what makes that true.
+  def handle_event("validate_upload", _params, socket) do
+    {:noreply, assign(socket, upload_error: nil)}
+  end
+
+  def handle_event("cancel_upload", %{"ref" => ref}, socket) do
+    {:noreply, socket |> cancel_upload(:image, ref) |> assign(upload_error: nil)}
+  end
+
+  # Runs after every chunk has been written and the writer has closed. By this point the
+  # image is either registered or rolled back; there is nothing left to consume but the
+  # outcome the writer recorded.
+  def handle_event("upload", _params, socket) do
+    results = consume_uploaded_entries(socket, :image, fn meta, _entry -> {:ok, meta.result} end)
+
+    case results do
+      [{:ok, image}] ->
+        {:noreply,
+         socket
+         |> put_flash(:info, uploaded_message(image))
+         |> assign(upload_error: nil)
+         |> load_images()}
+
+      [{:error, reason}] ->
+        {:noreply, assign(socket, upload_error: Images.describe_upload_error(reason))}
+
+      # No entry, or an entry the client never finished. consume_uploaded_entries only
+      # yields completed entries, so an empty list means there was nothing to upload.
+      [] ->
+        {:noreply, assign(socket, upload_error: "Choose an image file first.")}
+
+      other ->
+        {:noreply,
+         assign(socket, upload_error: "The upload ended unexpectedly: #{inspect(other)}")}
+    end
+  end
 
   # First click: nothing is deleted, the row asks for confirmation. The name is not
   # trusted here -- it is only used to match against a row that was actually loaded.
@@ -101,6 +168,21 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
          |> assign(delete_error: {name, message})
          |> load_images()}
     end
+  end
+
+  # LiveView's own client-side rejections, which never reach the writer.
+  defp upload_error_message(:too_large), do: "That file is larger than this console accepts."
+
+  defp upload_error_message(:not_accepted),
+    do: "Only .iso, .qcow2 and .img files can be uploaded."
+
+  defp upload_error_message(:too_many_files), do: "Upload one image at a time."
+  defp upload_error_message(:external_client_failure), do: "The browser could not read the file."
+  defp upload_error_message(other), do: "The file was rejected: #{inspect(other)}"
+
+  defp uploaded_message(%{name: name, size_bytes: size}) do
+    "Uploaded #{name} (#{SpectrumPhxWeb.Storage.Components.bytes(size)}) and replicated " <>
+      "it across the cluster."
   end
 
   defp deleted_message(name, %{backing: :skipped}) do
@@ -179,10 +261,67 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
         </div>
       </div>
 
-      <div class="alert alert-info alert-soft items-start" id="upload-note">
-        <.icon name="hero-information-circle" class="size-5 shrink-0" />
-        <p class="text-sm">{@upload_note}</p>
-      </div>
+      <form
+        id="upload-form"
+        phx-submit="upload"
+        phx-change="validate_upload"
+        class="card card-border bg-base-100"
+      >
+        <div class="card-body gap-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 class="card-title text-base">Upload an image</h2>
+            <span class="text-xs opacity-60">
+              ISO, qcow2 or raw, up to {SpectrumPhxWeb.Storage.Components.bytes(@max_image_bytes)}
+            </span>
+          </div>
+
+          <.live_file_input upload={@uploads.image} class="file-input file-input-bordered w-full" />
+
+          <div :for={entry <- @uploads.image.entries} id={"entry-" <> entry.ref} class="space-y-1">
+            <div class="flex items-center justify-between gap-3 text-sm">
+              <span class="truncate font-mono">{entry.client_name}</span>
+              <span class="tabular-nums opacity-70">
+                {SpectrumPhxWeb.Storage.Components.bytes(entry.client_size)}
+              </span>
+            </div>
+            <progress class="progress progress-primary w-full" value={entry.progress} max="100">
+              {entry.progress}%
+            </progress>
+            <div class="flex items-center justify-between gap-3">
+              <p :for={error <- upload_errors(@uploads.image, entry)} class="text-xs text-error">
+                {upload_error_message(error)}
+              </p>
+              <button
+                type="button"
+                id={"cancel-upload-" <> entry.ref}
+                phx-click="cancel_upload"
+                phx-value-ref={entry.ref}
+                class="btn btn-ghost btn-xs"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+
+          <p :for={error <- upload_errors(@uploads.image)} class="text-sm text-error">
+            {upload_error_message(error)}
+          </p>
+
+          <p :if={@upload_error} id="upload-error" class="text-sm text-error">{@upload_error}</p>
+
+          <div class="card-actions items-center justify-between">
+            <p class="text-xs opacity-60 max-w-2xl">{@upload_note}</p>
+            <.button
+              id="upload-button"
+              variant="primary"
+              phx-disable-with="Uploading..."
+              disabled={@uploads.image.entries == []}
+            >
+              Upload
+            </.button>
+          </div>
+        </div>
+      </form>
 
       <p :if={@images == [] and is_nil(@db_error)} id="images-empty" class="text-sm opacity-70">
         Hydra answered and the catalogue is empty. No images are registered yet.

@@ -462,7 +462,11 @@ defmodule SpectrumPhx.Vms do
   defp allocate_disk(%{resource: resource, size_gib: size_gib}) do
     case storage_client() do
       nil ->
-        on_a_spark_node(fn ip -> Spark.linstor_resource_create(ip, resource, size_gib) end)
+        # {:gib, _} and never :allow_two_primaries: a VM disk is read-write, and
+        # dual-primary on one is what let a VM run on two hosts and corrupt itself.
+        on_a_spark_node(fn ip ->
+          Spark.linstor_resource_create(ip, resource, {:gib, size_gib})
+        end)
 
       fun when is_function(fun, 3) ->
         fun.(:create, resource, %{size_gib: size_gib})

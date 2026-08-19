@@ -45,7 +45,7 @@ console streams bytes to it.
 | `/hosts` | `Cluster.HostsLive` | ZooKeeper + `Spark.host_disks/1` |
 | `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and Linstor endpoints |
 | `/storage` | `Storage.IndexLive` | DRBD status per node + `linstor --machine-readable storage-pool list` |
-| `/images` | `Images.IndexLive` | `hydra.images`, Linstor resource definitions |
+| `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Linstor resource definitions |
 | `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks` |
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
@@ -154,21 +154,64 @@ the previous console displayed something confidently false.
   had worked. The order is now inverted (backing store first, checked), and deletion is
   confirmed server-side through a distinct named event rather than a client-only dialog.
 
-## 7. What is not done yet
+## 7. Image upload
 
-**Image upload.** Uploads still go through the Python `POST /api/images/upload`, which
-streams to Spark and works. A LiveView port needs a `Phoenix.LiveView.UploadWriter` that
-opens the Spark connection in `init/2` and pushes each chunk in `write/2` with backpressure —
-the default writer spools to a temp file, which for a multi-gibibyte image reintroduces
-exactly the problem section 2 exists to prevent. Rollback has to run both from `close/2` and
-from the LiveView if the socket dies mid-upload. `SpectrumPhx.Images.upload_note/0` carries
-the full nine-step DRBD sequence a port must reproduce, and the console renders that note on
-the page so an operator looking for the button learns where uploading still works.
+Uploading is the one page that both reads and writes the data path, so it is worth stating
+how it avoids doing so from here.
 
-The remaining Python-tier routes — networks, snapshots, console proxy, cluster lifecycle —
-are still served by `spectrum_server.py` on 8443.
+The browser's chunks arrive over the LiveView channel and are pushed, one at a time, onto
+an HTTP request that is already open to spark-daemon's `POST /storage/device/write`.
+Nothing is spooled: LiveView's default writer would buffer the whole file to a temporary
+file first, which for an install ISO is gibibytes of the web tier's disk and puts this tier
+straight back on the data path. Memory use is one chunk regardless of image size, and
+because the send blocks until the socket accepts it, a slow host slows the browser rather
+than filling this node.
 
-## 8. See also
+The sequence, in order:
+
+1. `prepare_upload/2` -- resource definition, a volume definition sized in KiB from the
+   file, placement on every node, `--allow-two-primaries` (correct only for images), then
+   poll until the device appears and promote this node to Primary, **checking the role that
+   comes back**. A promotion that did not take means a peer still holds Primary, and
+   writing from a Secondary is the split-brain the check exists to prevent.
+2. Stream the chunks.
+3. `finish_upload/2` -- verify the byte count against the declared size, set `root:qemu`
+   `0660` (not `0666`: world-writable lets any local user corrupt the golden image every VM
+   is cloned from), flush, demote.
+4. `register/1` -- the catalogue row, **last**, because a row is a claim that the image is
+   usable.
+
+Two things about it are less obvious than they look, and both were established by running
+it against real hardware rather than by reasoning:
+
+**The preparation runs on the first chunk, not in the writer's `init/1`.** `init/1` is
+called inside the upload channel's `join`, and the browser joins with the socket's default
+ten-second timeout, then *rejoins* if it expires -- which would run the whole DRBD sequence
+a second time and leak the first attempt's connection. Waiting for a DRBD device can use
+most of that budget by itself. `write_chunk/2` is bounded by `:chunk_timeout`, which
+`allow_upload/3` accepts as an option, so the slow work sits under a limit the application
+controls.
+
+**Rollback closes the connection before it deletes the resource, and retries.**
+spark-daemon holds the block device open for the life of the write request, so an abandoned
+upload -- a cancelled transfer, a truncated body, a browser that vanished -- leaves the
+device busy for a moment after this tier has given up on it. Deleting first fails with
+"resource is still in use", and the first version of this code gave up there, leaving DRBD
+resources stuck Primary and holding storage on every node. Ordering the teardown and
+retrying the delete for a few seconds is what makes the rollback actually reclaim anything.
+
+## 8. What is not done yet
+
+The remaining Python-tier routes -- networks, snapshots, console proxy, cluster lifecycle --
+are still served by `spectrum_server.py` on 8443. `hylia.py` and `lanayru.py` are imported
+as Python modules by Spectrum and have no Elixir counterpart, so the routes that use them
+cannot move until they are reimplemented, shelled out to, or kept behind a port.
+
+Upload does not write a `catalyst_tasks` row, unlike the Python endpoint. LiveView reports
+progress on the page itself, which is better for the operator watching it happen; the cost
+is that an upload is not visible from `/tasks`.
+
+## 9. See also
 
 - [`spectrum_phx/README.md`](../spectrum_phx/README.md) — toolchain, build, local development
 - [spark_api.md](./spark_api.md) — the typed API the console calls

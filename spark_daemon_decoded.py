@@ -806,6 +806,11 @@ MIN_VOLUME_GIB = 1
 MAX_VOLUME_GIB = 65536
 KIB_PER_GIB = 1024 * 1024
 
+# LINSTOR aligns volume sizes to 4 KiB, one DRBD block. Requests are aligned to match
+# before they are sent, so a resource's stored size equals what was asked for and an
+# idempotent retry compares equal instead of looking like a size conflict.
+VOLUME_ALIGN_KIB = 4
+
 # Automatic split-brain resolution, applied to every VM disk at create time.
 #
 # --allow-two-primaries is deliberately absent. Setting it here let one VM be started
@@ -929,6 +934,64 @@ def validate_volume_gib(value):
     if value < MIN_VOLUME_GIB or value > MAX_VOLUME_GIB:
         return None, "size_gib must be between %d and %d" % (MIN_VOLUME_GIB, MAX_VOLUME_GIB)
     return value, None
+
+
+def validate_volume_size_kib(payload):
+    """Resolve a volume size to KiB from either `size_gib` or `size_kib`.
+
+    VM disks are whole GiB and say so. Images are not: an ISO is whatever size it is,
+    and rounding one up to the next GiB would both waste the difference on every node
+    and make the size-mismatch guard compare a rounded figure against the real one.
+
+    Exactly one of the two keys is accepted. Supplying both is an error rather than a
+    precedence rule, because a caller that sends a size in two units has a bug and
+    silently honouring one of them hides it.
+
+    The result is rounded up to a multiple of `VOLUME_ALIGN_KIB`. LINSTOR aligns volumes
+    to 4 KiB itself, so an unaligned request comes back as a slightly larger volume than
+    was asked for -- and the next idempotent create of the same resource would then
+    compare its own unaligned request against the aligned reality and reject the retry as
+    a size mismatch. Aligning here makes the request equal to what LINSTOR will store.
+    """
+    raw_kib = payload.get("size_kib")
+    raw_gib = payload.get("size_gib")
+
+    if raw_kib is not None and raw_gib is not None:
+        return None, "Send either size_gib or size_kib, not both"
+
+    if raw_kib is None:
+        size_gib, error = validate_volume_gib(raw_gib)
+        if error:
+            return None, error
+        return size_gib * KIB_PER_GIB, None
+
+    if isinstance(raw_kib, bool) or not isinstance(raw_kib, int):
+        return None, "size_kib must be an integer number of KiB"
+    if raw_kib < 1:
+        return None, "size_kib must be greater than zero"
+    if raw_kib > MAX_VOLUME_GIB * KIB_PER_GIB:
+        return None, "size_kib must not exceed %d" % (MAX_VOLUME_GIB * KIB_PER_GIB)
+
+    # Rounding up comes after the bounds and before anything else uses the figure. An
+    # image smaller than one DRBD block is rounded up to one rather than rejected: the
+    # floor is a property of the volume, not of what may be stored in it.
+    remainder = raw_kib % VOLUME_ALIGN_KIB
+    if remainder:
+        raw_kib += VOLUME_ALIGN_KIB - remainder
+    return raw_kib, None
+
+
+def validate_flag(value, name):
+    """A JSON boolean, or absent. Anything else is a caller bug worth reporting.
+
+    Deliberately strict: `allow_two_primaries` is the option that let one VM run on two
+    hosts and corrupt its own disk, so a truthy string must not be able to turn it on.
+    """
+    if value is None:
+        return False, None
+    if isinstance(value, bool):
+        return value, None
+    return None, "%s must be true or false" % name
 
 
 def validate_node_names(value):
@@ -3521,7 +3584,15 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         self.reject("No such Linstor resource: " + resource, 404)
 
     def handle_storage_linstor_resource(self):
-        """Create a VM disk: resource definition, volume definition, placement, options.
+        """Create replicated storage: resource definition, volume definition, placement,
+        DRBD options.
+
+        Backs both of the things the cluster stores this way, which differ in exactly two
+        respects. A VM disk is sized in whole GiB (`size_gib`) and is single-primary. A
+        golden image is sized in KiB (`size_kib`), because an ISO is whatever size it is,
+        and needs `allow_two_primaries` so guests on several hosts can attach it
+        read-only at once. Everything else -- idempotency, the size guard, the rollback --
+        is the same for both, so they share this endpoint rather than a copy of it.
 
         One idempotent operation rather than four endpoints. The four commands are
         meaningless apart -- a resource definition with no volume definition backs
@@ -3548,7 +3619,7 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if not valid_name(resource):
             self.reject("Invalid resource name")
             return
-        size_gib, error = validate_volume_gib(payload.get("size_gib"))
+        requested_kib, error = validate_volume_size_kib(payload)
         if error:
             self.reject(error)
             return
@@ -3557,6 +3628,11 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject(error)
             return
         nodes, error = validate_node_names(payload.get("nodes"))
+        if error:
+            self.reject(error)
+            return
+        allow_two_primaries, error = validate_flag(
+            payload.get("allow_two_primaries"), "allow_two_primaries")
         if error:
             self.reject(error)
             return
@@ -3575,7 +3651,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
                 existing = entry
                 break
 
-        requested_kib = size_gib * KIB_PER_GIB
         if existing is not None and existing["size_kib"] not in (None, requested_kib):
             self.send_json_response(409, {
                 "resource": resource,
@@ -3612,7 +3687,8 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         # already the one that was asked for.
         if existing is None or existing["size_kib"] != requested_kib:
             ok, _stdout, detail = linstor_call(
-                ["volume-definition", "create", "--vlmnr", "0", resource, "%dGiB" % size_gib])
+                ["volume-definition", "create", "--vlmnr", "0", resource,
+                 "%dKiB" % requested_kib])
             if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
                 undo("Could not create volume definition %s: %s" % (resource, detail))
                 return
@@ -3625,9 +3701,18 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
                 undo("Could not place %s on %s: %s" % (resource, node, detail))
                 return
 
-        # Automatic split-brain resolution. Not dual-primary: see DRBD_SPLIT_BRAIN_OPTIONS.
+        # Automatic split-brain resolution, and -- only when the caller asked for it --
+        # dual-primary. See DRBD_SPLIT_BRAIN_OPTIONS for why that is not the default:
+        # dual-primary on a read-write VM disk is what let one VM run on two hosts and
+        # corrupt it. A golden image is the case it is correct for, because guests on
+        # several hosts attach it read-only at the same time and each host must hold
+        # Primary to do so. It is written exactly once, by the upload that creates it,
+        # while the uploading node is the only Primary.
+        drbd_options = list(DRBD_SPLIT_BRAIN_OPTIONS)
+        if allow_two_primaries:
+            drbd_options = ["--allow-two-primaries", "yes"] + drbd_options
         ok, _stdout, detail = linstor_call(
-            ["resource-definition", "drbd-options"] + DRBD_SPLIT_BRAIN_OPTIONS + [resource])
+            ["resource-definition", "drbd-options"] + drbd_options + [resource])
         if not ok:
             undo("Could not set DRBD options on %s: %s" % (resource, detail))
             return
@@ -3635,10 +3720,11 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         self.send_json_response(200, {
             "resource": resource,
             "created": created,
-            "size_gib": size_gib,
+            "size_gib": requested_kib // KIB_PER_GIB,
             "size_kib": requested_kib,
             "storage_pool": storage_pool,
             "nodes": nodes,
+            "allow_two_primaries": allow_two_primaries,
             "device_path": linstor_resource_path(resource),
         })
 

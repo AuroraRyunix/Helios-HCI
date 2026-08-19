@@ -195,12 +195,21 @@ defmodule SpectrumPhx.Spark do
   exists on no node -- so the daemon runs them as one idempotent operation and deletes its
   own partial work if a later step fails.
 
+  `size` is `{:gib, n}` for a VM disk or `{:kib, n}` for an image. It is a tagged tuple
+  rather than a bare number because the two are not interchangeable and a silent unit
+  mix-up here allocates a volume a million times too large or too small: an ISO is
+  whatever size it is, and rounding one up to the next GiB both wastes the difference on
+  every node and makes the size guard compare a rounded figure against the real one.
+
   Options:
 
     * `:nodes` - place on these nodes. Omitted means every node in the daemon's cluster
       document, which is what the Python create path did.
     * `:storage_pool` - omitted means the daemon's `default-pool`. The daemon takes the
       value from an allowlist, so an unknown pool is a `400` and never a command fragment.
+    * `:allow_two_primaries` - dual-primary DRBD. Correct for a golden image, which
+      guests on several hosts attach read-only at the same time; never for a VM disk,
+      where it is what let one VM run on two hosts and corrupt itself.
     * `:timeout` - seconds. Placement creates a DRBD device on every node, so this is
       minutes-scale work rather than the 30s a control-plane call usually needs.
 
@@ -215,11 +224,17 @@ defmodule SpectrumPhx.Spark do
   Dual-primary is deliberately not set here. It is what let one VM start on two hosts and
   corrupt its disk; live migration scopes that window to the hand-over itself.
   """
-  def linstor_resource_create(ip, resource, size_gib, opts \\ []) when is_integer(size_gib) do
+  def linstor_resource_create(ip, resource, size, opts \\ [])
+
+  def linstor_resource_create(ip, resource, {unit, amount}, opts)
+      when unit in [:gib, :kib] and is_integer(amount) do
+    size_key = if unit == :gib, do: "size_gib", else: "size_kib"
+
     payload =
-      %{"resource" => resource, "size_gib" => size_gib}
+      %{"resource" => resource, size_key => amount}
       |> put_present("nodes", Keyword.get(opts, :nodes))
       |> put_present("storage_pool", Keyword.get(opts, :storage_pool))
+      |> put_present("allow_two_primaries", Keyword.get(opts, :allow_two_primaries))
 
     post_json(ip, "/api/v1/storage/linstor/resource", payload,
       timeout: Keyword.get(opts, :timeout, 240)
@@ -269,6 +284,34 @@ defmodule SpectrumPhx.Spark do
   """
   def db_repair(ip, keyspace \\ "hydra", primary_range \\ true) do
     post_json(ip, "/api/v1/db/repair", %{"keyspace" => keyspace, "primary_range" => primary_range})
+  end
+
+  @doc """
+  Everything needed to open a raw connection to a node's Spark daemon.
+
+  `Req` covers every request/response call in this module, but an image upload is neither:
+  the bytes arrive in chunks over a LiveView channel and have to be pushed onto an
+  already-open request as they come. That needs the connection held across calls, so
+  `SpectrumPhx.Images.UploadWriter` drives Mint directly -- and it must use exactly the
+  same port and mutual-TLS material as everything else here rather than assembling its
+  own.
+
+  `:port` and `:transport_opts` only. The connection itself belongs to the caller,
+  because only the caller knows when it is finished with it.
+  """
+  def connection_settings do
+    %{port: @port, transport_opts: tls_opts()}
+  end
+
+  @doc """
+  The path that streams a request body straight onto a block device.
+
+  The device travels in the query string and is validated by the daemon against its own
+  allowlist and a `/dev/drbd/` prefix check, so this is not the security boundary -- but
+  it is encoded here so a path is never concatenated raw into a request line.
+  """
+  def device_write_path(device) do
+    "/api/v1/storage/device/write?device=" <> URI.encode_www_form(device)
   end
 
   @doc false

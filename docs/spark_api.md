@@ -82,6 +82,9 @@ temp file and calls `virsh define` on that path.
 | POST | `/api/v1/storage/device/flush` | `{"path"}` | `{"flushed":true}` |
 | GET | `/api/v1/storage/container/mounted` | `?path=` | `{"mounted":bool}` |
 | POST | `/api/v1/storage/container/ensure` | `{"name"}` | `{"path":str,"created":bool}` |
+| GET | `/api/v1/storage/linstor/resources` | `?resource=` (optional) | `{"resources":[{"name","size_kib","size_gib","nodes","device_path"}]}` |
+| POST | `/api/v1/storage/linstor/resource` | `{"resource", "size_gib"\|"size_kib", "nodes"?, "storage_pool"?, "allow_two_primaries"?}` | `{"resource","created":bool,"size_kib","device_path",...}` |
+| POST | `/api/v1/storage/linstor/resource/delete` | `{"resource"}` | `{"resource","deleted":bool}` |
 
 `path` must resolve under `/dev/drbd/` or `/var/lib/hci/aether/`. `owner` is an allowlist
 (`root:qemu`, `root:root`), `mode` an octal string from an allowlist. Promotion returns the
@@ -97,6 +100,32 @@ upload and proxies the bytes here, so it needs neither `/dev` nor a storage moun
 
 A short write returns 400 with the byte count rather than 200, so a client that
 disconnects mid-upload cannot leave a truncated image registered as valid.
+
+Note the daemon holds the device open for the life of the write request. A caller that
+abandons an upload must close the connection *before* trying to delete the resource, or
+LINSTOR refuses with "resource is still in use" and the rollback leaks the storage it was
+meant to reclaim. Release is asynchronous, so the delete also has to be retried; see
+`SpectrumPhx.Images.rollback_upload/1`.
+
+`linstor/resource` creates a resource definition, a volume definition, placement on every
+node and the DRBD options as **one idempotent operation**. The four commands are
+meaningless apart, so exposing them separately would move the sequencing bug into every
+caller. `created: false` means the resource was already there and was adopted, which is
+what makes a retry after a timeout safe. A resource that exists at a *different* size is a
+`409` carrying the actual size, never a silent reuse -- that is precisely how a new VM ends
+up attached to a deleted VM's disk.
+
+Size is given in exactly one unit, and sending both is a `400` rather than a precedence
+rule. VM disks are whole GiB (`size_gib`). Images are not -- an ISO is whatever size it is
+-- so they use `size_kib`, which is rounded up to LINSTOR's 4 KiB alignment before use; an
+unaligned request would otherwise be stored larger than asked for, and the next idempotent
+create would reject its own retry as a size mismatch.
+
+`allow_two_primaries` defaults to false and is validated as a strict JSON boolean, so a
+truthy string cannot turn it on. It is correct for a golden image, which guests on several
+hosts attach read-only at the same time and which is written exactly once by the upload
+that creates it. It is never correct for a VM disk: dual-primary there is what let one VM
+run on two hosts and corrupt itself.
 
 ### Host
 

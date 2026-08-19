@@ -67,6 +67,11 @@ defmodule SpectrumPhx.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.2.0"},
       {:bandit, "~> 1.5"},
+      # Used directly by SpectrumPhx.Images.UploadWriter, which has to hold a request
+      # open across chunks. Every other Spark call goes through Req, which depends on
+      # Mint anyway -- this pins it as a first-class dependency rather than borrowing a
+      # transitive one.
+      {:mint, "~> 1.9"},
       # Native CQL driver for ScyllaDB (Hydra). Prepared statements remove the
       # string-interpolation injection class the Python tier had to patch per call site.
       {:xandra, "~> 0.19"},

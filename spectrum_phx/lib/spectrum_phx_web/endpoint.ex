@@ -11,8 +11,11 @@ defmodule SpectrumPhxWeb.Endpoint do
     same_site: "Lax"
   ]
 
+  # max_frame_size is stated rather than inherited. Image upload pushes 1 MiB chunks
+  # (see SpectrumPhxWeb.Images.IndexLive), and the framework's default is unbounded,
+  # which with uploads enabled means one client can name any frame size it likes.
   socket "/live", Phoenix.LiveView.Socket,
-    websocket: [connect_info: [session: @session_options]],
+    websocket: [connect_info: [session: @session_options], max_frame_size: 8_000_000],
     longpoll: [connect_info: [session: @session_options]]
 
   # Serve at "/" the static files from "priv/static" directory.

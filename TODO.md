@@ -324,12 +324,13 @@ overview, hosts, VM list/create/detail with disk allocation through the typed Li
 storage fabric, images, tasks, metrics, health. Navigation is one list checked against the router
 by `navigation_test.exs`.
 
-**Still on the Python tier:** networks, snapshots, console proxy, cluster lifecycle, and image
-upload. Upload is the one deliberate gap in a ported page -- it needs a
-`Phoenix.LiveView.UploadWriter` streaming to Spark, because the default writer spools a
-multi-gibibyte image to a temp file and puts the web tier back on the data path.
-`SpectrumPhx.Images.upload_note/0` carries the design; the console renders it so an operator is
-told where uploading still works.
+**Image upload is done and verified on hardware.** A custom `Phoenix.LiveView.UploadWriter`
+pushes each chunk onto an open request to spark-daemon, so nothing is spooled in the web
+tier. Verified end to end: 8 MiB written to a DRBD device and compared byte for byte,
+`root:qemu 0660`, demoted to Secondary, volume defined at exactly 8192 KiB, and the
+cancelled and truncated paths leaving no resource behind.
+
+**Still on the Python tier:** networks, snapshots, console proxy, and cluster lifecycle.
 
 **Costs still outstanding:** `hylia.py` (738 lines) and `lanayru.py` (468 lines) are imported as
 Python modules by Spectrum and have no Elixir counterpart; they must be reimplemented, shelled

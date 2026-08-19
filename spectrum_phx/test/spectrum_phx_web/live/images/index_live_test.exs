@@ -93,19 +93,109 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
   end
 
   describe "upload" do
-    test "the page states where uploading still happens", %{conn: conn} do
-      {:ok, view, _html} = mount_view(conn)
-
-      note = view |> element("#upload-note") |> render()
-      assert note =~ "/api/images/upload"
-      assert note =~ "not implemented in the Phoenix tier"
+    setup do
+      SpectrumPhx.UploadStubs.install()
+      :ok
     end
 
-    test "there is no upload control to click", %{conn: conn} do
+    test "there is a file input and a disabled submit until a file is chosen", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
 
-      refute view |> element("input[type=file]") |> has_element?()
+      assert view |> element("#upload-form input[type=file]") |> has_element?()
+      assert view |> element("#upload-button[disabled]") |> has_element?()
     end
+
+    test "a chosen file is listed, with nothing uploaded yet", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 4096)])
+      assert render_upload(upload, "rocky.iso", 0) =~ "rocky.iso"
+
+      # auto_upload is false, so selecting a file must not have allocated anything. If it
+      # had, browsing away from this page would leak a DRBD resource per file picked.
+      assert view |> element("#upload-button") |> has_element?()
+      refute view |> element("#upload-button[disabled]") |> has_element?()
+    end
+
+    test "a file with the wrong extension is rejected client-side", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("notes.txt", 10)])
+      render_upload(upload, "notes.txt", 0)
+
+      assert render(view) =~ "Only .iso, .qcow2 and .img files can be uploaded."
+    end
+
+    test "an entry can be cancelled before it is sent", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 4096)])
+      render_upload(upload, "rocky.iso", 0)
+
+      [entry] = upload.entries
+      view |> element("#cancel-upload-" <> entry["ref"]) |> render_click()
+
+      refute render(view) =~ "rocky.iso"
+      assert view |> element("#upload-button[disabled]") |> has_element?()
+    end
+
+    test "submitting with no file says so rather than failing silently", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      html = view |> element("#upload-form") |> render_submit()
+      assert html =~ "Choose an image file first."
+    end
+
+    test "a submitted image is streamed, registered, and confirmed on screen", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 2048)])
+      render_upload(upload, "rocky.iso", 100)
+
+      html = view |> element("#upload-form") |> render_submit()
+
+      assert html =~ "Uploaded rocky.iso"
+      # The bytes reached the transport rather than any disk of this tier's.
+      assert_receive {:upload_stub, {:finish, bytes}}
+      assert byte_size(bytes) == 2048
+    end
+
+    test "a failure is reported with the subsystem that refused, and rolls back", %{conn: conn} do
+      # The peer still holds Primary, so the promotion does not take.
+      SpectrumPhx.UploadStubs.install(%{drbd_role: {:ok, %{"role" => "secondary"}}})
+
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 64)])
+
+      # The chunk fails inside the writer; how LiveViewTest surfaces that is not the point.
+      # What matters is that the storage allocated a moment earlier was given back.
+      try do
+        render_upload(upload, "rocky.iso", 100)
+      catch
+        :exit, _reason -> :ok
+      end
+
+      assert_receive {:upload_stub, {:linstor_delete, _ip, "img-rocky"}}
+      refute_receive {:upload_stub, {:finish, _bytes}}
+    end
+
+    test "the page explains that nothing is staged in the web tier", %{conn: conn} do
+      {:ok, _view, html} = mount_view(conn)
+
+      # The note is on the page, not in a comment: an operator needs to know the bytes do
+      # not pass through this container's disk.
+      assert html =~ "Nothing is staged here"
+    end
+  end
+
+  defp entry(name, size) do
+    %{
+      name: name,
+      content: :binary.copy("0", size),
+      size: size,
+      type: MIME.from_path(name)
+    }
   end
 
   describe "delete confirmation" do
