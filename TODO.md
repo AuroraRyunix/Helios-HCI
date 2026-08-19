@@ -247,16 +247,24 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## Missing tooling / process
 
-* **No top-level `LICENSE` file.**
-* **Vendored frontend libraries lack bundled attribution.** `static/novnc/` headers reference an
-  `MPL 2.0 LICENSE.txt` that is not bundled; `static/vendor/pako/` has no license header or file.
-  (`static/spice-html5/` is fine — `COPYING`/`COPYING.LESSER` are present.)
-* **No CI/CD.** No `.github/workflows`, so no linting, no `test_hylia.py` on push, no `agahnim` build
-  validation, no Dockerfile build check.
-* **No `requirements.txt` / dependency pinning.**
-* **No regression test for the deployment manifest.** `sync_provision.py` now fails on drift, but nothing
-  asserts that every daemon in the README component table has an entry in `create_upgrade_zip.py` and
-  `check_updates.py`. The Lanayru gap existed across four lists simultaneously.
+* ~~No top-level `LICENSE` file.~~ **Resolved**: Business Source License 1.1, converting to
+  MPL-2.0 on 2030-08-19. MPL rather than Apache-2.0 because the BSL covenants require a
+  GPLv2-compatible Change License, and Apache-2.0 is compatible with GPLv3 but not GPLv2.
+  Third-party components itemised in [THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md).
+* ~~Vendored frontend libraries lack bundled attribution.~~ **Resolved**: noVNC's MPL-2.0 text and
+  pako's MIT text are now bundled. Noted while doing so: `static/spice-html5/` is 2.4 MB of LGPL-3.0
+  that **no served page loads** — only `src/lz_decompress.c` is used, compiled to WebAssembly during
+  the image build. Removing the unreferenced JavaScript would shrink the copyleft surface to that one
+  file.
+* ~~No CI/CD.~~ **Resolved**: `.github/workflows/ci.yml` byte-compiles every Python module, runs
+  `test_hylia.py` and `test_deployment_manifest.py`, builds and tests the Elixir app pinned to the
+  release image's toolchain (1.17.3/OTP 27.1.2) with `mix hex.audit`, checks `agahnim`, and builds the
+  Spectrum container image — the only step that evaluates `runtime.exs`.
+* ~~No `requirements.txt`.~~ **Resolved**: paramiko and cassandra-driver pinned.
+* ~~No regression test for the deployment manifest.~~ **Resolved**: `test_deployment_manifest.py`
+  asserts `*_B64`/mapping coverage in both directions, upgrade-package vs LCM-inventory parity, that
+  every embedded `*_script` literal compiles, and that no embedded source carries CRLF. That last
+  assertion failed on its first run and caught 17 files that had drifted back to CRLF.
 * **`podman build` cannot be run from a clean checkout** — the Dockerfile expects `server.py`, which is
   produced by renaming `spectrum_server.py` during provisioning (see `docs/AGENTS.md` §7).
 

@@ -12,14 +12,31 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 
 ## 1. Tech Stack
 
-* **Orchestration/control-plane code**: Python 3 (stdlib-heavy; no `requirements.txt` — dependencies, e.g. `paramiko` for `deploy_updates.py` and the `cassandra-driver` for `daruk.py`, are assumed present on the EL10.2 host image).
+* **Orchestration/control-plane code**: Python 3, deliberately stdlib-heavy. The only third-party dependencies are `paramiko` (`deploy_updates.py`, `provision.py`) and `cassandra-driver` (`daruk.py`), pinned in [requirements.txt](./requirements.txt); every daemon that runs on a hypervisor is stdlib-only.
 * **Console proxy sidecar**: Rust (`agahnim/`, Tokio + `tokio-tungstenite` + `tokio-rustls`) — a native systemd service (not a container) that proxies VNC/SPICE WebSocket console traffic.
 * **Frontend**: Vanilla HTML/CSS/JS under `static/` (no build step), with vendored noVNC (`static/novnc/`), SPICE-HTML5 (`static/spice-html5/`), and pako (`static/vendor/pako/`).
 * **Deployment model**: a deliberate split (see [docs/deployment.md](./docs/deployment.md)). Third-party services with real dependency trees run as **Podman Quadlets** (`.container` files in `/etc/containers/systemd/`): ZooKeeper, ScyllaDB, Aether/Linstor, the Linstor controller, Spectrum, and Slate. The Helios daemons themselves are **native `systemd` units** (`/etc/systemd/system/*.service`) — they are stdlib-only Python whose job is to configure the host (network namespaces, VLAN bridges, IP addresses, DRBD), so a container boundary would isolate nothing while adding an image to build and version.
 * **Data & consensus**: ScyllaDB ("Hydra", Cassandra-compatible, port `9042`) for cluster/VM metadata, and Apache ZooKeeper ("Odin"/"Zeus", port `2181`) for distributed consensus and leader election.
 * **Storage**: Linstor + DRBD ("Aether") for replicated block storage (this replaced an earlier GlusterFS-based design — no GlusterFS code remains in the current tree).
 * **Ingress**: Traefik ("Slate") terminating all client-facing WebUI/API/console traffic on port `443`.
-* **No CI**: there is no `.github/workflows` directory — tests and deploys are run manually (see [docs/setup-guide.md](./docs/setup-guide.md) and [TODO.md](./TODO.md)).
+* **CI**: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) byte-compiles every Python module, runs the unit and deployment-manifest tests, builds the Elixir app against the same toolchain the release image uses, checks the Rust console proxy, and builds the Spectrum container image.
+
+---
+
+## Licensing
+
+Helios-HCI is licensed under the **Business Source License 1.1** (see [LICENSE](./LICENSE)).
+
+In short: you may read, modify and self-host it freely, including commercially for your
+own infrastructure. What is not permitted is offering Helios-HCI to third parties as a
+hosted or managed commercial service. On the Change Date (2030-08-19) each released
+version converts automatically to the **Mozilla Public License 2.0**.
+
+BSL is source-available rather than OSI-approved open source. If that distinction matters
+for your use, the Change License terms above are what you are waiting on.
+
+Bundled third-party components (noVNC, pako, spice-html5) keep their own licenses and are
+not covered by the BSL — see [THIRD_PARTY_LICENSES.md](./THIRD_PARTY_LICENSES.md).
 
 ---
 
@@ -86,6 +103,8 @@ Helios-HCI/
 │   deploy_updates.py      # Update pipeline (check → build zip → roll out over SSH/paramiko)
 ├── push_to_github.py       # Manual GitHub Contents-API uploader (reads GITHUB_TOKEN)
 ├── test_hylia.py           # unittest suite for Hylia (`python -m unittest test_hylia.py`)
+├── LICENSE                 # Business Source License 1.1 (converts to MPL-2.0 on 2030-08-19)
+├── THIRD_PARTY_LICENSES.md # Licenses of vendored noVNC / pako / spice-html5
 ├── TODO.md                 # Roadmap and technical-debt backlog
 └── README.md
 ```
