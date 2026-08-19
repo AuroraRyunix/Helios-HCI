@@ -150,7 +150,9 @@ defmodule SpectrumPhxWeb.Vms.NewLiveTest do
 
       assert {:ok, _show_view, html} = follow_redirect(result, conn)
       assert html =~ "web-01"
-      assert html =~ "registered"
+      # The flash reports allocation, not just registration: create_vm/1 now provisions
+      # the disks too, and rolls the VM back if that fails.
+      assert html =~ "disks are allocated"
     end
 
     test "accepts the documented valid name shapes", %{conn: conn} do

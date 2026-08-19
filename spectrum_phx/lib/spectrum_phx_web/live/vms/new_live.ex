@@ -51,7 +51,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
       {:ok, vm} ->
         {:noreply,
          socket
-         |> put_flash(:info, "VM #{vm.name} registered. Storage is provisioned separately.")
+         |> put_flash(:info, "VM #{vm.name} created, and its disks are allocated.")
          |> push_navigate(to: ~p"/vms/#{vm.name}")}
 
       {:error, errors} when is_list(errors) ->
@@ -81,7 +81,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
       <.header>
         New virtual machine
         <:subtitle>
-          Registers the VM's metadata. Disks are allocated by the storage tier afterwards.
+          Creates the VM and allocates its disks. If disk allocation fails, the VM is removed again rather than left without storage.
         </:subtitle>
         <:actions>
           <.button navigate={~p"/vms"}>Cancel</.button>

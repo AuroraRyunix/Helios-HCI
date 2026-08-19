@@ -825,9 +825,12 @@ DRBD_SPLIT_BRAIN_OPTIONS = [
 LINSTOR_MASK_ERROR = 0xC000000000000000
 
 # A resource that is already there is not a failure for an idempotent create; a
-# resource that is already gone is not a failure for a delete.
-LINSTOR_EXISTS_MARKERS = ("already exists", "already has", "existing")
-LINSTOR_ABSENT_MARKERS = ("not found", "does not exist", "not exist", "unknown resource")
+# resource that is already gone is not a failure for a delete. Kept to the phrasings
+# LINSTOR actually uses: a loose marker here would read a real failure as a success and
+# return 200 for a disk that does not exist, which is the bug this whole endpoint is
+# meant to remove.
+LINSTOR_EXISTS_MARKERS = ("already exists", "already registered")
+LINSTOR_ABSENT_MARKERS = ("not found", "does not exist")
 
 IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
 
@@ -1441,6 +1444,9 @@ def parse_linstor_api_call_rc(text):
             "ret_code": ret_code,
             "message": str(entry.get("message") or ""),
             "details": str(entry.get("details") or ""),
+            # "already exists" lands in `cause` rather than `message` for some of the
+            # client's responses, and that string is what the idempotency check reads.
+            "cause": str(entry.get("cause") or ""),
         })
     return messages
 
@@ -1480,7 +1486,14 @@ def parse_linstor_resource_definitions(text):
     for entry in _linstor_entries(data):
         listed = _first_key(entry, _RD_LIST_KEYS)
         if not isinstance(listed, list):
-            continue
+            # Piraeus 1.31's client emits the definitions bare -- [[{"name": ...}]] --
+            # with no wrapper key at all, so an entry that already looks like a
+            # definition is one. Verified against the deployed client; without this the
+            # list endpoint reported an empty cluster while resources existed.
+            if _first_key(entry, _RD_NAME_KEYS):
+                listed = [entry]
+            else:
+                continue
         for definition in listed:
             if not isinstance(definition, dict):
                 continue
@@ -1547,7 +1560,7 @@ def linstor_call(args, timeout=120):
 
     parts = []
     for message in messages:
-        for field in ("message", "details"):
+        for field in ("message", "details", "cause"):
             if message[field]:
                 parts.append(message[field])
     if stderr.strip():
@@ -1577,7 +1590,11 @@ def linstor_inventory():
     where it is materialised; a failure there degrades `nodes` to [] rather than failing
     the read, since the definitions are the part a caller cannot do without.
     """
-    ok, stdout, detail = linstor_call(["resource-definition", "list"], timeout=60)
+    # volume-definition list, not resource-definition list: on the deployed client the
+    # latter omits volume_definitions entirely, so existing sizes came back as null and
+    # the size-mismatch guard below could never fire -- letting a new VM silently adopt
+    # a deleted VM's disk at a different size.
+    ok, stdout, detail = linstor_call(["volume-definition", "list"], timeout=60)
     if not ok:
         return None, detail or "linstor resource-definition list failed"
 
@@ -3588,11 +3605,17 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
                     reason += (" (rollback of %s also failed: %s)" % (resource, undo_detail))
             self.reject(reason, 500)
 
-        ok, _stdout, detail = linstor_call(
-            ["volume-definition", "create", resource, "%dGiB" % size_gib])
-        if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
-            undo("Could not create volume definition %s: %s" % (resource, detail))
-            return
+        # --vlmnr 0 rather than letting the client pick the next free number. Without it a
+        # retry against a resource that already has volume 0 does not fail as "already
+        # exists" -- it quietly adds a *second* volume, and the VM ends up with a disk it
+        # never asked for. The size check above is what decides whether volume 0 is
+        # already the one that was asked for.
+        if existing is None or existing["size_kib"] != requested_kib:
+            ok, _stdout, detail = linstor_call(
+                ["volume-definition", "create", "--vlmnr", "0", resource, "%dGiB" % size_gib])
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                undo("Could not create volume definition %s: %s" % (resource, detail))
+                return
 
         for node in nodes:
             ok, _stdout, detail = linstor_call(

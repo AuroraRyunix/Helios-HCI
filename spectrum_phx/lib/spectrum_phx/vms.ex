@@ -48,6 +48,7 @@ defmodule SpectrumPhx.Vms do
 
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
+  alias SpectrumPhx.Spark
   alias SpectrumPhx.Vms.Vm
 
   @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status"
@@ -79,6 +80,11 @@ defmodule SpectrumPhx.Vms do
   # `INSERT` in CQL is an upsert, and the Python create path relies on that.
   @insert_cql "INSERT INTO hydra.vms (#{@columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
 
+  # Undo for a create whose storage allocation failed. Conditional on the row still being
+  # the one this call inserted: an unconditional `DELETE` would also remove a VM that
+  # something else claimed and started in the meantime, which is a live VM's row.
+  @delete_cql "DELETE FROM hydra.vms WHERE name = ? IF state = ? AND host_ip = ?"
+
   @migration_lock "migrating"
   @unlocked_status "running"
 
@@ -109,6 +115,9 @@ defmodule SpectrumPhx.Vms do
 
   @doc "CQL used by `create_vm/1`."
   def insert_cql, do: @insert_cql
+
+  @doc "CQL used by `create_vm/1` to undo its row when storage allocation fails."
+  def delete_cql, do: @delete_cql
 
   @doc "The value written into the `status` column while a migration is in flight."
   def migration_lock, do: @migration_lock
@@ -287,24 +296,50 @@ defmodule SpectrumPhx.Vms do
   # -- lifecycle -------------------------------------------------------------------
 
   @doc """
-  Register a new VM's metadata.
+  Register a new VM and allocate its disks.
 
-  Validates with `SpectrumPhx.Vms.Vm.new/1` and inserts `IF NOT EXISTS`, so a create that
-  races another create for the same name loses rather than overwriting a live VM's row
-  (CQL `INSERT` is an upsert; without the condition the second create silently replaces
-  the first VM's disk paths).
+  Validates with `SpectrumPhx.Vms.Vm.new/1`, inserts `IF NOT EXISTS`, then allocates one
+  DRBD-backed Linstor resource per disk through `SpectrumPhx.Spark.linstor_resource_create/4`.
+  A VM that comes back `{:ok, vm}` has both a row and its storage.
 
-  TODO: storage allocation is not done here. `/api/vms/create` also runs, per disk,
-  `linstor resource-definition create`, `volume-definition create <n>GiB`, `resource
-  create <host> --storage-pool default-pool`, and the split-brain `drbd-options` -- and
-  rolls the earlier ones back if a later one fails. That sequence stays in the Python tier
-  behind Spark for now, so a VM created through this function has a metadata row and no
-  backing DRBD resources until storage is provisioned.
+  ## The row is written before the storage, on purpose
 
-  Under a `{:static, _}` source the parameters are validated and the built struct is
-  returned without being written anywhere; see `source/0`.
+  Disk resources are named after the VM (`<name>-disk<n>`), so the name is the shared
+  resource two concurrent creates would collide on. The `IF NOT EXISTS` insert is the only
+  thing in this system that makes that collision resolvable: it is one Paxos round, so
+  exactly one caller proceeds to allocate.
+
+  Reversing the order breaks the rollback rather than the happy path. `resource-definition
+  create` is idempotent by adoption, so the caller that loses the row insert cannot tell
+  its own resources from the winner's -- and its rollback would delete the winner's live
+  disks. Ordering it row-first also makes the surviving failure mode the recoverable one:
+  a row with no storage is deleted below and shows up in the operator's error, whereas
+  storage with no row is an orphan nothing ever looks at again.
+
+  ## Rollback
+
+  If any disk fails, the resources this call *created* are deleted and the row is removed
+  with an LWT conditional on it still being the row this call inserted (a VM that was
+  claimed and started in the meantime is left alone). The caller gets
+  `{:error, {:storage, message}}` naming the disk that failed.
+
+  Resources that were *adopted* rather than created -- Spark answering `"created" =>
+  false` -- are deliberately not deleted: they existed before this call and may hold
+  another VM's data. They are logged instead, because for a VM the database has never seen
+  an existing resource is a leftover from an incomplete delete.
+
+  A resource left behind by a failed rollback is logged as an orphan rather than retried
+  into a loop; that is a repair an operator does, and the alternative is deleting storage
+  this code is not sure it owns.
+
+  Under a `{:static, _}` source there is no row to write: the parameters are validated and
+  the built struct is returned. Allocation runs there only when `storage_client/0` is
+  stubbed, which is how the tests drive it -- with no stub, nothing is called at all and a
+  test can never reach a hypervisor. See `source/0`.
   """
-  @spec create_vm(map()) :: {:ok, Vm.t()} | {:error, keyword() | :already_exists | term()}
+  @spec create_vm(map()) ::
+          {:ok, Vm.t()}
+          | {:error, keyword() | :already_exists | {:storage, String.t()} | term()}
   def create_vm(params) do
     with {:ok, %Vm{} = vm} <- Vm.new(params) do
       disk_paths = vm |> Vm.disks() |> Enum.map(& &1.path)
@@ -335,13 +370,12 @@ defmodule SpectrumPhx.Vms do
 
       case source() do
         {:static, _vms} ->
-          {:ok, vm}
+          allocate_without_a_row(vm)
 
         :hydra ->
           case Hydra.apply_lwt(@insert_cql, insert_params) do
             {:ok, true} ->
-              broadcast({:vm_created, vm.name})
-              {:ok, vm}
+              allocate_or_undo(vm)
 
             {:ok, false} ->
               {:error, :already_exists}
@@ -350,6 +384,169 @@ defmodule SpectrumPhx.Vms do
               {:error, reason}
           end
       end
+    end
+  end
+
+  # Under a static source there is no row to write and no row to undo, so a create is
+  # validation plus -- when `storage_client/0` is stubbed -- allocation. That is the half
+  # of this path a test can drive: the allocation order, the adopt-versus-create
+  # distinction, and the rollback of a partially allocated VM. With no stub configured
+  # nothing is called at all, so a test can never reach a real hypervisor.
+  defp allocate_without_a_row(%Vm{} = vm) do
+    case storage_client() do
+      nil ->
+        {:ok, vm}
+
+      _stub ->
+        case allocate_storage(vm) do
+          :ok -> {:ok, vm}
+          {:error, message} -> {:error, {:storage, message}}
+        end
+    end
+  end
+
+  # The row is ours -- the LWT said so -- which is what makes both the allocation and the
+  # undo below safe to run without a second opinion.
+  defp allocate_or_undo(%Vm{} = vm) do
+    case allocate_storage(vm) do
+      :ok ->
+        broadcast({:vm_created, vm.name})
+        {:ok, vm}
+
+      {:error, message} ->
+        Logger.error("Storage allocation for VM #{vm.name} failed: #{message}")
+        undo_row(vm)
+        {:error, {:storage, message}}
+    end
+  end
+
+  defp allocate_storage(%Vm{} = vm) do
+    vm
+    |> Vm.disks()
+    |> Enum.reduce_while({:ok, []}, fn disk, {:ok, created} ->
+      case allocate_disk(disk) do
+        # Adopted, not created: it was already there, so this call does not own it and
+        # must not delete it during a rollback.
+        {:ok, %{"created" => false}} ->
+          Logger.warning(
+            "VM #{vm.name}: adopted the existing Linstor resource #{disk.resource} rather " <>
+              "than creating it. The database has never seen this VM, so that resource is " <>
+              "a leftover from an earlier VM of the same name."
+          )
+
+          {:cont, {:ok, created}}
+
+        {:ok, _response} ->
+          {:cont, {:ok, [disk.resource | created]}}
+
+        {:error, reason} ->
+          # Newest first, which is also the order to unwind in.
+          release_disks(created)
+          {:halt, {:error, describe_disk_failure(disk, reason)}}
+      end
+    end)
+    |> case do
+      {:ok, _created} -> :ok
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  # `nodes` is deliberately not sent: Spark reads the same cluster document this node
+  # does, and it is the component that owns the host inventory. Deriving a node list here
+  # would duplicate that knowledge and get it wrong exactly when a hostname is missing
+  # from the web tier's copy of the file.
+  defp allocate_disk(%{size_gib: nil, index: index}) do
+    {:error, "disk #{index} has no usable size"}
+  end
+
+  defp allocate_disk(%{resource: resource, size_gib: size_gib}) do
+    case storage_client() do
+      nil ->
+        on_a_spark_node(fn ip -> Spark.linstor_resource_create(ip, resource, size_gib) end)
+
+      fun when is_function(fun, 3) ->
+        fun.(:create, resource, %{size_gib: size_gib})
+    end
+  end
+
+  defp release_disks(resources) do
+    Enum.each(resources, fn resource ->
+      case release_disk(resource) do
+        {:ok, _response} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error(
+            "Rolling back VM creation: Linstor resource #{resource} could not be deleted " <>
+              "(#{inspect(reason)}). It is now an orphan and has to be removed by hand."
+          )
+      end
+    end)
+  end
+
+  defp release_disk(resource) do
+    case storage_client() do
+      nil ->
+        on_a_spark_node(fn ip -> Spark.linstor_resource_delete(ip, resource) end)
+
+      fun when is_function(fun, 3) ->
+        fun.(:delete, resource, %{})
+    end
+  end
+
+  # Linstor is a cluster-wide service: the client in any node's aether container reaches
+  # whichever node currently holds the controller. A node this call could not *reach* is
+  # therefore retried on the next node, while an answer from a daemon -- including a
+  # refusal -- is final and stops the walk. The endpoints being idempotent is what makes
+  # the retry safe: a create that timed out after the daemon acted is adopted, not
+  # duplicated.
+  defp on_a_spark_node(fun) do
+    Enum.reduce_while(spark_ips(), {:error, :no_spark_nodes}, fn ip, _last ->
+      case fun.(ip) do
+        {:ok, response} -> {:halt, {:ok, response}}
+        {:error, {status, _message}} = answer when is_integer(status) -> {:halt, answer}
+        {:error, {:http, _status}} = answer -> {:halt, answer}
+        {:error, _transport} = failure -> {:cont, failure}
+      end
+    end)
+  end
+
+  defp spark_ips do
+    [Config.local_ip() | Config.node_ips()]
+    |> Enum.reject(&(&1 in [nil, ""]))
+    |> Enum.uniq()
+  end
+
+  defp describe_disk_failure(disk, reason) do
+    "disk #{disk.index} (#{disk.resource}): " <> failure_text(reason)
+  end
+
+  defp failure_text(message) when is_binary(message), do: message
+
+  defp failure_text({status, message}) when is_integer(status) and is_binary(message) do
+    "spark returned #{status}: #{message}"
+  end
+
+  defp failure_text(other), do: inspect(other)
+
+  defp undo_row(%Vm{} = vm) do
+    params = [{"text", vm.name}, {"text", vm.state}, {"text", vm.host_ip}]
+
+    case Hydra.apply_lwt(@delete_cql, params) do
+      {:ok, true} ->
+        :ok
+
+      {:ok, false} ->
+        Logger.error(
+          "VM #{vm.name}: storage allocation failed, but the row changed underneath the " <>
+            "rollback (something claimed the VM) and was left in place."
+        )
+
+      {:error, reason} ->
+        Logger.error(
+          "VM #{vm.name}: storage allocation failed and the row could not be removed " <>
+            "(#{inspect(reason)}). It now points at storage that does not exist."
+        )
     end
   end
 
@@ -490,6 +687,23 @@ defmodule SpectrumPhx.Vms do
   @spec task_submitter() ::
           nil | (String.t(), String.t(), map() -> {:ok, map()} | {:error, term()})
   def task_submitter, do: Application.get_env(:spectrum_phx, :vms_task_submitter)
+
+  @doc """
+  Override for the storage calls `create_vm/1` makes: `nil` (talk to Spark) or a 3-arity
+  function receiving `(action, resource, opts)`.
+
+  `action` is `:create` (with `%{size_gib: n}`) or `:delete` (with `%{}`), and the return
+  value is whatever `SpectrumPhx.Spark.linstor_resource_create/4` and
+  `linstor_resource_delete/3` return -- `{:ok, %{"created" => bool}}`,
+  `{:ok, %{"deleted" => bool}}` or `{:error, reason}`.
+
+  Allocation is the one part of a create that cannot be exercised against a real cluster
+  in a test, and it is also the part whose *failure* path matters most, so the seam exists
+  to drive the rollback deliberately rather than hoping it is right.
+  """
+  @spec storage_client() ::
+          nil | (atom(), String.t(), map() -> {:ok, map()} | {:error, term()})
+  def storage_client, do: Application.get_env(:spectrum_phx, :vms_storage_client)
 
   # -- internals -------------------------------------------------------------------
 

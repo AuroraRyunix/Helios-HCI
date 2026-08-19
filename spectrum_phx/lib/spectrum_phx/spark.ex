@@ -168,6 +168,78 @@ defmodule SpectrumPhx.Spark do
   def container_ensure(ip, name),
     do: post_json(ip, "/api/v1/storage/container/ensure", %{"name" => name})
 
+  @doc """
+  Every Linstor resource the cluster holds, or one of them by name.
+
+  Returns `{:ok, %{"resources" => [%{"name", "size_kib", "size_gib", "nodes",
+  "device_path"}]}}`. The shape is the daemon's, not the Linstor client's: the client's
+  machine-readable document renamed its keys between output versions, so a caller that
+  parsed it would be coupled to which version a given cluster happens to run. An unknown
+  name is `{:error, {404, message}}`.
+  """
+  def linstor_resources(ip, resource \\ nil) do
+    path =
+      if resource,
+        do: "/api/v1/storage/linstor/resources?resource=" <> URI.encode(resource),
+        else: "/api/v1/storage/linstor/resources"
+
+    get_json(ip, path, timeout: 45)
+  end
+
+  @doc """
+  Allocate the DRBD-backed storage for one VM disk.
+
+  One call covers the resource definition, the volume definition, placement on every node
+  and the split-brain `drbd-options`. Those four commands are meaningless apart -- a
+  resource definition with no volume backs nothing, a volume definition with no resources
+  exists on no node -- so the daemon runs them as one idempotent operation and deletes its
+  own partial work if a later step fails.
+
+  Options:
+
+    * `:nodes` - place on these nodes. Omitted means every node in the daemon's cluster
+      document, which is what the Python create path did.
+    * `:storage_pool` - omitted means the daemon's `default-pool`. The daemon takes the
+      value from an allowlist, so an unknown pool is a `400` and never a command fragment.
+    * `:timeout` - seconds. Placement creates a DRBD device on every node, so this is
+      minutes-scale work rather than the 30s a control-plane call usually needs.
+
+  `%{"created" => false}` means the resource was already there and was adopted rather than
+  created. That is what makes a retry after a timeout safe -- and it is worth logging,
+  because for a VM the database has never seen, an existing resource is a leftover.
+
+  A resource that already exists at a *different* size comes back as
+  `{:error, {409, message}}` rather than being silently reused: that is precisely how a
+  new VM ends up attached to a deleted VM's disk.
+
+  Dual-primary is deliberately not set here. It is what let one VM start on two hosts and
+  corrupt its disk; live migration scopes that window to the hand-over itself.
+  """
+  def linstor_resource_create(ip, resource, size_gib, opts \\ []) when is_integer(size_gib) do
+    payload =
+      %{"resource" => resource, "size_gib" => size_gib}
+      |> put_present("nodes", Keyword.get(opts, :nodes))
+      |> put_present("storage_pool", Keyword.get(opts, :storage_pool))
+
+    post_json(ip, "/api/v1/storage/linstor/resource", payload,
+      timeout: Keyword.get(opts, :timeout, 240)
+    )
+  end
+
+  @doc """
+  Delete a Linstor resource definition, and with it its volume on every node.
+
+  `%{"deleted" => false}` means there was nothing to delete, which is a success: a
+  rollback wants the resource gone, not proof that it once existed. A resource that is
+  still in use, or one a node cannot release, is `{:error, {409, message}}` -- the state
+  key `deleted` comes back with it, as everywhere else in this API.
+  """
+  def linstor_resource_delete(ip, resource, opts \\ []) do
+    post_json(ip, "/api/v1/storage/linstor/resource/delete", %{"resource" => resource},
+      timeout: Keyword.get(opts, :timeout, 240)
+    )
+  end
+
   @doc "Default interface, gateway and addresses for a host."
   def host_network(ip), do: get_json(ip, "/api/v1/host/network")
 
@@ -222,6 +294,13 @@ defmodule SpectrumPhx.Spark do
         {:error, reason}
     end
   end
+
+  # An omitted option is not the same as a null: leaving the key out lets the daemon apply
+  # its own default (every configured node, the default storage pool) rather than being
+  # handed a value the caller does not actually have.
+  defp put_present(payload, _key, nil), do: payload
+  defp put_present(payload, _key, []), do: payload
+  defp put_present(payload, key, value), do: Map.put(payload, key, value)
 
   defp post(url, body, timeout) do
     case Req.post(url,

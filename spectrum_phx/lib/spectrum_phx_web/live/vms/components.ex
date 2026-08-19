@@ -69,6 +69,15 @@ defmodule SpectrumPhxWeb.Vms.Components do
   Every one of these corresponds to a refusal that has a real consequence, so they say
   what was refused rather than "an error occurred".
   """
+  # Storage allocation reports its own detail; without this clause the fallback rendered
+  # a disk failure as "the cluster database rejected the request", which points an
+  # operator at entirely the wrong subsystem.
+  def error_message({:storage, detail}) when is_binary(detail),
+    do: "Disk allocation failed, so the VM was not created: " <> detail
+
+  def error_message({:storage, detail}),
+    do: "Disk allocation failed, so the VM was not created: " <> inspect(detail)
+
   def error_message(:invalid_name), do: "Invalid VM name: " <> Vm.name_error() <> "."
 
   def error_message(:not_found), do: "That VM is not in the cluster database."

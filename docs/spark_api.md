@@ -143,7 +143,7 @@ calls each would retire.
 | VM device hotplug (attach/detach NIC and disk) | 5 | `virsh attach-device`, `detach-interface`, `attach-disk`, `detach-disk`. |
 | `POST /api/v1/vm/{name}/disk/resize` | 1 | `virsh blockresize`. |
 | `drbdadm resize` on `/storage/drbd/` | 1 | `/storage/drbd/role` covers only primary/secondary. |
-| Linstor resource operations | 3 | `resource-definition`/`volume-definition`/`resource create`. Blocks moving VM disk allocation out of the web tier. |
+| ~~Linstor resource operations~~ | ~~3~~ | **Done.** `POST /storage/linstor/resource`, `/resource/delete` and `GET /storage/linstor/resources`. See the correction below: the figure of 3 was wrong. |
 | `GET /api/v1/host/cpu` | 1 | Core count and model. |
 | `GET /api/v1/host/ping` | 2 | A liveness probe for the reboot task. Currently `echo 1`, and not migrated because `run_mtls_spark_api` has a 120s timeout against `run_remote_spark`'s 60s, which would change reboot detection timing. |
 
@@ -155,6 +155,30 @@ follows `lsblk -J` rather than being stated in the contract.
 Remaining by design: `rm`, `echo >`, `mkdir` and base64-decode calls in the LCM
 file-transfer and config-sync paths. Exposing file verbs as endpoints would reproduce
 `/execute` with a JSON wrapper.
+
+### Correction: `/execute` usage is undercounted
+
+The headline figure of 79 raw calls counts `run_remote_spark` call sites in
+`spectrum_server.py`. It misses Linstor entirely: those go through a separate
+`run_linstor_cmd` wrapper, which builds `podman exec ... linstor <args>` and *then* hands
+it to `run_remote_spark`, so its **21 call sites** never appear in the count. This gap was
+listed as worth 3 calls; the real figure is an order of magnitude higher.
+
+Two consequences worth carrying:
+
+* The migration metric should count wrappers that reach `/api/v1/execute`, not only direct
+  callers. Any future wrapper hides its call sites the same way.
+* `/api/v1/execute` cannot be removed on the strength of the direct-call count alone.
+
+Also unlike the other pass-through endpoints, the Linstor responses are **normalised** by
+the daemon rather than returned verbatim. `drbdsetup status --json` and `lsblk -J` have
+stable shapes; the Linstor client renames its own keys between output versions
+(`rsc_dfns`/`rsc_name`/`vlm_size` versus `resource_definitions`/`name`/`size_kib`), so a
+pass-through would push a version dependency onto every caller. An unrecognised document
+yields an empty list rather than a guess.
+
+Still requiring `/execute` after this work: `volume-definition set-size` (disk resize) and
+the dual-primary toggle around live migration.
 
 ## Related
 
