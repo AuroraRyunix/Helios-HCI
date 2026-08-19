@@ -2,6 +2,9 @@ defmodule SpectrumPhxWeb.Vms.NewLiveTest do
   # Not async: the VM source is configured through application env, which is global.
   use SpectrumPhxWeb.ConnCase, async: false
 
+  # Every dashboard sits behind authentication; sign the connection in.
+  setup %{conn: conn}, do: %{conn: log_in(conn)}
+
   import Phoenix.LiveViewTest
 
   @valid %{

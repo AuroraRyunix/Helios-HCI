@@ -20,3 +20,7 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# LiveView tests mount pages that sit behind authentication. The stub resolves the fixed
+# tokens ConnCase.log_in/2 issues, so the suite needs no ScyllaDB.
+config :spectrum_phx, :accounts_module, SpectrumPhxWeb.AccountsStub

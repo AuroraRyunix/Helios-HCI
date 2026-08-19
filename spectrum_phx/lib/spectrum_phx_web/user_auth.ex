@@ -13,6 +13,10 @@ defmodule SpectrumPhxWeb.UserAuth do
 
   alias SpectrumPhx.Accounts
 
+  # Resolved at runtime so tests can supply a stub instead of a live ScyllaDB. Production
+  # never overrides it.
+  defp accounts, do: Application.get_env(:spectrum_phx, :accounts_module, Accounts)
+
   @session_key "helios_session_token"
 
   @doc "Attach a freshly created session to the connection."
@@ -47,7 +51,7 @@ defmodule SpectrumPhxWeb.UserAuth do
   def fetch_current_user(conn, _opts) do
     token = get_session(conn, @session_key)
 
-    case token && Accounts.user_from_token(token) do
+    case token && accounts().user_from_token(token) do
       {:ok, username} -> assign(conn, :current_username, username)
       _ -> assign(conn, :current_username, nil)
     end
@@ -81,7 +85,7 @@ defmodule SpectrumPhxWeb.UserAuth do
   The check happens once, before the socket connects, rather than inside each view.
   """
   def on_mount(:ensure_authenticated, _params, session, socket) do
-    case session[@session_key] && Accounts.user_from_token(session[@session_key]) do
+    case session[@session_key] && accounts().user_from_token(session[@session_key]) do
       {:ok, username} ->
         {:cont, Phoenix.Component.assign(socket, :current_username, username)}
 

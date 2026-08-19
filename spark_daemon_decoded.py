@@ -783,6 +783,54 @@ HYDRA_DB_CONTAINER = "systemd-hydra-db"
 VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
 DRBD_ROLES = ("primary", "secondary")
 
+# -- Linstor ---------------------------------------------------------------
+# The client lives in the aether container, which runs on every node, and finds
+# whichever node currently holds the controller through LS_CONTROLLERS. Calling it
+# there rather than in systemd-linstor-controller is what makes these endpoints work
+# from any host instead of only the leader.
+LINSTOR_CONTAINER = "systemd-aether"
+CLUSTER_JSON = "/etc/hci/cluster.json"
+
+# Cluster creation makes exactly one pool:
+#   linstor storage-pool create lvmthin <node> default-pool vg_aether/thin_pool_aether
+# and Spectrum refuses dynamic container creation on this storage engine. A pool is
+# therefore an allowlisted value like an owner or a mode, never caller text; adding a
+# second pool to the product means adding its name here.
+ALLOWED_STORAGE_POOLS = ("default-pool",)
+DEFAULT_STORAGE_POOL = "default-pool"
+
+# 1 GiB .. 64 TiB. The floor rejects a zero-sized volume-definition; the ceiling is a
+# sanity bound on the number, not a capacity check -- Linstor still refuses what the
+# pool cannot actually back.
+MIN_VOLUME_GIB = 1
+MAX_VOLUME_GIB = 65536
+KIB_PER_GIB = 1024 * 1024
+
+# Automatic split-brain resolution, applied to every VM disk at create time.
+#
+# --allow-two-primaries is deliberately absent. Setting it here let one VM be started
+# on two hosts at once, and two qemu processes writing one raw DRBD device corrupts
+# it. Live migration needs dual-primary only for the hand-over window and enables it
+# around that call itself.
+DRBD_SPLIT_BRAIN_OPTIONS = [
+    "--after-sb-0pri", "discard-zero-changes",
+    "--after-sb-1pri", "discard-secondary",
+    "--after-sb-2pri", "disconnect",
+]
+
+# LINSTOR's ApiCallRc carries its severity in the top two bits: error is both set,
+# warning is the high bit alone, info the next one. Used only as a second opinion --
+# the client's exit status is the primary signal, so a wrong guess about this mask
+# cannot turn a successful call into a failure on its own.
+LINSTOR_MASK_ERROR = 0xC000000000000000
+
+# A resource that is already there is not a failure for an idempotent create; a
+# resource that is already gone is not a failure for a delete.
+LINSTOR_EXISTS_MARKERS = ("already exists", "already has", "existing")
+LINSTOR_ABSENT_MARKERS = ("not found", "does not exist", "not exist", "unknown resource")
+
+IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
+
 DNSMASQ_LEASE_FILES = ("/var/lib/dnsmasq/dnsmasq.leases", "/var/lib/misc/dnsmasq.leases")
 LIBVIRT_LEASE_GLOB = "/var/lib/libvirt/dnsmasq/*.leases"
 SECURE_BOOT_EFIVAR = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
@@ -856,6 +904,57 @@ def validate_mode(value):
     if value in ALLOWED_MODES:
         return value, None
     return None, "mode must be one of " + ", ".join(ALLOWED_MODES)
+
+
+def validate_storage_pool(value):
+    """Storage pool comes from a fixed allowlist, never from caller text."""
+    if value is None:
+        return DEFAULT_STORAGE_POOL, None
+    if value in ALLOWED_STORAGE_POOLS:
+        return value, None
+    return None, "storage_pool must be one of " + ", ".join(ALLOWED_STORAGE_POOLS)
+
+
+def validate_volume_gib(value):
+    """Volume size is an integer number of GiB inside sane bounds.
+
+    A bool is rejected explicitly: `isinstance(True, int)` is True in Python, and
+    `True` would otherwise be accepted and formatted as a 1 GiB volume.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, "size_gib must be an integer number of GiB"
+    if value < MIN_VOLUME_GIB or value > MAX_VOLUME_GIB:
+        return None, "size_gib must be between %d and %d" % (MIN_VOLUME_GIB, MAX_VOLUME_GIB)
+    return value, None
+
+
+def validate_node_names(value):
+    """Node names for a placement: a list of names, or the cluster's own nodes.
+
+    Omitting `nodes` places on every node in the cluster document, which is what the
+    Python tier's create path did. An explicit empty list is an error rather than a
+    silent no-op: a resource definition with no resources backs no disk.
+    """
+    if value is None:
+        nodes = cluster_node_names()
+        if not nodes:
+            return None, "No nodes are configured on this host and none were supplied"
+        return nodes, None
+
+    if not isinstance(value, list):
+        return None, "nodes must be a list of node names"
+    if not value:
+        return None, "nodes must not be empty"
+    if len(value) > 32:
+        return None, "nodes must contain at most 32 names"
+
+    nodes = []
+    for name in value:
+        if not valid_name(name):
+            return None, "Invalid node name"
+        if name not in nodes:
+            nodes.append(name)
+    return nodes, None
 
 
 def virsh_status_for(stderr):
@@ -1246,6 +1345,266 @@ def drbd_peer_roles(resource):
                 if isinstance(connection, dict) and connection.get("peer-role"):
                     roles.append(connection["peer-role"])
     return roles
+
+
+# ---------------------------------------------------------------------------
+# Linstor
+#
+# Same rules as the rest of the typed API: every element of every command is a
+# literal or an already-validated value, run_argv() calls subprocess.run() with a
+# list and shell=False, and what comes back is parsed into this daemon's own shape
+# rather than handed to the caller as stdout.
+# ---------------------------------------------------------------------------
+
+
+def cluster_hosts():
+    """[{"hostname","ip"}] from the on-host cluster document; [] when unreadable.
+
+    Values that could not be a node name or an address are dropped rather than
+    repaired, so a damaged cluster.json cannot contribute an argument to a command.
+    """
+    try:
+        with open(CLUSTER_JSON, "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    if not isinstance(hosts, list):
+        return []
+
+    parsed = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        hostname = host.get("hostname")
+        address = host.get("ip")
+        parsed.append({
+            "hostname": hostname if valid_name(hostname) else None,
+            "ip": address if isinstance(address, str) and IPV4_RE.match(address) else None,
+        })
+    return parsed
+
+
+def cluster_node_names():
+    """Every node name in the cluster document, in configured order."""
+    return [host["hostname"] for host in cluster_hosts() if host["hostname"]]
+
+
+def cluster_node_ips():
+    """Every node address in the cluster document, in configured order."""
+    return [host["ip"] for host in cluster_hosts() if host["ip"]]
+
+
+def linstor_argv(args):
+    """argv for one linstor client call inside the aether container.
+
+    LS_CONTROLLERS is one argv element built from the cluster document, so the client
+    reaches whichever node currently runs the controller. `-m` asks for the
+    machine-readable document; every remaining element is a fixed literal or a value
+    that has already passed validation at the boundary.
+    """
+    controllers = ",".join(cluster_node_ips()) or "127.0.0.1"
+    return (["podman", "exec", "-e", "LS_CONTROLLERS=" + controllers,
+             LINSTOR_CONTAINER, "linstor", "-m"] + list(args))
+
+
+def _linstor_entries(node):
+    """Yield the dicts in a machine-readable document, list nesting flattened.
+
+    Some client versions wrap the document in an extra list ([[{...}]]), so this
+    descends through lists but not through dict values -- a nested object inside a
+    resource is data, not another top-level entry.
+    """
+    if isinstance(node, list):
+        for item in node:
+            for found in _linstor_entries(item):
+                yield found
+    elif isinstance(node, dict):
+        yield node
+
+
+def parse_linstor_api_call_rc(text):
+    """[{"ret_code","message","details"}] from a linstor client response document."""
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    messages = []
+    for entry in _linstor_entries(data):
+        if "ret_code" not in entry and "message" not in entry:
+            continue
+        ret_code = entry.get("ret_code")
+        if not isinstance(ret_code, int):
+            ret_code = 0
+        messages.append({
+            "ret_code": ret_code,
+            "message": str(entry.get("message") or ""),
+            "details": str(entry.get("details") or ""),
+        })
+    return messages
+
+
+# The client renamed its keys between output versions. Both spellings are read here so
+# that no caller ever has to know which version a given cluster's client speaks.
+_RD_LIST_KEYS = ("resource_definitions", "rsc_dfns")
+_RD_NAME_KEYS = ("name", "rsc_name")
+_VD_LIST_KEYS = ("volume_definitions", "vlm_dfns")
+_VD_NUMBER_KEYS = ("volume_number", "vlm_nr")
+_VD_SIZE_KEYS = ("size_kib", "vlm_size")
+_RSC_LIST_KEYS = ("resources",)
+_RSC_NAME_KEYS = ("name", "rsc_name")
+_RSC_NODE_KEYS = ("node_name", "node")
+
+
+def _first_key(entry, keys):
+    for key in keys:
+        if key in entry:
+            return entry[key]
+    return None
+
+
+def parse_linstor_resource_definitions(text):
+    """[{"name","volumes":[{"number","size_kib"}]}] from `resource-definition list`.
+
+    An unrecognised document yields [] rather than a guess: a caller that gets an
+    empty list and then fails to create is recoverable, one that gets a wrong size is
+    not.
+    """
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    definitions = []
+    for entry in _linstor_entries(data):
+        listed = _first_key(entry, _RD_LIST_KEYS)
+        if not isinstance(listed, list):
+            continue
+        for definition in listed:
+            if not isinstance(definition, dict):
+                continue
+            name = _first_key(definition, _RD_NAME_KEYS)
+            if not isinstance(name, str) or not name:
+                continue
+            volumes = []
+            for volume in _first_key(definition, _VD_LIST_KEYS) or []:
+                if not isinstance(volume, dict):
+                    continue
+                number = _first_key(volume, _VD_NUMBER_KEYS)
+                size_kib = _first_key(volume, _VD_SIZE_KEYS)
+                volumes.append({
+                    "number": number if isinstance(number, int) else 0,
+                    "size_kib": size_kib if isinstance(size_kib, int) else None,
+                })
+            definitions.append({"name": name, "volumes": volumes})
+    return definitions
+
+
+def parse_linstor_resources(text):
+    """[{"name","node"}] from `resource list`: which nodes actually back a resource."""
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    placements = []
+    for entry in _linstor_entries(data):
+        listed = _first_key(entry, _RSC_LIST_KEYS)
+        if not isinstance(listed, list):
+            continue
+        for resource in listed:
+            if not isinstance(resource, dict):
+                continue
+            name = _first_key(resource, _RSC_NAME_KEYS)
+            node = _first_key(resource, _RSC_NODE_KEYS)
+            if not isinstance(name, str) or not name:
+                continue
+            placements.append({
+                "name": name,
+                "node": node if isinstance(node, str) else "",
+            })
+    return placements
+
+
+def linstor_says(detail, markers):
+    """True when the client's own message contains one of `markers`."""
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in markers)
+
+
+def linstor_call(args, timeout=120):
+    """Run one linstor client command. Returns (ok, stdout, detail).
+
+    `ok` is False when the client exited non-zero or reported an error-masked
+    ApiCallRc. The exit status is the primary signal and the mask is a second opinion,
+    so a wrong assumption about the mask cannot by itself turn a successful call into
+    a failure. `detail` is the client's own message text -- it drives the idempotency
+    checks and the error string, and is never returned as the body of a success.
+    """
+    rc, stdout, stderr = run_argv(linstor_argv(args), timeout=timeout)
+    messages = parse_linstor_api_call_rc(stdout)
+
+    parts = []
+    for message in messages:
+        for field in ("message", "details"):
+            if message[field]:
+                parts.append(message[field])
+    if stderr.strip():
+        parts.append(stderr.strip())
+    detail = " ".join(parts)
+
+    reported_error = any(
+        (message["ret_code"] & LINSTOR_MASK_ERROR) == LINSTOR_MASK_ERROR
+        for message in messages
+    )
+    ok = rc == 0 and not reported_error
+    if not ok and not detail:
+        detail = stdout.strip() or ("linstor %s failed with exit code %s" % (args[0], rc))
+    return ok, stdout, detail
+
+
+def linstor_resource_path(resource):
+    """Where a resource's volume 0 appears on every node backing it."""
+    return "/dev/drbd/by-res/%s/0" % resource
+
+
+def linstor_inventory():
+    """(resources, error): what Linstor holds, in this daemon's shape.
+
+    Each entry is {"name","size_kib","size_gib","nodes","device_path"}. Placement comes
+    from a second call because `resource-definition list` describes the definition, not
+    where it is materialised; a failure there degrades `nodes` to [] rather than failing
+    the read, since the definitions are the part a caller cannot do without.
+    """
+    ok, stdout, detail = linstor_call(["resource-definition", "list"], timeout=60)
+    if not ok:
+        return None, detail or "linstor resource-definition list failed"
+
+    placements = {}
+    ok_resources, resources_stdout, _ = linstor_call(["resource", "list"], timeout=60)
+    if ok_resources:
+        for placement in parse_linstor_resources(resources_stdout):
+            nodes = placements.setdefault(placement["name"], [])
+            if placement["node"] and placement["node"] not in nodes:
+                nodes.append(placement["node"])
+
+    inventory = []
+    for definition in parse_linstor_resource_definitions(stdout):
+        volume = None
+        for candidate in definition["volumes"]:
+            if candidate["number"] == 0:
+                volume = candidate
+                break
+        size_kib = volume["size_kib"] if volume else None
+        inventory.append({
+            "name": definition["name"],
+            "size_kib": size_kib,
+            "size_gib": (size_kib // KIB_PER_GIB) if isinstance(size_kib, int) else None,
+            "nodes": placements.get(definition["name"], []),
+            "device_path": linstor_resource_path(definition["name"]),
+        })
+    return inventory, None
 
 
 def read_dhcp_leases():
@@ -2654,6 +3013,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/storage/container/mounted":
             self.handle_storage_container_mounted(parsed)
             return True
+        if path == "/api/v1/storage/linstor/resources":
+            self.handle_storage_linstor_resources(parsed)
+            return True
         if path == "/api/v1/host/network":
             self.handle_host_network()
             return True
@@ -2715,6 +3077,12 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/storage/container/ensure":
             self.handle_storage_container_ensure()
+            return True
+        if path == "/api/v1/storage/linstor/resource":
+            self.handle_storage_linstor_resource()
+            return True
+        if path == "/api/v1/storage/linstor/resource/delete":
+            self.handle_storage_linstor_resource_delete()
             return True
         if path == "/api/v1/host/reboot":
             self.handle_host_reboot()
@@ -3110,6 +3478,181 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject(str(exc), 500)
             return
         self.send_json_response(200, {"path": path, "created": not existed})
+
+    # -- Storage: Linstor ----------------------------------------------
+
+    def handle_storage_linstor_resources(self, parsed):
+        """Everything Linstor holds, or one resource when `?resource=` is given."""
+        resource = self.query_param(parsed, "resource")
+        if resource is not None and not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+
+        inventory, error = linstor_inventory()
+        if inventory is None:
+            self.reject(error, 500)
+            return
+
+        if resource is None:
+            self.send_json_response(200, {"resources": inventory})
+            return
+
+        for entry in inventory:
+            if entry["name"] == resource:
+                self.send_json_response(200, {"resources": [entry]})
+                return
+        self.reject("No such Linstor resource: " + resource, 404)
+
+    def handle_storage_linstor_resource(self):
+        """Create a VM disk: resource definition, volume definition, placement, options.
+
+        One idempotent operation rather than four endpoints. The four commands are
+        meaningless apart -- a resource definition with no volume definition backs
+        nothing, and a volume definition with no resources exists on no node -- so
+        exposing them separately would just move the sequencing bug into every caller.
+
+        Idempotent in the sense that matters for a retry: each step tolerates the
+        object already being there, and the response says whether this call was the one
+        that created it. A resource that already exists at a *different* size is a 409
+        rather than a silent reuse, because that is how a VM ends up attached to a
+        disk left behind by an earlier VM of the same name.
+
+        Partial work is cleaned up here, not left for the caller: if placement or the
+        DRBD options fail after this call created the resource definition, the
+        definition is deleted again. A definition that already existed is never
+        deleted -- it may be backing a live VM.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        size_gib, error = validate_volume_gib(payload.get("size_gib"))
+        if error:
+            self.reject(error)
+            return
+        storage_pool, error = validate_storage_pool(payload.get("storage_pool"))
+        if error:
+            self.reject(error)
+            return
+        nodes, error = validate_node_names(payload.get("nodes"))
+        if error:
+            self.reject(error)
+            return
+
+        # Read before write: the controller has to be reachable for this to work at
+        # all, and knowing whether the resource is already there is what makes the
+        # difference between a safe retry and adopting someone else's disk.
+        inventory, error = linstor_inventory()
+        if inventory is None:
+            self.reject(error, 500)
+            return
+
+        existing = None
+        for entry in inventory:
+            if entry["name"] == resource:
+                existing = entry
+                break
+
+        requested_kib = size_gib * KIB_PER_GIB
+        if existing is not None and existing["size_kib"] not in (None, requested_kib):
+            self.send_json_response(409, {
+                "resource": resource,
+                "size_kib": existing["size_kib"],
+                "size_gib": existing["size_gib"],
+                "error": ("Linstor resource %s already exists at %s KiB, not the %d KiB "
+                          "requested" % (resource, existing["size_kib"], requested_kib)),
+            })
+            return
+
+        created = False
+        if existing is None:
+            ok, _stdout, detail = linstor_call(["resource-definition", "create", resource])
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                self.reject("Could not create resource definition %s: %s" % (resource, detail),
+                            500)
+                return
+            created = ok
+
+        def undo(reason):
+            """Delete only what this call created, then report the original failure."""
+            if created:
+                undone, _out, undo_detail = linstor_call(
+                    ["resource-definition", "delete", resource], timeout=180)
+                if not undone:
+                    print("[LINSTOR] Rollback of %s failed: %s" % (resource, undo_detail))
+                    reason += (" (rollback of %s also failed: %s)" % (resource, undo_detail))
+            self.reject(reason, 500)
+
+        ok, _stdout, detail = linstor_call(
+            ["volume-definition", "create", resource, "%dGiB" % size_gib])
+        if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+            undo("Could not create volume definition %s: %s" % (resource, detail))
+            return
+
+        for node in nodes:
+            ok, _stdout, detail = linstor_call(
+                ["resource", "create", node, resource, "--storage-pool", storage_pool],
+                timeout=180)
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                undo("Could not place %s on %s: %s" % (resource, node, detail))
+                return
+
+        # Automatic split-brain resolution. Not dual-primary: see DRBD_SPLIT_BRAIN_OPTIONS.
+        ok, _stdout, detail = linstor_call(
+            ["resource-definition", "drbd-options"] + DRBD_SPLIT_BRAIN_OPTIONS + [resource])
+        if not ok:
+            undo("Could not set DRBD options on %s: %s" % (resource, detail))
+            return
+
+        self.send_json_response(200, {
+            "resource": resource,
+            "created": created,
+            "size_gib": size_gib,
+            "size_kib": requested_kib,
+            "storage_pool": storage_pool,
+            "nodes": nodes,
+            "device_path": linstor_resource_path(resource),
+        })
+
+    def handle_storage_linstor_resource_delete(self):
+        """Remove a resource definition, and with it its volumes on every node.
+
+        `deleted` is false when there was nothing to delete. That is a success, not a
+        404: the caller of a rollback wants the resource gone, and a delete that races
+        another delete must not turn a completed rollback into an error.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+
+        ok, _stdout, detail = linstor_call(
+            ["resource-definition", "delete", resource], timeout=180)
+        if ok:
+            self.send_json_response(200, {"resource": resource, "deleted": True})
+            return
+        if linstor_says(detail, LINSTOR_ABSENT_MARKERS):
+            self.send_json_response(200, {"resource": resource, "deleted": False})
+            return
+
+        # The resource is there and did not go away -- in use by a running VM, or a
+        # node holding it is unreachable. 409 with the state key, as elsewhere in this
+        # API, so the caller learns what actually happened rather than "500".
+        self.send_json_response(409, {
+            "resource": resource,
+            "deleted": False,
+            "error": detail or ("Could not delete resource definition " + resource),
+        })
 
     # -- Host ----------------------------------------------------------
 

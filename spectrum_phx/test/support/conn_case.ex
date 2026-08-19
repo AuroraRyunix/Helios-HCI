@@ -34,4 +34,20 @@ defmodule SpectrumPhxWeb.ConnCase do
   setup _tags do
     {:ok, conn: Phoenix.ConnTest.build_conn()}
   end
+
+  @doc """
+  Put an authenticated session on the connection.
+
+  Every dashboard sits behind authentication, so a test that mounts one has to be signed
+  in. The token is resolved by the stub configured in `config/test.exs`, so this needs no
+  database.
+  """
+  def log_in(conn, username \\ "helios") do
+    conn
+    |> Phoenix.ConnTest.init_test_session(%{})
+    |> Plug.Conn.put_session(SpectrumPhxWeb.UserAuth.session_key(), test_token(username))
+  end
+
+  @doc "The token the test stub accepts."
+  def test_token(username \\ "helios"), do: "test-session-" <> username
 end

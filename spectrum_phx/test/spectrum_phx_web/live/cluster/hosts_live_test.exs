@@ -1,6 +1,9 @@
 defmodule SpectrumPhxWeb.Cluster.HostsLiveTest do
   use SpectrumPhxWeb.ConnCase
 
+  # Every dashboard sits behind authentication; sign the connection in.
+  setup %{conn: conn}, do: %{conn: log_in(conn)}
+
   import Phoenix.LiveViewTest
 
   alias SpectrumPhx.Cluster.Status
