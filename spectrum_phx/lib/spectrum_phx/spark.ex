@@ -118,8 +118,11 @@ defmodule SpectrumPhx.Spark do
 
   @doc "Parsed DRBD status, optionally for a single resource."
   def drbd_status(ip, resource \\ nil) do
-    path = if resource, do: "/api/v1/storage/drbd/status?resource=" <> resource,
-                        else: "/api/v1/storage/drbd/status"
+    path =
+      if resource,
+        do: "/api/v1/storage/drbd/status?resource=" <> resource,
+        else: "/api/v1/storage/drbd/status"
+
     get_json(ip, path)
   end
 
@@ -162,7 +165,8 @@ defmodule SpectrumPhx.Spark do
   end
 
   @doc "Ensure a storage container directory exists; returns its path."
-  def container_ensure(ip, name), do: post_json(ip, "/api/v1/storage/container/ensure", %{"name" => name})
+  def container_ensure(ip, name),
+    do: post_json(ip, "/api/v1/storage/container/ensure", %{"name" => name})
 
   @doc "Default interface, gateway and addresses for a host."
   def host_network(ip), do: get_json(ip, "/api/v1/host/network")
@@ -205,10 +209,17 @@ defmodule SpectrumPhx.Spark do
            connect_options: [transport_opts: tls_opts()],
            receive_timeout: timeout * 1000
          ) do
-      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 -> {:ok, body}
-      {:ok, %Req.Response{status: status, body: %{"error" => message}}} -> {:error, {status, message}}
-      {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
-      {:error, reason} -> {:error, reason}
+      {:ok, %Req.Response{status: status, body: body}} when status in 200..299 ->
+        {:ok, body}
+
+      {:ok, %Req.Response{status: status, body: %{"error" => message}}} ->
+        {:error, {status, message}}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:http, status}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

@@ -14,6 +14,22 @@ Nothing in `spectrum_phx/` modifies, restarts, or depends on the Python tier.
 
 ---
 
+## Toolchain
+
+Build and format with **Elixir 1.17.3 / OTP 27.1.2** -- the versions the release image
+uses (`hexpm/elixir:1.17.3-erlang-27.1.2-alpine-3.20.3`) and the versions CI pins.
+
+This matters more than it looks. A newer local toolchain has already caused two failures
+that only appeared downstream: a regex modifier that compiled on 1.20 but crashed the
+release at boot on 1.17, and formatter output that 1.20 produces and 1.17 rejects. A green
+local build is not evidence the image is good.
+
+If your local Elixir differs, format inside the same image rather than with your own:
+
+```
+podman run --rm -v "$PWD":/app:z -w /app   docker.io/hexpm/elixir:1.17.3-erlang-27.1.2-alpine-3.20.3   sh -c "apk add --no-cache git && mix local.hex --force && mix local.rebar --force          && mix deps.get && mix format"
+```
+
 ## Local development
 
 ```sh

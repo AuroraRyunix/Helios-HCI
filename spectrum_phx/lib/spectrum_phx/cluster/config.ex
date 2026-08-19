@@ -66,7 +66,10 @@ defmodule SpectrumPhx.Cluster.Config do
 
         {:error, reason} ->
           # Absent during local development; the app must still boot.
-          Logger.info("#{cluster_json_path()} unavailable (#{inspect(reason)}); using empty config.")
+          Logger.info(
+            "#{cluster_json_path()} unavailable (#{inspect(reason)}); using empty config."
+          )
+
           %{}
       end
 
