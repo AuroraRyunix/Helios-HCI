@@ -70,7 +70,14 @@ CHECK_ID_TO_FUNC = {
     "mipha_status": "service.mipha",
     "agahnim_status": "service.agahnim",
     "slate_status": "service.slate",
-    "slate_config_status": "service.slate.config"
+    "slate_config_status": "service.slate.config",
+    "zookeeper_ring_scale": "database.zookeeper.ring_scale",
+    "scylladb_quorum_safety": "database.scylladb.quorum_safety",
+    "replication_factor_vs_repair": "database.scylladb.replication_repair",
+    "mtls_cert_expiry_warning": "security.mtls.expiry_warning",
+    "flapping_service_check": "service.systemd.flapping",
+    "stale_node_registration": "database.zookeeper.node_registration",
+    "drbd_split_brain_check": "storage.drbd.split_brain"
 }
 
 def get_local_ip():
@@ -161,13 +168,16 @@ def run_node_checks(node, category, local_ip, results_dict):
                 "spectrum_privilege_check", "auth_seeding_check", "vip_binding_status",
                 "maintenance_mode_check", "vali_leader_status", "scylladb_tasks_schema",
                 "security_config_audit", "virsh_power_off_check", "stuck_tasks_check", "urbosa_compliance",
-                "ssh_known_hosts_seeding"
+                "ssh_known_hosts_seeding", "zookeeper_ring_scale", "scylladb_quorum_safety",
+                "replication_factor_vs_repair", "mtls_cert_expiry_warning", "flapping_service_check",
+                "stale_node_registration"
             ],
             "storage": [
                 "aether_peers", "aether_volume", "aether_split_brain",
                 "aether_heal_pending", "aether_storage_pools", "aether_storage_pools_space",
                 "storage_capacity", "storage_mount_options", "storage_volume_writable",
-                "fstab_safety_check", "orphaned_disks_check", "broken_disks_check"
+                "fstab_safety_check", "orphaned_disks_check", "broken_disks_check",
+                "drbd_split_brain_check"
             ],
             "hardware": [
                 "cpu_load", "ram_usage", "disk_space", "ntp_sync", "host_virtualization", "firmware_upgrades",
@@ -502,6 +512,13 @@ def show_list():
         ("storage.broken_disks", "broken_disks_check", "Verify Linstor replicas and check for stale temporary uploads in local cache"),
         ("security.auth.seeding", "auth_seeding_check", "Verify ScyllaDB authentication users table is seeded"),
         ("hardware.dns_ntp.sync", "dns_ntp_sync_check", "Verify DNS and NTP configurations are synchronized with cluster database"),
+        ("storage.drbd.split_brain", "drbd_split_brain_check", "Detect DRBD resources that are StandAlone or whose replication has diverged"),
+        ("database.scylladb.replication_repair", "replication_factor_vs_repair", "Compare hydra keyspace RF against node count and check replicas were populated by a repair"),
+        ("database.scylladb.quorum_safety", "scylladb_quorum_safety", "Verify live ScyllaDB nodes can still form a quorum at the configured RF"),
+        ("security.mtls.expiry_warning", "mtls_cert_expiry_warning", "Warn 30 days and fail 7 days before any Spark/mTLS certificate expires"),
+        ("service.systemd.flapping", "flapping_service_check", "Detect managed services crash-looping behind an 'active' systemctl status"),
+        ("database.zookeeper.ring_scale", "zookeeper_ring_scale", "Verify ZooKeeper ensemble has an odd voter count and correct observer configuration"),
+        ("database.zookeeper.node_registration", "stale_node_registration", "Verify every configured node holds a fresh ephemeral znode under /helios/nodes"),
     ]
     
     for func, check_id, desc in checks:

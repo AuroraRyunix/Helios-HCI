@@ -54,9 +54,172 @@ def is_urbosa_enabled():
     except Exception:
         return False
 
+# ---------------------------------------------------------------------------
+# Shared helpers for the diagnostic checks.
+#
+# These exist so a check can ask a question about the cluster (how many nodes are
+# configured, what the keyspace replication factor is, when a certificate expires)
+# without re-deriving it inline, and so every check can name the specific resource,
+# node or file at fault instead of reporting a bare "check failed".
+#
+# Everything here is read-only: no helper changes cluster state.
+# ---------------------------------------------------------------------------
+
+# spark-daemon refreshes each node's ephemeral znode every 5s. 30s is the same staleness
+# bound cluster_new.py renders `cluster status` with, so the CLI and Mimir agree on what
+# "stale" means rather than each picking its own number.
+NODE_STALE_AFTER = 30
+
+# systemd auto-restart counters. 3 matches spark-daemon's FLAP_RESTART_THRESHOLD: a unit
+# that has auto-restarted this many times is flapping, not running. NRestarts counts only
+# automatic restarts, so a rolling upgrade's `systemctl restart` does not inflate it.
+FLAP_WARN_RESTARTS = 3
+FLAP_FAIL_RESTARTS = 10
+
+ZK_NODES_PATH = "/helios/nodes"
+ZK_UNIT_FILE = "/etc/containers/systemd/zookeeper.container"
+MAINTENANCE_FLAG = "/etc/hci/maintenance.state"
+
+# Certificates are renewed by hand: nothing in the stack watches these expiry dates, so
+# the warning window has to be wide enough for a human to act on.
+CERT_WARN_DAYS = 30
+CERT_FAIL_DAYS = 7
+MTLS_CERT_DIRS = ["/etc/hci/spark/certs", "/root/.certs"]
+
+
+def in_maintenance():
+    return os.path.exists(MAINTENANCE_FLAG)
+
+
+def get_local_ip():
+    import socket as _socket
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def get_cluster_config():
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def get_cluster_hosts():
+    return [h for h in get_cluster_config().get("hosts", []) if h.get("ip")]
+
+
+def run_cqlsh(cql):
+    """Run one read-only CQL statement through the local ScyllaDB container."""
+    return run_cmd('podman exec -i systemd-hydra-db cqlsh %s -e "%s"' % (get_local_ip(), cql))
+
+
+def get_hydra_replication_factor():
+    """Return (rf:int|None, detail:str) for the hydra keyspace.
+
+    None means the factor could not be read. It is deliberately not defaulted to a
+    plausible number: a check that assumes RF=3 when the query failed reports fault
+    tolerance the cluster may not have, which is the exact failure this check exists for.
+    """
+    rc, out, err = run_cqlsh(
+        "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';")
+    if rc != 0:
+        return None, (err or out or "cqlsh exited %s" % rc).strip()[:300]
+    m = re.search(r"'replication_factor'\s*:\s*'?(\d+)'?", out)
+    if not m:
+        return None, "no replication_factor found in system_schema.keyspaces output: %s" % (
+            " ".join(out.split())[:200])
+    return int(m.group(1)), " ".join(out.split())[:200]
+
+
+def get_scylla_ring():
+    """Return (live, down, total, raw) from nodetool status; live is None on failure."""
+    rc, out, err = run_cmd("podman exec systemd-hydra-db nodetool status")
+    if rc != 0:
+        return None, None, None, (err or out or "nodetool status exited %s" % rc).strip()[:300]
+    live = len(re.findall(r"^U[NJLM]\s", out, re.MULTILINE))
+    down = len(re.findall(r"^D[NJLM]\s", out, re.MULTILINE))
+    return live, down, live + down, out
+
+
+def parse_nodetool_load(ring_out):
+    """Map node address -> stored bytes, parsed from `nodetool status` output."""
+    units = {"B": 1.0, "BYTES": 1.0,
+             "KB": 1024.0, "KIB": 1024.0,
+             "MB": 1024.0 ** 2, "MIB": 1024.0 ** 2,
+             "GB": 1024.0 ** 3, "GIB": 1024.0 ** 3,
+             "TB": 1024.0 ** 4, "TIB": 1024.0 ** 4}
+    loads = {}
+    for line in (ring_out or "").splitlines():
+        m = re.match(r"^U[NJLM]\s+(\S+)\s+([0-9.]+)\s*([A-Za-z]+)", line.strip())
+        if not m:
+            continue
+        factor = units.get(m.group(3).upper())
+        if factor is None:
+            continue
+        try:
+            loads[m.group(1)] = float(m.group(2)) * factor
+        except ValueError:
+            pass
+    return loads
+
+
+def cert_expiry_epoch(cert_path):
+    """Return (epoch:int|None, detail:str) for a certificate's notAfter date.
+
+    ssl.cert_time_to_seconds parses OpenSSL's date format without a locale dependency;
+    strptime is the fallback. A date that cannot be parsed returns None so the caller
+    reports the certificate as unverified rather than silently treating it as valid.
+    """
+    rc, out, err = run_cmd("openssl x509 -enddate -noout -in '%s'" % cert_path)
+    if rc != 0 or "notAfter=" not in out:
+        return None, (err or out or "openssl produced no notAfter field").strip()[:200]
+    date_str = out.split("notAfter=", 1)[1].strip().splitlines()[0].strip()
+    try:
+        import ssl as _ssl
+        return int(_ssl.cert_time_to_seconds(date_str)), date_str
+    except Exception:
+        pass
+    try:
+        import calendar
+        from datetime import datetime
+        dt = datetime.strptime(date_str.replace("GMT", "").strip(), "%b %d %H:%M:%S %Y")
+        return int(calendar.timegm(dt.timetuple())), date_str
+    except Exception as ex:
+        return None, "unparseable notAfter '%s' (%s)" % (date_str, ex)
+
+
+def load_helios_zk():
+    """Import the shared ZooKeeper client from wherever it was deployed, or None."""
+    try:
+        import helios_zk
+        return helios_zk
+    except ImportError:
+        pass
+    try:
+        import importlib.util
+        import importlib.machinery
+        for candidate in ("/usr/local/bin/helios_zk.py", "/usr/local/bin/helios_zk"):
+            if os.path.exists(candidate):
+                loader = importlib.machinery.SourceFileLoader("helios_zk", candidate)
+                spec = importlib.util.spec_from_loader("helios_zk", loader)
+                mod = importlib.util.module_from_spec(spec)
+                loader.exec_module(mod)
+                return mod
+    except Exception:
+        pass
+    return None
+
+
 def check_services(category):
     results = {}
-    
+
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
     in_maint = os.path.exists("/etc/hci/maintenance.state")
@@ -1133,6 +1296,546 @@ def check_services(category):
         "output": msg
     }
 
+    # 37. ZooKeeper Ensemble Scale & Observer Configuration Check
+    # An even voting count buys no fault tolerance, and a node whose ZOO_SERVERS entry
+    # disagrees with its own ZOO_PEER_TYPE votes (or abstains) against the ensemble's
+    # intent -- both silently change where consensus can be reached.
+    update_current_check(category, "zookeeper_ring_scale")
+    try:
+        hosts_cfg = get_cluster_hosts()
+        node_count = len(hosts_cfg)
+        node_ips = ", ".join(h.get("ip", "?") for h in hosts_cfg) or "none configured"
+
+        if not os.path.exists(ZK_UNIT_FILE):
+            status = "WARN"
+            msg = (f"ZooKeeper unit {ZK_UNIT_FILE} does not exist on this node, so ensemble "
+                   f"membership and observer configuration cannot be verified from here.")
+        else:
+            with open(ZK_UNIT_FILE, "r") as f:
+                unit_text = f.read()
+
+            my_id = None
+            m_id = re.search(r"ZOO_MY_ID=(\d+)", unit_text)
+            if m_id:
+                my_id = int(m_id.group(1))
+
+            # provision.py writes "ZOO_SERVERS=..." and cluster_new.py writes
+            # ZOO_SERVERS="..."; matching the server.N entries directly handles both.
+            entries = [(int(i), ip, bool(obs)) for i, ip, obs in
+                       re.findall(r"server\.(\d+)=([^:\s\"]+):\d+:\d+(:observer)?;", unit_text)]
+            voters = [(i, ip) for i, ip, obs in entries if not obs]
+            observers = [(i, ip) for i, ip, obs in entries if obs]
+            local_is_observer = "ZOO_PEER_TYPE=observer" in unit_text
+
+            issues = []
+            warns = []
+
+            if not entries:
+                # No server.N entries at all: the container runs standalone.
+                if node_count <= 1:
+                    status = "PASS"
+                    msg = ("Single-node cluster: ZooKeeper runs standalone with no ensemble "
+                           "membership, so there is no voting quorum to size. This is the correct "
+                           "configuration for one node.")
+                else:
+                    status = "FAIL"
+                    msg = (f"{node_count} nodes are configured in /etc/hci/cluster.json ({node_ips}) "
+                           f"but this node's ZooKeeper unit declares no ensemble members: it is running "
+                           f"standalone and is not participating in cluster consensus.")
+            else:
+                if node_count > 0 and len(entries) != node_count:
+                    issues.append(
+                        f"the ensemble declares {len(entries)} server(s) but /etc/hci/cluster.json "
+                        f"defines {node_count} node(s) ({node_ips}); ZOO_SERVERS is out of sync with "
+                        f"the cluster topology, so at least one node is missing from consensus")
+
+                if my_id is not None:
+                    mine = [(i, ip, obs) for i, ip, obs in entries if i == my_id]
+                    if not mine:
+                        issues.append(
+                            f"this node advertises ZOO_MY_ID={my_id} but the ensemble has no "
+                            f"server.{my_id} entry, so it cannot join the quorum it is configured for")
+                    else:
+                        _, my_ip, my_obs = mine[0]
+                        if my_obs != local_is_observer:
+                            issues.append(
+                                f"node {my_ip} (server.{my_id}) is declared "
+                                f"{'an observer' if my_obs else 'a voting member'} in ZOO_SERVERS but "
+                                f"its ZOO_PEER_TYPE says "
+                                f"{'observer' if local_is_observer else 'participant'}; the ensemble "
+                                f"and the node disagree about whether it votes")
+
+                voter_count = len(voters)
+                if voter_count and voter_count % 2 == 0:
+                    tolerated = voter_count - (voter_count // 2 + 1)
+                    warns.append(
+                        f"the ensemble has {voter_count} voting members "
+                        f"({', '.join(ip for _, ip in voters)}): quorum is {voter_count // 2 + 1}, so it "
+                        f"tolerates {tolerated} failure(s) -- exactly what {voter_count - 1} voters "
+                        f"would tolerate. The extra voter adds cost and no availability; use an odd "
+                        f"number of voting members")
+
+                if voter_count > 7:
+                    warns.append(
+                        f"{voter_count} voting members is beyond the practical Zab write-quorum size; "
+                        f"keep 3 (or at most 5) voters and configure the remaining nodes as observers")
+
+                if node_count > 3 and voter_count != 3:
+                    warns.append(
+                        f"this {node_count}-node cluster has {voter_count} voting member(s) and "
+                        f"{len(observers)} observer(s); nodes beyond the third are expected to be "
+                        f"observers (3 voters), otherwise every write waits on a larger quorum")
+
+                if issues:
+                    status = "FAIL"
+                    msg = "ZooKeeper ensemble configuration is unsafe:\n- " + "\n- ".join(issues)
+                    if warns:
+                        msg += "\nAdditional warnings:\n- " + "\n- ".join(warns)
+                elif warns:
+                    status = "WARN"
+                    msg = "ZooKeeper ensemble scale warnings:\n- " + "\n- ".join(warns)
+                else:
+                    status = "PASS"
+                    msg = (f"ZooKeeper ensemble is correctly scaled: {len(voters)} voting member(s) "
+                           f"({', '.join(ip for _, ip in voters)})"
+                           + (f" and {len(observers)} observer(s) "
+                              f"({', '.join(ip for _, ip in observers)})" if observers else "")
+                           + f", quorum {len(voters) // 2 + 1}, across {node_count} configured node(s).")
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running ZooKeeper ensemble scale check: {str(e)}"
+    results["zookeeper_ring_scale"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 38. ScyllaDB Quorum Safety Check
+    # Answers one question an operator asks before every maintenance window: if this node
+    # goes down, does the database keep serving quorum operations?
+    update_current_check(category, "scylladb_quorum_safety")
+    try:
+        hosts_cfg = get_cluster_hosts()
+        node_count = len(hosts_cfg)
+        rf, rf_detail = get_hydra_replication_factor()
+        maint = in_maintenance()
+
+        if rf is None:
+            status = "WARN"
+            msg = ("Could not read the replication factor of keyspace 'hydra', so quorum safety "
+                   f"cannot be evaluated: {rf_detail}")
+        elif node_count <= 1:
+            status = "PASS"
+            msg = (f"Single-node cluster with RF={rf}: quorum is this node alone, so there is no "
+                   "quorum redundancy to lose. Stopping the only node stops the database, which is "
+                   "expected on a one-node cluster rather than a fault.")
+        else:
+            live, down, total, ring_raw = get_scylla_ring()
+            if live is None:
+                status = "WARN"
+                msg = ("Could not read the ScyllaDB ring, so quorum safety cannot be evaluated: "
+                       f"{ring_raw}")
+            else:
+                quorum = rf // 2 + 1
+                node_ips = ", ".join(h.get("ip", "?") for h in hosts_cfg)
+                if live < quorum:
+                    # In a maintenance window this is the expected cost of the window, not news.
+                    status = "WARN" if maint else "FAIL"
+                    msg = (f"ScyllaDB cannot form a quorum: {live} of {total} ring node(s) are live "
+                           f"(UN) but RF={rf} requires {quorum} replica(s) for QUORUM. Quorum reads "
+                           f"and writes against keyspace 'hydra' are failing right now"
+                           + (" (this host is in maintenance mode, so it is expected for the duration "
+                              "of the window)." if maint else ".")
+                           + f"\nConfigured nodes: {node_ips}\n{ring_raw}")
+                elif live - 1 < quorum:
+                    status = "WARN"
+                    msg = (f"ScyllaDB has no quorum headroom: {live} live node(s) at RF={rf} where "
+                           f"QUORUM needs {quorum}. Taking any single node into maintenance leaves "
+                           f"{live - 1} live node(s) and freezes quorum operations on keyspace "
+                           f"'hydra' until it returns. Daruk degrades reads to consistency level ONE, "
+                           f"but quorum writes will fail.\nConfigured nodes: {node_ips}\n{ring_raw}")
+                else:
+                    status = "PASS"
+                    msg = (f"ScyllaDB quorum is safe: {live} of {total} node(s) live at RF={rf} "
+                           f"(QUORUM needs {quorum}); {live - quorum} node(s) can enter maintenance "
+                           f"before quorum is lost.")
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running ScyllaDB quorum safety check: {str(e)}"
+    results["scylladb_quorum_safety"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 39. Replication Factor vs Repair Check
+    # ALTER KEYSPACE is instant and system_schema reports the new factor immediately, but
+    # existing data is not copied to the new replicas until a repair runs. Until then the
+    # cluster reports fault tolerance it does not have.
+    update_current_check(category, "replication_factor_vs_repair")
+    try:
+        cfg = get_cluster_config()
+        hosts_cfg = [h for h in cfg.get("hosts", []) if h.get("ip")]
+        node_count = len(hosts_cfg)
+        try:
+            ftt = int(cfg.get("redundancy_factor", 1))
+        except (TypeError, ValueError):
+            ftt = 1
+        rf, rf_detail = get_hydra_replication_factor()
+        # Same derivation spectrum_server.py uses: one replica per tolerated failure plus
+        # the original, capped by the number of nodes that can actually hold one.
+        expected_rf = min(node_count, ftt + 1) if node_count > 1 else 1
+
+        if rf is None:
+            status = "WARN"
+            msg = f"Could not read the replication factor of keyspace 'hydra': {rf_detail}"
+        elif node_count <= 1:
+            if rf <= 1:
+                status = "PASS"
+                msg = (f"Single-node cluster (redundancy_factor={ftt}): keyspace 'hydra' is RF={rf}, "
+                       "the only correct value for one node. Repair is not applicable here -- there "
+                       "is no second replica to stream to.")
+            else:
+                status = "WARN"
+                msg = (f"Keyspace 'hydra' is RF={rf} but this cluster has a single node. Scylla "
+                       f"accepts the ALTER, yet {rf - 1} replica(s) can never be placed, so the "
+                       f"keyspace reports fault tolerance that does not exist. Set RF=1 or add nodes.")
+        else:
+            findings = []
+            critical = False
+
+            if rf == 1 and expected_rf > 1:
+                critical = True
+                findings.append(
+                    f"keyspace 'hydra' is RF=1 on a {node_count}-node cluster configured for "
+                    f"redundancy_factor={ftt} (expected RF={expected_rf}). Every partition lives on "
+                    f"exactly one node, so losing any node loses the cluster metadata it owned: the "
+                    f"cluster is reporting fault tolerance it does not have")
+            elif rf == 1:
+                findings.append(
+                    f"keyspace 'hydra' is RF=1 across {node_count} nodes. redundancy_factor={ftt} "
+                    f"means this is deliberate, but the database has no fault tolerance: losing any "
+                    f"node loses the metadata it owned")
+
+            if rf > node_count:
+                findings.append(
+                    f"keyspace 'hydra' is RF={rf} but only {node_count} node(s) are configured "
+                    f"({', '.join(h.get('ip', '?') for h in hosts_cfg)}), so {rf - node_count} "
+                    f"replica(s) can never be placed")
+            elif rf < expected_rf:
+                findings.append(
+                    f"keyspace 'hydra' is RF={rf} but redundancy_factor={ftt} over {node_count} "
+                    f"nodes calls for RF={expected_rf}")
+
+            # Repair evidence. With RF >= node count every live node must hold a full copy of
+            # the keyspace, so a node carrying a fraction of what its peers carry is what an
+            # RF increase without a subsequent repair looks like from the outside.
+            repair_note = ""
+            live, down, total, ring_raw = get_scylla_ring()
+            loads = parse_nodetool_load(ring_raw) if live else {}
+            if rf > 1 and rf >= node_count and len(loads) > 1:
+                max_ip = max(loads, key=lambda k: loads[k])
+                min_ip = min(loads, key=lambda k: loads[k])
+                max_load, min_load = loads[max_ip], loads[min_ip]
+                # Under ~64 MiB the load is dominated by system tables and commitlog noise,
+                # where the ratio between nodes carries no signal.
+                if max_load > 64 * 1024 ** 2 and min_load < max_load * 0.5:
+                    findings.append(
+                        f"node {min_ip} holds {min_load / 1024 ** 3:.2f} GiB while {max_ip} holds "
+                        f"{max_load / 1024 ** 3:.2f} GiB, yet RF={rf} over {node_count} node(s) means "
+                        f"every node should hold a full copy. This is what raising RF without a "
+                        f"subsequent repair looks like; run 'podman exec systemd-hydra-db nodetool "
+                        f"repair -pr hydra' on each node")
+                else:
+                    repair_note = (f"\nReplica loads are even across the ring "
+                                   f"({min_load / 1024 ** 2:.0f} MiB on {min_ip} to "
+                                   f"{max_load / 1024 ** 2:.0f} MiB on {max_ip}), which is consistent "
+                                   f"with a repaired keyspace.")
+            elif rf > 1:
+                repair_note = ("\nNote: replica population could not be compared on this topology, so "
+                               "a repair following an RF increase cannot be confirmed from here.")
+
+            if critical:
+                status = "FAIL"
+            elif findings:
+                status = "WARN"
+            else:
+                status = "PASS"
+
+            if findings:
+                msg = "Replication factor audit:\n- " + "\n- ".join(findings) + repair_note
+            else:
+                msg = (f"Keyspace 'hydra' is RF={rf} across {node_count} node(s) with "
+                       f"redundancy_factor={ftt} (expected RF={expected_rf})." + repair_note)
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running replication factor vs repair check: {str(e)}"
+    results["replication_factor_vs_repair"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 40. mTLS Certificate Expiry Warning
+    # Nothing in the stack renews these. Every mTLS call between nodes stops working the
+    # day they lapse, so the window has to be wide enough for a human to act on.
+    update_current_check(category, "mtls_cert_expiry_warning")
+    try:
+        expired, critical_certs, expiring, healthy, unverified = [], [], [], [], []
+        now = time.time()
+
+        for cert_dir in MTLS_CERT_DIRS:
+            if not os.path.isdir(cert_dir):
+                unverified.append(f"certificate directory {cert_dir} does not exist on this node")
+                continue
+            try:
+                names = sorted(n for n in os.listdir(cert_dir)
+                               if n.endswith(".crt") or n.endswith(".pem"))
+            except Exception as ex:
+                unverified.append(f"cannot list {cert_dir}: {str(ex)}")
+                continue
+            if not names:
+                unverified.append(f"no certificates (*.crt / *.pem) found in {cert_dir}")
+                continue
+
+            for name in names:
+                path = os.path.join(cert_dir, name)
+                epoch, detail = cert_expiry_epoch(path)
+                if epoch is None:
+                    unverified.append(f"{path}: {detail}")
+                    continue
+                days = (epoch - now) / 86400.0
+                if days < 0:
+                    expired.append(f"{path} EXPIRED {abs(days):.1f} days ago (notAfter={detail})")
+                elif days < CERT_FAIL_DAYS:
+                    critical_certs.append(
+                        f"{path} expires in {days:.1f} days (notAfter={detail})")
+                elif days < CERT_WARN_DAYS:
+                    expiring.append(f"{path} expires in {days:.1f} days (notAfter={detail})")
+                else:
+                    healthy.append(f"{path} valid for {days:.0f} more days")
+
+        renewal_hint = ("\nThere is no renewal daemon: these certificates are reissued by hand, so "
+                        "they must be replaced before the date above.")
+        if expired or critical_certs:
+            status = "FAIL"
+            msg = ("mTLS certificate expiry is critical:\n- "
+                   + "\n- ".join(expired + critical_certs) + renewal_hint)
+            if expiring or unverified:
+                msg += "\nAlso noted:\n- " + "\n- ".join(expiring + unverified)
+        elif expiring:
+            status = "WARN"
+            msg = (f"mTLS certificate(s) expiring within {CERT_WARN_DAYS} days:\n- "
+                   + "\n- ".join(expiring) + renewal_hint)
+            if unverified:
+                msg += "\nAlso noted:\n- " + "\n- ".join(unverified)
+        elif unverified:
+            status = "WARN"
+            msg = ("Some mTLS certificates could not be checked for expiry:\n- "
+                   + "\n- ".join(unverified))
+            if healthy:
+                msg += "\nVerified as valid:\n- " + "\n- ".join(healthy)
+        elif healthy:
+            status = "PASS"
+            msg = (f"All {len(healthy)} certificate(s) under {', '.join(MTLS_CERT_DIRS)} are valid "
+                   f"for more than {CERT_WARN_DAYS} days:\n- " + "\n- ".join(healthy))
+        else:
+            status = "WARN"
+            msg = (f"No certificates were found to check under {', '.join(MTLS_CERT_DIRS)}, so mTLS "
+                   f"certificate expiry could not be verified on this node.")
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running mTLS certificate expiry check: {str(e)}"
+    results["mtls_cert_expiry_warning"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 41. Flapping Service Check
+    # `systemctl is-active` returns "active" during each restart window of a unit with
+    # Restart=always, so a unit failing in a loop samples as healthy roughly half the time.
+    # NRestarts counts only automatic restarts, which makes the flapping visible.
+    update_current_check(category, "flapping_service_check")
+    try:
+        managed = ["zookeeper", "hydra-db", "daruk", "aether", "linstor-controller",
+                   "spark-daemon", "spectrum", "slate", "agahnim", "catalyst", "vali",
+                   "bifrost", "dagur", "mimir", "logos", "mipha", "gatoway", "hylia",
+                   "libvirtd"]
+        if urbosa_active:
+            managed.append("urbosa")
+
+        maint = in_maintenance()
+        crash_looping, flapping, absent, quiet = [], [], [], []
+
+        for svc in managed:
+            rc_f, out_f, err_f = run_cmd(
+                "systemctl show -p LoadState -p ActiveState -p SubState -p NRestarts "
+                "-p MainPID -p Result " + svc)
+            if rc_f != 0 and not out_f:
+                absent.append(f"{svc}: could not read restart counters ({err_f or 'no output'})")
+                continue
+
+            props = {}
+            for line in out_f.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k.strip()] = v.strip()
+
+            if props.get("LoadState") == "not-found":
+                # Not every node runs every unit; a unit that was never installed is not a fault.
+                continue
+
+            try:
+                n_restarts = int(props.get("NRestarts", "0") or 0)
+            except ValueError:
+                n_restarts = 0
+            active_state = props.get("ActiveState", "unknown")
+            sub_state = props.get("SubState", "unknown")
+            main_pid = props.get("MainPID", "0")
+            result = props.get("Result", "success")
+
+            detail = (f"{svc}: {n_restarts} automatic restart(s) "
+                      f"(ActiveState={active_state}, SubState={sub_state}, "
+                      f"MainPID={main_pid}, Result={result})")
+
+            # The exact shape of the hylia incident: systemd reports the unit active while
+            # it has no main process, because the sample landed inside a restart window.
+            mid_respawn = (active_state in ("active", "activating") and main_pid in ("0", "")
+                           and n_restarts >= FLAP_WARN_RESTARTS and not maint)
+
+            if n_restarts >= FLAP_FAIL_RESTARTS or mid_respawn:
+                crash_looping.append(
+                    detail + (" - reported active with no main process, i.e. sampled inside a "
+                              "restart window" if mid_respawn else " - crash-looping"))
+            elif n_restarts >= FLAP_WARN_RESTARTS:
+                flapping.append(detail)
+            elif n_restarts > 0:
+                quiet.append(f"{svc}: {n_restarts} restart(s)")
+
+        if crash_looping:
+            status = "FAIL"
+            msg = ("Service(s) are crash-looping; a status of 'active' from systemctl is not "
+                   "evidence they are running:\n- " + "\n- ".join(crash_looping))
+            if flapping:
+                msg += "\nAlso restarting repeatedly:\n- " + "\n- ".join(flapping)
+        elif flapping:
+            status = "WARN"
+            msg = (f"Service(s) have auto-restarted at least {FLAP_WARN_RESTARTS} times:\n- "
+                   + "\n- ".join(flapping))
+        elif absent:
+            status = "WARN"
+            msg = "Restart counters could not be read for some units:\n- " + "\n- ".join(absent)
+        else:
+            status = "PASS"
+            msg = (f"No managed service is flapping: all {len(managed)} unit(s) are below "
+                   f"{FLAP_WARN_RESTARTS} automatic restarts.")
+            if quiet:
+                msg += "\nUnits with a small restart history:\n- " + "\n- ".join(quiet)
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running flapping service check: {str(e)}"
+    results["flapping_service_check"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 42. Stale Node Registration Check
+    # Each node holds an ephemeral znode under /helios/nodes refreshed every 5s. A node
+    # configured in cluster.json whose znode is missing or stale is not publishing state,
+    # so anything reading that tree (cluster status, the reconcile loop) is working from a
+    # cluster view that no longer includes it.
+    update_current_check(category, "stale_node_registration")
+    client = None
+    try:
+        zkmod = load_helios_zk()
+        hosts_cfg = get_cluster_hosts()
+        configured = [h.get("ip") for h in hosts_cfg if h.get("ip")]
+        hostname_by_ip = {h.get("ip"): h.get("hostname", "") for h in hosts_cfg}
+
+        if zkmod is None:
+            status = "WARN"
+            msg = ("The helios_zk client is not deployed on this node "
+                   "(/usr/local/bin/helios_zk.py), so node registrations in ZooKeeper cannot be "
+                   "verified from here.")
+        elif not configured:
+            status = "WARN"
+            msg = ("No hosts are configured in /etc/hci/cluster.json, so there is no expected node "
+                   "set to compare the ZooKeeper registrations against.")
+        else:
+            zk_hosts = ["127.0.0.1"] + [ip for ip in configured if ip != "127.0.0.1"]
+            client = zkmod.connect(zk_hosts, timeout=3.0)
+            registered = {}
+            try:
+                for name in client.get_children(ZK_NODES_PATH):
+                    try:
+                        registered[name] = json.loads(
+                            client.get(ZK_NODES_PATH + "/" + name).decode("utf-8"))
+                    except Exception:
+                        registered[name] = {}
+            except Exception:
+                # The tree not existing yet is a real answer: nothing has registered.
+                registered = {}
+
+            now = int(time.time())
+            missing, stale, unexpected, fresh = [], [], [], []
+
+            for ip in configured:
+                label = f"{hostname_by_ip.get(ip) or 'node'} ({ip})"
+                if ip not in registered:
+                    missing.append(
+                        f"{label} is configured in cluster.json but has no ephemeral znode under "
+                        f"{ZK_NODES_PATH}; its session is gone or spark-daemon is not publishing")
+                    continue
+                data = registered[ip] or {}
+                try:
+                    ts = int(data.get("ts", 0) or 0)
+                except (TypeError, ValueError):
+                    ts = 0
+                age = now - ts
+                if ts <= 0:
+                    stale.append(f"{label} has a znode carrying no publish timestamp")
+                elif age > NODE_STALE_AFTER:
+                    stale.append(
+                        f"{label} last published {age}s ago (stale beyond {NODE_STALE_AFTER}s); "
+                        f"maintenance_status={data.get('maintenance_status', 'unknown')}")
+                else:
+                    fresh.append(f"{label} published {age}s ago")
+
+            for name in registered:
+                if name not in configured:
+                    unexpected.append(
+                        f"{name} holds a znode under {ZK_NODES_PATH} but is not configured in "
+                        f"/etc/hci/cluster.json")
+
+            maint = in_maintenance()
+            if missing:
+                # During a maintenance window nodes are expected to come and go.
+                status = "WARN" if maint else "FAIL"
+                msg = "Node registration in ZooKeeper is incomplete:\n- " + "\n- ".join(missing)
+                if maint:
+                    msg += ("\nThis host is in maintenance mode, so registrations are expected to "
+                            "churn for the duration of the window.")
+                if stale or unexpected:
+                    msg += "\nAlso noted:\n- " + "\n- ".join(stale + unexpected)
+            elif stale or unexpected:
+                status = "WARN"
+                msg = "Node registration warnings:\n- " + "\n- ".join(stale + unexpected)
+            else:
+                status = "PASS"
+                msg = (f"All {len(configured)} configured node(s) hold a fresh ephemeral znode under "
+                       f"{ZK_NODES_PATH} (within {NODE_STALE_AFTER}s):\n- " + "\n- ".join(fresh))
+    except Exception as e:
+        status = "WARN"
+        msg = (f"Could not verify node registrations in ZooKeeper: {str(e)}. The ZooKeeper service "
+               f"checks own the verdict on ZooKeeper itself.")
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+    results["stale_node_registration"] = {
+        "status": status,
+        "output": msg
+    }
+
     return results
 
 def check_storage(category):
@@ -1601,6 +2304,156 @@ def check_storage(category):
             "status": "FAIL",
             "output": f"Error during broken disks check: {str(e)}"
         }
+
+    # 13. DRBD Split-Brain / Diverged Replication Check
+    #
+    # A StandAlone connection means the two sides stopped replicating and each may have
+    # accepted writes the other has not seen. Resolving that is a per-resource question
+    # about which copy is authoritative, and it must be answered by an operator or by
+    # evidence from the resource itself -- never by a cluster-wide role such as the
+    # ZooKeeper leader, which says nothing about who holds the live data.
+    update_current_check(category, "drbd_split_brain_check")
+    try:
+        rc_d, out_d, err_d = run_cmd("drbdsetup status --json")
+        source = "host"
+        if rc_d != 0 or not out_d.strip():
+            rc_d, out_d, err_d = run_cmd(
+                "podman exec systemd-aether drbdsetup status --json")
+            source = "systemd-aether container"
+
+        # States that mean the two sides are not replicating and may have diverged.
+        DIVERGED = ("StandAlone",)
+        DEGRADED_CONN = ("Connecting", "Unconnected", "Disconnecting", "NetworkFailure",
+                         "ProtocolError", "BrokenPipe", "Timeout", "TearDown")
+        BAD_DISK = ("Failed", "Diskless", "DUnknown", "Inconsistent", "Outdated",
+                    "Attaching", "Detaching", "Negotiating")
+
+        if rc_d != 0 or not out_d.strip():
+            status = "WARN"
+            msg = ("DRBD replication state could not be read: drbdsetup is unavailable both on the "
+                   f"host and inside systemd-aether ({(err_d or out_d or 'no output').strip()[:300]}). "
+                   "Split-brain cannot be ruled out from here.")
+        else:
+            parsed = None
+            try:
+                parsed = json.loads(out_d)
+            except Exception:
+                parsed = None
+
+            if parsed is None:
+                # Text fallback: the JSON view is unavailable, but a StandAlone resource is
+                # still visible in the plain status output and must not go unreported.
+                rc_t, out_t, err_t = run_cmd("drbdadm status")
+                if rc_t != 0 or not out_t.strip():
+                    rc_t, out_t, err_t = run_cmd("podman exec systemd-aether drbdadm status")
+                if rc_t == 0 and "StandAlone" in out_t:
+                    status = "FAIL"
+                    msg = ("DRBD reports a StandAlone resource (split-brain or a severed "
+                           "replication link). Machine-readable status was unavailable, so the "
+                           "raw output is reproduced below:\n" + out_t)
+                elif rc_t == 0:
+                    status = "WARN"
+                    msg = ("DRBD JSON status could not be parsed, so only a text scan was possible. "
+                           "No StandAlone resource appeared in it:\n" + out_t)
+                else:
+                    status = "WARN"
+                    msg = ("DRBD status is unreadable in both JSON and text form: "
+                           f"{(err_t or out_t or 'no output').strip()[:300]}")
+            else:
+                split_brain, degraded, disk_issues, healthy = [], [], [], []
+
+                for resource in parsed:
+                    rname = resource.get("name", "unknown")
+                    role = resource.get("role", "Unknown")
+
+                    for dev in resource.get("devices", []):
+                        dstate = dev.get("disk-state", "Unknown")
+                        if dstate in BAD_DISK:
+                            disk_issues.append(
+                                f"resource '{rname}' volume {dev.get('volume', 0)} has local "
+                                f"disk-state {dstate} (local role {role})")
+
+                    connections = resource.get("connections", [])
+                    for conn in connections:
+                        peer = conn.get("name") or f"peer-node-id {conn.get('peer-node-id', '?')}"
+                        cstate = conn.get("connection") or conn.get("connection-state") or "Unknown"
+                        peer_role = conn.get("peer-role", "Unknown")
+
+                        if cstate in DIVERGED:
+                            if role == "Primary" and peer_role == "Primary":
+                                split_brain.append(
+                                    f"resource '{rname}' is StandAlone with BOTH sides Primary "
+                                    f"(local and peer '{peer}'): each side has been accepting writes "
+                                    f"the other has not seen. Do not let anything auto-discard here; "
+                                    f"the surviving copy must be chosen from the data, not from a "
+                                    f"cluster-wide role")
+                            else:
+                                split_brain.append(
+                                    f"resource '{rname}' connection to peer '{peer}' is StandAlone "
+                                    f"(local role {role}, peer role {peer_role}): replication has "
+                                    f"stopped and the copies may have diverged")
+                        elif cstate in DEGRADED_CONN:
+                            degraded.append(
+                                f"resource '{rname}' connection to peer '{peer}' is {cstate} "
+                                f"(local role {role}, peer role {peer_role})")
+
+                        for pdev in conn.get("peer_devices", []):
+                            vol = pdev.get("volume", 0)
+                            repl = pdev.get("replication-state", "Unknown")
+                            pdisk = pdev.get("peer-disk-state", "Unknown")
+                            if repl in ("SyncTarget", "SyncSource"):
+                                # A resync in progress is expected work, not divergence.
+                                degraded.append(
+                                    f"resource '{rname}' volume {vol} is resyncing with peer "
+                                    f"'{peer}' ({repl}, {pdev.get('out-of-sync', 0)} KiB out of sync)")
+                            elif repl == "Off" and cstate not in DIVERGED:
+                                degraded.append(
+                                    f"resource '{rname}' volume {vol} has replication Off toward "
+                                    f"peer '{peer}' while the connection reports {cstate}")
+                            elif pdisk in BAD_DISK and repl not in ("SyncTarget", "SyncSource"):
+                                disk_issues.append(
+                                    f"resource '{rname}' volume {vol} reports peer '{peer}' "
+                                    f"disk-state {pdisk} (replication {repl})")
+
+                    if not connections:
+                        # A resource with no peers is normal on a single-node cluster and for
+                        # single-replica placements, so it is reported, not flagged.
+                        healthy.append(
+                            f"'{rname}' (role {role}) has no replication peers on this node")
+                    else:
+                        healthy.append(
+                            f"'{rname}' (role {role}) with {len(connections)} peer connection(s)")
+
+                if not parsed:
+                    status = "PASS"
+                    msg = ("No DRBD resources are configured on this node, so there is no "
+                           "replication state that could be split-brain.")
+                elif split_brain:
+                    status = "FAIL"
+                    msg = ("DRBD SPLIT-BRAIN / diverged replication detected:\n- "
+                           + "\n- ".join(split_brain))
+                    if degraded or disk_issues:
+                        msg += "\nAlso noted:\n- " + "\n- ".join(degraded + disk_issues)
+                elif disk_issues:
+                    status = "WARN"
+                    msg = "DRBD replica disk states need attention:\n- " + "\n- ".join(disk_issues)
+                    if degraded:
+                        msg += "\nAlso noted:\n- " + "\n- ".join(degraded)
+                elif degraded:
+                    status = "WARN"
+                    msg = ("DRBD replication is not fully established:\n- " + "\n- ".join(degraded))
+                else:
+                    status = "PASS"
+                    msg = (f"All {len(parsed)} DRBD resource(s) are replicating normally with no "
+                           f"StandAlone or diverged connection (read from {source}):\n- "
+                           + "\n- ".join(healthy))
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running DRBD split-brain check: {str(e)}"
+    results["drbd_split_brain_check"] = {
+        "status": status,
+        "output": msg
+    }
 
     return results
 
