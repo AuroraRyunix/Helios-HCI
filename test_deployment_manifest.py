@@ -262,5 +262,49 @@ class TestLineEndings(unittest.TestCase):
         )
 
 
+
+class WorkflowFilesTest(unittest.TestCase):
+    """GitHub Actions workflows must parse, or CI silently never runs.
+
+    A workflow that fails to parse reports as a failed run with zero jobs and no logs,
+    which is easy to mistake for a flaky runner. This caught a stray carriage return
+    embedded mid-comment: YAML treats a bare CR as a line break, so the remainder of the
+    comment became a syntax error on the following line.
+    """
+
+    def _workflow_paths(self):
+        root = os.path.join(REPO_ROOT, ".github", "workflows")
+        if not os.path.isdir(root):
+            return []
+        return [os.path.join(root, f) for f in os.listdir(root)
+                if f.endswith((".yml", ".yaml"))]
+
+    def test_workflows_contain_no_stray_carriage_returns(self):
+        offenders = []
+        for path in self._workflow_paths():
+            raw = open(path, "rb").read()
+            if bytes([13]) in raw:
+                offenders.append(os.path.basename(path))
+        self.assertEqual(
+            [], offenders,
+            "Workflow files contain carriage returns. YAML treats a bare CR as a line "
+            "break, so this corrupts the document and the workflow fails to start: "
+            + ", ".join(offenders))
+
+    def test_workflows_parse_as_yaml(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("pyyaml not installed; workflow parsing not verified")
+        for path in self._workflow_paths():
+            with self.subTest(workflow=os.path.basename(path)):
+                try:
+                    doc = yaml.safe_load(open(path, encoding="utf-8").read())
+                except Exception as exc:
+                    self.fail(f"{os.path.basename(path)} is not valid YAML: {exc}")
+                self.assertIsInstance(doc, dict, "workflow must be a mapping")
+                self.assertIn("jobs", doc, "workflow defines no jobs")
+                self.assertTrue(doc["jobs"], "workflow defines an empty jobs map")
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,9 @@ name: CI
 
 # The repo previously had no CI at all, and several defects reached the tree that a
 # compile or an import check would have caught: an IndentationError inside an embedded
-# script that broke cluster creation for months, a function called but never defined, and
-# a CRLF working tree that shipped `#!/usr/bin/env python3` to every node.
+# script that broke cluster creation for months, a function called but never defined,
+# and a CRLF working tree that shipped carriage returns in every shebang, so no script
+# on any node could exec.
 #
 # Every job here is chosen to catch a failure that has actually happened.
 
