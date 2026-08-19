@@ -84,6 +84,8 @@ Helios-HCI/
 ├── docs/                 # Architecture guides, per-daemon narrative/technical docs, audit backlog
 │   └── history/          # Superseded point-in-time changelogs (walkthrough.md, task.md, readme_old.md)
 ├── slate_config/         # Traefik ("Slate") static + dynamic config (traefik.yml, dynamic.yml)
+├── spectrum_phx/          # Phoenix LiveView console (the Spectrum rewrite) -- see docs/spectrum_phx.md
+│   └── quadlet/          # spectrum-phx.container, the Quadlet unit for the built image
 ├── static/                # WebUI frontend (vanilla HTML/CSS/JS), no build step
 │   ├── novnc/            # Vendored noVNC client
 │   ├── spice-html5/       # Vendored SPICE-HTML5 client
@@ -122,6 +124,7 @@ Helios-HCI/
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed replicated block storage engine (replaced an earlier GlusterFS-based design). |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
+| [Spectrum (Phoenix)](./docs/spectrum_phx.md) | **Prism** | Podman + Elixir/Phoenix LiveView | The console rewrite, running beside the Python tier on port 8444 and taking over routes as they are ported. Renders server-side and never touches the data path. |
 | [Catalyst](./docs/catalyst.md) | **Task Orchestrator** | Native Python service | Centralized task manager scheduling and tracking long-running asynchronous cluster operations. |
 | [Slate](./docs/slate.md) | **Edge Ingress / Reverse Proxy** | Podman + Traefik | High-performance edge reverse proxy routing WebUI, API, VNC, and SPICE console traffic same-origin on port 443. |
 | [Vali](./docs/vali.md) | **Acropolis VM Manager** | Native Python service | Dynamic VM placement scheduler, load balancer, and Distributed Resource Scheduler (DRS). |

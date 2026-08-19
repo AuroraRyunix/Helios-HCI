@@ -215,6 +215,28 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## P2 — Storage / DFS
 
+* **`/api/cluster/metrics` scans the whole metrics table on every poll.** `SELECT JSON * FROM
+  hydra.logos_metrics` with no `WHERE` and no `LIMIT` -- roughly 8,600 live rows on a 3-node
+  cluster at a 30s cadence with a 24h TTL -- then discards all but 40 samples per host in the
+  browser, once per open tab. Same shape in `dagur_runs`, where a bare `LIMIT 100` returns
+  whatever 100 rows the coordinator reached first, not the 100 most recent. Fixed in the Phoenix
+  port; still live on 8443.
+* **`GET /api/images` writes.** It scans
+  `/var/lib/hci/aether/volumes/default-image-container` and inserts catalogue rows for files it
+  finds, so a page load mutates the database. If the catalogue is meant to be reconciled with the
+  filesystem, that belongs in a Dagur job.
+* **`/api/images/delete` always answers 200.** The row is deleted first, and both the
+  `resource-definition delete` and the fan-out `rm -f {path}` (unescaped, straight into a root
+  shell) are unchecked. A failed LINSTOR delete leaves storage allocated that nothing in the UI
+  can ever see again, and the operator is told it worked.
+* **`catalyst_tasks` has no time-ordered clustering key** (`task_id` is the whole primary key),
+  so "the most recent N tasks" is not answerable server-side and every read is a full scan. A
+  `created_at` clustering key would fix it.
+* **`mimir_results` accumulates duplicate rows.** `category` is the partition key and holds the
+  invocation scope, not the check kind, so running one category after a `run_all` writes a second
+  row for those checks and nothing removes the first. Readers see the same check twice with
+  different statuses.
+
 * **No maintenance-mode quorum gate.** Entering maintenance stops the local `hydra-db` unconditionally.
   On a 1- or 2-node cluster with QUORUM this can freeze all queries cluster-wide.
 * **No out-of-band fencing path.** `mipha.py` `ssh_fence_host` relies entirely on Spark's mTLS API. If a
@@ -290,26 +312,32 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## Design / future work
 
-### Under evaluation: Phoenix LiveView rewrite of Spectrum
+### In progress: Phoenix LiveView rewrite of Spectrum
 
-Spectrum is **already containerized** (`Dockerfile` → `localhost/spectrum:latest`, Quadlet in
-`provision.py`), so containerization is not part of the work. Scope: 7,300+ lines of Python across 95 API
-paths plus 21,484 lines of first-party frontend (`static/app.js` alone is 10,685). Vendored noVNC,
-spice-html5, and pako stay; `agahnim` already owns the console WebSocket, so the hardest realtime piece is
-out of scope.
+Underway as a strangler migration, documented in [docs/spectrum_phx.md](docs/spectrum_phx.md).
+`spectrum-phx` runs beside the Python tier on port 8444; Slate still routes to 8443, so nothing
+is cut over yet.
 
-Buys: pushed diffs instead of REST polling for task/DRS/metrics state; OTP supervision for the 13
-unsupervised threads; prepared statements via Xandra removing the CQL-injection class structurally;
-better fan-out for per-node mTLS calls.
+**Ported and verified against the live cluster:** authentication (shared `pbkdf2_sha256` hashes
+and `hydra.sessions` with the Python tier, enforced once via a router `live_session`), cluster
+overview, hosts, VM list/create/detail with disk allocation through the typed Linstor endpoints,
+storage fabric, images, tasks, metrics, health. Navigation is one list checked against the router
+by `navigation_test.exs`.
 
-Costs: `hylia.py` (738 lines) and `lanayru.py` (468 lines) are imported as Python modules by Spectrum, so
-they must be reimplemented, shelled out to, or kept behind a port. The build becomes multi-stage
-Elixir + assets, which reworks `create_upgrade_zip.py` and hylia's deploy path.
+**Still on the Python tier:** networks, snapshots, console proxy, cluster lifecycle, and image
+upload. Upload is the one deliberate gap in a ported page -- it needs a
+`Phoenix.LiveView.UploadWriter` streaming to Spark, because the default writer spools a
+multi-gibibyte image to a temp file and puts the web tier back on the data path.
+`SpectrumPhx.Images.upload_note/0` carries the design; the console renders it so an operator is
+told where uploading still works.
 
-Recommended shape: strangler, not big-bang — Traefik already fronts everything, so routing a path prefix
-to a second backend is config. Start with the hardest-polling dashboards. Do the injection and metadata
-work first. Note this rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and
-LCM defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
+**Costs still outstanding:** `hylia.py` (738 lines) and `lanayru.py` (468 lines) are imported as
+Python modules by Spectrum and have no Elixir counterpart; they must be reimplemented, shelled
+out to, or kept behind a port before those routes can move. `create_upgrade_zip.py` and hylia's
+deploy path still know only about the Python image.
+
+This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
+defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
 
 ### Scale-out add-ons (blueprints only)
 

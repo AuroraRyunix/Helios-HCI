@@ -39,6 +39,7 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Mipha (`mipha.py`) | [mipha.md](./mipha.md) | [mipha_technical.md](./mipha_technical.md) |
 | Spark (`spark.py` / `spark_daemon_decoded.py`) | [spark.md](./spark.md) | [spark_technical.md](./spark_technical.md) |
 | Spectrum (`spectrum_server.py`) | [spectrum.md](./spectrum.md) | [spectrum_technical.md](./spectrum_technical.md) |
+| Spectrum (Phoenix) (`spectrum_phx/`) | [spectrum_phx.md](./spectrum_phx.md) | [../spectrum_phx/README.md](../spectrum_phx/README.md) (toolchain, build, local dev) |
 | Urbosa (`urbosa.py`) | [urbosa.md](./urbosa.md) | [urbosa_technical.md](./urbosa_technical.md) |
 | Urbosa Bootstrap (`urbosa_bootstrap.py`) | — | [urbosa_bootstrap_technical.md](./urbosa_bootstrap_technical.md) |
 | Vali (`vali.py`) | [vali.md](./vali.md) | [vali_technical.md](./vali_technical.md) |

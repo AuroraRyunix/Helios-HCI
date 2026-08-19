@@ -1,5 +1,9 @@
 # Spectrum (Cluster Management Portal)
 
+> **Being replaced.** A Phoenix LiveView rewrite runs beside this service on port 8444
+> and takes over routes as they are ported. See [spectrum_phx.md](./spectrum_phx.md),
+> which also records where the pages documented here disagreed with the database.
+
 Spectrum is the cluster management gateway and web administration console. It is the direct equivalent of Nutanix **Prism**.
 
 > [!NOTE]
