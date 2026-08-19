@@ -106,6 +106,19 @@ already-fixed when it had never worked.
   stopped out from under the daemon returns in ~25s, a service started while the desired
   state is `stopped` is re-stopped in ~30s, and a quiet cluster logs nothing.
 
+**Testing pass (2026-08-19)**
+* **`cluster destroy` disk safety proven on hardware.** A real XFS filesystem with data was mounted
+  on a spare disk and both versions of the discovery logic run in plan-only mode: the old code listed
+  it for wiping, the new code skipped it with `mounted at /srv/backup`.
+* **Image upload fixed -- it had never worked.** It failed with `ENOENT` on the DRBD device because
+  Spectrum runs in a container that mounts no `/dev`; the `test -b` probe passed only because it runs
+  on the host via spark-daemon. Mounting `/dev` into the web tier would have been the wrong fix.
+  `POST /api/v1/storage/device/write` now streams the body onto the device from spark-daemon, and
+  Spectrum opens neither a device nor a staging file -- the same split as Stargate rather than Prism
+  owning the data path. Verified byte-identical on the device.
+* **CI is green** on all four jobs, after two real failures: a stray carriage return that stopped the
+  workflow parsing, and Elixir 1.20 formatter output that 1.17 rejects. Both now guarded by tests.
+
 **Correctness bugs found while fixing the above**
 * **The migration lock had never worked.** `vali.py` wrote `SET status = 'migrating'` to a column that
   does not exist on `hydra.vms` (there is only `state`), and the read side `vm_data.get("status", "")`
@@ -151,9 +164,11 @@ already-fixed when it had never worked.
   `download_url` and its `sha256` from the same response, and the manifest still declares the hashes for
   its own contents. Real integrity needs a detached signature over the manifest verified against a key
   pinned at provision time. Everything else in the update path is now defence-in-depth around this gap.
-* **Unsandboxed root command execution.** `spark_daemon_decoded.py` `/api/v1/execute` runs caller-supplied
-  strings via `shell=True` as root with no whitelist or parameterized wrapper. The upstream injection
-  feeders are now closed, but the primitive remains.
+* **Unsandboxed root command execution.** `/api/v1/execute` runs caller-supplied strings via
+  `shell=True` as root. **In progress**: the typed API in [docs/spark_api.md](./docs/spark_api.md)
+  covers 22 endpoints and `spectrum_server.py` is down from 79 raw calls to 45. `/api/v1/execute`
+  goes when that reaches zero across `spectrum_server.py` (45), `vali.py` (29), `hylia.py` (23) and
+  `mipha.py` (8). The v2 gap list in that doc names what each remaining group needs.
 * **Catalyst/Vali internal APIs are reachable on the LAN with no auth.** `catalyst.py` (`9091`) and
   `vali.py` (`9095`) bind `0.0.0.0` under `Network=host` and check neither source IP nor credential.
   Input validation now closes the injection paths; the authorization gap is untouched.
@@ -172,18 +187,20 @@ daemon's `run_cql_query` talks to — but it is a pass-through that executes raw
 provides the storage-engine work Nutanix hand-built into Cassandra; what is missing is the consistency
 discipline, the ring lifecycle, and the store abstraction.
 
-* **Daruk silently downgrades writes from QUORUM to ONE.** `daruk.py:68` downgrades on any error
-  containing `"unavailable"`, `"timeout"`, or `"active"` — the last matching an enormous range of
-  unrelated messages. Downgrading *writes* during a partition is how two nodes end up both believing they
-  own a VM, reconciled later by last-write-wins timestamp. Reads may degrade; ownership writes must fail.
+* ~~Daruk silently downgrades writes from QUORUM to ONE.~~ **Resolved (2026-08-19)**: reads may
+  still degrade, since stale data is recoverable; mutations, DDL and lightweight transactions now
+  surface the failure. Retrying a write at ONE during a partition is how two nodes come to believe
+  they own the same VM. The trigger was also narrowed from substring matching on
+  "unavailable"/"timeout"/"active" to driver exception types -- "active" alone matched a wide range
+  of unrelated errors. Ten classifier cases unit-tested; verified live.
 * **No compare-and-swap on ownership.** `IF NOT EXISTS` is used in 11 places, all seeding static rows.
   VM ownership, the migration lock, and task claiming are all blind writes. `UPDATE hydra.vms SET
   host_ip = ? WHERE name = ? IF host_ip = ?` would make the dual-primary scenario structurally impossible
   rather than defended-against. The migration lock in particular is still read-then-write and therefore
   racy even now that its column exists.
-* **Scheduled major compaction is an anti-pattern.** `spectrum_server.py` registers `nodetool compact`
-  every 12 hours. On STCS this produces one enormous SSTable that never compacts again, plus heavy IO on
-  a host also serving VM disks. Scylla's own guidance is not to schedule this.
+* ~~Scheduled major compaction is an anti-pattern.~~ **Resolved (2026-08-19)**: the 12-hourly
+  `nodetool compact` job is disabled, with a migration for existing clusters. Disabled rather than
+  deleted so an operator can see it and re-enable deliberately.
 * **Schema is scattered and unversioned.** 38 `CREATE TABLE IF NOT EXISTS` across five daemons with no
   migration system, so two daemon versions can race to define different schemas.
 * **No ring lifecycle management.** Nutanix auto-detaches an unhealthy node from the ring. Helios has no
@@ -206,9 +223,9 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   while its storage or database daemon is dead.
 * **No backup / disaster recovery.** Nothing snapshots the `hydra` keyspace or Linstor metadata to an
   external target.
-* **Live migration still passes `--unsafe`** (`vali.py`), which disables libvirt's coherence check.
-  Now that the two-primaries window is scoped, this is worth revisiting.
-
+* ~~Live migration still passes `--unsafe`.~~ **Resolved (2026-08-19)**: removed. It was only needed
+  while VM disks carried `--allow-two-primaries` permanently; that window is now scoped to the
+  migration itself, so libvirt's coherence check is the one we want.
 ---
 
 ## P2 — Networking
@@ -220,9 +237,10 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   persistence: first collision at ~178 routers, 413 collisions at 4000. Needs a persisted pool.
 * **VXLAN head-end replication overhead.** Static flood entries replicate every broadcast to every peer.
   "Scale-Out Urbosa" below is the designed fix.
-* **Bifrost split-brain fallback.** The no-leader case is guarded, but when a leader is found and is
-  merely *inactive*, the code still falls through to picking the lowest-sorted reachable candidate.
-
+* ~~Bifrost split-brain fallback.~~ **Resolved (2026-08-19)**: when ZooKeeper names a leader that is
+  not serving, Bifrost no longer elects a replacement by sort order -- a second election that can
+  disagree with the ensemble's, and in a partition each side would pick the lowest candidate it can
+  see. It releases the VIP instead: briefly unreachable is visible and recoverable, duplicated is not.
 ---
 
 ## P3 — Code health
