@@ -77,7 +77,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} current_username={@current_username} active={:vms}>
       <.header>
         New virtual machine
         <:subtitle>

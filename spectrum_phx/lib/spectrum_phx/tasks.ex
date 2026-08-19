@@ -171,6 +171,7 @@ defmodule SpectrumPhx.Tasks do
   # -- normalisation ---------------------------------------------------------
 
   defp task(row) do
+    row = stringify(row)
     payload_raw = string(get(row, "payload"))
     payload = decode_payload(payload_raw)
     status = row |> get("status") |> normalize_status()
@@ -285,22 +286,44 @@ defmodule SpectrumPhx.Tasks do
   # carried as `depth` for the view to indent by.
   defp tree(tasks) do
     by_id = Map.new(tasks, fn task -> {task.id, task} end)
+    parent_of = Map.new(tasks, fn task -> {task.id, effective_parent(task, by_id)} end)
 
     children =
       tasks
-      |> Enum.filter(fn task -> task.parent_id && Map.has_key?(by_id, task.parent_id) end)
-      |> Enum.group_by(& &1.parent_id)
+      |> Enum.filter(fn task -> Map.get(parent_of, task.id) end)
+      |> Enum.group_by(fn task -> Map.get(parent_of, task.id) end)
       |> Map.new(fn {parent, kids} -> {parent, Enum.sort_by(kids, &sort_key/1)} end)
 
     tasks
-    |> Enum.reject(fn task -> task.parent_id && Map.has_key?(by_id, task.parent_id) end)
+    |> Enum.reject(fn task -> Map.get(parent_of, task.id) end)
     |> Enum.flat_map(fn root -> flatten(root, children, 0) end)
   end
 
-  # Depth is capped rather than recursed without bound: a payload that names its own task
-  # as parent, or two tasks that name each other, would otherwise loop forever. Such a
-  # cycle cannot be built by the writers today, but it is a JSON field with no constraint
-  # on it, and a wedged socket is a worse answer than a flat row.
+  # `parent_task_id` is an unconstrained field inside a JSON blob. A task that names
+  # itself, or two that name each other, would leave every row with a parent and therefore
+  # no roots -- the whole list would silently vanish, which is a far worse failure than a
+  # missing indent. A task in a cycle is treated as a root instead.
+  defp effective_parent(task, by_id) do
+    cond do
+      is_nil(task.parent_id) -> nil
+      not Map.has_key?(by_id, task.parent_id) -> nil
+      cycle?(task.parent_id, task.id, by_id, map_size(by_id) + 1) -> nil
+      true -> task.parent_id
+    end
+  end
+
+  defp cycle?(_id, _origin, _by_id, 0), do: true
+
+  defp cycle?(id, origin, by_id, fuel) do
+    cond do
+      id == origin -> true
+      is_nil(Map.get(by_id, id)) -> false
+      true -> cycle?(Map.get(by_id, id).parent_id, origin, by_id, fuel - 1)
+    end
+  end
+
+  # Depth is also capped, so a chain longer than any workflow the Python tier builds
+  # renders flat rather than indenting itself off the page.
   defp flatten(task, _children, depth) when depth > 4, do: [%{task | depth: depth}]
 
   defp flatten(task, children, depth) do
@@ -342,18 +365,17 @@ defmodule SpectrumPhx.Tasks do
     |> Enum.max(fn -> 0 end)
   end
 
-  defp get(row, key) when is_map(row) do
-    case Map.fetch(row, key) do
-      {:ok, value} -> value
-      :error -> Map.get(row, String.to_atom(key))
-    end
-  end
-
+  defp get(row, key) when is_map(row), do: Map.get(row, key)
   defp get(_row, _key), do: nil
 
+  # Rows arrive with string keys from Xandra and often with atom keys from a fixture.
+  # Normalising once here means nothing downstream has to look for both, and no atom is
+  # created from data.
   defp stringify(map) when is_map(map) do
     Map.new(map, fn {key, value} -> {to_string(key), value} end)
   end
+
+  defp stringify(other), do: other
 
   defp string(value) when is_binary(value) do
     case String.trim(value) do

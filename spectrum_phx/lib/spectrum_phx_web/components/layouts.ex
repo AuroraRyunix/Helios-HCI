@@ -11,59 +11,81 @@ defmodule SpectrumPhxWeb.Layouts do
   # and other static content.
   embed_templates "layouts/*"
 
-  @doc """
-  Renders your app layout.
+  # The console's navigation, in one place. Every dashboard renders through `app/1`, so
+  # this list is the only thing that has to know a page exists.
+  @nav [
+    {:overview, "Overview", "/"},
+    {:hosts, "Hosts", "/hosts"},
+    {:vms, "VMs", "/vms"},
+    {:storage, "Storage", "/storage"},
+    {:images, "Images", "/images"},
+    {:tasks, "Tasks", "/tasks"},
+    {:metrics, "Metrics", "/metrics"},
+    {:health, "Health", "/health"}
+  ]
 
-  This function is typically invoked from every template,
-  and it often contains your application menu, sidebar,
-  or similar.
+  @doc "The navigation entries, as `{id, label, path}`. Exposed so tests can walk them."
+  def nav_items, do: @nav
+
+  @doc """
+  Renders the console layout: navigation, the signed-in operator, and the page itself.
 
   ## Examples
 
-      <Layouts.app flash={@flash}>
+      <Layouts.app flash={@flash} current_username={@current_username} active={:hosts}>
         <h1>Content</h1>
       </Layouts.app>
 
   """
   attr :flash, :map, required: true, doc: "the map of flash messages"
 
-  attr :current_scope, :map,
+  attr :current_username, :string,
     default: nil,
-    doc: "the current [scope](https://phoenix.hexdocs.pm/scopes.html)"
+    doc: "the signed-in operator, shown in the header"
+
+  attr :active, :atom,
+    default: nil,
+    doc: "which entry of `nav_items/0` is the current page"
 
   slot :inner_block, required: true
 
   def app(assigns) do
     ~H"""
-    <header class="navbar px-4 sm:px-6 lg:px-8">
-      <div class="flex-1">
-        <a href="/" class="flex-1 flex w-fit items-center gap-2">
-          <img src={~p"/images/logo.svg"} width="36" />
-          <span class="text-sm font-semibold">v{Application.spec(:phoenix, :vsn)}</span>
-        </a>
-      </div>
+    <header class="navbar border-b border-base-300 gap-2 px-4 sm:px-6 lg:px-8">
       <div class="flex-none">
-        <ul class="flex flex-column px-1 space-x-4 items-center">
-          <li>
-            <a href="https://phoenixframework.org/" class="btn btn-ghost">Website</a>
-          </li>
-          <li>
-            <a href="https://github.com/phoenixframework/phoenix" class="btn btn-ghost">GitHub</a>
-          </li>
-          <li>
-            <.theme_toggle />
-          </li>
-          <li>
-            <a href="https://phoenix.hexdocs.pm/overview.html" class="btn btn-primary">
-              Get Started <span aria-hidden="true">&rarr;</span>
-            </a>
+        <.link navigate="/" class="flex items-center gap-2 text-lg font-semibold">
+          <img src={~p"/images/logo.svg"} width="28" alt="" />
+          <span>Helios</span>
+        </.link>
+      </div>
+
+      <nav class="flex-1 overflow-x-auto" aria-label="Console">
+        <ul class="menu menu-horizontal gap-1 flex-nowrap">
+          <li :for={{id, label, path} <- nav_items()}>
+            <.link
+              navigate={path}
+              aria-current={if @active == id, do: "page"}
+              class={["font-medium whitespace-nowrap", @active == id && "menu-active"]}
+            >
+              {label}
+            </.link>
           </li>
         </ul>
+      </nav>
+
+      <div class="flex-none flex items-center gap-2">
+        <.theme_toggle />
+        <span :if={@current_username} class="text-sm opacity-70" data-role="current-user">
+          {@current_username}
+        </span>
+        <.link href={~p"/logout"} method="delete" class="btn btn-ghost btn-sm">
+          Sign out
+        </.link>
       </div>
     </header>
 
-    <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
+    <main class="px-4 py-8 sm:px-6 lg:px-8">
+      <div class="mx-auto max-w-7xl space-y-4">
         {render_slot(@inner_block)}
       </div>
     </main>

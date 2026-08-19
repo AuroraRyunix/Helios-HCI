@@ -88,7 +88,7 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} current_username={@current_username} active={:vms}>
       <.header>
         Virtual machines
         <:subtitle>

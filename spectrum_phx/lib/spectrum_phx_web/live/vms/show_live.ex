@@ -80,7 +80,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} current_username={@current_username} active={:vms}>
       <.header>
         <span class="font-mono">{@vm.name}</span>
         <:subtitle>
