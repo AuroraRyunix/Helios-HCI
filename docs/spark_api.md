@@ -92,9 +92,12 @@ resulting role so a caller can detect the peer already holding Primary -- the co
 that previously allowed a VM to start twice.
 
 `device/write` streams the request body straight onto the device. It exists because the
-web tier must not touch the data path at all: Spectrum's container mounts no `/dev`, so
-opening a DRBD device failed with `ENOENT` and image upload had never worked in this
-deployment. Mounting `/dev` into the web tier would have been the wrong fix -- Spark owns
+web tier must not touch the data path at all. Opening a DRBD device from the console
+failed with `ENOENT` and image upload had never worked in this deployment: a container's
+`/dev` carries device nodes but not udev's subdirectories, so `/dev/drbd/by-res/<res>/0`
+-- the form every code path uses -- does not exist inside it. Note this was never a
+permissions problem, which is why running the container `--privileged` did not fix it and
+could not have. Mounting `/dev` into the web tier would have been the wrong fix -- Spark owns
 host storage, the way Stargate rather than Prism owns it on Nutanix. Spectrum receives the
 upload and proxies the bytes here, so it needs neither `/dev` nor a storage mount.
 

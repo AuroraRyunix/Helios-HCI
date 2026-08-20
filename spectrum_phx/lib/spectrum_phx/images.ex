@@ -645,8 +645,9 @@ defmodule SpectrumPhx.Images do
 
   ## The constraint
 
-  The web tier must not touch the data path. Spectrum's container mounts no `/dev`, so
-  opening a DRBD device from here fails with `ENOENT` -- and mounting `/dev` in would be
+  The web tier must not touch the data path. A container's `/dev` carries device nodes but
+  not udev's subdirectories, so `/dev/drbd/by-res/<res>/0` does not exist inside one and
+  opening it fails with `ENOENT` -- and mounting `/dev` in would be
   the wrong fix. Staging the file onto a storage mount instead is equally wrong: it is
   still the web tier writing cluster storage, and it needs somewhere to put a file the
   size of an install ISO. Spark owns host storage, the way Stargate rather than Prism

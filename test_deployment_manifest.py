@@ -306,5 +306,71 @@ class WorkflowFilesTest(unittest.TestCase):
                 self.assertIn("jobs", doc, "workflow defines no jobs")
                 self.assertTrue(doc["jobs"], "workflow defines an empty jobs map")
 
+class QuadletPrivilegeTest(unittest.TestCase):
+    """Container privilege is declared in provision.py and nowhere else.
+
+    `--privileged` gives a container every capability, turns SELinux confinement off,
+    and bind-mounts the host's whole /dev -- every block device, including the boot
+    disk. The web console had it for years while being unable to use it: a container's
+    /dev has device nodes but not udev's subdirectories, so the /dev/drbd/by-res/...
+    paths it actually referenced were never there. It was pure attack surface on the
+    most exposed component in the cluster, and these tests keep it from coming back by
+    accident.
+    """
+
+    # Only the Linstor satellite legitimately manipulates the host: kernel modules,
+    # device mapper, block devices. Anything else asking for privilege is a bug.
+    ALLOWED_PRIVILEGED = {"aether"}
+
+    def _quadlets(self):
+        source = open(PROVISION, encoding="utf-8").read()
+        # The QUADLETS values are triple-quoted literals keyed by unit name.
+        found = dict(re.findall(r'"([a-z0-9-]+)":\s*"""(.*?)"""', source, re.S))
+        self.assertTrue(found, "no quadlet definitions found in provision.py")
+        return found
+
+    def _directives(self, body):
+        """Real directive lines only -- '##' comments discuss privilege in prose."""
+        return [
+            line.strip() for line in body.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    def test_only_the_storage_satellite_is_privileged(self):
+        for name, body in self._quadlets().items():
+            privileged = any(
+                "PodmanArgs" in line and "--privileged" in line
+                for line in self._directives(body)
+            )
+            if name in self.ALLOWED_PRIVILEGED:
+                continue
+            with self.subTest(unit=name):
+                self.assertFalse(
+                    privileged,
+                    f"{name}.container requests --privileged. If it genuinely needs host "
+                    f"access, add it to ALLOWED_PRIVILEGED with the reason; otherwise "
+                    f"scope it to explicit AddDevice/AddCapability grants.")
+
+    def test_the_web_console_drops_capabilities(self):
+        # Not merely "not privileged": podman still grants a default capability set,
+        # and Spectrum needs none of it. It binds a port above 1024 and reads files it
+        # owns.
+        body = self._quadlets().get("spectrum")
+        self.assertIsNotNone(body, "no spectrum quadlet in provision.py")
+        directives = self._directives(body)
+        self.assertIn("DropCapability=ALL", directives)
+        self.assertIn("NoNewPrivileges=true", directives)
+
+    def test_privileged_units_explain_themselves(self):
+        # A privilege nobody wrote a reason for is one nobody can review.
+        for name, body in self._quadlets().items():
+            if not any("--privileged" in l for l in self._directives(body)):
+                continue
+            with self.subTest(unit=name):
+                self.assertIn(
+                    "##", body,
+                    f"{name}.container is privileged with no comment saying why")
+
+
 if __name__ == "__main__":
     unittest.main()

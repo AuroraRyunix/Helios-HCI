@@ -31,8 +31,9 @@ reach into Stargate on Nutanix, and Spectrum does not reach into [Aether](./aeth
 
 The failure that established the rule: image upload called `test -b` on a device path and
 then opened it. `test -b` ran *on the host* through spark-daemon and passed; the open ran
-*inside the container*, which mounts no `/dev`, and failed with `ENOENT`. The upload had
-never worked. The first attempted fix — staging the file on a storage mount — is the same
+*inside the container* and failed with `ENOENT` -- a container's `/dev` has device nodes
+but not udev's subdirectories, so `/dev/drbd/by-res/<res>/0` is simply not there. The
+upload had never worked, and no amount of privilege would have made it. The first attempted fix — staging the file on a storage mount — is the same
 mistake wearing a different hat: it is still the web tier writing cluster storage. The
 correct shape is `POST /api/v1/storage/device/write`, where Spark owns the device and the
 console streams bytes to it.
