@@ -165,15 +165,28 @@ def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
 def call_catalyst_api(path, payload=None, method="GET"):
+    """Call the local Catalyst API over mutual TLS.
+
+    Catalyst dispatches cluster work and now requires a certificate this cluster's CA
+    signed. Loopback is reached by this node's own address because that is what its
+    certificate names -- see spark_endpoint() for the same reasoning applied to
+    spark-daemon.
+    """
     import urllib.request
     import json
-    url = f"http://127.0.0.1:9091{path}"
+    address, verify_identity = spark_endpoint("127.0.0.1")
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                         cafile="/etc/hci/spark/certs/ca.crt")
+    context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                            keyfile="/etc/hci/spark/certs/node.key")
+    context.check_hostname = verify_identity
+    url = f"https://{address}:9091{path}"
     data = None
     if payload is not None and method != "GET":
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with urllib.request.urlopen(req, context=context, timeout=35) as response:
             if response.status == 204:
                 return 204, None
             res = json.loads(response.read().decode("utf-8"))

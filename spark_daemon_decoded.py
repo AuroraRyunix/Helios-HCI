@@ -1878,11 +1878,19 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         
-        url = f"http://127.0.0.1:9095{path}"
+        # Vali requires mutual TLS. Loopback is reached by this node's own address,
+        # because that is what its certificate names -- see spark_endpoint().
+        address, verify_identity = spark_endpoint("127.0.0.1")
+        vali_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                              cafile="/etc/hci/spark/certs/ca.crt")
+        vali_ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                                 keyfile="/etc/hci/spark/certs/node.key")
+        vali_ctx.check_hostname = verify_identity
+        url = f"https://{address}:9095{path}"
         req = urllib.request.Request(url, data=post_data, method=method)
         req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
+            with urllib.request.urlopen(req, context=vali_ctx, timeout=120) as response:
                 res_bytes = response.read()
                 self.send_response(response.status)
                 self.send_header("Content-Type", "application/json")

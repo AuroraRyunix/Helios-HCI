@@ -733,15 +733,30 @@ def submit_catalyst_cql_task(job_name, cql_query):
     try:
         leader_ip = get_catalyst_target_ip()
         req = urllib.request.Request(
-            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+            f"https://{leader_ip}:9091/api/v1/tasks/submit",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res.get("task_id"), None
     except Exception as e:
         return None, str(e)
+
+def catalyst_ssl_context():
+    """Client context for calls to Catalyst, which now requires mutual TLS.
+
+    Catalyst dispatches cluster work -- VM start, stop, migrate -- and used to accept it
+    from anything that could open a socket to port 9091, checking neither a credential
+    nor a source address. It now requires a certificate signed by this cluster's CA, so
+    every caller has to present one.
+
+    The same client material every other inter-node call in this file uses. Inside the
+    Spectrum container these are bind-mounted read-only from the host.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    return context
 
 def validate_password_complexity(password):
     """Validates a password against the active cluster security policy."""
@@ -4372,11 +4387,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     self.send_json(200, {"task_id": res.get("task_id"), "status": "pending"})
             except Exception as e:
@@ -5043,11 +5058,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     try:
                         leader_ip = get_catalyst_target_ip()
                         req = urllib.request.Request(
-                            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                            f"https://{leader_ip}:9091/api/v1/tasks/submit",
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA BOOTSTRAP] Task submitted successfully: {res}")
@@ -5066,11 +5081,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     try:
                         leader_ip = get_catalyst_target_ip()
                         req = urllib.request.Request(
-                            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                            f"https://{leader_ip}:9091/api/v1/tasks/submit",
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA CLEANUP] Task submitted successfully: {res}")
@@ -6995,11 +7010,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -7040,11 +7055,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -7108,11 +7123,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(submit_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")

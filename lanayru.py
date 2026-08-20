@@ -6,6 +6,7 @@ import datetime
 import urllib.parse
 import urllib.request
 import socket
+import ssl
 import hashlib
 import base64
 
@@ -312,12 +313,17 @@ runcmd:
                         "command": "python3 /usr/local/bin/urbosa-bootstrap"
                     }
                 }
+                # Mutual TLS: Catalyst now requires a cluster-signed certificate.
+                ctx = ssl.create_default_context(
+                    ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
+                ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                                    keyfile="/etc/hci/spark/certs/node.key")
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=5) as response:
+                with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
                     pass
                 log("Successfully triggered Urbosa SDN DHCP daemon refresh.", "success")
             except Exception as e:

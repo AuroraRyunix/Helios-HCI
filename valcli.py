@@ -1282,16 +1282,30 @@ def get_zookeeper_leader_ip():
     candidates.sort()
     return candidates[0]
 
+def catalyst_client_context():
+    """Client certificate for Catalyst, which now requires mutual TLS.
+
+    It dispatches VM lifecycle work and used to accept it from anything that could open
+    a socket to port 9091, checking neither a credential nor a source address.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                         cafile="/etc/hci/spark/certs/ca.crt")
+    context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                            keyfile="/etc/hci/spark/certs/node.key")
+    return context
+
+
 def wait_for_catalyst_task(task_id):
     leader_ip = get_zookeeper_leader_ip()
-    url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
     print(f"Waiting for Catalyst task {task_id} to finish...")
     
     last_progress = -1
     while True:
         try:
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=35) as response:
+            with urllib.request.urlopen(
+                    req, context=catalyst_client_context(), timeout=35) as response:
                 if response.status == 200:
                     res = json.loads(response.read().decode("utf-8"))
                     status = res.get("status")
@@ -1311,7 +1325,7 @@ def wait_for_catalyst_task(task_id):
                 elif response.status == 204:
                     # Long polling timeout, update leader IP and keep waiting
                     leader_ip = get_zookeeper_leader_ip()
-                    url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+                    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
                     continue
                 else:
                     print(f"Unexpected response status from Catalyst: {response.status}")
@@ -1324,7 +1338,7 @@ def wait_for_catalyst_task(task_id):
             # Maybe leader is switching/rebooting, try to find new leader IP
             time.sleep(2)
             leader_ip = get_zookeeper_leader_ip()
-            url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+            url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
 
 def cmd_host_maintenance_enter(hostname, force_stop=False):
     if hostname == "--all":

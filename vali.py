@@ -314,13 +314,19 @@ def call_catalyst_api(path, payload=None, method="GET"):
     import urllib.request
     import json
     leader_ip = get_zookeeper_leader_ip()
-    url = f"http://{leader_ip}:9091{path}"
+    # Catalyst requires a cluster-signed certificate: it dispatches VM lifecycle
+    # work and used to accept it from anything that could open a socket to 9091.
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                     cafile="/etc/hci/spark/certs/ca.crt")
+    ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                        keyfile="/etc/hci/spark/certs/node.key")
+    url = f"https://{leader_ip}:9091{path}"
     data = None
     if payload is not None and method != "GET":
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with urllib.request.urlopen(req, context=ctx, timeout=35) as response:
             if response.status == 204:
                 return 204, None
             res = json.loads(response.read().decode("utf-8"))
@@ -1990,7 +1996,21 @@ def evacuate_host_thread(hostname, target_ip, force_stop):
 class ValiAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass # Disable logging to prevent stdout clutter
-        
+
+    def setup(self):
+        """Complete the TLS handshake in the worker thread.
+
+        Per connection rather than by wrapping the listening socket, so one slow or
+        hostile client cannot stall every other connection during its handshake.
+        """
+        self.connection = self.server.ssl_context.wrap_socket(self.request, server_side=True)
+        if self.timeout is not None:
+            self.connection.settimeout(self.timeout)
+        if self.disable_nagle_algorithm:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        self.rfile = self.connection.makefile("rb", self.rbufsize)
+        self.wfile = self.connection.makefile("wb", self.wbufsize)
+
     def do_GET(self):
         if self.path == "/api/v1/hosts":
             try:
@@ -2239,9 +2259,30 @@ def main():
     threading.Thread(target=queue_thread_loop, daemon=True).start()
     threading.Thread(target=drs_thread_loop, daemon=True).start()
     
+    # Mutual TLS against the cluster CA, as spark-daemon and Catalyst do.
+    #
+    # This API placed and moved VMs and bound 0.0.0.0 under Network=host while checking
+    # neither a credential nor a source address. CERT_REQUIRED means a caller must
+    # present a certificate this cluster CA signed -- which means a node -- and the
+    # handshake fails before a request line is parsed.
+    ca_cert = "/etc/hci/spark/certs/ca.crt"
+    node_cert = "/etc/hci/spark/certs/node.crt"
+    node_key = "/etc/hci/spark/certs/node.key"
+    for path in (ca_cert, node_cert, node_key):
+        if not os.path.exists(path):
+            print(f"[ERROR] Vali cannot start without {path}. The API would otherwise "
+                  f"listen without authentication.")
+            sys.exit(1)
+
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile=node_cert, keyfile=node_key)
+    ssl_context.load_verify_locations(cafile=ca_cert)
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+
     server_address = ("0.0.0.0", 9095)
     httpd = ThreadingHTTPServer(server_address, ValiAPIHandler)
-    print("Vali API listening on http://0.0.0.0:9095")
+    httpd.ssl_context = ssl_context
+    print("Vali API listening on https://0.0.0.0:9095 (mutual TLS)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

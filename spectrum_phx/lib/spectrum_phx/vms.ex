@@ -743,14 +743,26 @@ defmodule SpectrumPhx.Vms do
   defp maybe_put(map, _key, ""), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
+  # Mutual TLS, with the same client material `SpectrumPhx.Spark` uses.
+  #
+  # Catalyst dispatches cluster work -- start, stop, migrate -- and used to accept it from
+  # anything that could open a socket to port 9091, with no credential and no source
+  # check. It now requires a certificate the cluster CA signed, so this has to present
+  # one; over plain HTTP the submission is simply refused at the handshake.
   defp post_task(service, action, payload) do
+    settings = Spark.connection_settings()
+
     url =
-      "http://" <>
+      "https://" <>
         catalyst_ip() <> ":" <> Integer.to_string(@catalyst_port) <> "/api/v1/tasks/submit"
 
     body = %{"service" => service, "action" => action, "payload" => payload}
 
-    case Req.post(url, json: body, receive_timeout: 35_000) do
+    case Req.post(url,
+           json: body,
+           connect_options: [transport_opts: settings.transport_opts],
+           receive_timeout: 35_000
+         ) do
       {:ok, %Req.Response{status: 200, body: response}} -> {:ok, response}
       {:ok, %Req.Response{status: status, body: response}} -> {:error, {:http, status, response}}
       {:error, reason} -> {:error, reason}

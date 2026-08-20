@@ -259,7 +259,23 @@ def scheduler_thread_loop():
 class CatalystAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass # Prevent console clutter
-        
+
+    def setup(self):
+        """Complete the TLS handshake in the worker thread.
+
+        Same shape as spark-daemon's handler. Doing it here rather than by wrapping the
+        listening socket means one slow or hostile client cannot stall every other
+        connection during its handshake.
+        """
+        self.connection = self.server.ssl_context.wrap_socket(self.request, server_side=True)
+        if self.timeout is not None:
+            self.connection.settimeout(self.timeout)
+        if self.disable_nagle_algorithm:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        self.rfile = self.connection.makefile("rb", self.rbufsize)
+        self.wfile = self.connection.makefile("wb", self.wbufsize)
+
+
     def send_json(self, status, data):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -464,9 +480,34 @@ def main():
     t = threading.Thread(target=scheduler_thread_loop, daemon=True)
     t.start()
     
+    # Mutual TLS, against the same cluster CA every other inter-node call uses.
+    #
+    # This API dispatched cluster work -- VM start, stop, migrate -- to anything that
+    # could open a socket to port 9091. It bound 0.0.0.0 under Network=host and checked
+    # neither a credential nor a source address, so on any network the cluster could
+    # reach, it was an unauthenticated remote-control interface for every guest.
+    #
+    # CERT_REQUIRED is what closes it: a caller must present a certificate this cluster's
+    # CA signed, which means a node, and the handshake fails before a request line is
+    # ever parsed.
+    ca_cert = "/etc/hci/spark/certs/ca.crt"
+    node_cert = "/etc/hci/spark/certs/node.crt"
+    node_key = "/etc/hci/spark/certs/node.key"
+    for path in (ca_cert, node_cert, node_key):
+        if not os.path.exists(path):
+            print(f"[ERROR] Catalyst cannot start without {path}. The API would otherwise "
+                  f"listen without authentication.")
+            sys.exit(1)
+
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile=node_cert, keyfile=node_key)
+    ssl_context.load_verify_locations(cafile=ca_cert)
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+
     server_address = ("0.0.0.0", 9091)
     httpd = ThreadingHTTPServer(server_address, CatalystAPIHandler)
-    print("Catalyst API listening on port 9091")
+    httpd.ssl_context = ssl_context
+    print("Catalyst API listening on port 9091 (mutual TLS)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

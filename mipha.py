@@ -648,10 +648,19 @@ def ping_host(ip):
         return False
 
 def check_vali_health(ip):
-    url = f"http://{ip}:9095/api/v1/hosts"
+    # Vali requires mutual TLS, so even a health probe presents a certificate. A probe
+    # that could not authenticate would report every healthy host as down, and Mipha
+    # fences on that signal.
+    address, verify_identity = spark_endpoint(ip)
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                     cafile="/etc/hci/spark/certs/ca.crt")
+    ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                        keyfile="/etc/hci/spark/certs/node.key")
+    ctx.check_hostname = verify_identity
+    url = f"https://{address}:9095/api/v1/hosts"
     try:
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as response:
+        with urllib.request.urlopen(req, context=ctx, timeout=5) as response:
             return response.status == 200
     except Exception:
         return False
@@ -679,7 +688,13 @@ def get_linstor_pending_sync():
 
 
 def submit_catalyst_task(leader_ip, service, action, payload):
-    url = f"http://{leader_ip}:9091/api/v1/tasks/submit"
+    # Catalyst requires a cluster-signed certificate: it dispatches VM lifecycle
+    # work and used to accept it from anything that could open a socket to 9091.
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                     cafile="/etc/hci/spark/certs/ca.crt")
+    ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                        keyfile="/etc/hci/spark/certs/node.key")
+    url = f"https://{leader_ip}:9091/api/v1/tasks/submit"
     data = json.dumps({
         "service": service,
         "action": action,
@@ -687,7 +702,7 @@ def submit_catalyst_task(leader_ip, service, action, payload):
     }).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
             if response.status == 200:
                 res_data = json.loads(response.read().decode("utf-8"))
                 return res_data.get("task_id")
