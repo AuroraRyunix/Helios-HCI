@@ -167,21 +167,46 @@ def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
 # Initialize Database Schema
-def init_db_schema():
-    tasks_table = """
-    CREATE TABLE IF NOT EXISTS hydra.catalyst_tasks (
-        task_id uuid PRIMARY KEY,
-        service text,
-        action text,
-        status text,
-        payload text,
-        progress int,
-        error_msg text,
-        created_at timestamp,
-        updated_at timestamp
-    );
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin beside this file; inside the Spectrum container
+    it is copied to /app. Neither location is importable by name from the other.
     """
-    run_cql_query(tasks_table)
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    import os as _os
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                    "helios_schema.py")):
+        if not _os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
+
+def init_db_schema():
+    """Apply the cluster schema, which is shared and no longer this daemon's to define.
+
+    hydra.catalyst_tasks used to be created here. It now lives in helios_schema with
+    every other table, so two daemon versions cannot race to define it differently --
+    the loser's CREATE TABLE IF NOT EXISTS is a silent no-op and it never finds out.
+
+    Every daemon calls this. Applying happens behind a cluster lock, so concurrent
+    starts are safe and no daemon depends on another having run first.
+    """
+    applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+    if applied:
+        print(f"[Catalyst] Applied schema migrations: {', '.join(applied)}")
 
 # In-Memory Event Queues & Completion Sync
 queues = {

@@ -201,6 +201,32 @@ def run_cql_query(cql_query):
         except Exception as e2:
             return -1, "", f"Primary failed ({e1}). Fallback failed ({e2})."
 
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin beside this file; inside the Spectrum container
+    it is copied to /app. Neither location is importable by name from the other.
+    """
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    import os as _os
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                    "helios_schema.py")):
+        if not _os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
 def collect_inventory():
     try:
         import socket
@@ -295,14 +321,8 @@ def collect_inventory():
                 _, version = f.result()
                 inventory[host_name]["versions"][comp_name] = version
                 
-        cql_schema = """
-        CREATE TABLE IF NOT EXISTS hydra.lcm_inventory (
-            key text PRIMARY KEY,
-            inventory_json text,
-            last_updated timestamp
-        );
-        """
-        run_cql_query(cql_schema)
+        # hydra.lcm_inventory belongs to the cluster schema, not to this script.
+        load_schema_module().ensure_schema(run_cql_query)
         
         inventory_escaped = cql_escape(json.dumps(inventory))
         cql_insert = f"""

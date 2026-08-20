@@ -184,13 +184,33 @@ def parse_applied(stdout):
     """
     applied = {}
     for line in (stdout or "").splitlines():
-        if "|" not in line:
+        stripped = line.strip()
+        if not stripped or set(stripped) <= set("-+ "):
             continue
-        left, _, right = line.partition("|")
-        key, value = left.strip(), right.strip()
-        if not key or not value:
+        # cqlsh's row-count footer, "(2 rows)". It has no pipe and splits into exactly
+        # two fields, so the space-joined branch below would otherwise read it as a
+        # migration named "(2" -- which then never matches anything and quietly makes
+        # every real migration look unapplied.
+        if stripped.startswith("("):
             continue
-        if key == "id" or set(key) <= set("-+ "):
+
+        if "|" in stripped:
+            left, _, right = stripped.partition("|")
+            key, value = left.strip(), right.strip()
+        else:
+            # Not cqlsh. Through Daruk's /query the daemons get row values joined by a
+            # space and no header, so the same two columns arrive as:
+            #
+            #     0001-baseline 1f4c...
+            #
+            # Reading only the piped form made every migration look unapplied, and the
+            # runner would try to reapply the whole list on every single start.
+            parts = stripped.split()
+            if len(parts) != 2:
+                continue
+            key, value = parts
+
+        if not key or not value or key == "id":
             continue
         applied[key] = value
     return applied
@@ -222,10 +242,29 @@ def lwt_applied(stdout):
     Only the first field is looked at now.
     """
     text = stdout or ""
+
     if "[applied]" not in text:
-        # No LWT marker at all: the statement was not conditional, or the output shape
-        # changed. Treat as not-applied rather than assuming success, because the
-        # consequence of guessing wrong here is two daemons migrating at once.
+        # Not cqlsh. The daemons' own `run_cql_query` proxies to Daruk, which returns
+        # decoded row *values* joined by spaces and no column names at all, so the same
+        # rejection arrives as the bare string:
+        #
+        #     False 10.10.102.41
+        #
+        # There is no marker to look for, only position -- and `[applied]` is always the
+        # first value. Reading only the cqlsh form meant every successful acquisition
+        # through a daemon was read as a lost race, and the runner returned holding the
+        # lock it had just taken. This is the same shape that makes `run_cql_query`
+        # unable to express a conditional write at all.
+        #
+        # Safe because this is only ever called on a statement this module issued with a
+        # condition attached; it is not a general result parser.
+        first = text.strip().split(None, 1)[0] if text.strip() else ""
+        if first in ("True", "true"):
+            return True
+        if first in ("False", "false"):
+            return False
+        # Neither shape. Treat as not-applied rather than assuming success: the
+        # consequence of guessing wrong is two daemons migrating at once.
         return False
 
     for line in text.splitlines():

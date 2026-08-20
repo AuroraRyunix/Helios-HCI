@@ -1083,6 +1083,32 @@ def get_cluster_metrics(nodes_info):
         "used_mem_gb": used_mem_gb
     }
 
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin; inside the Spectrum container it is copied to
+    /app. Neither location is importable by name from the other.
+    """
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "helios_schema.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
+
 def init_db():
     """Attempts to initialize the ScyllaDB keyspace and table on startup."""
     print("Connecting to ScyllaDB and creating keyspace/table if not exists...")
@@ -1090,69 +1116,6 @@ def init_db():
     node_count = len(nodes) if nodes else 1
     desired_rf = min(3, node_count)
     create_keyspace = f"CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {desired_rf}}};"
-    create_table = """
-    CREATE TABLE IF NOT EXISTS hydra.vms (
-        name text PRIMARY KEY,
-        vcpu int,
-        memory int,
-        disk_path text,
-        disk_size int,
-        state text,
-        host_ip text,
-        disks_list text,
-        firmware text,
-        iso text,
-        boot_device text,
-        network_id text,
-        cpu_model text,
-        audio_enabled boolean,
-        status text
-    );
-    """
-    create_containers_table = """
-    CREATE TABLE IF NOT EXISTS hydra.storage_containers (
-        name text PRIMARY KEY,
-        tier text,
-        quota_bytes bigint,
-        path text,
-        ftt int
-    );
-    """
-    create_mimir_results = """
-    CREATE TABLE IF NOT EXISTS hydra.mimir_results (
-        category text,
-        check_name text,
-        node_ip text,
-        status text,
-        output text,
-        execution_id uuid,
-        timestamp timestamp,
-        PRIMARY KEY (category, check_name, node_ip)
-    );
-    """
-    create_dagur_schedules = """
-    CREATE TABLE IF NOT EXISTS hydra.dagur_schedules (
-        job_name text PRIMARY KEY,
-        task_type text,
-        cron_expression text,
-        interval_seconds int,
-        enabled boolean,
-        last_run_epoch bigint,
-        command text
-    );
-    """
-    create_dagur_runs = """
-    CREATE TABLE IF NOT EXISTS hydra.dagur_runs (
-        job_name text,
-        start_time timestamp,
-        run_id uuid,
-        end_time timestamp,
-        status text,
-        exit_code int,
-        output text,
-        PRIMARY KEY (job_name, start_time)
-    ) WITH CLUSTERING ORDER BY (start_time DESC);
-    """
     
     # Detect tier from local storage-pools.json
     detected_tier = "HDD"
@@ -1202,141 +1165,17 @@ def init_db():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('helios_update_check', 'update_check', '0 */4 * * *', 14400, true, 0, 'python3 /usr/local/bin/check-updates') IF NOT EXISTS;
     """
-    create_lcm_update_state = """
-    CREATE TABLE IF NOT EXISTS hydra.lcm_update_state (
-        key text PRIMARY KEY,
-        latest_version text,
-        release_date text,
-        download_url text,
-        sha256 text,
-        size bigint,
-        changelog text,
-        current_version text,
-        update_available boolean,
-        last_checked timestamp,
-        error_msg text
-    );
-    """
     
     # Define valhalla_images table
-    create_valhalla_images = """
-    CREATE TABLE IF NOT EXISTS hydra.valhalla_images (
-        name text PRIMARY KEY,
-        filename text,
-        size_bytes bigint,
-        type text,
-        path text,
-        created_at timestamp
-    );
-    """
 
-    create_users_table = """
-    CREATE TABLE IF NOT EXISTS hydra.users (
-        username text PRIMARY KEY,
-        password_hash text
-    );
-    """
 
-    create_sessions_table = """
-    CREATE TABLE IF NOT EXISTS hydra.sessions (
-        session_token text PRIMARY KEY,
-        username text,
-        created_at timestamp
-    );
-    """
 
-    create_console_sessions_table = """
-    CREATE TABLE IF NOT EXISTS hydra.console_sessions (
-        console_token text PRIMARY KEY,
-        host_ip text,
-        port int,
-        expires_at int
-    );
-    """
 
-    create_cluster_settings_table = """
-    CREATE TABLE IF NOT EXISTS hydra.cluster_settings (
-        key text PRIMARY KEY,
-        value text
-    );
-    """
-    create_mimir_schedules = """
-    CREATE TABLE IF NOT EXISTS hydra.mimir_schedules (
-        schedule_name text PRIMARY KEY,
-        category text,
-        enabled boolean,
-        last_run_epoch bigint
-    );
-    """
     insert_mimir_default = """
     INSERT INTO hydra.mimir_schedules (schedule_name, category, enabled, last_run_epoch)
     VALUES ('hourly_checks', 'all', true, 0) IF NOT EXISTS;
     """
 
-    create_gatoway_networks = """
-    CREATE TABLE IF NOT EXISTS hydra.gatoway_networks (
-        net_id uuid PRIMARY KEY,
-        name text,
-        type text,
-        vlan_id int
-    );
-    """
-    create_urbosa_t0_routers = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t0_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        uplink_interface text,
-        uplink_ip text,
-        gateway_ip text,
-        nat_rules text
-    );
-    """
-    create_urbosa_t1_routers = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t1_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        t0_link_id uuid,
-        dhcp_enabled boolean
-    );
-    """
-    create_urbosa_segments = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_segments (
-        segment_id uuid PRIMARY KEY,
-        name text,
-        vni int,
-        t1_link_id uuid,
-        subnet_cidr text,
-        gateway_ip text,
-        dhcp_enabled boolean,
-        dhcp_start text,
-        dhcp_end text
-    );
-    """
-    create_urbosa_firewall_rules = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_firewall_rules (
-        rule_id uuid PRIMARY KEY,
-        description text,
-        source_ip text,
-        dest_ip text,
-        protocol text,
-        port int,
-        action text,
-        priority int
-    );
-    """
-    create_urbosa_tunnel_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_tunnel_metrics (
-        node_ip text,
-        interface_name text,
-        timestamp timestamp,
-        rx_kbps float,
-        tx_kbps float,
-        rx_packets float,
-        tx_packets float,
-        PRIMARY KEY ((node_ip, interface_name), timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
     insert_default_network = """
     INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id)
     VALUES (7a68e0d6-11f8-4e89-9430-b3b44b8bc438, 'Physical-Direct', 'direct', null) IF NOT EXISTS;
@@ -1344,94 +1183,35 @@ def init_db():
 
     insert_default_image_container = "SELECT now() FROM system.local;"
 
-    create_logos_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.logos_metrics (
-        node_ip text,
-        timestamp timestamp,
-        cpu_pct float,
-        mem_pct float,
-        mem_total_kb bigint,
-        cpu_cores int,
-        disk_iops float,
-        disk_bandwidth_kbps float,
-        net_rx_kbps float,
-        net_tx_kbps float,
-        PRIMARY KEY (node_ip, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
-    create_vm_nvram = """
-    CREATE TABLE IF NOT EXISTS hydra.vm_nvram (
-        vm_name text PRIMARY KEY,
-        nvram_data text
-    );
-    """
-    create_console_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.console_metrics (
-        vm_name text,
-        timestamp timestamp,
-        avg_fps float,
-        low_fps float,
-        latency float,
-        PRIMARY KEY (vm_name, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
-    create_yggdrasil_jobs = """
-    CREATE TABLE IF NOT EXISTS hydra.hylia_jobs (
-        job_id uuid PRIMARY KEY,
-        state text,
-        target_nodes list<text>,
-        current_node text,
-        build_number text,
-        manifest_json text,
-        changelog_md text
-    );
-    """
-    create_yggdrasil_logs = """
-    CREATE TABLE IF NOT EXISTS hydra.hylia_logs (
-        job_id uuid,
-        timestamp timestamp,
-        log_line text,
-        PRIMARY KEY (job_id, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp ASC);
-    """
 
     # Retry loop since ScyllaDB may take a moment to bootstrap on boot
     for i in range(15):
         rc, out, err = run_cql_query(create_keyspace)
         if rc == 0:
             print("Keyspace 'hydra' checked/created successfully.")
-            rc2, out2, err2 = run_cql_query(create_table)
-            rc3, out3, err3 = run_cql_query(create_containers_table)
-            rc4, out4, err4 = run_cql_query(create_mimir_results)
-            rc5, out5, err5 = run_cql_query(create_dagur_schedules)
-            rc6, out6, err6 = run_cql_query(create_dagur_runs)
-            rc7, out7, err7 = run_cql_query(create_valhalla_images)
-            rc8, out8, err8 = run_cql_query(create_users_table)
-            rc9, out9, err9 = run_cql_query(create_sessions_table)
-            rc_cs, out_cs, err_cs = run_cql_query(create_console_sessions_table)
-            rc10, out10, err10 = run_cql_query(create_cluster_settings_table)
-            rc11, out11, err11 = run_cql_query(create_mimir_schedules)
-            rc12, out12, err12 = run_cql_query(create_gatoway_networks)
-            rc13, out13, err13 = run_cql_query(create_logos_metrics)
-            # Migrate existing logos_metrics table to add mem_total_kb and cpu_cores if missing
-            run_cql_query("ALTER TABLE hydra.logos_metrics ADD mem_total_kb bigint;")
-            run_cql_query("ALTER TABLE hydra.logos_metrics ADD cpu_cores int;")
-            rc14, out14, err14 = run_cql_query(create_urbosa_t0_routers)
-            rc15, out15, err15 = run_cql_query(create_urbosa_t1_routers)
-            rc16, out16, err16 = run_cql_query(create_urbosa_segments)
-            rc17, out17, err17 = run_cql_query(create_urbosa_firewall_rules)
-            rc18, out18, err18 = run_cql_query(create_urbosa_tunnel_metrics)
-            rc_nv, out_nv, err_nv = run_cql_query(create_vm_nvram)
-            rc_cm, out_cm, err_cm = run_cql_query(create_console_metrics)
-            rc_yj, out_yj, err_yj = run_cql_query(create_yggdrasil_jobs)
-            rc_yl, out_yl, err_yl = run_cql_query(create_yggdrasil_logs)
-            rc_lus, out_lus, err_lus = run_cql_query(create_lcm_update_state)
-            if (rc2 == 0 and rc3 == 0 and rc4 == 0 and rc5 == 0 and rc6 == 0 and 
-                rc7 == 0 and rc8 == 0 and rc9 == 0 and rc_cs == 0 and rc10 == 0 and rc11 == 0 and rc12 == 0 and rc13 == 0 and
-                rc14 == 0 and rc15 == 0 and rc16 == 0 and rc17 == 0 and rc18 == 0 and rc_nv == 0 and rc_cm == 0 and
-                rc_yj == 0 and rc_yl == 0 and rc_lus == 0):
+            # The tables are no longer defined here. helios_schema holds one ordered,
+            # recorded list applied behind a cluster lock, so two daemon versions cannot
+            # race to define the same table differently -- the loser's
+            # CREATE TABLE IF NOT EXISTS is a silent no-op and it never finds out.
+            #
+            # Twenty-three tables lived here, six of them also declared by vali.py or
+            # check_updates.py. They agreed, but nothing made them agree.
+            try:
+                applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+                if applied:
+                    print(f"Applied schema migrations: {', '.join(applied)}")
+                schema_ok = True
+                # Columns added after logos_metrics shipped. Not migrations:
+                # Scylla errors when the column exists, so these are idempotent
+                # only because that error is swallowed here.
+                run_cql_query("ALTER TABLE hydra.logos_metrics ADD mem_total_kb bigint;")
+                run_cql_query("ALTER TABLE hydra.logos_metrics ADD cpu_cores int;")
+            except Exception as schema_error:
+                # ScyllaDB may still be bootstrapping. The surrounding loop retries; a
+                # failure here must not be mistaken for a schema that applied.
+                print(f"Schema not applied yet: {schema_error}")
+                schema_ok = False
+            if schema_ok:
                 print("Tables checked/created successfully.")
                 run_cql_query(insert_default)
                 run_cql_query(insert_default_image_container)

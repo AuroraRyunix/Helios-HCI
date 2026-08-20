@@ -162,6 +162,22 @@ class OutputParsingTests(unittest.TestCase):
             ["", " [applied]", "-----------", "      True", "", "(1 rows)", ""])
         self.assertTrue(schema.lwt_applied(single_column))
 
+    def test_both_parsers_handle_daruk_output_as_well_as_cqlsh(self):
+        """The daemons do not use cqlsh; they proxy to Daruk.
+
+        Daruk's /query returns decoded row values joined by a space, with no column names
+        and no [applied] marker. Reading only the cqlsh form meant a successful lock
+        acquisition looked like a lost race -- so the runner returned holding the lock it
+        had just taken -- and every applied migration looked unapplied, so it would try
+        to reapply the whole list on every start. Verified against a real daemon.
+        """
+        self.assertTrue(schema.lwt_applied("True null null null"))
+        self.assertFalse(schema.lwt_applied("False 10.10.102.41"))
+        daruk_rows = "\n".join(["0001-baseline abc123", "0002-cluster-locks def456"])
+        self.assertEqual(
+            schema.parse_applied(daruk_rows),
+            {"0001-baseline": "abc123", "0002-cluster-locks": "def456"})
+
     def test_lwt_applied_is_false_when_the_marker_is_missing(self):
         # Guessing "applied" here would let two daemons migrate at once.
         self.assertFalse(schema.lwt_applied(""))

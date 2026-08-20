@@ -381,112 +381,48 @@ def submit_and_wait_task(service, action, task_payload, timeout_polls=3, parent_
     return False, f"Task timed out after ~{timeout_polls * POLL_INTERVAL_SEC}s (it may still be running in Catalyst).", ""
 
 # Initialize Database Schema
-def init_db_schema():
-    tasks_table = """
-    CREATE TABLE IF NOT EXISTS hydra.vali_tasks (
-        task_id uuid PRIMARY KEY,
-        vm_name text,
-        action text,
-        status text,
-        target_host text,
-        created_at bigint,
-        updated_at bigint,
-        error_msg text
-    );
-    """
-    drs_status_table = """
-    CREATE TABLE IF NOT EXISTS hydra.vali_drs_status (
-        cluster_name text PRIMARY KEY,
-        current_deviation double,
-        status_str text,
-        last_drs_run bigint,
-        drs_enabled boolean
-    );
-    """
-    drs_history_table = """
-    CREATE TABLE IF NOT EXISTS hydra.vali_drs_history (
-        event_time timestamp,
-        vm_name text,
-        source_host text,
-        target_host text,
-        reason text,
-        PRIMARY KEY (event_time, vm_name)
-    );
-    """
-    nodes_table = """
-    CREATE TABLE IF NOT EXISTS hydra.nodes (
-        hostname text PRIMARY KEY,
-        ip text,
-        status text,
-        maintenance_mode boolean
-    );
-    """
-    run_cql_query(tasks_table)
-    run_cql_query(drs_status_table)
-    run_cql_query("ALTER TABLE hydra.vali_drs_status ADD drs_enabled boolean;")
-    run_cql_query(drs_history_table)
-    run_cql_query(nodes_table)
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from."""
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    import os as _os
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                    "helios_schema.py")):
+        if not _os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
 
-    # Gatoway Networks schema
-    create_gatoway_networks = """
-    CREATE TABLE IF NOT EXISTS hydra.gatoway_networks (
-        net_id uuid PRIMARY KEY,
-        name text,
-        type text,
-        vlan_id int
-    );
+
+def init_db_schema():
+    """Apply the cluster schema, then the parts that are still this daemon's.
+
+    Nine tables used to be defined here, four of them also defined in
+    spectrum_server.py. They now live in helios_schema as one ordered, recorded list, so
+    two daemon versions cannot race to define the same table differently -- the loser's
+    CREATE TABLE IF NOT EXISTS is a silent no-op and it spends the rest of its life
+    reading columns that are not there.
+
+    The ALTER TABLE statements below have deliberately not moved. Scylla errors when the
+    column already exists, so they are idempotent only because that error is swallowed
+    here; inside a migration, where a failed statement aborts the run, they would break
+    every restart after the first. Making them migrations needs an
+    add-column-if-absent step that checks system_schema.columns first.
     """
-    run_cql_query(create_gatoway_networks)
-    
-    # Urbosa SDN schemas
-    create_urbosa_t0 = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t0_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        uplink_interface text,
-        uplink_ip text,
-        gateway_ip text,
-        nat_rules text
-    );
-    """
-    create_urbosa_t1 = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t1_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        t0_link_id uuid,
-        dhcp_enabled boolean
-    );
-    """
-    create_urbosa_segments = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_segments (
-        segment_id uuid PRIMARY KEY,
-        name text,
-        vni int,
-        t1_link_id uuid,
-        subnet_cidr text,
-        gateway_ip text,
-        dhcp_enabled boolean,
-        dhcp_start text,
-        dhcp_end text
-    );
-    """
-    create_urbosa_firewall = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_firewall_rules (
-        rule_id uuid PRIMARY KEY,
-        description text,
-        source_ip text,
-        dest_ip text,
-        protocol text,
-        port int,
-        action text,
-        priority int
-    );
-    """
-    run_cql_query(create_urbosa_t0)
-    run_cql_query(create_urbosa_t1)
-    run_cql_query(create_urbosa_segments)
-    run_cql_query(create_urbosa_firewall)
-    
+    applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+    if applied:
+        sys.stderr.write("Applied schema migrations: %s\n" % ", ".join(applied))
+
     insert_default_network = """
     INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id)
     VALUES (7a68e0d6-11f8-4e89-9430-b3b44b8bc438, 'Physical-Direct', 'direct', null) IF NOT EXISTS;
@@ -1971,13 +1907,16 @@ MAINTENANCE_LOCK_NAME = "cluster-maintenance"
 MAINTENANCE_LOCK_TTL_SECONDS = 300
 
 # Byte-for-byte the statement in helios_schema.py migration 0002-cluster-locks, which is
-# the source of truth for this table.
+# the source of truth for this table. A test asserts the two cannot drift.
 #
-# It is repeated here because nothing calls helios_schema.ensure_schema yet and
-# helios_schema.py is not in the deployment toolkit's upload list, so migration 0002
-# cannot reach a node. Without this the first maintenance request after an upgrade fails
-# on an unconfigured table and the host cannot be drained at all. Delete it once the
-# migration runner is wired into daemon startup.
+# It was originally repeated here because nothing called ensure_schema and
+# helios_schema.py was not deployed. Both are now true -- init_db_schema() applies the
+# migrations at startup -- so this is no longer the only way the table gets created.
+#
+# It stays as a floor rather than a duplicate. The lock is what stops two hosts draining
+# at once, and the cost of it being absent is not an error message: it is a maintenance
+# entry that proceeds unguarded. One no-op CREATE against a table that already exists is
+# a cheap price for that not depending on a migration having succeeded earlier in boot.
 CLUSTER_LOCKS_DDL = (
     "CREATE TABLE IF NOT EXISTS hydra.cluster_locks ( name text PRIMARY KEY, "
     "holder text, holder_token text, reason text, acquired_at_ms bigint );")

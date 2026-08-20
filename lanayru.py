@@ -10,6 +10,32 @@ import ssl
 import hashlib
 import base64
 
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin beside this file; inside the Spectrum container
+    it is copied to /app. Neither location is importable by name from the other.
+    """
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    import os as _os
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                    "helios_schema.py")):
+        if not _os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
 def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_id, created_at):
     from spectrum_server import (
         run_cql_query,
@@ -34,29 +60,9 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         time.sleep(1.5)
         
         log("Step 1: Creating persistent database schema in ScyllaDB (Hydra)...", "info")
-        cql_create1 = """
-        CREATE TABLE IF NOT EXISTS hydra.lanayru_clusters (
-            cluster_id uuid PRIMARY KEY,
-            name text,
-            control_nodes int,
-            overlay_segment_id uuid,
-            status text,
-            created_at timestamp
-        );
-        """
-        cql_create2 = """
-        CREATE TABLE IF NOT EXISTS hydra.lanayru_k8s_state (
-            cluster_id uuid,
-            name text,
-            value blob,
-            version int,
-            is_dir boolean,
-            ttl int,
-            PRIMARY KEY (cluster_id, name)
-        );
-        """
-        run_cql_query(cql_create1)
-        run_cql_query(cql_create2)
+        # The Lanayru tables are part of the cluster schema in helios_schema, not this
+        # script's to define. This applies whatever is outstanding.
+        load_schema_module().ensure_schema(run_cql_query)
         time.sleep(1)
         log("ScyllaDB tables hydra.lanayru_clusters & hydra.lanayru_k8s_state are verified.", "success")
 

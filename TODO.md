@@ -182,9 +182,18 @@ already-fixed when it had never worked.
   allowlisting), network probing via `ss`/`ip` (~12), linstor/drbd (~14, mostly already typed), virsh
   (~4), and `podman exec` for cqlsh (~8, which belongs behind Daruk rather than Spark). This is a
   programme of work rather than a task: each family needs an endpoint designed, validated and tested.
-* **Catalyst/Vali internal APIs are reachable on the LAN with no auth.** `catalyst.py` (`9091`) and
-  `vali.py` (`9095`) bind `0.0.0.0` under `Network=host` and check neither source IP nor credential.
-  Input validation now closes the injection paths; the authorization gap is untouched.
+* ~~Catalyst/Vali internal APIs are reachable on the LAN with no auth.~~ **Resolved (2026-08-20)**:
+  both now require mutual TLS against the cluster CA, with `CERT_REQUIRED`, and neither starts if its
+  certificates are absent -- falling back to plain HTTP when something is already wrong would reopen
+  the hole at the worst moment. The handshake runs per connection in the worker thread, so one slow
+  client cannot stall the listener. Every caller moved with them, including several that were not
+  obvious: `spectrum_server.py` had seven submission sites, and `vali.py` and `valcli.py` had their
+  own Catalyst clients. `test_internal_api_auth.py` asserts the property rather than the change -- no
+  daemon calls an internal control API over plain HTTP, both listeners demand a client certificate and
+  pin the CA -- and it is what found the three callers that had been missed.
+  Verified live for Catalyst end to end: plain HTTP refused, TLS without a client certificate refused
+  at the handshake, and a cluster-signed certificate reaching the handler; the Spectrum container
+  authenticates with its own `client.crt`.
 * ~~No mTLS certificate renewal.~~ **Resolved (2026-08-20)**: `impa`
   (status/plan/renew/rollback/selftest) drives renewal and CA rotation over SSH rather than mTLS,
   deliberately -- it has to work once the certificates it repairs have expired, which is exactly when
@@ -255,18 +264,37 @@ discipline, the ring lifecycle, and the store abstraction.
 * ~~Scheduled major compaction is an anti-pattern.~~ **Resolved (2026-08-19)**: the 12-hourly
   `nodetool compact` job is disabled, with a migration for existing clusters. Disabled rather than
   deleted so an operator can see it and re-enable deliberately.
-* **Schema is scattered and unversioned.** 38 `CREATE TABLE IF NOT EXISTS` across five daemons with no
-  migration system. **Partly done (2026-08-20)**: `helios_schema.py` holds one ordered migration list,
-  recorded in `hydra.schema_migrations` behind a TTL-bounded LWT lock, with checksums that refuse a
-  migration edited after it shipped. The baseline was extracted from the daemons and checked against
-  the live cluster -- 29 of its 31 tables exist there and match; the two that do not belong to Lanayru,
-  which has never successfully deployed. Six tables are declared by two daemons and one by three; they
-  were compared statement by statement and **currently agree**, so the risk is drift between daemon
-  versions during a rolling upgrade rather than a live bug.
-  **Remaining**: point the five `init_db*` functions at `ensure_schema()` and delete their local
-  `CREATE TABLE` blocks.
-* **No ring lifecycle management.** Nutanix auto-detaches an unhealthy node from the ring. Helios has no
-  quorum gate on maintenance entry and no decommission/rejoin sequencing.
+* ~~Schema is scattered and unversioned.~~ **Resolved (2026-08-20)**: `helios_schema.py` holds one
+  ordered migration list, recorded in `hydra.schema_migrations` behind a TTL-bounded LWT lock, with
+  checksums that refuse a migration edited after it shipped. All five daemons now call
+  `ensure_schema()` at startup and define no tables of their own; the lock makes concurrent starts
+  safe, so none of them depends on another having run first.
+  Two bugs surfaced only by running it against a real database rather than a fake. The LWT parser
+  compared the whole output line to "True", which matches cqlsh's single-column form and nothing else,
+  so a *successful* lock acquisition read as a lost race and the runner returned still holding the
+  lock. Then the daemons turned out not to use cqlsh at all -- they proxy to Daruk, which returns row
+  values joined by spaces with no column names, so both parsers had to learn that shape too. Verified
+  live: dropping the ledger and restarting catalyst, vali and the console applies both migrations,
+  records them, releases the lock, and leaves every seeding step working.
+  **Deliberately not moved**: the `ALTER TABLE ... ADD` statements. Scylla errors when the column
+  exists, so they are idempotent only because that error is swallowed at the call site; inside a
+  migration, where a failed statement aborts the run, they would break every restart after the first.
+  Making them migrations needs an add-column-if-absent step that consults `system_schema.columns`.
+* ~~No ring lifecycle management.~~ **Resolved (2026-08-20)**: maintenance entry is gated on quorum,
+  with the replication factor read from `system_schema.keyspaces` rather than assumed, and the gate
+  refusing outright if it cannot be read. It runs twice -- once in the API handler and again
+  immediately before the database is stopped -- because an evacuation can take an hour and the ring
+  the first check saw is not the ring at stop time. Cross-host exclusion is now a lock row taken with
+  `IF NOT EXISTS`, carrying a holder token so a previous holder cannot release the current one and a
+  TTL so a host that dies does not wedge maintenance for the cluster. `cluster ring`,
+  `cluster decommission` and `cluster rejoin` provide the preflight, the ordered plan and the
+  bookkeeping. See [docs/ring_lifecycle.md](docs/ring_lifecycle.md).
+  Verified live: the single-node cluster correctly refused to enter maintenance, reading RF and the
+  ring from the real database.
+  **Deliberately manual**: `nodetool decommission` and `removenode` stream data, run unbounded and
+  cannot be re-run, so an interrupted one leaves a node neither in nor out of the ring. Automatic
+  detach of an unhealthy node is also not implemented -- from a health check that has failed for
+  thirty seconds, a dead node and a partitioned one are indistinguishable.
 
 Suggested shape: keep `/query` working, add typed endpoints (`/v1/vm/claim`, `/v1/vm/migrate-lock`)
 backed by prepared LWT statements, migrate invariant-critical writes first, move schema ownership into
