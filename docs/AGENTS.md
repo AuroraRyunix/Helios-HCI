@@ -44,7 +44,8 @@ Every service below is named after its Nutanix analog (see the table in the top-
 | `catalyst.py` / `catcli` | Task orchestrator daemon (HTTP API on port `9091`) + its CLI. |
 | `dagur.py` | Cron/scheduled-task daemon, reads job definitions from the `hydra.dagur_schedules` ScyllaDB table. |
 | `daruk.py` | ScyllaDB CQL query proxy; runs as a plain `systemd` unit (not a Quadlet) that execs `podman exec` into the ScyllaDB container. |
-| `mimir.py` / `mcli` / `mcli-runner` | Health-check daemon + CLI + runner helper. |
+| `mimir.py` / `mcli` / `mcli-runner` | Health-check daemon + CLI + runner helper. Mimir also surveys this node's mTLS certificate expiry every 15 minutes, independently of the leader-only schedule. |
+| `impa.py` | mTLS certificate lifecycle: `status` / `plan` / `renew` / `rollback` / `selftest` for the cluster CA and the certificates it signs. Runs on the host holding `ca.key` and drives peers over SSH, not over mTLS, because renewal has to work once the certificates it repairs have expired. See [mtls_lifecycle.md](./mtls_lifecycle.md). |
 | `logos.py` | Metrics/telemetry collector. |
 | `lanayru.py` | Guest-Kubernetes ("Lanayru") deployer, split out of `spectrum_server.py`. |
 | `check_updates.py`, `create_upgrade_zip.py`, `deploy_updates.py` | Update pipeline: check for a newer version → build an upgrade zip → push it to nodes. |

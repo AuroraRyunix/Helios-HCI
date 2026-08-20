@@ -402,14 +402,94 @@ def check_urbosa_enabled():
                 return True
     return False
 
+_SPARK_LOCAL_IP = None
+
+def spark_local_ip():
+    """This node's address as its own certificate names it.
+
+    spectrum.env is what provision.py wrote; the UDP-connect trick is the fallback the
+    rest of this file already uses. Only a non-loopback answer is cached.
+    """
+    global _SPARK_LOCAL_IP
+    if _SPARK_LOCAL_IP:
+        return _SPARK_LOCAL_IP
+    resolved = "127.0.0.1"
+    try:
+        with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+            for line in f:
+                if line.startswith("LOCAL_HYPERVISOR_IP="):
+                    value = line.strip().split("=", 1)[1].strip()
+                    if value:
+                        resolved = value
+    except Exception:
+        pass
+    if resolved == "127.0.0.1":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))
+            resolved = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+    if resolved not in ("127.0.0.1", "::1", "localhost"):
+        _SPARK_LOCAL_IP = resolved
+    return resolved
+
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Loopback is in no node's SAN; spark-daemon binds 0.0.0.0:9099, so this
+    node's own address reaches the same listener and does verify.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        local = spark_local_ip()
+        if local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+class ClusterPeerSSLContext(ssl.SSLContext):
+    """mTLS context for the VIP, which no certificate is issued for.
+
+    The VIP floats -- it is answered by whichever node currently holds it -- so there is
+    no single address to hand check_hostname. Verifying the chain alone is what let any
+    certificate the cluster CA ever signed stand in for any node, so rather than drop the
+    identity check entirely this requires the peer's IP SAN to name a host that is in
+    cluster.json. That still refuses the shared client certificate, which carries no SAN
+    at all and sits on every node, being used to answer on the VIP.
+
+    Adding the VIP to every node certificate's SAN would let this become an ordinary
+    check_hostname check; see docs/mtls_lifecycle.md.
+    """
+
+    cluster_ips = frozenset()
+
+    def wrap_socket(self, sock, *args, **kwargs):
+        wrapped = super().wrap_socket(sock, *args, **kwargs)
+        try:
+            san = (wrapped.getpeercert() or {}).get("subjectAltName", ())
+            peer_ips = set(value for kind, value in san if kind == "IP Address")
+            if not peer_ips & self.cluster_ips:
+                raise ssl.SSLCertVerificationError(
+                    "the VIP is answered by a certificate for %s, which is not a configured "
+                    "cluster node" % (", ".join(sorted(peer_ips)) or "no IP address"))
+        except BaseException:
+            wrapped.close()
+            raise
+        return wrapped
+
 def make_request(path, method="GET", payload=None):
     # Try VIP if configured
     vip = None
+    cluster_ips = []
     try:
         if os.path.exists("/etc/hci/cluster.json"):
             with open("/etc/hci/cluster.json", "r") as f:
                 cdata = json.load(f)
                 vip = cdata.get("vip")
+                cluster_ips = [h["ip"] for h in cdata.get("hosts", []) if h.get("ip")]
     except Exception:
         pass
 
@@ -418,12 +498,21 @@ def make_request(path, method="GET", payload=None):
         target_ips.append(vip)
     target_ips.append("127.0.0.1")
 
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
-    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-
     last_err = ""
     for ip in target_ips:
+        if vip and ip == vip:
+            context = ClusterPeerSSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_REQUIRED
+            context.load_verify_locations(cafile="/root/.certs/ca.crt")
+            context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+            context.cluster_ips = frozenset(cluster_ips)
+        else:
+            ip, verify_identity = spark_endpoint(ip)
+            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+            context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+            context.check_hostname = verify_identity
+
         url = f"https://{ip}:9099{path}"
         data = None
         if payload is not None:

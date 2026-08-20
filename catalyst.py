@@ -26,11 +26,32 @@ try:
 except Exception:
     pass
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})

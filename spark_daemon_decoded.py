@@ -39,11 +39,68 @@ def get_service_build_number(target_path):
         pass
     return "Unknown"
 
+_SPARK_LOCAL_IP = None
+
+def spark_local_ip():
+    """This node's address as its own certificate names it.
+
+    spectrum.env is what provision.py wrote; the UDP-connect trick is the fallback the
+    rest of this file already uses. Only a non-loopback answer is cached, because the
+    daemon starts before the network is necessarily up and a cached 127.0.0.1 would
+    never recover.
+    """
+    global _SPARK_LOCAL_IP
+    if _SPARK_LOCAL_IP:
+        return _SPARK_LOCAL_IP
+    resolved = "127.0.0.1"
+    try:
+        with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+            for line in f:
+                if line.startswith("LOCAL_HYPERVISOR_IP="):
+                    value = line.strip().split("=", 1)[1].strip()
+                    if value:
+                        resolved = value
+    except Exception:
+        pass
+    if resolved == "127.0.0.1":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))
+            resolved = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+    if resolved not in ("127.0.0.1", "::1", "localhost"):
+        _SPARK_LOCAL_IP = resolved
+    return resolved
+
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        local = spark_local_ip()
+        if local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -87,10 +144,11 @@ class UdevHelper:
 
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -226,10 +284,11 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     ca_cert = "/etc/hci/spark/certs/ca.crt"
     node_cert = "/etc/hci/spark/certs/node.crt"
     node_key = "/etc/hci/spark/certs/node.key"
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_cert)
     context.load_cert_chain(certfile=node_cert, keyfile=node_key)
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -1864,8 +1923,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     print(f"[Spark Daemon] Local Vali is offline. Multi-node cluster detected. Attempting to delegate leave maintenance request to remote spark daemons: {other_ips}")
                     context_remote = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
                     context_remote.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-                    context_remote.check_hostname = False
-                    
+                    # Every address here comes from cluster.json, so each one is the IP its
+                    # own node certificate is issued for and verification stays on.
+                    context_remote.check_hostname = True
+
                     forward_success = False
                     for remote_ip in other_ips:
                         url = f"https://{remote_ip}:9099/api/v1/host/maintenance"

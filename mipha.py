@@ -440,27 +440,55 @@ try:
 except Exception:
     pass
 
-def run_remote_spark(ip, command):
-    # Try daemon certificates first, fallback to client certificates
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
+def spark_mtls_context(verify_identity):
+    """Build the mTLS context Mipha dials peers with, or None if no keypair is usable.
+
+    None rather than ssl._create_unverified_context(): Mipha fences hosts and promotes
+    the LINSTOR controller off what these calls report, and an unverified context turned
+    a missing keypair into a connection that trusts whatever answers on 9099. Failing the
+    call is the safe reading of "this node has no identity".
+    """
     cert_paths = [
         ("/etc/hci/spark/certs/ca.crt", "/etc/hci/spark/certs/node.crt", "/etc/hci/spark/certs/node.key"),
         ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
     ]
-    
-    context = None
     for ca, cert, key in cert_paths:
         if os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key):
             try:
                 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
                 context.load_cert_chain(certfile=cert, keyfile=key)
-                context.check_hostname = False
-                break
+                context.check_hostname = verify_identity
+                return context
             except Exception:
                 pass
-                
+    return None
+
+def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
+    context = spark_mtls_context(verify_identity)
     if not context:
-        context = ssl._create_unverified_context()
-        
+        return -1, "", "no usable mTLS keypair in /etc/hci/spark/certs or /root/.certs"
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -472,25 +500,11 @@ def run_remote_spark(ip, command):
         return -1, "", str(e)
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
-    cert_paths = [
-        ("/etc/hci/spark/certs/ca.crt", "/etc/hci/spark/certs/node.crt", "/etc/hci/spark/certs/node.key"),
-        ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
-    ]
-    
-    context = None
-    for ca, cert, key in cert_paths:
-        if os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key):
-            try:
-                context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca)
-                context.load_cert_chain(certfile=cert, keyfile=key)
-                context.check_hostname = False
-                break
-            except Exception:
-                pass
-                
+    ip, verify_identity = spark_endpoint(ip)
+    context = spark_mtls_context(verify_identity)
     if not context:
-        context = ssl._create_unverified_context()
-        
+        return -1, {}, "no usable mTLS keypair in /etc/hci/spark/certs or /root/.certs"
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":

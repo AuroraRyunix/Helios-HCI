@@ -9,6 +9,7 @@ Mimir is the background cluster health diagnostics and checking service for the 
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/mimir`) managed by systemd (`mimir.service`).
 - **Consensus Execution**: Mimir queries ZooKeeper status and only triggers checks on the node elected as the ZooKeeper leader to prevent concurrent execution.
 - **Autostart Constraint**: Mimir is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
+- **Certificate Survey (every node, every 15 minutes)**: the one check that is deliberately *not* behind the leader election above. Each node classifies every certificate under `/etc/hci/spark/certs` and `/root/.certs` and upserts the result into `hydra.mimir_results` as `mtls_cert_expiration` / `security.mtls.certs`, so the console shows a continuously refreshed answer rather than whatever the last leader-triggered fan-out left behind. The certificates are per-node, and the day they lapse is the day the leader-only fan-out stops being able to reach any node at all. `PASS` above 30 days, `WARN` inside 30, `FAIL` inside 7 or already expired; an expiry date that cannot be parsed is `WARN`, never `PASS`. See [mtls_lifecycle.md](./mtls_lifecycle.md) for the renewal path this check exists to prompt.
 
 ## Database Schema
 Mimir relies on the following ScyllaDB tables in the `hydra` keyspace:
