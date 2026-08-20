@@ -34,7 +34,9 @@ mapping = {
     "CHECK_UPDATES_B64": "check_updates.py",
     "HYLIA_B64": "hylia.py",
     "LANAYRU_B64": "lanayru.py",
-    "HELIOS_ZK_B64": "helios_zk.py"
+    "HELIOS_ZK_B64": "helios_zk.py",
+    "HELIOS_SIG_B64": "helios_sig.py",
+    "IMPA_B64": "impa.py"
 }
 
 # Any constant provision.py embeds must be listed above, otherwise editing its source

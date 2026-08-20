@@ -49,6 +49,7 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Check Updates (`check_updates.py`) | — | [check_updates_technical.md](./check_updates_technical.md) |
 | Create Upgrade Zip (`create_upgrade_zip.py`) | — | [create_upgrade_zip_technical.md](./create_upgrade_zip_technical.md) |
 | Deploy Updates (`deploy_updates.py`) | — | [deploy_updates_technical.md](./deploy_updates_technical.md) |
+| Update Signing (`helios_sig.py`) | [update_signing.md](./update_signing.md) | — |
 | Push to GitHub (`push_to_github.py`) | — | [push_to_github_technical.md](./push_to_github_technical.md) |
 | Replace Run CQL (`replace_run_cql.py`) | — | [replace_run_cql_technical.md](./replace_run_cql_technical.md) |
 | Test Hylia (`test_hylia.py`) | — | [test_hylia_technical.md](./test_hylia_technical.md) |

@@ -160,27 +160,71 @@ already-fixed when it had never worked.
 
 ## P1 — Open security items
 
-* **The update chain still has no signature.** Hardened but not solved: `check_updates.py` still takes
-  `download_url` and its `sha256` from the same response, and the manifest still declares the hashes for
-  its own contents. Real integrity needs a detached signature over the manifest verified against a key
-  pinned at provision time. Everything else in the update path is now defence-in-depth around this gap.
+* ~~The update chain still has no signature.~~ **Resolved (2026-08-20)**: detached Ed25519 signatures
+  over the release document and the package manifest, verified against a key pinned at provision time
+  (`/etc/hci/keys/release_ed25519.pub`). Asymmetric rather than a shared-secret MAC because every node
+  must verify, so a MAC would let any compromised node forge releases for the whole fleet.
+  `check-updates` now reads version, URL, digest and changelog *only* from the signed payload; hylia
+  refuses an unsigned package before it reads a digest, which is the only anchor the manual-upload path
+  has; and `/api/lcm/upgrade/download` takes the URL and digest from the verified row rather than the
+  caller's POST body, which was a way to route around the check entirely. Fails closed, verified live
+  against the real update server. The transition escape hatch is deliberately awkward and never accepts
+  a *bad* signature. See [docs/update_signing.md](docs/update_signing.md).
+  **Outstanding**: `RELEASE_PUBKEY_PEM` in `provision.py` ships empty -- generate a release keypair and
+  paste in the public half, or update checks stay failed-closed.
 * **Unsandboxed root command execution.** `/api/v1/execute` runs caller-supplied strings via
   `shell=True` as root. **In progress**: the typed API in [docs/spark_api.md](./docs/spark_api.md)
-  covers 22 endpoints and `spectrum_server.py` is down from 79 raw calls to 45. `/api/v1/execute`
-  goes when that reaches zero across `spectrum_server.py` (45), `vali.py` (29), `hylia.py` (23) and
-  `mipha.py` (8). The v2 gap list in that doc names what each remaining group needs.
+  covers 22 endpoints. **The remaining count was wrong, and larger than recorded**: 184 call sites,
+  not 105, because `cluster_new.py` (62) and `dagur.py` (1) were never counted -- they reach the same
+  shell through their own copies of `run_remote_spark`. Current: `spectrum_server.py` 64,
+  `cluster_new.py` 62, `vali.py` 28, `hylia.py` 22, `mipha.py` 7, `dagur.py` 1. They group into roughly
+  ten endpoint families -- systemd unit control (~15), filesystem operations (~22, needing careful path
+  allowlisting), network probing via `ss`/`ip` (~12), linstor/drbd (~14, mostly already typed), virsh
+  (~4), and `podman exec` for cqlsh (~8, which belongs behind Daruk rather than Spark). This is a
+  programme of work rather than a task: each family needs an endpoint designed, validated and tested.
 * **Catalyst/Vali internal APIs are reachable on the LAN with no auth.** `catalyst.py` (`9091`) and
   `vali.py` (`9095`) bind `0.0.0.0` under `Network=host` and check neither source IP nor credential.
   Input validation now closes the injection paths; the authorization gap is untouched.
-* **No mTLS certificate renewal.** Certificates under `/etc/hci/spark/certs/` and `/root/.certs/` are
-  generated once at provision time. Expiry silently freezes all inter-node orchestration.
-  `run_remote_spark` also sets `check_hostname = False`, so any valid node cert can impersonate any node.
-* **Spectrum runs `--privileged` with `Network=host`** (`provision.py`). Worth scoping to explicit device
-  and capability grants.
+* ~~No mTLS certificate renewal.~~ **Resolved (2026-08-20)**: `impa`
+  (status/plan/renew/rollback/selftest) drives renewal and CA rotation over SSH rather than mTLS,
+  deliberately -- it has to work once the certificates it repairs have expired, which is exactly when
+  port 9099 is what is broken. CA rotation is a three-pass trust/present/prune ordering, asserted
+  before a byte is written. Mimir now surveys both certificate directories on every node every 15
+  minutes (PASS >30d, WARN <30d, FAIL <7d; an unparseable date is WARN, never PASS -- the previous
+  check returned PASS when it could not parse one). Hostname verification is **on**: the certificates
+  already carried an IP SAN, and provisioning now adds loopback, localhost, the hostname and the VIP,
+  plus `serverAuth,clientAuth` on node certs and `clientAuth` only on `client.crt`, which sits on every
+  node and was previously valid as a server certificate too. CA validity went from 3650 to 7300 days --
+  **the CA and every leaf previously expired on the same day**, so a leaf renewed near that date would
+  outlive its issuer and fail cluster-wide. See [docs/mtls_lifecycle.md](docs/mtls_lifecycle.md).
+  **Outstanding**: the floating VIP cannot be identity-bound without regenerating certificates (any
+  node may answer it), and `spectrum_phx/lib/spectrum_phx/spark.ex` is now the last client that accepts
+  any cluster-signed certificate for any node.
+* ~~Spectrum runs `--privileged` with `Network=host`.~~ **Resolved (2026-08-20)**: now
+  `DropCapability=ALL` + `NoNewPrivileges=true`. `--privileged` was granting the most exposed component
+  in the cluster the full capability set, SELinux confinement off, and podman's whole `/dev` -- a
+  process in that container could open `/dev/sda` read-write, confirmed on the live node. It bought
+  nothing: a container's `/dev` carries device nodes but not udev's subdirectories, so the
+  `/dev/drbd/by-res/...` paths the code actually uses were never present. That, not a missing
+  permission, is why image upload failed with ENOENT. Verified live -- `CapEff` is zero, `/dev/sda` is
+  gone, every console endpoint still serves -- and guarded by tests in `test_deployment_manifest.py`.
+  **Outstanding**: `aether` keeps `--privileged` and now documents why (it loads the DRBD module and
+  drives device-mapper). Scoping it to explicit `AddDevice`/`AddCapability` grants needs an audit of
+  what the Linstor satellite actually calls; guessed wrong it fails as silent storage corruption.
 
 ---
 
 ## P1 — Metadata layer (Daruk as a Medusa Store)
+
+* **Catalyst double-claims scheduled jobs.** `catalyst.py:237` reads `last_run_epoch`, decides a job is
+  due, and writes it back blind. Two Catalyst instances that both believe they hold leadership -- which
+  `is_zookeeper_leader()` permits, since it probes ZooKeeper's four-letter `stat` and falls back to
+  "lowest node with 9091 open" -- both submit the same Dagur job. `IF last_run_epoch = ?` fixes it, and
+  the Daruk LWT endpoints added for VM ownership are the pattern to follow.
+* **`run_cql_query` cannot report a failed LWT.** It renders the rejection row as the string
+  `"False 10.10.102.41"` with `rc=0`, which is indistinguishable from success. Every caller still using
+  it for a conditional write is silently treating lost races as wins. This is why the typed endpoints
+  return `(ok, applied, current, error)` instead, and it is the argument for retiring raw `/query`.
 
 Daruk is already mapped to Nutanix's "Medusa Proxy" and is already the single per-node choke point every
 daemon's `run_cql_query` talks to — but it is a pass-through that executes raw CQL text. Scylla already
@@ -193,16 +237,34 @@ discipline, the ring lifecycle, and the store abstraction.
   they own the same VM. The trigger was also narrowed from substring matching on
   "unavailable"/"timeout"/"active" to driver exception types -- "active" alone matched a wide range
   of unrelated errors. Ten classifier cases unit-tested; verified live.
-* **No compare-and-swap on ownership.** `IF NOT EXISTS` is used in 11 places, all seeding static rows.
-  VM ownership, the migration lock, and task claiming are all blind writes. `UPDATE hydra.vms SET
-  host_ip = ? WHERE name = ? IF host_ip = ?` would make the dual-primary scenario structurally impossible
-  rather than defended-against. The migration lock in particular is still read-then-write and therefore
-  racy even now that its column exists.
+* ~~No compare-and-swap on ownership.~~ **Resolved (2026-08-20)**: Daruk gained typed LWT endpoints
+  (`/v1/vm/claim`, `/release`, `/set-state`, `/migrate-lock`, `/migrate-unlock`, `/migrate-commit`,
+  `/create`, `/node/maintenance`) backed by prepared statements at QUORUM + SERIAL, with a fixed
+  operation table so no caller text can reach a statement. Ten ownership-critical writes migrated:
+  Vali now claims a VM *before* promoting its disk rather than recording placement after boot, the
+  read-then-write migration lock became one Paxos round, and three reconcile loops no longer unplace a
+  VM that has legitimately moved. A refused CAS returns 200 with `applied: false` and the *current*
+  values, so a caller can name the actual owner -- a lost race and a failure are never collapsed.
+  Verified against live Scylla, which settled three things that were not assumable: the driver renames
+  `[applied]` to `applied` inside rows, `was_applied` is single-use, and **`INSERT ... JSON ? IF NOT
+  EXISTS` silently ignores the condition and overwrites the row**.
+  **Outstanding**: the migration lock has no holder identity or expiry, so a late cleanup from a failed
+  attempt can release a *later* migration's lock. Cross-host maintenance exclusion is still
+  read-then-write and an LWT cannot fix it (it spans partitions); it needs a single-row cluster lock,
+  which belongs with the schema-ownership item.
 * ~~Scheduled major compaction is an anti-pattern.~~ **Resolved (2026-08-19)**: the 12-hourly
   `nodetool compact` job is disabled, with a migration for existing clusters. Disabled rather than
   deleted so an operator can see it and re-enable deliberately.
 * **Schema is scattered and unversioned.** 38 `CREATE TABLE IF NOT EXISTS` across five daemons with no
-  migration system, so two daemon versions can race to define different schemas.
+  migration system. **Partly done (2026-08-20)**: `helios_schema.py` holds one ordered migration list,
+  recorded in `hydra.schema_migrations` behind a TTL-bounded LWT lock, with checksums that refuse a
+  migration edited after it shipped. The baseline was extracted from the daemons and checked against
+  the live cluster -- 29 of its 31 tables exist there and match; the two that do not belong to Lanayru,
+  which has never successfully deployed. Six tables are declared by two daemons and one by three; they
+  were compared statement by statement and **currently agree**, so the risk is drift between daemon
+  versions during a rolling upgrade rather than a live bug.
+  **Remaining**: point the five `init_db*` functions at `ensure_schema()` and delete their local
+  `CREATE TABLE` blocks.
 * **No ring lifecycle management.** Nutanix auto-detaches an unhealthy node from the ring. Helios has no
   quorum gate on maintenance entry and no decommission/rejoin sequencing.
 
@@ -214,6 +276,16 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 ---
 
 ## P2 — Storage / DFS
+
+* **Mipha's HA failover write is unconditional.** `mipha.py:1143` resets `state='Stopped', host_ip=''`
+  on every VM of a fenced host. It is guarded by SSH fencing and three consecutive failures, but a VM
+  already recovered elsewhere is clobbered by a late write. `IF host_ip = '<dead ip>'` scopes it to the
+  host that actually died.
+* **VM delete can orphan a running guest.** `spectrum_server.py` reads `host_ip`, destroys the domain
+  there, then deletes the row unconditionally. A VM that migrated in between is destroyed nowhere and
+  its row disappears, leaving a guest running that nothing knows about.
+* **Lanayru clears the migration lock it never held.** `lanayru.py:295` writes `hydra.vms SET
+  status='running'` blind -- `status` is the migration-lock column.
 
 * **`/api/cluster/metrics` scans the whole metrics table on every poll.** `SELECT JSON * FROM
   hydra.logos_metrics` with no `WHERE` and no `LIMIT` -- roughly 8,600 live rows on a 3-node
@@ -266,6 +338,15 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 ---
 
 ## P3 — Code health
+
+* **`mcli-runner`'s certificate check returns PASS when it cannot parse an expiry date**, and it looks
+  only at `client.crt`. It runs daily and overwrites Mimir's correct row for the same check name, so a
+  cluster with expiring certificates can report green once a day. Should defer to Mimir's survey or be
+  removed.
+* **`hydra.vali_tasks` is a dead table.** Created by `vali.py init_db_schema()` and documented in
+  `docs/vali.md` as the task queue; nothing reads or writes it. The real queue is Catalyst's in-process
+  `queue.Queue`, which is itself worth noting -- it does not survive a restart.
+* **`vali.evacuate_host_thread` is dead code** -- defined, never called.
 
 * **`run_cql_query` is copy-pasted into at least six files** (~40 lines each, including the cqlsh
   fallback). This is why the CQL-injection items had to be fixed at each call site — there is no single
