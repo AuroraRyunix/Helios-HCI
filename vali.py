@@ -210,6 +210,47 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+
+DARUK_URL = "http://127.0.0.1:9043"
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure: Daruk unreachable, a malformed request, a
+    database error. A compare-and-swap that was *refused* is `(True, False, {...}, "")`
+    and belongs to the caller, not to an error handler -- it means someone else holds what
+    was being claimed, and `current` says what they hold. Collapsing the two is what turns
+    a correctly refused claim into a spurious task failure, and, in the other direction,
+    a lost race into a second VM start on a second host.
+
+    There is deliberately no cqlsh fallback. That fallback exists so host services keep
+    working while Daruk is down, but it can only run statement text and cannot report
+    whether a condition held; an ownership write that cannot be made conditional must not
+    be made at all.
+    """
+    import urllib.request
+    import urllib.error
+    import json
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
 def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
@@ -1256,6 +1297,27 @@ def get_linstor_pending_sync():
         return 1
     return 0
 
+def release_failed_claim(vm_name, host_ip):
+    """Give back a placement claimed for a start that then failed.
+
+    Without this the VM stays recorded as Running on a host it never booted on, and every
+    later start is correctly refused because the row says someone owns it. The release is
+    conditional on the claim still being ours: if something else has taken the VM in the
+    meantime it is that owner's row, not ours to clear.
+    """
+    ok, applied, current, err = run_lwt("/v1/vm/release", {
+        "name": vm_name, "expected_host_ip": host_ip,
+    })
+    if not ok:
+        sys.stderr.write(
+            f"VM {vm_name}: start failed on {host_ip} and the claim could not be released "
+            f"({err}). The VM is recorded as running there and further starts will be refused.\n")
+    elif not applied:
+        sys.stderr.write(
+            f"VM {vm_name}: start failed on {host_ip}, but the row now places it on "
+            f"{current.get('host_ip')!r}, so the claim was left alone.\n")
+
+
 def process_queue_task(task):
     task_id = task.get("task_id")
     vm_name = task.get("vm_name")
@@ -1291,14 +1353,40 @@ def process_queue_task(task):
             selected_host = target_host if target_host else select_best_start_host(memory)
             if not selected_host:
                 return False, "No active hypervisor host has sufficient memory."
-                
-            # 2. Compile XML
+
+            # 2. Claim the VM for that host before anything touches its disks.
+            #
+            # This used to be the last step of a start: the resources were promoted, the
+            # domain defined and booted, and only then was host_ip written, unconditionally.
+            # Two callers racing on the same VM -- a manual start against a DRS placement,
+            # or a start issued while a stale host_ip was still in the row -- both reached
+            # that point and both wrote, so two qemu processes ended up on the same raw
+            # DRBD device. Claiming first means one of them is turned away here.
+            # Passed through as read, not coerced to "": a row whose host_ip was never
+            # written holds null, and `IF host_ip = ''` does not match null. Coercing here
+            # would refuse every start of such a VM as "owned by another host".
+            claimed_from = vm_data.get("host_ip")
+            ok, applied, current, err = run_lwt("/v1/vm/claim", {
+                "name": vm_name,
+                "host_ip": selected_host,
+                "expected_host_ip": claimed_from,
+                "state": "Running",
+            })
+            if not ok:
+                return False, f"Refusing to start {vm_name}: its host placement could not be claimed ({err}). Starting it without the claim risks a second copy on another host."
+            if not applied:
+                owner = current.get("host_ip") or ""
+                if owner:
+                    return False, f"Refusing to start {vm_name}: another host already owns it ({owner}). Stop it there first, or start it on {owner}."
+                return False, f"Refusing to start {vm_name}: its placement changed while this start was being prepared (host_ip is now {owner!r}, this start expected {claimed_from!r})."
+
+            # 3. Compile XML
             audio_enabled = bool(vm_data.get("audio_enabled", False))
             vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled)
             import base64
             b64_xml = base64.b64encode(vm_xml.encode("utf-8")).decode("utf-8")
             
-            # 3. Define and start VM via host spark-daemon
+            # 4. Define and start VM via host spark-daemon
             restore_cmd = get_nvram_restore_cmd(vm_name)
             q_vm = shlex.quote(vm_name)
 
@@ -1316,6 +1404,7 @@ def process_queue_task(task):
                         # Release the resources we already promoted so this host does not sit on them
                         for done in promoted:
                             run_remote_spark(selected_host, f"drbdadm secondary {shlex.quote(done)} || true")
+                        release_failed_claim(vm_name, selected_host)
                         return False, f"Refusing to start {vm_name}: DRBD resource {res_name} could not be promoted to Primary on {selected_host} ({(stderr_d or stdout_d).strip()}). The peer node may still hold Primary for this resource (the VM may still be running there)."
                     promoted.append(res_name)
                     run_remote_spark(selected_host, f"drbdadm resize {q_res} || true")
@@ -1323,31 +1412,49 @@ def process_queue_task(task):
             cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
             if rc != 0:
+                release_failed_claim(vm_name, selected_host)
                 return False, f"Failed to execute start on target host {selected_host}: {stderr.strip() or stdout.strip()}"
-                
-            # 4. Update ScyllaDB VM record
-            cql = f"UPDATE hydra.vms SET state = 'Running', host_ip = '{selected_host}' WHERE name = '{vm_name}';"
-            run_cql_query(cql)
+
+            # The record already says Running on selected_host: step 2 wrote it as part of
+            # the claim, which is the only way the write and the decision can be one event.
             return True, selected_host
-            
+
         elif action in ["stop", "poweroff"]:
             host_ip = vm_data.get("host_ip", "")
             if not host_ip:
-                # VM is not running, just clear DB
-                cql = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{vm_name}';"
-                run_cql_query(cql)
+                # Already unplaced. Still conditional, so a start that claimed the VM
+                # between this task's read and this write is not quietly undone. The value
+                # goes back as read -- "" and null are both unplaced, and `IF host_ip = ''`
+                # does not match a null.
+                ok, applied, current, err = run_lwt("/v1/vm/release", {
+                    "name": vm_name, "expected_host_ip": host_ip,
+                })
+                if not ok:
+                    return False, f"Could not mark {vm_name} stopped: {err}"
+                if not applied:
+                    return False, f"Not stopping {vm_name}: it was placed on {current.get('host_ip') or 'another host'} while this stop was being prepared. Re-issue the stop."
                 return True, ""
-                
+
             # Run destroy/undefine and backup NVRAM
             backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=True)
             q_vm = shlex.quote(vm_name)
             cmd = f"virsh -c qemu:///system destroy {q_vm} || true && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true && {backup_cmd}"
             run_remote_spark(host_ip, cmd)
-            
-            cql = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{vm_name}';"
-            run_cql_query(cql)
+
+            # Releasing the placement is what lets the VM be started somewhere else, so it
+            # is conditional on this task still being the one that owns it. An
+            # unconditional release here frees the row of a VM that a concurrent migration
+            # had already moved -- and the next start then boots a second copy of a guest
+            # that is still running on the new host.
+            ok, applied, current, err = run_lwt("/v1/vm/release", {
+                "name": vm_name, "expected_host_ip": host_ip,
+            })
+            if not ok:
+                return False, f"{vm_name} was destroyed on {host_ip} but its placement could not be released: {err}"
+            if not applied:
+                return False, f"{vm_name} was destroyed on {host_ip}, but Hydra now places it on {current.get('host_ip')!r}, so this stop did not release it. Check whether it is running there."
             return True, ""
-            
+
         elif action in ["reboot", "shutdown", "reset"]:
             host_ip = vm_data.get("host_ip", "")
             if not host_ip:
@@ -1373,14 +1480,19 @@ def process_queue_task(task):
             if not vm_data:
                 return False, "VM not found in metadata database."
             src_host = vm_data.get("host_ip", "")
-            state = vm_data.get("status", "")
-            
-            if not src_host or state.lower() != "running":
-                return False, f"VM must be running to migrate (current state: {state})."
-                
-            if state.lower() == "migrating":
-                return False, "VM is already in migrating state."
-                
+            # The power state lives in `state`. This check used to read the `status`
+            # column, which is the migration lock and is null until a VM has migrated at
+            # least once -- so the comparison raised AttributeError on None and every
+            # first migration of a VM failed with "'NoneType' object has no attribute
+            # 'lower'" reported as the task error.
+            power_state = vm_data.get("state") or ""
+
+            if not src_host or power_state.lower() != "running":
+                return False, f"VM must be running to migrate (current state: {power_state or 'unknown'}, host: {src_host or 'unplaced'})."
+
+            # There is no read of `status` here on purpose: whether the VM is already
+            # migrating is decided by the lock below, in the same operation that takes it.
+
             if src_host == target_ip:
                 return True, target_ip
                 
@@ -1413,13 +1525,17 @@ def process_queue_task(task):
             if target_free < disk_size:
                 return False, f"Target host {target_host} has insufficient free Linstor storage pool space ({target_free} MiB available, needs {disk_size} MiB)."
 
-            # Set migrating lock in database. This must be checked: if the column is missing
-            # (older schema) or the write otherwise fails, the guard above silently never
-            # engages and concurrent migrations of the same VM are no longer prevented.
-            print(f"Setting migrating status lock for VM '{vm_name}'...")
-            rc_lock, _, err_lock = run_cql_query(f"UPDATE hydra.vms SET status = 'migrating' WHERE name = '{vm_name}';")
-            if rc_lock != 0:
-                return False, f"Refusing to migrate {vm_name}: could not set the migration lock ({err_lock.strip() or 'database write failed'}). Without it a concurrent migration of the same VM would not be detected."
+            # Take the migration lock. The condition and the write are one Paxos round, so
+            # there is no window between them: previously the code read `status`, decided
+            # nobody was migrating, and set it in a separate statement, which two callers
+            # could both pass. Live migration is exactly the window in which DRBD
+            # dual-primary is open, so two of them on one VM is disk corruption.
+            print(f"Taking the migration lock for VM '{vm_name}'...")
+            ok, applied, current, err = run_lwt("/v1/vm/migrate-lock", {"name": vm_name})
+            if not ok:
+                return False, f"Refusing to migrate {vm_name}: the migration lock could not be taken ({err}). Without it a concurrent migration of the same VM would not be detected."
+            if not applied:
+                return False, f"Refusing to migrate {vm_name}: it is already migrating (status = {current.get('status')!r})."
 
             try:
                 q_vm = shlex.quote(vm_name)
@@ -1448,11 +1564,30 @@ def process_queue_task(task):
 
                 # 5. Clean up local NVRAM file on source host after successful migration
                 run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{q_vm}_vars.fd")
-                    
-                # Update ScyllaDB VM record (resets status back to running on target host)
-                cql = f"UPDATE hydra.vms SET host_ip = '{target_ip}', status = 'running' WHERE name = '{vm_name}';"
-                run_cql_query(cql)
-                
+
+                # Hand the placement over and drop the lock in one operation, conditional
+                # on both the source host and the lock still being ours. Two statements
+                # would leave a window in which the VM is recorded on the target with the
+                # lock still held, or unlocked while still recorded on the source -- and a
+                # start arriving in that window picks the wrong host.
+                ok, applied, current, err = run_lwt("/v1/vm/migrate-commit", {
+                    "name": vm_name,
+                    "host_ip": target_ip,
+                    "expected_host_ip": src_host,
+                })
+                if not ok or not applied:
+                    detail = err if not ok else (
+                        f"the row moved underneath the migration (host_ip = "
+                        f"{current.get('host_ip')!r}, status = {current.get('status')!r})")
+                    # The guest is already on the target: this is a record that no longer
+                    # matches reality, not a migration that failed, and saying so is what
+                    # stops an operator from "recovering" a VM that is running fine.
+                    run_lwt("/v1/vm/migrate-unlock", {"name": vm_name})
+                    return False, (
+                        f"{vm_name} migrated to {target_ip}, but its record could not be updated: {detail}. "
+                        f"The guest is running on {target_ip} while Hydra still places it on {src_host}; "
+                        f"repair the row before starting or stopping this VM.")
+
                 # Insert record in history
                 now = int(time.time() * 1000)
                 reason = task.get("error_msg", "Manual VM migration request") # Re-use error_msg for trigger reason
@@ -1464,9 +1599,16 @@ def process_queue_task(task):
                 run_cql_query(cql_history)
                 return True, target_ip
             except Exception as migrate_err:
-                print(f"Migration error caught: {migrate_err}. Releasing status lock on source host...")
-                # Reset status back to running on the source host
-                run_cql_query(f"UPDATE hydra.vms SET status = 'running' WHERE name = '{vm_name}';")
+                print(f"Migration error caught: {migrate_err}. Releasing the migration lock...")
+                # Conditional on the lock still being held by this migration. An
+                # unconditional reset here would clear the lock of whichever migration is
+                # running now, which is how a late cleanup from a failed attempt lets a
+                # second live migration of the same VM start.
+                ok_u, applied_u, current_u, err_u = run_lwt("/v1/vm/migrate-unlock", {"name": vm_name})
+                if not ok_u:
+                    sys.stderr.write(f"VM {vm_name}: migration failed and the lock could not be released ({err_u}). Further migrations will be refused until it is cleared.\n")
+                elif not applied_u:
+                    sys.stderr.write(f"VM {vm_name}: migration failed, but the lock is no longer this migration's to release (status = {current_u.get('status')!r}); left alone.\n")
                 return False, f"Migration failed: {str(migrate_err)}"
 
         elif action == "host_maintenance_enter":
@@ -2021,10 +2163,29 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": f"Another host ('{maint_host}') is already in maintenance mode. Only one host can enter maintenance mode at a time to preserve quorum."})
                     return
                     
-                # Mark status as ENTERING_MAINTENANCE immediately
-                cql_up = f"UPDATE hydra.nodes SET status = 'ENTERING_MAINTENANCE', maintenance_mode = false WHERE hostname = '{hostname}';"
-                run_cql_query(cql_up)
-                
+                # Claim the transition rather than announce it. Draining a host is a lock
+                # on that host: two requests -- a double click, or a leave racing an enter
+                # that is still evacuating -- both used to write a status and both went on
+                # to submit an evacuation task for the same VMs.
+                #
+                # Only this first transition is conditional. The ones that follow it are
+                # made by the workflow that already holds the claim, and `hydra.nodes`
+                # status is also written by mipha's health loop, so conditioning them too
+                # would wedge a host in ENTERING_MAINTENANCE the first time the two
+                # crossed.
+                ok, applied, current, err = run_lwt("/v1/node/maintenance", {
+                    "hostname": hostname,
+                    "status": "ENTERING_MAINTENANCE",
+                    "maintenance_mode": False,
+                    "expected_status": "NORMAL",
+                })
+                if not ok:
+                    self.send_json(500, {"error": f"Could not begin the maintenance transition for '{hostname}': {err}"})
+                    return
+                if not applied:
+                    self.send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not NORMAL, so it cannot enter maintenance mode now."})
+                    return
+
                 # Submit Catalyst task
                 status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
                     "service": "vali",

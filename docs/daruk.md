@@ -72,6 +72,87 @@ To prevent systemd boot dependency loops (where systemd tries to start the proxy
 
 ---
 
+## Typed Compare-and-Swap Endpoints
+
+`/query` runs whatever CQL it is handed and reports only whether the statement executed.
+That is enough for a blind `UPDATE` and useless for a conditional one: a lightweight
+transaction (LWT) that was *rejected* executed perfectly well, and every caller's
+`run_cql_query()` flattens result rows into space-joined strings, so **"another host
+already owns this VM" and "the claim succeeded" arrive as the same `rc=0`**. Ownership
+writes were therefore unconditional in practice.
+
+The `/v1/...` endpoints take **structured parameters instead of statement text**. The CQL
+lives in Daruk's operation table and nowhere else, each statement is prepared once, and
+values travel bound. A caller cannot supply CQL through them — there is no parameter that
+accepts it.
+
+### The applied / current contract
+
+| Outcome | HTTP | Body |
+| --- | --- | --- |
+| The swap landed | `200` | `{"status": "success", "applied": true}` |
+| The race was lost | `200` | `{"status": "success", "applied": false, "current": {...}}` |
+| The request or the database failed | `400` | `{"status": "error", "error": "..."}` |
+
+**A rejected compare-and-swap is a lost race, not a failure.** It is answered `200` on
+purpose, so that a caller's generic error handling cannot turn a correctly refused claim
+into a spurious outage. `applied` is the only field that says whether the write happened.
+
+`current` holds the conditioned columns *as the database sees them now* — that is what lets
+a caller say "the VM is already running on 10.10.102.42" rather than "the update failed".
+It is returned only on rejection: on success the driver echoes the columns' *pre-image*,
+which a caller could easily misread as the new state.
+
+> [!NOTE]
+> `current` values that are all null mean either a row that does not exist or a column that
+> was never written; the two cannot be told apart from the result alone. Callers read the
+> row before claiming it, which is where "no such VM" is decided.
+
+### Operations
+
+| Endpoint | Condition | Refused when |
+| --- | --- | --- |
+| `POST /v1/vm/claim` | `IF host_ip = ?` | another host holds the placement |
+| `POST /v1/vm/release` | `IF host_ip = ?` | the caller is not the host of record |
+| `POST /v1/vm/set-state` | `IF host_ip = ?` | the caller is not the host of record |
+| `POST /v1/vm/migrate-lock` | `IF status != 'migrating'` | a migration is already in flight |
+| `POST /v1/vm/migrate-unlock` | `IF status = 'migrating'` | this caller does not hold the lock |
+| `POST /v1/vm/migrate-commit` | `IF host_ip = ? AND status = 'migrating'` | the source host or the lock changed |
+| `POST /v1/vm/create` | `IF NOT EXISTS` | the name is already registered |
+| `POST /v1/node/maintenance` | `IF status = ?` | the host is not in the expected state |
+
+`migrate-commit` moves the placement and drops the lock in one Paxos round. Two statements
+would leave a window in which the VM is recorded on the target with the lock still held, or
+unlocked while still recorded on the source — and a start arriving in that window picks the
+wrong host.
+
+### Example
+
+```bash
+# Claim web-01 for this host, but only if nothing else holds it.
+curl -s -X POST -H "Content-Type: application/json" \
+  -d '{"name": "web-01", "host_ip": "10.10.102.41", "expected_host_ip": ""}' \
+  http://127.0.0.1:9043/v1/vm/claim
+# {"status": "success", "applied": true}
+
+# The same claim from a second host, racing on the same read.
+# {"status": "success", "applied": false, "current": {"host_ip": "10.10.102.41"}}
+```
+
+A misspelt parameter is a `400`, not a default. `{"expcted_host_ip": "..."}` would
+otherwise fall back to `""` and turn the compare-and-swap into the unconditional claim the
+endpoint exists to remove.
+
+### Known limits
+
+* The migration lock is a bare value with no holder identity and no expiry. A cleanup from
+  a failed attempt that arrives after a *second* migration has taken the lock will match
+  and release it. A holder token would fix that.
+* An `UPDATE ... IF col = null` applies against a row that does not exist and creates a
+  partial one. Endpoints whose callers pass a concrete expected value are unaffected.
+
+---
+
 ## Command Examples & Verification
 
 ### A. Managing the Daruk Service

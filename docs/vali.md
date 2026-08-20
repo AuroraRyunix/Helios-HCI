@@ -48,8 +48,34 @@ When the Vali Leader processes a `start` task from the queue:
 1. It queries available memory across all online nodes in the cluster.
 2. It filters out nodes without sufficient memory to accommodate the VM configuration.
 3. It selects the candidate node with the least used memory (dynamic scheduling).
-4. It compiles the VM's XML and calls the target node's `spark-daemon` `/api/v1/execute` to define and start the VM.
-5. It updates the VM record state to `Running` and `host_ip` to the chosen hypervisor node.
+4. **It claims the VM for that node** through Daruk's `POST /v1/vm/claim`, which writes
+   `state = 'Running'` and `host_ip` only if the row still holds the placement Vali read
+   when it decided to start. A VM another host already owns is refused here, and the error
+   names that host.
+5. It compiles the VM's XML and calls the target node's `spark-daemon` `/api/v1/execute` to define and start the VM.
+6. If the DRBD promotion or the start itself fails, the claim is given back — conditionally,
+   so a VM something else has taken in the meantime is left alone.
+
+### Placement is a compare-and-swap, not a write
+
+The claim used to be the *last* step of a start: the resources were promoted, the domain
+defined and booted, and only then was `host_ip` written unconditionally. Two callers racing
+on the same VM — a manual start against a DRS placement, or a start issued while a stale
+`host_ip` was still in the row — both reached that point and both wrote, so two qemu
+processes ended up on the same raw DRBD device.
+
+Claiming first means one of them is turned away before anything touches the disks. The DRBD
+promotion check that follows is the second gate, not the only one.
+
+The same applies in reverse: `stop` releases the placement conditionally on Vali still being
+the host of record. An unconditional release frees the row of a VM a concurrent migration had
+already moved, and the next start boots a second copy of a guest that is still running.
+
+> [!NOTE]
+> These calls go to Daruk's typed endpoints and have **no `cqlsh` fallback**. That fallback
+> can only run statement text and cannot report whether a condition held; an ownership write
+> that cannot be made conditional must not be made at all. A start with Daruk down is
+> refused, loudly.
 
 ## Distributed Resource Scheduler (DRS)
 The Vali Leader runs a periodic DRS loop (every 30 seconds):
@@ -59,6 +85,34 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 4. **Live Migration**: Vali executes live migrations via libvirt:
    `virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe <vm_name> qemu+ssh://root@<target_ip>/system`
     And updates the VM's `host_ip` in ScyllaDB on completion. To enable compatibility during live migrations, VM guest CPUs are defined with `<cpu mode='host-model'/>` when running under KVM.
+
+### The migration lock
+
+The `status` column on `hydra.vms` holds a transient lifecycle lock (`migrating`), distinct
+from `state` (`Running`/`Stopped`). It is taken through Daruk's `POST /v1/vm/migrate-lock`,
+which is `UPDATE ... SET status = 'migrating' ... IF status != 'migrating'` — the condition
+and the write are one Paxos round.
+
+This replaces a read of `status` followed by a separate write, which two callers could both
+pass. That mattered because **live migration is exactly the window in which DRBD
+dual-primary is open**: two concurrent migrations of one VM is disk corruption, not a
+scheduling annoyance. A failed lock aborts the migration; it is never logged and stepped
+over.
+
+On success the hand-over runs through `POST /v1/vm/migrate-commit`, which moves `host_ip` to
+the target *and* clears the lock in a single round, conditional on both the source host and
+the lock still belonging to this migration. On failure the lock is released conditionally,
+so a late cleanup from a failed attempt cannot unlock a migration that has since started.
+
+A null `status` satisfies `!= 'migrating'`, which matters because `status` is null for every
+VM that has never migrated — the common case is the null case. This is verified against a
+live Scylla; see [docs/daruk_technical.md](./daruk_technical.md).
+
+> [!NOTE]
+> The "is it running?" gate reads the `state` column. It previously read `status` — the lock
+> column — and compared it to `"running"`, so it raised `AttributeError` on the `None` of a
+> VM that had never migrated, and every first migration failed with
+> `'NoneType' object has no attribute 'lower'` reported as the task error.
 
 ## VM Display and Video Configuration Standards
 To ensure compatibility across all hypervisor nodes:
@@ -131,6 +185,19 @@ valcli host.maintenance.enter hci-node01 --force
 # Restore a node from maintenance mode, starting services and re-syncing volumes
 valcli host.maintenance.leave hci-node01
 ```
+
+Entering maintenance is a claim on the host, taken through Daruk's
+`POST /v1/node/maintenance` as `IF status = 'NORMAL'`. A host that is already transitioning
+is refused with `409` instead of starting a second evacuation of the same VMs. Only that
+first transition is conditional: the ones that follow are made by the workflow that already
+holds the claim, and `hydra.nodes.status` is also written by Mipha's health loop, so
+conditioning them too would wedge a host the first time the two crossed.
+
+> [!WARNING]
+> The cross-host rule — only one host in maintenance at a time, to preserve quorum — is
+> still a read of every node row followed by a write, and two hosts entering concurrently
+> can both pass it. Closing that needs a single-row cluster-wide lock, which needs a table
+> that does not exist yet.
 
 ### B. Live Migration Command Syntax (libvirt)
 To execute manual VM live migrations outside `valcli` (useful for troubleshooting):
