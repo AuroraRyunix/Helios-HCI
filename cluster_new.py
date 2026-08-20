@@ -2,6 +2,7 @@
 import sys
 import argparse
 import json
+import re
 import ssl
 import urllib.request
 import os
@@ -394,6 +395,156 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+# --- the ScyllaDB ring ------------------------------------------------------------------
+#
+# hydra.nodes and the ring are two different memberships and they are not kept in step.
+# A host marked DOWN leaves the VM scheduler immediately; its ScyllaDB stays a ring
+# member holding token ranges, and every QUORUM operation keeps counting it. Nothing in
+# Helios ever reconciled the two, so a node that was replaced months ago could still be
+# the reason a maintenance request is refused, with nothing on any screen saying so.
+#
+# These helpers are the read side. `cluster ring`, `cluster decommission` and
+# `cluster rejoin` are built on them; see docs/ring_lifecycle.md for the sequences.
+
+
+_HOST_ID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+_LOAD_UNITS = ("bytes", "KB", "MB", "GB", "TB", "KiB", "MiB", "GiB", "TiB")
+
+
+def parse_nodetool_status(text):
+    """Ring members from `nodetool status`, as {address, status, state, host_id}.
+
+    The first column is two characters: U/D for up or down, then N/L/J/M for normal,
+    leaving, joining or moving. Only a member that is both up and normal is a replica
+    that can answer a query -- `UJ` has not finished streaming in, `UL` is streaming out.
+
+    The host id is found by shape rather than by column index. `Load` is printed as
+    "2.38 MB", two whitespace-separated fields, and as a bare "?" when it is unknown, so
+    every column after it shifts depending on the node. Indexing positionally returned
+    the `Owns` column -- a literal "?" -- as the host id, which is the argument
+    `nodetool removenode` needs and the one thing a decommission plan cannot get wrong.
+    """
+    members = []
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        marker = fields[0]
+        if len(marker) != 2 or marker[0] not in "UD" or marker[1] not in "NLJM":
+            continue
+        host_id = next((f for f in fields[2:] if _HOST_ID_RE.match(f)), "")
+        if len(fields) > 3 and fields[3] in _LOAD_UNITS:
+            load = fields[2] + " " + fields[3]
+        else:
+            load = fields[2] if len(fields) > 2 else ""
+        members.append({
+            "address": fields[1],
+            "status": marker[0],
+            "state": marker[1],
+            "available": marker == "UN",
+            "load": load,
+            "host_id": host_id,
+        })
+    return members
+
+
+def parse_replication_factor(text):
+    """The number of replicas the hydra keyspace declares, or None if it cannot be read.
+
+    The replication map arrives as a stringified dict whichever way it is fetched, so the
+    pairs are read out of the text rather than out of a real mapping. The separator is
+    `[:,]` because the driver's own `OrderedMapSerializedKey` reprs its pairs as tuples
+    rather than with colons.
+    NetworkTopologyStrategy spreads the factor across datacenters and QUORUM is computed
+    from their sum, so those values are added. LocalStrategy and EverywhereStrategy have
+    no replication factor at all.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if "localstrategy" in lowered or "everywherestrategy" in lowered:
+        return None
+    pairs = re.findall(r"['\"]([^'\"]+)['\"]\s*[:,]\s*['\"]?(\d+)['\"]?", text)
+    factors = {key: int(value) for key, value in pairs if key != "class"}
+    if "replication_factor" in factors:
+        return factors["replication_factor"]
+    if not factors:
+        return None
+    return sum(factors.values())
+
+
+def get_hydra_replication_factor():
+    """RF as the database reports it, or None. Never a plausible-looking guess: assuming
+    3 on a cluster actually running RF=1 would wave through the removal that takes the
+    only copy of the metadata with it."""
+    rc, stdout, _ = run_cql_query(
+        "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';")
+    if rc != 0:
+        return None
+    return parse_replication_factor(stdout)
+
+
+def read_ring(ips):
+    """Read the ring from whichever node will answer. Returns (members, error).
+
+    Any member's `nodetool status` describes the whole ring, so this tries each node in
+    turn -- the one that cannot answer is frequently the one being asked about.
+    """
+    errors = []
+    for ip in ips:
+        rc, stdout, stderr = run_remote_spark(ip, "nodetool status")
+        if rc == 0:
+            members = parse_nodetool_status(stdout)
+            if members:
+                return members, ""
+            errors.append(f"{ip}: nodetool status returned no ring members")
+        else:
+            errors.append(f"{ip}: {(stderr or stdout or 'unreachable').strip()[:120]}")
+    return [], "; ".join(errors)
+
+
+def quorum_of(replication_factor):
+    """What Scylla demands at ConsistencyLevel.QUORUM: a strict majority of RF."""
+    return replication_factor // 2 + 1
+
+
+def render_ring(members, replication_factor):
+    lines = []
+    if replication_factor:
+        lines.append(f"  hydra replication factor: {replication_factor} "
+                     f"(QUORUM needs {quorum_of(replication_factor)} replicas)")
+    else:
+        lines.append(f"  hydra replication factor: {YELLOW}unknown{RESET}")
+    up = sum(1 for m in members if m["available"])
+    lines.append(f"  ring members: {up} of {len(members)} up and normal")
+    for m in members:
+        marker = f"{m['status']}{m['state']}"
+        colour = GREEN if m["available"] else RED
+        lines.append(f"    {colour}{marker}{RESET}  {m['address']:<16} {m['load']:<12} {GRAY}{m['host_id']}{RESET}")
+    return "\n".join(lines)
+
+
+def cluster_hosts_config():
+    """The parsed /etc/hci/cluster.json, or None."""
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_cluster_config(ips, config):
+    """Push a cluster.json to every listed node. Returns the list of nodes that failed."""
+    payload = base64.b64encode(json.dumps(config, indent=4).encode("utf-8")).decode("utf-8")
+    command = f"mkdir -p /etc/hci && echo {payload} | base64 -d > /etc/hci/cluster.json"
+    failed = []
+    for ip, (rc, _out, _err) in run_parallel(ips, command).items():
+        if rc != 0:
+            failed.append(ip)
+    return failed
+
+
 def check_urbosa_enabled():
     rc, stdout, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';")
     if rc == 0 and stdout:
@@ -537,10 +688,13 @@ def main():
     parser.add_argument("-v", "--vip", required=False, help="Floating Cluster Virtual IP (VIP)")
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
-    parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy"], help="Action to perform")
-    
+    parser.add_argument("--node", required=False, help="Single host IP, for 'decommission' and 'rejoin'")
+    parser.add_argument("--finalize", action="store_true", help="Perform the bookkeeping half of a decommission or rejoin, once the ring work is done")
+    parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy",
+                                            "ring", "decommission", "rejoin"], help="Action to perform")
+
     args = parser.parse_args()
-    
+
     if args.command == "create":
         # Ensure we have servers
         config_ips = []
@@ -2036,6 +2190,370 @@ print("--- Local wipe completed ---", flush=True)
         print("\n==========================================================")
         print("      HCI Cluster Destroyed & Cleaned Successfully!        ")
         print("==========================================================")
+
+    elif args.command == "ring":
+        ips = get_cluster_ips()
+        members, error = read_ring(ips)
+        if error:
+            print(f"[ERROR] Could not read the ScyllaDB ring: {error}")
+            sys.exit(1)
+        print("\nScyllaDB ring (Hydra metadata):")
+        print(render_ring(members, get_hydra_replication_factor()))
+
+        # The two memberships side by side. They diverge silently, and the divergence is
+        # what makes a maintenance refusal look arbitrary.
+        rc, stdout, _ = run_cql_query("SELECT JSON hostname, ip, status FROM hydra.nodes;")
+        rows = []
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+        if rows:
+            print("\n  Cluster membership (hydra.nodes):")
+            addresses = {m["address"] for m in members}
+            for row in rows:
+                in_ring = "in ring" if row.get("ip") in addresses else f"{YELLOW}not in ring{RESET}"
+                print(f"    {row.get('hostname', ''):<20} {row.get('ip', ''):<16} "
+                      f"{row.get('status', ''):<22} {in_ring}")
+            configured = {row.get("ip") for row in rows}
+            for address in sorted(addresses - configured):
+                label = "(no hydra.nodes row)"
+                print(f"    {GRAY}{label:<20}{RESET} {address:<16} "
+                      f"{YELLOW}ring member the cluster does not know about{RESET}")
+        print()
+
+    elif args.command == "decommission":
+        # Permanently removing a node from the ring. This command does the parts that are
+        # reversible and refuses when the destructive part would be unsafe; it never runs
+        # `nodetool decommission` or `nodetool removenode` itself. Those stream every
+        # token range this node owns to its replicas, run for as long as that takes, and
+        # cannot be undone or re-run -- a decommission interrupted half way leaves a node
+        # that is neither in the ring nor out of it. That is an operator's decision made
+        # while watching it, not a side effect of a CLI verb.
+        if not args.node:
+            parser.error("decommission requires --node <ip>")
+        target = args.node.strip()
+        ips = get_cluster_ips()
+        survivors = [ip for ip in ips if ip != target]
+
+        print("==========================================================")
+        print(f"   Decommission preflight for {target}")
+        print("==========================================================")
+
+        if target not in ips:
+            print(f"[WARNING] {target} is not listed in /etc/hci/cluster.json.")
+
+        replication_factor = get_hydra_replication_factor()
+        members, error = read_ring(survivors or ips)
+        if error:
+            print(f"[ERROR] Could not read the ScyllaDB ring: {error}")
+            print("[ERROR] Refusing to plan a decommission against a ring that cannot be read.")
+            sys.exit(1)
+
+        print("\nScyllaDB ring:")
+        print(render_ring(members, replication_factor))
+
+        ring_member = next((m for m in members if m["address"] == target), None)
+        others_down = [m for m in members if not m["available"] and m["address"] != target]
+
+        blockers = []
+        notes = []
+
+        # There is no sequence to print for the last node: every step below assumes
+        # somewhere for its data to go. Say so and stop, rather than emitting a plan whose
+        # third step is "lower the replication factor to 0".
+        if ring_member is not None and len(members) == 1:
+            print(f"\n[BLOCKED] {target} is the only member of the ring. Decommissioning it "
+                  "does not shrink the cluster, it destroys it: there is no remaining "
+                  "replica for its data to stream to. Use 'cluster destroy' if that is "
+                  "what you mean.")
+            sys.exit(1)
+
+        if replication_factor is None:
+            blockers.append(
+                "The hydra keyspace's replication factor could not be read, so the effect "
+                "of removing a replica is unknown.")
+        elif ring_member is not None:
+            remaining = len(members) - 1
+            assigned_after = min(replication_factor, remaining)
+            required = quorum_of(replication_factor)
+            if assigned_after < required:
+                blockers.append(
+                    f"After removal the ring holds {remaining} node(s), so a partition has "
+                    f"{assigned_after} replica(s), and QUORUM at RF={replication_factor} needs "
+                    f"{required}. Lower the keyspace replication factor to at most {remaining} "
+                    f"and run a full repair BEFORE decommissioning.")
+            elif assigned_after == required:
+                notes.append(
+                    f"After removal the ring has exactly {assigned_after} replica(s) for a "
+                    f"quorum of {required}: the cluster will survive the removal and will not "
+                    f"survive the next node failure. Plan a replacement.")
+
+        if others_down:
+            blockers.append(
+                "Other ring members are not up and normal (" +
+                ", ".join(f"{m['address']} {m['status']}{m['state']}" for m in others_down) +
+                "). A decommission streams this node's data to its replicas; with a replica "
+                "unavailable the stream cannot complete and the data it carried is lost.")
+
+        if ring_member is None:
+            notes.append(f"{target} is not a ring member. Nothing to detach -- only the "
+                         "bookkeeping below is outstanding.")
+        elif not ring_member["available"]:
+            notes.append(
+                f"{target} is '{ring_member['status']}{ring_member['state']}', not up. "
+                "`nodetool decommission` runs ON the node being removed and needs it "
+                "running; a node that is gone for good is removed from a SURVIVING node "
+                f"with `nodetool removenode {ring_member['host_id'] or '<host-id>'}` instead, "
+                "which rebuilds its ranges from the remaining replicas.")
+
+        # VMs still placed here. Removing the node's metadata row while a VM still points
+        # at it leaves that VM unstartable and unfindable.
+        rc, stdout, _ = run_cql_query("SELECT JSON name, host_ip, state FROM hydra.vms;")
+        placed = []
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        vm = json.loads(line)
+                        if vm.get("host_ip") == target:
+                            placed.append(vm.get("name"))
+                    except Exception:
+                        pass
+        if placed:
+            blockers.append(
+                f"{len(placed)} VM(s) are still placed on {target}: {', '.join(sorted(placed)[:10])}"
+                f"{' ...' if len(placed) > 10 else ''}. Drain the host first "
+                f"(maintenance mode), which migrates them and leaves the placements clean.")
+
+        print()
+        for note in notes:
+            print(f"[NOTE] {note}")
+        for blocker in blockers:
+            print(f"[BLOCKED] {blocker}")
+
+        if args.finalize:
+            if ring_member is not None:
+                print(f"\n[ERROR] {target} is still a ring member. --finalize is the "
+                      "bookkeeping that follows the ring removal, not a substitute for it.")
+                sys.exit(1)
+            if blockers:
+                print("\n[ERROR] Refusing to finalize while the checks above are unresolved.")
+                sys.exit(1)
+
+            print("\n--- Finalizing: removing the node from cluster metadata ---")
+            config = cluster_hosts_config()
+            if config:
+                remaining_hosts = [h for h in config.get("hosts", []) if h.get("ip") != target]
+                if len(remaining_hosts) != len(config.get("hosts", [])):
+                    # Renumber, because node_id is an index other tooling counts on -- the
+                    # witness node in a three node layout is identified by position.
+                    for index, host in enumerate(remaining_hosts):
+                        host["node_id"] = index + 1
+                    config["hosts"] = remaining_hosts
+                    failed = write_cluster_config(survivors, config)
+                    if failed:
+                        print(f"[WARNING] Could not update /etc/hci/cluster.json on: {', '.join(failed)}")
+                    else:
+                        print(f"Updated /etc/hci/cluster.json on {len(survivors)} node(s).")
+                else:
+                    print("/etc/hci/cluster.json does not list this node; nothing to change.")
+            else:
+                print("[WARNING] /etc/hci/cluster.json could not be read; skipped.")
+
+            # hydra.nodes is keyed by hostname, and CQL has no DELETE on a non-key column,
+            # so the row is looked up by address first.
+            rc_r, stdout_r, _ = run_cql_query(
+                f"SELECT JSON hostname FROM hydra.nodes WHERE ip = '{target}' ALLOW FILTERING;")
+            removed = []
+            if rc_r == 0 and stdout_r:
+                for line in stdout_r.splitlines():
+                    line = line.strip()
+                    if line.startswith("{") and line.endswith("}"):
+                        try:
+                            hostname = json.loads(line).get("hostname")
+                        except Exception:
+                            continue
+                        if hostname:
+                            run_cql_query(f"DELETE FROM hydra.nodes WHERE hostname = '{hostname}';")
+                            removed.append(hostname)
+            if removed:
+                print(f"Removed hydra.nodes row(s): {', '.join(removed)}")
+            else:
+                print("No hydra.nodes row referenced this address.")
+
+            print("\nStill manual, and deliberately so:")
+            print(f"  - LINSTOR: 'linstor node delete <hostname>' once its resources have")
+            print(f"    been re-replicated elsewhere. Deleting a node that still holds the")
+            print(f"    only copy of a volume loses that volume.")
+            print(f"  - ZooKeeper: remove the node from the ensemble configuration on every")
+            print(f"    remaining host and restart them one at a time. A voter that is gone")
+            print(f"    still counts toward the ensemble's quorum until it is removed.")
+            print("\nDecommission bookkeeping complete.")
+        else:
+            print("\n--- Decommission sequence ---")
+            print(f"  1. Drain {target}: put it in maintenance mode so its VMs migrate off.")
+            print(f"     The quorum gate refuses this if the cluster cannot spare the replica,")
+            print(f"     which is the same condition that makes step 4 unsafe.")
+            print(f"  2. LINSTOR: move its storage replicas to surviving nodes and wait for")
+            print(f"     the DRBD resync to finish. 'linstor resource list' on a survivor.")
+            if replication_factor is not None and ring_member is not None:
+                remaining = len(members) - 1
+                if min(replication_factor, remaining) < quorum_of(replication_factor):
+                    print(f"  3. Lower the keyspace replication factor to at most {remaining}:")
+                    print(f"     ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy',")
+                    print(f"       'replication_factor': {remaining}}};")
+                    print(f"     then 'nodetool repair -pr hydra' on every remaining node.")
+                else:
+                    print(f"  3. Replication factor {replication_factor} still fits a "
+                          f"{remaining}-node ring; no ALTER KEYSPACE needed.")
+            else:
+                print("  3. Check the keyspace replication factor still fits the smaller ring.")
+            if ring_member is not None and ring_member["available"]:
+                print(f"  4. ON {target}: 'nodetool decommission'. It streams every range it")
+                print(f"     owns to the remaining replicas and can run for hours. Watch it;")
+                print(f"     do not interrupt it and do not run it twice.")
+            elif ring_member is not None:
+                print(f"  4. ON A SURVIVING NODE: 'nodetool removenode "
+                      f"{ring_member['host_id'] or '<host-id>'}'. Use this rather than")
+                print(f"     decommission because {target} is not running.")
+            else:
+                print(f"  4. (already done -- {target} is not in the ring)")
+            print(f"  5. 'cluster decommission --node {target} --finalize' to clear its")
+            print(f"     cluster.json entry and its hydra.nodes row.")
+            print(f"  6. LINSTOR node delete and ZooKeeper ensemble reconfiguration, by hand.")
+            if blockers:
+                print("\n[ERROR] The blockers above must be resolved before step 4.")
+                sys.exit(1)
+
+    elif args.command == "rejoin":
+        # Bringing a node back. The dangerous half here is not the ring operation, it is
+        # the data the node still has on disk: a node that was decommissioned and then
+        # started again with its old commitlog and sstables either refuses to start or
+        # re-introduces rows that were deleted while it was away, because its tombstones
+        # are older than gc_grace and its data is not. Scylla cannot tell the difference.
+        if not args.node:
+            parser.error("rejoin requires --node <ip>")
+        target = args.node.strip()
+        ips = get_cluster_ips()
+        survivors = [ip for ip in ips if ip != target]
+
+        print("==========================================================")
+        print(f"   Rejoin preflight for {target}")
+        print("==========================================================")
+
+        rc, out, err = run_remote_spark(target, "echo online")
+        if rc != 0 or "online" not in (out or "").lower():
+            print(f"[ERROR] spark-daemon on {target} is not answering: {(err or out or '').strip()[:200]}")
+            print("[ERROR] The node has to be reachable before it can be brought back.")
+            sys.exit(1)
+        print(f"[{target}] spark-daemon is online.")
+
+        replication_factor = get_hydra_replication_factor()
+        members, error = read_ring(survivors or ips)
+        if error:
+            print(f"[ERROR] Could not read the ScyllaDB ring: {error}")
+            sys.exit(1)
+        print("\nScyllaDB ring:")
+        print(render_ring(members, replication_factor))
+
+        ring_member = next((m for m in members if m["address"] == target), None)
+        in_config = target in ips
+
+        # Does it still carry data from its previous life in the ring?
+        rc_d, stdout_d, _ = run_remote_spark(
+            target, "ls -A /var/lib/hci/hydra/data/data 2>/dev/null | head -5")
+        has_old_data = rc_d == 0 and bool((stdout_d or "").strip())
+
+        print()
+        if ring_member is not None and ring_member["available"]:
+            print(f"[NOTE] {target} is already a live ring member "
+                  f"('{ring_member['status']}{ring_member['state']}'). Nothing to rejoin.")
+        elif ring_member is not None:
+            print(f"[NOTE] {target} is in the ring but reported "
+                  f"'{ring_member['status']}{ring_member['state']}'. This is a node that never "
+                  "left, so it does not need to rejoin -- start hydra-db on it and let it "
+                  "catch up, then repair.")
+        else:
+            print(f"[NOTE] {target} is not in the ring, so it joins as a new member and "
+                  "bootstraps its ranges from the seeds.")
+            if has_old_data:
+                print(f"[BLOCKED] {target} still has ScyllaDB data under "
+                      "/var/lib/hci/hydra/data. A node that left the ring must not rejoin "
+                      "carrying it: rows deleted cluster-wide while it was away have "
+                      "tombstones the returning node never saw, and bootstrapping on top of "
+                      "its old sstables resurrects them. Wipe the directory first.")
+
+        if not in_config:
+            print(f"[NOTE] {target} is not listed in /etc/hci/cluster.json; --finalize adds it.")
+
+        if args.finalize:
+            print("\n--- Finalizing: restoring the node's cluster metadata ---")
+            config = cluster_hosts_config()
+            if config is None:
+                print("[ERROR] /etc/hci/cluster.json could not be read.")
+                sys.exit(1)
+
+            if not in_config:
+                rc_h, hostname, _ = run_remote_spark(target, "hostname")
+                hostname = (hostname or "").strip()
+                if rc_h != 0 or not hostname:
+                    print(f"[ERROR] Could not resolve the hostname of {target}.")
+                    sys.exit(1)
+                hosts = list(config.get("hosts", []))
+                hosts.append({"node_id": len(hosts) + 1, "ip": target, "hostname": hostname})
+                config["hosts"] = hosts
+                failed = write_cluster_config([h["ip"] for h in hosts], config)
+                if failed:
+                    print(f"[WARNING] Could not update /etc/hci/cluster.json on: {', '.join(failed)}")
+                else:
+                    print(f"Restored {target} ({hostname}) to /etc/hci/cluster.json on "
+                          f"{len(hosts)} node(s).")
+            else:
+                print("/etc/hci/cluster.json already lists this node.")
+
+            if ring_member is not None and ring_member["available"]:
+                # Only once it is genuinely serving. Registering it as NORMAL while it is
+                # still bootstrapping hands it VMs it cannot run.
+                entry = next((h for h in config.get("hosts", []) if h.get("ip") == target), None)
+                hostname = (entry or {}).get("hostname", "")
+                if hostname:
+                    run_cql_query(
+                        "INSERT INTO hydra.nodes (hostname, ip, status, maintenance_mode) "
+                        f"VALUES ('{hostname}', '{target}', 'NORMAL', false);")
+                    print(f"Registered {hostname} ({target}) in hydra.nodes as NORMAL.")
+            else:
+                print(f"[NOTE] {target} is not yet up and normal in the ring, so it was NOT "
+                      "registered as a schedulable host. Re-run --finalize once "
+                      "'cluster ring' shows it UN.")
+
+            print("\nStill manual, and deliberately so:")
+            print("  - 'nodetool repair -pr hydra' on every node once the join completes.")
+            print("    Bootstrapping streams the ranges the new node now owns; it does not")
+            print("    reconcile what the survivors wrote while it was gone.")
+            print("  - Raising the keyspace replication factor back, if it was lowered for")
+            print("    the smaller ring. ALTER KEYSPACE changes the strategy only -- the data")
+            print("    is not copied to the new replicas until a repair runs.")
+            print("  - LINSTOR: re-create this node's storage replicas and let DRBD resync.")
+        else:
+            print("\n--- Rejoin sequence ---")
+            print(f"  1. Confirm {target} is meant to come back as the same node. If it was")
+            print(f"     decommissioned, wipe /var/lib/hci/hydra/data before anything else.")
+            print(f"  2. 'cluster rejoin --node {target} --finalize' to restore its")
+            print(f"     /etc/hci/cluster.json entry on every node, so the seeds are right.")
+            print(f"  3. ON {target}: 'systemctl start zookeeper hydra-db'. It bootstraps into")
+            print(f"     the ring by streaming from the seeds; watch 'cluster ring' until it")
+            print(f"     reports UN. A node stuck at UJ is still streaming, not broken.")
+            print(f"  4. Raise the replication factor back if it was lowered, then")
+            print(f"     'nodetool repair -pr hydra' on every node.")
+            print(f"  5. LINSTOR: re-create its storage replicas and wait for the resync.")
+            print(f"  6. 'cluster rejoin --node {target} --finalize' again to register it in")
+            print(f"     hydra.nodes as a schedulable host, then 'cluster start'.")
 
 if __name__ == "__main__":
     main()

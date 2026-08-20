@@ -25,6 +25,7 @@ RELEASE_DOWNLOAD_URL = os.environ.get("HELIOS_RELEASE_DOWNLOAD_URL", "").strip()
 components_map = {
     "spark": {"src": "spark.py", "target": "/usr/local/bin/spark"},
     "impa": {"src": "impa.py", "target": "/usr/local/bin/impa"},
+    "helios-schema": {"src": "helios_schema.py", "target": "/usr/local/bin/helios_schema.py"},
     "cluster": {"src": "cluster_new.py", "target": "/usr/local/bin/cluster"},
     "spark-daemon": {"src": "spark_daemon_decoded.py", "target": "/usr/local/bin/spark-daemon"},
     "bifrost": {"src": "bifrost.py", "target": "/usr/local/bin/bifrost"},

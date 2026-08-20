@@ -35,7 +35,7 @@ jobs:
         run: python -m compileall -q $(git ls-files '*.py') mcli mcli-runner catcli nodetool allssh
 
       - name: Unit tests
-        run: python -m unittest test_hylia.py test_deployment_manifest.py test_spark_daemon.py test_update_signature.py test_helios_schema.py test_mtls_lifecycle.py test_daruk_lwt.py test_internal_api_auth.py -v
+        run: python -m unittest test_hylia.py test_deployment_manifest.py test_spark_daemon.py test_update_signature.py test_helios_schema.py test_mtls_lifecycle.py test_daruk_lwt.py test_internal_api_auth.py test_ring_lifecycle.py -v
 
   elixir:
     name: Elixir (spectrum_phx)

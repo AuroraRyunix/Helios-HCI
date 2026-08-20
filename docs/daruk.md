@@ -120,11 +120,44 @@ which a caller could easily misread as the new state.
 | `POST /v1/vm/migrate-commit` | `IF host_ip = ? AND status = 'migrating'` | the source host or the lock changed |
 | `POST /v1/vm/create` | `IF NOT EXISTS` | the name is already registered |
 | `POST /v1/node/maintenance` | `IF status = ?` | the host is not in the expected state |
+| `POST /v1/lock/acquire` | `IF NOT EXISTS` | another holder has the lock |
+| `POST /v1/lock/renew` | `IF holder_token = ?` | the caller is not this acquisition |
+| `POST /v1/lock/release` | `IF holder_token = ?` | the caller is not this acquisition |
 
 `migrate-commit` moves the placement and drops the lock in one Paxos round. Two statements
 would leave a window in which the VM is recorded on the target with the lock still held, or
 unlocked while still recorded on the source — and a start arriving in that window picks the
 wrong host.
+
+### Cluster-wide locks
+
+`hydra.cluster_locks` holds one row per named mutual exclusion. A lightweight transaction
+cannot span partitions, so any exclusion that has to hold *across hosts* must condition on
+a row every contender shares — which a scan of `hydra.nodes` is not, and never was. The
+maintenance lock (`cluster-maintenance`) is the first user; see
+[ring_lifecycle.md](./ring_lifecycle.md).
+
+Three things make it a lock rather than a flag:
+
+* **`IF NOT EXISTS`** — the check and the claim are one Paxos round. A refusal returns the
+  whole existing row, so the caller's error can name the holder and its reason without a
+  second read.
+* **`holder_token`** — identifies one *acquisition*, not one node, and both `renew` and
+  `release` condition on it. This is the holder token the migration lock lacks: matching
+  on `holder` alone lets a stale release from a node's earlier, expired acquisition drop
+  the lock that same node holds now.
+* **`USING TTL`** — a node that dies holding the lock must not wedge the cluster until
+  somebody deletes the row by hand. The TTL is short (300s for maintenance) and long
+  operations renew it rather than asking for a longer one.
+
+`renew` rewrites **every** non-key column, `holder_token` included. A column left out of
+the `SET` keeps the original insert's TTL and expires first, after which the row is still
+alive — other cells are live — but no longer renewable or releasable by its holder.
+
+`acquired_at_ms` is a `bigint`, not a `timestamp`, because a refused `IF NOT EXISTS`
+returns the whole row and `make_serializable` passes a driver `datetime` through
+untouched — `json.dumps` would then raise on exactly the response that says who holds the
+lock.
 
 ### Example
 
@@ -147,7 +180,8 @@ endpoint exists to remove.
 
 * The migration lock is a bare value with no holder identity and no expiry. A cleanup from
   a failed attempt that arrives after a *second* migration has taken the lock will match
-  and release it. A holder token would fix that.
+  and release it. A holder token would fix that — `hydra.cluster_locks` demonstrates the
+  shape, and the VM migration lock has not been moved onto it.
 * An `UPDATE ... IF col = null` applies against a row that does not exist and creates a
   partial one. Endpoints whose callers pass a concrete expected value are unaffected.
 

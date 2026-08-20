@@ -26,6 +26,7 @@ mindmap
       _bind_lwt parameter validation and binding
       _lwt_statement prepared-statement cache at SERIAL
       _split_lwt_result applied / current
+      Cluster locks: acquire / renew / release with TTL and holder token
 ```
 
 ## Function & Logic Breakdown
@@ -71,7 +72,14 @@ The whole surface of the typed endpoints: a dict keyed by URL path, each entry h
 | `fixed` | values the proxy supplies and a caller cannot name (the migration lock string) |
 
 `binds` may repeat a name — `migrate-lock` binds the lock value twice, once as the value to
-write and once as the value to compare against.
+write and once as the value to compare against, and `/v1/lock/renew` binds `holder_token`
+twice, once to rewrite it and once to condition on it.
+
+A bind marker is not confined to the value list: `/v1/lock/acquire` ends
+`IF NOT EXISTS USING TTL ?` and `/v1/lock/renew` begins `UPDATE ... USING TTL ?`, so the
+TTL is bound like any other parameter rather than spliced into the statement text.
+Verified against Scylla 5.4 through the prepared-statement path, along with binding an
+`int` to a `bigint` millisecond column.
 
 ### `_bind_lwt(op_path, op, params)`
 Validates the request body and returns the bound tuple, or raises `ValueError`.
@@ -119,6 +127,15 @@ Verified against the live cluster (Scylla 5.4, `release_version` 3.0.8, python
 | `IF col = null` against an absent row | **applies, and creates a partial row** |
 | `INSERT ... IF NOT EXISTS`, refused | returns the whole existing row |
 | Statement with no `IF` | no rows and `column_names is None` |
+| `IF NOT EXISTS USING TTL ?` | accepted; the TTL binds as the last parameter |
+| A row renewed past its insert marker's TTL | still exists; a competing `IF NOT EXISTS` is still refused |
+| `DELETE ... IF col = <concrete>` on an absent row | does not apply |
+| A `timestamp` column in an LWT result | comes back as a `datetime`, which `make_serializable` does not convert |
+
+The last one is why `hydra.cluster_locks.acquired_at_ms` is a `bigint`. A refused
+`IF NOT EXISTS` returns the whole row, and `json.dumps` raises on a `datetime` — on
+exactly the response that tells a caller who holds the lock. Any future conditional
+endpoint over a table with a `timestamp` column hits the same edge.
 
 The driver reports the column as `[applied]` in `ResultSet.column_names` but sanitises it to
 `applied` in each row's `_fields`/`_asdict()`, because `[applied]` is not a valid Python

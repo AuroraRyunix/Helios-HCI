@@ -98,6 +98,22 @@ def _is_degradable_failure(exc):
 MIGRATION_LOCK = "migrating"
 UNLOCKED_STATUS = "running"
 
+# Cluster-wide mutual exclusion lives in one row of hydra.cluster_locks, keyed by lock
+# name. A lightweight transaction is confined to a single partition, so any exclusion
+# that has to hold across hosts must condition on a row every contender shares -- which
+# a scan of hydra.nodes is not, and never was.
+#
+# Every non-key column is rewritten on renew, holder_token included. Leaving one out
+# would let that column keep the *original* insert's TTL and expire first, after which
+# the row is still alive (other cells are live) but no longer renewable or releasable by
+# its holder. Verified against Scylla 5.4: a renewed row still refuses a competing
+# IF NOT EXISTS after the original insert marker has expired.
+_LOCK_COLUMNS = ("name", "holder", "holder_token", "reason", "acquired_at_ms")
+_LOCK_ACQUIRE_CQL = (
+    "INSERT INTO hydra.cluster_locks (" + ", ".join(_LOCK_COLUMNS) + ") VALUES ("
+    + ", ".join("?" * len(_LOCK_COLUMNS)) + ") IF NOT EXISTS USING TTL ?"
+)
+
 # Built from one tuple so the column list and the placeholder count cannot drift apart.
 _VM_COLUMNS = (
     "name", "vcpu", "memory", "disk_path", "disk_size", "state", "host_ip", "disks_list",
@@ -230,6 +246,61 @@ LWT_OPS = {
             "status": {"type": "text", "required": True},
             "maintenance_mode": {"type": "bool", "required": True},
             "expected_status": {"type": "text", "required": True, "nullable": True},
+        },
+    },
+    # Cluster-wide locks. `IF NOT EXISTS` on one shared row is the only form of exclusion
+    # that actually excludes here: the previous "only one host in maintenance at a time"
+    # check read every node row and then wrote, so two hosts entering a second apart both
+    # saw nobody in maintenance and both went on to stop their local ScyllaDB.
+    #
+    # The TTL is not optional. A node that dies holding this lock must not wedge
+    # maintenance for the whole cluster until somebody notices and deletes the row by
+    # hand, because on a cluster that cannot enter maintenance nobody can replace the
+    # hardware that died.
+    "/v1/lock/acquire": {
+        "cql": _LOCK_ACQUIRE_CQL,
+        "binds": _LOCK_COLUMNS + ("ttl_seconds",),
+        "params": {
+            "name": {"type": "text", "required": True},
+            "holder": {"type": "text", "required": True},
+            # Identifies this acquisition, not this node. Required, with no default: a
+            # token every caller shares is not a token.
+            "holder_token": {"type": "text", "required": True},
+            "reason": {"type": "text", "default": ""},
+            "acquired_at_ms": {"type": "int", "required": True},
+            "ttl_seconds": {"type": "int", "required": True},
+        },
+    },
+    # Extending a lock the caller still holds. Long operations -- evacuating a host's VMs
+    # can run for many minutes -- would otherwise force a TTL long enough to cover the
+    # slowest case, which is the same TTL that leaves a dead holder's lock standing.
+    "/v1/lock/renew": {
+        "cql": (
+            "UPDATE hydra.cluster_locks USING TTL ? "
+            "SET holder = ?, holder_token = ?, reason = ?, acquired_at_ms = ? "
+            "WHERE name = ? IF holder_token = ?"
+        ),
+        "binds": ("ttl_seconds", "holder", "holder_token", "reason", "acquired_at_ms",
+                  "name", "holder_token"),
+        "params": {
+            "name": {"type": "text", "required": True},
+            "holder": {"type": "text", "required": True},
+            "holder_token": {"type": "text", "required": True},
+            "reason": {"type": "text", "default": ""},
+            "acquired_at_ms": {"type": "int", "required": True},
+            "ttl_seconds": {"type": "int", "required": True},
+        },
+    },
+    # Conditional on the token, not the holder. A release that matches on holder alone
+    # drops the lock a node holds *now* on behalf of an acquisition of its own that
+    # expired earlier -- the same late-cleanup flaw daruk.md records against the
+    # migration lock, except that here it releases a host that is still shutting down.
+    "/v1/lock/release": {
+        "cql": "DELETE FROM hydra.cluster_locks WHERE name = ? IF holder_token = ?",
+        "binds": ("name", "holder_token"),
+        "params": {
+            "name": {"type": "text", "required": True},
+            "holder_token": {"type": "text", "required": True},
         },
     },
 }

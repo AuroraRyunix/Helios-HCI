@@ -3,6 +3,7 @@ __build__ = "1.2.2"
 import sys
 import os
 import json
+import re
 import time
 import stat
 import socket
@@ -724,6 +725,183 @@ def ssh_fence_host(ip):
     return False
 
 # ---------------------------------------------------------------------------
+# Ring lifecycle.
+#
+# Two jobs live here, and only one of them acts.
+#
+# The first is keeping the cluster maintenance lock alive. Vali takes it when a host
+# starts draining and gives it back when that host has finished rejoining, which can be
+# hours apart -- far longer than any TTL short enough to be useful when the holder dies.
+# Mipha already runs a ten second control loop on the leader and already knows which host
+# is in maintenance, so it renews the lock for as long as hydra.nodes says the host is
+# still transitioning. That is what lets the TTL stay at five minutes.
+#
+# The second is reporting, not acting. When a node is gone for good its ScyllaDB is still
+# a ring member holding token ranges that nobody serves, and every QUORUM operation keeps
+# counting it. Nutanix detaches such a node from the ring automatically; Helios does not,
+# and deliberately: `nodetool removenode` and `nodetool decommission` stream data, run
+# unbounded, cannot be undone, and are wrong to trigger from a health check that has been
+# failing for thirty seconds -- a network partition looks exactly the same from here. So
+# the ring state is surfaced with the command that would fix it, and a human runs it.
+# See docs/ring_lifecycle.md.
+
+MAINTENANCE_LOCK_NAME = "cluster-maintenance"
+MAINTENANCE_LOCK_TTL_SECONDS = 300
+
+# hydra.nodes states in which a host still holds the maintenance lock. RECOVERING is
+# included because a host that has left maintenance but has not finished resyncing its
+# storage is not yet a replica anyone should count on, and no second host should start
+# draining until it is.
+MAINTENANCE_LOCK_STATES = ("ENTERING_MAINTENANCE", "IN_MAINTENANCE", "RECOVERING")
+
+DARUK_URL = "http://127.0.0.1:9043"
+
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`. A refused compare-and-swap is
+    `(True, False, {...}, "")` -- a lost race, not a failure. Collapsing the two would
+    make a lock this node does not hold look like an error, and, worse, make an error
+    look like a lock it does hold.
+
+    Deliberately no cqlsh fallback: that path can run statement text but cannot report
+    whether a condition held, and a lock renewal that cannot be made conditional must not
+    be made at all.
+    """
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
+
+def read_maintenance_lock():
+    """The cluster maintenance lock row as it stands, or {} if nobody holds it."""
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON name, holder, holder_token, reason, acquired_at_ms "
+        f"FROM hydra.cluster_locks WHERE name = '{MAINTENANCE_LOCK_NAME}';")
+    if rc != 0 or not stdout:
+        return {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except Exception:
+                pass
+    return {}
+
+
+def renew_maintenance_lock_for(hostname):
+    """Extend the lock's TTL, but only if `hostname` is the holder of record.
+
+    The token is read rather than remembered: this process did not acquire the lock and
+    may not even be the process that will release it. Reading it and then renewing
+    conditionally on it is still exact -- if the lock changed hands between the read and
+    the renew, the token no longer matches and the renew is refused rather than stealing
+    somebody else's lock and extending it in this host's name.
+    """
+    lock = read_maintenance_lock()
+    if not lock or lock.get("holder") != hostname:
+        return False
+    token = lock.get("holder_token") or ""
+    if not token:
+        return False
+    ok, applied, _current, error = run_lwt("/v1/lock/renew", {
+        "name": MAINTENANCE_LOCK_NAME,
+        "holder": hostname,
+        "holder_token": token,
+        "reason": lock.get("reason") or f"{hostname} is in maintenance",
+        "acquired_at_ms": int(time.time() * 1000),
+        "ttl_seconds": MAINTENANCE_LOCK_TTL_SECONDS,
+    })
+    if not ok:
+        sys.stderr.write(
+            f"[Mipha HA] Could not renew the cluster maintenance lock for {hostname}: {error}\n")
+    return applied
+
+
+_HOST_ID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
+
+def parse_nodetool_status(text):
+    """Ring members from `nodetool status`, as {address, status, state, host_id}.
+
+    The first column is two characters: U/D for up or down, then N/L/J/M for normal,
+    leaving, joining or moving. A member is only a replica that can answer a query when
+    it is both -- `UJ` has not finished streaming in and `UL` is streaming out.
+
+    The host id is matched by shape, not by column index: `Load` occupies two fields
+    ("2.38 MB") or one ("?"), so the columns after it shift from node to node -- and the
+    host id is the argument `nodetool removenode` takes.
+    """
+    members = []
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        marker = fields[0]
+        if len(marker) != 2 or marker[0] not in "UD" or marker[1] not in "NLJM":
+            continue
+        members.append({
+            "address": fields[1],
+            "status": marker[0],
+            "state": marker[1],
+            "available": marker == "UN",
+            "host_id": next((f for f in fields[2:] if _HOST_ID_RE.match(f)), ""),
+        })
+    return members
+
+
+def report_ring_detach_candidate(hostname, ip):
+    """Say whether a host that just failed over is still counted as a ScyllaDB replica.
+
+    A failed-over host is out of the VM scheduler immediately, because hydra.nodes says
+    DOWN. Its ScyllaDB is not out of anything: the ring still assigns it token ranges and
+    every QUORUM operation still counts it toward the replicas it needs. On a three node
+    RF=3 cluster that is the difference between "one node is down" and "the next node to
+    go down takes the cluster with it" -- which is exactly the state the maintenance
+    quorum gate will refuse to add to, without ever explaining why.
+
+    This does not detach anything. See the note at the top of this section.
+    """
+    rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
+    if rc != 0:
+        sys.stderr.write(f"[Mipha HA] Could not read the ScyllaDB ring: "
+                         f"{(stderr or stdout or '').strip()[:200]}\n")
+        return
+    members = parse_nodetool_status(stdout)
+    target = next((m for m in members if m["address"] == ip), None)
+    if target is None:
+        print(f"[Mipha HA] Host {hostname} ({ip}) is not a ScyllaDB ring member; "
+              "nothing to detach.")
+        return
+    up = sum(1 for m in members if m["available"])
+    print(f"[Mipha HA] RING: {hostname} ({ip}) is still a ring member, reported "
+          f"'{target['status']}{target['state']}'. {up} of {len(members)} members are up.")
+    print(f"[Mipha HA] RING: the ring still assigns it token ranges, so QUORUM keeps "
+          f"counting it and maintenance on any other host will be refused while it is down.")
+    print(f"[Mipha HA] RING: if this host is coming back, do nothing. If it is gone for "
+          f"good, detach it deliberately -- 'cluster decommission -s {ip}' explains the "
+          f"sequence. Automatic detach is not done here: from a health check a dead node "
+          f"and a partitioned one look identical, and removenode cannot be undone.")
+
+# ---------------------------------------------------------------------------
 # Scheduled storage auto-heal.
 #
 # Invoked by the Dagur cron entry as `mipha --auto-heal`. This is deliberately a
@@ -919,6 +1097,16 @@ def main():
                             except:
                                 pass
 
+                # Keep the cluster maintenance lock alive for whichever host is mid
+                # transition. Vali takes it and gives it back, but the window between
+                # those two events is an operator's maintenance window, not a task's
+                # runtime, so nothing inside Vali is still running to renew it. Without
+                # this the lock's TTL would have to cover the longest maintenance anyone
+                # ever performs, which is the same TTL that leaves a dead holder's lock
+                # standing for hours.
+                if db_status in MAINTENANCE_LOCK_STATES:
+                    renew_maintenance_lock_for(hostname)
+
                 if db_status in ["IN_MAINTENANCE", "ENTERING_MAINTENANCE"]:
                     consecutive_failures[ip] = 0
                     continue
@@ -1023,8 +1211,14 @@ def main():
                             run_cql_query(cql_normal)
                             print(f"[Mipha HA] Host {hostname} rejoin and sync completed successfully.")
                         else:
-                            # Failed/timed out
-                            err_msg = f"{storage_name} volume sync timed out or failed to complete self-heal."
+                            # Failed/timed out.
+                            #
+                            # `storage_name` was never defined anywhere in this file, so
+                            # this branch raised NameError, was swallowed by the control
+                            # loop's `except Exception`, and left both Catalyst tasks
+                            # stuck at 'processing' forever -- a rejoin that timed out
+                            # looked identical to one still in progress.
+                            err_msg = "Linstor/DRBD volume sync timed out or failed to complete self-heal."
                             cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
                             run_cql_query(cql_child_end)
                             
@@ -1032,7 +1226,7 @@ def main():
                             run_cql_query(cql_parent_end)
                             
                             # Leave status as RECOVERING so Vali does not use it
-                            print(f"[Mipha HA] ERROR: Host {hostname} rejoin failed. {storage_name} sync not complete.")
+                            print(f"[Mipha HA] ERROR: Host {hostname} rejoin failed. Linstor/DRBD sync not complete.")
                     
                 # 3. Trigger Failover if threshold reached
                 if consecutive_failures.get(ip, 0) >= 3:
@@ -1047,6 +1241,12 @@ def main():
                     print(f"[Mipha HA] Marking host {hostname} status as DOWN in metadata store...")
                     cql_down = f"UPDATE hydra.nodes SET status = 'DOWN' WHERE ip = '{ip}';"
                     run_cql_query(cql_down)
+
+                    # Marking it DOWN takes it out of the VM scheduler. It does not take
+                    # it out of the ScyllaDB ring, which is a separate lifecycle with its
+                    # own consequences -- say what those are rather than leaving the
+                    # cluster quietly one failure away from losing quorum.
+                    report_ring_detach_candidate(hostname, ip)
                     
                     # A1. Create parent failover task in Catalyst for WebUI visibility
                     parent_task_id = str(uuid.uuid4())

@@ -116,6 +116,7 @@ local_daemon = "spark_daemon_decoded.py"
 local_helios_zk = "helios_zk.py"
 local_helios_sig = "helios_sig.py"
 local_impa = "impa.py"
+local_helios_schema = "helios_schema.py"
 local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
@@ -538,6 +539,10 @@ def deploy_to_node(ip):
             # works once the certificates it exists to renew have expired.
             print(f"[{ip}] Uploading impa to /usr/local/bin/impa...")
             put_text_file(sftp, local_impa, "/usr/local/bin/impa")
+
+            # The ordered schema, imported by the daemons at startup.
+            print(f"[{ip}] Uploading helios_schema to /usr/local/bin/helios_schema.py...")
+            put_text_file(sftp, local_helios_schema, "/usr/local/bin/helios_schema.py")
             ssh.exec_command("chmod +x /usr/local/bin/impa")
             
             # 2a. Copy Bifrost CLI

@@ -11,8 +11,9 @@ In Nutanix, Medusa acts as the database proxy and abstraction layer sitting in f
 ## Containerized HCI Approach
 In our architecture, **Hydra** runs in a container on every host, leveraging a distributed **ScyllaDB** (a C++ rewritten, high-performance Cassandra-compatible database) or standard **Cassandra** container cluster.
 1. **Consensus & Clustering**: The ScyllaDB/Cassandra instances on all three hosts auto-discover each other using Zookeeper/Odin and form a ring topology.
-2. **Replication & Consensus**: Data keyspaces use a replication factor of 3 (RF=3) with local quorum write/read consistency. This ensures metadata is consistent and partition-tolerant.
-3. **CQL HTTP Proxy (Daruk)**: To avoid the massive host CPU overhead of spawning containerized `cqlsh` python sessions repeatedly, a persistent **CQL HTTP Proxy (Daruk)** (`daruk.service`) runs inside the `systemd-hydra-db` container.
+2. **Replication & Consensus**: A three-node cluster uses a replication factor of 3 (RF=3) with quorum read/write consistency, so metadata is consistent and partition-tolerant. RF is **not** fixed at 3 — a single-node cluster runs RF=1, and `cluster create -r` sets the redundancy factor. Anything reasoning about fault tolerance must read the actual factor out of `system_schema.keyspaces` rather than assume; `cluster ring` prints it.
+3. **Ring lifecycle**: Membership of the ring is a separate thing from membership of the cluster (`hydra.nodes`), and the two do not move together. A node marked `DOWN` leaves the VM scheduler in one write and stays a ring member holding token ranges, which every `QUORUM` operation keeps counting. Entering maintenance mode stops the local `hydra-db`, so it is gated on whether the remaining replicas can still form a quorum, and only one host may transition at a time. See [ring_lifecycle.md](./ring_lifecycle.md).
+4. **CQL HTTP Proxy (Daruk)**: To avoid the massive host CPU overhead of spawning containerized `cqlsh` python sessions repeatedly, a persistent **CQL HTTP Proxy (Daruk)** (`daruk.service`) runs inside the `systemd-hydra-db` container.
     * **Port**: `9043` on `localhost` (bridged via `Network=host`).
     * **Connection**: Maintains a single, persistent native python `cassandra-driver` connection to ScyllaDB.
     * **Uptime Fallback**: Clients issue HTTP POST requests containing CQL queries, which execute in under 2ms. If the proxy is unavailable, host-level processes automatically fall back to executing `cqlsh` directly via `podman exec`. Note that containerized services (like Spectrum) lack host `podman` command access and require Daruk to be online.
@@ -81,6 +82,11 @@ Hydra stores:
 2. **Virtual Disk Map**: Logical disk IDs mapped to Aether storage blocks.
 3. **Snapshot History**: References to point-in-time storage states.
 4. **Task Progress**: Global operations status (e.g., migration progress, backup progress).
+5. **Cluster locks**: `hydra.cluster_locks` — one row per cluster-wide mutual exclusion,
+   taken with `IF NOT EXISTS` and a TTL. A lightweight transaction cannot span partitions,
+   so exclusion that holds across hosts has to condition on a single shared row.
+
+The schema is declared once, in order, in `helios_schema.py`, and applied behind a lock.
 
 ---
 

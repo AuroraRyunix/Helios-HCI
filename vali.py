@@ -1621,10 +1621,14 @@ def process_queue_task(task):
             hostname = payload.get("hostname")
             target_ip = payload.get("target_ip")
             force_stop = payload.get("force_stop", False)
-            
+            # Taken by the API handler before this task was submitted; renewed below for
+            # as long as the evacuation runs, and given back on every failure path.
+            lock_token = payload.get("lock_token", "")
+
             if not is_valid_object_name(hostname) or not is_valid_object_name(target_ip):
+                release_maintenance_lock(lock_token)
                 return False, "Invalid payload parameters for host_maintenance_enter."
-                
+
             # Perform VM evacuation
             rc_v, stdout_v, _ = run_cql_query("SELECT JSON name, host_ip, state, memory FROM hydra.vms;")
             vms = []
@@ -1690,24 +1694,49 @@ def process_queue_task(task):
                         "status": "processing",
                         "progress": progress
                     }, method="POST")
-            
+
+                    # Evacuating a host can run for many minutes. Renewing here is what
+                    # lets the lock's TTL stay short enough that a node dying mid-drain
+                    # frees it quickly.
+                    renew_maintenance_lock(hostname, lock_token, f"evacuating {hostname}")
+
             if success:
+                # The last thing before the database goes down. The gate ran once already
+                # in the API handler, but the ring it saw was the ring before the
+                # evacuation -- which may have taken an hour, and during which another
+                # node can have died. This is the check that actually protects quorum;
+                # the earlier one only avoids a pointless evacuation.
+                quorum_ok, quorum_reason = check_stop_preserves_quorum(target_ip)
+                if not quorum_ok:
+                    cql = f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';"
+                    run_cql_query(cql)
+                    release_maintenance_lock(lock_token)
+                    print(f"[Maintenance Catalyst Task] REFUSED to stop services on {hostname}: {quorum_reason}")
+                    print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL. Its VMs have already been evacuated; DRS will rebalance them.")
+                    return False, f"Refused to enter maintenance mode: {quorum_reason}"
+
                 # Mark node status as IN_MAINTENANCE in DB
                 cql = f"UPDATE hydra.nodes SET status = 'IN_MAINTENANCE', maintenance_mode = true WHERE hostname = '{hostname}';"
                 run_cql_query(cql)
-                print(f"[Maintenance Catalyst Task] Host {hostname} successfully entered maintenance mode.")
-                
+                print(f"[Maintenance Catalyst Task] Host {hostname} successfully entered maintenance mode. {quorum_reason}")
+
+                # The lock stays held for as long as the host is in maintenance, and is
+                # renewed from here on by Mipha's control loop -- this task is about to
+                # end, and a lock nobody renews would expire five minutes into a
+                # maintenance window that lasts hours.
+                renew_maintenance_lock(hostname, lock_token, f"{hostname} is in maintenance")
+
                 # Write state file and stop all cluster services on the target host (except spark-daemon)
                 run_remote_spark(target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
                 stop_cmd = "sleep 2 && systemctl stop spectrum catalyst bifrost dagur mimir vali aether linstor-controller hydra-db gatoway urbosa logos mipha daruk agahnim slate"
-                
+
                 # Update task progress to 100 before running the stop command, so the task status is marked completed in ScyllaDB
                 call_catalyst_api("/api/v1/tasks/update", {
                     "task_id": task_id,
                     "status": "completed",
                     "progress": 100
                 }, method="POST")
-                
+
                 # Run the remote service shutdown in the background
                 run_remote_spark(target_ip, f"({stop_cmd}) >/dev/null 2>&1 < /dev/null &")
                 return True, target_ip
@@ -1715,9 +1744,10 @@ def process_queue_task(task):
                 # Revert node status to NORMAL
                 cql = f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';"
                 run_cql_query(cql)
+                release_maintenance_lock(lock_token)
                 print(f"[Maintenance Catalyst Task] Evacuation failed for host {hostname} on VM {failed_vm}: {fail_reason}. Host status reverted to NORMAL.")
                 return False, f"Evacuation failed on VM {failed_vm}: {fail_reason}"
-                
+
         elif action == "host_maintenance_leave":
             hostname = payload.get("hostname")
             target_ip = payload.get("target_ip")
@@ -1806,12 +1836,27 @@ def process_queue_task(task):
                 cql_normal = f"UPDATE hydra.nodes SET status = 'NORMAL' WHERE hostname = '{hostname}';"
                 run_cql_query(cql_normal)
                 print(f"[Maintenance Catalyst Task] Host {hostname} rejoin and sync completed successfully.")
+
+                # The host is back in the ring and back in service, so the cluster
+                # maintenance lock is finally free. It is released here rather than when
+                # `leave` was requested: until the storage has resynced this host is not
+                # a replica anyone should be counting on, and letting a second host start
+                # draining in that window is the case the lock exists to stop.
+                #
+                # The token from the acquisition is long gone -- `leave` can arrive hours
+                # later, and after a leader change this is not even the same process --
+                # so the row is read and released on the token it carries.
+                release_maintenance_lock_for_host(hostname)
             else:
                 err_msg = "DRBD volume sync timed out or failed to complete self-heal."
                 cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
                 run_cql_query(cql_child_end)
-                print(f"[Maintenance Catalyst Task] ERROR: Sync not complete for {hostname}.")
-                
+                # The lock stays held. The host did not finish rejoining, so the cluster
+                # is still short a replica and no other host should start draining. Mipha
+                # keeps renewing it while hydra.nodes says RECOVERING; if this node is
+                # abandoned instead of fixed, the TTL frees it.
+                print(f"[Maintenance Catalyst Task] ERROR: Sync not complete for {hostname}. The cluster maintenance lock is still held by {hostname}.")
+
             # Spawn subtask to run Mimir Health Check
             print(f"[Maintenance Catalyst Task] Spawning Mimir health checks subtask for host {hostname}...")
             submit_and_wait_task("dagur", "execute", {
@@ -1900,7 +1945,328 @@ def queue_thread_loop():
             sys.stderr.write(f"Error in Vali worker thread: {e}\n")
             time.sleep(2)
 
+# --- ring lifecycle: the quorum gate and the cluster maintenance lock -------------------
+#
+# Entering maintenance stops the host's ScyllaDB along with everything else. On a three
+# node cluster at RF=3 with QUORUM reads and writes, stopping the *second* node leaves
+# one replica of three, quorum is two, and the whole cluster stops answering -- including
+# the metadata reads that the maintenance workflow itself needs to finish. Nothing
+# checked for that: the stop was unconditional and the only guard was a scan of
+# hydra.nodes that two concurrent requests both passed.
+#
+# Three separate things are needed and they are deliberately kept separate:
+#
+#   1. a quorum gate, derived from the *actual* replication factor and the *actual* ring,
+#      evaluated immediately before the stop as well as before the evacuation;
+#   2. a cluster-wide lock with a holder and a TTL, so two hosts cannot transition at
+#      once and a host that dies holding it does not wedge maintenance forever;
+#   3. explicit sequencing for a node that leaves the ring for good or comes back --
+#      see docs/ring_lifecycle.md.
+
+MAINTENANCE_LOCK_NAME = "cluster-maintenance"
+# Short on purpose. A node that dies mid-transition frees the lock in five minutes rather
+# than holding it until an operator finds the row, and every long-running step renews it:
+# Vali's evacuation task while it runs, then Mipha's control loop for as long as
+# hydra.nodes says the host is still in a maintenance state.
+MAINTENANCE_LOCK_TTL_SECONDS = 300
+
+# Byte-for-byte the statement in helios_schema.py migration 0002-cluster-locks, which is
+# the source of truth for this table.
+#
+# It is repeated here because nothing calls helios_schema.ensure_schema yet and
+# helios_schema.py is not in the deployment toolkit's upload list, so migration 0002
+# cannot reach a node. Without this the first maintenance request after an upgrade fails
+# on an unconfigured table and the host cannot be drained at all. Delete it once the
+# migration runner is wired into daemon startup.
+CLUSTER_LOCKS_DDL = (
+    "CREATE TABLE IF NOT EXISTS hydra.cluster_locks ( name text PRIMARY KEY, "
+    "holder text, holder_token text, reason text, acquired_at_ms bigint );")
+
+_cluster_locks_table_ready = False
+
+
+def ensure_cluster_locks_table():
+    global _cluster_locks_table_ready
+    if _cluster_locks_table_ready:
+        return
+    run_cql_query(CLUSTER_LOCKS_DDL)
+    _cluster_locks_table_ready = True
+
+
+def parse_replication_factor(text):
+    """The number of replicas the hydra keyspace declares, or None if it cannot be read.
+
+    The replication map arrives as a stringified dict whichever way it is fetched --
+    Daruk flattens result rows into space-joined `str(value)`, and the cqlsh fallback
+    prints the same shape -- so this reads the pairs out of the text rather than
+    expecting a real mapping. The separator is `[:,]` because the driver's own
+    `OrderedMapSerializedKey` reprs its pairs as tuples rather than with colons, and the
+    difference is invisible until the gate quietly reports "replication factor unknown"
+    and refuses every maintenance request.
+
+    NetworkTopologyStrategy spreads the factor across datacenters and QUORUM is computed
+    from their sum, so the per-datacenter values are added. LocalStrategy and
+    EverywhereStrategy have no replication factor at all and give None.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if "localstrategy" in lowered or "everywherestrategy" in lowered:
+        return None
+    pairs = re.findall(r"['\"]([^'\"]+)['\"]\s*[:,]\s*['\"]?(\d+)['\"]?", text)
+    factors = {key: int(value) for key, value in pairs if key != "class"}
+    if "replication_factor" in factors:
+        return factors["replication_factor"]
+    if not factors:
+        return None
+    return sum(factors.values())
+
+
+def get_hydra_replication_factor():
+    """RF as the database reports it, never a guess.
+
+    A plausible-looking default is worse than no answer here: assuming 3 on a cluster
+    that is actually running RF=1 would wave through the stop that takes the only copy
+    of the metadata offline.
+    """
+    rc, stdout, _ = run_cql_query(
+        "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';")
+    if rc != 0:
+        return None
+    return parse_replication_factor(stdout)
+
+
+_HOST_ID_RE = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
+
+def parse_nodetool_status(text):
+    """Ring members from `nodetool status`, as {address, status, state, host_id}.
+
+    Rows look like `UN  10.10.102.41  2.38 MB  256  ?  <uuid>  rack1`. The first column
+    is two characters: U/D for up or down, then N/L/J/M for normal, leaving, joining or
+    moving. Only a member that is both up and normal is a replica that can answer a
+    query, so `available` is deliberately narrower than "up": a joining node has not
+    finished streaming and a leaving node is on its way out.
+
+    The host id is matched by shape, not by column index: `Load` occupies two fields
+    ("2.38 MB") or one ("?"), so everything after it shifts from node to node.
+    """
+    members = []
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        marker = fields[0]
+        if len(marker) != 2 or marker[0] not in "UD" or marker[1] not in "NLJM":
+            continue
+        members.append({
+            "address": fields[1],
+            "status": marker[0],
+            "state": marker[1],
+            "available": marker == "UN",
+            "host_id": next((f for f in fields[2:] if _HOST_ID_RE.match(f)), ""),
+        })
+    return members
+
+
+def get_ring_members():
+    """Read the ring, from this node. Returns (members, error).
+
+    Any node's `nodetool status` describes the whole ring, so this asks the local one
+    rather than the host being drained -- which is the host most likely to be the reason
+    the ring is being inspected in the first place.
+    """
+    rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
+    if rc != 0:
+        return [], (stderr or stdout or "nodetool status failed").strip()[:300]
+    members = parse_nodetool_status(stdout)
+    if not members:
+        return [], "nodetool status returned no ring members"
+    return members, ""
+
+
+def quorum_of(replication_factor):
+    """What Scylla demands at ConsistencyLevel.QUORUM: a strict majority of RF."""
+    return replication_factor // 2 + 1
+
+
+def evaluate_stop(members, replication_factor, address):
+    """Whether stopping `address` leaves the hydra keyspace able to serve QUORUM.
+
+    Returns (allowed, reason, facts). The arithmetic is the worst case on purpose,
+    because the cheap version of this check -- "are at least quorum-many nodes up right
+    now" -- passes on the exact cluster this gate exists for.
+
+    A given partition lives on `min(RF, ring size)` nodes. We cannot tell from
+    `nodetool status` which nodes hold which partition, so every unavailable member is
+    assumed to be a replica of the partition we care about; that is the case that
+    actually loses data availability, and it is the one worth refusing on.
+    """
+    facts = {
+        "replication_factor": replication_factor,
+        "ring_size": len(members),
+        "ring_up": sum(1 for m in members if m["available"]),
+        "address": address,
+    }
+    target = next((m for m in members if m["address"] == address), None)
+    if target is None:
+        # Witness nodes run no ScyllaDB at all, so they hold no replicas and stopping
+        # one costs the ring nothing.
+        facts["ring_member"] = False
+        return True, f"{address} is not a member of the ScyllaDB ring; it holds no replicas.", facts
+    facts["ring_member"] = True
+    if not target["available"]:
+        return True, (f"{address} is already unavailable to the ring "
+                      f"(nodetool reports '{target['status']}{target['state']}'), so stopping it "
+                      "removes nothing that is currently answering."), facts
+
+    required = quorum_of(replication_factor)
+    assigned = min(replication_factor, len(members))
+    unavailable_after = len(members) - (facts["ring_up"] - 1)
+    worst_case_replicas_after = max(0, assigned - unavailable_after)
+    facts["required"] = required
+    facts["replicas_after"] = worst_case_replicas_after
+
+    if worst_case_replicas_after >= required:
+        return True, (f"RF={replication_factor} needs {required} replicas for QUORUM; "
+                      f"stopping {address} leaves {worst_case_replicas_after}."), facts
+    return False, (
+        f"Stopping {address} would leave {worst_case_replicas_after} of "
+        f"{assigned} replicas available, and QUORUM at RF={replication_factor} needs "
+        f"{required}. The hydra keyspace would stop answering reads and writes for the "
+        f"whole cluster. Ring: {facts['ring_up']} of {facts['ring_size']} members up."), facts
+
+
+def check_stop_preserves_quorum(address):
+    """The gate itself. Returns (allowed, reason).
+
+    Refuses when the replication factor or the ring cannot be established. An unknown
+    answer here is not a safe answer: the whole point is to stop a host whose database
+    the cluster still needs.
+    """
+    replication_factor = get_hydra_replication_factor()
+    if not replication_factor:
+        return False, ("Could not read the hydra keyspace's replication factor, so the "
+                       "effect of stopping this host's database is unknown. Refusing "
+                       "rather than guessing.")
+    members, error = get_ring_members()
+    if error:
+        return False, (f"Could not read the ScyllaDB ring ({error}), so the effect of "
+                       "stopping this host's database is unknown. Refusing rather than "
+                       "guessing.")
+    allowed, reason, _facts = evaluate_stop(members, replication_factor, address)
+    return allowed, reason
+
+
+def acquire_maintenance_lock(hostname, reason):
+    """Take the cluster-wide maintenance lock. Returns (ok, token, current, error).
+
+    `ok` is False only for a real failure. A lock already held is (True, "", {...}, "")
+    and `current` carries the holder -- a refused acquisition is a lost race, not an
+    outage, exactly as Daruk's other conditional endpoints report it.
+    """
+    ensure_cluster_locks_table()
+    token = str(uuid.uuid4())
+    ok, applied, current, error = run_lwt("/v1/lock/acquire", {
+        "name": MAINTENANCE_LOCK_NAME,
+        "holder": hostname,
+        "holder_token": token,
+        "reason": reason,
+        "acquired_at_ms": int(time.time() * 1000),
+        "ttl_seconds": MAINTENANCE_LOCK_TTL_SECONDS,
+    })
+    if not ok:
+        return False, "", {}, error
+    if not applied:
+        return True, "", current, ""
+    return True, token, {}, ""
+
+
+def read_maintenance_lock():
+    """The lock row as it stands, or {} if nobody holds it."""
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON name, holder, holder_token, reason, acquired_at_ms "
+        f"FROM hydra.cluster_locks WHERE name = '{MAINTENANCE_LOCK_NAME}';")
+    if rc != 0 or not stdout:
+        return {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except Exception:
+                pass
+    return {}
+
+
+def renew_maintenance_lock(hostname, token, reason):
+    """Push the TTL out, but only for the acquisition that owns it."""
+    ok, applied, _current, error = run_lwt("/v1/lock/renew", {
+        "name": MAINTENANCE_LOCK_NAME,
+        "holder": hostname,
+        "holder_token": token,
+        "reason": reason,
+        "acquired_at_ms": int(time.time() * 1000),
+        "ttl_seconds": MAINTENANCE_LOCK_TTL_SECONDS,
+    })
+    if not ok:
+        sys.stderr.write(f"[Maintenance] Could not renew the maintenance lock: {error}\n")
+        return False
+    if not applied:
+        # The TTL ran out and somebody else took it, or this host was released by hand.
+        # Say so loudly: from here on nothing is excluding a second host's transition.
+        sys.stderr.write(
+            f"[Maintenance] Host {hostname} no longer holds the cluster maintenance lock.\n")
+    return applied
+
+
+def release_maintenance_lock(token):
+    """Give the lock back. Conditional on the token, so it can only drop our own."""
+    if not token:
+        return False
+    ok, applied, _current, error = run_lwt("/v1/lock/release", {
+        "name": MAINTENANCE_LOCK_NAME,
+        "holder_token": token,
+    })
+    if not ok:
+        sys.stderr.write(f"[Maintenance] Could not release the maintenance lock: {error}\n")
+        return False
+    if not applied:
+        # Expired, or already released. Not an error, and specifically not something to
+        # retry unconditionally -- an unconditional delete here would drop whatever lock
+        # has since been taken by whichever host is draining now.
+        print("[Maintenance] The maintenance lock was no longer this transition's to release.")
+    return applied
+
+
+def release_maintenance_lock_for_host(hostname):
+    """Release the lock held on `hostname`'s behalf, without holding its token.
+
+    `leave` can arrive hours after `enter`, from a different Vali process after a leader
+    change, so the token from the acquisition is long gone. Reading the row and then
+    releasing on the token it carries is still safe: if the lock changes hands between
+    the read and the release, the token no longer matches and the release is refused.
+    """
+    lock = read_maintenance_lock()
+    if not lock:
+        return False
+    if lock.get("holder") != hostname:
+        print(f"[Maintenance] The maintenance lock is held by '{lock.get('holder')}', "
+              f"not by '{hostname}'; leaving it alone.")
+        return False
+    return release_maintenance_lock(lock.get("holder_token") or "")
+
+
 def evacuate_host_thread(hostname, target_ip, force_stop):
+    # Nothing calls this any more -- the maintenance API submits a Catalyst task instead
+    # -- but it is a second, complete copy of the enter sequence including the
+    # unconditional `systemctl stop ... hydra-db ...`, so it is gated too rather than
+    # left as a way back into the bug.
+    quorum_ok, quorum_reason = check_stop_preserves_quorum(target_ip)
+    if not quorum_ok:
+        sys.stderr.write(f"[Maintenance] Refusing to evacuate {hostname}: {quorum_reason}\n")
+        return
     try:
         # Get all VMs running on this host
         rc_v, stdout_v, _ = run_cql_query("SELECT JSON name, host_ip, state, memory FROM hydra.vms;")
@@ -2162,27 +2528,51 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             target_ip = host_info.get("ip")
             
             if action == "enter":
-                # Check if another host is already in maintenance
-                rc_all, stdout_all, _ = run_cql_query("SELECT JSON hostname, status, maintenance_mode FROM hydra.nodes;")
-                already_in_maint = False
-                maint_host = ""
-                if rc_all == 0 and stdout_all:
-                    for line in stdout_all.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                node = json.loads(line)
-                                if node.get("hostname") != hostname and (node.get("maintenance_mode", False) or node.get("status", "NORMAL") != "NORMAL"):
-                                    already_in_maint = True
-                                    maint_host = node.get("hostname")
-                                    break
-                            except:
-                                pass
-                                
-                if already_in_maint:
-                    self.send_json(400, {"error": f"Another host ('{maint_host}') is already in maintenance mode. Only one host can enter maintenance mode at a time to preserve quorum."})
+                # Without an address there is no way to ask the ring about this host, and
+                # the quorum gate would find no matching ring member and read that as
+                # "holds no replicas" -- waving through the one case it exists to catch.
+                if not target_ip:
+                    self.send_json(409, {"error": f"Host '{hostname}' has no IP recorded in hydra.nodes, so its effect on the ScyllaDB ring cannot be established."})
                     return
-                    
+
+                # Refuse before evacuating anything if the database this host carries is
+                # one the cluster cannot lose. Entering maintenance stops hydra-db, and
+                # on a cluster already missing a replica that stop is what takes the
+                # metadata layer below quorum -- after which the maintenance workflow
+                # cannot even record what it did. The gate runs again immediately before
+                # the stop, because an evacuation can take long enough for a second node
+                # to die in the middle of it.
+                quorum_ok, quorum_reason = check_stop_preserves_quorum(target_ip)
+                if not quorum_ok:
+                    self.send_json(409, {
+                        "error": f"Host '{hostname}' cannot enter maintenance mode: {quorum_reason}",
+                        "reason": "quorum",
+                    })
+                    return
+
+                # Exclude every other host's transition, cluster-wide, in one Paxos round.
+                #
+                # What was here before scanned every hydra.nodes row for a host already in
+                # maintenance and then wrote. Two hosts entering a second apart both read
+                # "nobody" and both proceeded -- a lightweight transaction cannot span
+                # partitions, so the check and the claim were never one operation. A
+                # single lock row is the shape that can be: see hydra.cluster_locks.
+                lock_ok, lock_token, lock_current, lock_err = acquire_maintenance_lock(
+                    hostname, f"maintenance entry on {hostname}")
+                if not lock_ok:
+                    self.send_json(500, {"error": f"Could not take the cluster maintenance lock: {lock_err}"})
+                    return
+                if not lock_token:
+                    holder = lock_current.get("holder") or "another host"
+                    self.send_json(409, {
+                        "error": f"Host '{holder}' already holds the cluster maintenance lock "
+                                 f"({lock_current.get('reason') or 'no reason recorded'}). "
+                                 "Only one host may transition at a time, to preserve quorum.",
+                        "reason": "locked",
+                        "holder": lock_current.get("holder", ""),
+                    })
+                    return
+
                 # Claim the transition rather than announce it. Draining a host is a lock
                 # on that host: two requests -- a double click, or a leave racing an enter
                 # that is still evacuating -- both used to write a status and both went on
@@ -2199,30 +2589,45 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
                     "maintenance_mode": False,
                     "expected_status": "NORMAL",
                 })
+                # Every exit from here on has to give the lock back. Leaving it held on a
+                # request that never started a transition blocks maintenance cluster-wide
+                # until the TTL runs out.
                 if not ok:
+                    release_maintenance_lock(lock_token)
                     self.send_json(500, {"error": f"Could not begin the maintenance transition for '{hostname}': {err}"})
                     return
                 if not applied:
+                    release_maintenance_lock(lock_token)
                     self.send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not NORMAL, so it cannot enter maintenance mode now."})
                     return
 
-                # Submit Catalyst task
+                # Submit Catalyst task. The lock token travels with it: the task renews
+                # the lock while it evacuates and releases it if the transition fails.
                 status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
                     "service": "vali",
                     "action": "host_maintenance_enter",
                     "payload": {
                         "hostname": hostname,
                         "target_ip": target_ip,
-                        "force_stop": force_stop
+                        "force_stop": force_stop,
+                        "lock_token": lock_token
                     }
                 }, method="POST")
-                
+
                 if status_api == 200:
                     task_id = res_api.get("task_id")
                     self.send_json(200, {"status": "transitioning", "task_id": task_id, "message": f"Entering maintenance mode task submitted (Task ID: {task_id})."})
                 else:
+                    # Nothing is going to run, so put the host and the lock back.
+                    run_lwt("/v1/node/maintenance", {
+                        "hostname": hostname,
+                        "status": "NORMAL",
+                        "maintenance_mode": False,
+                        "expected_status": "ENTERING_MAINTENANCE",
+                    })
+                    release_maintenance_lock(lock_token)
                     self.send_json(500, {"error": f"Failed to submit host maintenance task to Catalyst: {res_api}"})
-                
+
             elif action == "leave":
                 # Submit Catalyst task
                 status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {

@@ -95,6 +95,29 @@ MIGRATIONS = [
         "CREATE TABLE IF NOT EXISTS hydra.vms ( name text PRIMARY KEY, vcpu int, memory int, disk_path text, disk_size int, state text, host_ip text, disks_list text, firmware text, iso text, boot_device text, network_id text, cpu_model text, audio_enabled boolean, status text );",
         ],
     },
+    {
+        "id": "0002-cluster-locks",
+        "description": (
+            "One row per cluster-wide mutual exclusion, taken with IF NOT EXISTS. "
+            "Added for the maintenance lock: 'only one host in maintenance at a time' "
+            "was a scan of every hydra.nodes row followed by a write, so two hosts "
+            "entering concurrently both read 'nobody' and both proceeded. A lightweight "
+            "transaction cannot span partitions, so the exclusion has to live in a "
+            "single row that every contender conditions on."
+        ),
+        "statements": [
+            # `holder_token` identifies one *acquisition*, not one node. Releasing on
+            # holder alone lets a stale release from a node's earlier, expired
+            # acquisition drop the lock that same node holds now -- the flaw daruk.md
+            # records against the migration lock.
+            #
+            # `acquired_at_ms` is bigint rather than timestamp on purpose. A refused
+            # IF NOT EXISTS returns the whole existing row, and Daruk's make_serializable
+            # passes a driver datetime through untouched, so json.dumps would raise on
+            # exactly the response that tells a caller who holds the lock.
+            "CREATE TABLE IF NOT EXISTS hydra.cluster_locks ( name text PRIMARY KEY, holder text, holder_token text, reason text, acquired_at_ms bigint );",
+        ],
+    },
 ]
 
 
@@ -179,18 +202,42 @@ def lwt_applied(stdout):
     cqlsh renders an LWT result as an `[applied]` column holding True or False. A
     rejected LWT is not an error and exits zero, so the return code says nothing --
     reading this is the only way to tell "I took the lock" from "someone else holds it".
+
+    `[applied]` is the first column and the row carries the conditioned columns beside
+    it, which is what makes this fiddlier than it looks. Against a real Scylla:
+
+        [applied] | name         | acquired_at                     | holder
+       -----------+--------------+---------------------------------+--------
+            False | hydra-schema | 2026-08-20 10:00:14.701000+0000 | 10.0.0.1
+
+    and on success the other columns come back null:
+
+        [applied] | name | acquired_at | holder
+       -----------+------+-------------+--------
+             True | null |        null |   null
+
+    An earlier version compared the whole stripped line to "True", which matched the
+    single-column case and nothing else -- so every successful lock acquisition read as a
+    lost race, and the caller returned while still holding the lock it had just taken.
+    Only the first field is looked at now.
     """
-    text = (stdout or "")
+    text = stdout or ""
     if "[applied]" not in text:
         # No LWT marker at all: the statement was not conditional, or the output shape
         # changed. Treat as not-applied rather than assuming success, because the
         # consequence of guessing wrong here is two daemons migrating at once.
         return False
+
     for line in text.splitlines():
-        stripped = line.strip().strip("|").strip()
-        if stripped in ("True", "true"):
+        stripped = line.strip()
+        if not stripped or "[applied]" in stripped:
+            continue
+        if set(stripped) <= set("-+ "):
+            continue
+        first = stripped.split("|", 1)[0].strip()
+        if first in ("True", "true"):
             return True
-        if stripped in ("False", "false"):
+        if first in ("False", "false"):
             return False
     return False
 

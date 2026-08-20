@@ -129,6 +129,39 @@ class OutputParsingTests(unittest.TestCase):
         self.assertTrue(schema.lwt_applied("\n [applied]\n-----------\n      True\n"))
         self.assertFalse(schema.lwt_applied("\n [applied] | holder\n---+---\n False | b\n"))
 
+    def test_lwt_applied_reads_the_first_column_of_a_multi_column_row(self):
+        """Captured verbatim from cqlsh against Scylla 5.4.
+
+        A rejected LWT returns the conditioned columns beside [applied]; an accepted one
+        returns them as null. An earlier version compared the whole stripped line to
+        "True", which matched only the single-column case -- so every successful lock
+        acquisition was read as a lost race and the caller returned while holding the
+        lock it had just taken. The TTL was the only thing that eventually freed it.
+        """
+        accepted = "\n".join([
+            "",
+            " [applied] | name | acquired_at | holder",
+            "-----------+------+-------------+--------",
+            "      True | null |        null |   null",
+            "",
+        ])
+        rejected = "\n".join([
+            "",
+            " [applied] | name         | acquired_at                     | holder",
+            "-----------+--------------+---------------------------------+--------",
+            "     False | hydra-schema | 2026-08-20 10:00:14.701000+0000 | 10.0.0.1",
+            "",
+        ])
+        self.assertTrue(schema.lwt_applied(accepted))
+        self.assertFalse(schema.lwt_applied(rejected))
+
+    def test_lwt_applied_ignores_the_header_and_rule(self):
+        # "[applied]" appears in the header; the rule is dashes and pluses. Neither is a
+        # row, and treating either as one would answer from the wrong line.
+        single_column = "\n".join(
+            ["", " [applied]", "-----------", "      True", "", "(1 rows)", ""])
+        self.assertTrue(schema.lwt_applied(single_column))
+
     def test_lwt_applied_is_false_when_the_marker_is_missing(self):
         # Guessing "applied" here would let two daemons migrate at once.
         self.assertFalse(schema.lwt_applied(""))

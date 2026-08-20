@@ -36,7 +36,8 @@ mapping = {
     "LANAYRU_B64": "lanayru.py",
     "HELIOS_ZK_B64": "helios_zk.py",
     "HELIOS_SIG_B64": "helios_sig.py",
-    "IMPA_B64": "impa.py"
+    "IMPA_B64": "impa.py",
+    "HELIOS_SCHEMA_B64": "helios_schema.py"
 }
 
 # Any constant provision.py embeds must be listed above, otherwise editing its source

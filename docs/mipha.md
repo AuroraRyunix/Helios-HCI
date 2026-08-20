@@ -42,6 +42,27 @@ UPDATE hydra.nodes SET status = 'DOWN' WHERE ip = '<dead_host_ip>';
 ```
 This prevents Vali's scheduler from placing new virtual machines onto the crashed host.
 
+It does **not** remove the host from the ScyllaDB ring, which is a separate membership
+with separate consequences: the ring still assigns the dead node token ranges, and every
+`QUORUM` operation still counts it toward the replicas it needs. Mipha therefore reports
+the ring's view of the failed host — whether it is still a member, what `nodetool` calls
+it, how many members are up, and the command that would detach it — and detaches nothing.
+`nodetool removenode` is irreversible, and from a health check that has been failing for
+thirty seconds a dead node and a partitioned one look identical. See
+[ring_lifecycle.md](./ring_lifecycle.md).
+
+### B2. Maintenance Lock Renewal
+Vali takes the cluster-wide maintenance lock (`hydra.cluster_locks`) when a host starts
+draining and gives it back when that host has finished rejoining — an operator's
+maintenance window apart, far longer than any TTL short enough to be useful when the
+holder dies. Mipha renews it on every control-loop pass for whichever host `hydra.nodes`
+reports in `ENTERING_MAINTENANCE`, `IN_MAINTENANCE` or `RECOVERING`, which is what lets
+the TTL stay at five minutes.
+
+The renewal is conditional on the lock's holder token, read from the row: if the lock
+changed hands, the renewal is refused rather than extending someone else's lock in the
+wrong host's name.
+
 ### C. Active Service Recovery (No Hardcoded Timers)
 Before executing VM recovery, Mipha actively verifies that the management plane has settled:
 1. **ZooKeeper Leader Resolution:** It queries ZK ports across the surviving nodes to verify that a ZooKeeper leader has successfully been established.
