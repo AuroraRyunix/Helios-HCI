@@ -19,11 +19,32 @@ def run_command_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command, timeout=45):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command, "timeout": timeout}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -39,10 +60,11 @@ def run_remote_spark(ip, command, timeout=45):
             time.sleep(2)
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -210,6 +232,53 @@ def hash_file(file_path):
             sha256.update(chunk)
     return sha256.hexdigest()
 
+def _load_signing_module():
+    """Import helios_sig from wherever this process happens to be running.
+
+    On a host, hylia sits in /usr/local/bin next to it. Inside the Spectrum container it
+    runs from /app, where the module is copied by the Dockerfile. Neither location is
+    importable by name from the other, so both are tried.
+    """
+    try:
+        import helios_sig
+        return helios_sig
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sig.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_sig.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_sig", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise Exception(
+        "Cannot verify this update package: helios_sig.py was not found. Refusing to "
+        "install an unverified package. Reinstall the LCM components, or see "
+        "docs/update_signing.md.")
+
+
+def _verify_package_signature(extract_dir):
+    """Refuse a package whose manifest was not signed by the pinned release key.
+
+    An unsigned package is refused unless the operator has explicitly set the transition
+    variable; a *badly* signed one is refused in every case, because a bad signature is
+    evidence of tampering rather than of an old release process.
+    """
+    helios_sig = _load_signing_module()
+    try:
+        helios_sig.verify_package_manifest(extract_dir)
+    except helios_sig.SignatureMissing as exc:
+        if not helios_sig.unsigned_updates_permitted():
+            raise Exception(
+                "Refusing this update package. %s %s"
+                % (exc, helios_sig.unsigned_override_hint()))
+        print("[Hylia] UNVERIFIED PACKAGE: %s Installing anyway because the unsigned "
+              "override is set. Nothing in this package has been shown to come from the "
+              "Helios release key." % exc)
+
+
 def validate_and_extract_zip(zip_path, extract_dir):
     if os.path.exists(extract_dir):
         import shutil
@@ -221,6 +290,15 @@ def validate_and_extract_zip(zip_path, extract_dir):
 
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_dir)
+
+    # Before the manifest is trusted for anything. Every component digest lives in the
+    # manifest, so one signature over it transitively covers every file and every install
+    # path in the package -- but only if it is checked before those digests are read.
+    #
+    # This is the anchor for the manual upload path in particular. `check-updates`
+    # verifies what the update server advertises, and a package handed straight to the
+    # console never passed through it.
+    _verify_package_signature(extract_dir)
 
     manifest_path = os.path.join(extract_dir, "manifest.json")
     if not os.path.exists(manifest_path):

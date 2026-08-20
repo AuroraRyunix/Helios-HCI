@@ -4,6 +4,7 @@ RUN apt-get update && apt-get install -y libvirt-clients qemu-utils procps opens
 WORKDIR /app
 COPY server.py .
 COPY hylia.py .
+COPY helios_sig.py .
 COPY lanayru.py .
 COPY static/ ./static/
 EXPOSE 8443

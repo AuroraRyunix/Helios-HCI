@@ -544,6 +544,73 @@ def run_cql_query(cql_query, *args, **kwargs):
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 
+DARUK_URL = "http://127.0.0.1:9043"
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure: Daruk unreachable, a malformed request, a
+    database error. A compare-and-swap that was *refused* is `(True, False, {...}, "")`
+    and belongs to the caller, not to an error handler -- it means someone else holds what
+    was being claimed, and `current` says what they hold. run_cql_query() cannot express
+    that distinction at all: it flattens rows into space-joined strings and returns rc=0
+    either way, so an ownership write that lost its race reads as one that won.
+
+    There is deliberately no cqlsh fallback. That fallback exists so services keep working
+    while Daruk is down, but it can only run statement text and cannot report whether a
+    condition held; an ownership write that cannot be made conditional must not be made.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
+
+def reconcile_local_vm(name, host_ip, live_state):
+    """Write back what libvirt says about a VM this node believes it owns.
+
+    `host_ip` is the placement the reconciler read, and every write is conditional on it
+    still being there. The unconditional version of this loop was a way to lose a running
+    VM: a guest that had just been migrated away still had a local libvirt trace, the
+    reconciler saw "not running here", and cleared host_ip on a row that now pointed at
+    the new owner. The VM was then unplaced as far as Hydra was concerned and the next
+    start booted a second copy of it against the same DRBD device.
+
+    Returns True when the write landed. A refusal is not an error -- it means this node is
+    no longer the host of record and has nothing to say about the VM.
+    """
+    if live_state == "Stopped":
+        ok, applied, current, err = run_lwt("/v1/vm/release", {
+            "name": name, "expected_host_ip": host_ip,
+        })
+    else:
+        ok, applied, current, err = run_lwt("/v1/vm/set-state", {
+            "name": name, "state": live_state, "expected_host_ip": host_ip,
+        })
+    if not ok:
+        print(f"[Reconcile] VM '{name}': could not update its record ({err}).")
+        return False
+    if not applied:
+        print(f"[Reconcile] VM '{name}' is no longer placed here (Hydra now says {current.get('host_ip')!r}); leaving its record alone.")
+        return False
+    return True
+
+
 def get_actual_replication_factor():
     try:
         import urllib.request
@@ -2600,18 +2667,16 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         if name in libvirt_vms:
                             run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
-                            cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                            run_cql_query(cql_update)
-                            vm["state"] = "Stopped"
-                            vm["host_ip"] = ""
-                            host_ip = ""
+                            if reconcile_local_vm(name, host_ip, "Stopped"):
+                                vm["state"] = "Stopped"
+                                vm["host_ip"] = ""
+                                host_ip = ""
                     elif vm.get("state") != live_state:
-                        cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                        run_cql_query(cql_update)
-                        vm["state"] = live_state
-                
+                        if reconcile_local_vm(name, host_ip, live_state):
+                            vm["state"] = live_state
+
                 vm_status = vm.get("state", "Stopped").lower()
-                
+
                 # Resolve host IP to hostname for the frontend UI
                 vm_node_display = host_ip
                 for n in get_cluster_nodes():
@@ -3130,18 +3195,16 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         if name in libvirt_vms:
                             run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
-                            cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                            run_cql_query(cql_update)
-                            vm["state"] = "Stopped"
-                            vm["host_ip"] = ""
-                            host_ip = ""
+                            if reconcile_local_vm(name, host_ip, "Stopped"):
+                                vm["state"] = "Stopped"
+                                vm["host_ip"] = ""
+                                host_ip = ""
                     elif vm.get("state") != live_state:
-                        cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                        run_cql_query(cql_update)
-                        vm["state"] = live_state
-                
+                        if reconcile_local_vm(name, host_ip, live_state):
+                            vm["state"] = live_state
+
                 vm_status = vm.get("state", "Stopped").lower()
-                
+
                 # Resolve host IP to hostname for the frontend UI
                 vm_node_display = host_ip
                 for n in get_cluster_nodes():
@@ -4324,8 +4387,35 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 content = self.rfile.read(content_length)
                 payload = json.loads(content.decode('utf-8'))
-                download_url = payload.get("download_url")
-                expected_sha256 = payload.get("sha256")
+
+                # The URL and digest come from the row check-updates wrote, not from the
+                # request. They are the values that were covered by the release
+                # signature; taking them from the caller lets anyone who can reach this
+                # API point the installer at a package of their choosing and supply a
+                # matching digest, which is the whole signature check bypassed. The
+                # request body is now only a trigger.
+                rc_state, out_state, _err_state = run_cql_query(
+                    "SELECT JSON download_url, sha256 FROM hydra.lcm_update_state "
+                    "WHERE key = 'latest';")
+                signed = {}
+                if rc_state == 0:
+                    for line in (out_state or "").splitlines():
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                signed = json.loads(line)
+                            except ValueError:
+                                signed = {}
+                            break
+                download_url = signed.get("download_url")
+                expected_sha256 = signed.get("sha256")
+                if not download_url or not expected_sha256:
+                    self.send_json(409, {
+                        "error": "No verified update is recorded. Run an update check "
+                                 "first; downloads use the URL and digest that check "
+                                 "verified, not values supplied here."
+                    })
+                    return
 
                 # Only https, only an allowlisted update host. Without this the
                 # caller picks any URL urlopen understands, including file://.
@@ -5514,24 +5604,39 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 network_id = "7a68e0d6-11f8-4e89-9430-b3b44b8bc438"
             cpu_model = payload.get("cpu_model", "")
             audio_enabled = bool(payload.get("audio_enabled", False))
+            # The typed endpoint rejects a null where a string is due, and every one of
+            # these fields reaches it straight from the request body, where an explicit
+            # null is what a form with a cleared field sends.
             vm_meta = {
                 "name": name,
                 "vcpu": vcpu,
                 "memory": memory,
-                "disk_path": disk_paths[0] if disk_paths else "",
+                "disk_path": (disk_paths[0] if disk_paths else "") or "",
                 "disk_size": primary_disk_size_gb if disk_paths else 0,
                 "state": "Stopped",
                 "host_ip": "",
                 "disks_list": ",".join(disks_payload) if disks_payload else "NONE",
-                "firmware": firmware,
-                "iso": iso,
-                "boot_device": boot_device,
+                "firmware": firmware or "uefi",
+                "iso": iso or "",
+                "boot_device": boot_device or "",
                 "network_id": network_id,
-                "cpu_model": cpu_model,
+                "cpu_model": cpu_model or "",
                 "audio_enabled": audio_enabled
             }
-            cql = f"INSERT INTO hydra.vms JSON '{json.dumps(vm_meta)}';"
-            run_cql_query(cql)
+            # INSERT is an upsert in CQL, so this used to overwrite whatever row already
+            # carried the name -- including a live VM's, whose host_ip it reset to "". The
+            # VM kept running while Hydra recorded it as unplaced, and the next start put
+            # a second copy of it on another host against the same disks. The insert is
+            # now conditional, and a name that is already taken is refused.
+            ok, applied, current, err = run_lwt("/v1/vm/create", vm_meta)
+            if not ok:
+                log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name}, error_msg=err, task_id=task_id, created_at=created_at)
+                self.send_json(500, {"error": f"Failed to register VM {name}: {err}"})
+                return
+            if not applied:
+                log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name}, error_msg="VM already exists", task_id=task_id, created_at=created_at)
+                self.send_json(409, {"error": f"A VM named '{name}' already exists (currently placed on {current.get('host_ip') or 'no host'}). Its record was left untouched."})
+                return
 
             # 4. Append event log
             EVENT_LOGS.append({
@@ -7425,11 +7530,9 @@ def db_reconcile_loop():
                                     if name in libvirt_vms:
                                         run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                                     if db_state != "Stopped" or host_ip != "":
-                                        cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                                        run_cql_query(cql_update)
+                                        reconcile_local_vm(name, host_ip, "Stopped")
                                 elif db_state != live_state:
-                                    cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                                    run_cql_query(cql_update)
+                                    reconcile_local_vm(name, host_ip, live_state)
                             else:
                                 # This VM is assigned to another node in the database.
                                 # If it exists locally (defined or running), we must clean it up to prevent split-brain.

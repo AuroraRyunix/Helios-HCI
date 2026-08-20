@@ -4,12 +4,15 @@ import urllib.parse
 import json
 import time
 import sys
+import re
 import hashlib
 
 # Build string reported when an installed component carries no __build__ tag.
 # This script is deployed standalone as /usr/local/bin/check-updates, so the value
 # cannot be imported from hylia; it is the single source of truth within this file.
 FALLBACK_BUILD = "1.2.0-b4081"
+
+_SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 
 def cql_escape(value):
     """Escape a value for embedding inside a single-quoted CQL string literal.
@@ -39,6 +42,90 @@ def validate_download_url(url):
     if parsed.scheme != "https" or not parsed.netloc:
         raise Exception(f"Update server returned an invalid download_url: {url!r}")
     return url
+
+def validate_package_digest(digest):
+    """The package digest is what Spectrum checks the downloaded zip against, and it
+    refuses anything that is not 64 hex characters. Catch it here instead, where the
+    release that supplied it can still be named."""
+    digest = "" if digest is None else str(digest).strip()
+    if not _SHA256_RE.match(digest):
+        raise Exception(f"Update server returned an invalid package sha256: {digest!r}")
+    return digest.lower()
+
+def load_signing_module():
+    """Import helios_sig, or fail the check.
+
+    This script is deployed as /usr/local/bin/check-updates, a name python cannot
+    import, so it loads its neighbour by path the same way it loads hylia. There is no
+    branch here that carries on without the module: a check that cannot verify a
+    signature has nothing to say about whether an update is safe to offer, and the
+    honest outcome is an error in the console rather than an update nobody vouched for.
+    """
+    try:
+        import helios_sig
+        return helios_sig
+    except ImportError:
+        pass
+    module_path = "/usr/local/bin/helios_sig.py"
+    try:
+        import importlib.util
+        import importlib.machinery
+        import os
+        if os.path.exists(module_path):
+            loader = importlib.machinery.SourceFileLoader("helios_sig", module_path)
+            spec = importlib.util.spec_from_loader("helios_sig", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+    except Exception as e:
+        raise Exception(f"Update signature verification is unavailable: {module_path} could not be loaded ({e}).")
+    raise Exception(
+        f"Update signature verification is unavailable: {module_path} is missing. "
+        "It ships in the upgrade package and is written by provision.py; reinstall it "
+        "on this node before update checks can run."
+    )
+
+def resolve_release_document(document, public_key_path=None):
+    """Return the release fields that a signature actually covers.
+
+    The bug this closes: the old code read latest_version, download_url and its
+    sha256 straight out of the response body. A digest supplied by whoever supplied
+    the URL proves the download arrived intact, and nothing else -- so anyone able to
+    answer for the update host could hand every node a package of their choosing and
+    the matching hash, and the whole chain below (Spectrum's zip check, hylia's
+    per-component digests) would confirm it faithfully all the way onto root's PATH.
+
+    Now the server sends a signed text blob and the fields are read out of that,
+    verified against the key pinned on this node at provision time. Values sitting
+    beside it in the response are ignored entirely; trusting one because a signature
+    elsewhere in the body verified is the same bug with a signature stapled to it.
+
+    Returns (release fields, note) where note is empty for a verified release and a
+    banner for the one case an operator can deliberately opt into.
+    """
+    helios_sig = load_signing_module()
+    key_path = public_key_path or helios_sig.PINNED_PUBLIC_KEY_PATH
+    try:
+        release, key_id = helios_sig.verify_signed_document(document, key_path)
+    except helios_sig.SignatureMissing as e:
+        if not helios_sig.unsigned_updates_permitted():
+            raise Exception(f"Refusing this release. {e} {helios_sig.unsigned_override_hint()}")
+        note = (f"UNVERIFIED RELEASE: accepted without a signature because "
+                f"{helios_sig.UNSIGNED_OVERRIDE_ENV} is set. {e}")
+        print("=" * 78)
+        print(note)
+        print("Nothing in this release has been shown to come from the Helios release key.")
+        print("=" * 78)
+        return document, note
+    except helios_sig.SignatureError as e:
+        # Present and wrong is never a migration problem, so the escape hatch does not
+        # reach this branch. Either the package was tampered with or the release key
+        # was rotated without re-pinning it; both need a human, not a retry.
+        raise Exception(f"Refusing this release. {e}")
+
+    detail = f" (key {key_id})" if key_id else ""
+    print(f"Release signature verified against the key pinned at {key_path}{detail}.")
+    return release, ""
 
 def run_cql_query(cql_query):
     try:
@@ -150,6 +237,7 @@ def collect_inventory():
             
         components_paths = {
             "spark": "/usr/local/bin/spark",
+            "impa": "/usr/local/bin/impa",
             "spark-daemon": "/usr/local/bin/spark-daemon",
             "bifrost": "/usr/local/bin/bifrost",
             "valcli": "/usr/local/bin/valcli",
@@ -170,6 +258,7 @@ def collect_inventory():
             "hylia": "/usr/local/bin/hylia",
             "lanayru": "/usr/local/bin/lanayru.py",
             "helios-zk": "/usr/local/bin/helios_zk.py",
+            "helios-sig": "/usr/local/bin/helios_sig.py",
             "check-updates": "/usr/local/bin/check-updates",
             "nodetool": "/usr/local/bin/nodetool",
             "allssh": "/usr/local/bin/allssh",
@@ -269,13 +358,17 @@ def main():
         with urllib.request.urlopen(req, timeout=15) as response:
             data = json.loads(response.read().decode('utf-8'))
             
-        latest_version = data.get("latest_version")
-        release_date = data.get("release_date")
-        download_url = validate_download_url(data.get("download_url"))
-        sha256 = data.get("sha256")
-        size = cql_int(data.get("size", 0))
-        changelog = data.get("changelog", "")
-        latest_components = data.get("components", {})
+        # Nothing below reads from `data` again: every field an update decision rests
+        # on comes out of the half the release key signed.
+        release, signature_note = resolve_release_document(data)
+
+        latest_version = release.get("latest_version")
+        release_date = release.get("release_date")
+        download_url = validate_download_url(release.get("download_url"))
+        sha256 = validate_package_digest(release.get("sha256"))
+        size = cql_int(release.get("size", 0))
+        changelog = release.get("changelog", "")
+        latest_components = release.get("components", {})
         
         # Collect current inventory first
         installed_inv = collect_inventory()
@@ -316,6 +409,9 @@ def main():
         
         # Insert update state. Every value below comes from the remote update server,
         # so all of them are escaped and 'size' is coerced to an integer literal.
+        # error_msg carries the unsigned-release banner when there is one: Spectrum
+        # surfaces that column as the LCM page's error, which is the only place an
+        # operator would see that this release was never verified.
         cql_insert = f"""
         INSERT INTO hydra.lcm_update_state (
             key, latest_version, release_date, download_url, sha256, size,
@@ -324,7 +420,7 @@ def main():
             'latest', '{cql_escape(latest_version)}', '{cql_escape(release_date)}',
             '{cql_escape(download_url)}', '{cql_escape(sha256)}', {size},
             '{cql_escape(changelog)}', '{cql_escape(current_version)}',
-            {'true' if update_available else 'false'}, {now_ms}, ''
+            {'true' if update_available else 'false'}, {now_ms}, '{cql_escape(signature_note)}'
         );
         """
         rc, _, err = run_cql_query(cql_insert)

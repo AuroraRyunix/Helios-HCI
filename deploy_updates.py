@@ -114,6 +114,8 @@ local_spark = "spark.py"
 local_cluster = "cluster_new.py"
 local_daemon = "spark_daemon_decoded.py"
 local_helios_zk = "helios_zk.py"
+local_helios_sig = "helios_sig.py"
+local_impa = "impa.py"
 local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
@@ -133,6 +135,39 @@ local_daruk = "daruk.py"
 local_yggdrasil = "hylia.py"
 local_check_updates = "check_updates.py"
 local_nodetool = "nodetool"
+
+# The release public key check-updates verifies signed releases against. provision.py
+# pins it when a node is built; a node built before update signing existed has none at
+# all, and without one every update check fails closed. A rollout can therefore seed
+# it, over the same host-key-verified session that writes root-executed code into
+# /usr/local/bin -- and only ever the public half.
+RELEASE_PUBKEY_REMOTE_PATH = "/etc/hci/keys/release_ed25519.pub"
+
+release_pubkey_path = os.environ.get("HELIOS_RELEASE_PUBKEY", "").strip()
+if not release_pubkey_path:
+    for candidate in ("release_ed25519.pub", os.path.expanduser("~/.helios/release_ed25519.pub")):
+        if os.path.exists(candidate):
+            release_pubkey_path = candidate
+            break
+
+release_pubkey_pem = None
+if release_pubkey_path and os.path.exists(release_pubkey_path):
+    with open(release_pubkey_path, "r", encoding="utf-8", errors="ignore") as f_relkey:
+        release_pubkey_pem = f_relkey.read().replace("\r\n", "\n")
+    # Pointing this at the signing key instead of its public half would copy the one
+    # secret the whole scheme depends on onto every node in the fleet.
+    if "PRIVATE KEY" in release_pubkey_pem:
+        print(f"Error: {release_pubkey_path} contains a PRIVATE key. Only the public half may be")
+        print("       distributed; the signing key never leaves the release workstation.")
+        sys.exit(1)
+    if "BEGIN PUBLIC KEY" not in release_pubkey_pem:
+        print(f"Error: {release_pubkey_path} is not a PEM public key.")
+        sys.exit(1)
+    print(f"=== Release public key {release_pubkey_path} will be pinned at {RELEASE_PUBKEY_REMOTE_PATH} ===")
+else:
+    print("=== No release public key found locally; nodes keep whatever provision.py pinned ===")
+    print("    Update checks fail closed on a node with no pinned key. Set HELIOS_RELEASE_PUBKEY")
+    print("    to the public half of the release signing key to pin it during this rollout.")
 
 local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
@@ -494,6 +529,16 @@ def deploy_to_node(ip):
             # Shared ZooKeeper client, imported by spark-daemon and the cluster CLI.
             print(f"[{ip}] Uploading helios_zk to /usr/local/bin/helios_zk.py...")
             put_text_file(sftp, local_helios_zk, "/usr/local/bin/helios_zk.py")
+
+            # Update signature verification, imported by check-updates.
+            print(f"[{ip}] Uploading helios_sig to /usr/local/bin/helios_sig.py...")
+            put_text_file(sftp, local_helios_sig, "/usr/local/bin/helios_sig.py")
+
+            # Certificate lifecycle tool. Reaches peers over SSH, not mTLS, so it still
+            # works once the certificates it exists to renew have expired.
+            print(f"[{ip}] Uploading impa to /usr/local/bin/impa...")
+            put_text_file(sftp, local_impa, "/usr/local/bin/impa")
+            ssh.exec_command("chmod +x /usr/local/bin/impa")
             
             # 2a. Copy Bifrost CLI
             print(f"[{ip}] Uploading bifrost to /usr/local/bin/bifrost...")
@@ -602,7 +647,18 @@ def deploy_to_node(ip):
             # Copy check-updates script
             print(f"[{ip}] Uploading check-updates script to /usr/local/bin/check-updates...")
             put_text_file(sftp, local_check_updates, "/usr/local/bin/check-updates")
-            
+
+            # Pin the release public key. World-readable on purpose: it is public, and
+            # the Spectrum container reads it through the same read-only /etc/hci mount.
+            if release_pubkey_pem:
+                print(f"[{ip}] Pinning release public key at {RELEASE_PUBKEY_REMOTE_PATH}...")
+                stdin_key, stdout_key, stderr_key = ssh.exec_command("mkdir -p /etc/hci/keys && chmod 755 /etc/hci/keys")
+                stdout_key.channel.recv_exit_status()
+                f_relkey_remote = sftp.open(RELEASE_PUBKEY_REMOTE_PATH, "w")
+                f_relkey_remote.write(release_pubkey_pem)
+                f_relkey_remote.close()
+                ssh.exec_command(f"chmod 644 {RELEASE_PUBKEY_REMOTE_PATH}")
+
             # Write hylia Quadlet
             print(f"[{ip}] Writing hylia.container Quadlet...")
             f_ygg = sftp.open("/etc/systemd/system/hylia.service", "w")
@@ -700,6 +756,12 @@ def deploy_to_node(ip):
                 
                 print(f"[{ip}] Uploading hylia.py for Spectrum build...")
                 put_text_file(sftp, local_yggdrasil, "/tmp/spectrum_build/hylia.py")
+
+                # Staged for the image alongside hylia: the console extracts update
+                # packages in-container, so whatever verifies a manifest has to exist
+                # there too. Requires a matching COPY line in the Dockerfile.
+                print(f"[{ip}] Uploading helios_sig.py for Spectrum build...")
+                put_text_file(sftp, local_helios_sig, "/tmp/spectrum_build/helios_sig.py")
                 
                 # 3c. Upload all static assets for Spectrum build (recursively)
                 print(f"[{ip}] Uploading static assets for Spectrum build...")
