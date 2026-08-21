@@ -575,8 +575,19 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(runner.seconds_since_monotonic(None, 100.0))
         self.assertIsNone(runner.seconds_since_monotonic("0", 100.0))
         self.assertIsNone(runner.seconds_since_monotonic("nonsense", 100.0))
-        self.assertIsNone(runner.seconds_since_monotonic("1000000", None))
         self.assertAlmostEqual(runner.seconds_since_monotonic("60000000", 100.0), 40.0)
+
+    def test_an_unreadable_uptime_yields_none(self):
+        # `uptime=None` means "read it from the system", so this has to stub the reader
+        # rather than pass None and hope. Passing None asserted a platform accident: on a
+        # host with /proc/uptime the read succeeds and a number comes back, so the test
+        # passed only where the reader could not work and failed in CI.
+        saved = runner.monotonic_uptime
+        runner.monotonic_uptime = lambda: None
+        try:
+            self.assertIsNone(runner.seconds_since_monotonic("1000000"))
+        finally:
+            runner.monotonic_uptime = saved
 
     def test_migration_tasks_only_match_in_flight_migrations_of_that_vm(self):
         tasks = [
