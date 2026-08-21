@@ -737,7 +737,7 @@ def hylia_rolling_upgrade(job_id):
                     log_upgrade(job_id, f"[{hostname}] Rebuilding Spectrum container on host...")
                     build_cmd = (
                         "rm -rf /tmp/spectrum_build && mkdir -p /tmp/spectrum_build/static && "
-                        "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/server.py && "
+                        "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/spectrum_server.py && "
                         "cp /usr/local/bin/hylia /tmp/spectrum_build/hylia.py && "
                         "cp /usr/local/bin/Dockerfile /tmp/spectrum_build/Dockerfile && "
                         # lanayru is imported by spectrum_server at runtime; tolerate its

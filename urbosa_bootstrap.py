@@ -157,8 +157,13 @@ def main():
                 "    ip netns del \"$ns\" || true; "
                 "  fi; "
                 "done && "
+                # Every link family Urbosa creates in the ROOT namespace. The
+                # halves that live inside namespaces go with the namespaces
+                # above; these do not, and deleting only br-ov-* and vxlan-*
+                # left the veths and macvlans behind on every teardown.
                 "for link in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do "
-                "  if [[ \"$link\" =~ ^br-ov- || \"$link\" =~ ^vxlan- ]]; then "
+                "  if [[ \"$link\" =~ ^br-ov- || \"$link\" =~ ^vxlan- || \"$link\" =~ ^veth-ov- "
+                "     || \"$link\" =~ ^mv-t0- || \"$link\" =~ ^t0-[0-9a-f]{8}$ || \"$link\" =~ ^t1-[0-9a-f]{8}$ ]]; then "
                 "    ip link del \"$link\" || true; "
                 "  fi; "
                 "done && "
@@ -175,6 +180,11 @@ def main():
         run_cql_query("TRUNCATE hydra.urbosa_t1_routers;")
         run_cql_query("TRUNCATE hydra.urbosa_segments;")
         run_cql_query("TRUNCATE hydra.urbosa_firewall_rules;")
+        # Transit /30 reservations. Leaving these behind would hand the next
+        # generation of routers a pool that is fully allocated to routers that no
+        # longer exist. Not fatal - urbosa reclaims orphaned reservations on its
+        # own - but a teardown should not need a follow-up.
+        run_cql_query("TRUNCATE hydra.urbosa_transit_pool;")
         print("Urbosa cleanup completed successfully.")
         return
 

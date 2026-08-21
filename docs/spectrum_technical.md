@@ -47,6 +47,64 @@ mindmap
 ### mTLS Command Routing
 - **`run_remote_spark(ip, command, timeout=45)`**: Routes administrative tasks securely across nodes using Spark's port `9099` mTLS execution API.
 
+### Bounded reads
+
+Two polling endpoints used to answer every request with a full table scan. Both tables
+have a time-ordered clustering key, so "the newest N rows of one partition" is a read the
+storage engine answers directly — it walks N rows on one replica set instead of every row
+on all of them.
+
+- **`read_node_metrics(limit=METRICS_SAMPLES_PER_NODE)`**: one
+  `WHERE node_ip = ? LIMIT n` per configured node against `hydra.logos_metrics`
+  (`PRIMARY KEY (node_ip, timestamp)`, `CLUSTERING ORDER BY (timestamp DESC)`, 24h TTL).
+  Returns `(rows, unread_ips)`; a node whose partition could not be read is *named*, not
+  silently omitted, because that is not the same as a node that reported nothing.
+- **`read_dagur_runs(per_job, cap)`**: one partition per row of `hydra.dagur_schedules`
+  against `hydra.dagur_runs` (`PRIMARY KEY (job_name, start_time)`, clustered
+  `start_time DESC`), merged newest-first. Job names are matched against
+  `_DAGUR_JOB_NAME_RE` before they reach a statement.
+- **`cql_timestamp_ms(value)`**: `SELECT JSON` renders a `timestamp` column as
+  `"2026-08-18 20:58:32.922Z"`, not as a number. Every cross-partition merge orders on
+  this rather than on the raw value.
+- **`is_ip_literal(value)`** / **`parse_json_rows(stdout)`**: an address that is not
+  literally an address never reaches a statement; `parse_json_rows` is the one place that
+  turns `SELECT JSON` output back into dicts.
+
+`METRICS_SAMPLES_PER_NODE` is 40 because `static/metrics.html` slices each host's series
+to its last 40 points before drawing it. Anything beyond that was read out of Hydra and
+discarded in JavaScript.
+
+### The Valhalla image catalogue
+- **`image_backing_kind(path)`**: `'drbd'`, `'file'`, or `None`. `None` means the row
+  points somewhere this file will not delete from, and the delete is refused rather than
+  attempted. Quoting is not the guard on its own — a correctly quoted `rm -f /etc` is
+  still `rm -f /etc` — so the path must be under `/dev/drbd/` or under
+  `/var/lib/hci/aether/volumes/`, with no `..` segment and no NUL.
+- **`remove_image_backing(name, path)`**: a DRBD-backed image is removed by deleting its
+  LINSTOR resource definition (`img-<slug>`), which tears the device down on every node;
+  `rm` on `/dev/drbd/by-res/<res>/0` would delete a udev symlink and leave the resource,
+  and the storage it holds, allocated. A staged file is removed on every node and each
+  result is checked. Returns `(ok, detail)`.
+- **`delete_catalogue_image(name)`**: backing store first and checked, then the row.
+  Returns `(status, body)`. On failure the row is kept, so the image stays on the page
+  and the delete can be retried.
+
+### VM lifecycle
+- **`delete_vm(name)`**: read the row (so "no such VM" is decided before any conditional
+  write) → `POST /v1/vm/migrate-lock` → re-read the placement under the lock →
+  `POST /v1/vm/set-state` (whose condition is `IF host_ip = ?`) → destroy, undefine,
+  delete disks, all checked → delete the row. Any refusal or failure leaves the row in
+  place and releases the lock. Helpers: `_read_vm_row`, `_destroy_vm_on_host`,
+  `_delete_vm_disks`.
+- **`run_lwt(endpoint, params)`**: `(ok, applied, current, error)` against Daruk's typed
+  compare-and-swap endpoints. A refused swap is `(True, False, {...}, "")` — a lost race,
+  not a failure. See [daruk.md](./daruk.md).
+
+### Tests
+`test_spectrum_data_layer.py` covers all of the above with a fake Hydra that records
+statements, so the assertions are on the *shape* of each read and the *order* of each
+write sequence, not only on the result.
+
 ### HTTP Routing (`SpectrumAPIHandler`)
 Serves static assets, routes frontend routes, and handles REST APIs:
 - **`GET /api/status`**: Returns health, services state, and cluster storage mappings.

@@ -36,11 +36,27 @@ The active Mipha leader monitors all hosts defined in `/etc/hci/cluster.json`. E
 A node is declared **OFFLINE** only if both checks fail for 3 consecutive intervals (30 seconds).
 
 ### B. Node State Reconcile
-Once a node is declared offline, Mipha updates its status in ScyllaDB:
+Once a node is declared offline, Mipha marks it `DOWN` through Daruk's
+[`POST /v1/node/maintenance`](./daruk.md#operations), which is
+`UPDATE hydra.nodes SET status = ?, maintenance_mode = ? WHERE hostname = ? IF status = ?`
+with the status this pass read as the expected value.
+
+This prevents Vali's scheduler from placing new virtual machines onto the crashed host.
+
+Two things were wrong with the statement it replaces:
+
 ```sql
+-- rejected by Scylla; `ip` is not the partition key
 UPDATE hydra.nodes SET status = 'DOWN' WHERE ip = '<dead_host_ip>';
 ```
-This prevents Vali's scheduler from placing new virtual machines onto the crashed host.
+
+`hostname` is the partition key and `ip` is a plain column, so Scylla answered *"Cannot
+execute this query as it might involve data filtering"* and nothing read the return code —
+**a host that died was never actually marked `DOWN`**, and Vali went on scheduling onto it.
+And unconditionally, a failover decision made before an operator touched the host would
+have dragged it back out of maintenance. Conditioning on the status this pass read means
+the later change wins; a refusal is logged and the failover continues, because the per-VM
+release below is what actually keeps two hosts off one disk.
 
 It does **not** remove the host from the ScyllaDB ring, which is a separate membership
 with separate consequences: the ring still assigns the dead node token ranges, and every
@@ -75,10 +91,25 @@ Once the management plane is confirmed to be healthy, Mipha retrieves all virtua
 SELECT name, memory, host_ip, state FROM hydra.vms;
 ```
 For each VM where `host_ip == <dead_host_ip>` and `state == 'Running'`:
-1. **Reset State:** Updates its state to `Stopped` and clears `host_ip` in ScyllaDB:
-   ```sql
-   UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '<vm_name>';
-   ```
+1. **Release the placement — conditionally.** `release_orphaned_vm()` calls Daruk's
+   [`POST /v1/vm/release`](./daruk.md#the-applied--current-contract) with
+   `expected_host_ip = <dead_host_ip>`, which is
+   `UPDATE hydra.vms SET host_ip = '', state = 'Stopped' WHERE name = ? IF host_ip = ?`.
+
+   This write used to be unconditional. SSH fencing and three consecutive failed health
+   checks make a live host here unlikely, **not impossible**: the VM list was read seconds
+   earlier, and in that window the guest can have been recovered elsewhere — by a previous
+   failover pass whose start task only just landed, by an operator, or by a Vali start that
+   was already in flight. The blind write then unplaced a *running* VM, and the start task
+   below booted a second copy of it against the same DRBD device. Two qemu processes on one
+   raw device is the corruption failover exists to prevent.
+
+   A refusal means the VM is somewhere else and needs nothing from this failover, so it is
+   **skipped, not started**. So is a VM whose release could not be answered at all: there is
+   deliberately no `cqlsh` fallback, because a write that cannot be made conditional must not
+   be made — we would no longer know who owns the guest, and guessing is how both sides of a
+   partition come to own the same one.
+
 2. **Inject Task:** Submits a task to Catalyst (`http://<catalyst_leader_ip>:9091/api/v1/tasks/submit`) to start the VM without specifying a target host:
    ```json
    {

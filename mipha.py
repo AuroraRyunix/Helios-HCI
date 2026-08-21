@@ -518,7 +518,72 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
+class ConditionalStatementError(RuntimeError):
+    """A compare-and-swap was handed to the query path, which cannot report one."""
+
+
+def _cql_outside_string_literals(cql_query):
+    """The statement with every single-quoted literal blanked out.
+
+    Task error messages, DRBD command output and operator-supplied text all end up inside
+    CQL literals here, and any of them can contain the word "if". Searching the raw text
+    for the keyword would refuse an ordinary INSERT because a resync failure happened to
+    print "check if the peer is reachable". A doubled quote ('') is an escaped quote
+    inside a literal, not the end of one.
+    """
+    out = []
+    index = 0
+    length = len(cql_query)
+    while index < length:
+        char = cql_query[index]
+        if char != "'":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if cql_query[index] == "'":
+                if index + 1 < length and cql_query[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        out.append("''")
+    return "".join(out)
+
+
+# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
+# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
+# caller needs.
+_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
+
+
+def is_conditional_cql(cql_query):
+    """True when the statement is a lightweight transaction rather than a plain write."""
+    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
+
+
 def run_cql_query(cql_query, *args, **kwargs):
+    """Run a statement whose only interesting outcome is "did it execute".
+
+    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
+    *rejected* lightweight transaction as its row of values joined by spaces --
+
+        False 10.10.102.41
+
+    -- and returns rc=0, which is indistinguishable from a successful write, so every
+    caller that used this function for a compare-and-swap was treating lost races as wins.
+    The refusal is here rather than in a review comment because the bug comes back the
+    moment somebody appends "IF ..." to an existing call and the tests still pass.
+
+    Conditional writes belong on one of Daruk's typed /v1/... endpoints; see run_lwt().
+    """
+    if is_conditional_cql(cql_query):
+        raise ConditionalStatementError(
+            "a conditional statement cannot be run through run_cql_query(): its result "
+            "cannot say whether the condition held. Use a Daruk /v1/... endpoint via "
+            f"run_lwt(). Statement: {' '.join(cql_query.split())[:200]}")
     import urllib.request
     import json
     try:
@@ -833,6 +898,45 @@ def renew_maintenance_lock_for(hostname):
         sys.stderr.write(
             f"[Mipha HA] Could not renew the cluster maintenance lock for {hostname}: {error}\n")
     return applied
+
+
+def release_orphaned_vm(vm_name, dead_host_ip):
+    """Unplace a VM stranded on a host that died, conditional on it still being there.
+
+    Returns True only when this failover now owns the recovery of `vm_name`, so a caller
+    that gets False must not go on to start it.
+
+    SSH fencing and three consecutive failed health checks make a live host here unlikely,
+    not impossible -- and the write it guards was unconditional. The VM list was read
+    seconds before this runs, and in that window the guest can have been recovered
+    elsewhere: by a previous failover pass whose start task only just landed, by an
+    operator, or by a Vali start that was already in flight. A blind
+    `SET state='Stopped', host_ip=''` then unplaces a *running* VM, and the start task
+    that follows boots a second copy of it against the same DRBD device -- two qemu
+    processes on one raw device, which is the corruption failover exists to prevent.
+
+    `IF host_ip = '<dead ip>'` scopes the reset to the host that actually died. A refusal
+    is not an error: it means the VM is somewhere else and needs nothing from us.
+    """
+    ok, applied, current, error = run_lwt("/v1/vm/release", {
+        "name": vm_name,
+        "expected_host_ip": dead_host_ip,
+    })
+    if not ok:
+        # Daruk is unreachable or the write failed. Do not fall back to an unconditional
+        # reset and do not start the VM: we no longer know who owns it, and guessing is
+        # how both sides of a partition come to own the same guest. The loop retries in
+        # ten seconds; a VM that stays down for one more pass is recoverable, a VM started
+        # twice is not.
+        print(f"[Mipha HA] ERROR: Could not release '{vm_name}' from {dead_host_ip}: "
+              f"{error}. Leaving it placed and skipping it this pass.")
+        return False
+    if not applied:
+        print(f"[Mipha HA] VM '{vm_name}' is no longer on the dead host "
+              f"(host_ip is now '{current.get('host_ip')}'). Already recovered elsewhere; "
+              f"leaving it alone.")
+        return False
+    return True
 
 
 _HOST_ID_RE = re.compile(
@@ -1238,9 +1342,32 @@ def main():
                         ssh_fence_host(ip)
                     
                     # A. Mark Host as DOWN in ScyllaDB
+                    #
+                    # Keyed on `hostname`, which is the partition key. This was written
+                    # `WHERE ip = ...` and `ip` is a plain column, so Scylla rejected the
+                    # statement outright ("Cannot execute this query as it might involve
+                    # data filtering") -- and run_cql_query's rc=1 was never read. A host
+                    # that died has therefore never actually been marked DOWN, which left
+                    # Vali free to keep scheduling VMs onto it.
+                    #
+                    # Conditional on the status this pass read, so a host an operator moved
+                    # into maintenance in the meantime is not dragged back out by a
+                    # failover decision that was made before they touched it. A refusal is
+                    # not a reason to abandon the failover: the per-VM release below is
+                    # what actually keeps two hosts off one disk.
                     print(f"[Mipha HA] Marking host {hostname} status as DOWN in metadata store...")
-                    cql_down = f"UPDATE hydra.nodes SET status = 'DOWN' WHERE ip = '{ip}';"
-                    run_cql_query(cql_down)
+                    ok_down, applied_down, current_down, err_down = run_lwt(
+                        "/v1/node/maintenance", {
+                            "hostname": hostname,
+                            "status": "DOWN",
+                            "maintenance_mode": False,
+                            "expected_status": db_status,
+                        })
+                    if not ok_down:
+                        print(f"[Mipha HA] WARNING: could not mark {hostname} DOWN: {err_down}")
+                    elif not applied_down:
+                        print(f"[Mipha HA] {hostname} was not '{db_status}' any more "
+                              f"(it is '{current_down.get('status')}'); leaving its status alone.")
 
                     # Marking it DOWN takes it out of the VM scheduler. It does not take
                     # it out of the ScyllaDB ring, which is a separate lifecycle with its
@@ -1354,10 +1481,12 @@ def main():
                         vm_name = vm.get("name")
                         print(f"[Mipha HA] Recovering VM '{vm_name}'...")
                         
-                        # Reset VM status in ScyllaDB so Vali will allow a fresh start
-                        cql_reset = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{vm_name}';"
-                        run_cql_query(cql_reset)
-                        
+                        # Give the placement back so Vali will allow a fresh start. If the
+                        # VM is not on the dead host any more, it needs nothing from this
+                        # failover and must not be started a second time.
+                        if not release_orphaned_vm(vm_name, ip):
+                            continue
+
                         # Submit task to Catalyst queue to start the VM.
                         # target_host is left empty so Vali schedules it on the best surviving node.
                         task_payload = {"vm_name": vm_name, "target_host": "", "parent_task_id": parent_task_id}

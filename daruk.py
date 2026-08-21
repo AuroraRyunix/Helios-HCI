@@ -44,14 +44,51 @@ def connect_db():
 connect_db()
 
 def make_serializable(obj):
+    """Convert a driver result into something json.dumps will accept.
+
+    The types below are the ones the driver hands back that JSON has no notion of, and
+    every one of them used to fall through to `return obj` and raise inside json.dumps --
+    *after* the handler's try block, so the caller got a 400 with no body.
+
+    That failed worst on exactly the response worth having. A refused lightweight
+    transaction returns the whole existing row, so a conditional write against any table
+    with a `timestamp` or `uuid` column answered 400 on rejection and 200 on success --
+    which reads as "the call failed" rather than "somebody else holds it". Two tables
+    were given `bigint`/`text` columns specifically to dodge this before it was fixed
+    here; that should not have been necessary and is not, now.
+
+    Timestamps become epoch milliseconds, matching how the Python tier already writes
+    them (`INSERT ... JSON` with an integer), so a value survives a round trip unchanged.
+    """
+    import datetime
+    import decimal
+    import ipaddress
+    import uuid as uuid_module
+
     if isinstance(obj, dict):
-        return {k: make_serializable(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple, set)):
-        return [make_serializable(v) for v in obj]
-    elif hasattr(obj, 'items'):
         return {str(k): make_serializable(v) for k, v in obj.items()}
-    else:
-        return obj
+    if isinstance(obj, (list, tuple, set)):
+        return [make_serializable(v) for v in obj]
+    if isinstance(obj, uuid_module.UUID):
+        return str(obj)
+    if isinstance(obj, datetime.datetime):
+        # Naive values out of the driver are UTC.
+        if obj.tzinfo is None:
+            obj = obj.replace(tzinfo=datetime.timezone.utc)
+        return int(obj.timestamp() * 1000)
+    if isinstance(obj, (datetime.date, datetime.time)):
+        return obj.isoformat()
+    if isinstance(obj, datetime.timedelta):
+        return int(obj.total_seconds() * 1000)
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.hex()
+    if isinstance(obj, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        return str(obj)
+    if hasattr(obj, 'items'):
+        return {str(k): make_serializable(v) for k, v in obj.items()}
+    return obj
 
 # Statements that only read. Anything else -- INSERT, UPDATE, DELETE, BATCH, TRUNCATE,
 # and every DDL form -- mutates and must never be silently retried at a weaker
@@ -230,6 +267,46 @@ LWT_OPS = {
             "cpu_model": {"type": "text", "default": ""},
             "audio_enabled": {"type": "bool", "default": False},
             "status": {"type": "text", "default": None, "nullable": True},
+        },
+    },
+    # Claiming a scheduler tick. `last_run_epoch` is the schedule's clock and its lock at
+    # once: a scheduler reads it, decides the job is due, and writes the current time back.
+    # Blind, that read-decide-write is a double submission waiting for two schedulers to
+    # run at once -- which is not hypothetical, because leadership here is decided by
+    # probing ZooKeeper's four-letter `stat` and falling back to "lowest node with 9091
+    # open". A partitioned or slow ZooKeeper gives two nodes that answer at the same
+    # instant, both submit the same backup, the same scrub, the same compaction.
+    #
+    # `IF last_run_epoch = ?` makes the claim and the clock one Paxos round, so the loser
+    # is told the tick is taken and skips it. `expected_last_run_epoch` is required and
+    # nullable, with no default: a default would silently match the schedules whose clock
+    # has never been written and turn the claim back into the blind write.
+    #
+    # Two entries rather than one with a table parameter: the table and its key column are
+    # part of the statement, and a statement assembled from a request is the thing these
+    # endpoints exist to prevent.
+    "/v1/schedule/claim-job": {
+        "cql": (
+            "UPDATE hydra.dagur_schedules SET last_run_epoch = ? "
+            "WHERE job_name = ? IF last_run_epoch = ?"
+        ),
+        "binds": ("last_run_epoch", "job_name", "expected_last_run_epoch"),
+        "params": {
+            "job_name": {"type": "text", "required": True},
+            "last_run_epoch": {"type": "int", "required": True},
+            "expected_last_run_epoch": {"type": "int", "required": True, "nullable": True},
+        },
+    },
+    "/v1/schedule/claim-check": {
+        "cql": (
+            "UPDATE hydra.mimir_schedules SET last_run_epoch = ? "
+            "WHERE schedule_name = ? IF last_run_epoch = ?"
+        ),
+        "binds": ("last_run_epoch", "schedule_name", "expected_last_run_epoch"),
+        "params": {
+            "schedule_name": {"type": "text", "required": True},
+            "last_run_epoch": {"type": "int", "required": True},
+            "expected_last_run_epoch": {"type": "int", "required": True, "nullable": True},
         },
     },
     # Host maintenance transitions. Draining a host is a lock on that host: entering it

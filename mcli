@@ -21,6 +21,22 @@ GRAY = "\033[90m"
 RESET = "\033[0m"
 
 CHECK_ID_TO_FUNC = {
+    # This map decides the partition a result is stored under, not just how it is
+    # displayed. A check missing from it falls back to the *invoked* category, which puts
+    # the same check in a different partition depending on how it was run -- the
+    # duplication this map exists to prevent, reintroduced for that check alone, which is
+    # the hardest kind to notice. A test asserts every check mcli-runner reports is here.
+    #
+    # Every value must contain a dot: the legacy-partition cleanup uses that to tell a
+    # real category from an invocation scope.
+    "firmware_upgrades": "hardware.firmware",
+    "host_virtualization": "hardware.virtualization",
+    "maintenance_mode_check": "service.maintenance.state",
+    "scylladb_tasks_schema": "database.scylladb.tasks_schema",
+    "security_config_audit": "security.config.audit",
+    "ssh_known_hosts_seeding": "security.ssh.known_hosts",
+    "vali_leader_status": "service.vali.leader",
+    "vip_binding_status": "service.bifrost.vip",
     "zookeeper_status": "database.zookeeper",
     "hydra-db_status": "database.scylladb",
     "daruk_status": "database.daruk",
@@ -360,11 +376,27 @@ def execute_health_checks(category):
                     "output": output
                 })
                     
-                # Store CQL statements for batch write
+                # Store CQL statements for batch write.
+                #
+                # The partition is the check's own category, not the category that was
+                # invoked. `category` is the partition key, so writing the invocation
+                # scope meant `run_all` wrote every check under 'all' while
+                # `health_checks storage` wrote the same checks under 'storage' -- two
+                # rows for one check, with different statuses and timestamps, and nothing
+                # ever removing either. The console rendered both.
+                #
+                # It also made the column a lie. Anything grouping by `category` after a
+                # run_all got exactly one bucket, which is why the old web console
+                # carried a hardcoded check-name list to group by instead -- and that
+                # list had drifted from this map.
+                #
+                # A check now always lands in the same row whichever way it is invoked,
+                # so a re-run updates rather than duplicates.
+                stored_category = CHECK_ID_TO_FUNC.get(check_name, category)
                 escaped_output = output.replace("'", "''")
                 cql = f"""
                 INSERT INTO hydra.mimir_results (category, check_name, node_ip, status, output, execution_id, timestamp)
-                VALUES ('{category}', '{check_name}', '{ip}', '{status}', '{escaped_output}', {execution_id}, toTimestamp(now()));
+                VALUES ('{stored_category}', '{check_name}', '{ip}', '{status}', '{escaped_output}', {execution_id}, toTimestamp(now()));
                 """
                 cql_statements.append(cql.strip())
                 
@@ -390,6 +422,22 @@ def execute_health_checks(category):
     if cql_statements:
         batch_cql = "BEGIN BATCH\n" + "\n".join(cql_statements) + "\nAPPLY BATCH;"
         run_cql_query(local_ip, batch_cql)
+
+        # Shed the partition this run would have written to before the fix above.
+        #
+        # Every earlier run stored results under the *invoked* category, so a cluster
+        # upgrading to this version still carries a full set of stale rows there --
+        # rendered beside the new ones, with older statuses. They cannot be removed by a
+        # migration because a delete needs the partition key and there is no way to ask
+        # for "every partition that is not a real category".
+        #
+        # Real categories always contain a dot (`storage.pools`); the invocation scopes
+        # never do (`all`, `storage`, `hardware`). That is the discriminator, and the
+        # guard means a future scope that *is* dotted cannot make this delete live rows.
+        if "." not in category:
+            run_cql_query(
+                local_ip,
+                f"DELETE FROM hydra.mimir_results WHERE category = '{category}';")
             
     print("=" * 70)
     print("Diagnostics Summary:")

@@ -29,6 +29,82 @@ def get_drbd_role(resource_name):
         return out.strip()
     return "Secondary"
 
+def classify_certificate(cert_path, label, warn_days=30, fail_days=0):
+    """Status and message for one certificate's expiry.
+
+    Uses mimir's parser, which reads OpenSSL's date format through
+    `ssl.cert_time_to_seconds` rather than a locale-dependent strptime. An unparseable
+    date is WARN, never PASS: "I could not check this" and "this is fine" are different
+    answers, and the check this replaced gave the second for both.
+    """
+    if not os.path.exists(cert_path):
+        return "FAIL", f"{label} not found at {cert_path}."
+
+    module = load_mimir_module()
+    if module is None:
+        return "WARN", (f"{label} expiry could not be checked: the certificate parser "
+                        f"could not be loaded.")
+
+    epoch, detail = module.cert_expiry_epoch(cert_path)
+    if epoch is None:
+        return "WARN", f"{label} at {cert_path} could not be read for expiry: {detail}"
+
+    days = (epoch - time.time()) / 86400.0
+    if days < fail_days:
+        return "FAIL", f"{label} is EXPIRED ({abs(days):.1f} days ago, notAfter={detail})."
+    if days < warn_days:
+        return "WARN", f"{label} expires in {days:.1f} days (notAfter={detail})."
+    return "PASS", f"{label} is valid for {days:.1f} more days (notAfter={detail})."
+
+
+def load_mimir_module():
+    """Load mimir by path, or None.
+
+    An explicit SourceFileLoader, not `spec_from_file_location` alone: mimir is deployed
+    as `/usr/local/bin/mimir` with no `.py` suffix, and importlib infers a loader from
+    the file extension. Given an extensionless path it returns `None` for the spec, and
+    the failure surfaces as `'NoneType' object has no attribute 'loader'` rather than
+    anything resembling "cannot import". The same applies to every deployed CLI here.
+    """
+    candidates = ["/usr/local/bin/mimir",
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "mimir.py")]
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            import importlib.util
+            from importlib.machinery import SourceFileLoader
+
+            loader = SourceFileLoader("mimir_checks", candidate)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+        except Exception:
+            return None
+    return None
+
+
+def survey_certs_via_mimir():
+    """Classify this node's mTLS certificates using mimir's own survey.
+
+    Loaded by path because mimir is deployed as /usr/local/bin/mimir, a name Python
+    cannot import. This is the same trick check-updates uses for helios_sig.
+
+    If mimir cannot be loaded the answer is WARN, never PASS. An unverifiable
+    certificate state is not a healthy one, and reporting it as healthy is exactly the
+    defect this replaced.
+    """
+    module = load_mimir_module()
+    if module is None:
+        return "WARN", ("mTLS certificate expiry could not be checked: the survey could "
+                        "not be loaded on this node.")
+    try:
+        return module.survey_mtls_certs()
+    except Exception as exc:
+        return "WARN", f"mTLS certificate expiry could not be checked: {exc}"
+
+
 def update_current_check(category, check_name):
     try:
         with open(f"/tmp/mimir_check_{category}", "w") as f:
@@ -371,36 +447,20 @@ def check_services(category):
         "output": msg
     }
     
-    # 6. mTLS Client Certificate Expiration Check
+    # 6. mTLS Certificate Expiration Check
+    #
+    # Delegated to mimir's survey rather than reimplemented here. There were two
+    # implementations of this check writing the same row under the same name, and this
+    # was the weaker one: it looked only at /root/.certs/client.crt, ignoring the node
+    # and CA certificates in /etc/hci/spark/certs, and -- worse -- it answered PASS when
+    # it could not parse the expiry date. Because it runs daily and mimir surveys every
+    # fifteen minutes, a cluster with expiring certificates could go green once a day.
+    #
+    # One implementation, one verdict. mimir.survey_mtls_certs() covers both directories,
+    # treats an unparseable date as WARN, and is the same function the daemon publishes
+    # from, so the console cannot see the two disagree.
     update_current_check(category, "mtls_cert_expiration")
-    cert_path = "/root/.certs/client.crt"
-    if os.path.exists(cert_path):
-        rc, out, err = run_cmd(f"openssl x509 -enddate -noout -in {cert_path}")
-        if rc == 0:
-            date_str = out.replace("notAfter=", "").strip()
-            try:
-                from datetime import datetime
-                clean_date = date_str.replace("GMT", "").strip()
-                expiry_dt = datetime.strptime(clean_date, "%b %d %H:%M:%S %Y")
-                diff = expiry_dt - datetime.utcnow()
-                if diff.days < 0:
-                    status = "FAIL"
-                    msg = f"mTLS Client Certificate is EXPIRED since {date_str}!"
-                elif diff.days < 30:
-                    status = "WARN"
-                    msg = f"mTLS Client Certificate is expiring soon (in {diff.days} days) on {date_str}."
-                else:
-                    status = "PASS"
-                    msg = f"mTLS Client Certificate is valid. Expires on {date_str} (in {diff.days} days)."
-            except Exception as ex:
-                status = "PASS"
-                msg = f"mTLS Client Certificate exists. Expiration date: {date_str} (parse error: {str(ex)})."
-        else:
-            status = "FAIL"
-            msg = f"Failed to check client certificate enddate: {err or out}"
-    else:
-        status = "FAIL"
-        msg = f"mTLS Client Certificate not found at {cert_path}."
+    status, msg = survey_certs_via_mimir()
     results["mtls_cert_expiration"] = {
         "status": status,
         "output": msg
@@ -409,33 +469,10 @@ def check_services(category):
     # 6b. Ingress Server Certificate Expiration Check
     update_current_check(category, "ingress_cert_expiration")
     cert_path = "/etc/hci/spectrum/certs/server.crt"
-    if os.path.exists(cert_path):
-        rc, out, err = run_cmd(f"openssl x509 -enddate -noout -in {cert_path}")
-        if rc == 0:
-            date_str = out.replace("notAfter=", "").strip()
-            try:
-                from datetime import datetime
-                clean_date = date_str.replace("GMT", "").strip()
-                expiry_dt = datetime.strptime(clean_date, "%b %d %H:%M:%S %Y")
-                diff = expiry_dt - datetime.utcnow()
-                if diff.days < 0:
-                    status = "FAIL"
-                    msg = f"Ingress Server Certificate is EXPIRED since {date_str}!"
-                elif diff.days < 30:
-                    status = "WARN"
-                    msg = f"Ingress Server Certificate is expiring soon (in {diff.days} days) on {date_str}."
-                else:
-                    status = "PASS"
-                    msg = f"Ingress Server Certificate is valid. Expires on {date_str} (in {diff.days} days)."
-            except Exception as ex:
-                status = "PASS"
-                msg = f"Ingress Server Certificate exists. Expiration date: {date_str} (parse error: {str(ex)})."
-        else:
-            status = "FAIL"
-            msg = f"Failed to check ingress certificate enddate: {err or out}"
-    else:
-        status = "FAIL"
-        msg = f"Ingress Server Certificate not found at {cert_path}."
+    # Classified through the same helper as the mTLS check above. It used a
+    # locale-dependent strptime and answered PASS when parsing failed -- so a
+    # certificate whose date this node's locale could not read was reported as valid.
+    status, msg = classify_certificate(cert_path, "Ingress Server Certificate")
     results["ingress_cert_expiration"] = {
         "status": status,
         "output": msg

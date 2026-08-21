@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import json
 import time
 import socket
@@ -60,7 +61,74 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
+class ConditionalStatementError(RuntimeError):
+    """A compare-and-swap was handed to the query path, which cannot report one."""
+
+
+def _cql_outside_string_literals(cql_query):
+    """The statement with every single-quoted literal blanked out.
+
+    This daemon writes the *stdout of arbitrary jobs* into hydra.dagur_runs, so a CQL
+    literal here can hold anything a backup script or a health check printed. Searching
+    the raw statement for the keyword would refuse a run record because the job happened
+    to print "check if the volume is mounted". A doubled quote ('') is an escaped quote
+    inside a literal, not the end of one.
+    """
+    out = []
+    index = 0
+    length = len(cql_query)
+    while index < length:
+        char = cql_query[index]
+        if char != "'":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if cql_query[index] == "'":
+                if index + 1 < length and cql_query[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        out.append("''")
+    return "".join(out)
+
+
+# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
+# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
+# caller needs.
+_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
+
+
+def is_conditional_cql(cql_query):
+    """True when the statement is a lightweight transaction rather than a plain write."""
+    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
+
+
 def run_cql_query(cql_query, *args, **kwargs):
+    """Run a statement whose only interesting outcome is "did it execute".
+
+    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
+    *rejected* lightweight transaction as its row of values joined by spaces --
+
+        False 10.10.102.41
+
+    -- and returns rc=0, which is indistinguishable from a successful write, so every
+    caller that used this function for a compare-and-swap was treating lost races as wins.
+    The refusal is here rather than in a review comment because the bug comes back the
+    moment somebody appends "IF ..." to an existing call and the tests still pass.
+
+    Conditional writes belong on one of Daruk's typed /v1/... endpoints. Dagur has none:
+    it takes work from Catalyst, which claims each scheduler tick with
+    /v1/schedule/claim-job before this daemon ever hears about the job.
+    """
+    if is_conditional_cql(cql_query):
+        raise ConditionalStatementError(
+            "a conditional statement cannot be run through run_cql_query(): its result "
+            "cannot say whether the condition held. Use a Daruk /v1/... endpoint. "
+            f"Statement: {' '.join(cql_query.split())[:200]}")
     import urllib.request
     import json
     try:

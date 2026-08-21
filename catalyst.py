@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import json
 import time
 import socket
+import urllib.error
 import urllib.request
 import ssl
 import threading
@@ -62,7 +64,89 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
+DARUK_URL = "http://127.0.0.1:9043"
+
+
+class ConditionalStatementError(RuntimeError):
+    """A compare-and-swap was handed to the query path, which cannot report one."""
+
+
+def _cql_outside_string_literals(cql_query):
+    """The statement with every single-quoted literal blanked out.
+
+    Job output, task error messages and operator-supplied commands all end up inside CQL
+    literals here, and any of them can contain the word "if". Searching the raw text for
+    the keyword would refuse an ordinary INSERT because a job Dagur ran happened to print
+    "check if the volume is mounted". A doubled quote ('') is an escaped quote inside a
+    literal, not the end of one.
+    """
+    out = []
+    index = 0
+    length = len(cql_query)
+    while index < length:
+        char = cql_query[index]
+        if char != "'":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if cql_query[index] == "'":
+                if index + 1 < length and cql_query[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        out.append("''")
+    return "".join(out)
+
+
+# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
+# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
+# caller needs.
+_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
+
+
+def is_conditional_cql(cql_query):
+    """True when the statement is a lightweight transaction rather than a plain write."""
+    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
+
+
 def run_cql_query(cql_query, *args, **kwargs):
+    """Run a statement whose only interesting outcome is "did it execute".
+
+    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
+    *rejected* lightweight transaction as its row of values joined by spaces --
+
+        False 10.10.102.41
+
+    -- and returns rc=0, which is indistinguishable from a successful write, so every
+    caller that used this function for a compare-and-swap was treating lost races as wins.
+    The refusal is here rather than in a review comment because the bug comes back the
+    moment somebody appends "IF ..." to an existing call and the tests still pass.
+
+    Conditional writes belong on one of Daruk's typed /v1/... endpoints; see run_lwt().
+    """
+    if is_conditional_cql(cql_query):
+        raise ConditionalStatementError(
+            "a conditional statement cannot be run through run_cql_query(): its result "
+            "cannot say whether the condition held. Use a Daruk /v1/... endpoint via "
+            "run_lwt(), or run_conditional_cql_query() if the caller reads the [applied] "
+            f"verdict itself. Statement: {' '.join(cql_query.split())[:200]}")
+    return run_conditional_cql_query(cql_query)
+
+
+def run_conditional_cql_query(cql_query, *args, **kwargs):
+    """run_cql_query without the conditional-statement guard.
+
+    The only legitimate caller is one that reads the `[applied]` verdict out of stdout
+    itself. helios_schema does: its schema lock is taken with IF NOT EXISTS and released
+    with IF holder = ?, and it parses the verdict positionally through `lwt_applied()`,
+    including Daruk's space-joined shape. That lock cannot move to a typed endpoint
+    because it runs *before* the schema exists -- Daruk would need an operation table
+    entry for a table nothing has created yet.
+    """
     import urllib.request
     import json
     try:
@@ -105,6 +189,42 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure: Daruk unreachable, a malformed request, a
+    database error. A compare-and-swap that was *refused* is `(True, False, {...}, "")` --
+    a lost race, not a failure. `current` carries the values that beat it, so the caller
+    can say which scheduler already claimed the tick rather than "the update failed".
+
+    There is deliberately no cqlsh fallback. That fallback keeps services working while
+    Daruk is down, but it can only run statement text and cannot report whether a
+    condition held; a claim that cannot be made conditional must not be made at all --
+    running the job twice is worse than not running it this tick.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
+
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
     ips = []
@@ -203,8 +323,13 @@ def init_db_schema():
 
     Every daemon calls this. Applying happens behind a cluster lock, so concurrent
     starts are safe and no daemon depends on another having run first.
+
+    The unguarded executor is handed over deliberately: the schema lock is an
+    IF NOT EXISTS insert and a conditional delete, and helios_schema reads the [applied]
+    verdict itself. It is the one caller allowed to run a conditional statement through
+    the text path.
     """
-    applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+    applied = load_schema_module().ensure_schema(run_conditional_cql_query, node_id=LOCAL_IP)
     if applied:
         print(f"[Catalyst] Applied schema migrations: {', '.join(applied)}")
 
@@ -225,6 +350,39 @@ def submit_task_to_memory(service, task_data):
         task_id = task_data["task_id"]
         with lock:
             task_events[task_id] = threading.Event()
+
+def claim_scheduled_run(job_name, expected_last_run, now):
+    """Take this tick of `job_name`, or report that somebody else already has it.
+
+    The scheduler's clock is its lock. Reading `last_run_epoch`, deciding the job is due
+    and writing the time back is a read-modify-write, and blind it submits the job once
+    per scheduler that reaches the row -- two Dagur runs of the same backup, the same
+    scrub, the same compaction, against the same volumes at the same moment.
+
+    Two schedulers is not a hypothetical: is_zookeeper_leader() probes ZooKeeper's
+    four-letter `stat` and, when the leader does not answer on 9091, falls back to "lowest
+    node with 9091 open". A ZooKeeper that is slow, restarting or partitioned hands that
+    answer to two nodes at once, and both then believe they are the only scheduler.
+
+    Conditioning the clock write on the value that was read makes the claim and the clock
+    one Paxos round, so exactly one caller proceeds. Returning False on a Daruk failure is
+    the safe direction: a tick that is skipped runs on the next pass ten seconds later,
+    and a tick that is run twice cannot be taken back.
+    """
+    ok, applied, current, error = run_lwt("/v1/schedule/claim-job", {
+        "job_name": job_name,
+        "last_run_epoch": now,
+        "expected_last_run_epoch": expected_last_run,
+    })
+    if not ok:
+        print(f"[Scheduler] Could not claim '{job_name}': {error}. Skipping this tick.")
+        return False
+    if not applied:
+        print(f"[Scheduler] Job '{job_name}' was already claimed for this interval "
+              f"(last_run_epoch is now {current.get('last_run_epoch')}). Skipping.")
+        return False
+    return True
+
 
 # Scheduler Thread: reads hydra.dagur_schedules and submits execution tasks to Dagur
 def scheduler_thread_loop():
@@ -249,19 +407,30 @@ def scheduler_thread_loop():
                     for s in schedules:
                         if s.get("enabled", False):
                             name = s.get("job_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = s.get("interval_seconds", 3600)
+                            # The value as the row holds it, nulls included, because that
+                            # is what the compare-and-swap has to condition on. `.get(k, 0)`
+                            # returns None for a column that exists and is null, so the
+                            # arithmetic below needs its own coercion -- and used to raise
+                            # TypeError on such a row, which the loop's except swallowed
+                            # and which cost every *other* schedule that pass.
+                            last_run_recorded = s.get("last_run_epoch")
+                            last_run = last_run_recorded if isinstance(last_run_recorded, int) else 0
+                            interval = s.get("interval_seconds") or 3600
                             command = s.get("command", "")
-                            
+
                             if name in local_last_run and now - local_last_run[name] < interval:
                                 continue
-                                
+
                             if now - last_run >= interval:
+                                # Claim the tick before doing anything with it. A refused
+                                # claim means another scheduler got there first and is
+                                # already submitting this job.
+                                if not claim_scheduled_run(name, last_run_recorded, now):
+                                    continue
+
                                 print(f"[Scheduler] Triggering Dagur job: {name}...")
                                 local_last_run[name] = now
-                                cql_update = f"UPDATE hydra.dagur_schedules SET last_run_epoch = {now} WHERE job_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
+
                                 task_id = str(uuid.uuid4())
                                 now_ms = int(time.time() * 1000)
                                 payload = json.dumps({"job_name": name, "command": command})

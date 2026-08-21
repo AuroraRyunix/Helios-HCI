@@ -757,7 +757,7 @@ def deploy_to_node(ip):
                 put_text_file(sftp, local_dockerfile, "/tmp/spectrum_build/Dockerfile")
                 
                 print(f"[{ip}] Uploading server.py for Spectrum build...")
-                put_text_file(sftp, local_server, "/tmp/spectrum_build/server.py")
+                put_text_file(sftp, local_server, "/tmp/spectrum_build/spectrum_server.py")
                 
                 print(f"[{ip}] Uploading hylia.py for Spectrum build...")
                 put_text_file(sftp, local_yggdrasil, "/tmp/spectrum_build/hylia.py")
@@ -767,6 +767,7 @@ def deploy_to_node(ip):
                 # there too. Requires a matching COPY line in the Dockerfile.
                 print(f"[{ip}] Uploading helios_sig.py for Spectrum build...")
                 put_text_file(sftp, local_helios_sig, "/tmp/spectrum_build/helios_sig.py")
+                put_text_file(sftp, local_helios_schema, "/tmp/spectrum_build/helios_schema.py")
                 
                 # 3c. Upload all static assets for Spectrum build (recursively)
                 print(f"[{ip}] Uploading static assets for Spectrum build...")
@@ -835,7 +836,7 @@ def deploy_to_node(ip):
             ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
             
             # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
-            ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
+            ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/spectrum_server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
             
             # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
             print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")

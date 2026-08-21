@@ -118,6 +118,54 @@ MIGRATIONS = [
             "CREATE TABLE IF NOT EXISTS hydra.cluster_locks ( name text PRIMARY KEY, holder text, holder_token text, reason text, acquired_at_ms bigint );",
         ],
     },
+    {
+        "id": "0003-bound-task-history",
+        "description": (
+            "A retention window on hydra.catalyst_tasks, which grows without bound. "
+            "Its primary key is task_id alone, so it has no time-ordered clustering key "
+            "and 'the most recent N tasks' is not answerable server-side -- every read "
+            "is a full scan of the whole table, and both consoles do exactly that on "
+            "every page load. This does not make the query indexed; it bounds what the "
+            "scan has to walk, which is the part that gets worse forever. Thirty days "
+            "of task history is a log, not a system of record."
+        ),
+        "statements": [
+            # Not ALTER ... ADD, which errors when the column exists and would break
+            # every restart after the first. Setting a table property is idempotent:
+            # applying the same value twice is accepted, so a re-run is a no-op.
+            #
+            # Existing rows are unaffected -- a default TTL applies to writes made after
+            # it is set, so history already recorded stays until something rewrites it.
+            # That is the conservative direction: nothing already stored disappears
+            # because this migration ran.
+            #
+            # The real fix is a companion table keyed by time bucket that Catalyst writes
+            # alongside, so recent tasks are one partition read. That is a dual-write and
+            # belongs with the work that migrates the readers.
+            "ALTER TABLE hydra.catalyst_tasks WITH default_time_to_live = 2592000;",
+        ],
+    },
+    {
+        "id": "0004-urbosa-transit-pool",
+        "description": (
+            "Transit /30 allocations for Urbosa Tier-1 routers. The addressing was "
+            "derived from md5(router_id) with no collision check and no persistence, so "
+            "two routers whose hashes met were handed the same /30 and the Tier-0 "
+            "delivered one tenant's return traffic into the other's namespace. Keyed on "
+            "the slot, so INSERT ... IF NOT EXISTS resolves two claimants racing for one "
+            "subnet."
+        ),
+        "statements": [
+            # text and bigint rather than uuid and timestamp. That was originally to work
+            # around Daruk returning 400 on any lightweight transaction whose refused row
+            # carried a type json.dumps could not encode -- which is exactly the response
+            # that says who won the slot. make_serializable now handles both, so this is
+            # no longer load-bearing; it is kept because changing a live table's column
+            # types is not something a migration can do, and epoch milliseconds are what
+            # the rest of this schema already stores.
+            "CREATE TABLE IF NOT EXISTS hydra.urbosa_transit_pool ( subnet_index int PRIMARY KEY, router_id text, node_id text, allocated_at_ms bigint );",
+        ],
+    },
 ]
 
 

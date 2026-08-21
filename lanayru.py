@@ -39,6 +39,7 @@ def load_schema_module():
 def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_id, created_at):
     from spectrum_server import (
         run_cql_query,
+        run_lwt,
         run_remote_spark,
         run_linstor_cmd,
         log_catalyst_task,
@@ -159,20 +160,54 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             assigned_ip = f"172.16.10.{10 + i}" if seg_num == 1 else f"172.16.11.{10 + i}"
             vm_ips.append((vm_name, assigned_ip))
 
-            # 1. Create Linstor storage volumes (Allocating 50 GiB thin storage per Tanzu/LKE specifications)
             res_name = f"{vm_name}-disk0"
+            disk_path = f"/dev/drbd/by-res/{res_name}/0"
+            target_host = hosts[i % len(hosts)]["ip"]
+
+            # Register the VM before anything is built for it.
+            #
+            # This used to be an unconditional INSERT run *after* the disk had been
+            # created and the OS image written to it. INSERT is an upsert in CQL, so
+            # deploying a cluster whose name collided with an existing VM reset that VM's
+            # placement to this target host -- after which two hosts could start it
+            # against the same DRBD device. Claiming the name first means a collision
+            # costs a refused deployment rather than somebody else's guest.
+            #
+            # (The old statement also named columns hydra.vms does not have -- uuid,
+            # vcpus, ram, guest_ip, network_name, created_at -- so Scylla rejected it and
+            # run_cql_query's rc=1 was never read. No Lanayru control node has ever been
+            # registered. The guest address lives in the cloud-init config; hydra.vms has
+            # no column for it.)
+            ok, applied, current, lwt_error = run_lwt("/v1/vm/create", {
+                "name": vm_name,
+                "vcpu": 2,
+                "memory": 4096,
+                "disk_path": disk_path,
+                "disk_size": 50,
+                "state": "Stopped",
+                "host_ip": target_host,
+                "disks_list": res_name,
+                "network_id": f"{cluster_name}-segment-{seg_num}",
+            })
+            if not ok:
+                log(f"ERROR: could not register VM '{vm_name}': {lwt_error}", "error")
+                raise RuntimeError(f"Registration of {vm_name} failed: {lwt_error}")
+            if not applied:
+                log(f"ERROR: a VM named '{vm_name}' already exists (host_ip "
+                    f"'{current.get('host_ip')}'). Choose a different cluster name.", "error")
+                raise RuntimeError(f"VM {vm_name} is already registered")
+
+            # 1. Create Linstor storage volumes (Allocating 50 GiB thin storage per Tanzu/LKE specifications)
             log(f"Creating Linstor storage resource definition '{res_name}' (50 GiB)...", "info")
             run_linstor_cmd(f"resource-definition create {res_name}")
             run_linstor_cmd(f"volume-definition create {res_name} 50GiB")
-            
+
             # Autoplace volume on target nodes
-            target_host = hosts[i % len(hosts)]["ip"]
             log(f"Autoplacing storage resource '{res_name}' to cluster node {target_host}...", "info")
             run_linstor_cmd(f"resource create {res_name} --auto-place 3")
             time.sleep(0.5)
 
             # Copy guest OS image to Linstor block device
-            disk_path = f"/dev/drbd/by-res/{res_name}/0"
             log(f"Copying OS template image to Linstor block device for VM '{vm_name}'...", "info")
             run_remote_spark(target_host, f"drbdadm primary {res_name} || true")
             run_remote_spark(target_host, f"qemu-img convert -O raw /var/lib/hci/aether/images/cirros.img {disk_path} || dd if=/var/lib/hci/aether/images/cirros.img of={disk_path} bs=4M conv=sparse || true")
@@ -286,20 +321,33 @@ runcmd:
             nvram_file_path = f"/var/lib/hci/aether/nvram/{vm_name}_vars.fd"
             run_remote_spark(target_host, f"mkdir -p /var/lib/hci/aether/nvram/ && cp {ovmf_vars} {nvram_file_path} || cp /usr/share/OVMF/OVMF_VARS.fd {nvram_file_path} || true")
             
-            # Set up metadata record in ScyllaDB
-            cql_vm = f"""
-            INSERT INTO hydra.vms (name, uuid, vcpus, ram, status, host_ip, guest_ip, disks_list, network_name, created_at)
-            VALUES ('{vm_name}', {str(uuid.uuid4())}, 2, 4096, 'stopped', '{target_host}', '{assigned_ip}', '{res_name}', '{cluster_name}-segment-{seg_num}', toTimestamp(now()));
-            """
-            run_cql_query(cql_vm)
-            
             # Define and start VM inside target hypervisor
             log(f"Registering XML definition in libvirt and starting guest VM '{vm_name}' on {target_host}...", "info")
             b64_xml = base64.b64encode(xml_def.encode('utf-8')).decode('utf-8')
             run_remote_spark(target_host, f"echo {b64_xml} | base64 -d > /tmp/{vm_name}.xml")
             run_remote_spark(target_host, f"virsh -c qemu:///system define /tmp/{vm_name}.xml")
             run_remote_spark(target_host, f"virsh -c qemu:///system start {vm_name}")
-            run_cql_query(f"UPDATE hydra.vms SET status = 'running' WHERE name = '{vm_name}';")
+
+            # Record that the guest is running, conditional on this deployment still being
+            # the host of record.
+            #
+            # This was `UPDATE hydra.vms SET status = 'running'`, and `status` is not the
+            # power state -- it is the VM migration lock, whose released value happens to
+            # be the string 'running'. A provisioner that has never taken that lock was
+            # therefore clearing it on every VM it created, so a live migration in flight
+            # over the same name would find its lock gone and a second migration free to
+            # start. `state` is the column that records what the guest is doing, and
+            # /v1/vm/set-state writes it without touching `status` at all.
+            ok, applied, current, lwt_error = run_lwt("/v1/vm/set-state", {
+                "name": vm_name,
+                "state": "Running",
+                "expected_host_ip": target_host,
+            })
+            if not ok:
+                log(f"Could not record '{vm_name}' as running: {lwt_error}", "warning")
+            elif not applied:
+                log(f"'{vm_name}' is no longer placed on {target_host} "
+                    f"(it is on '{current.get('host_ip')}'); leaving its state alone.", "warning")
             time.sleep(1)
 
         log("Step 4: Waiting for guest network leases and DHCP initialization...", "info")

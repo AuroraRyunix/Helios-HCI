@@ -329,16 +329,27 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   `resource-definition delete` and the fan-out `rm -f {path}` (unescaped, straight into a root
   shell) are unchecked. A failed LINSTOR delete leaves storage allocated that nothing in the UI
   can ever see again, and the operator is told it worked.
-* **`catalyst_tasks` has no time-ordered clustering key** (`task_id` is the whole primary key),
-  so "the most recent N tasks" is not answerable server-side and every read is a full scan. A
-  `created_at` clustering key would fix it.
-* **`mimir_results` accumulates duplicate rows.** `category` is the partition key and holds the
-  invocation scope, not the check kind, so running one category after a `run_all` writes a second
-  row for those checks and nothing removes the first. Readers see the same check twice with
-  different statuses.
-
-* **No maintenance-mode quorum gate.** Entering maintenance stops the local `hydra-db` unconditionally.
-  On a 1- or 2-node cluster with QUORUM this can freeze all queries cluster-wide.
+* **`catalyst_tasks` has no time-ordered clustering key** (`task_id` is the whole primary key), so
+  "the most recent N tasks" is not answerable server-side and every read is a full scan.
+  **Partly mitigated (2026-08-20)**: migration `0003-bound-task-history` sets a 30-day TTL, so the scan
+  no longer walks a table that grows forever. That bounds the cost; it does not make the query indexed.
+  The real fix is a companion table keyed by time bucket that Catalyst writes alongside, which is a
+  dual-write and belongs with the work that migrates the readers. Note that setting a table property is
+  idempotent, unlike `ALTER ... ADD`, which is why this one could be a migration at all -- verified
+  against real Scylla.
+* ~~`mimir_results` accumulates duplicate rows.~~ **Resolved (2026-08-20)**: results are stored under
+  the check's *own* category from `CHECK_ID_TO_FUNC`, not the category that was invoked, so a check
+  always lands in the same row however it is run and a re-run updates rather than duplicates. This also
+  makes the column mean what its name says -- grouping by it after a `run_all` previously yielded one
+  bucket, which is why the old console carried a hardcoded check-name list that had drifted from this
+  map. Legacy partitions are shed on the next run, discriminated by real categories containing a dot
+  where invocation scopes do not, with a guard so a future dotted scope cannot delete live rows. A test
+  asserts every check the runner reports has a category -- it found eight that did not, each of which
+  would have kept duplicating. Verified live: the `all` partition is gone and no check name appears in
+  more than one partition.
+* ~~No maintenance-mode quorum gate.~~ **Resolved (2026-08-20)** as part of the ring lifecycle work
+  above -- the gate reads the replication factor from `system_schema.keyspaces`, refuses if it cannot
+  read it, and runs again immediately before the database is stopped rather than only at API entry.
 * **No out-of-band fencing path.** `mipha.py` `ssh_fence_host` relies entirely on Spark's mTLS API. If a
   node's software hangs while the box stays powered, there is no IPMI/PDU STONITH fallback.
 * **No automated self-fencing on partial failure.** Mipha's ping-based liveness reports a host healthy
@@ -367,15 +378,25 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## P3 — Code health
 
-* **`mcli-runner`'s certificate check returns PASS when it cannot parse an expiry date**, and it looks
-  only at `client.crt`. It runs daily and overwrites Mimir's correct row for the same check name, so a
-  cluster with expiring certificates can report green once a day. Should defer to Mimir's survey or be
-  removed.
-* **`hydra.vali_tasks` is a dead table.** Created by `vali.py init_db_schema()` and documented in
-  `docs/vali.md` as the task queue; nothing reads or writes it. The real queue is Catalyst's in-process
-  `queue.Queue`, which is itself worth noting -- it does not survive a restart.
-* **`vali.evacuate_host_thread` is dead code** -- defined, never called.
-
+* ~~`mcli-runner`'s certificate check returns PASS when it cannot parse an expiry date.~~
+  **Resolved (2026-08-20)**: both certificate checks now go through Mimir's survey rather than a second
+  implementation, so there is one parser and one verdict. An unreadable date is WARN -- "I could not
+  check this" and "this is fine" are different answers, and the old code gave the second for both. It
+  also looked only at `client.crt`, ignoring the node and CA certificates in `/etc/hci/spark/certs`.
+  The sibling ingress check had the same defect and the same locale-dependent `strptime`, and was fixed
+  with it. Verified live, which caught a second bug in the fix: `mimir` is deployed as
+  `/usr/local/bin/mimir` with no `.py` suffix, and `spec_from_file_location` returns `None` for an
+  extensionless path, so the loader needs an explicit `SourceFileLoader`.
+* ~~`hydra.vali_tasks` is a dead table.~~ **Corrected and documented (2026-08-20)**: nothing *writes*
+  it, but it is not unreferenced -- `valcli`'s cleanup reads and deletes from it and `mcli` checks it
+  exists, so dropping it would break both. They simply always find it empty. `docs/vali.md` and the
+  master architecture guide both described it as the live task queue, which was the actual harm; both
+  now say what it is, and record that the real queue is Catalyst's in-process `queue.Queue` and does
+  not survive a restart, so a task accepted and not yet run is lost rather than resumed.
+* ~~`vali.evacuate_host_thread` is dead code.~~ **Resolved (2026-08-20)**: removed. It was a complete
+  second copy of the maintenance-enter sequence, including the unconditional database stop the quorum
+  gate now prevents -- a way back into the bug for anyone who wired it up. Deleted rather than left
+  gated, because two implementations of one sequence drift.
 * **`run_cql_query` is copy-pasted into at least six files** (~40 lines each, including the cqlsh
   fallback). This is why the CQL-injection items had to be fixed at each call site — there is no single
   query layer to parameterize. The Daruk work above is the structural fix.
@@ -414,11 +435,12 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   asserts `*_B64`/mapping coverage in both directions, upgrade-package vs LCM-inventory parity, that
   every embedded `*_script` literal compiles, and that no embedded source carries CRLF. That last
   assertion failed on its first run and caught 17 files that had drifted back to CRLF.
-* **`podman build` cannot be run from a clean checkout** — the Dockerfile expects `server.py`, which is
-  produced by renaming `spectrum_server.py` during provisioning (see `docs/AGENTS.md` §7).
-
----
-
+* ~~`podman build` cannot be run from a clean checkout.~~ **Resolved (2026-08-20)**: the Dockerfile
+  copies `spectrum_server.py` and renames it on the way in, so the build works from the tree as checked
+  out. The rename indirection is gone rather than worked around -- it had four touchpoints
+  (`provision.py`, `deploy_updates.py` twice, and `hylia.py`'s rebuild), all staging the file under the
+  other name. The in-image layout is unchanged, so `CMD` and every path inside the container stay as
+  they were. Verified by building the image from a clean checkout on the test node.
 ## Design / future work
 
 ### In progress: Phoenix LiveView rewrite of Spectrum

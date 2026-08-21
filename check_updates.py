@@ -10,7 +10,26 @@ import hashlib
 # Build string reported when an installed component carries no __build__ tag.
 # This script is deployed standalone as /usr/local/bin/check-updates, so the value
 # cannot be imported from hylia; it is the single source of truth within this file.
+#
+# It means "installed, from before builds were tagged". It does NOT mean "we could not
+# find out" -- see read_current_version() for why that distinction is the whole bug this
+# file used to have.
 FALLBACK_BUILD = "1.2.0-b4081"
+
+# What lcm_update_state.current_version says when this node's build could not be read.
+# Deliberately not a version string: it must not compare equal or unequal to a real one
+# by accident, and it has to be visibly wrong in the console.
+UNKNOWN_VERSION = "unknown"
+
+# What Spark's /api/v1/node/binary-version returns for a component it could not be asked
+# about at all, versus the ones it could. "Not Installed" and "Unknown" are answers --
+# the file is missing, or it is there without a __build__ tag. "N/A" is what this script
+# writes when the request itself failed, which is not an answer about the component.
+VERSION_UNREADABLE = "N/A"
+
+# hylia carries this node's build tag. Named here so a test can point the read at a
+# fixture instead of the installed file.
+HYLIA_PATH = "/usr/local/bin/hylia"
 
 _SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 
@@ -337,36 +356,124 @@ def collect_inventory():
         print(f"Warning: Failed to collect cluster inventory: {e}")
         return {}
 
-def main():
-    sys.path.append("/usr/local/bin")
-    sys.path.append(".")
-    
-    current_version = FALLBACK_BUILD
+def read_current_version(hylia_path=None):
+    """This node's installed build, or None when it could not be determined.
+
+    The bug this closes: `current_version` started at FALLBACK_BUILD and every failure
+    path left it there. So a node where hylia could not be imported *or* read -- a broken
+    interpreter, a half-finished upgrade, a permissions problem, the file simply missing
+    -- reported the build from before builds were tagged, which is not equal to any
+    release the server will ever publish. The check below is `latest_version !=
+    current_version`, so that node announced "update available" on every run, forever,
+    and no amount of updating could clear it: the next run could not read the version it
+    had just installed either.
+
+    Unknown is not old. Returning None here lets the caller say "this node's version
+    could not be read" instead of answering a question it has no data for.
+
+    A hylia that loads but has no `__build__` attribute is a different case and does
+    return FALLBACK_BUILD: the component is installed and genuinely predates build tags.
+    """
+    import importlib.machinery
+    import importlib.util
+    import os
+
+    hylia_path = HYLIA_PATH if hylia_path is None else hylia_path
     try:
-        import importlib.util
-        import importlib.machinery
-        import os
-        hylia_path = "/usr/local/bin/hylia"
         if os.path.exists(hylia_path):
             loader = importlib.machinery.SourceFileLoader("hylia", hylia_path)
             spec = importlib.util.spec_from_loader("hylia", loader)
             hylia_mod = importlib.util.module_from_spec(spec)
             loader.exec_module(hylia_mod)
-            current_version = getattr(hylia_mod, "__build__", FALLBACK_BUILD)
-        else:
-            import hylia
-            current_version = getattr(hylia, "__build__", FALLBACK_BUILD)
+            return getattr(hylia_mod, "__build__", FALLBACK_BUILD)
+        import hylia
+        return getattr(hylia, "__build__", FALLBACK_BUILD)
     except Exception:
-        try:
-            with open("/usr/local/bin/hylia", "r") as f:
-                for line in f:
-                    if "__build__" in line:
-                        parts = line.split("=")
-                        if len(parts) >= 2:
-                            current_version = parts[1].strip().strip('"').strip("'")
-                            break
-        except Exception:
-            pass
+        pass
+
+    # Executing hylia failed. It may still be readable as text, and the build tag is a
+    # literal assignment near the top of it.
+    try:
+        with open(hylia_path, "r") as f:
+            for line in f:
+                if "__build__" in line:
+                    parts = line.split("=")
+                    if len(parts) >= 2:
+                        value = parts[1].strip().strip('"').strip("'")
+                        if value:
+                            return value
+    except Exception:
+        pass
+
+    return None
+
+
+def decide_update_available(latest_version, current_version, latest_components, installed_inv):
+    """Whether an update should be offered, and what could not be compared.
+
+    `current_version` is None when this node's build could not be read at all. Returns
+    (update_available, notes), where `notes` names everything that was skipped rather
+    than guessed at; the caller writes them into `lcm_update_state.error_msg`, which
+    Spectrum renders on the LCM page.
+
+    The rule the whole function exists to enforce: **unknown never counts as a
+    mismatch.** Every comparison here is an inequality against a release version, so any
+    value substituted for "we could not find out" is unequal to the release forever, and
+    the console offers an update that installing cannot clear. An operator who is not
+    being offered an update is entitled to know whether that is because there is none or
+    because the question could not be answered -- but not to be told there is one on the
+    strength of a value nobody read.
+    """
+    notes = []
+
+    # 1. Base check: this node's build against the release.
+    if current_version is None:
+        update_available = False
+        notes.append(
+            f"This node's installed build could not be read from {HYLIA_PATH}, so it "
+            f"cannot be compared against the latest release. Repair or reinstall hylia on "
+            f"this node; until then this check cannot say whether an update is needed.")
+    else:
+        update_available = (latest_version != current_version)
+
+    # 2. Component check: any component on any node that differs from the release.
+    #
+    # Only components that actually answered are compared. VERSION_UNREADABLE means the
+    # node could not be asked, which is not a version -- the old code substituted
+    # FALLBACK_BUILD for it, so a single unreachable node was a permanent update prompt.
+    # "Not Installed" and "Unknown" *are* answers about the component and are compared.
+    unreadable = []
+    if latest_components and installed_inv:
+        for host_name, host_info in (installed_inv or {}).items():
+            versions = (host_info or {}).get("versions", {}) or {}
+            for comp_name, target_ver in latest_components.items():
+                installed_ver = versions.get(comp_name)
+                if not installed_ver or installed_ver == VERSION_UNREADABLE:
+                    unreadable.append(f"{host_name}/{comp_name}")
+                    continue
+                if installed_ver == "Unknown":
+                    installed_ver = FALLBACK_BUILD
+                if installed_ver != target_ver:
+                    update_available = True
+
+    if unreadable:
+        shown = ", ".join(sorted(unreadable)[:8])
+        more = "" if len(unreadable) <= 8 else f" (+{len(unreadable) - 8} more)"
+        notes.append(
+            f"{len(unreadable)} component version(s) could not be read and were not "
+            f"compared: {shown}{more}.")
+
+    return update_available, notes
+
+
+def main():
+    sys.path.append("/usr/local/bin")
+    sys.path.append(".")
+
+    current_version = read_current_version()
+    current_version_known = current_version is not None
+    if not current_version_known:
+        current_version = UNKNOWN_VERSION
 
     cb = int(time.time())
     url = f"https://updates-helios.zerotwo.cloud/api/v1/releases/latest?cb={cb}"
@@ -393,23 +500,18 @@ def main():
         
         # Collect current inventory first
         installed_inv = collect_inventory()
-        
-        # 1. Base check: compare overall build version
-        update_available = (latest_version != current_version)
-        
-        # 2. Component check: check if any component on any node does not match the latest release
-        if not update_available and latest_components and installed_inv:
-            for host_name, host_info in installed_inv.items():
-                for comp_name, target_ver in latest_components.items():
-                    installed_ver = host_info.get("versions", {}).get(comp_name)
-                    if installed_ver == "Unknown" or not installed_ver:
-                        installed_ver = FALLBACK_BUILD
-                    if installed_ver != target_ver:
-                        update_available = True
-                        break
-                if update_available:
-                    break
-        
+
+        update_available, unknowns = decide_update_available(
+            latest_version,
+            current_version if current_version_known else None,
+            latest_components,
+            installed_inv)
+
+        if unknowns and signature_note:
+            signature_note = signature_note + " " + " ".join(unknowns)
+        elif unknowns:
+            signature_note = " ".join(unknowns)
+
         # Ensure schema table exists first
         cql_schema = """
         CREATE TABLE IF NOT EXISTS hydra.lcm_update_state (
@@ -450,6 +552,8 @@ def main():
             
         print("Update status successfully checked and saved to ScyllaDB.")
         print(f"Latest: {latest_version} (Current: {current_version}) | Available: {update_available}")
+        for note in unknowns:
+            print(f"NOT COMPARED: {note}")
         sys.exit(0)
         
     except Exception as e:

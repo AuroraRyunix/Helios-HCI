@@ -58,6 +58,37 @@ CREATE TABLE IF NOT EXISTS hydra.lanayru_k8s_state (
 );
 ```
 
+### C. Registering Control-Plane VMs
+
+Each control node is registered in `hydra.vms` **before** any storage is built for it, using
+Daruk's [`POST /v1/vm/create`](./daruk.md#operations) (`INSERT ... IF NOT EXISTS`). A name
+that is already taken fails the deployment with the current owner named.
+
+The order matters and so does the condition. `INSERT` is an upsert in CQL, and the
+registration used to be unconditional and to run *after* the disk had been created and the
+OS image written to it. Deploying a cluster whose name collided with an existing VM
+therefore reset that VM's placement onto the new target host — and by then the image copy
+had already run over its disk.
+
+The registration also named columns `hydra.vms` does not have — `uuid`, `vcpus`, `ram`,
+`guest_ip`, `network_name`, `created_at` — so Scylla rejected the statement and
+`run_cql_query`'s `rc=1` was never read. **No Lanayru control node had ever actually been
+recorded.** The real columns are `vcpu`, `memory`, `disk_path`, `disks_list`, `network_id`
+and `state`; there is no column for the guest address, which lives in the cloud-init
+configuration.
+
+Once libvirt has started the guest, Lanayru records that through
+[`POST /v1/vm/set-state`](./daruk.md#operations) with `expected_host_ip` set to the target
+host, so a VM that has moved on is left alone.
+
+> [!WARNING]
+> That write was `UPDATE hydra.vms SET status = 'running' WHERE name = ?`, and **`status` is
+> not the power state — it is the VM migration lock**, whose *released* value happens to be
+> the string `running`. A provisioner that has never held that lock was clearing it on every
+> VM it created, so a live migration in flight over the same name would find its lock gone
+> and a second migration free to start. `state` is the column that records what the guest is
+> doing; `/v1/vm/set-state` writes it and does not name `status` at all.
+
 ---
 
 ## 2. Deployment Options

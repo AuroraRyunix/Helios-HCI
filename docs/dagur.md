@@ -37,6 +37,23 @@ Dagur operates as a distributed execution worker by doing the following:
    - Reports progress and status updates back to Catalyst via `POST /api/v1/tasks/update`.
    - Inserts run results, exit codes, and output logs into `hydra.dagur_runs`.
 
+### Duplicate Runs Are Prevented Upstream
+
+Dagur itself holds no lock. A job reaches it only after Catalyst has claimed that tick with
+[`POST /v1/schedule/claim-job`](./daruk.md#claiming-a-scheduler-tick), whose
+`IF last_run_epoch = ?` means exactly one scheduler can submit a given interval's run. The
+leader check here is a second line of defence, not the first: `is_zookeeper_leader()` falls
+back to *"lowest node with 9091 open"* when ZooKeeper's leader does not answer, and two
+nodes can get that answer at the same moment.
+
+Dagur's own `run_cql_query()` refuses any statement carrying an `IF` clause — see
+[the guard](./daruk_technical.md#the-conditional-statement-guard-in-run_cql_query). It has
+no conditional writes of its own, so nothing legitimate is refused; the guard exists so the
+next change cannot quietly add one. The keyword is looked for **outside quoted literals**
+because this daemon writes the stdout of arbitrary jobs into `hydra.dagur_runs`, and a job
+that printed "check if the volume is mounted" would otherwise have its run record thrown
+away.
+
 ---
 
 ## Command Examples & Syntax

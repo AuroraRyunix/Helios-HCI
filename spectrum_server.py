@@ -5,7 +5,9 @@ import uuid
 import sys
 import json
 import ssl
+import shlex
 import socket
+import ipaddress
 import subprocess
 import urllib.request
 import urllib.parse
@@ -819,6 +821,537 @@ def get_cluster_nodes():
         return hosts
 
     return _CACHED_CLUSTER_JSON_HOSTS
+
+# --------------------------------------------------------------------------
+# Bounded reads
+#
+# Two of this console's polling endpoints answered every request with a full table scan.
+# Both tables they scan have a time-ordered clustering key, so "the newest N rows of one
+# partition" is a read the storage engine answers directly: it walks N rows on one
+# replica set instead of every row on all of them.
+#
+# The scans were not only expensive. `SELECT ... LIMIT 100` with no WHERE returns the
+# first 100 rows the coordinator reaches in *token* order, which is not the most recent
+# 100 of anything -- one busy job's partition could fill the whole answer while another
+# job's runs never appeared at all.
+# --------------------------------------------------------------------------
+
+# metrics.html slices each host's series to its last 40 points before drawing it, so
+# every sample past that was read out of Hydra and thrown away -- once per open browser
+# tab, every 30 seconds. At logos.py's 30s cadence, 40 samples is the 20 minutes of
+# history the charts actually show.
+METRICS_SAMPLES_PER_NODE = 40
+
+# dagur_runs rows read per job. The page merges every job's recent history into one
+# table and sorts it in the browser, so this is a per-partition depth, not a page size;
+# DAGUR_RUNS_MAX caps what the merge sends.
+DAGUR_RUNS_PER_JOB = 10
+DAGUR_RUNS_MAX = 100
+
+# Job names are the partition key of hydra.dagur_runs and go back into CQL as a string
+# literal. They are written by this file's own seeding and by dagur.py, but nothing
+# validates them on the way in, and run_cql_query() falls back to piping statement text
+# into cqlsh when Daruk is down -- where a ';' in a "job name" is a second statement.
+_DAGUR_JOB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def is_ip_literal(value):
+    """True only for a value that is literally an IP address.
+
+    Node addresses come out of /etc/hci/cluster.json and hydra.nodes and go straight back
+    into CQL as a partition key. Same reasoning as _DAGUR_JOB_NAME_RE above: not user
+    input, but not checked on the way in either.
+    """
+    try:
+        ipaddress.ip_address(str(value).strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_json_rows(stdout):
+    """Rows of a `SELECT JSON` result, as dicts."""
+    rows = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    return rows
+
+
+def read_node_metrics(limit=METRICS_SAMPLES_PER_NODE):
+    """The newest `limit` telemetry samples for each node, one partition at a time.
+
+    hydra.logos_metrics is PRIMARY KEY (node_ip, timestamp) with CLUSTERING ORDER BY
+    (timestamp DESC) and a 24h TTL, and logos.py writes one row per node every 30
+    seconds -- about 2,880 live rows per node, 8,600 on a three-node cluster.
+
+    /api/cluster/metrics used to read all of them with `SELECT JSON * FROM
+    hydra.logos_metrics`: no WHERE, no LIMIT, on every poll of every open tab, to draw
+    120 points. Reading each node's partition with a LIMIT is answered by the clustering
+    order without a scan.
+
+    Nodes come from the cluster configuration, so a node that has been removed from the
+    cluster stops appearing here even while its rows live out their TTL. That is the
+    intended behaviour: the charts are of the cluster, not of the table.
+
+    Returns (rows, unread_ips). `unread_ips` names nodes whose partition could not be
+    read at all, which is a different thing from a node that reported nothing and must
+    not be drawn as one.
+    """
+    rows = []
+    unread = []
+    for node in get_cluster_nodes():
+        ip = (node or {}).get("ip")
+        if not ip or not is_ip_literal(ip):
+            continue
+        ip = str(ip).strip()
+        cql = ("SELECT JSON node_ip, timestamp, cpu_pct, mem_pct, mem_total_kb, "
+               "cpu_cores, disk_iops, disk_bandwidth_kbps, net_rx_kbps, net_tx_kbps "
+               f"FROM hydra.logos_metrics WHERE node_ip = '{ip}' LIMIT {int(limit)};")
+        rc, stdout, _ = run_cql_query(cql)
+        if rc != 0:
+            unread.append(ip)
+            continue
+        rows.extend(parse_json_rows(stdout))
+    return rows, unread
+
+
+def cql_timestamp_ms(value):
+    """A CQL timestamp as epoch milliseconds, or 0.0 when it cannot be read.
+
+    `SELECT JSON` renders a `timestamp` column as "2026-08-18 20:58:32.922Z", not as a
+    number. Sorting those values as they arrive sorts strings, which happens to be
+    correct for one format and silently is not for another -- and comparing a string to
+    an int raises. Every merge across partitions in this file goes through here.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    import datetime
+    cleaned = text.replace("Z", "").split("+")[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(cleaned, fmt).timestamp() * 1000.0
+        except ValueError:
+            continue
+    return 0.0
+
+
+def read_dagur_runs(per_job=DAGUR_RUNS_PER_JOB, cap=DAGUR_RUNS_MAX):
+    """The most recent runs of every scheduled job, newest first.
+
+    hydra.dagur_runs is PRIMARY KEY (job_name, start_time) clustered start_time DESC, so
+    a job's recent history is a single-partition read. The old `SELECT JSON * FROM
+    hydra.dagur_runs LIMIT 100` had no WHERE: a full scan, and its 100 rows were whatever
+    the coordinator reached first rather than the 100 latest.
+
+    Job names come from hydra.dagur_schedules -- one row per job, a handful of rows. A
+    run whose schedule has since been deleted is no longer listed; the only alternative
+    is the scan this replaces, and an orphaned job's history is not what the page is for.
+
+    Returns (runs, ok). `ok` is False when the schedule list itself could not be read, so
+    an empty history and an unreadable database are distinguishable.
+    """
+    rc, stdout, _ = run_cql_query("SELECT JSON job_name FROM hydra.dagur_schedules;")
+    if rc != 0:
+        return [], False
+
+    runs = []
+    for row in parse_json_rows(stdout):
+        job = (row.get("job_name") or "").strip()
+        if not _DAGUR_JOB_NAME_RE.match(job):
+            continue
+        cql = ("SELECT JSON job_name, start_time, run_id, end_time, status, exit_code, "
+               "output FROM hydra.dagur_runs "
+               f"WHERE job_name = '{job}' LIMIT {int(per_job)};")
+        rc_r, stdout_r, _ = run_cql_query(cql)
+        if rc_r != 0:
+            continue
+        runs.extend(parse_json_rows(stdout_r))
+
+    # Each partition already came back newest-first; this orders the merge across jobs.
+    runs.sort(key=lambda run: cql_timestamp_ms(run.get("start_time")), reverse=True)
+    return runs[:int(cap)], True
+
+
+# --------------------------------------------------------------------------
+# The Valhalla image catalogue
+#
+# Two defects lived here. `GET /api/images` scanned a directory and INSERTed catalogue
+# rows for whatever it found, so loading a page wrote to the database. And
+# /api/images/delete deleted the catalogue row first, fired an unchecked
+# `resource-definition delete` and an unchecked fan-out `rm -f {path}` -- with the path
+# interpolated straight into a root shell -- and answered 200 whatever happened. A failed
+# LINSTOR delete therefore left a DRBD resource holding storage on every node that
+# nothing in the UI could ever see again, and the operator was told it had worked.
+# --------------------------------------------------------------------------
+
+# Where upload stages image files, and the only prefix under which this file will run an
+# `rm`. Note the trailing slash: without it, "/var/lib/hci/aether/volumes-evil/x" is a
+# prefix match.
+IMAGE_CONTAINER_ROOT = "/var/lib/hci/aether/volumes/"
+
+# A DRBD device is not a file. Removing one means deleting the LINSTOR resource, which
+# tears the device down on every node; `rm` on /dev/drbd/by-res/<res>/0 deletes a udev
+# symlink and leaves the resource -- and the storage it holds -- allocated.
+DRBD_DEVICE_PREFIX = "/dev/drbd/"
+
+
+def image_backing_kind(path):
+    """How an image's backing store must be removed: 'drbd', 'file', or None.
+
+    None means the row points somewhere this file will not delete from, and the delete is
+    refused and reported rather than attempted. Quoting the path is not the guard on its
+    own -- `rm -f` on a correctly quoted "/etc" is still `rm -f /etc`. What makes it safe
+    is that the path has to be one of the two shapes an image can legitimately have.
+    """
+    if not isinstance(path, str):
+        return None
+    path = path.strip()
+    if not path or "\x00" in path or ".." in path:
+        return None
+    if path.startswith(DRBD_DEVICE_PREFIX) and len(path) > len(DRBD_DEVICE_PREFIX):
+        return "drbd"
+    if path.startswith(IMAGE_CONTAINER_ROOT) and len(path) > len(IMAGE_CONTAINER_ROOT):
+        return "file"
+    return None
+
+
+# LINSTOR is being asked to delete something that is already gone. That is the state the
+# call was trying to reach, so it is not a failure -- but every other non-zero exit is,
+# and must not be swallowed the way the old code swallowed all of them.
+#
+# "no domain" is libvirt's wording, kept here because the VM delete path below applies
+# the same reasoning to virsh: a domain that is already undefined is the outcome asked
+# for. spark-daemon maps both wordings to 404 in virsh_status_for().
+_ALREADY_GONE_RE = re.compile(
+    r"not found|does not exist|unknown resource|no such|no domain", re.IGNORECASE)
+
+
+def remove_image_backing(name, path):
+    """Remove an image's backing store, checked. Returns (ok, detail).
+
+    `ok` False means the storage is still allocated, and the caller must leave the
+    catalogue row alone so the image stays visible and the delete can be retried.
+    `detail` carries the daemon's own message.
+    """
+    kind = image_backing_kind(path)
+
+    if kind is None:
+        if not path:
+            # A row with no path at all: written by the directory scan that /api/images
+            # used to perform, which never recorded one. There is nothing to remove, and
+            # saying so beats inventing a path to delete.
+            return True, "no backing store recorded"
+        return False, (f"Refusing to delete image '{name}': its recorded path {path!r} is "
+                       f"neither a DRBD device under {DRBD_DEVICE_PREFIX} nor a file under "
+                       f"{IMAGE_CONTAINER_ROOT}.")
+
+    if kind == "drbd":
+        res_name = f"img-{slugify_image_name(name)}"
+        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
+        if rc == 0:
+            return True, f"LINSTOR resource {res_name} deleted"
+        message = ((stderr or "") + " " + (stdout or "")).strip()
+        if _ALREADY_GONE_RE.search(message):
+            return True, f"LINSTOR resource {res_name} was already gone"
+        return False, (f"LINSTOR refused to delete resource {res_name}: "
+                       f"{message[:400] or 'no output'}")
+
+    # A staged image file exists on every node, so it has to be removed on every node.
+    # A node that does not answer is reported: a copy left behind is what the next upload
+    # of the same name collides with.
+    nodes = []
+    rc_n, stdout_n, _ = run_cql_query("SELECT JSON ip FROM hydra.nodes;")
+    if rc_n == 0:
+        nodes = [row.get("ip") for row in parse_json_rows(stdout_n) if row.get("ip")]
+    if not nodes:
+        nodes = [LOCAL_IP or "127.0.0.1"]
+
+    command = "rm -f -- " + shlex.quote(path)
+    failures = []
+    for ip in nodes:
+        try:
+            rc_rm, stdout_rm, stderr_rm = run_remote_spark(ip, command, timeout=30)
+        except Exception as e:
+            failures.append(f"{ip}: {e}")
+            continue
+        if rc_rm != 0:
+            detail = ((stderr_rm or "") + " " + (stdout_rm or "")).strip()
+            failures.append(f"{ip}: {detail[:200] or 'removal failed'}")
+    if failures:
+        return False, f"Could not remove {path} on: " + "; ".join(failures)
+    return True, f"{path} removed on {len(nodes)} node(s)"
+
+
+def delete_catalogue_image(name):
+    """Delete an image: its backing store first, checked, then its catalogue row.
+
+    Returns (status_code, body). The order is the fix. The old code deleted the row
+    first, which is the one ordering where a failure downstream is unrecoverable from the
+    UI: the storage is still allocated and the only handle on it -- the row naming its
+    path -- has already been thrown away. Backing store first means a failure leaves the
+    image exactly where it was, still listed, still deletable.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return 400, {"error": "An image name is required."}
+    name = name.strip()
+
+    rc, stdout, stderr = run_cql_query(
+        "SELECT JSON name, path FROM hydra.valhalla_images "
+        f"WHERE name = '{name.replace(chr(39), chr(39) * 2)}';")
+    if rc != 0:
+        return 503, {"error": f"The image catalogue could not be read: {stderr or 'unknown error'}"}
+    rows = parse_json_rows(stdout)
+    if not rows:
+        # Not a silent success. The row this was asked to delete does not exist, and
+        # answering 200 would tell the operator a delete happened that did not.
+        return 404, {"error": f"No image named '{name}' is in the catalogue."}
+    path = rows[0].get("path") or ""
+
+    ok, detail = remove_image_backing(name, path)
+    if not ok:
+        return 500, {
+            "error": detail,
+            "image": name,
+            "catalogue_row": "kept",
+            "message": (f"Image '{name}' was NOT deleted. Its backing store is still "
+                        f"allocated, so the catalogue row has been left in place."),
+        }
+
+    rc_d, _, stderr_d = run_cql_query(
+        f"DELETE FROM hydra.valhalla_images WHERE name = '{name.replace(chr(39), chr(39) * 2)}';")
+    if rc_d != 0:
+        # The backing store is gone and the row is not. The image is unusable and the row
+        # has to be cleaned up by hand, which is worth saying plainly rather than
+        # answering 200 and leaving a catalogue entry pointing at nothing.
+        return 500, {
+            "error": (f"Image '{name}' backing store was removed ({detail}), but its "
+                      f"catalogue row could not be deleted: {stderr_d or 'unknown error'}. "
+                      f"The row now points at storage that no longer exists; remove it with "
+                      f"DELETE FROM hydra.valhalla_images WHERE name = '{name}'."),
+            "image": name,
+            "catalogue_row": "orphaned",
+        }
+
+    return 200, {"message": f"Image '{name}' successfully deleted.", "detail": detail}
+
+
+# --------------------------------------------------------------------------
+# VM delete
+#
+# The old sequence read host_ip, destroyed the domain on that host, and then deleted the
+# row unconditionally. A VM that migrated between the read and the destroy was destroyed
+# nowhere -- the destroy went to the host it had left -- and its row disappeared anyway,
+# leaving a guest running on a host that nothing in the cluster still associates with it.
+# It cannot be found in the UI, it is not counted against the host's capacity, and it
+# holds its DRBD device open against the next thing that claims the name.
+#
+# The fix is to stop the VM from moving and to prove it has not moved, using Daruk's
+# typed compare-and-swap endpoints (docs/daruk.md):
+#
+#   1. Read the row, so "no such VM" is decided before any conditional write. This
+#      matters: `UPDATE ... IF status != ?` *applies* against a row that does not exist
+#      and creates a partial one, so calling migrate-lock on an unknown name would invent
+#      a VM rather than report one missing.
+#   2. Take the migration lock. A refusal means a live migration is in flight, and
+#      deleting a VM mid-hand-over is the worst possible moment. Holding it also
+#      serialises two concurrent deletes of the same VM.
+#   3. Re-read the placement under the lock, then pin it with `/v1/vm/set-state`, whose
+#      condition is `IF host_ip = ?`. A refusal means something moved the VM between the
+#      read and the write -- migration is not the only writer; the reconciler releases a
+#      placement too -- and the delete stops there with the row intact.
+#   4. Only then destroy, undefine, and delete storage, all checked.
+#
+# What is still missing is a conditional *delete*: Daruk has no /v1/vm/delete, so the
+# final `DELETE FROM hydra.vms` is unconditional. It runs while this caller holds the
+# migration lock and has just proved the placement, which closes the window the defect
+# was about, but a `DELETE ... IF host_ip = ?` would close it outright.
+# --------------------------------------------------------------------------
+
+# The state written on the row while the delete runs, so an operator refreshing the page
+# sees why the VM stopped answering rather than watching it flicker.
+VM_DELETING_STATE = "Deleting"
+
+
+def _read_vm_row(name):
+    """(row, ok) for one VM. `ok` False means the read failed, not that it is missing."""
+    rc, stdout, stderr = run_cql_query(
+        "SELECT JSON name, host_ip, state, status, disks_list, disk_path "
+        f"FROM hydra.vms WHERE name = '{name}';")
+    if rc != 0:
+        return None, False
+    rows = parse_json_rows(stdout)
+    return (rows[0] if rows else None), True
+
+
+def _destroy_vm_on_host(name, host_ip):
+    """Stop and undefine the guest on the host of record. Returns (ok, detail).
+
+    A destroy that fails for any reason other than "there is no such domain here" leaves
+    a guest running, and deleting the row on top of that produces exactly the orphan this
+    whole path exists to avoid. So it is checked, and only "already gone" passes.
+    """
+    quoted = urllib.parse.quote(name, safe="")
+    rc, res, err = run_mtls_spark_api(host_ip, f"/api/v1/vm/{quoted}/power", {"action": "destroy"})
+    message = str((res or {}).get("error") or err or "")
+    if rc != 0 and not _ALREADY_GONE_RE.search(message) and "not running" not in message.lower():
+        return False, f"{host_ip} refused to destroy the guest: {message[:300] or 'no output'}"
+
+    rc_u, res_u, err_u = run_mtls_spark_api(host_ip, "/api/v1/vm/undefine",
+                                            {"name": name, "keep_nvram": True})
+    message_u = str((res_u or {}).get("error") or err_u or "")
+    if rc_u != 0 and not _ALREADY_GONE_RE.search(message_u):
+        return False, f"{host_ip} refused to undefine the guest: {message_u[:300] or 'no output'}"
+    return True, f"guest destroyed and undefined on {host_ip}"
+
+
+def _delete_vm_disks(name, disks_list):
+    """Delete the VM's LINSTOR resources, checked. Returns (ok, detail).
+
+    Unchecked, this is the images defect again in another table: the row goes, the
+    resources stay, and the storage they hold is no longer reachable from anything the
+    UI shows. A resource that is already gone is the state being asked for, not an error.
+    """
+    count = len(disks_list.split(",")) if disks_list else 1
+    failures = []
+    for idx in range(count):
+        res_name = f"{name}-disk{idx}"
+        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
+        if rc == 0:
+            continue
+        message = ((stderr or "") + " " + (stdout or "")).strip()
+        if _ALREADY_GONE_RE.search(message):
+            continue
+        failures.append(f"{res_name}: {message[:200] or 'no output'}")
+    if failures:
+        return False, "LINSTOR refused to delete " + "; ".join(failures)
+    return True, f"{count} disk resource(s) deleted"
+
+
+def delete_vm(name):
+    """Delete a VM and everything backing it. Returns (status_code, body).
+
+    See the block comment above for the ordering and why each step is conditional.
+    """
+    if not is_valid_vm_name(name):
+        return 400, {"error": VM_NAME_ERROR}
+
+    row, ok = _read_vm_row(name)
+    if not ok:
+        return 503, {"error": "hydra.vms could not be read, so it is not known where this VM is placed."}
+    if row is None:
+        return 404, {"error": f"No VM named '{name}' is registered."}
+
+    task_id, created_at = log_catalyst_task("vm", "delete", "processing", 10, {"vm_name": name})
+
+    def fail(status, message):
+        log_catalyst_task("vm", "delete", "failed", 100, {"vm_name": name},
+                          error_msg=message, task_id=task_id, created_at=created_at)
+        return status, {"error": message, "vm": name, "record": "kept"}
+
+    lock_ok, locked, current, lock_err = run_lwt("/v1/vm/migrate-lock", {"name": name})
+    if not lock_ok:
+        return fail(503, f"Refusing to delete '{name}': the migration lock could not be taken "
+                         f"({lock_err}). Without it a migration could move the guest out from "
+                         f"under the delete.")
+    if not locked:
+        return fail(409, f"Refusing to delete '{name}': it is migrating "
+                         f"(status = {current.get('status')!r}). Retry once the migration settles.")
+
+    unlock_after = True
+    try:
+        # Re-read under the lock: a migration may have committed between the first read
+        # and the lock, and this is the placement the destroy has to go to.
+        row, ok = _read_vm_row(name)
+        if not ok:
+            return fail(503, f"Refusing to delete '{name}': hydra.vms became unreadable "
+                             f"after the migration lock was taken.")
+        if row is None:
+            # Something else deleted it while we waited. The lock we hold is on a row that
+            # no longer exists; leaving it set would resurrect a stub, so drop it.
+            return fail(404, f"No VM named '{name}' is registered.")
+
+        host_ip = row.get("host_ip") or ""
+        previous_state = row.get("state") or "Stopped"
+        disks_list = row.get("disks_list") or ""
+
+        # The compare-and-swap. `/v1/vm/set-state` writes `state` conditional on
+        # `IF host_ip = ?`, so it is a placement check and a status marker in one round.
+        # A refusal is not an error -- it means the VM is somewhere else now, and this
+        # delete has been operating on a stale reading of where its guest lives.
+        ok_cas, applied, current, cas_err = run_lwt("/v1/vm/set-state", {
+            "name": name, "state": VM_DELETING_STATE, "expected_host_ip": host_ip,
+        })
+        if not ok_cas:
+            return fail(503, f"Refusing to delete '{name}': its placement could not be "
+                             f"confirmed ({cas_err}).")
+        if not applied:
+            return fail(409, f"Refusing to delete '{name}': it has moved to "
+                             f"{current.get('host_ip')!r} since this delete started. Nothing has "
+                             f"been destroyed and the VM's record is unchanged; retry the delete.")
+
+        def restore_state():
+            """Put `state` back after an aborted delete, still conditional on placement."""
+            run_lwt("/v1/vm/set-state", {
+                "name": name, "state": previous_state, "expected_host_ip": host_ip,
+            })
+
+        if host_ip:
+            destroyed, detail = _destroy_vm_on_host(name, host_ip)
+            if not destroyed:
+                restore_state()
+                return fail(500, f"'{name}' was not deleted: {detail}. The guest may still be "
+                                 f"running, so its record has been left in place.")
+        else:
+            # Hydra places this VM nowhere. There is no host to destroy it on, and
+            # guessing one would destroy a guest of the same name belonging to nobody.
+            detail = "no host of record; nothing to destroy"
+
+        disks_ok, disk_detail = _delete_vm_disks(name, disks_list)
+        if not disks_ok:
+            restore_state()
+            return fail(500, f"'{name}' was not deleted: {disk_detail}. Its storage is still "
+                             f"allocated, so its record has been left in place.")
+
+        nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
+        run_remote_spark(host_ip or LOCAL_IP, "rm -f -- " + shlex.quote(nvram_path))
+        run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
+
+        rc_del, _, stderr_del = run_cql_query(f"DELETE FROM hydra.vms WHERE name = '{name}';")
+        if rc_del != 0:
+            return fail(500, f"'{name}' was destroyed and its storage deleted, but its record "
+                             f"could not be removed: {stderr_del or 'unknown error'}. The row now "
+                             f"describes a VM that no longer exists.")
+
+        # The row is gone, and the migration lock lived in one of its columns.
+        unlock_after = False
+
+        EVENT_LOGS.append({"desc": f"VM '{name}' successfully deleted.", "time": "Just now"})
+        log_catalyst_task("vm", "delete", "completed", 100, {"vm_name": name},
+                          task_id=task_id, created_at=created_at)
+        invalidate_status_cache()
+        return 200, {"message": f"VM {name} deleted successfully.",
+                     "detail": f"{detail}; {disk_detail}"}
+    except Exception as e:
+        return fail(500, f"'{name}' could not be deleted: {e}")
+    finally:
+        if unlock_after:
+            # Conditional on the lock still being this delete's to release, so a late
+            # unlock cannot clear a migration that started afterwards.
+            run_lwt("/v1/vm/migrate-unlock", {"name": name})
+
 
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader by querying stat on port 2181."""
@@ -2157,7 +2690,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         # If there is a recorded error_msg, return it in the error field
                         error_msg = state_row.get("error_msg", "")
                         self.send_json(200, {
-                            "current_version": state_row.get("current_version", "1.2.0-b4081"),
+                            # Not a plausible-looking build number. check-updates writes
+                            # "unknown" here when it could not read hylia, and inventing a
+                            # version to stand in for one that could not be read is how
+                            # this pair of files came to report an update forever.
+                            "current_version": state_row.get("current_version") or "unknown",
                             "latest_version": state_row.get("latest_version", ""),
                             "update_available": state_row.get("update_available", False),
                             "release_date": state_row.get("release_date", ""),
@@ -2173,15 +2710,19 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 else:
                     # No cached update state found yet!
                     # Return that a check is needed or is in progress
-                    current_version = "1.2.0-b4081"
+                    current_version = "unknown"
                     try:
                         sys.path.append("/usr/local/bin")
                         sys.path.append(".")
                         import hylia
+                        # A hylia that imports but carries no __build__ predates build
+                        # tags, which is a real answer. A hylia that will not import at
+                        # all is not, and must not be given one.
                         current_version = getattr(hylia, "__build__", "1.2.0-b4081")
                     except Exception:
                         pass
-                        
+
+
                     self.send_json(200, {
                         "current_version": current_version,
                         "update_available": False,
@@ -3198,18 +3739,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/cluster/metrics":
-            cql = "SELECT JSON * FROM hydra.logos_metrics;"
-            rc, stdout, stderr = run_cql_query(cql)
-            metrics = []
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            metrics.append(json.loads(line))
-                        except Exception:
-                            pass
-            
+            # One bounded read per node instead of a scan of the whole table. See
+            # read_node_metrics() for why the old form cost a full cluster scan per
+            # open tab per poll.
+            metrics, metrics_unavailable = read_node_metrics()
+
             logs = []
             
             # 1. mimir_results
@@ -3236,30 +3770,24 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         except:
                             pass
             
-            # 2. dagur_runs
-            cql_dagur = "SELECT JSON * FROM hydra.dagur_runs LIMIT 50;"
-            rc_d, stdout_d, _ = run_cql_query(cql_dagur)
-            if rc_d == 0:
-                for line in stdout_d.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            item = json.loads(line)
-                            ts = item.get("start_time", "")
-                            job = item.get("job_name", "")
-                            status = item.get("status", "")
-                            exit_code = item.get("exit_code", 0)
-                            out = item.get("output", "")
-                            msg = f"Dagur Job '{job}' finished with status '{status}' (Exit: {exit_code}). Output: {out}"
-                            logs.append({
-                                "timestamp": ts,
-                                "source": "Dagur",
-                                "level": "INFO" if status == "SUCCESS" else "ERROR",
-                                "message": msg
-                            })
-                        except:
-                            pass
-                            
+            # 2. dagur_runs -- per job and bounded. `LIMIT 50` with no WHERE was a scan
+            # returning whichever 50 rows the coordinator reached first, so the "recent
+            # activity" feed was not showing recent activity.
+            dagur_runs, _dagur_ok = read_dagur_runs(per_job=5, cap=50)
+            for item in dagur_runs:
+                ts = item.get("start_time", "")
+                job = item.get("job_name", "")
+                status = item.get("status", "")
+                exit_code = item.get("exit_code", 0)
+                out = item.get("output", "")
+                msg = f"Dagur Job '{job}' finished with status '{status}' (Exit: {exit_code}). Output: {out}"
+                logs.append({
+                    "timestamp": ts,
+                    "source": "Dagur",
+                    "level": "INFO" if status == "SUCCESS" else "ERROR",
+                    "message": msg
+                })
+
             # 3. catalyst_tasks
             cql_catalyst = "SELECT JSON * FROM hydra.catalyst_tasks;"
             rc_c, stdout_c, _ = run_cql_query(cql_catalyst)
@@ -3333,7 +3861,12 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             logs.sort(key=get_ts_epoch, reverse=True)
             logs = logs[:200]
 
-            self.send_json(200, {"metrics": metrics, "logs": logs, "console_metrics": console_metrics_list})
+            # `metrics_unavailable` names nodes whose telemetry partition could not be
+            # read. A node that is absent from `metrics` because it was never asked is
+            # not a node that reported nothing, and the two must not look alike.
+            self.send_json(200, {"metrics": metrics, "logs": logs,
+                                 "console_metrics": console_metrics_list,
+                                 "metrics_unavailable": metrics_unavailable})
             return
 
         elif path == "/api/cluster/nodes/hardware":
@@ -3446,17 +3979,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/dagur/runs":
-            db_runs = []
-            cql = "SELECT JSON * FROM hydra.dagur_runs LIMIT 100;"
-            rc, stdout, stderr = run_cql_query(cql)
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            db_runs.append(json.loads(line))
-                        except Exception:
-                            pass
+            # Per job and bounded. The old `LIMIT 100` had no WHERE, so it scanned the
+            # table and returned the first 100 rows in token order -- never "the 100 most
+            # recent runs", which is what the page claims to show.
+            db_runs, runs_ok = read_dagur_runs()
+            if not runs_ok:
+                self.send_json(503, {"error": "The Dagur job list could not be read, so no "
+                                              "execution history can be shown."})
+                return
             self.send_json(200, {"runs": db_runs})
             return
 
@@ -3510,43 +4040,27 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/images":
-            db_images = []
-            cql = "SELECT JSON * FROM hydra.valhalla_images;"
+            # A pure read. This endpoint used to scan
+            # /var/lib/hci/aether/volumes/default-image-container and INSERT a catalogue
+            # row for every image-looking file it found, so opening the Images page wrote
+            # to the database -- from every tab, on every refresh.
+            #
+            # The rows it wrote were also guesses. Upload puts an image on a replicated
+            # DRBD device (/dev/drbd/by-res/img-<slug>/0), not in that directory, so the
+            # only files the scan ever caught were ones nobody registered; it recorded
+            # them with a `path` no LINSTOR resource backs, and only as this node sees
+            # them. Reconciling the catalogue against the filesystem is a cluster-wide
+            # job, and belongs in hydra.dagur_schedules where it can run once and be
+            # retried, not in a GET.
+            cql = "SELECT JSON name, filename, size_bytes, type, path, created_at FROM hydra.valhalla_images;"
             rc, stdout, stderr = run_cql_query(cql)
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            db_images.append(json.loads(line))
-                        except Exception:
-                            pass
-            # Scan filesystem for files not in database
-            target_dir = "/var/lib/hci/aether/volumes/default-image-container"
-            if os.path.exists(target_dir):
-                try:
-                    existing_names = {img.get("name") for img in db_images if img.get("name")}
-                    for f in os.listdir(target_dir):
-                        if f.lower().endswith((".iso", ".img", ".qcow2")) and f not in existing_names:
-                            fpath = os.path.join(target_dir, f)
-                            st = os.stat(fpath)
-                            size_bytes = st.st_size
-                            created_at = int(st.st_mtime * 1000)
-                            image_meta = {
-                                "name": f,
-                                "filename": f,
-                                "size_bytes": size_bytes,
-                                "type": "iso" if f.lower().endswith(".iso") else "template",
-                                "path": fpath,
-                                "created_at": created_at
-                            }
-                            image_meta_json = json.dumps(image_meta).replace("'", "''")
-                            cql_ins = f"INSERT INTO hydra.valhalla_images JSON '{image_meta_json}';"
-                            run_cql_query(cql_ins)
-                            db_images.append(image_meta)
-                except Exception as e:
-                    print(f"[API] Error scanning image directory: {e}")
-            self.send_json(200, {"images": db_images})
+            if rc != 0:
+                # An unreadable catalogue is not an empty catalogue, and answering 200
+                # with [] would draw "no images registered" over a database outage.
+                self.send_json(503, {"error": f"The image catalogue could not be read: "
+                                              f"{stderr or 'unknown error'}"})
+                return
+            self.send_json(200, {"images": parse_json_rows(stdout)})
             return
 
         elif path == "/api/storage/disks":
@@ -5456,47 +5970,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
-                
-            name_esc = name.replace("'", "''")
-            cql_select = f"SELECT JSON path FROM hydra.valhalla_images WHERE name = '{name_esc}';"
-            rc, stdout, stderr = run_cql_query(cql_select)
-            path_to_delete = None
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            path_to_delete = json.loads(line).get("path")
-                        except Exception:
-                            pass
-            
-            cql_delete = f"DELETE FROM hydra.valhalla_images WHERE name = '{name_esc}';"
-            run_cql_query(cql_delete)
-            
-            res_name = f"img-{slugify_image_name(name)}"
-            run_linstor_cmd(f"resource-definition delete {res_name}")
-            
-            if path_to_delete:
-                if not path_to_delete.startswith("/dev/drbd/"):
-                    nodes = []
-                    rc_n, stdout_n, _ = run_cql_query("SELECT JSON ip FROM hydra.nodes;")
-                    if rc_n == 0 and stdout_n:
-                        for line in stdout_n.splitlines():
-                            line = line.strip()
-                            if line.startswith("{") and line.endswith("}"):
-                                try:
-                                    nodes.append(json.loads(line).get("ip"))
-                                except:
-                                    pass
-                    if not nodes:
-                        nodes = ["127.0.0.1"]
-                    for other_ip in nodes:
-                        try:
-                            run_remote_spark(other_ip, f"rm -f {path_to_delete}")
-                        except Exception as e:
-                            print(f"Error removing image file from {other_ip}: {e}")
-                    
-            self.send_json(200, {"message": f"Image '{name}' successfully deleted."})
+
+            # Backing store first and checked, then the row. See delete_catalogue_image().
+            status, body = delete_catalogue_image(name)
+            self.send_json(status, body)
             return
 
         elif self.path == "/api/vms/cdrom":
@@ -6026,7 +6503,6 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path == "/api/vms/delete":
-            task_id, created_at = None, None
             try:
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
@@ -6034,68 +6510,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            if not is_valid_vm_name(name):
-                self.send_json(400, {"error": VM_NAME_ERROR})
-                return
-
-            task_id, created_at = log_catalyst_task("vm", "delete", "processing", 10, {"vm_name": name})
-            try:
-                # Find VM details in ScyllaDB
-                cql = f"SELECT JSON host_ip, disks_list, disk_path FROM hydra.vms WHERE name = '{name}';"
-                rc, stdout, stderr = run_cql_query(cql)
-                host_ip = ""
-                disks_list = ""
-                disk_path = ""
-                if rc == 0:
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                vm_meta = json.loads(line)
-                                host_ip = vm_meta.get("host_ip", "")
-                                disks_list = vm_meta.get("disks_list", "")
-                                disk_path = vm_meta.get("disk_path", "")
-                            except Exception:
-                                pass
-
-                # 1. Stop and undefine VM if it is active on a host
-                if host_ip:
-                    run_mtls_spark_api(
-                        host_ip,
-                        "/api/v1/vm/" + urllib.parse.quote(name, safe="") + "/power",
-                        {"action": "destroy"})
-                    run_mtls_spark_api(host_ip, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
-
-                # 2. Delete Linstor resources and NVRAM files
-                num_disks = len(disks_list.split(",")) if disks_list else 1
-                for idx in range(num_disks):
-                    res_name = f"{name}-disk{idx}"
-                    run_linstor_cmd(f"resource-definition delete {res_name}")
-                # Delete UEFI nvram vars file and DB entry
-                nvram_file_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
-                if host_ip:
-                    run_remote_spark(host_ip, f"rm -f {nvram_file_path}")
-                else:
-                    run_remote_spark(LOCAL_IP, f"rm -f {nvram_file_path}")
-                run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
-
-                # 4. Remove metadata record from ScyllaDB
-                cql = f"DELETE FROM hydra.vms WHERE name = '{name}';"
-                run_cql_query(cql)
-
-                # 5. Append delete event log
-                EVENT_LOGS.append({
-                    "desc": f"VM '{name}' successfully deleted.",
-                    "time": "Just now"
-                })
-
-                log_catalyst_task("vm", "delete", "completed", 100, {"vm_name": name}, task_id=task_id, created_at=created_at)
-                invalidate_status_cache()
-
-                self.send_json(200, {"message": f"VM {name} deleted successfully."})
-            except Exception as e:
-                log_catalyst_task("vm", "delete", "failed", 100, {"vm_name": name}, error_msg=str(e), task_id=task_id, created_at=created_at)
-                self.send_json(500, {"error": str(e)})
+            # The destroy goes to the host that still holds the placement, proved with a
+            # compare-and-swap, and the row only goes once there is nothing left running.
+            # See delete_vm() for the ordering.
+            status, body = delete_vm(name)
+            self.send_json(status, body)
             return
 
         elif self.path == "/api/storage/containers/create":
