@@ -13,6 +13,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
+import traceback
 import random
 import threading
 import hashlib
@@ -268,11 +269,32 @@ def log_catalyst_task(service, action, status, progress, payload_dict, error_msg
 
 
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    local = globals().get("LOCAL_IP")
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command, timeout=45):
     """Executes a command on the local or remote node via its spark-daemon mTLS API."""
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command, "timeout": timeout}).encode("utf-8")
@@ -455,7 +477,8 @@ def set_vm_disks_two_primaries(vm_name, enabled):
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099{path}"
     data = None
@@ -1690,6 +1713,14 @@ def init_db():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('system_history_cleanup', 'system_cleanup', '0 0 * * *', 86400, true, 0, '/usr/local/bin/valcli system.cleanup') IF NOT EXISTS;
     """
+    # Enabled on a fresh cluster even though no backup target is configured yet, so it
+    # fails nightly with a message naming the fix. A cluster with no backups should say so
+    # once a day; a disabled schedule is silent, which is what "no backup/DR" looked like.
+    insert_metadata_backup = """
+    INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
+    VALUES ('metadata_backup', 'backup', '30 1 * * *', 86400, true, 0, '/usr/local/bin/saga backup --all-nodes') IF NOT EXISTS;
+    """
+
     insert_orphaned_disks_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('orphaned_disks_cleanup', 'storage_cleanup', '0 2 * * *', 86400, true, 0, '/usr/local/bin/valcli storage.cleanup_orphaned') IF NOT EXISTS;
@@ -1771,6 +1802,7 @@ def init_db():
                 run_cql_query(insert_mimir_default)
                 run_cql_query(insert_system_cleanup)
                 run_cql_query(insert_orphaned_disks_cleanup)
+                run_cql_query(insert_metadata_backup)
                 run_cql_query(insert_helios_update_check)
                 run_cql_query(insert_default_network)
                 # Attempt to alter vms table to add network_id
@@ -5604,7 +5636,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 # file-like body, and the framing it produced was rejected mid-transfer.
                 ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
                 ctx.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-                ctx.check_hostname = False
+                _relay_ip, _relay_verify = spark_endpoint(LOCAL_IP)
+                ctx.check_hostname = _relay_verify
 
                 progress_state = {"sent": 0, "reported": 0}
 
@@ -7475,10 +7508,20 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             req.add_header("Authorization", auth)
                         req.add_header("Content-Type", "application/json")
                         
-                        # Bypass SSL verification for internal communication
-                        ctx = ssl.create_default_context()
+                        # Verified against the console certificate, which provisioning
+                        # generates once and installs on every node -- so this proves the
+                        # peer is a console in *this* cluster. It previously used
+                        # CERT_NONE while forwarding the caller's Cookie and
+                        # Authorization headers, so anything that could answer on
+                        # :8443 collected a live session and a reboot request.
+                        #
+                        # check_hostname stays off: the certificate is CN=Spectrum and is
+                        # deliberately the same on every node, so there is no per-node
+                        # name to match. Pinning the certificate is the identity check.
+                        ctx = ssl.create_default_context(
+                            ssl.Purpose.SERVER_AUTH,
+                            cafile="/etc/hci/spectrum/certs/server.crt")
                         ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
                         
                         with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
                             resp_data = response.read()
@@ -7833,45 +7876,6 @@ def get_catalyst_target_ip():
         return "127.0.0.1"
     return leader_ip
 
-def mimir_scheduler_loop():
-    # Wait for ScyllaDB and ZooKeeper to bootstrap on startup
-    time.sleep(30)
-    while True:
-        try:
-            if is_zookeeper_leader():
-                # Read schedules
-                cql = "SELECT JSON * FROM hydra.mimir_schedules;"
-                rc, stdout, stderr = run_cql_query(cql)
-                if rc == 0:
-                    schedules = []
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                schedules.append(json.loads(line))
-                            except Exception:
-                                pass
-                    
-                    now = int(time.time())
-                    for s in schedules:
-                        if s.get("enabled", False):
-                            name = s.get("schedule_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = 3600 if name == "hourly_checks" else 86400
-                            
-                            if now - last_run >= interval:
-                                print(f"[Mimir Scheduler] Triggering check: {name}...")
-                                # Update last_run_epoch first to prevent multiple runs
-                                cql_update = f"UPDATE hydra.mimir_schedules SET last_run_epoch = {now} WHERE schedule_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
-                                category = s.get("category", "all")
-                                run_cmd = f"/usr/local/bin/mcli health_checks run_all" if category == "all" else f"/usr/local/bin/mcli health_checks {category}"
-                                import threading
-                                threading.Thread(target=run_remote_spark, args=("127.0.0.1", run_cmd), daemon=True).start()
-        except Exception:
-            pass
-        time.sleep(60)
 
 def insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, output):
     clean_output = output.replace("'", "''").replace("\\", "\\\\")
@@ -7910,42 +7914,6 @@ def execute_dagur_job_thread(job_name, command):
         "time": "Just now"
     })
 
-def dagur_scheduler_loop():
-    # Wait for ScyllaDB and ZooKeeper to bootstrap on startup
-    time.sleep(30)
-    while True:
-        try:
-            if is_zookeeper_leader():
-                cql = "SELECT JSON * FROM hydra.dagur_schedules;"
-                rc, stdout, stderr = run_cql_query(cql)
-                if rc == 0:
-                    schedules = []
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                schedules.append(json.loads(line))
-                            except Exception:
-                                pass
-                    
-                    now = int(time.time())
-                    for s in schedules:
-                        if s.get("enabled", False):
-                            name = s.get("job_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = s.get("interval_seconds", 3600)
-                            command = s.get("command", "")
-                            
-                            if now - last_run >= interval:
-                                print(f"[Dagur Scheduler] Triggering job: {name}...")
-                                cql_update = f"UPDATE hydra.dagur_schedules SET last_run_epoch = {now} WHERE job_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
-                                t = threading.Thread(target=execute_dagur_job_thread, args=(name, command), daemon=True)
-                                t.start()
-        except Exception:
-            pass
-        time.sleep(10)
 
 def internal_token_verifier_loop():
     import socket
@@ -8000,27 +7968,62 @@ def internal_token_verifier_loop():
             except Exception:
                 pass
 
+def supervise(name, target, restart_delay=5.0, max_restart_delay=300.0):
+    """Run a background loop under a supervisor that restarts it if it dies.
+
+    Every long-running loop here was a bare daemon thread. A daemon thread that raises
+    prints a traceback to a log nobody tails and then simply stops existing -- the
+    process keeps serving, so nothing looks wrong, and the feature that thread provided
+    is silently gone until someone notices months later that reconciliation stopped or
+    metrics stopped being collected. That is the failure mode this exists for: not a
+    crash, but a quiet partial death.
+
+    Backoff is exponential and capped. A loop that fails instantly and forever -- an
+    unreachable database at boot, say -- must not become a restart storm that buries the
+    log and burns a core; but it must also keep trying, because the condition that broke
+    it is usually temporary.
+
+    The supervisor thread is itself a daemon, so the process still exits promptly.
+    """
+    def runner():
+        delay = restart_delay
+        while True:
+            started = time.time()
+            try:
+                target()
+                # A loop that returns has decided to stop. Respect that rather than
+                # spinning it back up.
+                print(f"[supervise] {name} returned; not restarting.")
+                return
+            except Exception as exc:
+                ran_for = time.time() - started
+                traceback.print_exc()
+                # Reset the backoff if it managed a decent run: a loop that dies after an
+                # hour is a different problem from one that cannot start at all.
+                if ran_for > max_restart_delay:
+                    delay = restart_delay
+                print(f"[supervise] {name} died after {ran_for:.0f}s ({exc!r}); "
+                      f"restarting in {delay:.0f}s.")
+                time.sleep(delay)
+                delay = min(delay * 2, max_restart_delay)
+
+    thread = threading.Thread(target=runner, name=f"supervise-{name}", daemon=True)
+    thread.start()
+    return thread
+
+
 def main():
-    # Start background VM state reconciliation thread
-    t = threading.Thread(target=db_reconcile_loop, daemon=True)
-    t.start()
+    # Background loops, each under a supervisor. See supervise() for why: a bare daemon
+    # thread that raises leaves the process healthy and the feature dead.
+    supervise("db_reconcile", db_reconcile_loop)
+    supervise("metrics_and_cluster_monitor", metrics_and_cluster_monitor_loop)
+    supervise("internal_token_verifier", internal_token_verifier_loop)
 
-    # Start background Mimir health checks scheduler thread
-    # t2 = threading.Thread(target=mimir_scheduler_loop, daemon=True)
-    # t2.start()
+    # The Mimir and Dagur scheduler loops are deliberately not started here. Catalyst
+    # owns both schedules and now claims each tick with a compare-and-swap; running a
+    # second scheduler over the same rows from the console would race it, and before the
+    # claim existed it double-submitted jobs outright.
 
-    # Start background Dagur central task runner scheduler thread
-    # t3 = threading.Thread(target=dagur_scheduler_loop, daemon=True)
-    # t3.start()
-    
-    # Start background metrics and cluster monitor loop thread
-    t4 = threading.Thread(target=metrics_and_cluster_monitor_loop, daemon=True)
-    t4.start()
-
-    # Start background internal console token verifier socket server
-    t5 = threading.Thread(target=internal_token_verifier_loop, daemon=True)
-    t5.start()
-    
     # 1. Initialize self-signed SSL certificates for web traffic
     cert_file, key_file = init_ssl()
     

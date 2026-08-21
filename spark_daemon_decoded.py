@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__build__ = "1.2.2"
+__build__ = "1.2.3"
 import sys
 import os
 import ssl
@@ -1470,6 +1470,204 @@ def drbd_peer_roles(resource):
                 if isinstance(connection, dict) and connection.get("peer-role"):
                     roles.append(connection["peer-role"])
     return roles
+
+
+# ---------------------------------------------------------------------------
+# Fencing
+#
+# Mipha fences a host before it restarts that host's VMs somewhere else. The fence it
+# used to send was a shell string --
+#
+#     systemctl stop libvirtd virtqemud || true; pkill -9 qemu || true
+#
+# -- whose every clause ends in `|| true`, so it exits 0 whatever happened, and whose
+# exit status was the only thing the caller checked. "The daemon accepted the request"
+# was being read as "no guest is running any more", and the two are not the same on a
+# host wedged enough to need fencing in the first place.
+#
+# This endpoint does the same work and then answers with the state it can actually
+# observe afterwards: guest processes still alive, DRBD resources still Primary, devices
+# still open. Mipha treats `fenced: false` and an unanswered request identically -- both
+# mean the host is not proven safe to fail over.
+#
+# The marker file is written before anything is demoted. Mipha's storage loop re-promotes
+# linstor-db and the container resources within two seconds on whichever node holds
+# ZooKeeper leadership, so a fence that demotes first would be undone before it finished.
+# ---------------------------------------------------------------------------
+
+FENCE_MARKER_PATH = "/run/hci/mipha-self-fence.json"
+
+# Mount points Mipha's storage loop puts on top of DRBD devices. A resource cannot be
+# demoted while a filesystem sits on it, and the list is fixed rather than derived so a
+# fence never unmounts something it did not put there.
+FENCE_MOUNTS = ("/var/lib/linstor",
+                "/var/lib/hci/aether/volumes/default-vm-container",
+                "/var/lib/hci/aether/volumes/default-image-container")
+
+
+def qemu_process_ids():
+    """PIDs of the guest processes running on this host, read from /proc.
+
+    Not pkill: pkill's exit status reports whether its pattern matched anything, which
+    says nothing about what is left running once it has finished.
+    """
+    found = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry, "r") as handle:
+                if handle.read().strip().startswith("qemu"):
+                    found.append(int(entry))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def drbd_local_resources():
+    """[(name, role, [open volume numbers])] per loaded resource; None if unreadable.
+
+    None is deliberately distinct from []: "this host has no DRBD resources" and "this
+    host's DRBD state could not be read" must not produce the same fence verdict.
+    """
+    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json"], timeout=30)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(stdout.strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    resources = []
+    for entry in data:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        opened = [str(device.get("volume", 0))
+                  for device in (entry.get("devices") or [])
+                  if isinstance(device, dict) and device.get("open")]
+        resources.append((entry["name"], str(entry.get("role", "")), opened))
+    return resources
+
+
+def write_fence_marker(reason, report):
+    """Record that this host is fenced, where its own Mipha will see it.
+
+    On tmpfs on purpose: a reboot ends the fence, because a rebooted host is not running
+    the guests any more.
+    """
+    try:
+        os.makedirs(os.path.dirname(FENCE_MARKER_PATH), exist_ok=True)
+        with open(FENCE_MARKER_PATH, "w") as handle:
+            json.dump({"reason": reason, "at": time.time(), "report": report}, handle)
+        return True
+    except OSError:
+        return False
+
+
+def fence_this_host():
+    """Stop every guest, release every DRBD device, and report what is *still* held.
+
+    The return value is evidence, not a receipt. `fenced` is true only when nothing is
+    left: no guest process, no Primary resource, no open device. A DRBD state that could
+    not be read is `fenced: false` -- an unreadable answer is not a good one.
+    """
+    report = {"fenced": False, "libvirt_active": False, "qemu_pids": [],
+              "primary_resources": [], "open_devices": [], "actions": [], "detail": ""}
+
+    write_fence_marker("fenced through the Spark API", {})
+
+    # 1. Ask libvirt to stop its domains first. A destroy releases the DRBD device
+    #    through the normal path and leaves libvirt's own state consistent; the SIGKILL
+    #    below is the fallback for when libvirt is part of what has failed.
+    rc, stdout, _ = run_argv(VIRSH + ["list", "--name", "--state-running"], timeout=30)
+    if rc == 0:
+        for name in [line.strip() for line in stdout.splitlines() if line.strip()]:
+            rc_d, out_d, err_d = run_argv(VIRSH + ["destroy", name], timeout=60)
+            report["actions"].append("destroy %s: %s" % (
+                name, "ok" if rc_d == 0 else (err_d or out_d).strip()[:120]))
+    else:
+        report["actions"].append(
+            "virsh could not list running domains; killing guest processes directly")
+
+    # 2. Stop libvirt so nothing restarts a domain behind the fence.
+    for unit in ("libvirtd", "virtqemud", "libvirtd.socket", "virtqemud.socket"):
+        run_argv(["systemctl", "stop", unit], timeout=60)
+    _rc_a, out_a, _err_a = run_argv(["systemctl", "is-active", "libvirtd"], timeout=15)
+    report["libvirt_active"] = out_a.strip() == "active"
+
+    # 3. SIGKILL whatever survived, then look again rather than assuming.
+    for _attempt in range(3):
+        pids = qemu_process_ids()
+        if not pids:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        time.sleep(2)
+    report["qemu_pids"] = qemu_process_ids()
+
+    # 4. Drop the filesystems this host's storage loop mounted on DRBD devices; a
+    #    resource cannot go Secondary underneath a mount.
+    if run_argv(["mountpoint", "-q", FENCE_MOUNTS[0]], timeout=15)[0] == 0:
+        run_argv(["systemctl", "stop", "linstor-controller"], timeout=60)
+    for mount in FENCE_MOUNTS:
+        if run_argv(["mountpoint", "-q", mount], timeout=15)[0] != 0:
+            continue
+        rc_u, out_u, err_u = run_argv(["umount", "-l", mount], timeout=60)
+        report["actions"].append("umount %s: %s" % (
+            mount, "ok" if rc_u == 0 else (err_u or out_u).strip()[:120]))
+
+    # 5. Give up Primary on everything. Checked, and never --force: a demotion that is
+    #    refused is exactly the information the caller needs, and forcing it past a
+    #    process that still holds the device would not make that process stop writing.
+    resources = drbd_local_resources()
+    if resources is None:
+        report["detail"] = ("guest processes were stopped, but drbdsetup did not answer, "
+                            "so it cannot be shown that this host released its disks")
+        return report
+    for name, role, _opened in resources:
+        if role.lower() != "primary":
+            continue
+        rc_s, out_s, err_s = run_argv(["drbdadm", "secondary", name], timeout=60)
+        report["actions"].append("secondary %s: %s" % (
+            name, "ok" if rc_s == 0 else (err_s or out_s).strip()[:120]))
+
+    after = drbd_local_resources()
+    if after is None:
+        report["detail"] = ("demotions were issued, but drbdsetup did not answer "
+                            "afterwards, so the result could not be read back")
+        return report
+    report["primary_resources"] = [name for name, role, _o in after
+                                   if role.lower() == "primary"]
+    report["open_devices"] = ["%s/%s" % (name, volume)
+                              for name, _role, opened in after for volume in opened]
+
+    report["fenced"] = (not report["qemu_pids"]
+                        and not report["primary_resources"]
+                        and not report["open_devices"])
+    if report["fenced"]:
+        report["detail"] = ("no guest process, no Primary DRBD resource and no open DRBD "
+                            "device remain on this host")
+    else:
+        parts = []
+        if report["qemu_pids"]:
+            parts.append("guest processes still running: %s" % report["qemu_pids"])
+        if report["primary_resources"]:
+            parts.append("still Primary on %s" % ", ".join(report["primary_resources"]))
+        if report["open_devices"]:
+            parts.append("devices still open: %s" % ", ".join(report["open_devices"]))
+        report["detail"] = "the fence did not take -- " + "; ".join(parts)
+
+    write_fence_marker("fenced through the Spark API",
+                       {"fenced": report["fenced"], "detail": report["detail"]})
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -3162,6 +3360,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/storage/container/mounted":
             self.handle_storage_container_mounted(parsed)
             return True
+        if path == "/api/v1/storage/drbd/options":
+            self.handle_storage_drbd_options(parsed)
+            return True
         if path == "/api/v1/storage/linstor/resources":
             self.handle_storage_linstor_resources(parsed)
             return True
@@ -3235,6 +3436,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/host/reboot":
             self.handle_host_reboot()
+            return True
+        if path == "/api/v1/host/fence":
+            self.handle_host_fence()
             return True
         if path == "/api/v1/db/repair":
             self.handle_db_repair()
@@ -3452,6 +3656,37 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if any(peer.lower() == "primary" for peer in drbd_peer_roles(resource)):
             message = "Peer already holds Primary for %s. %s" % (resource, message)
         self.send_json_response(409, {"role": resulting or "Unknown", "error": message})
+
+    def handle_storage_drbd_options(self, parsed):
+        """The *configured* resource options, which `drbdsetup status` does not carry.
+
+        This exists for fencing. A device's `quorum` flag in the status document reads
+        true both when quorum is held and when quorum is switched off altogether, so a
+        caller that only had the status could not tell "we hold the majority" from "this
+        cluster has no quorum at all" -- and those have opposite consequences for whether
+        a partitioned peer has stopped writing.
+        """
+        resource = self.query_param(parsed, "resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        rc, stdout, stderr = run_argv(["drbdsetup", "show", "--json", resource], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "drbdsetup show failed", 404)
+            return
+        try:
+            shown = json.loads(stdout.strip() or "[]")
+        except Exception:
+            self.reject("Could not parse drbdsetup show output", 500)
+            return
+        for entry in shown if isinstance(shown, list) else []:
+            if isinstance(entry, dict) and entry.get("resource") == resource:
+                options = entry.get("options")
+                self.send_json_response(200, {
+                    "resource": resource,
+                    "options": options if isinstance(options, dict) else {}})
+                return
+        self.reject("drbdsetup show returned no options for " + resource, 404)
 
     def handle_storage_device(self, parsed):
         raw_path = self.query_param(parsed, "path")
@@ -3899,6 +4134,24 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return
         schedule_host_reboot()
         self.send_json_response(200, {"rebooting": True})
+
+    def handle_host_fence(self):
+        """Fence this host and answer with the state that can be observed afterwards.
+
+        409 rather than 200 when the fence did not take, per the typed API's rule that a
+        409 means "the operation did not take" and carries the state key that says so.
+        The body is the same either way, because the body *is* the evidence: a caller
+        that cannot read it must treat the request as failed.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        if payload.get("confirm") is not True:
+            self.reject('Fencing this host requires {"confirm": true}')
+            return
+        report = fence_this_host()
+        self.send_json_response(200 if report.get("fenced") else 409, report)
 
     # -- Database ------------------------------------------------------
 

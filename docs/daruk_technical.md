@@ -194,6 +194,10 @@ conditional statement as text at all. It is there so the class cannot come back 
 time somebody appends `IF ...` to an existing call and the tests still pass.
 
 > [!NOTE]
-> `replace_run_cql.py` regenerates `run_cql_query()` across the tree from a hardcoded
-> template that has no guard, and its `static_dir` points at a path that no longer exists.
-> Re-running it would silently revert this in every file it touches.
+> `replace_run_cql.py` used to regenerate `run_cql_query()` across the tree from a
+> hardcoded, guard-less template, so re-running it silently reverted the
+> conditional-write guard everywhere. It has been deleted: its `static_dir` pointed
+> at a path from a different machine, so it had not been runnable for some time, and
+> a generator that can silently undo a safety check is not worth keeping. There are
+> still several hand-maintained copies of `run_cql_query`; consolidating them into one
+> module is tracked in TODO.md.

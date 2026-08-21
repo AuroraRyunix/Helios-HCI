@@ -88,6 +88,25 @@ Hydra stores:
 
 The schema is declared once, in order, in `helios_schema.py`, and applied behind a lock.
 
+### Backup
+
+Hydra is the only place the cluster records what its DRBD volumes *are*. The volumes are
+replicated and survive a host loss; the mapping from volume to VM, its placement, its
+network and its NVRAM is not replicated anywhere else. Losing the keyspace leaves a pile
+of anonymous block devices.
+
+`saga` snapshots the keyspace with `nodetool snapshot` and archives the SSTables, the
+keyspace definition and the migration ledger to an operator-supplied external target,
+alongside the LINSTOR controller database and `/etc/hci`. A restore refuses to load
+SSTables into a schema whose `hydra.schema_migrations` does not match the artefact's.
+
+Note that `nodetool snapshot` is **per node**: a node's snapshot holds only the SSTables
+for the token ranges it replicates, and RF is not fixed at 3 (see §2). One artefact per
+node, taken together, is the unit of recovery.
+
+See [backup_restore.md](./backup_restore.md) — including what it deliberately does not
+cover.
+
 ---
 
 ## Sample Podman Quadlet / Run Definition

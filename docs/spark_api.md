@@ -85,6 +85,8 @@ temp file and calls `virsh define` on that path.
 | GET | `/api/v1/storage/linstor/resources` | `?resource=` (optional) | `{"resources":[{"name","size_kib","size_gib","nodes","device_path"}]}` |
 | POST | `/api/v1/storage/linstor/resource` | `{"resource", "size_gib"\|"size_kib", "nodes"?, "storage_pool"?, "allow_two_primaries"?}` | `{"resource","created":bool,"size_kib","device_path",...}` |
 | POST | `/api/v1/storage/linstor/resource/delete` | `{"resource"}` | `{"resource","deleted":bool}` |
+| GET | `/api/v1/storage/drbd/options` | `?resource=` | `{"resource","options":{...}}` |
+| POST | `/api/v1/host/fence` | `{"confirm":true}` | 200 with a verification report, or 409 |
 
 `path` must resolve under `/dev/drbd/` or `/var/lib/hci/aether/`. `owner` is an allowlist
 (`root:qemu`, `root:root`), `mode` an octal string from an allowlist. Promotion returns the
@@ -109,6 +111,19 @@ abandons an upload must close the connection *before* trying to delete the resou
 LINSTOR refuses with "resource is still in use" and the rollback leaks the storage it was
 meant to reclaim. Release is asynchronous, so the delete also has to be retried; see
 `SpectrumPhx.Images.rollback_upload/1`.
+
+`drbd/options` exists because `drbdsetup status --json` reports `"quorum": true` both
+when a majority is genuinely held **and when quorum is switched off entirely** -- verified
+on a live cluster, where every resource reported `"quorum": true` in status while
+`drbdsetup show` said `"quorum": "off"`. Storage fencing rests on quorum being armed, so
+it has to read the configured options rather than the status.
+
+`host/fence` asks a host to take itself out of service and **reads back what it produced**:
+no guest process, no open DRBD device, no resource held Primary. It returns that report
+rather than a bare success, because the previous fence was a shell string whose every
+clause ended in `|| true` and whose exit status the caller discarded -- so a host that had
+gone silent, the exact case fencing exists for, was recorded as fenced on no evidence.
+A fence that cannot be confirmed is a failure; see [fencing.md](./fencing.md).
 
 `linstor/resource` creates a resource definition, a volume definition, placement on every
 node and the DRBD options as **one idempotent operation**. The four commands are

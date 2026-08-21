@@ -48,11 +48,31 @@ def is_valid_object_name(name):
 
 
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -64,10 +84,11 @@ def run_remote_spark(ip, command):
         return -1, "", str(e)
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -726,7 +747,9 @@ def get_vm_disk_size(vm_name):
                             return int(val * 1024)
                         except:
                             pass
-    return 51200
+    # Unknown, not "50 GiB". A guessed size that happens to fit lets a migration proceed
+    # onto a target that cannot hold the disk.
+    return None
 
 def get_linstor_free_space(target_ip):
     ips = []
@@ -739,27 +762,52 @@ def get_linstor_free_space(target_ip):
     if not ips:
         ips = ["127.0.0.1"]
     controllers_str = ",".join(ips)
-    cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor storage-pool list"
+    # --machine-readable. The human table was parsed by scanning cells for one containing
+    # "/", which hit "vg_aether/thin_pool_aether" -- the backing volume group, printed
+    # before the capacity columns -- and fell through to the fallback on every real
+    # cluster. Since the gate only refuses when the disk is *larger* than this number, a
+    # fallback of 999999 MiB meant it refused nothing, ever.
+    cmd = (f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether "
+           f"linstor -m --output-version v1 storage-pool list")
     rc, stdout, _ = run_remote_spark(target_ip, cmd)
-    if rc == 0 and stdout:
-        for line in stdout.splitlines():
-            if "default-pool" in line or "lvm_thin" in line or "thin" in line:
-                parts = line.split("|")
-                for p in parts:
-                    if "/" in p:
-                        try:
-                            free_str = p.split("/")[0].strip()
-                            val = float(free_str.split()[0])
-                            unit = free_str.split()[1].lower()
-                            if "gib" in unit:
-                                return int(val * 1024)
-                            elif "tib" in unit:
-                                return int(val * 1024 * 1024)
-                            elif "mib" in unit:
-                                return int(val)
-                        except:
-                            pass
-    return 999999
+    if rc != 0 or not stdout:
+        return None
+
+    # LINSTOR reports capacities in KiB. Diskless pools report INT64_MAX, which averaged
+    # or summed into a total makes a full fabric look empty, so they are skipped.
+    best = None
+    try:
+        payload = json.loads(stdout)
+    except Exception:
+        return None
+    for entry in _iter_storage_pools(payload):
+        if entry.get("provider_kind") in ("DISKLESS", "diskless"):
+            continue
+        free_kib = entry.get("free_capacity")
+        if not isinstance(free_kib, int) or free_kib < 0 or free_kib > (1 << 60):
+            continue
+        free_mib = free_kib // 1024
+        best = free_mib if best is None else min(best, free_mib)
+    return best
+
+
+def _iter_storage_pools(payload):
+    """Yield storage-pool dicts from whatever shape the client emits.
+
+    Piraeus wraps them inconsistently between versions -- sometimes a bare list of lists,
+    sometimes a dict under a key. Reading only one shape is how the resource list came
+    back empty while resources existed.
+    """
+    stack = [payload]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if "free_capacity" in item or "storage_pool_name" in item:
+                yield item
+                continue
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
 
 def get_vm_xml_specs(name):
     cql = f"SELECT JSON * FROM hydra.vms WHERE name = '{name}';"
@@ -1461,9 +1509,20 @@ def process_queue_task(task):
             if avail_mb < memory_needed:
                 return False, f"Target host {target_host} has insufficient free memory ({int(avail_mb)} MB available, needs {memory_needed} MB)."
 
-            # Storage capacity gate check
+            # Storage capacity gate. Either input being unknown refuses the migration
+            # rather than waving it through: both used to fall back to a constant, and
+            # the free-space constant was large enough that the gate never refused
+            # anything at all.
             disk_size = get_vm_disk_size(vm_name)
+            if disk_size is None:
+                return False, (f"Refusing to migrate {vm_name}: its disk size could not be "
+                               f"determined, so there is no way to tell whether "
+                               f"{target_host} can hold it.")
             target_free = get_linstor_free_space(target_ip)
+            if target_free is None:
+                return False, (f"Refusing to migrate {vm_name}: the free storage on "
+                               f"{target_host} could not be read, so the capacity check "
+                               f"cannot be made.")
             if target_free < disk_size:
                 return False, f"Target host {target_host} has insufficient free Linstor storage pool space ({target_free} MiB available, needs {disk_size} MiB)."
 

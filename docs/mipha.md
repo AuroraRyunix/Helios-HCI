@@ -16,13 +16,19 @@ graph TD
     LeaderCheck{Is ZooKeeper Leader?} -->|No| Follower[Idle Follower Mode]
     LeaderCheck -->|Yes| ActiveLeader[Active Leader Coordinator]
     ActiveLeader -->|Poll every 10s| HealthCheck[Ping & Spark API Node Status]
-    HealthCheck -->|3 Consecutive Failures| NodeDown[Mark Host DOWN in ScyllaDB]
+    HealthCheck -->|3 Consecutive Failures, or host reports FENCED| Fence[Fence ladder: self / spark / BMC / storage]
+    Fence -->|Not confirmed| Refuse[Mark DOWN, refuse the failover, fail the Catalyst task]
+    Fence -->|Confirmed| NodeDown[Mark Host DOWN in ScyllaDB]
     NodeDown -->|Wait for ZK & Vali Re-election| PollVali[Poll Vali API on port 9095]
     PollVali -->|Unresponsive| RestartVali[Restart Vali via Spark API] --> PollVali
     PollVali -->|Vali Active| FailoverVMs[Query Dead Host VMs in ScyllaDB]
-    FailoverVMs -->|Reset state & host| SubmitTasks[Submit Start Task to Catalyst]
+    FailoverVMs -->|Conditional release| SubmitTasks[Submit Start Task to Catalyst]
     SubmitTasks -->|Vali schedules VM| BootVM[VM Powered On on Healthy Host]
 ```
+
+Every host, leader or not, also runs a **local subsystem watchdog** that can take the host
+out of service by itself when its storage or hypervisor fails while its network keeps
+answering. See [fencing.md](./fencing.md).
 
 ---
 
@@ -34,6 +40,12 @@ The active Mipha leader monitors all hosts defined in `/etc/hci/cluster.json`. E
 2. **Spark Daemon Query:** Checks if the Spark mTLS endpoint (`https://<ip>:9099/api/v1/node/status`) is responding.
 
 A node is declared **OFFLINE** only if both checks fail for 3 consecutive intervals (30 seconds).
+
+Neither check sees a host whose *storage* or *libvirt* has died while its network stack
+keeps answering, which is why every host also runs the local watchdog described in
+[fencing.md §7](./fencing.md#7-self-fencing). A host that fences itself publishes
+`hydra.nodes.status = FENCED`, and that is a second, independent failover trigger — the
+leader acts on it without waiting for a health check that will never fail.
 
 ### B. Node State Reconcile
 Once a node is declared offline, Mipha marks it `DOWN` through Daruk's
@@ -84,6 +96,34 @@ Before executing VM recovery, Mipha actively verifies that the management plane 
 1. **ZooKeeper Leader Resolution:** It queries ZK ports across the surviving nodes to verify that a ZooKeeper leader has successfully been established.
 2. **Vali Active Polling:** It queries Vali's API (`http://<leader_ip>:9095/api/v1/hosts`) on the leader node.
 3. **Vali Watchdog:** If Vali is unresponsive, Mipha issues remote Spark commands to restart `vali.service` and continues polling until Vali responds with HTTP 200.
+
+### C2. Fencing — and refusing to fail over without one
+
+Nothing below happens until a fence has been **confirmed**. `fence_host()` tries four
+methods in order and each must read back the state it claims to have produced:
+
+| Rung | Confirms when |
+| :--- | :--- |
+| `self` | the host already fenced itself and recorded `FENCED` in `hydra.nodes` |
+| `spark` | `POST /api/v1/host/fence` reports no guest process, no open DRBD device and no Primary resource |
+| `bmc` | `ipmitool chassis power status` reads `off` after a power-off |
+| `storage` | every resource the host backs is quorate here and disconnected there, so DRBD is already failing its writes |
+
+A host already confirmed fenced during this outage is not fenced again; a fence that
+*failed* is retried on the next pass.
+
+If no rung confirms, the default `unconfirmed_fence_policy: "block"` marks the host `DOWN`
+— which stops Vali placing new work there — and then **stops**. Nothing is released and
+nothing is restarted, the Catalyst parent task is marked `failed` with the reason, and the
+failover starts by itself once the operator powers the host off or arms DRBD quorum.
+
+This replaces `ssh_fence_host()`, which sent a shell string whose every clause ended in
+`|| true` (so its exit status was 0 whatever happened), discarded that status anyway, and
+only ran at all when the host still answered ping — meaning a host that had gone silent
+was assumed dead on no evidence.
+
+Credentials, thresholds, exactly what each rung proves, and **what remains unsafe** are in
+[fencing.md](./fencing.md).
 
 ### D. VM Failover Execution
 Once the management plane is confirmed to be healthy, Mipha retrieves all virtual machines that were running on the crashed host:
@@ -140,18 +180,31 @@ journalctl -u mipha -f --no-pager
 systemctl restart mipha
 ```
 
-### B. Simulating a Host Failover
+### B. Fencing
+```bash
+# What fencing this host could actually perform, and what it could not.
+# Run it before you rely on HA, not after a failover has been refused.
+mipha --fence-status
+
+# Return a host that fenced itself to service, from that host.
+mipha --clear-self-fence
+```
+
+### C. Simulating a Host Failover
 To simulate a host crash and observe Mipha's recovery orchestration:
-1. Stop the target host's Spark Daemon and block network access (or shut down the host).
-2. Monitor Mipha logs on the active leader:
+1. Check first that a fence can be confirmed at all — `mipha --fence-status` on the leader.
+   With no BMC and no DRBD quorum the failover will be refused by design, and the
+   simulation will show you that refusal rather than a failover.
+2. Stop the target host's Spark Daemon and block network access (or shut down the host).
+3. Monitor Mipha logs on the active leader:
    ```bash
    journalctl -u mipha -n 50 --no-pager
    ```
-3. Verify that the dead host is marked `DOWN` in ScyllaDB:
+4. Verify that the dead host is marked `DOWN` in ScyllaDB:
    ```bash
    valcli db.query "SELECT hostname, ip, status FROM hydra.nodes;"
    ```
-4. Verify that the VMs previously on the dead host are moved to another node and are now in the `Running` state:
+5. Verify that the VMs previously on the dead host are moved to another node and are now in the `Running` state:
    ```bash
    valcli vm.list
    ```
@@ -162,3 +215,7 @@ To simulate a host crash and observe Mipha's recovery orchestration:
 ## Technical Reference
 
 For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./mipha_technical.md).
+
+For fencing — the ladder, where BMC credentials live, what DRBD quorum does and does not
+prove, self-fencing, and the cases that are still not safe — see
+[fencing.md](./fencing.md).

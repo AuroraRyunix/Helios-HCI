@@ -51,6 +51,7 @@ Every service below is named after its Nutanix analog (see the table in the top-
 | `check_updates.py`, `create_upgrade_zip.py`, `deploy_updates.py` | Update pipeline: check for a newer version → build an upgrade zip → push it to nodes. |
 | `push_to_github.py` | Manual GitHub Contents-API uploader (reads `GITHUB_TOKEN` from the environment). |
 | `test_hylia.py` | `unittest` suite for `hylia.py`. |
+| `saga.py` | Metadata backup/restore (`backup`/`list`/`verify`/`restore`/`prune`/`snapshots`/`target`). Snapshots the `hydra` keyspace with `nodetool snapshot`, captures the Linstor controller DB and `/etc/hci`, and archives them to an operator-supplied external target. Talks to `cqlsh`/`nodetool` directly rather than through Daruk, because the restore path must work when the metadata layer is what is broken. `valcli backup.*` are pass-throughs. See [backup_restore.md](./backup_restore.md). |
 | `nodetool` | Thin wrapper: `podman exec`s into the ScyllaDB container to run the real `nodetool`. |
 | `allssh` | Fan-out mTLS command executor across all cluster nodes. |
 | `agahnim/` (Rust) | WebSocket console-proxy sidecar for VNC/SPICE, runs as a native `systemd` unit built from source on each node (**not** a Quadlet container — see the note in §3). |
@@ -99,7 +100,7 @@ Client → Slate (Traefik, :443) → Spectrum (spectrum_server.py, WebUI/API)
 
 ## 5. Build / test commands that actually exist
 
-* **Run the test suite**: `python -m unittest test_hylia.py` (verified — passes 2 tests against the current `hylia.py`). This is the only automated test file in the repo.
+* **Run the test suite**: `python -m unittest discover -p 'test_*.py'`, or one file at a time, e.g. `python -m unittest test_hylia` or `python -m unittest test_saga_backup` (46 tests covering backup/restore, retention and artefact integrity). The root `test_*.py` files are plain `unittest`; several use hand-written fakes rather than mocking, so they run with no cluster and no third-party packages.
 * **Syntax-check a script after editing it**: `python -m py_compile <file>.py` (no linter or formatter config exists in the repo).
 * **Build the Rust console proxy**: `cd agahnim && cargo build --release` (this is exactly what `provision.py` does remotely on each node — there's no prebuilt binary checked in).
 * **Build the Spectrum container image**: see §6 — do not `podman build` straight off the checked-out `Dockerfile` in this repo root; it expects a `server.py` that only exists in the temporary build context `provision.py`/`deploy_updates.py` construct.

@@ -283,6 +283,7 @@ def collect_inventory():
         components_paths = {
             "spark": "/usr/local/bin/spark",
             "impa": "/usr/local/bin/impa",
+            "saga": "/usr/local/bin/saga",
             "helios-schema": "/usr/local/bin/helios_schema.py",
             "spark-daemon": "/usr/local/bin/spark-daemon",
             "bifrost": "/usr/local/bin/bifrost",

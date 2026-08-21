@@ -67,10 +67,31 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    local = globals().get("LOCAL_IP")
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")

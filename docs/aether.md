@@ -61,6 +61,35 @@ To maximize storage I/O performance and support enterprise features, Aether runs
 
 ---
 
+## Backup: the controller database, not the volumes
+
+Two different things, and conflating them is the mistake worth avoiding.
+
+**The Linstor controller database is backed up.** `/var/lib/linstor/linstordb.mv.db` is
+the only record of each DRBD resource's port, minor, node-id, placement and volume
+definitions. The LVM metadata on each host and the DRBD on-disk metadata *technically*
+contain enough to reverse-engineer it; in practice that is days of archaeology per
+resource with a live risk of attaching the wrong replica set to the wrong volume. `saga`
+captures it with `linstor controller backupdb`, on the node running the controller —
+which is the only node it exists on.
+
+Note that `linstor controller backupdb` writes its output into the controller's own
+`/var/lib/linstor`, which in Helios is the `linstor-db` DRBD volume: it puts the backup
+on the volume being backed up. Saga moves it off and deletes the original in the same
+step; left alone it grows the HA volume by a copy of itself on every run.
+
+**Guest data on the DRBD volumes is NOT backed up.** DRBD replication protects against a
+host failing. It does not protect against a guest filesystem corrupting, a VM being
+deleted, or the storage tier being lost on every replica — a synchronous replica of a
+corrupted block is a corrupted block. There is no snapshot schedule, no changed-block
+tracking and no off-site volume replication in Helios today. Linstor's own
+`linstor snapshot` and `linstor backup ship` (to an S3 remote) can do this and are not
+currently driven by anything here.
+
+See [backup_restore.md](./backup_restore.md).
+
+---
+
 ## Command Examples & Storage Administration
 
 ### A. Querying Linstor Controller Status

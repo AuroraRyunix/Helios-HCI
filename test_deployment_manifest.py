@@ -372,5 +372,32 @@ class QuadletPrivilegeTest(unittest.TestCase):
                     f"{name}.container is privileged with no comment saying why")
 
 
+class WorkflowTestDiscoveryTest(unittest.TestCase):
+    """CI must discover test files, not enumerate them.
+
+    The unit-test step used to name every file. Adding a suite and forgetting to add it
+    there meant the suite simply never ran -- silently, with CI still green. Two were
+    missing when this was noticed, one of them covering fencing.
+    """
+
+    def test_ci_discovers_tests_rather_than_naming_them(self):
+        path = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+        content = read_text(path)
+        step = [l for l in content.splitlines() if "python -m unittest" in l]
+        self.assertTrue(step, "no unittest step in ci.yml")
+        for line in step:
+            self.assertIn("discover", line,
+                          "the unit-test step enumerates files; a new suite would not run")
+            self.assertNotRegex(
+                line, r"test_\w+\.py",
+                "the unit-test step still names individual test files")
+
+    def test_every_test_file_would_be_discovered(self):
+        # Discovery uses the pattern in ci.yml; a file outside it is invisible.
+        names = [f for f in os.listdir(REPO_ROOT)
+                 if f.startswith("test_") and f.endswith(".py")]
+        self.assertGreater(len(names), 10, "test files seem to have gone missing")
+
+
 if __name__ == "__main__":
     unittest.main()

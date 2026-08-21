@@ -34,8 +34,12 @@ jobs:
         # every node at provisioning time.
         run: python -m compileall -q $(git ls-files '*.py') mcli mcli-runner catcli nodetool allssh
 
+      # Discovery, not an enumerated list. The list silently lost coverage every time
+      # a test file was added and nobody remembered to name it here -- two suites were
+      # missing when this was changed. A test in test_deployment_manifest.py asserts
+      # this step never goes back to naming files.
       - name: Unit tests
-        run: python -m unittest test_hylia.py test_deployment_manifest.py test_spark_daemon.py test_update_signature.py test_helios_schema.py test_mtls_lifecycle.py test_daruk_lwt.py test_internal_api_auth.py test_ring_lifecycle.py test_mimir_results.py test_conditional_writes.py test_spectrum_data_layer.py test_urbosa_reclaim.py -v
+        run: python -m unittest discover -p 'test_*.py' -v
 
   elixir:
     name: Elixir (spectrum_phx)

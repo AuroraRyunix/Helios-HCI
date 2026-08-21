@@ -45,6 +45,30 @@ def read(name):
     return io.open(os.path.join(HERE, name), encoding="utf-8").read()
 
 
+def reported_checks(runner_source):
+    """Every check name `mcli-runner` writes into its results dict.
+
+    Not all of them are literals. The per-service loop writes `results[f"{svc}_status"]`
+    for each name in its `svcs` list, and a scan for quoted keys cannot see those -- which
+    is how `hylia_status` came to be the one check with no entry in CHECK_ID_TO_FUNC. It
+    was written to the invoked scope's partition and deleted again by the
+    legacy-partition cleanup seconds later, in the same run, on every run, and never
+    appeared in either console.
+    """
+    reported = set(re.findall(r'results\["([a-z0-9_.-]+)"\]', runner_source))
+    for match in re.finditer(r'results\[f"\{(\w+)\}_status"\]', runner_source):
+        loop_var = match.group(1)
+        # The list the loop iterates, declared as `svcs = [...]` above it.
+        for names in re.findall(r"^\s*%ss?\s*=\s*\[(.*?)\]" % loop_var,
+                                runner_source[:match.start()], re.S | re.M):
+            for svc in re.findall(r'"([a-z0-9_.-]+)"', names):
+                reported.add(svc + "_status")
+    # The same loop appends this one conditionally.
+    if 'svcs.append("urbosa")' in runner_source:
+        reported.add("urbosa_status")
+    return reported
+
+
 class CategoryPartitionTests(unittest.TestCase):
     """`category` is the partition key, so what goes in it decides duplication."""
 
@@ -82,9 +106,7 @@ class CategoryPartitionTests(unittest.TestCase):
     def test_the_map_covers_the_checks_the_runner_reports(self):
         # A check missing from the map falls back to the invoked category, which
         # reintroduces the duplication for that check alone -- the hardest kind to spot.
-        runner = read("mcli-runner")
-        reported = set(re.findall(r'results\["([a-z0-9_]+)"\]', runner))
-        missing = sorted(reported - set(self.map))
+        missing = sorted(reported_checks(read("mcli-runner")) - set(self.map))
         self.assertEqual(missing, [], "these checks have no category and would duplicate")
 
 

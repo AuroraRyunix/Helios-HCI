@@ -1,5 +1,8 @@
 # __build__="1.2.2"
-FROM docker.io/library/python:3.11-slim
+# Overridable for air-gapped or mirrored builds, matching spectrum_phx's Dockerfile:
+#   podman build --build-arg BASE_IMAGE=mirror.local:5000/library/python:3.11-slim .
+ARG BASE_IMAGE=docker.io/library/python:3.11-slim
+FROM ${BASE_IMAGE}
 RUN apt-get update && apt-get install -y libvirt-clients qemu-utils procps openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 # The repository's filename, renamed on the way in. It used to be `COPY server.py .`,

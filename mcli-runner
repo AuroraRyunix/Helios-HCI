@@ -4,6 +4,7 @@ import subprocess
 import json
 import os
 import re
+import shlex
 import time
 
 def run_cmd(cmd):
@@ -66,23 +67,10 @@ def load_mimir_module():
     the failure surfaces as `'NoneType' object has no attribute 'loader'` rather than
     anything resembling "cannot import". The same applies to every deployed CLI here.
     """
-    candidates = ["/usr/local/bin/mimir",
-                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "mimir.py")]
-    for candidate in candidates:
-        if not os.path.exists(candidate):
-            continue
-        try:
-            import importlib.util
-            from importlib.machinery import SourceFileLoader
-
-            loader = SourceFileLoader("mimir_checks", candidate)
-            spec = importlib.util.spec_from_loader(loader.name, loader)
-            module = importlib.util.module_from_spec(spec)
-            loader.exec_module(module)
-            return module
-        except Exception:
-            return None
-    return None
+    return load_deployed_module(
+        "mimir_checks",
+        ["/usr/local/bin/mimir",
+         os.path.join(os.path.dirname(os.path.abspath(__file__)), "mimir.py")])
 
 
 def survey_certs_via_mimir():
@@ -161,6 +149,76 @@ MAINTENANCE_FLAG = "/etc/hci/maintenance.state"
 CERT_WARN_DAYS = 30
 CERT_FAIL_DAYS = 7
 MTLS_CERT_DIRS = ["/etc/hci/spark/certs", "/root/.certs"]
+
+# --- spark-daemon watchdog -------------------------------------------------------------
+# The watchdog is a `while True` inside a daemon thread in spark-daemon, sleeping this
+# long between passes. It publishes no heartbeat, so everything below infers it.
+WATCHDOG_INTERVAL = 30
+# The autostart sequence ahead of the loop polls ZooKeeper and the settings sync with
+# sleeps; on a slow node it can take a minute or more before the loop is entered.
+WATCHDOG_STARTUP_GRACE = 180
+# Three missed passes. Below that, a unit could simply be between `systemctl start` and
+# `active`, and calling that a watchdog failure would fire on every ordinary restart.
+WATCHDOG_DOWN_GRACE = 3 * WATCHDOG_INTERVAL
+# The window searched for the loop's startup announcement. Wide enough that a slow
+# autostart is not mistaken for a thread that never reached the loop.
+WATCHDOG_JOURNAL_WINDOW = 3600
+# Every probe this check makes is bounded. A wedged ZooKeeper container or a very large
+# journal must not turn a diagnostic into the thing that hangs.
+WATCHDOG_PROBE_TIMEOUT = 30
+# Exactly the units spark-daemon's watchdog restarts. This check is about that loop's
+# behaviour, so a unit it does not supervise (zookeeper, libvirtd, linstor-controller)
+# must not appear here -- their absence is somebody else's verdict.
+WATCHDOG_SERVICES = ["hydra-db", "daruk", "aether", "spectrum", "bifrost", "dagur",
+                     "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "aether"]
+
+# `cluster_new.py` touches this on every node before a cluster operation and removes it
+# after. spark-daemon's watchdog skips every pass while it exists -- and returns before
+# ever entering the loop if it exists when the daemon starts.
+CLUSTER_OP_LOCK = "/run/hci/cluster_operation.lock"
+CLUSTER_OP_LOCK_WARN = 900
+CLUSTER_OP_LOCK_FAIL = 3600
+
+# --- LINSTOR controller latency ---------------------------------------------------------
+# The audit's threshold. A `linstor node list` is a single controller round trip against
+# an in-memory view; seconds mean the controller is blocked, not busy.
+LINSTOR_LATENCY_WARN = 5.0
+LINSTOR_LATENCY_FAIL = 20.0
+# A check that measures how long a query takes must not itself hang when the answer is
+# "forever": run_cmd has no timeout, so the timed variant is used with this bound.
+LINSTOR_LATENCY_TIMEOUT = 60
+
+# --- DRS / migration storage capacity gate ----------------------------------------------
+# vali's get_linstor_free_space() returns this when it cannot parse the storage-pool
+# listing, which is larger than any single VM disk -- so an unparseable listing does not
+# make the gate refuse, it makes the gate wave everything through.
+VALI_FREE_SPACE_FALLBACK_MIB = 999999
+# How far the gate's answer may sit from what the pool actually reports before it is
+# treated as a parse failure rather than rounding. Both bounds must be exceeded, so a
+# small pool cannot trip the relative test on a few MiB of drift.
+GATE_DISAGREEMENT_PCT = 10.0
+GATE_DISAGREEMENT_MIB = 1024
+# vali's own call carries a 120s timeout; mcli allows a remote node 90s for the whole
+# runner, so the gate is called under a bound of this check's own.
+GATE_CALL_TIMEOUT = 20
+# virsh blocks indefinitely against a wedged libvirtd.
+VIRSH_TIMEOUT = 15
+# Thin pools freeze every writer the moment they fill, so the free-space floor is on the
+# pool itself and not on the filesystems layered over it.
+THIN_POOL_WARN_FREE_PCT = 15.0
+THIN_POOL_FAIL_FREE_PCT = 5.0
+
+# --- migration locks ---------------------------------------------------------------------
+# hydra.vms.status is the per-VM migration lock, taken and released by daruk's LWT
+# endpoints. These are daruk's own constants; a different value here would make the check
+# report locks that do not exist.
+MIGRATION_LOCK_VALUE = "migrating"
+MIGRATION_UNLOCKED_VALUE = "running"
+# vali gives a migration ~10 minutes (MIGRATE_TIMEOUT_POLLS at POLL_INTERVAL_SEC) before
+# it stops waiting, so a task still in flight past that is not simply a large guest.
+MIGRATION_STUCK_AFTER = 600
+DARUK_URL = "http://127.0.0.1:9043"
 
 
 def in_maintenance():
@@ -291,6 +349,1104 @@ def load_helios_zk():
     except Exception:
         pass
     return None
+
+
+def load_deployed_module(name, candidates):
+    """Load one of the deployed scripts by path, or None.
+
+    Same trap as load_mimir_module: these are installed into /usr/local/bin with no `.py`
+    suffix, importlib infers a loader from the extension, and `spec_from_file_location`
+    on an extensionless path returns None -- which surfaces as "'NoneType' object has no
+    attribute 'loader'" rather than anything resembling "cannot import". An explicit
+    SourceFileLoader is the only thing that works.
+    """
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    for candidate in candidates:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            loader = SourceFileLoader(name, candidate)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            return module
+        except Exception:
+            return None
+    return None
+
+
+def load_vali_module():
+    """Load vali so a check can call the gate vali itself calls, or None.
+
+    Importing rather than re-implementing is deliberate. A check that carried its own
+    copy of vali's storage-pool parser would keep reporting the gate broken after the
+    gate was fixed, and would keep reporting it healthy if it broke in a new way. Calling
+    the real function means the check follows the code it is checking.
+
+    vali's module level does nothing but read /etc/hci/spectrum/spectrum.env and set a
+    default socket timeout; its server is behind `if __name__ == "__main__"`.
+    """
+    return load_deployed_module("vali_under_check", [
+        "/usr/local/bin/vali",
+        "/usr/local/bin/vali.py",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "vali.py")])
+
+
+def run_cmd_timed(cmd, timeout):
+    """run_cmd with a wall-clock bound. Returns (rc, out, err, elapsed, timed_out).
+
+    run_cmd waits forever. A check whose whole subject is how long something takes cannot
+    use it: a blocked LINSTOR controller would stall the entire diagnostic run instead of
+    being reported by it.
+    """
+    started = time.time()
+    try:
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - started
+        return -1, "", "no answer within %.0fs" % timeout, elapsed, True
+    except Exception as exc:
+        elapsed = time.time() - started
+        return -1, "", str(exc), elapsed, False
+    return (res.returncode,
+            res.stdout.decode("utf-8", errors="ignore").strip(),
+            res.stderr.decode("utf-8", errors="ignore").strip(),
+            time.time() - started,
+            False)
+
+
+def run_bounded(cmd, timeout):
+    """run_cmd with a bound, discarding the timing. (rc, out, err)."""
+    rc, out, err, _elapsed, _timed_out = run_cmd_timed(cmd, timeout)
+    return rc, out, err
+
+
+def call_with_timeout(func, timeout, *args):
+    """Call func in a thread and give up after `timeout`. Returns (value, error).
+
+    Used where the callable is somebody else's and carries its own, longer timeout.
+    `mcli` allows a remote node 90 seconds for the entire runner; one library call
+    blocking for 120 loses every check on that node, not just its own.
+    """
+    import threading
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["value"] = func(*args)
+        except Exception as exc:
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=target)
+    worker.daemon = True
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return None, "did not return within %.0fs" % timeout
+    if "error" in outcome:
+        return None, outcome["error"]
+    return outcome.get("value"), ""
+
+
+def systemd_props(unit, props):
+    """systemd's view of one unit as a dict, or {} if it could not be read."""
+    rc, out, err = run_cmd("systemctl show %s %s" % (
+        " ".join("-p " + p for p in props), unit))
+    if rc != 0 and not out:
+        return {}
+    parsed = {}
+    for line in out.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+
+def monotonic_uptime():
+    """Seconds since boot, or None. systemd's *TimestampMonotonic fields use this clock."""
+    try:
+        with open("/proc/uptime", "r") as f:
+            return float(f.readline().split()[0])
+    except Exception:
+        return None
+
+
+def seconds_since_monotonic(raw, uptime=None):
+    """Seconds elapsed since a systemd monotonic timestamp, or None.
+
+    Monotonic microseconds compared against /proc/uptime rather than parsing the
+    human-rendered ActiveEnterTimestamp: that field is formatted in the node's locale,
+    and a locale-dependent date parse has already produced one health check here that
+    answered PASS because it could not read a date.
+    """
+    if uptime is None:
+        uptime = monotonic_uptime()
+    if uptime is None or raw in (None, ""):
+        return None
+    try:
+        stamp = int(raw) / 1000000.0
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    return max(0.0, uptime - stamp)
+
+
+def libvirt_units_active():
+    """True if any libvirt daemon or its activation socket is up.
+
+    Four names, because a modular host runs virtqemud and a socket-activated one leaves
+    the service unit `inactive` while virsh works perfectly. The reference cluster is
+    exactly that, and gating anything on `libvirtd.service` alone reads a working
+    hypervisor as an absent one.
+    """
+    for unit in ("libvirtd", "libvirtd.socket", "virtqemud", "virtqemud.socket"):
+        rc, out, err = run_cmd("systemctl is-active " + unit)
+        if out.strip() == "active":
+            return True
+    return False
+
+
+def parse_json_rows(out):
+    """Rows of a `SELECT JSON ...` cqlsh result, skipping the frame cqlsh draws round them."""
+    rows = []
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    return rows
+
+
+def parse_cql_timestamp_ms(value):
+    """Milliseconds since the epoch for a CQL `timestamp` column value, or None.
+
+    `SELECT JSON` renders a timestamp as the string '2026-08-21 20:58:49.309Z', not as a
+    number. int() on that raises, and a check that swallows the exception silently stops
+    examining every row it was written to examine.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    import calendar
+    from datetime import datetime
+
+    normalised = text.replace("T", " ").replace("Z", "").strip()
+    # Drop a trailing numeric UTC offset; every timestamp Scylla renders is already UTC.
+    normalised = re.sub(r"\s*[+-]\d{2}:?\d{2}$", "", normalised)
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.strptime(normalised, fmt)
+        except ValueError:
+            continue
+        return int(calendar.timegm(parsed.timetuple()) * 1000 + parsed.microsecond // 1000)
+    return None
+
+
+def human_duration(seconds):
+    """A duration an operator can read at a glance."""
+    if seconds is None:
+        return "an unknown time"
+    seconds = int(seconds)
+    if seconds < 120:
+        return "%ds" % seconds
+    if seconds < 7200:
+        return "%dm" % (seconds // 60)
+    if seconds < 172800:
+        return "%dh%dm" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dd%dh" % (seconds // 86400, (seconds % 86400) // 3600)
+
+
+def compose_report(headline, fails, warns, notes):
+    """One message from the three buckets a check sorts its findings into.
+
+    Every check below reports the same way: what is wrong first, then what is merely
+    suspect, then the evidence that was gathered either way. The evidence is printed even
+    on a PASS, because "PASS" with nothing behind it is indistinguishable from a check
+    that did not run.
+    """
+    parts = []
+    if fails:
+        parts.append(headline + ":\n- " + "\n- ".join(fails))
+        if warns:
+            parts.append("Also noted:\n- " + "\n- ".join(warns))
+    elif warns:
+        parts.append(headline + ":\n- " + "\n- ".join(warns))
+    if notes:
+        label = "Evidence:\n- " if (fails or warns) else ""
+        parts.append(label + "\n- ".join(notes) if label else "\n".join(notes))
+    return "\n".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# spark-daemon watchdog liveness.
+#
+# The watchdog is the only thing on a host that restarts a cluster service after it
+# fails. It is a `while True` inside a daemon thread of spark-daemon, and it publishes
+# nothing: no heartbeat, no status endpoint, no state file. Meanwhile spark-daemon keeps
+# answering its mTLS API whether or not that thread is alive, so `systemctl is-active
+# spark-daemon` stays green while nothing on the host self-heals. That is precisely the
+# "partial software failure with the OS still up" case in section 12 of the audit.
+#
+# There is nothing to query, so the loop is inferred from three things it cannot fake:
+#
+#   1. Its preconditions. The thread returns *permanently* -- not retrying, for the life
+#      of the process -- if /etc/hci/cluster.json is missing or the cluster operation
+#      lock is held when it starts, and skips every pass while that lock exists.
+#   2. Its own startup announcement in the journal, but only where the journal still
+#      covers the daemon's startup. After rotation, absence of the line proves nothing,
+#      and a check that read it as proof would report a healthy node as broken.
+#   3. Its effect. A unit it supervises that has been down for several passes means the
+#      loop is either wedged -- its `systemctl start` and `podman` calls carry no
+#      timeout, so one hung call stops the thread forever without raising -- or its
+#      restarts are failing. Neither is visible any other way.
+# ---------------------------------------------------------------------------
+
+
+def collect_watchdog_facts():
+    """Everything watchdog liveness is judged on. All reads, no verdicts."""
+    facts = {
+        "unit": {}, "started_ago": None, "maintenance": in_maintenance(),
+        "cluster_json": os.path.exists("/etc/hci/cluster.json"),
+        "lock_present": False, "lock_age": None, "lock_predates_start": None,
+        "cluster_state": None, "cluster_state_detail": "",
+        "journal_covers_start": None, "journal_detail": "",
+        "watchdog_announced": False, "watchdog_errors": 0,
+        "supervised": [], "down_units": [], "unreadable_units": [],
+    }
+
+    facts["unit"] = systemd_props("spark-daemon", [
+        "LoadState", "ActiveState", "SubState", "ActiveEnterTimestampMonotonic",
+        "InvocationID", "NRestarts", "MainPID"])
+    uptime = monotonic_uptime()
+    facts["started_ago"] = seconds_since_monotonic(
+        facts["unit"].get("ActiveEnterTimestampMonotonic"), uptime)
+
+    if os.path.exists(CLUSTER_OP_LOCK):
+        facts["lock_present"] = True
+        try:
+            # cluster_new.py `touch`es this file on each acquire, so its mtime is when
+            # the current operation took it -- not when the file was first created.
+            age = time.time() - os.path.getmtime(CLUSTER_OP_LOCK)
+            facts["lock_age"] = age
+            if facts["started_ago"] is not None:
+                facts["lock_predates_start"] = age > facts["started_ago"]
+        except Exception:
+            pass
+
+    if facts["unit"].get("ActiveState") in ("active", "activating"):
+        # The same read the watchdog itself performs each pass. Asking ZooKeeper rather
+        # than guessing means the check evaluates the loop's own precondition instead of
+        # a proxy for it: with the cluster stopped, restarting nothing is correct.
+        rc_s, out_s, err_s = run_bounded(
+            "podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 "
+            "get /cluster_state", WATCHDOG_PROBE_TIMEOUT)
+        if rc_s == 0 and out_s.strip():
+            facts["cluster_state"] = "started" if "started" in out_s else "stopped"
+            facts["cluster_state_detail"] = " ".join(out_s.split())[:200]
+        else:
+            facts["cluster_state_detail"] = (err_s or out_s or
+                                             "zkCli.sh exited %s" % rc_s).strip()[:200]
+
+        invocation = facts["unit"].get("InvocationID")
+        if invocation and facts["started_ago"] is not None:
+            until = int(time.time() - facts["started_ago"]) + WATCHDOG_JOURNAL_WINDOW
+            # Only this invocation's entries: `journalctl -u X FIELD=v` ORs the two
+            # matches and would drag in every other run of the unit.
+            rc_j, out_j, err_j = run_bounded(
+                "journalctl _SYSTEMD_INVOCATION_ID=%s --until=@%d --no-pager -o cat"
+                % (invocation, until), WATCHDOG_PROBE_TIMEOUT)
+            if rc_j != 0:
+                facts["journal_detail"] = (err_j or out_j or
+                                           "journalctl exited %s" % rc_j).strip()[:200]
+            else:
+                # An [AUTOSTART] line is the discriminator. It is printed by the same
+                # thread, in the same function, just before the loop is entered, so if
+                # one survives in this window the announcement would have too.
+                facts["journal_covers_start"] = "[AUTOSTART]" in out_j
+                facts["watchdog_announced"] = (
+                    "Starting service health watchdog" in out_j)
+            rc_e, out_e, _ = run_bounded(
+                "journalctl _SYSTEMD_INVOCATION_ID=%s --no-pager -o cat -n 5000 "
+                "| grep -c 'Error in service watchdog' || true" % invocation,
+                WATCHDOG_PROBE_TIMEOUT)
+            try:
+                facts["watchdog_errors"] = int((out_e or "0").strip().splitlines()[0])
+            except (ValueError, IndexError):
+                facts["watchdog_errors"] = 0
+
+        supervised = list(WATCHDOG_MAINTENANCE_SERVICES if facts["maintenance"]
+                          else WATCHDOG_SERVICES)
+        if not facts["maintenance"] and is_urbosa_enabled():
+            supervised.append("urbosa")
+        facts["supervised"] = supervised
+
+        for svc in supervised:
+            props = systemd_props(svc, [
+                "LoadState", "ActiveState", "SubState",
+                "InactiveEnterTimestampMonotonic"])
+            if not props:
+                facts["unreadable_units"].append(svc)
+                continue
+            if props.get("LoadState") == "not-found":
+                # Not every node carries every unit; one that was never installed is not
+                # something the watchdog failed to restart.
+                continue
+            if props.get("ActiveState") in ("active", "activating"):
+                continue
+            facts["down_units"].append({
+                "name": svc,
+                "active_state": props.get("ActiveState", "unknown"),
+                "sub_state": props.get("SubState", "unknown"),
+                "down_for": seconds_since_monotonic(
+                    props.get("InactiveEnterTimestampMonotonic"), uptime),
+            })
+    return facts
+
+
+def classify_watchdog(facts):
+    """(status, message) for spark-daemon's watchdog. Never PASS on an unknown."""
+    unit = facts.get("unit") or {}
+    if not unit:
+        return "WARN", (
+            "systemctl could not be read for spark-daemon, so it is not known whether "
+            "the service watchdog is running. Nothing else on a host restarts a failed "
+            "cluster service, so this is an unknown, not a pass.")
+
+    active_state = unit.get("ActiveState", "unknown")
+    if unit.get("LoadState") == "not-found":
+        return "WARN", (
+            "spark-daemon is not installed on this node, so it has no service watchdog. "
+            "If this host is meant to run cluster workloads, the host agent is missing.")
+    if active_state not in ("active", "activating"):
+        return "FAIL", (
+            "spark-daemon is %s (%s). The watchdog thread lives inside it, so nothing "
+            "on this host is restarting failed cluster services and a service that dies "
+            "now stays dead. Start it with 'systemctl start spark-daemon'; the "
+            "service.spark check owns the verdict on the daemon itself."
+            % (active_state, unit.get("SubState", "unknown")))
+
+    fails, warns, notes = [], [], []
+    started_ago = facts.get("started_ago")
+    notes.append("spark-daemon has been active for %s (PID %s)."
+                 % (human_duration(started_ago), unit.get("MainPID", "?")))
+
+    if not facts.get("cluster_json"):
+        warns.append(
+            "/etc/hci/cluster.json is absent. spark-daemon's autostart thread checks for "
+            "it once and returns when it is missing, so the watchdog loop is not running "
+            "on this host. If this host belongs to a cluster, restore the file and run "
+            "'systemctl restart spark-daemon' -- the thread does not retry.")
+
+    if facts.get("lock_present"):
+        age = facts.get("lock_age")
+        if facts.get("lock_predates_start"):
+            fails.append(
+                "%s was already held when spark-daemon started (lock taken %s ago, "
+                "daemon started %s ago). The autostart thread returns immediately in "
+                "that case and the watchdog loop is never entered for the life of the "
+                "process, so nothing has restarted a failed service since. Release the "
+                "lock once the cluster operation has finished ('rm -f %s') and run "
+                "'systemctl restart spark-daemon'."
+                % (CLUSTER_OP_LOCK, human_duration(age),
+                   human_duration(started_ago), CLUSTER_OP_LOCK))
+        elif age is not None and age > CLUSTER_OP_LOCK_FAIL:
+            fails.append(
+                "a cluster operation lock has been held for %s. The watchdog skips every "
+                "pass while %s exists, so nothing has restarted a failed service for "
+                "that long. If no 'cluster' command is running, the lock is stale: "
+                "remove it with 'rm -f %s'."
+                % (human_duration(age), CLUSTER_OP_LOCK, CLUSTER_OP_LOCK))
+        elif age is not None and age > CLUSTER_OP_LOCK_WARN:
+            warns.append(
+                "a cluster operation lock has been held for %s. The watchdog is paused "
+                "for the duration. If no 'cluster' command is running, remove %s."
+                % (human_duration(age), CLUSTER_OP_LOCK))
+        else:
+            notes.append(
+                "a cluster operation is in progress (%s held %s); the watchdog pauses "
+                "for the duration by design."
+                % (CLUSTER_OP_LOCK, human_duration(age)))
+
+    covers = facts.get("journal_covers_start")
+    if covers is True and not facts.get("watchdog_announced"):
+        fails.append(
+            "the journal still holds spark-daemon's startup output for the current run, "
+            "and it contains no '[WATCHDOG] Starting service health watchdog' line. The "
+            "autostart thread returned or died before reaching the loop, so nothing on "
+            "this host has restarted a failed service since it started. Restart the "
+            "daemon ('systemctl restart spark-daemon') and read "
+            "'journalctl -u spark-daemon | grep AUTOSTART' for where it stopped.")
+    elif covers is True:
+        notes.append("the watchdog announced itself in the journal for the current "
+                     "spark-daemon run, so the loop was entered.")
+    elif covers is False:
+        notes.append(
+            "the journal no longer covers spark-daemon's startup, so its announcement "
+            "could not be read; the verdict rests on the loop's preconditions and on "
+            "what it has actually been doing.")
+    elif facts.get("journal_detail"):
+        warns.append("the journal could not be read (%s), so the watchdog's startup "
+                     "announcement could not be checked."
+                     % facts["journal_detail"])
+
+    if facts.get("watchdog_errors"):
+        warns.append(
+            "%d '[WATCHDOG] Error in service watchdog' entries in the current run: the "
+            "loop is alive but its passes are raising, so some services are not being "
+            "supervised. 'journalctl -u spark-daemon | grep WATCHDOG' has the exception."
+            % facts["watchdog_errors"])
+
+    cluster_state = facts.get("cluster_state")
+    if cluster_state is None:
+        warns.append(
+            "the cluster state could not be read from ZooKeeper (%s), so it is not known "
+            "whether the watchdog should be restarting anything right now. The "
+            "database.zookeeper checks own the verdict on ZooKeeper itself."
+            % (facts.get("cluster_state_detail") or "no detail"))
+    elif cluster_state != "started" and not facts.get("maintenance"):
+        notes.append("ZooKeeper reports the cluster stopped, so the watchdog restarts "
+                     "nothing by design.")
+    else:
+        overdue = [u for u in facts.get("down_units", [])
+                   if u.get("down_for") is None or u["down_for"] > WATCHDOG_DOWN_GRACE]
+        recent = [u for u in facts.get("down_units", []) if u not in overdue]
+        for unit_down in overdue:
+            fails.append(
+                "%s has been %s/%s for %s -- longer than %d watchdog passes -- while the "
+                "cluster is started. The loop is either wedged (its 'systemctl start' "
+                "and 'podman' calls carry no timeout, so one hung call stops the thread "
+                "without raising) or its restarts are failing. Check "
+                "'systemctl status %s' and 'journalctl -u spark-daemon | grep WATCHDOG'."
+                % (unit_down["name"], unit_down["active_state"], unit_down["sub_state"],
+                   human_duration(unit_down.get("down_for")),
+                   WATCHDOG_DOWN_GRACE // WATCHDOG_INTERVAL, unit_down["name"]))
+        for unit_down in recent:
+            notes.append("%s is %s but only for %s, which is inside the window the "
+                         "watchdog needs to notice and restart it."
+                         % (unit_down["name"], unit_down["active_state"],
+                            human_duration(unit_down.get("down_for"))))
+        if not facts.get("down_units"):
+            notes.append("all %d unit(s) the watchdog supervises here are active: %s."
+                         % (len(facts.get("supervised", [])),
+                            ", ".join(facts.get("supervised", []))))
+
+    if facts.get("unreadable_units"):
+        warns.append("systemctl could not be read for %s, so whether the watchdog is "
+                     "keeping them up is unknown."
+                     % ", ".join(facts["unreadable_units"]))
+
+    if (started_ago is not None and started_ago < WATCHDOG_STARTUP_GRACE
+            and (fails or warns)):
+        # Inside the startup grace the autostart sequence has not necessarily reached the
+        # loop yet, so everything above is genuinely undecided rather than wrong.
+        return "WARN", (
+            "spark-daemon started %s ago and its autostart sequence has not necessarily "
+            "reached the watchdog loop yet, so the findings below are not yet "
+            "conclusive; re-run this check once startup has settled.\n- %s"
+            % (human_duration(started_ago), "\n- ".join(fails + warns)))
+
+    if fails:
+        return "FAIL", compose_report(
+            "The spark-daemon service watchdog is not supervising this host",
+            fails, warns, notes)
+    if warns:
+        return "WARN", compose_report(
+            "The spark-daemon service watchdog could not be fully verified",
+            fails, warns, notes)
+    return "PASS", (
+        "The spark-daemon service watchdog is running and supervising this host. It "
+        "publishes no heartbeat, so this is inferred from its preconditions, its journal "
+        "and its effect:\n" + "\n".join(notes))
+
+
+# ---------------------------------------------------------------------------
+# LINSTOR controller latency.
+#
+# `linstor node list` is one round trip against the controller's in-memory view. Seconds
+# mean the controller is blocked -- an offline satellite it is still waiting on, or its
+# embedded database holding a lock -- and every storage operation queued behind it, VM
+# creation and live migration included, is blocked for the same reason.
+# ---------------------------------------------------------------------------
+
+
+def collect_linstor_latency_facts(controller_ip):
+    facts = {"controller_ip": controller_ip}
+    # Timed separately so the message can tell the operator whether the seconds are the
+    # controller's or just the container round trip; without it every reading on a loaded
+    # host looks like controller latency.
+    rc_o, _, _, overhead, overhead_timeout = run_cmd_timed(
+        "podman exec systemd-aether true", LINSTOR_LATENCY_TIMEOUT)
+    facts["overhead"] = None if (rc_o != 0 or overhead_timeout) else overhead
+
+    rc, out, err, elapsed, timed_out = run_cmd_timed(
+        "podman exec -e LS_CONTROLLERS=%s systemd-aether linstor --no-color node list"
+        % controller_ip, LINSTOR_LATENCY_TIMEOUT)
+    facts["rc"] = rc
+    facts["elapsed"] = elapsed
+    facts["timed_out"] = timed_out
+    facts["error"] = (err or out or "").strip()[:300]
+    facts["offline_nodes"] = []
+    facts["node_count"] = 0
+    if rc == 0:
+        for line in out.splitlines():
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+            if len(cells) < 4 or cells[0] in ("Node",):
+                continue
+            facts["node_count"] += 1
+            if cells[-1].upper() != "ONLINE":
+                facts["offline_nodes"].append("%s (%s)" % (cells[0], cells[-1]))
+    return facts
+
+
+def classify_linstor_latency(facts):
+    controller = facts.get("controller_ip", "unknown")
+    elapsed = facts.get("elapsed")
+    hint = ("Check 'systemctl status linstor-controller' and, for each satellite, "
+            "'podman exec systemd-aether linstor node list' -- a satellite the "
+            "controller cannot reach is the usual cause.")
+
+    if facts.get("timed_out"):
+        return "FAIL", (
+            "The LINSTOR controller did not answer 'linstor node list' within %.0fs "
+            "(controllers tried: %s). Every storage operation is blocked behind it: VM "
+            "creation, disk attach and live migration will all hang. %s"
+            % (LINSTOR_LATENCY_TIMEOUT, controller, hint))
+    if facts.get("rc") != 0:
+        return "FAIL", (
+            "The LINSTOR controller could not be queried (controllers tried: %s): %s\n"
+            "Storage operations cannot be scheduled while this is true. %s"
+            % (controller, facts.get("error") or "no output", hint))
+
+    detail = "'linstor node list' answered in %.2fs across %d node(s)" % (
+        elapsed or 0.0, facts.get("node_count", 0))
+    if facts.get("overhead") is not None:
+        detail += " (of which %.2fs is the 'podman exec' round trip into systemd-aether)" \
+                  % facts["overhead"]
+    offline = facts.get("offline_nodes") or []
+    if offline:
+        detail += "; satellites not ONLINE: " + ", ".join(offline)
+
+    if elapsed is None:
+        return "WARN", ("The LINSTOR query completed but was not timed, so controller "
+                        "latency could not be evaluated.")
+    if elapsed >= LINSTOR_LATENCY_FAIL:
+        return "FAIL", (
+            "The LINSTOR controller is blocking: %s, far beyond the %.0fs at which a "
+            "query is treated as a hang. Storage operations queued behind it will time "
+            "out. %s" % (detail, LINSTOR_LATENCY_FAIL, hint))
+    if elapsed >= LINSTOR_LATENCY_WARN:
+        return "WARN", (
+            "The LINSTOR controller is slow: %s, over the %.0fs threshold. This is what "
+            "a controller waiting on an unreachable satellite or holding a database lock "
+            "looks like before it stops answering entirely. %s"
+            % (detail, LINSTOR_LATENCY_WARN, hint))
+    if offline:
+        return "WARN", (
+            "The LINSTOR controller is responsive (%s), but a satellite is not ONLINE, "
+            "which is what turns into controller latency next. The storage.peers check "
+            "owns the verdict on satellite state." % detail)
+    return "PASS", "The LINSTOR controller is responsive: %s." % detail
+
+
+# ---------------------------------------------------------------------------
+# DRS / migration storage capacity gate.
+#
+# vali refuses a migration whose target cannot hold the guest's disk, by comparing the
+# disk size against get_linstor_free_space(target). That function parses the human
+# storage-pool table and returns a fixed 999999 MiB when the parse yields nothing -- a
+# number larger than any single VM disk, so an unparseable listing does not make the gate
+# refuse, it makes the gate wave everything through.
+#
+# The check therefore calls vali's own function rather than re-implementing it, and
+# compares the answer against what the pool actually reports. A private copy of vali's
+# parser would keep reporting the gate broken after it was fixed, and would keep
+# reporting it healthy if it broke in some new way.
+# ---------------------------------------------------------------------------
+
+
+def linstor_node_name(local_ip):
+    """This host's LINSTOR node name, or None.
+
+    LINSTOR registers satellites under their hostname, and every `linstor ... list` is
+    answered by the controller for the whole cluster. Without this name the pools and
+    volumes of every other node would be counted as local headroom.
+    """
+    for host in get_cluster_hosts():
+        if host.get("ip") == local_ip and host.get("hostname"):
+            return host["hostname"]
+    try:
+        import socket as _socket
+        return _socket.gethostname()
+    except Exception:
+        return None
+
+
+def _linstor_json(controller_ip, subcommand):
+    """Rows of a machine-readable `linstor` listing, or (None, error)."""
+    rc, out, err, _, timed_out = run_cmd_timed(
+        "podman exec -e LS_CONTROLLERS=%s systemd-aether linstor -m --output-version v1 "
+        "%s" % (controller_ip, subcommand), LINSTOR_LATENCY_TIMEOUT)
+    if timed_out or rc != 0:
+        return None, (err or out or "linstor %s exited %s" % (subcommand, rc)).strip()[:300]
+    try:
+        payload = json.loads(out)
+    except Exception as exc:
+        return None, "linstor %s did not return JSON: %s" % (subcommand, exc)
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        payload = payload[0]
+    if not isinstance(payload, list):
+        return None, "linstor %s returned %s, not a list of rows" % (
+            subcommand, type(payload).__name__)
+    return [row for row in payload if isinstance(row, dict)], ""
+
+
+def collect_drs_storage_facts(local_ip, controller_ip):
+    facts = {"local_ip": local_ip, "node_name": linstor_node_name(local_ip),
+             "gate_value": None, "gate_error": "", "pools": [], "linstor_error": "",
+             "provisioned_kib": None}
+
+    vali = load_vali_module()
+    if vali is None:
+        facts["gate_error"] = ("vali is not deployed on this node "
+                               "(/usr/local/bin/vali), so its storage capacity gate "
+                               "could not be exercised")
+    else:
+        # The gate reaches the storage pool through spark-daemon's mTLS API with vali's
+        # own 120-second timeout. mcli allows a remote node 90 seconds for the whole
+        # runner, so an unbounded call here would lose every check on that node.
+        value, error = call_with_timeout(
+            vali.get_linstor_free_space, GATE_CALL_TIMEOUT, local_ip)
+        if error:
+            facts["gate_error"] = "vali.get_linstor_free_space() %s" % error
+        else:
+            try:
+                facts["gate_value"] = int(value)
+            except (TypeError, ValueError):
+                facts["gate_error"] = ("vali.get_linstor_free_space() returned %r, which "
+                                       "is not a number of MiB" % (value,))
+
+    if facts["node_name"] is None:
+        facts["linstor_error"] = ("this host's LINSTOR node name could not be "
+                                  "determined, so its own storage pools could not be "
+                                  "told apart from its peers'")
+        return facts
+
+    rows, error = _linstor_json(controller_ip, "storage-pool list")
+    if rows is None:
+        facts["linstor_error"] = error
+        return facts
+
+    pool_names = set()
+    for pool in rows:
+        if pool.get("node_name") != facts["node_name"]:
+            continue
+        if str(pool.get("provider_kind", "")).upper() == "DISKLESS":
+            # A diskless pool reports 2^63-1 free and stores nothing. Counting it would
+            # report unlimited headroom on a node whose backing pool is full.
+            continue
+        pool_names.add(pool.get("storage_pool_name"))
+        facts["pools"].append({
+            "name": pool.get("storage_pool_name", "unknown"),
+            "node": pool.get("node_name", "unknown"),
+            "kind": pool.get("provider_kind", "unknown"),
+            "free_kib": pool.get("free_capacity"),
+            "total_kib": pool.get("total_capacity"),
+        })
+
+    rows_v, _error_v = _linstor_json(controller_ip, "volume list")
+    if rows_v is not None:
+        provisioned = 0
+        seen = False
+        for resource in rows_v:
+            if resource.get("node_name") != facts["node_name"]:
+                continue
+            for volume in resource.get("volumes") or []:
+                if volume.get("storage_pool_name") not in pool_names:
+                    continue
+                # The STORAGE layer is what the pool has to provide; the DRBD layer above
+                # it reports slightly less, being what the guest sees.
+                sizes = [layer.get("data", {}).get("usable_size_kib")
+                         for layer in volume.get("layer_data_list") or []
+                         if str(layer.get("type", "")).upper() == "STORAGE"]
+                sizes = [s for s in sizes if s]
+                if not sizes:
+                    sizes = [layer.get("data", {}).get("usable_size_kib")
+                             for layer in volume.get("layer_data_list") or []]
+                    sizes = [s for s in sizes if s]
+                if sizes:
+                    provisioned += int(max(sizes))
+                    seen = True
+        facts["provisioned_kib"] = provisioned if seen else None
+    return facts
+
+
+def classify_drs_storage_gate(facts):
+    fails, warns, notes = [], [], []
+    pools = facts.get("pools") or []
+    gate = facts.get("gate_value")
+
+    if facts.get("linstor_error"):
+        return "WARN", (
+            "The DRS and migration storage capacity gate could not be evaluated: this "
+            "node's LINSTOR storage pools could not be read (%s). Whether a migration "
+            "target has room for a guest's disk is therefore unknown -- which is not the "
+            "same as it having room." % facts["linstor_error"])
+    if not pools:
+        return "WARN", (
+            "No backing LINSTOR storage pool was found on this node, so the storage "
+            "capacity gate has nothing to measure against. If this host is meant to "
+            "store replicas, 'podman exec systemd-aether linstor storage-pool list' "
+            "will show what it actually has.")
+
+    usable = [p for p in pools
+              if isinstance(p.get("free_kib"), int) and isinstance(p.get("total_kib"), int)
+              and p["total_kib"] > 0]
+    if not usable:
+        return "WARN", (
+            "LINSTOR reported %d storage pool(s) on this node but none of them carried a "
+            "readable capacity, so the storage capacity gate cannot be checked against "
+            "them: %s" % (len(pools), ", ".join(p["name"] for p in pools)))
+
+    smallest = min(usable, key=lambda p: p["free_kib"])
+    real_free_mib = smallest["free_kib"] / 1024.0
+    for pool in usable:
+        notes.append("pool '%s' on %s (%s): %.1f GiB free of %.1f GiB"
+                     % (pool["name"], pool["node"], pool["kind"],
+                        pool["free_kib"] / 1048576.0, pool["total_kib"] / 1048576.0))
+
+    if gate is None:
+        warns.append(
+            "%s, so it is not known what free space a migration to this host would be "
+            "checked against." % (facts.get("gate_error") or
+                                  "vali's storage capacity gate could not be called"))
+    else:
+        drift = abs(gate - real_free_mib)
+        disagrees = (drift > GATE_DISAGREEMENT_MIB
+                     and drift > real_free_mib * GATE_DISAGREEMENT_PCT / 100.0)
+        if disagrees and gate > real_free_mib:
+            fails.append(
+                "the storage capacity gate is failing open on this node: vali's "
+                "get_linstor_free_space() reports %d MiB free while pool '%s' actually "
+                "has %.0f MiB. vali refuses a migration only when the guest's disk is "
+                "larger than that number, so with a figure this size it refuses nothing "
+                "-- a VM will migrate onto a host that cannot hold its disk and the "
+                "thin pool fills instead.%s Reproduce with: podman exec -e "
+                "LS_CONTROLLERS=%s systemd-aether linstor storage-pool list"
+                % (gate, smallest["name"], real_free_mib,
+                   (" %d MiB is vali's hard-coded fallback for a storage-pool listing it "
+                    "could not read or parse." % VALI_FREE_SPACE_FALLBACK_MIB
+                    if gate == VALI_FREE_SPACE_FALLBACK_MIB else ""),
+                   facts.get("local_ip", "127.0.0.1")))
+        elif disagrees:
+            warns.append(
+                "the storage capacity gate reads %d MiB free while pool '%s' reports "
+                "%.0f MiB. It is refusing migrations this host could actually accept."
+                % (gate, smallest["name"], real_free_mib))
+        else:
+            notes.append("vali's storage capacity gate reads %d MiB free, matching what "
+                         "pool '%s' reports." % (gate, smallest["name"]))
+
+    for pool in usable:
+        free_pct = pool["free_kib"] * 100.0 / pool["total_kib"]
+        if free_pct < THIN_POOL_FAIL_FREE_PCT:
+            fails.append(
+                "pool '%s' on %s is %.1f%% free (%.1f GiB of %.1f GiB). A thin pool "
+                "freezes every guest writing to it the moment it fills, and DRS will "
+                "keep placing work here until it does. Extend it or move replicas off "
+                "this node." % (pool["name"], pool["node"], free_pct,
+                                pool["free_kib"] / 1048576.0,
+                                pool["total_kib"] / 1048576.0))
+        elif free_pct < THIN_POOL_WARN_FREE_PCT:
+            warns.append(
+                "pool '%s' on %s is %.1f%% free (%.1f GiB of %.1f GiB), below the %.0f%% "
+                "at which a migration onto this host stops being safe."
+                % (pool["name"], pool["node"], free_pct, pool["free_kib"] / 1048576.0,
+                   pool["total_kib"] / 1048576.0, THIN_POOL_WARN_FREE_PCT))
+
+    provisioned = facts.get("provisioned_kib")
+    total_kib = sum(p["total_kib"] for p in usable)
+    if provisioned is None:
+        notes.append("provisioned volume sizes could not be read, so thin-pool "
+                     "over-commitment was not evaluated.")
+    elif total_kib and provisioned > total_kib:
+        warns.append(
+            "volumes on this node are provisioned for %.1f GiB against %.1f GiB of pool "
+            "(%.0f%% over-committed). Thin provisioning makes that legal, and it is only "
+            "a problem when the guests actually write -- but nothing in the stack refuses "
+            "a migration on this basis, so the pool can be filled by guests that were "
+            "already here." % (provisioned / 1048576.0, total_kib / 1048576.0,
+                               provisioned * 100.0 / total_kib))
+    else:
+        notes.append("volumes on this node are provisioned for %.1f GiB against %.1f GiB "
+                     "of pool." % ((provisioned or 0) / 1048576.0, total_kib / 1048576.0))
+
+    if fails:
+        return "FAIL", compose_report(
+            "The DRS and migration storage capacity gate is unsafe on this node",
+            fails, warns, notes)
+    if warns:
+        return "WARN", compose_report(
+            "The DRS and migration storage capacity gate needs attention",
+            fails, warns, notes)
+    return "PASS", ("The DRS and migration storage capacity gate is working and this "
+                    "node has headroom:\n" + "\n".join(notes))
+
+
+# ---------------------------------------------------------------------------
+# Migration locks.
+#
+# hydra.vms.status is the per-VM migration lock, taken by daruk's migrate-lock LWT and
+# released by migrate-commit or migrate-unlock. Live migration is exactly the window in
+# which DRBD dual-primary is open, so two of them on one VM is disk corruption, and the
+# lock is the only thing preventing it.
+#
+# Two failures are worth reporting and they are not the same:
+#
+#   * A lock left held by a migration that died -- a killed vali, a lost node -- refuses
+#     every further migration *and* every delete of that VM, permanently and silently.
+#   * A live migration running while the lock is *not* held. That is the dangerous one:
+#     nothing would stop a second migration of the same disk, and it is only visible by
+#     asking libvirt what it is actually doing rather than asking the database.
+# ---------------------------------------------------------------------------
+
+
+def collect_migration_lock_facts():
+    facts = {"vms": None, "vms_error": "", "tasks": None, "tasks_error": "",
+             "tasks_scanned": False, "libvirt_reachable": False,
+             "hypervisor_present": False, "domains": None,
+             "domains_error": "", "migrating_domains": []}
+
+    rc, out, err = run_cqlsh("SELECT JSON name, host_ip, state, status FROM hydra.vms;")
+    if rc != 0:
+        facts["vms_error"] = (err or out or "cqlsh exited %s" % rc).strip()[:300]
+    else:
+        facts["vms"] = parse_json_rows(out)
+
+    # Ask virsh, not systemd. `libvirtd.service` is inactive on a modular or
+    # socket-activated host while virsh works perfectly -- the reference cluster is
+    # exactly that -- so gating on the unit would report "no migration can be running
+    # here" on a host that is migrating right now.
+    rc_l, out_l, err_l = run_bounded(
+        "virsh -c qemu:///system list --name --state-running", VIRSH_TIMEOUT)
+    if rc_l != 0:
+        facts["domains_error"] = (err_l or out_l or "virsh exited %s" % rc_l).strip()[:300]
+        facts["hypervisor_present"] = libvirt_units_active()
+    else:
+        facts["libvirt_reachable"] = True
+        facts["hypervisor_present"] = True
+        facts["domains"] = [d.strip() for d in out_l.splitlines() if d.strip()]
+        for domain in facts["domains"]:
+            rc_j, out_j, err_j = run_bounded(
+                "virsh -c qemu:///system domjobinfo %s" % shlex.quote(domain),
+                VIRSH_TIMEOUT)
+            if rc_j != 0:
+                facts["domains_error"] = (
+                    facts["domains_error"] + " " +
+                    ("domjobinfo %s: %s" % (domain,
+                                            (err_j or out_j or "").strip()[:120]))
+                ).strip()
+                continue
+            job_type = ""
+            operation = ""
+            for line in out_j.splitlines():
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                key = key.strip().lower()
+                if key == "job type":
+                    job_type = value.strip()
+                elif key == "operation":
+                    operation = value.strip()
+            if job_type and job_type.lower() != "none" and "migration" in \
+                    operation.lower():
+                facts["migrating_domains"].append(
+                    {"name": domain, "job_type": job_type, "operation": operation})
+
+    # The task table is scanned only when something claims a migration is happening. It
+    # is a full partition scan of a table with a 30-day retention, and running one every
+    # hour to confirm that nothing is migrating is the kind of unbounded read this
+    # codebase has had to remove elsewhere.
+    locked = [vm for vm in (facts["vms"] or [])
+              if str(vm.get("status") or "").lower() == MIGRATION_LOCK_VALUE]
+    if locked or facts["migrating_domains"]:
+        facts["tasks_scanned"] = True
+        rc_t, out_t, err_t = run_cqlsh(
+            "SELECT JSON task_id, service, action, status, payload, created_at "
+            "FROM hydra.catalyst_tasks;")
+        if rc_t != 0:
+            facts["tasks_error"] = (err_t or out_t or
+                                    "cqlsh exited %s" % rc_t).strip()[:300]
+        else:
+            facts["tasks"] = parse_json_rows(out_t)
+    return facts
+
+
+def migration_tasks_for(tasks, vm_name):
+    """In-flight migration tasks naming this VM, with their age in seconds."""
+    matches = []
+    now_ms = time.time() * 1000
+    for task in tasks or []:
+        if str(task.get("action", "")).lower() != "migrate":
+            continue
+        if str(task.get("status", "")).lower() not in ("pending", "processing"):
+            continue
+        payload = task.get("payload") or ""
+        named = False
+        try:
+            named = json.loads(payload).get("vm_name") == vm_name
+        except Exception:
+            named = ('"vm_name": "%s"' % vm_name) in payload
+        if not named:
+            continue
+        created = parse_cql_timestamp_ms(task.get("created_at"))
+        matches.append({
+            "task_id": task.get("task_id", "unknown"),
+            "status": task.get("status", "unknown"),
+            "age": None if created is None else max(0.0, (now_ms - created) / 1000.0),
+        })
+    return matches
+
+
+def classify_migration_locks(facts):
+    fails, warns, notes = [], [], []
+
+    if facts.get("vms") is None:
+        return "WARN", (
+            "hydra.vms could not be read (%s), so migration locks could not be audited. "
+            "A lock left held refuses every further migration and every delete of that "
+            "VM, so this is an unknown rather than a pass." % facts.get("vms_error"))
+
+    vms = facts["vms"]
+    by_name = {vm.get("name"): vm for vm in vms if vm.get("name")}
+    locked = [vm for vm in vms
+              if str(vm.get("status") or "").lower() == MIGRATION_LOCK_VALUE]
+
+    unlock_hint = (
+        "Once 'virsh domjobinfo %s' on its host confirms no migration is running, "
+        "release it with: curl -sf -X POST %s/v1/vm/migrate-unlock "
+        "-H 'Content-Type: application/json' -d '{\"name\": \"%s\"}'")
+
+    for vm in locked:
+        name = vm.get("name", "unknown")
+        host = vm.get("host_ip") or "unplaced"
+        tasks = migration_tasks_for(facts.get("tasks"), name)
+        if facts.get("tasks") is None:
+            warns.append(
+                "VM '%s' (recorded on %s) holds the migration lock, but "
+                "hydra.catalyst_tasks could not be read (%s) so it is not known whether "
+                "a migration is actually running. Until this is resolved every further "
+                "migration and every delete of '%s' is refused."
+                % (name, host, facts.get("tasks_error") or "no detail", name))
+        elif not tasks:
+            fails.append(
+                "VM '%s' (recorded on %s) holds the migration lock with no migration "
+                "task in flight for it. The lock is orphaned -- a migration died without "
+                "releasing it -- and every further migration and every delete of '%s' is "
+                "refused for as long as it is held. (A delete in progress holds the same "
+                "lock briefly, so confirm nothing is running first.) %s"
+                % (name, host, name, unlock_hint % (name, DARUK_URL, name)))
+        elif len(tasks) > 1:
+            fails.append(
+                "VM '%s' has %d migration tasks in flight at once (%s). Two live "
+                "migrations of one guest hold DRBD dual-primary open on the same disk "
+                "from both sides. Stop the extra task before it starts."
+                % (name, len(tasks),
+                   ", ".join("%s/%s" % (t["task_id"], t["status"]) for t in tasks)))
+        else:
+            task = tasks[0]
+            if task["age"] is not None and task["age"] > MIGRATION_STUCK_AFTER:
+                warns.append(
+                    "VM '%s' has been migrating for %s (task %s, %s). vali stops waiting "
+                    "on a migration after %s, so this one is stuck: the lock will not be "
+                    "released on its own. Check 'virsh domjobinfo %s' on %s."
+                    % (name, human_duration(task["age"]), task["task_id"],
+                       task["status"], human_duration(MIGRATION_STUCK_AFTER), name, host))
+            else:
+                notes.append("VM '%s' is migrating (task %s, %s, running %s); the lock is "
+                             "held as it should be."
+                             % (name, task["task_id"], task["status"],
+                                human_duration(task["age"])))
+
+    for domain in facts.get("migrating_domains", []):
+        name = domain["name"]
+        row = by_name.get(name)
+        if row is None:
+            fails.append(
+                "libvirt is running a migration of domain '%s' on this host (%s, %s) but "
+                "there is no hydra.vms row for it, so no migration lock exists and "
+                "nothing would refuse a second migration of the same disk. Find out what "
+                "started it before it completes."
+                % (name, domain["job_type"], domain["operation"]))
+        elif str(row.get("status") or "").lower() != MIGRATION_LOCK_VALUE:
+            fails.append(
+                "libvirt is running a migration of '%s' on this host (%s, %s) while the "
+                "Hydra migration lock is NOT held (hydra.vms.status = %r). The DRBD "
+                "dual-primary window is open on that disk with nothing preventing a "
+                "second migration of it. Whatever started this migration bypassed "
+                "daruk's migrate-lock endpoint."
+                % (name, domain["job_type"], domain["operation"], row.get("status")))
+        else:
+            notes.append("libvirt is migrating '%s' here (%s) and the lock is held."
+                         % (name, domain["operation"]))
+
+    odd = [vm for vm in vms
+           if vm.get("status") not in (None, "")
+           and str(vm["status"]).lower() not in (MIGRATION_LOCK_VALUE,
+                                                 MIGRATION_UNLOCKED_VALUE)]
+    for vm in odd:
+        warns.append(
+            "VM '%s' has hydra.vms.status = %r, which is neither the migration lock (%r) "
+            "nor the released value (%r). daruk's LWTs condition on those two values, so "
+            "a third one is a write from somewhere that does not know the lock protocol."
+            % (vm.get("name"), vm.get("status"), MIGRATION_LOCK_VALUE,
+               MIGRATION_UNLOCKED_VALUE))
+
+    if facts.get("domains_error") and facts.get("hypervisor_present"):
+        warns.append(
+            "libvirt is present on this host but its running domains could not be "
+            "inspected (%s), so a migration running here without the lock would not have "
+            "been seen." % facts["domains_error"])
+    elif facts.get("domains_error"):
+        # No hypervisor at all means no live migration can be running on this host, so
+        # the local half of the audit is satisfied rather than merely unchecked.
+        notes.append(
+            "no libvirt daemon or socket is active on this node and virsh does not "
+            "answer (%s), so no live migration can be running here; the "
+            "service.libvirtd check owns that verdict." % facts["domains_error"])
+    else:
+        notes.append("%d running domain(s) on this host, none of them mid-migration."
+                     % len(facts.get("domains") or []))
+
+    notes.append("%d VM record(s) audited, %d holding the migration lock."
+                 % (len(vms), len(locked)))
+    if not facts.get("tasks_scanned"):
+        notes.append("no VM claimed a migration, so hydra.catalyst_tasks was not scanned.")
+
+    if fails:
+        return "FAIL", compose_report("VM migration locking is unsafe",
+                                      fails, warns, notes)
+    if warns:
+        return "WARN", compose_report("VM migration locking needs attention",
+                                      fails, warns, notes)
+    return "PASS", ("Every VM migration lock matches what is actually running:\n"
+                    + "\n".join(notes))
 
 
 def check_services(category):
@@ -1128,24 +2284,42 @@ def check_services(category):
         cql = "SELECT JSON task_id, service, action, status, created_at FROM hydra.catalyst_tasks;"
         rc, out, err = run_cmd(f"podman exec -i systemd-hydra-db cqlsh {local_ip} -e \"{cql}\"")
         if rc == 0:
+            # `created_at` is a CQL `timestamp`, which SELECT JSON renders as the string
+            # '2026-08-21 20:58:49.309Z'. int() on that raises ValueError, and the except
+            # below swallowed it -- so every in-flight task was skipped and this check
+            # answered PASS on every cluster it has ever run on, whatever was stuck.
             stuck_tasks = []
+            unreadable = []
             now_ms = int(time.time() * 1000)
             for line in out.splitlines():
                 line = line.strip()
                 if line.startswith("{") and line.endswith("}"):
                     try:
                         task = json.loads(line)
-                        status = task.get("status")
-                        created_at = task.get("created_at")
-                        if status in ["pending", "processing"] and created_at:
-                            if now_ms - int(created_at) > 10 * 60 * 1000:
-                                stuck_tasks.append(f"{task.get('task_id')} ({task.get('service')} - {task.get('action')})")
                     except Exception:
-                        pass
+                        continue
+                    status = task.get("status")
+                    created_at = task.get("created_at")
+                    if status not in ["pending", "processing"] or not created_at:
+                        continue
+                    label = f"{task.get('task_id')} ({task.get('service')} - {task.get('action')})"
+                    created_ms = parse_cql_timestamp_ms(created_at)
+                    if created_ms is None:
+                        # An age that cannot be read is not an age of zero.
+                        unreadable.append(f"{label}: created_at {created_at!r} is unreadable")
+                    elif now_ms - created_ms > 10 * 60 * 1000:
+                        stuck_tasks.append(
+                            f"{label} - {status} for "
+                            f"{human_duration((now_ms - created_ms) / 1000.0)}")
             if stuck_tasks:
                 results["stuck_tasks_check"] = {
                     "status": "WARN",
-                    "output": f"Found stuck Catalyst tasks: {', '.join(stuck_tasks)}.\nThese tasks have been pending or processing for more than 10 minutes."
+                    "output": f"Found stuck Catalyst tasks: {', '.join(stuck_tasks)}.\nThese tasks have been pending or processing for more than 10 minutes.\nInspect one with: podman exec -i systemd-hydra-db cqlsh {local_ip} -e \"SELECT * FROM hydra.catalyst_tasks WHERE task_id = <id>;\""
+                }
+            elif unreadable:
+                results["stuck_tasks_check"] = {
+                    "status": "WARN",
+                    "output": "Some in-flight Catalyst tasks could not be aged, so whether any is stuck is unknown:\n- " + "\n- ".join(unreadable)
                 }
             else:
                 results["stuck_tasks_check"] = {
@@ -1873,6 +3047,51 @@ def check_services(category):
         "output": msg
     }
 
+    # 43. Spark Service Watchdog Liveness Check
+    # `systemctl is-active spark-daemon` says nothing about the thread inside it that
+    # restarts failed services, and that thread is the only self-healing a host has.
+    update_current_check(category, "watchdog_daemon_status")
+    try:
+        status, msg = classify_watchdog(collect_watchdog_facts())
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running spark watchdog liveness check: {str(e)}"
+    results["watchdog_daemon_status"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 44. DRS / Migration Storage Capacity Gate Check
+    # The gate exists in vali; whether it can answer is a property of this node, and
+    # when it cannot answer it does not refuse, it approves.
+    update_current_check(category, "drs_storage_capacity_check")
+    try:
+        hosts_cfg = get_cluster_hosts()
+        controllers = ",".join(h["ip"] for h in hosts_cfg) or "127.0.0.1"
+        status, msg = classify_drs_storage_gate(
+            collect_drs_storage_facts(get_local_ip(), controllers))
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running DRS storage capacity gate check: {str(e)}"
+    results["drs_storage_capacity_check"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 45. Migration Lock Auditor
+    # Live migration is the window in which DRBD dual-primary is open, and hydra.vms.status
+    # is the only thing that stops two of them landing on one disk.
+    update_current_check(category, "migration_lock_status")
+    try:
+        status, msg = classify_migration_locks(collect_migration_lock_facts())
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running migration lock check: {str(e)}"
+    results["migration_lock_status"] = {
+        "status": status,
+        "output": msg
+    }
+
     return results
 
 def check_storage(category):
@@ -2488,6 +3707,23 @@ def check_storage(category):
         status = "WARN"
         msg = f"Error running DRBD split-brain check: {str(e)}"
     results["drbd_split_brain_check"] = {
+        "status": status,
+        "output": msg
+    }
+
+    # 14. LINSTOR Controller Latency Check
+    # Every other storage check here asks the controller a question and believes the
+    # answer. This one times the question: a controller that answers in twenty seconds is
+    # about to stop answering, and everything queued behind it -- VM creation, disk
+    # attach, live migration -- is already stalled.
+    update_current_check(category, "linstor_latency_check")
+    try:
+        status, msg = classify_linstor_latency(
+            collect_linstor_latency_facts(controller_ip))
+    except Exception as e:
+        status = "WARN"
+        msg = f"Error running LINSTOR controller latency check: {str(e)}"
+    results["linstor_latency_check"] = {
         "status": status,
         "output": msg
     }

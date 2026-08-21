@@ -24,6 +24,21 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-linstor-controller linstor resource list` | Verifies Linstor/DRBD storage volume state. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
 | `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `N/A (Native)` | DRBD kernel replication natively handles replication synchronization. |
+| `metadata_backup` | `backup` | `30 1 * * *` | 24 hours | `/usr/local/bin/saga backup --all-nodes` | Backs up the `hydra` keyspace, the Linstor controller database and `/etc/hci` to an external target, then prunes to the retention policy. See [backup_restore.md](./backup_restore.md). |
+
+`metadata_backup` is **enabled on a fresh cluster even though no backup target is
+configured yet**, so it fails once a day with a message naming the command that fixes it
+(`valcli backup.target <dir>`). A cluster with no backups should say so out loud; a
+schedule disabled by default would be silent, which is what "no backup / disaster
+recovery" looked like before it existed.
+
+> [!NOTE]
+> `execute_dagur_job_thread` calls `run_remote_spark("127.0.0.1", command)` with no
+> `timeout` in the payload, so spark-daemon applies its **45-second default** to every
+> scheduled job. That is ample for the jobs above today — a full metadata backup of the
+> single-node test cluster takes about 6.6 seconds — but it is a ceiling, and a job that
+> exceeds it is recorded as FAILED with `Command timed out after 45 seconds` even when
+> the work completed.
 
 ---
 

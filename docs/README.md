@@ -16,6 +16,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [spark_api.md](./spark_api.md) | The typed per-domain Spark API that replaces raw shell execution: the contract, the design rules, and the migration metric. |
 | [cluster_state.md](./cluster_state.md) | How desired cluster state and per-node actual state are held in ZooKeeper, the ephemeral-znode liveness model, and the direct-probe fallback. |
 | [network.md](./network.md) | Full network scope/port allocation reference. |
+| [backup_restore.md](./backup_restore.md) | What the cluster cannot rebuild, how `saga` captures it, the restore sequence, retention — and, explicitly, what is *not* backed up (guest data is not). |
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |
 | [add_ons_design.md](./add_ons_design.md) | Forward-looking design blueprint for four scale-out add-ons (Helios Portal, Helios Files, Helios Horizon, Scale-Out Urbosa) — none implemented yet. |
@@ -44,6 +45,7 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Urbosa Bootstrap (`urbosa_bootstrap.py`) | — | [urbosa_bootstrap_technical.md](./urbosa_bootstrap_technical.md) |
 | Vali (`vali.py`) | [vali.md](./vali.md) | [vali_technical.md](./vali_technical.md) |
 | Valcli (`valcli.py`) | — | [valcli_technical.md](./valcli_technical.md) |
+| Saga (`saga.py`) | [backup_restore.md](./backup_restore.md) | — (the narrative doc covers the internals too) |
 | Provision (`provision.py`) | — | [provision_technical.md](./provision_technical.md) |
 | Sync Provision (`sync_provision.py`) | — | [sync_provision_technical.md](./sync_provision_technical.md) |
 | Check Updates (`check_updates.py`) | — | [check_updates_technical.md](./check_updates_technical.md) |
@@ -51,7 +53,6 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Deploy Updates (`deploy_updates.py`) | — | [deploy_updates_technical.md](./deploy_updates_technical.md) |
 | Update Signing (`helios_sig.py`) | [update_signing.md](./update_signing.md) | — |
 | Push to GitHub (`push_to_github.py`) | — | [push_to_github_technical.md](./push_to_github_technical.md) |
-| Replace Run CQL (`replace_run_cql.py`) | — | [replace_run_cql_technical.md](./replace_run_cql_technical.md) |
 | Test Hylia (`test_hylia.py`) | — | [test_hylia_technical.md](./test_hylia_technical.md) |
 | Valkyrie (host OS) | [valkyrie.md](./valkyrie.md) | — (no daemon code; it's the physical hypervisor host itself) |
 | Odin (consensus concept) | [odin.md](./odin.md) | — |

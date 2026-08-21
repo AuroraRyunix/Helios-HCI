@@ -117,6 +117,7 @@ local_helios_zk = "helios_zk.py"
 local_helios_sig = "helios_sig.py"
 local_impa = "impa.py"
 local_helios_schema = "helios_schema.py"
+local_saga = "saga.py"
 local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
@@ -174,6 +175,34 @@ local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
 local_dockerfile = os.path.join(local_dir, "Dockerfile")
 local_static_dir = os.path.join(local_dir, "static")
+
+# Third-party image references, and the registry override that makes an air-gapped or
+# mirrored site possible. Kept in step with provision.py's IMAGES catalogue -- these
+# quadlet bodies are a second copy of the ones there, and a rolling update that wrote a
+# different image than provisioning did would silently downgrade a service.
+IMAGES = {
+    "aether": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
+    "linstor-controller": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
+    "slate": "docker.io/library/traefik:v2.10",
+}
+
+REGISTRY = (os.environ.get("HELIOS_REGISTRY") or "").strip()
+
+
+def resolve_image(name):
+    """The image reference for a component, with any registry override applied.
+
+    Replaces the registry host and keeps the repository path, which is what a mirror or
+    pull-through cache expects. Same rule as provision.py's resolver.
+    """
+    reference = IMAGES[name]
+    if not REGISTRY:
+        return reference
+    head, _, rest = reference.partition("/")
+    if "." in head or ":" in head or head == "localhost":
+        return REGISTRY.rstrip("/") + "/" + rest
+    return REGISTRY.rstrip("/") + "/" + reference
+
 
 logos_service_content = """[Unit]
 Description=Logos Distributed Metrics Service
@@ -419,7 +448,7 @@ ExecStartPre=-/usr/bin/bash -c "printf '[Unit]\\\\nAfter=lvm2-monitor.service ne
 ExecStartPre=-/usr/bin/systemctl daemon-reload
 
 [Container]
-Image=quay.io/piraeusdatastore/piraeus-server:v1.31.0
+Image=""" + resolve_image("aether") + """
 Network=host
 Volume=/dev:/dev
 Volume=/lib/modules:/lib/modules:ro
@@ -445,7 +474,7 @@ MemoryMax=1G
 MemoryHigh=900M
 
 [Container]
-Image=quay.io/piraeusdatastore/piraeus-server:v1.31.0
+Image=""" + resolve_image("linstor-controller") + """
 Network=host
 Volume=/var/lib/linstor:/var/lib/linstor:z
 Volume=/etc/linstor:/etc/linstor:z
@@ -489,7 +518,7 @@ MemoryMax=512M
 MemoryHigh=400M
 
 [Container]
-Image=docker.io/library/traefik:v2.10
+Image=""" + resolve_image("slate") + """
 Network=host
 Volume=/etc/hci/slate:/etc/traefik:z
 Volume=/etc/hci/spectrum/certs:/etc/hci/spectrum/certs:ro,z
@@ -539,6 +568,11 @@ def deploy_to_node(ip):
             # works once the certificates it exists to renew have expired.
             print(f"[{ip}] Uploading impa to /usr/local/bin/impa...")
             put_text_file(sftp, local_impa, "/usr/local/bin/impa")
+
+            # Metadata backup and restore. The keyspace is the only statement of
+            # which DRBD volume belongs to which VM.
+            print(f"[{ip}] Uploading saga to /usr/local/bin/saga...")
+            put_text_file(sftp, local_saga, "/usr/local/bin/saga")
 
             # The ordered schema, imported by the daemons at startup.
             print(f"[{ip}] Uploading helios_schema to /usr/local/bin/helios_schema.py...")

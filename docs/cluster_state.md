@@ -122,7 +122,22 @@ This is the case that motivated the work — see §1.
 
 ---
 
-## 7. The client
+## 7. None of this is backed up, on purpose
+
+`saga`, the metadata backup tool, deliberately captures nothing from ZooKeeper. See
+[backup_restore.md](./backup_restore.md) §2.5.
+
+`/helios/nodes/<ip>` is **ephemeral** — §2 — so there is nothing durable to capture; the
+entry is republished within about five seconds of the node's `spark-daemon` starting.
+`/cluster_state` holds one word that an operator retypes with `cluster start`.
+
+Capturing them would be wrong twice: it would imply the tree is a system of record when
+it is a live view, and restoring a stale `stopped` into a cluster somebody is trying to
+bring up would hold it down — the same class of mistake as §4's latch.
+
+---
+
+## 8. The client
 
 `helios_zk.py` is a minimal ZooKeeper 3.x wire-protocol client written against the
 standard library, because the repo carries no third-party dependencies (see
@@ -138,10 +153,11 @@ the `cluster` CLI via `SourceFileLoader`, matching how `check_updates` loads `hy
 
 ---
 
-## 8. Related
+## 9. Related
 
 * [cluster.md](./cluster.md) — the `cluster` CLI itself
 * [spark.md](./spark.md) / [spark_technical.md](./spark_technical.md) — the daemon that publishes
 * [zookeeper.md](./zookeeper.md), [odin.md](./odin.md) — the ensemble
+* [backup_restore.md](./backup_restore.md) — what *is* backed up, and why this is not
 * [TODO.md](../TODO.md) — remaining work, including the Daruk/Medusa metadata layer this
   composes with (one authoritative source rather than every caller re-deriving state)
