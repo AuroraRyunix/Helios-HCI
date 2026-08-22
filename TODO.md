@@ -321,22 +321,20 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## P2 — Storage / DFS
 
-* **191 replicated volumes, cluster-wide, whatever the node count.** LINSTOR's
-  `TcpPortAutoRange` is its default `7700-7890` -- 191 ports, one per DRBD resource, and Helios never
-  sets it. That is the ceiling on VM disks plus images for the whole cluster: at twenty nodes it is
-  about nine VMs per host. It surfaces as a confusing LINSTOR error at create time, not as "out of
-  capacity". Verified on the live cluster, where four resources hold 7700-7703.
-  Widening the range and the documented firewall span is a one-property change and should happen
-  regardless. It buys roughly an order of magnitude, not an architecture: each DRBD resource still
-  costs a kernel object, its own threads and RF-1 standing TCP connections per node, so the real
-  ceiling after widening is somewhere in the low thousands and needs measuring rather than guessing.
-  The underlying issue is that DRBD replicates *devices* while a hyperconverged store wants to
-  replicate *extents* -- see the DFS entry under Design / future work.
+* ~~191 replicated volumes, cluster-wide, whatever the node count.~~ **Resolved
+  (2026-08-22)**: the ceiling was LINSTOR's `TcpPortAutoRange` default of `7700-7890` -- one
+  port per DRBD resource, so about nine VMs per host at twenty nodes, surfacing as a confusing
+  LINSTOR error at create time rather than as "out of capacity". Widening the range was the
+  interim measure and was never needed: the underlying problem was that DRBD replicates
+  *devices*, so each volume cost a kernel object, its own threads and RF-1 standing connections
+  per node. Sidon replicates extents and holds one connection per node **pair**, whatever the
+  disk count. See [docs/sidon.md](docs/sidon.md).
 * **`hydra` uses SimpleStrategy, so all three replicas can land in one rack.** Replication factor is
   `min(3, node_count)`, which is correct, but `SimpleStrategy` places replicas by token order alone and
   knows nothing about racks or datacentres. On any cluster spanning more than one rack a single rack
-  loss can take the whole metadata layer with it -- and the metadata layer is what makes the surviving
-  DRBD volumes identifiable.
+  loss can take the whole metadata layer with it -- and the metadata layer is what makes the
+  surviving extent groups identifiable. An extent group without the block map is four megabytes
+  of unlabelled bytes, so this is not merely a control-plane outage.
   `NetworkTopologyStrategy` with a rack-aware snitch is the standard answer. This wants deciding
   *before* anyone racks a second cabinet: changing the strategy later requires a full repair, and until
   that repair completes the cluster is running with replicas it believes exist and does not.
@@ -615,22 +613,43 @@ deploy path still know only about the Python image.
 This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
 defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
 
-### Designed: the extent-based DFS (Sidon), with Hydra as the metadata layer
+### Built: the extent-based store (Sidon), with Hydra as the metadata layer
 
-**Decision taken (2026-08-22): build in-house rather than adopt Ceph.** The full design
-is in [docs/dfs/](docs/dfs/README.md) — architecture, the invariant contract, the
-journal/drain data path, epoch-fenced ownership (which deletes the dual-primary class
-structurally), the metadata schema with exactly-once drain, the Ganon fault-injection
-harness, milestones with gates and abandonment values, and sixteen recorded decisions
-with their rejected alternatives.
+**Decision taken 2026-08-22, built the same day.** The reasoning is in
+[docs/dfs/](docs/dfs/README.md) — architecture, the invariant contract, the journal/drain
+data path, epoch-fenced ownership, the metadata schema with exactly-once drain, the Ganon
+harness, milestones with gates and abandonment values, and the ADR list with every
+rejected alternative. The operator's view is [docs/sidon.md](docs/sidon.md).
 
-The build order's first milestone is **Ganon against DRBD** — the harness calibrated on
-a substrate known to be correct, attacking the *shipping* product, with standalone value
-whether or not the rest is ever built. No data-path code exists until it is green.
+Shipped: the journal and drain, extent groups with checksummed and identity-stamped
+footers, write-all journal replication, replica-side epoch fencing persisted across
+restarts, ownership transfer with recovery from a replica's journal, forwarding for
+non-owners, extent replication with read repair, and Purah's re-replication, mark-sweep
+reclamation and scrub. LINSTOR and DRBD are gone from the tree.
 
-Interim measures stay worthwhile regardless: the `TcpPortAutoRange` widening above, and
-the two-substrates-one-thin-pool capacity accounting caveat recorded in
-[docs/dfs/architecture.md](docs/dfs/architecture.md) §4.
+Ganon was built first and calibrated against DRBD, as designed. That calibration produced
+the finding worth keeping: the same corruption injected under both substrates is *served
+as data* by DRBD and refused with EIO by Sidon.
+
+**Left, in the order it probably matters:**
+
+* **mTLS on the replication port.** The daemon refuses to bind 9105 to anything but
+  loopback until this exists, so multi-node replication is blocked on it — deliberately,
+  rather than relying on someone remembering not to ship a plaintext cluster data path.
+* **Multi-host soaks.** Everything above was verified with several daemon instances on one
+  machine, which proves the protocol and the state machine and cannot prove independence
+  from one machine: the instances share a clock and a page cache. Real hosts are what
+  settle clock skew, genuine partitions, and the kernel-death injector — which needs
+  `kernel.sysrq` widened on a node somebody is willing to lose.
+* **Snapshots and clones.** The schema and the immutability rules are already in place; a
+  snapshot is a map copy against a frozen parent. Nothing creates one yet. This is also
+  what closes saga's honest caveat about guest data.
+* **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
+  already carries an algorithm byte, so it is off the write path entirely.
+* **Erasure coding**, as a Purah job over cold sealed groups — after the above, not
+  before. **Deduplication is argued against** in [decisions.md](docs/dfs/decisions.md).
+* **`vhost-user-blk`** beside NBD, deliberately last: performance work reorders
+  operations, and reordering is where invariants go to die.
 
 ### Scale-out add-ons (blueprints only)
 
