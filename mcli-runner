@@ -1898,11 +1898,25 @@ def check_services(category):
                 
         active_vali_ip = None
         balance_score = "N/A"
+        import ssl
         import urllib.request
+
+        # Mutual TLS, because that is what 9095 speaks. This check dialled `http://`
+        # and read the refused handshake as "Vali is unresponsive on all nodes",
+        # reporting a healthy placement manager as dead on every node of every cluster
+        # -- and leaving an SSLError traceback in vali's journal on every run. The port
+        # was hardened to CERT_REQUIRED and this call site was not moved with it.
+        vali_ctx = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+        vali_ctx.load_cert_chain(certfile="/root/.certs/client.crt",
+                                 keyfile="/root/.certs/client.key")
+        # Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so
+        # addressing a node by its own address is the only way the hostname check can
+        # pass -- which is how these are addressed here.
         for ip in hosts:
             try:
-                req = urllib.request.Request(f"http://{ip}:9095/api/v1/drs/status")
-                with urllib.request.urlopen(req, timeout=2) as resp:
+                req = urllib.request.Request(f"https://{ip}:9095/api/v1/drs/status")
+                with urllib.request.urlopen(req, timeout=5, context=vali_ctx) as resp:
                     data = json.loads(resp.read().decode('utf-8'))
                     active_vali_ip = ip
                     balance_score = data.get('balance_score', 'N/A')

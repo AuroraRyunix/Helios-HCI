@@ -25,7 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CALLERS = [
     "spectrum_server.py", "vali.py", "mipha.py", "dagur.py", "mimir.py",
     "lanayru.py", "catalyst.py", "cluster_new.py", "spark_daemon_decoded.py",
-    "valcli.py", "hylia.py",
+    "valcli.py", "hylia.py", "mcli", "mcli-runner", "spark.py", "logos.py",
+    "bifrost.py", "saga.py",
 ]
 
 INTERNAL_PORTS = ("9091", "9095")
@@ -38,14 +39,48 @@ def read(name):
     return io.open(path, encoding="utf-8").read()
 
 
+def code_of(line):
+    """The line with any trailing comment removed.
+
+    The assertion is about *calls*, so a comment saying why a call no longer uses
+    `http://` must not read as one that does. Quote-aware rather than a plain split,
+    because a `#` inside a string literal is not a comment.
+    """
+    quote = None
+    for index, char in enumerate(line):
+        if quote:
+            if char == "\\":
+                continue
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
+
+
 class PlainHttpTests(unittest.TestCase):
+    def test_every_caller_named_here_is_a_file(self):
+        """A name in CALLERS that is not a file is a typo, and a typo silently switches
+        a caller off. `mcli-runner` was simply absent, so its health check went on
+        dialling `http://` on 9095 after the port was hardened -- reporting a healthy
+        Vali as dead on every node, and leaving an SSLError traceback in vali's journal
+        every time it ran."""
+        absent = [name for name in CALLERS if read(name) is None]
+        self.assertEqual(
+            absent, [],
+            "CALLERS names files that are not in the repository, so they are not being "
+            "checked at all: %s" % absent)
+
     def test_no_daemon_calls_an_internal_api_over_plain_http(self):
         offenders = []
         for name in CALLERS:
             source = read(name)
             if source is None:
                 continue
-            for number, line in enumerate(source.splitlines(), 1):
+            for number, raw in enumerate(source.splitlines(), 1):
+                line = code_of(raw)
                 if "http://" not in line:
                     continue
                 if any(port in line for port in INTERNAL_PORTS):
@@ -53,6 +88,26 @@ class PlainHttpTests(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             "these call an internal control API over plain HTTP:\n  " + "\n  ".join(offenders))
+
+
+class CommentStrippingTests(unittest.TestCase):
+    """`code_of` has to remove prose without removing code, and the second half is the
+    one that would quietly disable the scanner."""
+
+    def test_a_comment_about_http_is_not_a_call(self):
+        self.assertEqual(
+            code_of("    # this used to dial http://x:9095/ and no longer does").strip(),
+            "")
+
+    def test_a_url_containing_a_hash_is_still_read(self):
+        line = '    req = Request("http://%s:9095/api#frag" % ip)'
+        self.assertIn("http://", code_of(line))
+        self.assertIn("9095", code_of(line))
+
+    def test_a_trailing_comment_does_not_hide_the_call_before_it(self):
+        line = '    open("http://x:9091/")  # fine, honest'
+        self.assertIn("http://", code_of(line))
+        self.assertNotIn("honest", code_of(line))
 
 
 class ServerTests(unittest.TestCase):
