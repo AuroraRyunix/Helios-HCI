@@ -338,7 +338,12 @@ impl Vdisk {
             // returns an error and the guest sees EIO, which is the honest outcome --
             // acknowledging on a subset would mean the takeover proof's "read one replica
             // sees every acknowledged write" is false.
-            self.replicate(&rec.framed)?;
+            if let Err(e) = self.replicate(&rec.framed) {
+                // Flag it before returning, so the curator's watcher can act while the
+                // guest is still seeing errors rather than after the timer notices.
+                self.mark_degraded(e.to_string());
+                return Err(e);
+            }
             written.push((off, rec.data_len, rec.data_pos));
         }
         // Overlay updates only after every record is durable, so a partially written
@@ -460,6 +465,9 @@ impl Vdisk {
     /// Record a new set after the map has accepted it, so the two do not drift.
     pub fn set_map_replicas(&mut self, nodes: Vec<String>) {
         self.map_replicas = nodes;
+        // Healed. Left set, the watcher would re-heal on every tick forever, and an
+        // operator reading status would see a disk reported broken that is not.
+        self.degraded = None;
     }
 
     fn replicate_extent_to(
@@ -588,6 +596,19 @@ impl Vdisk {
             }
         }
         Ok(())
+    }
+
+    /// Note that this vdisk cannot currently satisfy write-all, and why.
+    ///
+    /// Separate from the append path's error return because the two audiences differ: the
+    /// guest gets EIO and can do nothing about it, while the curator needs a durable flag
+    /// it can find on its next pass. Without this a node loss stops writes and nothing
+    /// notices until the heal timer fires minutes later.
+    pub fn mark_degraded(&mut self, detail: String) {
+        if self.degraded.is_none() {
+            eprintln!("sidon: vdisk {} is degraded: {detail}", self.id);
+            self.degraded = Some(detail);
+        }
     }
 
     /// Fence every reachable replica at this vdisk's epoch, and rebuild from one of them.

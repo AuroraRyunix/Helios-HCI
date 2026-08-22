@@ -941,12 +941,43 @@ impl Daemon {
 
     /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.
     pub fn start_purah(self: &Arc<Self>) {
+        // Heal promptly when a write fails, not only on the timer.
+        //
+        // Write-all means an unreachable replica stops writes: the guest gets EIO until
+        // the set is restored. That is the design's trade, and it is the right one -- a
+        // quorum journal would keep writing and cost the three-line takeover proof -- but
+        // waiting a full timer tick to *notice* turns a node loss into a multi-minute
+        // write outage for no reason. A degraded vdisk is a signal, so the loop watches
+        // for one and heals on the spot.
+        let watcher = Arc::clone(self);
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(5));
+            let degraded = {
+                let map = watcher.attached.lock().expect("attached mutex poisoned");
+                map.values().any(|a| {
+                    a.vdisk.as_ref().map(|v| {
+                        v.lock().expect("vdisk mutex poisoned").degraded.is_some()
+                    }).unwrap_or(false)
+                })
+            };
+            if degraded {
+                if let Err(e) = watcher.op_purah_heal() {
+                    eprintln!("purah: prompt re-replication failed: {e}");
+                }
+            }
+        });
+
         let me = Arc::clone(self);
         let interval = me.cfg.purah_interval;
         if interval.is_zero() {
-            println!("sidon: purah is disabled (interval 0)");
+            // Reclamation and scrub off, redundancy watching still on. They answer to
+            // different concerns -- one is about disk, the other about surviving a node
+            // loss -- and an operator who turns off the garbage collector has not asked
+            // to stop restoring replicas.
+            println!("sidon: purah sweep/scrub disabled (interval 0); the redundancy watcher still runs");
             return;
         }
+
         thread::spawn(move || loop {
             thread::sleep(interval);
             match me.op_purah_sweep() {
