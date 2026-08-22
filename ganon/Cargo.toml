@@ -1,0 +1,14 @@
+[package]
+name = "ganon"
+version = "0.1.0"
+license = "BUSL-1.1"
+edition = "2021"
+
+# Ganon deliberately depends on nothing that Sidon depends on, and links none of Sidon's
+# code. A harness that shares a library with the thing it judges can have a bug vouch for
+# itself: the same wrong CRC, the same wrong offset arithmetic, agreeing perfectly. The
+# stamp format is specified in docs/dfs/ganon.md and implemented twice on purpose.
+[dependencies]
+
+[profile.release]
+opt-level = 2

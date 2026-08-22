@@ -20,7 +20,7 @@ and because the invariants that fail *silently* — the I-3 ordering rules — a
 reachable without a peer. Milestone 5 is where peers become mandatory: its whole subject
 is what happens between hosts. Plan the hardware for 5, not for 1.
 
-## 1. Ganon vs DRBD
+## 1. Ganon vs DRBD -- **done**
 
 Build the harness ([ganon.md](./ganon.md)); calibrate it against the substrate two
 decades of production says is correct. Run the full applicable matrix against the
@@ -38,7 +38,7 @@ decades of production says is correct. Run the full applicable matrix against th
   into CI, plus whatever it finds. This milestone is worth funding even if the word
   "Sidon" is never spoken again.
 
-## 2. Map and endpoints, no data path
+## 2. Map and endpoints, no data path -- **done**
 
 The `dfs_*` migrations in `helios_schema.py`, the Daruk `LWT_OPS` entries
 ([metadata.md §2](./metadata.md)), and simulation tests driving claim / drain-commit /
@@ -53,7 +53,7 @@ pattern, which exists precisely because LWT behaviour was not assumable last tim
   useful beyond storage) and the simulation suite documents Scylla's LWT semantics
   further.
 
-## 3. The journal vertical slice
+## 3. The journal vertical slice -- **done** (single-replica)
 
 Sidon serves one vdisk over an NBD unix socket: append to a replicated journal
 (write-all, epoch-stamped), ack, replay on restart. No drain, no egroups — reads come
@@ -64,7 +64,7 @@ entirely from the overlay. First single-replica, then RF2 across two nodes.
 - **Abandonment value: low** — and that is fine. This is the first step that only pays
   as part of the whole, which is why two milestones of standalone value precede it.
 
-## 4. The extent store
+## 4. The extent store -- **done** (single-replica)
 
 Drain, open/sealed egroups, checksummed reads, redirect-on-replica-failure, the
 data-before-metadata ordering throughout.

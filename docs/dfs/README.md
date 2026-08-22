@@ -1,8 +1,11 @@
 # The Helios DFS — design documents
 
-**Status: designed, not yet building.** These documents are the deliverable of the design
-phase. Nothing in this directory is implemented; the first implementation milestone is a
-fault-injection harness, not the filesystem.
+**Status: building.** Milestones 0-4 are done on a single node: Sidon serves vdisks to
+qemu over NBD, journals and drains into extent groups, commits the block map to Hydra,
+and a libvirt VM boots from it. Ganon is built and calibrated against DRBD. What is *not*
+built: replication to peers, ownership transfer between hosts, and Purah. The
+documents remain the specification -- where code and document disagree, that is a bug in
+one of them and the disagreement is the finding.
 
 ## What this is
 

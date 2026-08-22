@@ -80,18 +80,30 @@ jobs:
         run: mix hex.audit
 
   rust:
-    name: Rust (agahnim console proxy)
+    name: Rust (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agahnim, sidon, ganon]
     defaults:
       run:
-        working-directory: agahnim
+        working-directory: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: agahnim
+          workspaces: ${{ matrix.crate }}
       - run: cargo check --all-targets
+      # sidon and ganon carry the storage correctness suites -- journal replay after a
+      # torn write, overlay segment disjointness, checksum and misdirect detection, and
+      # the ack journal's legal-history rule. They gate every data-path change, so they
+      # run here rather than only on a node. agahnim has no tests to run yet, and
+      # `cargo test` on a crate without them is a pass that means nothing.
+      - name: Unit tests
+        if: matrix.crate != 'agahnim'
+        run: cargo test --all-targets
 
   container:
     name: Spectrum (Phoenix) image builds

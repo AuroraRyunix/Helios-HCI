@@ -13,13 +13,13 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 ## 1. Tech Stack
 
 * **Orchestration/control-plane code**: Python 3, deliberately stdlib-heavy. The only third-party dependencies are `paramiko` (`deploy_updates.py`, `provision.py`) and `cassandra-driver` (`daruk.py`), pinned in [requirements.txt](./requirements.txt); every daemon that runs on a hypervisor is stdlib-only.
-* **Console proxy sidecar**: Rust (`agahnim/`, Tokio + `tokio-tungstenite` + `tokio-rustls`) — a native systemd service (not a container) that proxies VNC/SPICE WebSocket console traffic.
+* **Native Rust services**: three, all native systemd units rather than containers. `agahnim/` (Tokio + `tokio-tungstenite` + `tokio-rustls`) proxies VNC/SPICE WebSocket console traffic. `sidon/` is the storage data path — it serves VM disks to qemu over NBD and is dependency-thin on purpose (`serde_json` only; everything on the byte path is std). `ganon/` is the fault-injection harness that gates changes to it, and depends on nothing at all.
 * **Frontend**: Vanilla HTML/CSS/JS under `static/` (no build step), with vendored noVNC (`static/novnc/`), SPICE-HTML5 (`static/spice-html5/`), and pako (`static/vendor/pako/`).
 * **Deployment model**: a deliberate split (see [docs/deployment.md](./docs/deployment.md)). Third-party services with real dependency trees run as **Podman Quadlets** (`.container` files in `/etc/containers/systemd/`): ZooKeeper, ScyllaDB, Aether/Linstor, the Linstor controller, Spectrum, and Slate. The Helios daemons themselves are **native `systemd` units** (`/etc/systemd/system/*.service`) — they are stdlib-only Python whose job is to configure the host (network namespaces, VLAN bridges, IP addresses, DRBD), so a container boundary would isolate nothing while adding an image to build and version.
 * **Data & consensus**: ScyllaDB ("Hydra", Cassandra-compatible, port `9042`) for cluster/VM metadata, and Apache ZooKeeper ("Odin"/"Zeus", port `2181`) for distributed consensus and leader election.
-* **Storage**: Linstor + DRBD ("Aether") for replicated block storage (this replaced an earlier GlusterFS-based design — no GlusterFS code remains in the current tree).
+* **Storage**: in transition. Linstor + DRBD ("Aether") is what runs today for replicated block storage (itself a replacement for an earlier GlusterFS design — no GlusterFS code remains). **Sidon** is its successor: an extent-based store whose placement map lives in Hydra, replicating extent groups instead of devices. It boots VMs today on a single node; the decision is replacement, not coexistence, and DRBD comes off the nodes when its disks have moved. See [docs/dfs/](./docs/dfs/README.md).
 * **Ingress**: Traefik ("Slate") terminating all client-facing WebUI/API/console traffic on port `443`.
-* **CI**: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) byte-compiles every Python module, runs the unit and deployment-manifest tests, builds the Elixir app against the same toolchain the release image uses, checks the Rust console proxy, and builds the Spectrum container image.
+* **CI**: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) byte-compiles every Python module, runs the unit and deployment-manifest tests, builds the Elixir app against the same toolchain the release image uses, checks all three Rust crates (`agahnim`, `sidon`, `ganon`) and runs the storage crates' test suites, and builds the Spectrum container image.
 
 ---
 
@@ -81,7 +81,14 @@ Helios-HCI/
 ├── agahnim/              # Rust WebSocket console-proxy sidecar (Tokio), builds to /usr/local/bin/agahnim
 │   ├── Cargo.toml
 │   └── src/main.rs
+├── sidon/                # Rust extent-based DFS data path, builds to /usr/local/bin/sidon.
+│   ├── Cargo.toml        #   Journal, overlay, extent store, NBD server, Daruk metadata client.
+│   └── src/              #   crc, journal, overlay, extent, vdisk, nbd, control, meta, err
+├── ganon/                # Rust fault-injection harness, builds to /usr/local/bin/ganon.
+│   ├── Cargo.toml        #   Shares no code with sidon, deliberately: see its Cargo.toml.
+│   └── src/              #   stamp, journal (the ack journal), target (device + NBD adapters)
 ├── docs/                 # Architecture guides, per-daemon narrative/technical docs, audit backlog
+│   ├── dfs/              # The extent-based DFS: architecture, invariants, data path, ADRs
 │   └── history/          # Superseded point-in-time changelogs (walkthrough.md, task.md, readme_old.md)
 ├── slate_config/         # Traefik ("Slate") static + dynamic config (traefik.yml, dynamic.yml)
 ├── spectrum_phx/          # Phoenix LiveView console (the Spectrum rewrite) -- see docs/spectrum_phx.md
@@ -123,9 +130,9 @@ Helios-HCI/
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed replicated block storage engine (replaced an earlier GlusterFS-based design). |
-| [Sidon](./docs/dfs/README.md) | **Stargate** (successor) | Native Rust systemd service — *designed, not built* | Per-node data-path daemon for the extent-based DFS. Serves VM disks to qemu over NBD, owns the replicated journal and the drain, and forwards to the vdisk's owner when it is not the owner itself. Intended to replace Aether's per-device DRBD replication. |
-| [Purah](./docs/dfs/data-path.md) | **Curator** — *designed, not built* | Leader-elected role inside Sidon | Re-replication after node loss, mark-sweep garbage collection, background scrub against seal hashes, and locality rebuild after ownership moves. |
-| [Ganon](./docs/dfs/ganon.md) | — *designed, not built* | Rust test harness | Fault-injection harness: kills, stalls, partitions and corrupts a storage substrate, then asserts every read returned a legal value. Built and calibrated against DRBD **before** any DFS code exists, and useful against the shipping product on its own. |
+| [Sidon](./docs/dfs/README.md) | **Stargate** (successor) | Native Rust systemd service | Per-node data-path daemon for the extent-based DFS. Serves VM disks to qemu over NBD on a unix socket; guest writes land in a per-vdisk journal and are acknowledged after one `fdatasync`, then a background drain coalesces them into extent groups and commits the block map to Hydra. **Working on a single node** — a libvirt VM boots from it. Replication to peers and ownership forwarding are the next milestones. |
+| [Purah](./docs/dfs/data-path.md) | **Curator** — *designed, not built* | Leader-elected role inside Sidon | Re-replication after node loss, mark-sweep garbage collection, background scrub against seal hashes, and locality rebuild after ownership moves. Extent groups orphaned by redirect-on-write accumulate until this exists. |
+| [Ganon](./docs/dfs/ganon.md) | — | Rust test harness | Fault-injection harness. Writes self-describing stamped blocks, keeps an ack journal off the system under test, and asserts every read returned a *legal* value — the newest acknowledged generation, or one that was in flight when the world ended, and nothing else. Speaks to a DRBD device and to an NBD socket through the same adapter trait, so a scenario never knows its substrate. **Working**, and calibrated against DRBD first as designed. |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Spectrum (Phoenix)](./docs/spectrum_phx.md) | **Prism** | Podman + Elixir/Phoenix LiveView | The console rewrite, running beside the Python tier on port 8444 and taking over routes as they are ported. Renders server-side and never touches the data path. |
 | [Catalyst](./docs/catalyst.md) | **Task Orchestrator** | Native Python service | Centralized task manager scheduling and tracking long-running asynchronous cluster operations. |
@@ -273,6 +280,7 @@ Helios-HCI uses a lightweight, secure network layout for inter-node orchestratio
 * **Mutual TLS (mTLS) Mesh**: All cross-node administrative tasks and remote executions run securely over port `9099` via the **Spark Daemon**.
 * **Consensus & Metadata Mesh**: Database gossip (ScyllaDB on `7000`) and consensus election (ZooKeeper on `2888`/`3888`) route over cluster-facing networks.
 * **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Slate ingress on port `443`.
+* **Storage (Sidon)**: **no new port.** Control arrives on a unix socket at `/run/sidon/control.sock`, reached from spark-daemon, so callers are authenticated once by the existing mTLS mesh on `9099` rather than by a second credential nobody would rotate. Guests attach over a per-vdisk unix socket under `/var/lib/hci/sidon/nbd/`, group-owned by `qemu`. Port `9105` is reserved for extent replication between nodes and does not bind at `ftt=0` — one connection per node *pair* when it does, independent of VM count, which was the whole complaint about DRBD's per-device model.
 
 ### Cluster Network Flow Chart
 
@@ -341,7 +349,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 ## 9. Documentation
 
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
-* [docs/dfs/](./docs/dfs/README.md) - Design for the extent-based DFS (Sidon) that will replace per-device DRBD replication for VM disks. Designed, not yet building; the first milestone is a fault-injection harness.
+* [docs/dfs/](./docs/dfs/README.md) - The extent-based DFS (Sidon) replacing per-device DRBD replication for VM disks: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, and the ADR list. Sidon and Ganon are built and running on a single node; replication, ownership transfer and the curator are not.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.
