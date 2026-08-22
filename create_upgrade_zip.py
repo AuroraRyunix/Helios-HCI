@@ -1,3 +1,4 @@
+import io
 import os
 import json
 import stat
@@ -21,6 +22,106 @@ BUILD_DIR = "upgrade_build"
 RELEASE_DOC_NAME = f"upgrade_{VERSION}.release.json"
 RELEASE_DOWNLOAD_URL = os.environ.get("HELIOS_RELEASE_DOWNLOAD_URL", "").strip() or \
     f"https://updates-helios.zerotwo.cloud/downloads/{ZIP_NAME}"
+
+# Components that are built on the node rather than copied to it.
+#
+# The package carries *sources*, and hylia compiles them. The alternative -- shipping
+# binaries -- was rejected because it moves what the signature means: signing a tarball of
+# Rust you can read is a claim about the code, while signing an ELF is a claim about
+# whoever's machine produced it. This way the release key vouches for something a reader
+# can audit.
+#
+# The cost is honest and worth stating: every node needs a toolchain, a build takes
+# minutes rather than milliseconds, and a build that fails on one node fails that node's
+# upgrade. hylia keeps the running binary until the new one exists, so the failure is a
+# node that did not update rather than a node without storage.
+#
+# Only Rust crates. The console's container image is a different problem -- it pulls base
+# images from a public registry at build time -- and is deliberately not solved here.
+SOURCE_COMPONENTS = {
+    "sidon-src": {
+        "dir": "sidon",
+        "binary": "sidon",
+        "target": "/usr/local/bin/sidon",
+        "unit": "sidon",
+    },
+    "ganon-src": {
+        "dir": "ganon",
+        "binary": "ganon",
+        "target": "/usr/local/bin/ganon",
+        # No unit: ganon is a harness an operator runs, not a service.
+        "unit": None,
+    },
+    "agahnim-src": {
+        "dir": "agahnim",
+        "binary": "agahnim",
+        "target": "/usr/local/bin/agahnim",
+        "unit": "agahnim",
+    },
+}
+
+# What goes into a crate tarball. Everything else -- target/, .git, editor droppings --
+# is rebuilt or irrelevant, and including it would make the digest depend on whether the
+# packager had run a build.
+SOURCE_INCLUDE = ("Cargo.toml", "Cargo.lock", "src")
+
+
+def crate_tarball(crate_dir, dest):
+    """A byte-identical tarball for identical sources.
+
+    Reproducibility is the whole point of shipping sources: the release document asserts
+    a sha256, and a digest that changes because tar recorded a different mtime or walked
+    the directory in a different order is a digest nobody can check. So every varying
+    field is pinned -- mtime, uid/gid, owner names, and the order of entries -- and the
+    gzip header gets no timestamp of its own.
+    """
+    import gzip
+    import tarfile
+
+    members = []
+    for name in SOURCE_INCLUDE:
+        path = os.path.join(crate_dir, name)
+        if not os.path.exists(path):
+            continue
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for f in sorted(files):
+                    if f.endswith(".rs"):
+                        full = os.path.join(root, f)
+                        members.append((os.path.relpath(full, crate_dir).replace("\\", "/"), full))
+        else:
+            members.append((name, path))
+    members.sort()
+
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        for arcname, full in members:
+            with open(full, "rb") as handle:
+                # LF, always. A packager on Windows would otherwise ship CRLF into a
+                # Rust file and change the digest without changing the code.
+                data = handle.read().replace(b"\r\n", b"\n")
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data)
+            info.mtime = 0
+            info.mode = 0o644
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.type = tarfile.REGTYPE
+            tar.addfile(info, io.BytesIO(data))
+
+    with open(dest, "wb") as out:
+        # mtime=0 and no embedded filename. Both default to something that varies: the
+        # timestamp to "now", and the name to `fileobj.name` -- so without `filename=""`
+        # the digest depends on the path the packager happened to write to, which is the
+        # sort of reproducibility bug that passes every check that builds to the same
+        # place twice.
+        with gzip.GzipFile(filename="", fileobj=out, mode="wb", mtime=0) as gz:
+            gz.write(raw.getvalue())
+    return [name for name, _ in members]
+
 
 components_map = {
     "spark": {"src": "spark.py", "target": "/usr/local/bin/spark"},
@@ -277,6 +378,37 @@ def main():
             "version": comp_version
         }
         
+    # Source components: one deterministic tarball each, digested like any other member.
+    for comp_name, info in SOURCE_COMPONENTS.items():
+        crate_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), info["dir"])
+        if not os.path.isdir(crate_dir):
+            raise SystemExit(f"{comp_name}: {crate_dir} is not a directory")
+        dest_filename = f"{comp_name}.tar.gz"
+        dest_path = os.path.join(BUILD_DIR, dest_filename)
+        files = crate_tarball(crate_dir, dest_path)
+        if not files:
+            raise SystemExit(f"{comp_name}: no sources found under {crate_dir}")
+
+        sha256 = hashlib.sha256()
+        with open(dest_path, "rb") as f_bin:
+            while chunk := f_bin.read(8192):
+                sha256.update(chunk)
+
+        file_modes[dest_filename] = 0o644
+        components_manifest[comp_name] = {
+            "file": dest_filename,
+            "sha256": sha256.hexdigest(),
+            "target_path": info["target"],
+            "version": VERSION,
+            # The presence of this key is what tells hylia to build rather than copy.
+            "build": {
+                "kind": "cargo",
+                "binary": info["binary"],
+                "unit": info["unit"],
+                "files": len(files),
+            },
+        }
+
     # Write changelog
     changelog_filename = "changelog.md"
     with open(os.path.join(BUILD_DIR, changelog_filename), "w", encoding="utf-8") as f_ch:

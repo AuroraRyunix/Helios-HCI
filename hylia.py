@@ -179,6 +179,10 @@ def log_upgrade(job_id, line):
 # restricted character set that cannot escape a shell word.
 ALLOWED_TARGET_PREFIXES = ("/usr/local/bin/",)
 _SAFE_PATH_RE = re.compile(r'^[A-Za-z0-9._/-]+$')
+# A bare file or unit name: no slash, no dots that could climb, nothing a shell
+# would look at twice. Everything validated with this is interpolated into a root
+# command on every node in the cluster.
+_SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
 _SAFE_FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 _SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 
@@ -356,6 +360,171 @@ def get_remote_sha256(node_ip, remote_path):
     if rc != 0 or not out or not out.strip():
         return None
     return out.strip().split()[0].lower()
+
+# Where a source component is unpacked and built. Under /tmp on purpose: it is scratch,
+# and a build tree left behind after a failed upgrade should not survive a reboot.
+BUILD_ROOT = "/tmp/hylia_build"
+
+
+def validate_build_spec(comp_name, comp_info):
+    """The `build` section, or None for an ordinary file component.
+
+    Validated as strictly as `target_path` is, and for the same reason: everything here
+    reaches a root shell on every node. `binary` is a bare name because it is
+    interpolated into a path, and `kind` is an allow-list of one because a package that
+    could name its own build command would be a package that could run anything.
+    """
+    spec = comp_info.get("build")
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise Exception(f"Component '{comp_name}' has a 'build' that is not an object.")
+    kind = spec.get("kind")
+    if kind != "cargo":
+        raise Exception(
+            f"Component '{comp_name}' asks for build kind {kind!r}; this hylia only "
+            f"knows 'cargo'.")
+    binary = spec.get("binary")
+    if not isinstance(binary, str) or not _SAFE_NAME_RE.match(binary or ""):
+        raise Exception(
+            f"Component '{comp_name}' names build artefact {binary!r}, which is not a "
+            f"plain file name.")
+    unit = spec.get("unit")
+    if unit is not None and (not isinstance(unit, str) or not _SAFE_NAME_RE.match(unit)):
+        raise Exception(f"Component '{comp_name}' names unit {unit!r}, which is not a plain name.")
+    return {"kind": kind, "binary": binary, "unit": unit}
+
+
+def build_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir, spec):
+    """Compile a source component on the node and install what it produced.
+
+    The package carries sources and their digest, so the signature covers code a reader
+    can audit rather than an artefact from someone's machine. The cost is that a build
+    can fail, and the ordering here is what makes that survivable: nothing touches the
+    live binary until the new one has been compiled. A failure leaves the node running
+    what it was running, and fails this node's upgrade rather than half-applying it.
+    """
+    comp_file, declared_hash, target_path = validate_manifest_component(comp_name, comp_info)
+    local_file_path = os.path.join(extract_dir, comp_file)
+    if not os.path.exists(local_file_path):
+        raise Exception(
+            f"Staged sources '{local_file_path}' for component '{comp_name}' are missing.")
+
+    with open(local_file_path, "rb") as f_bin:
+        file_bytes = f_bin.read()
+    local_hash = hashlib.sha256(file_bytes).hexdigest()
+    if local_hash != declared_hash:
+        raise Exception(
+            f"Staged sources for '{comp_name}' no longer match the manifest checksum "
+            f"(declared {declared_hash}, actual {local_hash}). Refusing to build them.")
+
+    # A tarball is binary, so no CRLF normalisation here: the bytes on the node must be
+    # the bytes that were digested, or the check below means nothing.
+    b64_data = base64.b64encode(file_bytes).decode("utf-8")
+    work = f"{BUILD_ROOT}/{comp_name}"
+    staged_tar = f"{work}.tar.gz.b64"
+    tar_path = f"{work}.tar.gz"
+
+    log_upgrade(job_id, f"[{hostname}] Transferring sources for '{comp_name}'...")
+    rc_p, _, err_p = run_remote_spark(
+        node_ip, f"mkdir -p '{work}' && rm -rf '{work}'/* '{staged_tar}' '{tar_path}'")
+    if rc_p != 0:
+        raise Exception(f"Could not prepare a build area for '{comp_name}' on {hostname}: {err_p}")
+
+    chunk_size = 64000
+    for c_idx in range(0, len(b64_data), chunk_size):
+        rc_w, _, err_w = run_remote_spark(
+            node_ip, f"echo '{b64_data[c_idx:c_idx+chunk_size]}' >> '{staged_tar}'")
+        if rc_w != 0:
+            run_remote_spark(node_ip, f"rm -rf '{work}' '{staged_tar}' '{tar_path}'")
+            raise Exception(f"Failed to transfer sources for '{comp_name}' to {hostname}: {err_w}")
+
+    rc_d, _, err_d = run_remote_spark(
+        node_ip, f"base64 -d < '{staged_tar}' > '{tar_path}' && rm -f '{staged_tar}'")
+    if rc_d != 0:
+        run_remote_spark(node_ip, f"rm -rf '{work}' '{staged_tar}' '{tar_path}'")
+        raise Exception(f"Failed to decode sources for '{comp_name}' on {hostname}: {err_d}")
+
+    # Verified on the node, against the digest the release key signed. /tmp is writable
+    # by anyone, so this is the check that matters rather than the one done before send.
+    remote_hash = get_remote_sha256(node_ip, tar_path)
+    if remote_hash != declared_hash:
+        run_remote_spark(node_ip, f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(
+            f"Sources for '{comp_name}' do not match the signed manifest on {hostname} "
+            f"(expected {declared_hash}, got {remote_hash}). Nothing was built.")
+
+    rc_x, _, err_x = run_remote_spark(node_ip, f"tar -xzf '{tar_path}' -C '{work}'")
+    if rc_x != 0:
+        run_remote_spark(node_ip, f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(f"Could not unpack sources for '{comp_name}' on {hostname}: {err_x}")
+
+    log_upgrade(job_id, f"[{hostname}] Compiling '{comp_name}' (this takes minutes, not seconds)...")
+    built = f"{work}/target/release/{spec['binary']}"
+    # `--locked` refuses to touch Cargo.lock, which is the point of shipping one: the
+    # signed package pins the whole dependency graph, not just this repository's source.
+    # Without it two nodes building the same signed sources on different days could
+    # resolve different versions of a transitive crate, and the signature would cover
+    # neither of them.
+    #
+    # `--offline` is deliberately *not* passed. The lockfile pins what to fetch, and a
+    # node with a cold registry must be able to fetch it; refusing would make the first
+    # upgrade after a reprovision fail for a reason unrelated to the upgrade.
+    rc_b, out_b, err_b = run_remote_spark(
+        node_ip, f"cd '{work}' && cargo build --release --locked 2>&1 | tail -40")
+    if rc_b != 0:
+        detail = (err_b or out_b or "").strip()[:600]
+        run_remote_spark(node_ip, f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(
+            f"'{comp_name}' failed to compile on {hostname}: {detail}. The running "
+            f"binary was left in place.")
+
+    rc_e, _, _ = run_remote_spark(node_ip, f"test -x '{built}'")
+    if rc_e != 0:
+        run_remote_spark(node_ip, f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(
+            f"'{comp_name}' compiled on {hostname} but produced no {spec['binary']} "
+            f"executable. Nothing was installed.")
+
+    # Same atomic swap the file path uses: back the old one up, rename over, and keep the
+    # backup until the new file is confirmed in place.
+    backup_path = f"{target_path}.hylia_bak"
+    swap_cmd = (
+        f"rm -f '{backup_path}' && "
+        f"if [ -e '{target_path}' ]; then cp -p '{target_path}' '{backup_path}'; fi && "
+        f"install -m 0755 '{built}' '{target_path}'"
+    )
+    rc_s, _, err_s = run_remote_spark(node_ip, swap_cmd)
+    if rc_s != 0:
+        run_remote_spark(
+            node_ip,
+            f"if [ -e '{backup_path}' ]; then mv -f '{backup_path}' '{target_path}'; fi; "
+            f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(f"Failed to install '{comp_name}' on {hostname}: {err_s}. Previous version restored.")
+
+    built_hash = get_remote_sha256(node_ip, built)
+    live_hash = get_remote_sha256(node_ip, target_path)
+    if not live_hash or live_hash != built_hash:
+        run_remote_spark(
+            node_ip,
+            f"if [ -e '{backup_path}' ]; then mv -f '{backup_path}' '{target_path}'; fi; "
+            f"rm -rf '{work}' '{tar_path}'")
+        raise Exception(
+            f"Post-install verification failed for '{comp_name}' on {hostname}. "
+            f"Previous version restored.")
+
+    run_remote_spark(node_ip, f"rm -f '{backup_path}'; rm -rf '{work}' '{tar_path}'")
+    # Deliberately not restarted here. A rolling upgrade reboots the node it has drained,
+    # and restarting the storage daemon outside that window detaches every vdisk on it.
+    # systemd runs the inode it already opened, so the old process keeps working until
+    # the reboot puts the new binary into service.
+    log_upgrade(
+        job_id,
+        f"[{hostname}] Component '{comp_name}' built and installed ({(built_hash or '')[:12]}...). "
+        f"It takes effect on the next restart of "
+        f"{spec['unit'] or 'whatever runs it'}.")
+    return True
+
 
 def deploy_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir):
     """Install one component on a node via a staged, verified, atomic swap.
@@ -691,7 +860,13 @@ def hylia_rolling_upgrade(job_id):
                     validate_manifest_component(comp_name, comp_info)
 
                 for comp_name, comp_info in components.items():
-                    deploy_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir)
+                    spec = validate_build_spec(comp_name, comp_info)
+                    if spec:
+                        build_component(job_id, node_ip, hostname, comp_name,
+                                        comp_info, extract_dir, spec)
+                    else:
+                        deploy_component(job_id, node_ip, hostname, comp_name,
+                                         comp_info, extract_dir)
 
                 if "spectrum" in components:
                     log_upgrade(job_id, f"[{hostname}] Rebuilding Spectrum container on host...")
