@@ -927,8 +927,10 @@ def collect_drs_storage_facts(local_ip, _controller_ip=None):
             facts["gate_error"] = ("vali.get_storage_free_space() returned %r, which is "
                                    "neither an integer nor None" % (value,))
 
-    rc, out, err = run_cmd(
+    rc, out, err, _elapsed, timed_out = run_cmd_timed(
         "printf '{\"op\":\"capacity\"}\\n' | nc -U /run/sidon/control.sock", 30)
+    if timed_out:
+        rc, out, err = -1, "", "sidon did not answer within 30s"
     if rc != 0 or not out.strip():
         facts["capacity_error"] = (err or "sidon did not answer").strip()[:300]
     else:
@@ -2902,8 +2904,11 @@ def check_storage(category):
     # is no controller to ask about pools. What remains worth asking is whether every
     # vdisk this node serves can still reach every replica it is supposed to.
     update_current_check(category, "replica_health")
-    rc_l, out_l, err_l = run_cmd(
+    rc_l, out_l, err_l, _elapsed, timed_out = run_cmd_timed(
         "printf '{\"op\":\"list\"}\\n' | nc -U /run/sidon/control.sock", 30)
+    if timed_out:
+        rc_l, out_l, err_l = -1, "", "sidon did not answer within 30s"
+
     if rc_l != 0 or not out_l.strip():
         status = "FAIL"
         msg = ("Sidon did not answer on its control socket (%s). Nothing on this node can "
@@ -3059,8 +3064,10 @@ def check_storage(category):
     # get wrong, and the consequence of getting it wrong is deleting live data.
     update_current_check(category, "orphaned_disks_check")
     try:
-        rc_c, out_c, err_c = run_cmd(
+        rc_c, out_c, err_c, _elapsed, timed_out = run_cmd_timed(
             "printf '{\"op\":\"capacity\"}\\n' | nc -U /run/sidon/control.sock", 30)
+        if timed_out:
+            rc_c, out_c, err_c = -1, "", "sidon did not answer within 30s"
         capacity = None
         if rc_c == 0 and out_c.strip():
             try:
@@ -3190,9 +3197,11 @@ def check_storage(category):
     update_current_check(category, "sidon_latency_check")
     try:
         started = time.time()
-        rc_p, out_p, err_p = run_cmd(
+        rc_p, out_p, err_p, _elapsed, timed_out = run_cmd_timed(
             "printf '{\"op\":\"ping\"}\\n' | nc -U /run/sidon/control.sock",
             SIDON_LATENCY_TIMEOUT)
+        if timed_out:
+            rc_p = -1
         elapsed = time.time() - started
         if rc_p != 0 or not out_p.strip():
             status = "FAIL"
