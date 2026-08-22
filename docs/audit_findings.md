@@ -2,6 +2,16 @@
 
 This document outlines critical issues, edge cases, and design bottlenecks identified during the deep audit of the Helios-HCI codebase.
 
+> [!IMPORTANT]
+> **Every storage finding here predates [Sidon](./sidon.md).** LINSTOR and DRBD were
+> replaced on 2026-08-22, so findings about DRBD roles, split-brain, resyncs, LINSTOR
+> controllers and storage pools describe a layer that no longer exists. They are kept
+> rather than deleted: an audit that erases the problems a design was built to solve
+> invites the next design to walk into them. Each carries a status line saying what
+> replaced it, and where a *recommendation* turned out to be wrong the correction is kept
+> beside it — 5.A is the one to read, because the fix it proposed was itself a data-loss
+> bug.
+
 ---
 
 ## 1. Quorum & Scale Boundaries ($N=1$, $N=2$, $N=40$)
@@ -50,6 +60,14 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** When ZooKeeper leader election changes, the new leader coordinates with other hosts to release `linstor-db` by executing a remote release script. However, this is gated by `ping_host(ip)`.
 *   **Impact:** If the previous leader node is partitioned (network split, not pingable) but still powered on, it will keep `linstor-db` promoted as `Primary` and mounted. The new leader will skip the remote release command, attempt to run `drbdadm primary linstor-db`, and fail due to split-brain locking. The database volume will fail to mount on the new leader, halting all cluster management.
 *   **Recommendation:** Force-fence the unresponsive node via IPMI/PDU (STONITH) before attempting to promote the DRBD resource locally, or use `drbdadm primary --force linstor-db` after a timeout.
+*   **Status (2026-08-22): RESOLVED by removal.** There is no `linstor-db`, no promotion,
+    and no leader-held control-plane volume. That whole class of problem came from DRBD's
+    control plane being itself a replicated volume that had to be Primary on exactly one
+    node; Sidon's block map is in Hydra, which every node can write. The recommendation
+    was also aimed the wrong way round, and it is worth saying so: STONITH-before-promote
+    is the strongest ladder available *when the storage cannot be fenced directly*. It can
+    now, so the storage rung runs first and the BMC is hygiene. See
+    [fencing.md](./fencing.md).
 
 ### B. Bifrost Split-Brain VIP Conflict
 *   **Location:** `bifrost.py` (lines 63–79)
@@ -78,6 +96,14 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** During rolling upgrades, Hylia evacuates a host's VMs and triggers a reboot. It checks if the host's storage volumes are synchronized *after* the reboot, but not *before*.
 *   **Impact:** If the cluster storage is already degraded (e.g., Node 3's disk is broken, so Node 2 contains the only healthy copy of a VM's data) and Hylia reboots Node 2, the VM's storage becomes completely unavailable, causing VM crash or data corruption.
 *   **Recommendation:** Implement pre-flight checks in Hylia that verify that **all** DRBD resources across the **entire cluster** are fully synchronized and healthy before taking a node offline.
+*   **Status (2026-08-22): PARTIALLY RESOLVED, and the shape changed.** There is no
+    synchronization to verify — extent groups are immutable, so a copy is byte-identical
+    or absent, and Purah restores absent ones in the background. What Hylia checks before
+    and after is narrower and answerable at once: that the node's Sidon answers, that its
+    extent store is mounted with room in it, and that it holds no degraded vdisk. The
+    original concern survives in a different form: rebooting the node holding the last
+    reachable replica of a vdisk still makes it unavailable, and the cluster-wide replica
+    check that would catch that is not written. It needs more than one node to test.
 
 ---
 
@@ -93,18 +119,38 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 
 ## 5. Aether (Storage & DRBD) Reliability Hellholes
 
+> [!NOTE]
+> **This whole section is history.** Aether — LINSTOR and DRBD — was replaced by
+> [Sidon](./sidon.md) on 2026-08-22, and the findings below are kept because the reasoning
+> is what the replacement was designed against. Each carries its own status line. The one
+> worth reading first is 5.A: it records a fix that was itself a data-loss bug, which is
+> the sort of thing that gets re-proposed by anyone who has forgotten it.
+
 ### A. Split-Brain StandAlone Deadlocks
 *   **Location:** `mipha.py` (lines 52–68)
 *   **The Issue:** When a DRBD resource enters `StandAlone` (due to split-brain data divergence), Mipha's auto-resolution check only triggers connection resets with `--discard-my-data` if the local node role is `Secondary`.
 *   **Impact:** If a network partition occurs while VMs are active on both nodes, both nodes will have promoted their local resources to `Primary`. Since both nodes report `role == "Primary"`, neither will match the resolution condition (`role != "Primary"`), leaving the DRBD volumes permanently stuck in `StandAlone` and replication suspended until manual operator intervention.
 *   **Recommendation:** Enhance `resolve_drbd_standalone` to check if a split-brain is active, determine which node has the latest writes, force-demote the other node to `Secondary`, and run the connection reset.
-*   **Status (2026-08-17): RESOLVED — but note the correction below.** The parenthetical in the original recommendation ("or let ZooKeeper designate the leader's storage as correct") was implemented and **was itself a data-loss bug**, so it has been struck from the recommendation above. ZooKeeper leadership is a single cluster-wide property; "which node holds the authoritative copy" is a per-resource question. A node running a VM and holding `Primary` on that VM's disk would discard its own live writes purely because a different node happened to be the ZK leader, resyncing from a stale copy while qemu was still writing. `resolve_drbd_standalone` now decides per resource from DRBD role and device holders, and never discards on a resource whose device is in use — see [mipha_technical.md](./mipha_technical.md) for the full policy. Do not reintroduce a cluster-wide tiebreaker here.
+*   **Status (2026-08-17): RESOLVED — but note the correction below.** The parenthetical in the original recommendation ("or let ZooKeeper designate the leader's storage as correct") was implemented and **was itself a data-loss bug**, so it has been struck from the recommendation above. ZooKeeper leadership is a single cluster-wide property; "which node holds the authoritative copy" is a per-resource question. A node running a VM and holding `Primary` on that VM's disk would discard its own live writes purely because a different node happened to be the ZK leader, resyncing from a stale copy while qemu was still writing. `resolve_drbd_standalone` decided per resource from DRBD role and device holders, and never discarded on a resource whose device was in use.
+*   **Status (2026-08-22): GONE, and the reason is the point.** `resolve_drbd_standalone`
+    is deleted along with DRBD. Split-brain is not a state Sidon can reach: every journal
+    append carries its writer's epoch, every replica persists the highest epoch it has
+    been fenced at and fsyncs it before acknowledging the fence, and an append below that
+    is refused. Two owners cannot both be accepted, so there is no divergence to resolve
+    and nothing to discard — the daemon no longer has a site that discards data at all.
+    The prohibition survives its subject: **do not reintroduce a cluster-wide tiebreaker
+    for a per-object question**, in this or any other component.
 
 ### B. Blocking Sequential Linstor Command Hangs
 *   **Location:** `spectrum_server.py` (lines 265–287)
 *   **The Issue:** `run_linstor_cmd` loops through all cluster node IPs sequentially to attempt a `podman exec` call inside the `systemd-aether` container.
 *   **Impact:** If a node is completely offline, `run_remote_spark` will wait for the full default socket timeout (45 seconds). When creating, deleting, or resizing VM disks, multiple Linstor commands are executed sequentially. If any node is unresponsive, VM operations will block for several minutes, causing task timeouts in Catalyst or browser gateways.
 *   **Recommendation:** Fast-fail node connections by pinging them first, or query only the active Linstor Controller IP (resolved via ZooKeeper) rather than iterating through all nodes.
+*   **Status (2026-08-22): RESOLVED by removal.** `run_linstor_cmd` is gone with every one
+    of its 21 call sites. The walk existed because LINSTOR had a single controller whose
+    location the caller did not know, so it tried each node in turn. Sidon has no
+    controller: a storage call goes to the node it concerns, over that node's own control
+    socket, and there is nothing to search for.
 
 ---
 
@@ -129,7 +175,7 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 ### A. Lack of Storage Capacity Gates in DRS
 *   **Location:** `vali.py` (lines 587–620)
 *   **The Issue:** Vali's DRS balancer only evaluates memory and CPU usage when selecting a target host for VM live migration.
-*   **Impact:** Since VM thin pool storage (/dev/sdb) is local to each host and managed via DRBD, if a VM is migrated to a host with an almost full storage pool (even if CPU/RAM load is low), the VM's disk write operations will freeze, crashing the guest file system.
+*   **Impact:** Since VM storage is local to each host, migrating a VM to a host whose extent store is nearly full freezes its writes and crashes the guest file system. **Status (2026-08-22): the gate exists and now fails closed** -- see 12.4 above. A store above 95% is also reported as unable to drain by the storage checks and by hylia's maintenance guard.
 *   **Recommendation:** Add storage pool capacity checks to the DRS host evaluation matrix.
 
 ### B. Concurrent Migration Collisions
@@ -195,6 +241,15 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **The Issue:** Aether has no automated recovery loops for physical disk errors, LVM thin pool exhaustion, or DRBD metadata corruption.
 *   **Impact:** If a drive fails or falls offline, or if a DRBD resource enters a degraded state, Aether does not attempt to reconstruct or migrate replica pools to surviving hosts. The storage remains degraded until manually resolved by an operator.
 *   **Recommendation:** Introduce a dedicated Storage Health Monitor to automatically trigger Linstor volume re-creation or replica moves when hardware faults are detected.
+*   **Status (2026-08-22): RESOLVED — this is Purah.** It is a role inside Sidon rather
+    than a separate service, and it does three things: re-replicates after a node is lost
+    (within seconds of a write failing, not on the next timer tick), reclaims orphaned
+    extent groups by mark-sweep with no reference counts anywhere, and scrubs every sealed
+    group against the hash taken when it was known good. On the test cluster the heal
+    completes in about three seconds. Thin-pool exhaustion is separate and still
+    unhandled: the extent store is its own filesystem so it cannot take the host down, and
+    the storage checks warn above 85% and fail above 95%, but nothing reclaims space
+    automatically when a pool fills.
 
 ---
 
@@ -203,6 +258,13 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 ### A. Backup & Disaster Recovery (DR) Manager
 *   **The Issue:** There is no service or utility to back up the cluster database (`hydra` keyspace) and Linstor configuration metadata to an external target.
 *   **Impact:** If ScyllaDB data corruption occurs or DRBD metadata is wiped across multiple nodes, the cluster cannot be restored, leading to complete VM data loss.
+*   **Status (2026-08-22): the stakes went up.** `saga` exists and backs up the `hydra`
+    keyspace and `/etc/hci`; there is no LINSTOR controller database to capture any more,
+    so a per-node artefact is now complete on every node rather than only on the
+    controller's. But the keyspace now holds the *block map*, which is the only statement
+    of which extent group holds which part of which vdisk. An extent group without it is
+    four megabytes of unlabelled bytes. See [backup_restore.md](./backup_restore.md),
+    including what it deliberately does not cover.
 *   **Recommendation:** Create a backup daemon that periodically snapshots the ScyllaDB database and copies it to a configured external NFS share or S3 target.
 
 ---
@@ -223,7 +285,14 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
         - Catalyst queues a task to evacuate all VMs from the degraded host and decommissions the database node from the ring (if $N_{active} \ge 3$).
         - **Failover Boot Sequence**: Once Mipha confirms the degraded host is offline or fenced (either verified via Spark, or after executing an out-of-band IPMI STONITH power-off), Mipha coordinates with Vali and Catalyst to **safely spawn the VMs on healthy nodes**.
     3.  **Self-Fencing on Quorum Loss (Network Partition)**: If a host's local Spark daemon detects that it has lost connection to ZooKeeper consensus (or cannot contact ScyllaDB seeds) for more than 30 seconds:
-        - The host must assume it is partitioned. To prevent split-brain writes on DRBD storage, it must automatically demote its local DRBD storage resources to `Secondary` and suspend all local running virtual machines.
+        - The host must assume it is partitioned, destroy its guests and detach its
+          vdisks. **Status (2026-08-22):** implemented as mipha's self-fence watchdog. One
+          behaviour genuinely regressed and is recorded in
+          [fencing.md](./fencing.md): DRBD's quorum loss *was* a majority test, so a node
+          could self-fence without checking that any peer was reachable. A failed drain
+          proves nothing of the kind — the extent store may simply be full — so the peer
+          check now applies to every local storage fault, and with no peer answering the
+          outcome is quarantine rather than fence.
 
 
 ---
@@ -251,10 +320,17 @@ To proactively detect and surface the architectural gaps identified in this audi
     *   The effect test is the only way to catch a loop that is wedged rather than dead: its `systemctl start` and `podman` calls carry no timeout, so one hung call stops the thread forever without raising anything.
 
 ### B. Storage engine checks (Category: `storage`)
-1.  **DRBD Split-Brain Dual-Primary Check (`drbd_split_brain_check`)** — *implemented*, `storage.drbd.split_brain`:
-    *   **Logic**: Parse `drbdsetup status --json`. If any replication volumes are in `StandAlone` state while their roles are both `Primary`, trigger a critical failure alarm. As built it reports every `StandAlone` connection, not only the dual-Primary case: replication that has stopped may have diverged whichever roles the two sides hold.
-2.  **Linstor Controller Query Latency Check (`linstor_latency_check`)** — *implemented*, `storage.linstor.latency`:
-    *   **Logic**: Execute a lightweight Linstor CLI query (e.g., `linstor node list`) and measure the execution time. If it exceeds 5 seconds, flag a latency warning indicating a possible database blocking hang or offline node. FAIL above 20 seconds or on no answer within 60. The `podman exec` round trip into `systemd-aether` is timed separately and subtracted in the message, so container overhead on a loaded host does not read as controller latency.
+1.  ~~**DRBD Split-Brain Dual-Primary Check (`drbd_split_brain_check`)**~~ — **removed
+    2026-08-22.** It parsed `drbdsetup status --json` for `StandAlone` connections. Split-
+    brain is not a state Sidon can reach, so there is nothing to check for. Its successor,
+    `replica_health`, asks the narrower question that is left: can every vdisk this node
+    serves still reach every replica it is supposed to?
+2.  ~~**Linstor Controller Query Latency Check (`linstor_latency_check`)**~~ — **replaced
+    2026-08-22 by `sidon_latency_check`.** The chokepoint moved rather than disappeared.
+    There is no controller to time; the equivalent is the local daemon's own control
+    socket, which every attach, detach, drain and fence on this node goes through. Same
+    thresholds — WARN above 5s, FAIL above 20s or no answer — and no container round trip
+    to subtract, because there is no container.
 
 ### C. Scheduler & DRS checks (Category: `drs`)
 
@@ -262,9 +338,15 @@ To proactively detect and surface the architectural gaps identified in this audi
 
 1.  **DRS Storage Capacity Gate Check (`drs_storage_capacity_check`)** — *implemented*, `service.vali.drs_storage_gate`:
     *   **Logic as proposed**: Verify that Vali's DRS balancer checks Linstor thin pool storage capacity before initiating migrations, alerting if DRS is running without storage capacity validation.
-    *   **Logic as built**: the gate now exists (`vali.py`, in the migrate task handler), so the proposal as written asks a question about source code whose answer is a fixed "yes". The runtime question is whether the gate can *answer*, and on the reference cluster it cannot: `get_linstor_free_space()` parses the human storage-pool table looking for a field containing `/`, finds `vg_aether/thin_pool_aether` before it reaches the capacity columns, and falls through to a hard-coded `999999` MiB. That is larger than any single VM disk, so an unparseable listing does not make the gate refuse — it makes the gate approve everything.
-    *   The check calls `vali.get_linstor_free_space()` itself, by importing the deployed `vali`, and compares its answer against the free capacity `linstor -m storage-pool list` reports for this node's backing pools. A private copy of vali's parser would keep reporting the gate broken after it was fixed, and would keep reporting it healthy if it broke in a new way. It then checks the pool has real headroom and reports thin-pool over-commitment.
-    *   **Still open in `vali.py`** (not in this change's scope): `get_linstor_free_space()` and `get_vm_disk_size()` both fail open — one returns `999999` MiB free, the other `51200` MiB needed — so a failure to read either side lets the migration through. Both should return "unknown" and make the gate refuse.
+    *   **Logic as built**: the gate exists (`vali.py`, in the migrate task handler), so the proposal as written asks a question about source code whose answer is a fixed "yes". The runtime question is whether the gate can *answer*, and on the reference cluster it could not: `get_linstor_free_space()` parsed the human storage-pool table looking for a field containing `/`, found `vg_aether/thin_pool_aether` before it reached the capacity columns, and fell through to a hard-coded `999999` MiB. That is larger than any single VM disk, so an unparseable listing did not make the gate refuse — it made the gate approve everything.
+    *   The check calls vali's own function by importing the deployed `vali`, rather than re-implementing the parse. A private copy would keep reporting the gate broken after it was fixed, and would keep reporting it healthy if it broke in a new way.
+    *   **Status (2026-08-22): RESOLVED.** `get_storage_free_space()` asks Sidon for
+        `available_bytes` from `statvfs` on the filesystem holding the extents — the number
+        that actually decides whether a drain can complete — and there is no table to
+        parse and no per-node filtering to get wrong. **Both sides now fail closed**:
+        either the free space or the disk size coming back unknown refuses the migration
+        rather than waving it through, which is the failure mode this finding was really
+        about.
 2.  **Concurrent Migration Lock Auditor (`migration_lock_status`)** — *implemented*, `service.vali.migration_locks`:
     *   **Logic**: Audit `hydra.vms.status` — the per-VM migration lock taken by daruk's `migrate-lock` LWT — against the migrations that are actually running. A lock held with no migration task in flight is orphaned and refuses every later migration *and* every delete of that VM until it is cleared; the message names the `migrate-unlock` call that clears it. A live migration running on this host while the lock is *not* held is the dangerous direction, and it is only visible by asking libvirt (`virsh domjobinfo`) what it is doing rather than asking the database.
     *   `hydra.catalyst_tasks` is scanned only when a VM claims a migration or libvirt reports one. It is a full partition scan of a table with a 30-day retention, and running one hourly on every node to confirm that nothing is migrating is the unbounded read this codebase has removed elsewhere.
@@ -275,7 +357,7 @@ To proactively detect and surface the architectural gaps identified in this audi
 
 ### A. Air-Gap Registry Hardcoding
 *   **Location:** `provision.py` (lines 88, 109, 129, 153, 204)
-*   **The Issue:** Container image source registries are hardcoded to public hosts (`docker.io` and `quay.io`) for core system components (ScyllaDB, ZooKeeper, Linstor, Traefik).
+*   **The Issue:** Container image source registries are hardcoded to public hosts (`docker.io` and `quay.io`) for core system components (ScyllaDB, ZooKeeper, Traefik, and the Elixir/Alpine images the Phoenix console is built from). The storage tier is no longer among them: it is a Rust binary built from this repository on the node.
 *   **Impact:** Enterprise installations are frequently deployed in secure, air-gapped data centers without external internet access. The lack of a configuration parameter to prefix custom local registries prevents container pulls and boots during provisioning.
 *   **Recommendation:** Add a registry configuration variable or CLI flag (e.g. `--registry <local-registry-ip>`) to prefix container images during Quadlet configuration generation.
 
@@ -318,6 +400,13 @@ To proactively detect and surface the architectural gaps identified in this audi
 ---
 
 ## 16. Lanayru Kubernetes Engine (LKE) Refactoring & Gaps
+
+> [!NOTE]
+> **Storage-related findings in this section are stale.** `run_linstor_cmd` no longer
+> exists; lanayru creates vdisks through Sidon like everything else. The findings are kept
+> because the non-storage half of each -- a hardcoded size, colliding UUIDs -- is
+> unchanged, and because the size one is really about a parameter that never reached the
+> allocation call, whichever allocator is on the other end.
 
 The guest Kubernetes orchestration engine (Lanayru) code was refactored out of `spectrum_server.py` into a dedicated [lanayru.py](file:///C:/Users/AuraFlight/Desktop/container-hci/lanayru.py) script. During this process, several critical architectural and logic bugs were identified:
 

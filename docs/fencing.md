@@ -1,50 +1,27 @@
 # Fencing
 
-> [!IMPORTANT]
-> **The storage rung is no longer an inference, and the ladder's order changed.**
->
-> Everything below describing DRBD quorum — arming it, what it proves, the cases where
-> it cannot be armed at all — describes a storage layer that has been removed. With
-> DRBD there was no way to reach into an unreachable host and stop it writing its own
-> local copy, so this rung read quorum and *inferred* that a host which could not see a
-> majority was already failing its own I/O. Sound, but conditional: it needed quorum
-> armed, it needed more than two nodes, and where those did not hold nothing could be
-> confirmed. That is the residual-unsafe case §8 records.
->
-> Under [Sidon](./sidon.md) it is an action. Fencing raises the epoch on the vdisks the
-> dead host owns, and every replica then refuses its appends — no cooperation from the
-> host, no quorum arithmetic, no minimum node count. So it runs **first** rather than
-> last: it is the only unconditional rung, and spark and BMC drop to hygiene. A wedged
-> host still holds the VIP and still burns CPU, but data safety no longer waits on
-> either.
->
-> The residual-unsafe case is gone with it. The only way to reach an unconfirmed fence
-> now is for Hydra itself to be unreachable — where refusing the failover is obviously
-> right rather than regrettable, because promoting a VM whose disk ownership cannot be
-> moved is precisely the split-brain this exists to prevent.
->
-> One behaviour genuinely regressed and is worth naming: DRBD's quorum loss *was* a
-> majority test, so a node could self-fence without checking that any peer was
-> reachable. A failed drain proves nothing of the kind — the extent store may simply be
-> full — so the peer check now applies to every local storage fault, and with no peer
-> answering the outcome is quarantine rather than fence.
-
-How Helios establishes that a failed host has stopped writing, before it restarts that
-host's VMs somewhere else — and, precisely, when it cannot.
-
-This is the Nutanix "Acropolis HA needs a fence" problem. Mipha is the HA manager; this
-document is the part of Mipha that decides whether a failover is allowed to happen at
-all.
-
----
+> [!NOTE]
+> **The storage rung used to be an inference and is now an action, and that reordered the
+> ladder.** With DRBD there was no way to reach into an unreachable host and stop it
+> writing its own local copy, so this rung read quorum and *inferred* that a host which
+> could not see a majority was already failing its own I/O — sound, but conditional on
+> quorum being armed and on there being more than two nodes. Under [Sidon](./sidon.md) it
+> raises the epoch on the dead host's vdisks and every replica then refuses its appends,
+> so it runs **first**: it is the only unconditional rung, and spark and BMC drop to
+> hygiene. §5 keeps the old reasoning, because the ways a storage fence can look like it
+> works and not work are worth not rediscovering.
 
 ## 1. Why this is the whole problem
 
-A VM's disk is a raw DRBD device, opened directly by qemu. If Mipha starts a second copy
-of a VM on a healthy host while the first copy is still running on the failed one, two
-qemu processes write the same block device with two independent views of its filesystem.
-The result is not a merge conflict; it is a destroyed filesystem, usually within seconds,
-and no later repair recovers it.
+If Mipha starts a second copy of a VM on a healthy host while the first copy is still
+running on the failed one, two qemu processes write the same disk with two independent
+views of its filesystem. The result is not a merge conflict; it is a destroyed filesystem,
+usually within seconds, and no later repair recovers it.
+
+Under [Sidon](./sidon.md) the storage layer refuses the second writer by itself — that is
+what §3 is — but the refusal has to be *made*, and making it is what fencing is. The
+danger has not gone away; it has become something the cluster can act on rather than
+something it has to reason about.
 
 The guard has always been stated as "fence first, then fail over". Until this work the
 fence was one request to `spark-daemon` **on the host being fenced**:
@@ -80,22 +57,28 @@ a success, and the first rung that confirms stops the ladder.
 
 | Rung | What it does | What it proves |
 | :--- | :--- | :--- |
-| `self` | Reads that the host already fenced itself (`hydra.nodes.status = FENCED`) | The host stopped its own guests and gave up Primary, and verified it locally |
-| `spark` | `POST /api/v1/host/fence` — kill guests, stop libvirt, demote DRBD — then reads back the post-state | No guest process, no open DRBD device, no Primary resource on that host |
+| `storage` | Raises the epoch on every vdisk the host owns, and fences every reachable replica at the new epoch | The host's next write is refused, whether or not it knows or is reachable |
+| `self` | Reads that the host already fenced itself (`hydra.nodes.status = FENCED`) | The host stopped its own guests and detached its vdisks, and verified it locally |
+| `spark` | `POST /api/v1/host/fence` — kill guests, stop libvirt, detach vdisks — then reads back the post-state | No guest process and no vdisk still attached on that host |
 | `bmc` | `ipmitool chassis power off`, then polls `chassis power status` until it reads `off` | The chassis has no power |
-| `storage` | Reads DRBD quorum from the surviving replicas | The failed host's own kernel is already failing its writes |
+
+**Storage runs first, and that is a reversal.** It used to be last, because it could only
+*infer* that a host had stopped writing; now it *makes* it stop, so it is the only
+unconditional rung and anything tried before it would be something weaker tried first. The
+rest are no longer safety mechanisms — a wedged host still holds a VIP and still burns
+CPU, and stopping that is worth doing — but data safety no longer waits on any of them.
 
 ```mermaid
 flowchart TB
     T["3 failed health checks<br/>or hydra.nodes = FENCED"] --> L{"ledger:<br/>already fenced<br/>this outage?"}
     L -->|yes| OK["confirmed"]
-    L -->|no| S["spark: fence and read back"]
+    L -->|no| Q["storage: raise the epoch,<br/>fence the replicas"]
+    Q -->|"CAS applied"| OK
+    Q -->|"Hydra unreachable"| S["self / spark: read the host's own report"]
     S -->|"fenced: true"| OK
     S -->|"no / unanswered"| B["bmc: power off, poll status"]
     B -->|"chassis is off"| OK
-    B -->|"no entry / unreachable"| Q["storage: quorum held here?"]
-    Q -->|"armed and held"| OK
-    Q -->|"quorum off / still connected"| NO["NOT confirmed"]
+    B -->|"no entry / unreachable"| NO["NOT confirmed"]
     OK --> F["release placement, restart VMs elsewhere"]
     NO --> BLOCK["failover refused, Catalyst task marked failed"]
 ```
@@ -108,7 +91,55 @@ next outage is decided on its own evidence.
 
 ---
 
-## 3. Rung 2 — in-band, through Spark
+## 3. Rung 1 — storage, the one that always works
+
+The cluster owns the storage, and under Sidon that is enough on its own. Ownership of a
+vdisk is an `(owner, epoch)` pair in Hydra; every journal append carries its writer's
+epoch; and every replica persists the highest epoch it has been fenced at, fsynced before
+the fence is acknowledged. Fencing is therefore two writes and no cooperation:
+
+```
+1. CAS in Hydra:      (dead_host, e) -> (nobody, e+1)
+2. FENCE every reachable replica at e+1, in parallel
+```
+
+After step 2 the deposed host's next append meets a refusal. It does not have to agree, or
+be reachable, or be running, or know that anything happened. It can be wedged, lying about
+its own state, or convinced it is still the owner.
+
+This rung needs Hydra and nothing else. It works on two nodes, with no BMC, with no quorum
+arithmetic and no minimum node count. It is the only rung that has to succeed.
+
+### Why the old design could not do this
+
+Worth keeping, because the reasons were specific to DRBD and the obvious readings of "cut
+the host off from its storage" still do not work in general:
+
+* **Disconnecting the resource on the survivors did nothing to the failed host.** DRBD
+  replication is peer-to-peer; the old Primary went on writing its own local copy exactly
+  as before, and now without replicating.
+* **`linstor resource delete <deadnode> <res>` was not a fence.** It needed the satellite
+  on that node to carry it out. Against an unreachable node it recorded an intent. It was
+  storage *cleanup*, and calling it fencing would have been a lie.
+* **Promoting the resource on the survivor proved nothing either.** DRBD's refusal to
+  allow two Primaries is enforced across a *connection*. Once the connection was gone the
+  promotion check had no peer to consult, and `drbdadm primary` on the survivor and the
+  old Primary on the failed host coexisted happily, each certain it was the only one.
+
+What was left was to read DRBD quorum and *infer* that a host which could not see a
+majority was already failing its own I/O. Sound, but conditional: it needed quorum armed
+(and reading the flag was not enough — `drbdsetup status` reported `quorum: true` both
+when a majority was held and when quorum was switched off entirely), it needed more than
+two nodes for a majority to exist, and where those did not hold nothing could be
+confirmed.
+
+The difference is that Sidon's replicas enforce the fence themselves, at the point where
+the write arrives, rather than the deposed host's own kernel being relied on to notice
+something and stop.
+
+---
+
+## 4. Rung 3 — in-band, through Spark
 
 `POST /api/v1/host/fence` with `{"confirm": true}` runs on the target host and returns
 the state it can observe afterwards:
@@ -131,34 +162,26 @@ one call where the failure detail is the point.
 
 The sequence is: write the fence marker; `virsh destroy` each running domain; stop
 `libvirtd`/`virtqemud` and their sockets; SIGKILL any surviving `qemu*` process found in
-`/proc`; drop the mounts Mipha's own storage loop put on DRBD devices; `drbdadm secondary`
-every Primary resource — **checked, never `--force`**; then re-read everything.
+`/proc`; detach every attached vdisk — **checked, never forced**; then re-read everything.
 
-Two details that matter:
-
-* **The marker is written first.** `linstor_ha_loop()` re-promotes `linstor-db` and the
-  container resources within two seconds on whichever node holds ZooKeeper leadership, so
-  a fence that demoted before the loop knew to stand down would be undone before it
-  finished. `self_fence_is_active()` forces that loop into its follower branch.
-* **`drbdadm secondary` is not forced.** A demotion that is refused is exactly the
-  information the caller needs. Forcing it past a process that still holds the device
-  would not make that process stop writing; it would only stop us finding out.
+The detach is not forced, and that is the same reasoning the demotion it replaced rested
+on: a detach that is refused is exactly the information the caller needs. Forcing it past
+a process that still holds the socket would not make that process stop writing; it would
+only stop us finding out.
 
 A `spark-daemon` too old to have the endpoint (a rolling upgrade) falls back to the
-legacy command — and then runs `pgrep -a qemu` and reads `/api/v1/storage/drbd/status`,
-because the legacy command's exit status is worthless. If that verification cannot be
-read, the rung fails.
+legacy command — and then runs `pgrep -a qemu`, because the legacy command's exit status
+is worthless. If that verification cannot be read, the rung fails.
 
-**What this rung does and does not prove.** A confirmed spark fence means the target's
-kernel reported no process holding the DRBD device and *accepted a demotion to Secondary*
-— DRBD refuses to demote a device that is open, so the demotion succeeding is real
-evidence that the writer is gone. It does not defend against a host that is lying: a
-compromised or badly malfunctioning `spark-daemon` can return whatever it likes. That is
-inherent to in-band fencing and is the reason the BMC rung exists.
+**What this rung does and does not prove.** A confirmed spark fence means the target
+reported no guest process and no vdisk still attached. It does not defend against a host
+that is lying: a compromised or badly malfunctioning `spark-daemon` can return whatever it
+likes. That is inherent to in-band fencing, and it is why this rung is no longer the one
+safety rests on — §3 runs first and never asks the host anything.
 
 ---
 
-## 4. Rung 3 — out-of-band, through the BMC
+## 5. Rung 4 — out-of-band, through the BMC
 
 ### Where the credentials live
 
@@ -240,88 +263,6 @@ within `power_off_timeout_seconds`, the rung fails and says what the BMC last an
 
 ---
 
-## 5. Rung 4 — storage, the one that always exists
-
-Even with no BMC, the cluster owns the storage. It is worth being exact about what that
-buys, because the obvious readings of "cut the host off from its DRBD resources" do not
-work:
-
-* **Disconnecting the resource on the survivors does nothing to the failed host.** DRBD
-  replication is peer-to-peer; the old Primary goes on writing its own local copy exactly
-  as before, and now without replicating.
-* **`linstor resource delete <deadnode> <res>` is not a fence.** It needs the satellite on
-  that node to carry it out. Against an unreachable node it records an intent. It is
-  storage *cleanup*, and calling it fencing would be a lie.
-* **Promoting the resource here proves nothing either.** DRBD's refusal to allow two
-  Primaries is enforced across a *connection*. Once the connection is gone, the promotion
-  check has no peer to consult; `drbdadm primary` on the survivor and the old Primary on
-  the failed host coexist happily, each certain it is the only one.
-
-What does work is a property the failed host's own kernel enforces without any
-cooperation from its userspace: **DRBD quorum**.
-
-With `quorum majority` and `on-no-quorum io-error`, a node that cannot see a majority of
-a resource's nodes fails every I/O on that resource. Two disjoint sets cannot both be a
-majority. So if a surviving replica holds quorum, the failed host by definition does not,
-and its writes are **already erroring** — before Mipha does anything at all.
-
-`storage_fence_assert()` confirms only when, for **every** resource the failed host backs,
-all of the following read true from a surviving replica:
-
-1. the configured `quorum` is `majority`, `all`, or a number greater than half the
-   resource's node count — `quorum 1` is satisfied by every node alone, so both sides of
-   a partition would hold it;
-2. the configured `on-no-quorum` is `io-error` or `suspend-io` — a suspended writer is
-   not writing, which is the same safety property with a different user experience;
-3. this survivor's devices all report `quorum: true`;
-4. the connection to the failed host is not `Connected`.
-
-Partial coverage is not coverage: one unarmed resource out of two blocks the whole
-assertion, because the VM on the unarmed one is the one that gets two writers.
-
-### Reading the flag is not enough — this is the trap
-
-`drbdsetup status --json` reports `"quorum": true` on a device **both** when a majority is
-held **and** when quorum is switched off entirely. A storage fence built on that flag
-alone would confirm on every cluster that has no quorum at all. That is why
-`GET /api/v1/storage/drbd/options` was added: it returns the *configured* options from
-`drbdsetup show --json`, which is the only place the distinction exists.
-
-Verified on the live single-node cluster: every resource reports `"quorum": true` in the
-status document while `drbdsetup show` reports `"quorum": "off"`, and the assertion
-correctly refuses.
-
-### Arming it
-
-LINSTOR arms quorum by itself on clusters that can hold one. The live cluster carries
-LINSTOR's defaults:
-
-```
-DrbdOptions/Resource/on-no-quorum        io-error
-DrbdOptions/auto-add-quorum-tiebreaker   True
-```
-
-and sets `DrbdOptions/Resource/quorum` per resource-definition to `majority` once the
-resource has enough nodes, or `off` when it does not. On the single-node test cluster it
-is `off` on every resource, which is correct — there is no majority of one to hold.
-
-To arm it explicitly:
-
-```bash
-# one resource
-linstor resource-definition drbd-options --quorum majority --on-no-quorum io-error <resource>
-# everything created from now on
-linstor controller set-property DrbdOptions/auto-quorum io-error
-```
-
-`mipha --fence-status` prints these when it finds an unarmed resource.
-
-Worth knowing but not required: `on-suspended-primary-outdated force-secondary` (DRBD
-9.1+) makes a suspended, outdated Primary demote itself rather than merely disconnect.
-Helios leaves it at LINSTOR's `disconnect` default; `io-error` already stops the writes.
-
----
-
 ## 6. The gate
 
 `failover_permitted(fence, config)` is the decision, kept as one function rather than a
@@ -332,8 +273,8 @@ condition buried in the control loop:
   marked `DOWN`, so Vali stops placing new work there, but **nothing is released and
   nothing is restarted**. The Catalyst parent task is marked `failed` with the reason, so
   the refusal is visible in the UI rather than only in a journal nobody is reading. The
-  loop retries on the next pass, so the failover starts by itself the moment the operator
-  powers the host off or arms quorum.
+  loop retries on the next pass, so the failover starts by itself the moment Hydra is
+  reachable again or the operator powers the host off.
 * **not confirmed, `unconfirmed_fence_policy: "failover"`** → it proceeds anyway, with a
   warning on every occurrence. This is available on purpose and is not the default: a
   cluster may rather risk it than lose HA, but it has to say so.
@@ -359,20 +300,20 @@ Every 10 seconds, three probes, each returning `ok`, `failed` or **`unknown`**:
 | storage serviceability | per Primary resource, from the status document | see below |
 
 `unknown` is load-bearing. A probe that could not reach a verdict — `virsh` not installed,
-`drbdsetup` failing on a node that backs no resources — never escalates to the tier that
-destroys running guests. That distinction is what stops a slow probe from evacuating a
-healthy host.
+Sidon momentarily not answering — never escalates to the tier that destroys running
+guests. That distinction is what stops a slow probe from evacuating a healthy host.
 
-A Primary resource is **unserviceable** for one of three causes:
+A vdisk is **unserviceable** when Sidon reports it **degraded**: its drain has failed. The
+guest's writes are still safe in the journal, but the journal is no longer emptying, so
+the disk will backpressure and stop. That is the local-origin equivalent of the old
+"Primary without quorum" — the guest is not broken yet and will be.
 
-* `quorum-lost` — a device reports `quorum: false`. With `on-no-quorum io-error` the
-  guest's writes are already failing, and a majority exists elsewhere.
-* `io-failures` — `force-io-failures` or `suspended-quorum` on the resource. Same effect
-  on the guest, local origin.
-* `no-data` — the local disk is `Failed`/`Detaching` **and** no connected peer is
-  `UpToDate`. A failed local disk *with* a healthy peer is deliberately not listed: DRBD 9
-  turns the node into a diskless client and keeps serving over the network, the guest
-  never notices, and fencing it would be an outage we caused.
+There are fewer causes than there were, and the missing ones are worth naming. DRBD had
+three: `quorum-lost`, `io-failures`, and `no-data` (a failed local disk with no `UpToDate`
+peer — a failed local disk *with* one was deliberately not listed, because DRBD 9 turned
+the node into a diskless client and kept serving over the network). Sidon has no quorum to
+lose, and a read whose local copy is damaged is repaired from a replica transparently, so
+what is left is the case where this node can no longer make progress.
 
 ### Two tiers
 
@@ -387,14 +328,13 @@ them would be a self-inflicted outage, and failing them over while they are stil
 would be the corruption this whole document is about. Losing management of a working VM is
 not a reason to destroy it.
 
-**Fence** — stop the guests, give up Primary on every DRBD resource, publish `FENCED`.
-Reserved for conditions where the guests are *already* broken, so stopping is strictly
-better than continuing — and, the point, it makes the host provably safe to fail over with
-no BMC anywhere in the cluster.
+**Fence** — stop the guests, detach every vdisk, publish `FENCED`. Reserved for
+conditions where the guests are *already* broken, so stopping is strictly better than
+continuing.
 
-Concretely, "take itself out" is: write the marker (so `linstor_ha_loop` stands down);
-call the local `POST /api/v1/host/fence`, or a short built-in fallback if `spark-daemon`
-is itself dead; verify; release ZooKeeper leadership; publish the status.
+Concretely, "take itself out" is: write the marker; call the local
+`POST /api/v1/host/fence`, or a short built-in fallback if `spark-daemon` is itself dead;
+verify; release ZooKeeper leadership; publish the status.
 
 ### Guarding against a self-fence that should not have happened
 
@@ -402,34 +342,40 @@ A self-fence that fires on a blip evacuates a healthy host. So:
 
 * **Three consecutive passes** (30 s) of the same condition. One good pass resets the
   counter to zero — a failure, a recovery and another failure do not add up to a fence.
-* **A startup grace period** of 180 s. Resources come up Secondary and without quorum
-  during `drbdadm up`; without this, every probe fires at once on boot.
+* **A startup grace period** of 180 s. Sidon replays journals and re-establishes peers
+  during startup; without this, every probe fires at once on boot.
 * **`unknown` never escalates** to the hard tier.
 * **A host in maintenance is exempt.** A host being drained on purpose looks a great deal
   like a host whose storage is failing.
 * **A single-node cluster never self-fences.** There is nowhere for the guests to be
   restarted, so it would be a pure outage with no safety benefit whatsoever.
-* **The `no-data` and `io-failures` triggers additionally require a peer that answers.**
-  If nothing else is up, killing the guests here does not get them started anywhere else,
-  so the host quarantines instead. `quorum-lost` is exempt from this check: losing quorum
-  *is* a majority test, so if we lost it a majority exists elsewhere by definition,
-  whether or not it is answering us right now.
+* **Every storage trigger requires a peer that answers.** If nothing else is up, killing
+  the guests here does not get them started anywhere else, so the host quarantines
+  instead.
 * **`"enabled": false`** switches the whole thing off.
 
-Note the consequence of the last exemption: on a cluster where DRBD quorum is not armed,
-the `quorum-lost` trigger can never fire, so the hard tier only reacts to local device
-faults. That is safe — it never fires spuriously — and it is also the honest limit: with
-no quorum, self-fencing does not protect against a network partition.
+The peer check is the one behaviour that got *stricter* rather than looser, and it is a
+real regression worth stating. DRBD's `quorum-lost` was exempt from it: losing quorum
+**is** a majority test, so if we had lost it a majority existed elsewhere by definition,
+whether or not it was answering us right now. A failed drain proves nothing of the kind —
+the extent store may simply be full, on a cluster where nothing else is wrong — so with no
+peer answering, the outcome here is quarantine rather than fence.
 
 ### Leadership
 
 A self-fenced host that holds ZooKeeper leadership is a problem: the Mipha leader does not
-monitor itself, so nothing would evacuate it, and the LINSTOR controller would stay on
-storage that has just been declared unserviceable. The fence therefore stops the local
+monitor itself, so nothing would evacuate it, and Purah would keep running on a host whose
+storage has just been declared unserviceable. The fence therefore stops the local
 `zookeeper` so a healthy node takes over — but **only at three nodes or more**, because
 below that the remaining ensemble could not form a quorum either. On a two-node cluster
-the fence still stops the guests and demotes the storage, and then logs that coordination
+the fence still stops the guests and detaches the vdisks, and then logs that coordination
 stays put until an operator intervenes.
+
+One thing this used to be worse. Under LINSTOR the controller itself lived on a replicated
+volume the leader had to hold Primary and mounted, so a self-fenced leader took the
+cluster's whole control plane with it unless leadership moved. Sidon's block map is in
+Hydra, which every node can write, so leadership decides who *acts* and not who holds the
+only copy of anything.
 
 ### Coming back
 
@@ -447,11 +393,17 @@ exists behind `auto_recover_after_clean_seconds`, and defaults to 0 — off.
 
 Stated precisely, because an over-claimed fence is worse than a missing one.
 
-### 8.1 No BMC, quorum not armed, host unreachable
+### 8.1 Hydra unreachable
 
-No rung can confirm. The default is to **refuse the failover**: the VMs stay placed on the
-failed host and stay down until an operator acts. That is an availability failure, not a
-safety failure — and it is the honest outcome.
+The one way left to reach an unconfirmed fence. If `hydra.dfs_vdisks` cannot be read or
+the compare-and-swap cannot be made, nothing can be fenced — and the default is to
+**refuse the failover**: the VMs stay placed on the failed host and stay down until an
+operator acts.
+
+Unlike its predecessor this is obviously right rather than regrettable. Promoting a VM
+whose disk ownership cannot be moved is precisely the split-brain the ladder exists to
+prevent, and a cluster whose metadata layer is unreachable has a larger problem than one
+host being down.
 
 It becomes a *safety* failure only if the operator sets
 `unconfirmed_fence_policy: "failover"`. Then Helios will restart the guests on a host it
@@ -459,36 +411,35 @@ cannot prove has stopped, and if that host is still running them, their disks ar
 destroyed. The setting exists because some clusters would rather take that risk than lose
 HA; nothing in this design makes it safe.
 
-### 8.2 Two-node clusters have no storage fence
+### 8.2 ~~Two-node clusters have no storage fence~~ — resolved
 
-DRBD quorum needs a majority. A two-replica resource on a two-node cluster has no third
-vote, and LINSTOR's diskless tiebreaker needs a third node to place it on. So on a
-two-node Helios cluster the storage rung can never confirm, and **a BMC is not optional
-if you want HA to work there**. Three nodes is the first configuration where the storage
-rung stands on its own.
+Kept because it shaped the design. DRBD quorum needed a majority, a two-replica resource
+on a two-node cluster had no third vote, and LINSTOR's diskless tiebreaker needed a third
+node to place it on — so on a two-node cluster the storage rung could never confirm and
+**a BMC was not optional**. Three nodes was the first configuration where it stood on its
+own.
 
-*Not verified here:* the single-node test cluster can only demonstrate the `quorum: off`
-case. That LINSTOR sets `quorum majority` and adds a tiebreaker at three nodes is its
-documented behaviour and matches the controller properties observed on the live cluster
-(`auto-add-quorum-tiebreaker True`, `on-no-quorum io-error`), but it has not been observed
-end to end here.
+Epoch fencing is not a vote. Two nodes is fine, and so is one.
 
 ### 8.3 The in-band rung trusts the host it is fencing
 
-A confirmed spark fence rests on the target's own report. The demotion succeeding is real
-evidence — DRBD will not demote an open device — but a compromised or badly malfunctioning
-`spark-daemon` can return `fenced: true` regardless. In-band fencing cannot close this;
-that is what the BMC rung is for.
+A confirmed spark fence rests on the target's own report: a compromised or badly
+malfunctioning `spark-daemon` can return `fenced: true` regardless. In-band fencing cannot
+close this; that is what the BMC rung is for. It matters much less than it did, because
+the storage rung runs first and does not consult the host at all.
 
-### 8.4 Quorum loses the last unreplicated writes
+### 8.4 ~~Quorum loses the last unreplicated writes~~ — resolved
 
-Between a partition starting and DRBD noticing it, the isolated Primary can complete
-writes its peers never receive. When it rejoins, the split-brain policy
-(`after-sb-1pri discard-secondary`, and the per-resource resolution in
-`resolve_drbd_standalone()`) discards the divergent copy in favour of the survivor's.
-That is correct — the survivor is the one that has been serving the guest — and it is
-still lost data for that window. Quorum prevents *concurrent writers*; it does not make a
-partition free.
+Kept because it is the failure the journal's write-all rule was chosen to avoid. Between a
+partition starting and DRBD noticing it, the isolated Primary could complete writes its
+peers never received; when it rejoined, the split-brain policy discarded the divergent
+copy in favour of the survivor's. Correct — the survivor is the one that has been serving
+the guest — and still lost data for that window.
+
+Sidon does not acknowledge a write that has not reached every replica. A guest whose peer
+is unreachable gets EIO and knows the write did not happen, rather than being told it did
+and having it discarded later. That is the trade: availability during single-replica loss,
+in exchange for never losing an acknowledged write.
 
 ### 8.5 A self-fenced host that cannot reach the database
 
@@ -499,7 +450,7 @@ than corruption, and the watchdog retries the write on every pass.
 
 ### 8.6 A self-fence that did not fully take
 
-If a guest could not be killed or a resource refused to demote, the host publishes
+If a guest could not be killed or a vdisk refused to detach, the host publishes
 `DEGRADED`, **not** `FENCED`. `FENCED` is a claim the leader acts on by skipping its own
 ladder entirely, so it may only be published by a fence that verified. The leader then has
 to prove the fence itself, and will refuse the failover if it cannot.
@@ -507,7 +458,17 @@ to prove the fence itself, and will refuse the failover if it cannot.
 ### 8.7 Nothing here fences the network
 
 There is no fabric control in Helios, so a host cannot be cut off at the switch. The
-storage rung is the substitute, and it only works where quorum is armed.
+storage rung is the substitute, and it is now a complete one for the purpose that matters:
+a partitioned host cannot write. It can still hold a VIP and still answer clients, which
+network fencing would stop and this does not.
+
+### 8.8 A local storage fault with no peer to ask
+
+The one behaviour that genuinely regressed. DRBD's quorum loss *was* a majority test, so a
+node could self-fence on it without checking that any peer was reachable. A failed drain
+proves nothing of the kind — the extent store may simply be full — so the peer check now
+applies to every local storage fault, and with no peer answering the outcome is quarantine
+rather than fence.
 
 ---
 
@@ -535,30 +496,35 @@ Out-of-band (BMC) coverage, 1 host(s) in the cluster:
   ipmitool is NOT installed on this host: no BMC fence can run from here.
   Valkyrie-997A49          no BMC entry -- power fencing unavailable
 
-Storage fencing (DRBD quorum) for the resources on this host:
-  img-test                     NOT ARMED -- quorum is off, so DRBD does not stop a partitioned node from writing
-  linstor-db                   NOT ARMED -- quorum is off, so DRBD does not stop a partitioned node from writing
-  test-disk0                   NOT ARMED -- quorum is off, so DRBD does not stop a partitioned node from writing
+Storage fencing:
+  ARMED -- 15 vdisk(s) in the map, 11 owned by this host.
+  Fencing a host raises the epoch on the vdisks it owns; every replica then rejects its writes.
+  This works on two nodes, with no BMC, and against a host that is wedged or unreachable. There is nothing to arm.
 
 Self-fencing          : enabled (threshold 3 x 10s)
 ```
 
 ---
 
-## 10. The two Spark endpoints this added
+## 10. The Spark endpoint this added
 
-Both follow `spark_api.md`'s rules: no caller-supplied command fragments, argv lists with
+It follows `spark_api.md`'s rules: no caller-supplied command fragments, argv lists with
 `shell=False`, structured responses, validated at the boundary.
 
 | Method | Path | Body / Query | Returns |
 | :-- | :-- | :-- | :-- |
-| GET | `/api/v1/storage/drbd/options` | `?resource=` | `{"resource":str,"options":{...}}` |
 | POST | `/api/v1/host/fence` | `{"confirm":true}` | `200`/`409` with the verification report |
 
-`/storage/drbd/options` exists because `drbdsetup status` cannot distinguish "quorum held"
-from "quorum disabled" (§5). `/host/fence` exists because the fence has to be verified on
-the host that ran it, and because one implementation shared by the remote fence and the
-self-fence is better than two that drift.
+`/host/fence` exists because the fence has to be verified on the host that ran it, and
+because one implementation shared by the remote fence and the self-fence is better than
+two that drift.
+
+There were two. `GET /api/v1/storage/drbd/options` returned a resource's *configured*
+options, and existed for one reason: `drbdsetup status` reported `quorum: true` both when
+a majority was genuinely held and when quorum was switched off entirely, so the rung had
+to read the configuration rather than the status to know whether its own evidence meant
+anything. Nothing needs it now — the storage rung neither reads a flag nor infers from
+one.
 
 ---
 
@@ -566,7 +532,9 @@ self-fence is better than two that drift.
 
 * [mipha.md](./mipha.md) — the HA coordinator this is part of
 * [mipha_technical.md](./mipha_technical.md) — function-level reference
-* [aether.md](./aether.md) — LINSTOR/DRBD, replication factors, the write path
+* [sidon.md](./sidon.md) — the storage layer this rests on: ownership, epochs, the
+  write-all journal
+* [aether.md](./aether.md) — its predecessor, kept as history
 * [spark_api.md](./spark_api.md) — the typed API contract these two endpoints follow
 * [ring_lifecycle.md](./ring_lifecycle.md) — the other half of "a host went away": the
   ScyllaDB ring, which fencing deliberately does not touch

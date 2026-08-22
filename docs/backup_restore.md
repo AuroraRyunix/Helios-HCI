@@ -34,8 +34,8 @@ is usually missing — how it is put back.
 ## 1. Why: the pile of anonymous block devices
 
 The storage layer is the part that already survives. Lose a host at FTT=1 and every
-DRBD resource is still intact on its peer. What is *not* replicated anywhere outside
-the metadata layer is the answer to "which resource is which":
+extent group is still intact on its peer. What is *not* replicated anywhere outside the
+metadata layer is the answer to "which bytes are which":
 
 | Held in | What it is | Reconstructible? |
 | :--- | :--- | :--- |
@@ -44,18 +44,26 @@ the metadata layer is the answer to "which resource is which":
 | `hydra.storage_containers` | Container name, tier, quota, FTT | **No** |
 | `hydra.gatoway_networks`, `hydra.urbosa_*` | VLANs, overlay segments, routers, firewall rules, transit /30 allocations | **No** |
 | `hydra.users` | Console logins and their password hashes | **No** |
-| LINSTOR controller DB | Each resource's port, minor, node-id, placement and volume definitions | **No** in practice |
+| `hydra.dfs_vdisks`, `hydra.dfs_block_map`, `hydra.dfs_egroups` | Every vdisk, its owner and epoch, and **which extent group holds which extent of it** | **No** |
 | `/etc/hci/cluster.json` | Node identities, redundancy factor, VIP, cluster name | **No** |
 | `/var/lib/hci/certs_staging/ca.key` | The cluster CA. Exists on exactly one host | Only by re-issuing every certificate in the cluster |
 
-Lose the `hydra` keyspace and you have `/dev/drbd1000`, `/dev/drbd1001`, `/dev/drbd1002`
+Lose the `hydra` keyspace and you have a directory of four-megabyte files with hex names
 and no statement anywhere about what any of them is.
+
+This got worse, and it is worth being exact about why. Under DRBD the block map was the
+device itself: a resource was a named kernel object with its own on-disk metadata, so
+losing the control plane left you with anonymous *devices* that a determined operator
+could still mount and inspect. The extent store has no such fallback. An extent group is
+a slice of several vdisks interleaved, with a footer per extent naming which vdisk and
+index it belongs to — enough to prove a byte is the right byte, not enough to reassemble
+a disk. The map in `hydra.dfs_block_map` is the only thing that says what goes where.
 
 ---
 
 ## 2. What is backed up, and what deliberately is not
 
-Saga captures four things and refuses to capture a fifth.
+Saga captures three things and refuses to capture a fourth.
 
 ### 2.1 The `hydra` keyspace — captured
 
@@ -75,26 +83,23 @@ The keyspace definition is captured alongside it (`meta/schema.cql`, from
 `DESCRIBE KEYSPACE`), and so is the migration ledger `hydra.schema_migrations`
 (`meta/schema_migrations.json`) — see [§5.2](#52-the-schema-check-and-why-it-refuses).
 
-### 2.2 The LINSTOR controller database — captured
+### 2.2 There is no separate storage database — and that is an improvement
 
-Via `linstor controller backupdb`, which writes a consistent zip of the H2 database.
+Saga used to capture a fourth thing: the LINSTOR controller's H2 database, holding each
+resource's port, minor, node-id, placement and volume definitions. Two properties made it
+awkward, and both are gone:
 
-This one is *technically* reconstructible and practically is not. The LVM metadata on
-each host says which logical volumes exist, and each DRBD resource's on-disk metadata
-carries its own node-ids — so a determined operator could reverse-engineer the resource
-definitions. That is an archaeology project measured in days, per resource, with a live
-risk of attaching the wrong replica set to the wrong volume. Treat it as unrecoverable.
-
-Two properties worth knowing:
-
-* It is captured **only on the node running the controller**, because that is the only
-  node it exists on. Every other node's artefact records
-  `contains_linstor_db: false` and says why. `saga list` flags a backup round where no
+* It existed on **exactly one node**, so an artefact taken anywhere else was incomplete
+  and had to say so in its manifest, and `saga list` had to flag a backup round where no
   node captured it.
-* `linstor controller backupdb` writes into the controller's own `/var/lib/linstor`,
-  which in Helios is the `linstor-db` DRBD volume — i.e. it writes the backup onto the
-  very volume being backed up. Saga moves it off and deletes the original in the same
-  step. Left alone, this grows the HA volume by a copy of itself on every run.
+* `linstor controller backupdb` wrote into the controller's own `/var/lib/linstor`, which
+  was itself the `linstor-db` DRBD volume — the backup landed on the volume being backed
+  up, growing the HA volume by a copy of itself on every run unless something moved it off
+  and deleted the original, which Saga had to do.
+
+Sidon keeps no database of its own. Its equivalent tables live in the `hydra` keyspace
+this already snapshots, so a per-node artefact is now complete on every node, and there is
+no one-node dependency and no self-referential backup to unpick.
 
 ### 2.3 `/etc/hci` — captured
 
@@ -211,8 +216,7 @@ work uses.
    written in. A failure here stops the run: an artefact whose table shape is unknown
    is one no restore can check.
 3. `nodetool snapshot -t saga-<round> hydra`.
-4. Gather the snapshot's files, `/etc/hci`, the LINSTOR database (if the controller is
-   here), and the generated `meta/` files.
+4. Gather the snapshot's files, `/etc/hci`, and the generated `meta/` files.
 5. Write `<target>/saga-<cluster>-<node>-<stamp>.tar.gz.partial`, fsync, rename to the
    final name, write the `.manifest.json` sidecar.
 6. **Always** `nodetool clearsnapshot -t saga-<round> hydra`, on every path including
@@ -277,7 +281,6 @@ meta/schema_migrations.json       hydra.schema_migrations, id -> checksum
 meta/nodetool-status.txt          the ring as it stood (diagnostic)
 etc-hci/…                         /etc/hci, minus *.key unless --include-ca
 ca/…                              only with --include-ca
-linstor/linstordb.zip             only on the controller node
 scylla/<table>/…                  the snapshot's SSTable files, per table
 ```
 
@@ -317,25 +320,24 @@ table first — and understand that this is itself the destructive step.
 On a multi-node cluster, run the restore for **each node's artefact from that round**.
 They can all be run from one node; `--load-and-stream` routes each SSTable to its owner.
 
-**Case B — total loss of the metadata layer; the DRBD volumes survived.**
+**Case B — total loss of the metadata layer; the extent stores survived.**
 
 1. **Get `cluster.json` back first.** `saga restore --extract-only /tmp/recover <artefact>`
    unpacks the archive and touches nothing. `etc-hci/cluster.json` is in there. Every
    later step needs it.
 2. **Rebuild the nodes** with `provision.py` / `cluster create`, using that
    `cluster.json`'s node identities, redundancy factor and VIP. Do not invent new ones:
-   the DRBD resources on disk are addressed by node-id.
-3. **Restore the LINSTOR controller database** — by hand, deliberately, because the
-   automated version would mean stopping storage on a live cluster:
-   ```bash
-   systemctl stop linstor-controller
-   unzip -o /tmp/recover/linstor/linstordb.zip -d /var/lib/linstor/
-   systemctl start linstor-controller
-   podman exec -e LS_CONTROLLERS=<node-ip> systemd-aether linstor node list
-   podman exec -e LS_CONTROLLERS=<node-ip> systemd-aether linstor resource list
-   ```
-   The zip contains `linstordb.mv.db` and nothing else. Restore it on the node that will
-   run the controller.
+   extent groups are placed by node name, and the block map you are about to restore
+   refers to those names.
+
+   Provisioning is idempotent about the extent store — it will not reformat a thin volume
+   that already has a filesystem on it — but check before running it on a node whose
+   extent groups you are trying to keep, and take an LVM snapshot first if you can spare
+   the space. This is the step where an operator in a hurry destroys the data the rest of
+   the procedure exists to recover.
+3. **There is no separate storage database to restore.** It was a step here, and its
+   absence is the largest simplification in this procedure: the block map is in the
+   keyspace, so restoring the keyspace restores it.
 4. **Let the daemons create the schema.** Start `hydra-db`; Spectrum applies
    `helios_schema.py`'s migrations behind the cluster lock. The schema comes from the
    *build you are running*, not from the backup — `meta/schema.cql` in the artefact is
@@ -349,8 +351,12 @@ They can all be run from one node; `--load-and-stream` routes each SSTable to it
    `/var/lib/hci/certs_staging/` on the first host in `cluster.json`, `chmod 600` the
    key, and run `impa selftest`. If the artefact does **not** have it, you are re-issuing:
    `impa renew --ca` across every node.
-7. `cluster start`, then `valcli vm.list` and `valcli storage.list` and check that what
-   they say matches what `linstor resource list` and `drbdadm status` say.
+7. `cluster start`, then `valcli vm.list` and `valcli storage.list`. What to check:
+   every vdisk the map names has an owner, and the extent-group counts per node are
+   plausible against what is on disk. Then run a scrub —
+   `printf '{"op":"purah-scrub"}\n' | nc -U /run/sidon/control.sock` — which rehashes
+   every sealed group against the hash recorded when it was sealed, and is the only thing
+   that will tell you the restored map and the surviving bytes actually agree.
 
 **After any restore of `hydra.sessions`**, existing console session tokens from the
 backup come back with it. They are rows with no TTL. Clear them if the backup is old
@@ -485,15 +491,18 @@ not grow like guest data; `catalyst_tasks` carries a 30-day TTL (migration
 
 Stated plainly, because "backup" is a word that invites people to assume more:
 
-* **Guest data is not backed up.** Nothing here reads a DRBD volume. A VM's disk is
-  replicated by DRBD, which protects against a host failing and against nothing else —
-  not against a guest filesystem corrupting, not against a VM being deleted, not
-  against ransomware inside a guest, not against the storage tier being lost on every
-  replica. There is no snapshot, no changed-block tracking, no off-site volume
-  replication. LINSTOR's own `linstor backup ship` / `linstor snapshot` can do that
-  against an S3 remote and Helios does not currently drive it.
-* **VM images in the Valhalla catalogue** (`hydra.valhalla_images` → Linstor `img-*`
-  resources) are metadata-only here. The rows come back; the image contents do not.
+* **Guest data is not backed up.** Nothing here reads a vdisk. A VM's disk is replicated
+  by Sidon, which protects against a host failing and against nothing else — not against
+  a guest filesystem corrupting, not against a VM being deleted, not against ransomware
+  inside a guest, not against the storage tier being lost on every replica. There is no
+  snapshot, no changed-block tracking, no off-site replication.
+
+  This is closer than it was. Sealed extent groups are immutable and the schema already
+  distinguishes a vdisk from the map that reads it, so a snapshot is a map copy against a
+  frozen parent — cheap, and most of the way built. Nothing creates one yet; see
+  [dfs/](./dfs/README.md).
+* **VM images in the Valhalla catalogue** (`hydra.valhalla_images` → the `img-*` vdisks)
+  are metadata-only here. The rows come back; the image contents do not.
 * **The backup is not application-consistent for guests.** It never touches them, so
   the question does not arise — but do not read "consistent point-in-time snapshot" as
   saying anything about what is inside a VM.
@@ -507,10 +516,10 @@ Stated plainly, because "backup" is a word that invites people to assume more:
   and truncation, not tampering. The artefact contains `hydra.users` password hashes
   and session tokens by construction, and the cluster CA when `--include-ca` is used;
   protecting the target is the operator's job.
-* **The restore is not automated end to end.** Rebuilding nodes, restoring the LINSTOR
-  database and restoring the CA are documented manual steps, because each of them means
-  stopping something on a live cluster and none of them should happen because a cron
-  job decided to.
+* **The restore is not automated end to end.** Rebuilding nodes and restoring the CA are
+  documented manual steps, because each means stopping something on a live cluster and
+  neither should happen because a cron job decided to. There used to be a third — the
+  LINSTOR controller database — and it is gone with LINSTOR.
 * **Nothing tests the backups but you.** `valcli backup.verify` proves the artefact is
   intact, not that it restores. Restore something on purpose, occasionally.
 
@@ -532,7 +541,6 @@ Flags in `saga list`:
 
 | Flag | Meaning |
 | :--- | :--- |
-| `LINSTOR` | This artefact contains the LINSTOR controller database |
 | `CA` | This artefact contains the cluster CA private key |
 | `LOCAL` | Written to the same filesystem as the database — not protected against losing that disk |
 | `PARTIAL` | An interrupted run; not a backup |
@@ -542,11 +550,13 @@ Flags in `saga list`:
 ## 9. Verified behaviour
 
 Everything below was run against the live single-node test cluster (Scylla 5.4.0,
-LINSTOR 1.31.0, `hydra` at RF=1) on 2026-08-21.
+`hydra` at RF=1) on 2026-08-21, when the storage layer was still LINSTOR 1.31.0. The
+figures are unchanged by the storage replacement except where noted: Saga reads the
+keyspace and `/etc/hci`, and neither moved.
 
-* **Backup.** 35 tables, 691–853 SSTable files, ~1 MiB compressed, **6.6 s** wall clock
-  including the LINSTOR database. `nodetool listsnapshots` shows zero `saga-*` tags
-  afterwards.
+* **Backup.** 35 tables, 691–853 SSTable files, ~1 MiB compressed, **6.6 s** wall clock —
+  which then included capturing the LINSTOR database, so it is now a little faster and a
+  little simpler. `nodetool listsnapshots` shows zero `saga-*` tags afterwards.
 * **Target refusal.** With `saga_target` on the same filesystem as
   `/var/lib/hci/hydra/data`, `saga backup` refuses and exits 1;
   `--allow-same-filesystem` proceeds and the manifest records
@@ -575,7 +585,8 @@ LINSTOR 1.31.0, `hydra` at RF=1) on 2026-08-21.
 ## 10. Related
 
 * [hydra.md](./hydra.md) — the keyspace this protects, and its replication factor
-* [aether.md](./aether.md) — LINSTOR/DRBD, and why guest data is not in scope here
+* [sidon.md](./sidon.md) — the storage layer, and why guest data is not in scope here
+* [dfs/](./dfs/README.md) — including snapshots, which are designed and not built
 * [cluster_state.md](./cluster_state.md) — why ZooKeeper is not backed up
 * [dagur.md](./dagur.md) — the scheduler that runs the nightly job
 * [mtls_lifecycle.md](./mtls_lifecycle.md) — the CA, where it lives, and `impa renew --ca`

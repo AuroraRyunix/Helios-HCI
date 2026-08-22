@@ -7,7 +7,7 @@ The contract that replaces `POST /api/v1/execute` with per-domain endpoints.
 `spark-daemon` is the only component permitted to act on a hypervisor, and today its main
 entry point is `/api/v1/execute`, which runs a caller-supplied string through a shell as
 root. `spectrum_server.py` alone makes **79 raw execute calls against 15 typed ones**,
-shelling out for `virsh` (12), `ip` (5), `rm` (4), `drbdadm` (4), plus `podman`, `reboot`
+shelling out for `virsh` (12), `ip` (5), `rm` (4), plus `podman`, `reboot`
 and `mkdir`.
 
 That single fact explains a large share of this project's defect history: every shell
@@ -30,22 +30,24 @@ finish that pattern and stop routing around it.
    (`\Z`, not `$` -- `$` also matches before a trailing newline). Paths must resolve under
    an allowlisted root. Reject rather than sanitize.
 
-   One carve-out is required and was found during implementation: `/dev/drbd/by-res/<res>/<vol>`
-   is a symlink to `/dev/drbdNNNN`, so a plain `realpath`-must-be-under-an-allowed-root rule
-   rejects *every* DRBD device and makes the storage endpoints unusable. The rule is
+   One carve-out used to be required and no longer is. `/dev/drbd/by-res/<res>/<vol>` was
+   a symlink to `/dev/drbdNNNN`, so a plain realpath-under-an-allowed-root rule rejected
+   *every* DRBD device; the exception that allowed it was the only place a device node was
+   reachable at all. There are no device nodes in the allow-list now -- a vdisk is a unix
+   socket under `/var/lib/hci/sidon/nbd/` -- so the rule is
    therefore: the literal path must be under an allowed root **and** the realpath must be
-   under an allowed root, *except* that a literal path under `/dev/drbd/` may resolve to
-   `\A/dev/drbd[0-9]+\Z`. An aether-rooted symlink pointing at `/etc/shadow` is still rejected.
+   under an allowed root, with no exception. A symlink under one of those roots pointing
+   at `/etc/shadow` is still rejected.
 4. **Structured responses.** Return parsed JSON, not captured stdout. A caller that has to
    regex stdout is still coupled to the command.
 
-   Note the two pass-through documents keep their upstream shape: `/storage/drbd/status`
-   returns the top-level **array** from `drbdsetup status --json`, and `/host/disks` returns
+   Note the pass-through document keeps its upstream shape: `/host/disks` returns
    the `{"blockdevices": [...]}` **object** from `lsblk -J`.
 
 5. **Error codes.** `400` for a rejected parameter, `404` for an unknown domain or resource,
    `409` when an operation did not take. A `409` still carries the state key so the caller
-   learns the actual value: `/storage/drbd/role` returns `{"role": "<actual>", "error": ...}`
+   learns the actual value: a refused `attach` returns `409` with the host that owns the
+   vdisk named in the body
    and names the peer when one holds Primary; `/vm/{name}/power` returns
    `{"state": "<actual>", "error": ...}`.
 6. **`/api/v1/execute` stays** during migration, and shrinks as call sites move. It is not
@@ -70,28 +72,47 @@ All are mTLS on `:9099`, JSON in and out. Errors return
 `xml_b64` is base64 so domain XML never passes through a shell. The daemon decodes it to a
 temp file and calls `virsh define` on that path.
 
-### Storage (DRBD / Linstor / block devices)
+### Storage (Sidon vdisks, files and block devices)
 
 | Method | Path | Body / Query | Returns |
 | :-- | :-- | :-- | :-- |
-| GET | `/api/v1/storage/drbd/status` | `?resource=` (optional) | parsed `drbdsetup status --json` |
-| POST | `/api/v1/storage/drbd/role` | `{"resource","role":"primary"\|"secondary","force":bool}` | `{"role":str}` |
+| POST | `/api/v1/dfs/vdisk` | `{"op": ..., "vdisk_id"?: ..., ...}` | whatever Sidon answers |
+| POST | `/api/v1/dfs/write` | `?vdisk=` + **raw body** | `{"written":int}` |
 | GET | `/api/v1/storage/device` | `?path=` | `{"exists":bool,"is_block":bool,"size_bytes":int}` |
 | POST | `/api/v1/storage/device/prepare` | `{"path","owner","mode"}` | `{"prepared":true}` |
 | POST | `/api/v1/storage/device/write` | `?device=` + **raw body** | `{"written":int}` |
 | POST | `/api/v1/storage/device/flush` | `{"path"}` | `{"flushed":true}` |
 | GET | `/api/v1/storage/container/mounted` | `?path=` | `{"mounted":bool}` |
 | POST | `/api/v1/storage/container/ensure` | `{"name"}` | `{"path":str,"created":bool}` |
-| GET | `/api/v1/storage/linstor/resources` | `?resource=` (optional) | `{"resources":[{"name","size_kib","size_gib","nodes","device_path"}]}` |
-| POST | `/api/v1/storage/linstor/resource` | `{"resource", "size_gib"\|"size_kib", "nodes"?, "storage_pool"?, "allow_two_primaries"?}` | `{"resource","created":bool,"size_kib","device_path",...}` |
-| POST | `/api/v1/storage/linstor/resource/delete` | `{"resource"}` | `{"resource","deleted":bool}` |
-| GET | `/api/v1/storage/drbd/options` | `?resource=` | `{"resource","options":{...}}` |
 | POST | `/api/v1/host/fence` | `{"confirm":true}` | 200 with a verification report, or 409 |
 
-`path` must resolve under `/dev/drbd/` or `/var/lib/hci/aether/`. `owner` is an allowlist
-(`root:qemu`, `root:root`), `mode` an octal string from an allowlist. Promotion returns the
-resulting role so a caller can detect the peer already holding Primary -- the condition
-that previously allowed a VM to start twice.
+`path` must resolve under `/var/lib/hci/aether/`, `/var/lib/hci/sidon/` or
+`/var/lib/hci/images/`. `owner` is an allowlist (`root:qemu`, `root:root`), `mode` an
+octal string from an allowlist.
+
+#### `/api/v1/dfs/vdisk`
+
+Fronts Sidon's unix control socket. An **allow-list**, not a pass-through: forwarding
+whatever arrives would make this endpoint exactly as powerful as the socket it fronts,
+which is the reason for fronting it. Two groups:
+
+| Group | Operations | `vdisk_id` |
+| :-- | :-- | :-- |
+| Per vdisk | `create` `attach` `detach` `delete` `status` `flush` `seal` `resize` | required |
+| Per node | `list` `ping` `capacity` `peers` `purah-sweep` `purah-scrub` `purah-heal` | not taken |
+
+The split is load-bearing and is pinned by `test_dfs_endpoint.py`. It was once written as
+"everything except `list` and `ping` needs a `vdisk_id`", which refused `capacity`,
+`peers` and the three Purah jobs outright -- and since everything that asks a node how
+much room it has goes through here, and every caller's behaviour on no answer is to be
+cautious, that silently made hylia refuse every maintenance exit, made vali's migration
+capacity gate refuse every migration, and made the console render a cluster with no
+storage in it. Nothing raised anywhere.
+
+`attach` is the ownership operation and the one whose refusal matters: it wins the
+`(owner, epoch)` compare-and-swap in Hydra and fences every replica at the new epoch, so
+a `409` means another host holds the disk and the body names it. `409` means the answer
+will not change on a retry; `503` means it might.
 
 `device/write` streams the request body straight onto the device. It exists because the
 web tier must not touch the data path at all. Opening a DRBD device from the console
@@ -106,53 +127,43 @@ upload and proxies the bytes here, so it needs neither `/dev` nor a storage moun
 A short write returns 400 with the byte count rather than 200, so a client that
 disconnects mid-upload cannot leave a truncated image registered as valid.
 
-Note the daemon holds the device open for the life of the write request. A caller that
-abandons an upload must close the connection *before* trying to delete the resource, or
-LINSTOR refuses with "resource is still in use" and the rollback leaks the storage it was
-meant to reclaim. Release is asynchronous, so the delete also has to be retried; see
+Note the daemon keeps the vdisk attached for the life of the write request. A caller that
+abandons an upload must close the connection *before* trying to delete it, or the delete
+is refused and the rollback leaks the storage it was meant to reclaim. Release is
+asynchronous, so the delete also has to be retried; see
 `SpectrumPhx.Images.rollback_upload/1`.
 
-`drbd/options` exists because `drbdsetup status --json` reports `"quorum": true` both
-when a majority is genuinely held **and when quorum is switched off entirely** -- verified
-on a live cluster, where every resource reported `"quorum": true` in status while
-`drbdsetup show` said `"quorum": "off"`. Storage fencing rests on quorum being armed, so
-it has to read the configured options rather than the status.
+`/api/v1/dfs/write` is the same idea as `/storage/device/write` and a smaller thing to
+trust: the device form takes a path and checks it against an allow-list, while this one
+takes a *vdisk name* and derives the socket itself, so a caller cannot name a file at all.
 
 `host/fence` asks a host to take itself out of service and **reads back what it produced**:
-no guest process, no open DRBD device, no resource held Primary. It returns that report
+no guest process, no vdisk still attached. It returns that report
 rather than a bare success, because the previous fence was a shell string whose every
 clause ended in `|| true` and whose exit status the caller discarded -- so a host that had
 gone silent, the exact case fencing exists for, was recorded as fenced on no evidence.
 A fence that cannot be confirmed is a failure; see [fencing.md](./fencing.md).
 
-`linstor/resource` creates a resource definition, a volume definition, placement on every
-node and the DRBD options as **one idempotent operation**. The four commands are
-meaningless apart, so exposing them separately would move the sequencing bug into every
-caller. `created: false` means the resource was already there and was adopted, which is
-what makes a retry after a timeout safe. A resource that exists at a *different* size is a
-`409` carrying the actual size, never a silent reuse -- that is precisely how a new VM ends
-up attached to a deleted VM's disk.
+`create` allocates a vdisk, and it is a metadata operation: a row and a block map, sparse,
+with nothing written until a guest writes. It returns in milliseconds, where the LINSTOR
+placement it replaced built a kernel object on every node and needed a four-minute
+timeout. Size is in bytes, with no alignment to round to -- the DRBD path rounded to whole
+KiB and then to DRBD's own 4 KiB, which made an idempotent retry compare unequal and
+reject itself as a size conflict.
 
-Size is given in exactly one unit, and sending both is a `400` rather than a precedence
-rule. VM disks are whole GiB (`size_gib`). Images are not -- an ISO is whatever size it is
--- so they use `size_kib`, which is rounded up to LINSTOR's 4 KiB alignment before use; an
-unaligned request would otherwise be stored larger than asked for, and the next idempotent
-create would reject its own retry as a size mismatch.
+An existing vdisk of the same name is refused rather than adopted. Adoption was safe when
+a create was idempotent-by-adoption; refusing is safer, because a create that adopts is
+also a rollback that deletes someone else's live disk.
 
-`allow_two_primaries` defaults to false and is validated as a strict JSON boolean, so a
-truthy string cannot turn it on. It is correct for a golden image, which guests on several
-hosts attach read-only at the same time and which is written exactly once by the upload
-that creates it. It is never correct for a VM disk: dual-primary there is what let one VM
-run on two hosts and corrupt itself.
+`seal` is what replaced `--allow-two-primaries`. That flag existed because a golden image
+is attached read-only by guests on several hosts at once, and DRBD required each of those
+hosts to hold Primary in order to read -- exactly the state that corrupts a device the
+moment anything writes. A sealed vdisk cannot reach it: it is permanently immutable, reads
+need no lease, and writes are refused by class at the NBD layer. The seal drains first,
+because the drain is itself a write path and a vdisk frozen around an undrained journal
+could never finish draining it.
 
-### Host
-
-| Method | Path | Body / Query | Returns |
-| :-- | :-- | :-- | :-- |
-| GET | `/api/v1/host/network` | -- | `{"default_interface","default_gateway","addresses":[{"interface","family","address","prefixlen","scope"}]}` |
-| GET | `/api/v1/host/memory` | -- | `{"total_mb","used_mb","free_mb","available_mb"}` |
-| GET | `/api/v1/host/disks` | -- | parsed `lsblk -J` |
-| GET | `/api/v1/host/capabilities` | -- | `{"kvm":bool,"drbd_module":bool,"secure_boot":bool}` |
+| GET | `/api/v1/host/capabilities` | -- | `{"kvm":bool,"secure_boot":bool}` |
 | GET | `/api/v1/host/dhcp-leases` | -- | `{"leases":[{"mac","ip","hostname","expires"}]}` |
 | POST | `/api/v1/host/reboot` | `{"confirm":true}` | `{"rebooting":true}` |
 
@@ -189,8 +200,8 @@ calls each would retire.
 | VM media (CD-ROM change/eject) | 10 | `virsh change-media`, `qemu-monitor-command`. The largest single group remaining. |
 | VM device hotplug (attach/detach NIC and disk) | 5 | `virsh attach-device`, `detach-interface`, `attach-disk`, `detach-disk`. |
 | `POST /api/v1/vm/{name}/disk/resize` | 1 | `virsh blockresize`. |
-| `drbdadm resize` on `/storage/drbd/` | 1 | `/storage/drbd/role` covers only primary/secondary. |
-| ~~Linstor resource operations~~ | ~~3~~ | **Done.** `POST /storage/linstor/resource`, `/resource/delete` and `GET /storage/linstor/resources`. See the correction below: the figure of 3 was wrong. |
+| ~~`drbdadm resize`~~ | ~~1~~ | **Gone with DRBD.** A vdisk is sparse and its map is keyed by extent index, so growing one changes a recorded size and nothing else; `resize` on `/api/v1/dfs/vdisk` covers it, and only qemu needs telling afterwards. |
+| ~~Linstor resource operations~~ | ~~3~~ | **Gone with LINSTOR.** Every storage operation goes through `/api/v1/dfs/vdisk`, and the figure of 3 was wrong in a way worth keeping — see the correction below. |
 | `GET /api/v1/host/cpu` | 1 | Core count and model. |
 | `GET /api/v1/host/ping` | 2 | A liveness probe for the reboot task. Currently `echo 1`, and not migrated because `run_mtls_spark_api` has a 120s timeout against `run_remote_spark`'s 60s, which would change reboot detection timing. |
 
@@ -205,27 +216,27 @@ file-transfer and config-sync paths. Exposing file verbs as endpoints would repr
 
 ### Correction: `/execute` usage is undercounted
 
-The headline figure of 79 raw calls counts `run_remote_spark` call sites in
-`spectrum_server.py`. It misses Linstor entirely: those go through a separate
-`run_linstor_cmd` wrapper, which builds `podman exec ... linstor <args>` and *then* hands
-it to `run_remote_spark`, so its **21 call sites** never appear in the count. This gap was
-listed as worth 3 calls; the real figure is an order of magnitude higher.
+The headline figure of 79 raw calls counted `run_remote_spark` call sites in
+`spectrum_server.py`. It missed LINSTOR entirely: those went through a separate
+`run_linstor_cmd` wrapper, which built `podman exec ... linstor <args>` and *then* handed
+it to `run_remote_spark`, so its **21 call sites** never appeared in the count. The gap
+was listed as worth 3 calls; the real figure was an order of magnitude higher.
 
-Two consequences worth carrying:
+Both the wrapper and the calls are gone, and the lesson is the part worth keeping:
 
-* The migration metric should count wrappers that reach `/api/v1/execute`, not only direct
+* The migration metric must count wrappers that reach `/api/v1/execute`, not only direct
   callers. Any future wrapper hides its call sites the same way.
 * `/api/v1/execute` cannot be removed on the strength of the direct-call count alone.
 
-Also unlike the other pass-through endpoints, the Linstor responses are **normalised** by
-the daemon rather than returned verbatim. `drbdsetup status --json` and `lsblk -J` have
-stable shapes; the Linstor client renames its own keys between output versions
-(`rsc_dfns`/`rsc_name`/`vlm_size` versus `resource_definitions`/`name`/`size_kib`), so a
-pass-through would push a version dependency onto every caller. An unrecognised document
-yields an empty list rather than a guess.
+The normalisation argument outlived the thing it was about. `lsblk -J` has a stable shape
+and is passed through; the LINSTOR client renamed its own keys between output versions
+(`rsc_dfns`/`rsc_name`/`vlm_size` versus `resource_definitions`/`name`/`size_kib`), so
+those responses had to be normalised or every caller inherited a version dependency.
+Sidon's control socket answers a JSON document this repository defines, which removes the
+question rather than answering it — the shape cannot drift out from under a caller,
+because nothing upstream owns it.
 
-Still requiring `/execute` after this work: `volume-definition set-size` (disk resize) and
-the dual-primary toggle around live migration.
+Nothing storage-related requires `/execute` any more.
 
 ## Related
 

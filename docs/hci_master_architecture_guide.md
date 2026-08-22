@@ -13,7 +13,7 @@ Below is the mapping between Nutanix proprietary services and their Helios-HCI c
 | Nutanix Service | Helios-HCI Component | Description |
 | :--- | :--- | :--- |
 | **AHV / Acropolis** | **Bifrost & Vali** | VM lifecycle manager, scheduling agent, and QEMU/KVM hypervisor wrapper. |
-| **Stargate** | **Aether** | Distributed block storage data-path engine (Linstor + DRBD block replication). |
+| **Stargate** | **Sidon** | Per-node storage data path: an extent store serving VM disks to qemu over NBD, with the placement map in Hydra. Replaced Aether (Linstor + DRBD). |
 | **Zeus Configuration** | **ZooKeeper** | Consensus configuration store and cluster metadata repository. |
 | **Zeus Datastore** | **HydraDB (ScyllaDB)** | High-throughput distributed storage for cluster stats, VM states, and logs. |
 | **Prism Central / Element**| **Spectrum** | Unified web console and administration interface (React/Python). |
@@ -34,11 +34,10 @@ graph TD
     Spark -- "Local Execute / API Calls" --> Vali[Vali Hypervisor Agent]
     Spark -- "Local Execute" --> Bifrost[Bifrost VM Manager]
     Vali -- "Libvirt API" --> VM[QEMU/KVM Virtual Machine]
-    VM -- "Block Write" --> DRBD[DRBD Kernel Module]
-    DRBD -- "Sync LAN replication (Port 7700+)" --> PeerDRBD[Peer Node DRBD]
-    Spark -- "Linstor Client API" --> LC[Linstor Controller]
-    LC -- "Configure (Port 3376)" --> LS[Linstor Satellite]
-    LS -- "Manage" --> DRBD
+    VM -- "NBD over a unix socket" --> Sidon[Sidon Storage Daemon]
+    Sidon -- "Journal + extent replication (Port 9105)" --> PeerSidon[Peer Node Sidon]
+    Sidon -- "Block map + ownership" --> Hydra[(HydraDB)]
+    Spark -- "Control socket" --> Sidon
 ```
 
 ### Cluster Ports Matrix
@@ -48,19 +47,43 @@ graph TD
 *   **2888/3888 (TCP)**: ZooKeeper quorum peer/leader election ports.
 *   **9042 (TCP)**: ScyllaDB database native transport port.
 *   **9043 (TCP)**: Daruk query proxy port (redirects to ScyllaDB).
-*   **3370 (TCP)**: Linstor controller API port.
-*   **3366 (TCP)**: Linstor satellite API port.
-*   **7700-7890 (TCP)**: DRBD block replication port range (assigned dynamically).
+*   **9105 (TCP)**: Sidon replication. Journal appends, extent-group transfer, epoch
+    fencing and forwarded guest I/O. One connection per node **pair**, independent of VM
+    count. mTLS is not implemented yet, so the daemon refuses to bind this port to
+    anything but loopback.
 
 ---
 
-## 3. Storage Layer: Linstor + DRBD Block Replication
+## 3. Storage Layer: the extent store (Sidon)
 
-Aether bypasses standard network filesystems (e.g., NFS, GlusterFS) by implementing direct block-level replication using Linstor and DRBD:
+Sidon replaced Linstor + DRBD because DRBD replicates *devices*. Every replicated volume
+was a standing connection between named peers, costing a TCP port, a kernel object, its
+own threads and RF-1 connections per node -- the right shape for a handful of HA volumes
+and the wrong shape for one volume per VM disk. The visible symptom was a ceiling of 191
+replicated volumes cluster-wide on the default port range. Sidon replicates *extents* and
+holds one connection per node pair, whatever the disk count. See
+[sidon.md](./sidon.md).
 
-*   **LVM-Thin Pools**: Non-boot storage drives on each node are unified under an LVM volume group `vg_aether` and thin-provisioned pool `thin_pool_aether`.
-*   **DRBD Resources**: Virtual disks are allocated as DRBD resources. If a VM is configured with $FTT=1$, Linstor creates a replicated DRBD volume mirrored across the local node and a peer node.
-*   **Direct I/O Path**: The QEMU virtual machine interacts directly with the local DRBD block device (`/dev/drbd/by-res/<vm>/0`). Read operations are processed locally at host hardware speeds. Write operations are processed locally and replicated synchronously over the network via DRBD to the peer node before the write is acknowledged.
+*   **LVM-Thin Pools**: Non-boot storage drives on each node are unified under an LVM
+    volume group `vg_aether` and thin-provisioned pool `thin_pool_aether`. Sidon takes one
+    thin volume from it, formatted XFS and mounted at `/var/lib/hci/sidon` -- its own
+    filesystem, so filling the extent store cannot stop the host.
+*   **Extents and extent groups**: a vdisk is cut into 1 MiB extents, which live in 4 MiB
+    append-only extent groups -- ordinary files. Sealed groups are **immutable**,
+    permanently: a rewritten extent is appended somewhere new and the block map is
+    repointed. That is what makes repair a checksum comparison rather than a divergence
+    protocol, a snapshot a map copy rather than a data copy, and scrub lock-free. The
+    price is garbage collection, paid deliberately, because GC is a performance problem
+    and replica divergence is a correctness problem.
+*   **I/O path**: qemu speaks NBD to the Sidon on its own host over a unix socket. There
+    is no block device and no kernel client in the path. A write lands in a per-vdisk
+    journal, is replicated **write-all** to every replica, and is acknowledged after that
+    -- nothing on the path touches Hydra. A background drain coalesces the journal into
+    extent groups and commits the block map.
+*   **Ownership**: exactly one node serves a vdisk at a time, as an `(owner, epoch)` pair
+    in Hydra moved only by compare-and-swap. Every replica persists the highest epoch it
+    has been fenced at and refuses anything older, which is what makes split-brain a
+    rejected request rather than a corrupted disk.
 
 ---
 
@@ -391,51 +414,67 @@ To prevent systemd boot dependency loops (where systemd tries to start the proxy
 
 ---
 
-### Aether (Linstor/DRBD Storage Fabric)
-Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
-
-> [!WARNING]
-> **Secure Boot Requirement:** 
-> Because DRBD runs as an out-of-tree kernel module, **Secure Boot must be disabled** on all hypervisor hosts. Alternatively, the ELRepo secure boot public key (`/etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der`) must be imported into each host's MOK database (`mokutil --import`) and enrolled at boot. If Secure Boot is enabled without enrolling the key, loading the DRBD driver will fail with `Key was rejected by service`.
+### Sidon (Storage Data Path)
+Sidon is the per-node storage daemon and the only data path. It is the direct equivalent
+of Nutanix **Stargate**.
 
 > [!NOTE]
-> **Name Origin:** In Greek mythology, **Aether** is the personification of the bright upper sky and the air breathed by gods. Historically in physics, the *aether* was a hypothetical space-filling medium postulated to support the propagation of electromagnetic waves. In Helios-HCI, **Aether** refers to the distributed storage fabric (Linstor + DRBD) that spans all physical nodes to form a single, unified virtual storage medium.
+> **Secure Boot can stay enabled.** It used to have to be disabled on every hypervisor, or
+> the ELRepo signing key enrolled by hand at each host's console, because DRBD shipped as
+> an out-of-tree kernel module the kernel refuses to load unenrolled. Sidon is a userspace
+> daemon speaking NBD over a unix socket: it loads no module, so provisioning has one
+> fewer way to fail before it has touched anything.
+
+> [!NOTE]
+> **Name Origin:** Prince Sidon of the Zora, from *Breath of the Wild*. Aether, the
+> predecessor, was named for the hypothetical space-filling medium of nineteenth-century
+> physics -- a fitting name for a storage fabric and, in hindsight, for something that
+> turned out not to be there.
 
 ---
 
 ### Nutanix Role (Stargate)
-In Nutanix, Stargate is the core data-path service. All read and write operations from VMs are sent directly to Stargate. In our updated architecture, Aether bypasses FUSE filesystems completely, exposing virtual disks directly to QEMU as replicated DRBD block devices.
+In Nutanix, Stargate is the core data-path service: every read and write from a VM goes to
+it. Sidon is the same shape. A guest talks to the Sidon on its own host, always, and Sidon
+decides where the bytes go -- to local extent groups, to replicas over 9105, or forwarded
+to whichever node currently owns the vdisk.
 
 ---
 
 ### Failures To Tolerate (FTT) & Replication
 
-FTT defines the redundancy level of the cluster, mapping directly to Nutanix Redundancy Factors (RF). Under Linstor/DRBD, FTT dictates the auto-placement replication count of the DRBD resources:
+FTT defines the redundancy level of the cluster, mapping directly to Nutanix Redundancy
+Factors (RF). It sets the number of copies of every extent group and the size of the
+write-all set a journal append must reach:
 
-*   **FTT = 0 (Redundancy Factor 1 / RF1)**:
-    - **Replication count**: 1.
-    - **Minimum hosts**: 1.
-    - **Behavior**: Allocated only on the host running the VM. No network replication.
-*   **FTT = 1 (Redundancy Factor 2 / RF2)**:
-    - **Replication count**: 2.
-    - **Minimum hosts**: 2.
-    - **Behavior**: Replicated synchronously over the network between 2 hosts using DRBD. Survives 1 host failure.
-*   **FTT = 2 (Redundancy Factor 3 / RF3)**:
-    - **Replication count**: 3.
-    - **Minimum hosts**: 3.
-    - **Behavior**: Replicated synchronously over the network across 3 hosts using DRBD. Survives 2 simultaneous host failures.
+*   **FTT = 0 (RF1)**: one copy, one host minimum, no network replication. A supported
+    topology, not a stepping stone -- there is simply nothing to fence and nothing to
+    re-replicate.
+*   **FTT = 1 (RF2)**: two copies across two hosts. Survives one host failure.
+*   **FTT = 2 (RF3)**: three copies across three hosts. Survives two.
+
+**Write-all, not quorum**: an append that has not reached every replica is not
+acknowledged, and the guest gets EIO. That is a deliberate trade. It costs availability
+during single-replica loss and buys a three-line safety proof -- fencing one replica stops
+the old owner, because the old owner needed all of them, and reading one replica sees
+every acknowledged write, for the same reason. Purah re-replicates onto a spare within
+seconds of a write failing, so the exposure is an interruption rather than an outage.
 
 ---
 
-### Underlying Storage Engine: Linstor + DRBD
+### Underlying Storage Engine
 
-To maximize storage I/O performance and support enterprise features, Aether runs **Linstor** and **DRBD** as the software-defined storage (SDS) replication engine:
-
-#### Linstor & DRBD Implementation
-* **Host Storage Pools**: Raw non-boot disks >= 100GB (e.g., `/dev/sdb`, `/dev/nvme0n1`) are dynamically scanned and claimed on each node during cluster creation, then configured as an LVM-Thin Pool (`thin_pool_aether` inside `vg_aether`). Lvm-thin natively handles space-saving snapshots, thin provisioning, and high-performance block allocations.
-* **Linstor Satellite**: Runs as a privileged Podman container on all nodes, communicating with the host kernel to provision block devices dynamically.
-* **Linstor Controller**: Runs as a manager service on the leader node, keeping track of volume definitions, resource allocation, and replication targets.
-* **Direct Block Access**: Instead of accessing a file on a shared mount, VMs are defined with direct block storage targets mapping to `/dev/drbd/by-res/<vm_name>/0`. This achieves near bare-metal I/O throughput.
+* **Host Storage Pools**: Raw non-boot disks >= 100GB (e.g., `/dev/sdb`, `/dev/nvme0n1`)
+  are scanned and claimed on each node during cluster creation, then configured as an
+  LVM-Thin Pool (`thin_pool_aether` inside `vg_aether`).
+* **The extent store**: one thin volume from that pool, XFS, mounted at
+  `/var/lib/hci/sidon` by UUID with `nofail` -- so a node whose storage volume is missing
+  still boots to a shell rather than stopping at an emergency prompt.
+* **No containers, no kernel module**: `sidon.service` is a native systemd unit running a
+  Rust binary. The Linstor satellite and controller containers are gone, and provisioning
+  removes them from nodes upgraded from a DRBD cluster.
+* **Per-vdisk sockets**: qemu attaches over `/var/lib/hci/sidon/nbd/<vdisk>.sock`,
+  group-owned by `qemu`.
 
 ---
 
@@ -444,12 +483,19 @@ To maximize storage I/O performance and support enterprise features, Aether runs
 ```
 [ Virtual Machine (VM) ]
            │
-           │ (Direct Block I/O to /dev/drbd/by-res/test/0)
+           │ NBD over /var/lib/hci/sidon/nbd/<vdisk>.sock
            ▼
-[ DRBD Kernel Driver (Host Kernel) ]
-           ├───► Local Writes to vg_aether/thin_pool_aether (LVM Thin)
-           └───► Synchronous network replication (TCP/RDMA) to Peer Host
+[ Sidon (userspace, this host) ]
+           ├───► journal append + fdatasync            (local)
+           └───► journal append + fdatasync on the peer (port 9105, in parallel)
+                            │
+                            ▼
+                  acknowledged to the guest
 ```
+
+Nothing on that path touches Hydra. That is the design's one inviolable performance rule:
+acknowledgement never waits on the metadata layer. The drain into extent groups, and the
+block-map commit that follows it, happen in the background.
 
 ---
 
@@ -607,7 +653,7 @@ When `spark-daemon` starts up (e.g. during host boot), it spawns a background th
 4. **Cluster State Verification**: Queries the ZooKeeper database for `/cluster_state`. If the cluster state is set to `stopped` (e.g. administrator manually stopped the cluster), it skips starting the workloads.
 5. **Workload Autostart**: Starts the following local cluster services sequentially:
    - `hydra-db` (ScyllaDB container)
-   - `aether` (Linstor Satellite storage container)
+   - `sidon` (native unit -- the storage data path; not a container)
    - `spectrum` (Management WebUI container)
    - `bifrost` (Floating VIP Manager)
    - `dagur` (Task Scheduler)
@@ -700,12 +746,12 @@ To ensure compatibility across all hypervisor nodes:
 ### VM Disk Resizing & Split-Brain Protection
 
 To guarantee data integrity and correct capacity detection across all states:
-* **Boot Disk Resizing**: When starting a VM, Vali checks its configured disk size in ScyllaDB. Before booting libvirt, it promotes (`drbdadm primary`) and resizes (`drbdadm resize`) the DRBD device on the hypervisor. This guarantees guest OS installers (like Windows Server) detect the updated size immediately.
-* **Live Disk Resizing**: When editing a running VM's disk capacity, Vali runs `drbdadm resize` on the host kernel block device, resolves the correct device prefix (`vd` vs `sd`) based on the bus type, and executes QEMU `blockresize` dynamically:
+* **Boot Disk Resizing**: nothing to do, and the reason is worth recording. A DRBD volume was a kernel block device with a size the kernel had to be told about, and a stopped VM's device sat `Secondary` where it could not be resized at all -- so the power-on path had to prepend `drbdadm primary` and `drbdadm resize` or the guest installer saw the old capacity. A vdisk has no kernel object and no size the host has to agree with: it is sparse, its map is keyed by extent index, and a grown range simply reads as zeroes until something writes there.
+* **Live Disk Resizing**: When editing a running VM's disk capacity, Vali raises the recorded size through Sidon's `resize`, resolves the correct device prefix (`vd` vs `sd`) based on the bus type, and executes QEMU `blockresize` dynamically:
   ```bash
   virsh -c qemu:///system blockresize <vm_name> <target_dev> <new_size_in_kb>
   ```
-* **Split-Brain VM Protection**: If a host suffers a network partition or hard crash, its VMs are failed over to other hosts. When the partitioned/crashed host returns online, a local Spectrum reconciliation loop (`db_reconcile_loop`) verifies all local VMs. If any local VM is assigned to another node (or stopped) in the ScyllaDB registry, it runs `virsh destroy` and `virsh undefine --keep-nvram` locally to kill the stale instance and protect DRBD block storage.
+* **Split-Brain VM Protection**: If a host suffers a network partition or hard crash, its VMs are failed over to other hosts. When the partitioned/crashed host returns online, a local Spectrum reconciliation loop (`db_reconcile_loop`) verifies all local VMs. If any local VM is assigned to another node (or stopped) in the ScyllaDB registry, it runs `virsh destroy` and `virsh undefine --keep-nvram` locally to kill the stale instance. This is now belt to the storage layer's braces rather than the only guard: the returning host was fenced at a lower epoch, so every replica already refuses its writes.
 
 ---
 
@@ -846,9 +892,9 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | Job Name | Task Type | Cron Expression | Interval | Command | Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `mimir_diagnostics` | `mimir_health` | `0 * * * *` | 1 hour | `/usr/local/bin/mcli health_checks run_all` | Runs cluster health checks. |
-| `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `podman exec systemd-linstor-controller linstor resource list` | Verifies Linstor/DRBD storage volume state. |
+| `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `purah-scrub` on `/run/sidon/control.sock` | Rehashes every sealed extent group against the hash taken when it was sealed. Needs no lock, because sealed means immutable. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
-| `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `N/A (Native)` | DRBD kernel replication natively handles replication synchronization. |
+| `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `/usr/local/bin/mipha --auto-heal` | A backstop. Purah re-replicates within seconds of a write failing, so a daily pass exists to catch what an event-driven path missed, not to be the path. |
 
 ---
 
@@ -1555,7 +1601,7 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 ### 6.1 Host Bootstrapping & Provisioning (Odin)
 1. Odin contacts the target server over SSH and assigns the hostname dynamically based on the IP address hash (`Valkyrie-XXXXXX`).
 2. Configures DNS `/etc/resolv.conf`, NTP `/etc/chrony.conf`, and networking.
-3. Installs dependencies: Podman, Libvirt, QEMU, Linstor, and DRBD kernel module.
+3. Installs dependencies: Podman, Libvirt, QEMU, and the Rust toolchain the storage and console daemons are built with. No kernel module, and therefore no Secure Boot pre-flight.
 4. Generates certificate authority (CA) and issues local mTLS certs for the Spark REST API daemon.
 5. Starts the Spark agent daemon on port 9099.
 
@@ -1564,7 +1610,7 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 2. The CLI performs connection checks and templates hostnames using MD5 hashes.
 3. Overwrites `/etc/hci/cluster.json` on all nodes.
 4. Scans local disks and configures `vg_aether/thin_pool_aether` thin-provisioning pools.
-5. Registers nodes and storage pools inside Linstor.
+5. Carves the extent store's thin volume from that pool, makes an XFS filesystem on it, and mounts it at `/var/lib/hci/sidon` by UUID with `nofail`.
 6. Defines and formats storage containers (`default-vm-container` and `default-image-container`).
 7. Distributes configuration files, starts consensus (ZooKeeper), databases (ScyllaDB), hypervisor agents (Vali), and orchestration engines (Bifrost, Dagur, Mimir, etc.).
 8. Executes secure SSH key seeding via `ssh-keyscan` and distributes public keys to `/root/.ssh/known_hosts` on all cluster nodes.
@@ -1573,14 +1619,15 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 ### 6.3 VM Creation & Startup
 1. Spectrum UI submits VM creation request to Catalyst / Bifrost.
 2. Bifrost queries Mimir scheduler for the best node target based on current CPU/Memory load.
-3. Bifrost allocates a Linstor DRBD block device volume `/dev/drbd/by-res/<vm_name>/0` (mirrored across hosts).
+3. Bifrost creates a vdisk `<vm_name>-disk<n>` at the cluster's replication factor. Sparse and immediate: a row and a block map, with nothing allocated until the guest writes.
 4. Bifrost calls Spark API on the target node to define the VM domain in Libvirt (Vali agent).
-5. Vali launches the VM under QEMU/KVM, mounting the DRBD block device as virtio-blk.
+5. Vali **attaches** each vdisk on the target as a checked step before the domain is defined. The attach wins the ownership compare-and-swap in Hydra and fences every replica at the new epoch, so a refusal here -- naming the host that holds the disk -- stops a second copy of a VM before libvirt is involved.
+6. Vali launches the VM under QEMU/KVM with a `<disk type='network'>` whose source is NBD over `/var/lib/hci/sidon/nbd/<vdisk>.sock`. There is no block device in the path.
 
 ### 6.4 HA Failover Process (Mipha)
 1. Mipha daemon monitors heartbeats from all hypervisor nodes in the ZooKeeper quorum registry.
 2. If a node fails, Mipha detects the node offline status in ZooKeeper.
 3. Mipha queries ScyllaDB (`hydra.vms`) to identify the virtual machines that were active on the failed host.
-4. Mipha updates the DRBD volume attachment parameters in Linstor to set the failed node attachment as orphaned.
-5. Mipha schedules VM boot requests on surviving hosts. The surviving hosts mount the replicated DRBD storage volumes locally and restart the VM domains.
+4. Mipha **fences the storage first**, and this is now an action rather than an inference: it raises the epoch on every vdisk the dead host owns, and every replica then refuses that host's appends -- whether the host is wedged, lying about its own state, unreachable, or unaware it was deposed. The DRBD version could only read quorum and *infer* that a host which could not see a majority was already failing its own I/O, which needed quorum armed and more than two nodes.
+5. Mipha schedules VM boot requests on surviving hosts. Each attaches the vdisks at the new epoch and restarts the VM domains.
 6. When the dead host boots back up, its local Spectrum `db_reconcile_loop` checks the cluster database. Since the database assigns the VMs to the surviving hosts, the returning node immediately destroys and undefines its local VM domains to prevent split-brain conflicts.

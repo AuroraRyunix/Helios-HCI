@@ -7,12 +7,6 @@ This document details the internal technical structure, functions, flowcharts, a
 ```mermaid
 mindmap
   root((Mipha Daemon))
-    Linstor / DRBD HA Thread
-      linstor_ha_loop
-      Promotes/demotes linstor-db resource
-      Mounts /var/lib/linstor on ZK leader
-      Controls linstor-controller service
-      Self-Heals StandAlone/Stuck Sync states
     Host Monitoring & Health Checks
       main loop runs every 10s on ZK leader
       Pings nodes (ICMP ping -c 1)
@@ -20,11 +14,11 @@ mindmap
       Tracks consecutive failures (threshold = 3)
     Self-Fence Watchdog
       runs on every host, not only the leader
-      probes libvirt, drbdsetup, per-resource serviceability
+      probes libvirt and sidon, per-vdisk serviceability
       quarantine tier -> hydra.nodes DEGRADED
-      fence tier -> stop guests, demote DRBD, publish FENCED
+      fence tier -> stop guests, detach vdisks, publish FENCED
     Failover Orchestration
-      Fence ladder: self / spark / BMC / storage quorum
+      Fence ladder: storage epoch first, then self / spark / BMC
       Refuses the failover when no rung confirms
       Marks host DOWN in ScyllaDB nodes table
       Queries orphaned VMs from hydra.vms
@@ -34,29 +28,32 @@ mindmap
       Detects returning host (db status DOWN -> ONLINE)
       Sets status to RECOVERING
       Starts hypervisor services remotely
-      Polls Linstor sync status to return NORMAL
+      Returns NORMAL at once: extent groups are immutable, so there is no resync
 ```
 
 ## Function & Logic Breakdown
 
-### DRBD & Linstor HA Functions
-- **`check_linstor_db_mount()`**: Returns True if `/var/lib/linstor` is mounted.
-- **`get_local_drbd_role(resource_name)`**: Reads `drbdadm role <res>` to determine if the local resource is in `Primary` or `Secondary` state.
-- **`get_all_drbd_resources()`**: Scans `/etc/drbd.d/*.res` to list all configured DRBD targets.
-- **`resolve_drbd_standalone(resource_name)`**: Resolves split-brain `StandAlone` conditions using a **per-resource** decision. ZooKeeper leadership is deliberately *not* consulted here: leadership is a single cluster-wide property, but "which node holds the authoritative copy" is a question about one resource, and using the former to answer the latter caused a node running a VM to discard its own live writes and resync from a stale peer.
+### There is no storage HA thread
 
-  The policy, evaluated per resource:
-  1. Not `StandAlone`, or `drbdsetup status --json` unreadable → no action.
-  2. Local role is not `Primary` **and** the device has a live holder (mounted filesystem, stacked device, or a process holding it open) → refuse to touch the connection; log the resource and the holder for the operator.
-  3. Local `Secondary` + peer `Primary` + no holders → the local copy is the safe victim: `disconnect`, then a **checked** `drbdadm secondary` (no `--force`, no `|| true`), then `connect --discard-my-data`. This is the only site in the daemon that discards data.
-  4. Local `Primary`, peer not `Primary` → keep local writes; plain `disconnect`/`connect`.
-  5. Both `Primary`, both `Secondary`, or peer role undeterminable → never discard; plain `disconnect`/`connect` and log for operator intervention.
+`linstor_ha_loop` and everything under it are gone, and what they did no longer has a
+counterpart. That thread existed because DRBD's control plane was itself a replicated
+volume: the LINSTOR controller's database lived on `linstor-db`, which had to be Primary
+on exactly one node and mounted there, so the ZooKeeper leader had to promote it, mount
+`/var/lib/linstor`, stop the controllers elsewhere and start its own -- and then deal with
+what happened when two nodes disagreed about who that was.
 
-  Because a `StandAlone` connection reports `peer-role: Unknown`, the peer role is resolved by querying reachable peers over the Spark mTLS path, and only when the local node is not `Primary` (i.e. only when it could be the victim). A result is accepted only if at least one peer answered and all answers agree.
-- **`check_and_resolve_stuck_resync()`**: Parses JSON output from `drbdsetup status --json`. If resync progress is stalled for 3 checks (90 seconds), triggers connection self-heal.
-- **`linstor_ha_loop()`**: Separate thread. Coordinates storage HA:
-  - If node is the ZooKeeper leader: promotes `linstor-db` to Primary, mounts `/var/lib/linstor` locally, stops linstor-controllers on remote nodes, and starts the local controller. Also mounts virtual VM/image containers.
-  - If node is a follower: unmounts targets and demotes resources to Secondary.
+The functions that dealt with the disagreement are gone too. `resolve_drbd_standalone`
+implemented a five-case policy for deciding which side of a split-brain to discard, and
+was the only site in the daemon that discarded data. `check_and_resolve_stuck_resync`
+watched for a resync that had stalled. **Split-brain is not a state this storage layer can
+reach**: every journal append carries its writer's epoch, every replica persists the
+highest epoch it has been fenced at, and an append below that is refused -- so two owners
+cannot both be accepted, there is no divergence to resolve, and there is no resync to
+stall. Sidon needs no leader-elected coordinator: its block map is in Hydra, which every
+node can write.
+
+What ZooKeeper leadership still decides is who *acts* -- who runs the failover ladder, and
+who runs Purah. One actor, not one truth.
 
 ### Fencing Functions
 
@@ -69,7 +66,9 @@ See [fencing.md](./fencing.md) for the design and for what remains unsafe.
   does not run. Absent is a supported state and means "no BMC"; it never means "assume the
   fence worked".
 - **`fence_host(hostname, ip, hosts, db_status, config)` → `FenceResult`**: the ladder.
-  Tries `self`, `spark`, `bmc`, `storage` in order and stops at the first that confirms.
+  Tries `storage`, `self`, `spark`, `bmc` in order and stops at the first that confirms.
+  Storage moved to the front because it stopped being an inference: it is now the only
+  unconditional rung, so trying anything before it is trying something weaker first.
   Never raises: a rung that throws is recorded as a failed rung. A host already confirmed
   fenced during this outage is returned from `FENCE_LEDGER` without being touched again;
   only confirmations are cached, so a failed fence is retried.
@@ -77,22 +76,31 @@ See [fencing.md](./fencing.md) for the design and for what remains unsafe.
   rather than a condition in the control loop, because it is the decision the whole ladder
   exists to make.
 - **`spark_fence_host(ip)`**: `POST /api/v1/host/fence`, reading the `409` body as well as
-  the `200`. Falls back to the legacy shell command *plus* an explicit `pgrep -a qemu` and
-  DRBD status verification when the peer daemon answers `404` (a rolling upgrade).
+  the `200`. Falls back to the legacy shell command *plus* an explicit `pgrep -a qemu` when
+  the peer daemon answers `404` (a rolling upgrade). Hygiene rather than safety now: a
+  wedged host still holds its VIP and still burns CPU, but its writes were already refused
+  by the storage rung.
 - **`bmc_fence_host(hostname, ip, config)`**: `ipmitool chassis power off`, then polls
   `chassis power status` until it reads `off`. A zero exit status is never treated as a
   power-off. The password goes through `IPMI_PASSWORD` and `-E`, never argv.
-- **`storage_fence_assert(dead_hostname, dead_ip, hosts)`**: proves from the surviving
-  replicas that the failed host's kernel is already failing its writes. Requires, per
-  resource, that quorum is armed (`quorum` is a real majority **and** `on-no-quorum` is
-  `io-error`/`suspend-io`), that this side holds quorum, and that the peer connection is
-  not `Connected`.
-- **`quorum_arms_the_fence(options, node_count)`**: the arithmetic. `majority`/`all` are
-  safe by construction; a numeric quorum only when it exceeds half the nodes, since
-  `quorum 1` is satisfied by both sides of a partition at once.
-- **`_drbd_options_from(ip, resource)`**: the *configured* options, local or through
-  `GET /api/v1/storage/drbd/options`. Needed because `drbdsetup status` reports
-  `quorum: true` both when a majority is held and when quorum is off.
+- **`storage_fence_assert(dead_hostname, dead_ip, hosts)`**: **stops** the failed host's
+  writes rather than arguing that they have stopped. Reads `hydra.dfs_vdisks` for the
+  vdisks the dead host owns, raises each one's epoch through a compare-and-swap, and
+  fences every reachable replica at the new epoch — in parallel, because a failover has a
+  time budget. The deposed host does not have to agree, be reachable, or know: its next
+  append meets a refusal.
+
+  This rung works on two nodes, works with no BMC, works with no quorum, and needs Hydra
+  and nothing else. When Hydra is unreachable the honest answer is that nothing can be
+  fenced, which is what it returns — and refusing the failover there is obviously right
+  rather than regrettable, since promoting a VM whose disk ownership cannot be moved is
+  exactly the split-brain the ladder exists to prevent.
+
+  The functions that supported the old inference are gone with it:
+  `quorum_arms_the_fence` did the arithmetic on whether a numeric quorum was a real
+  majority, and `_drbd_options_from` read the *configured* options because
+  `drbdsetup status` reported `quorum: true` both when a majority was held and when
+  quorum was switched off entirely.
 
 ### Self-Fencing Functions
 
@@ -100,15 +108,16 @@ See [fencing.md](./fencing.md) for the design and for what remains unsafe.
   host regardless of leadership.
 - **`probe_local_health()`**: one pass. Each probe returns `ok`, `failed` or `unknown`, and
   `unknown` never escalates to the destructive tier.
-- **`resource_is_unserviceable(resource)` → `(bool, cause, detail)`**: `quorum-lost`,
-  `io-failures` or `no-data`. A failed local disk with a connected `UpToDate` peer is
-  deliberately *not* unserviceable — DRBD 9 keeps serving it over the network.
+- The storage probe asks Sidon what it is serving. A vdisk reported **degraded** is one
+  whose drain has failed: the guest's writes are still safe in the journal, but the
+  journal is no longer emptying, so the disk will backpressure and stop. That is the
+  local-origin equivalent of the old "Primary without quorum" — the guest is not broken
+  yet and will be.
 - **`self_fence_decide(probe, counters, config, hosts, uptime)` → `(action, reason)`**:
   `none`, `quarantine` or `fence`. Requires three consecutive passes, resets on any good
   one, honours a startup grace period, exempts a host in maintenance, and never fires on a
   single-node cluster.
-- **`execute_self_fence(reason, hosts, config)`**: writes the marker first (so
-  `linstor_ha_loop` stands down before anything is demoted), calls the local
+- **`execute_self_fence(reason, hosts, config)`**: writes the marker first, calls the local
   `/api/v1/host/fence` or a built-in fallback, releases ZooKeeper leadership at three nodes
   or more, then publishes the status.
 - **`self_fence_announcement()`**: `FENCED` only when the local fence verified, otherwise
@@ -136,7 +145,11 @@ See [fencing.md](./fencing.md) for the design and for what remains unsafe.
 #### Rejoining Node Ingestion
 - If a node marked as `DOWN` recovers connectivity, Mipha sets status to `RECOVERING`.
 - Remotely triggers service start commands.
-- Polls Linstor synchronization metrics using `get_linstor_pending_sync()`. Once fully synchronized, transitions node status back to `NORMAL`.
+- Transitions straight back to `NORMAL`. There is nothing to wait for: extent groups are
+  immutable, so a returning node's copies are either correct or absent, and Purah replaces
+  the absent ones in the background off the hot path. The DRBD version polled a sync
+  metric because a returning node came back with stale replicas that had to catch up block
+  by block before it could be trusted with a guest.
 
 #### Fencing & VM Failover
 
@@ -169,16 +182,21 @@ before this second trigger existed nothing evacuated it.
 
 #### Self-Fencing
 
-Runs on every host in its own thread. Probes libvirt, the DRBD control plane, and the
-serviceability of every Primary resource every 10 seconds.
+Runs on every host in its own thread. Probes libvirt and Sidon, and the serviceability of
+every vdisk this host owns, every 10 seconds.
 
 - **libvirt dead** → quarantine (`hydra.nodes.status = DEGRADED`, which Vali already
   excludes from placement). Not a fence: qemu keeps running when `libvirtd` dies, so the
   guests are fine and only their management is lost.
-- **A Primary resource that cannot serve I/O** (quorum lost, forced I/O failures, or a
-  failed disk with no `UpToDate` peer) for three consecutive passes → fence: destroy the
-  guests, demote every resource, release ZooKeeper leadership at three nodes or more,
+- **A vdisk that cannot serve I/O** — degraded, meaning its drain has failed and the
+  journal is no longer emptying — for three consecutive passes → fence: destroy the
+  guests, detach every vdisk, release ZooKeeper leadership at three nodes or more,
   publish `FENCED`.
+- **The peer check applies to every local storage fault**, and this is the one behaviour
+  that genuinely regressed. DRBD's quorum loss *was* a majority test, so a node could
+  self-fence without checking that any peer was reachable. A failed drain proves nothing
+  of the kind — the extent store may simply be full — so with no peer answering the
+  outcome is quarantine rather than fence.
 - **A fence that did not fully take publishes `DEGRADED`, not `FENCED`** — the leader must
   then prove the fence itself.
 
