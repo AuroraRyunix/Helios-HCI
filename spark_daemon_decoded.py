@@ -3465,6 +3465,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/dfs/vdisk":
             self.handle_dfs_vdisk()
             return True
+        if path == "/api/v1/dfs/write":
+            self.handle_dfs_write(parsed)
+            return True
         if path == "/api/v1/storage/linstor/resource":
             self.handle_storage_linstor_resource()
             return True
@@ -3907,7 +3910,8 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     # over the mutual TLS this daemon already terminates. That is the whole reason this
     # endpoint exists: one authenticated surface for the cluster rather than a second
     # certificate, a second port and a second thing to rotate, per storage tier.
-    DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping")
+    DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping",
+               "seal", "resize", "capacity", "purah-sweep", "purah-scrub")
 
     def handle_dfs_vdisk(self):
         payload, error = self.read_json_payload()
@@ -3948,6 +3952,59 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject("sidon call failed: %s" % exc, 500)
             return
         self.send_json_response(200, result)
+
+    def handle_dfs_write(self, parsed):
+        """Stream the request body into a vdisk over its NBD socket.
+
+        The Sidon counterpart of /api/v1/storage/device/write, and it exists for the same
+        reason: the web tier receives the upload and must not touch storage, so it proxies
+        the bytes to this daemon, which is native to the host and owns the data path.
+
+        No allowlist of paths is needed here because there is no path -- the caller names
+        a vdisk, and the socket is derived from it. A caller cannot name a file.
+        """
+        params = urllib.parse.parse_qs(parsed.query or "")
+        vdisk_id = (params.get("vdisk") or [None])[0]
+        if not valid_name(vdisk_id):
+            self.send_json_response(400, {"error": "Invalid vdisk id"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            self.send_json_response(400, {"error": "Content-Length required and must be > 0"})
+            return
+
+        try:
+            sidon = load_sidon_module()
+        except Exception as exc:
+            self.send_json_response(500, {"error": "helios_sidon is unavailable: %s" % exc})
+            return
+
+        writer = None
+        try:
+            writer = sidon.NbdWriter(sidon.nbd_socket(vdisk_id), vdisk_id)
+            written = writer.write_stream(self.rfile, length)
+            writer.flush()
+        except Exception as exc:
+            if writer:
+                writer.close()
+            self.send_json_response(500, {"error": "vdisk write failed: %s" % exc})
+            return
+        writer.close()
+
+        if written != length:
+            # Reported rather than raised: the caller knows what it sent and is the only
+            # one that can decide whether a short write is a truncated upload or a client
+            # that hung up. Saying "wrote 4 of 900 bytes" beats "failed".
+            self.send_json_response(500, {
+                "error": "vdisk write was short",
+                "written": written,
+                "expected": length,
+            })
+            return
+        self.send_json_response(200, {"vdisk_id": vdisk_id, "written": written})
 
     # -- Storage: Linstor ----------------------------------------------
 

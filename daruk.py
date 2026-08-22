@@ -445,6 +445,19 @@ LWT_OPS = {
             "expected_epoch": {"type": "int", "required": True},
         },
     },
+    # Grow-only, and conditional on the size the caller read. Shrinking a vdisk under a
+    # guest discards whatever lived past the new end, which no filesystem survives; the
+    # condition additionally stops two concurrent resizes from racing to different sizes
+    # and leaving the map disagreeing with what the guest was told.
+    "/v1/dfs/vdisk-resize": {
+        "cql": "UPDATE hydra.dfs_vdisks SET size_bytes = ? WHERE vdisk_id = ? IF size_bytes = ?",
+        "binds": ("size_bytes", "vdisk_id", "expected_size_bytes"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "size_bytes": {"type": "int", "required": True},
+            "expected_size_bytes": {"type": "int", "required": True},
+        },
+    },
     "/v1/dfs/egroup-create": {
         "cql": (
             "INSERT INTO hydra.dfs_egroups (egroup_id, state, node, path, size, "
@@ -468,6 +481,21 @@ LWT_OPS = {
     # it is leaving. open -> sealed, open -> dead, sealed -> dead. Nothing re-opens a
     # sealed group: that is the property that makes repair a checksum comparison and
     # snapshots a map copy.
+    # Sealing a vdisk: rw -> immutable, one way, conditional on it still being rw. This
+    # is what replaces DRBD's --allow-two-primaries for golden images. That option existed
+    # because several hosts attach one image at once and each needed Primary to read it;
+    # it is also what made the corruption the fencing work spent weeks defending against.
+    # An immutable vdisk cannot express the hazard: writes are refused by class, so any
+    # number of hosts may serve reads from it and none of them can write.
+    "/v1/dfs/vdisk-seal": {
+        "cql": "UPDATE hydra.dfs_vdisks SET class = ? WHERE vdisk_id = ? IF class = ?",
+        "binds": ("sealed_class", "vdisk_id", "expected_class"),
+        "fixed": {"sealed_class": "immutable"},
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "expected_class": {"type": "text", "default": "rw"},
+        },
+    },
     "/v1/dfs/egroup-state": {
         "cql": (
             "UPDATE hydra.dfs_egroups SET state = ?, seal_hash = ?, size = ? "

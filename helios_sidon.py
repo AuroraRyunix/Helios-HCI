@@ -149,8 +149,30 @@ def delete_vdisk(vdisk_id, **kw):
     return call("delete", vdisk_id=vdisk_id, **kw)
 
 
+def seal(vdisk_id, **kw):
+    """Freeze a vdisk to the immutable class, permanently.
+
+    What golden images get instead of DRBD's `--allow-two-primaries`. That option existed
+    so several hosts could each hold Primary on one image and read it; it is also the
+    option that caused the corruption the fencing work exists to prevent. An immutable
+    vdisk cannot express the hazard at all -- writes are refused by class, so any number
+    of readers is safe and no writer is possible.
+    """
+    return call("seal", vdisk_id=vdisk_id, **kw)
+
+
+def resize(vdisk_id, size_bytes, **kw):
+    """Grow a vdisk. Shrinking is refused by the daemon, not merely discouraged."""
+    return call("resize", vdisk_id=vdisk_id, size_bytes=int(size_bytes), **kw)
+
+
 def status(vdisk_id, **kw):
     return call("status", vdisk_id=vdisk_id, **kw)
+
+
+def capacity(**kw):
+    """What this node's extent store holds and how much room is left."""
+    return call("capacity", **kw)
 
 
 def list_attached(**kw):
@@ -161,6 +183,138 @@ def flush(vdisk_id, **kw):
     """Force a drain. Not needed for durability -- writes are already durable in the
     journal -- but it bounds replay time and is what a clean shutdown should do."""
     return call("flush", vdisk_id=vdisk_id, **kw)
+
+
+# --- A minimal NBD client -------------------------------------------------------------
+#
+# Written from the protocol specification rather than from Sidon's server, and kept here
+# rather than in a dependency because the only thing that streams into a vdisk from
+# Python is image upload. Newstyle handshake, NBD_OPT_GO, simple replies -- the same
+# subset the server implements, and nothing more.
+
+NBD_MAGIC = 0x4E42444D41474943
+NBD_IHAVEOPT = 0x49484156454F5054
+NBD_REP_MAGIC = 0x3E889045565A9
+NBD_REQUEST_MAGIC = 0x25609513
+NBD_SIMPLE_REPLY_MAGIC = 0x67446698
+NBD_OPT_GO = 7
+NBD_REP_ACK = 1
+NBD_REP_INFO = 3
+NBD_INFO_EXPORT = 0
+NBD_CMD_WRITE = 1
+NBD_CMD_FLUSH = 3
+NBD_CMD_DISC = 2
+
+# 1 MiB per request: it matches the journal's record cap, so one client write becomes one
+# journal record rather than being split and re-joined.
+NBD_CHUNK = 1 << 20
+
+
+class NbdWriter(object):
+    """Streams bytes into a vdisk over its NBD socket.
+
+    Used by spark for image upload. The web tier never touches this: it has no access to
+    the socket and should not, so the bytes are relayed to spark, which is native to the
+    host and owns storage.
+    """
+
+    def __init__(self, socket_path, export, timeout=3600):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect(socket_path)
+        self.handle = 0
+        self.size = self._handshake(export)
+
+    def _recv(self, count):
+        buf = b""
+        while len(buf) < count:
+            chunk = self.sock.recv(count - len(buf))
+            if not chunk:
+                raise SidonError("nbd connection closed after %d of %d bytes" % (len(buf), count), "io")
+            buf += chunk
+        return buf
+
+    def _handshake(self, export):
+        import struct
+        greeting = self._recv(18)
+        magic, ihaveopt, _flags = struct.unpack(">QQH", greeting)
+        if magic != NBD_MAGIC or ihaveopt != NBD_IHAVEOPT:
+            raise SidonError("not an NBD newstyle server", "io")
+        # fixed newstyle | no zeroes
+        self.sock.sendall(struct.pack(">I", 3))
+
+        name = export.encode("utf-8")
+        payload = struct.pack(">I", len(name)) + name + struct.pack(">H", 0)
+        self.sock.sendall(struct.pack(">QII", NBD_IHAVEOPT, NBD_OPT_GO, len(payload)) + payload)
+
+        size = None
+        while True:
+            head = self._recv(20)
+            rep_magic, _opt, rep_type, length = struct.unpack(">QIII", head)
+            if rep_magic != NBD_REP_MAGIC:
+                raise SidonError("nbd option reply magic 0x%x is wrong" % rep_magic, "io")
+            data = self._recv(length) if length else b""
+            if rep_type == NBD_REP_INFO and len(data) >= 10:
+                info_type, export_size = struct.unpack(">HQ", data[0:10])
+                if info_type == NBD_INFO_EXPORT:
+                    size = export_size
+            elif rep_type == NBD_REP_ACK:
+                break
+            elif rep_type & 0x80000000:
+                raise SidonError("nbd server refused NBD_OPT_GO (reply type 0x%x)" % rep_type, "refused")
+        if size is None:
+            raise SidonError("nbd server never reported the export size", "io")
+        return size
+
+    def _request(self, cmd, offset, length, data=None):
+        import struct
+        self.handle += 1
+        self.sock.sendall(struct.pack(">IHHQQI", NBD_REQUEST_MAGIC, 0, cmd,
+                                      self.handle, offset, length))
+        if data:
+            self.sock.sendall(data)
+        if cmd == NBD_CMD_DISC:
+            return
+        reply = self._recv(16)
+        magic, errno, handle = struct.unpack(">IIQ", reply)
+        if magic != NBD_SIMPLE_REPLY_MAGIC:
+            raise SidonError("nbd reply magic 0x%x; the stream is desynchronised" % magic, "io")
+        if handle != self.handle:
+            raise SidonError("nbd reply handle %d does not match request %d" % (handle, self.handle), "io")
+        if errno:
+            raise SidonError("nbd server returned errno %d at offset %d" % (errno, offset), "io")
+
+    def write_stream(self, stream, total, progress=None):
+        """Copy `total` bytes from `stream` into the vdisk. Returns bytes written."""
+        if total > self.size:
+            raise SidonError(
+                "image is %d bytes but the vdisk holds %d" % (total, self.size), "refused")
+        written = 0
+        while written < total:
+            want = min(NBD_CHUNK, total - written)
+            chunk = stream.read(want)
+            if not chunk:
+                break
+            # A short read is not an error here; it is a slow client. Write what arrived
+            # and keep the offset honest rather than padding to the requested length.
+            self._request(NBD_CMD_WRITE, written, len(chunk), chunk)
+            written += len(chunk)
+            if progress:
+                progress(written)
+        return written
+
+    def flush(self):
+        self._request(NBD_CMD_FLUSH, 0, 0)
+
+    def close(self):
+        try:
+            self._request(NBD_CMD_DISC, 0, 0)
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
 
 
 def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR):

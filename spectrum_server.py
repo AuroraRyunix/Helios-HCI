@@ -306,50 +306,6 @@ def run_remote_spark(ip, command, timeout=45):
     except Exception as e:
         return -1, "", str(e)
 
-def run_linstor_cmd(linstor_args):
-    """Executes a Linstor command against the cluster controllers, trying active leader first and fast-failing offline nodes."""
-    import json
-    import os
-    import socket
-    hosts = []
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                hosts = json.load(f).get("hosts", [])
-    except Exception:
-        pass
-    ips = [h["ip"] for h in hosts] if hosts else ["127.0.0.1"]
-    controllers_str = ",".join(ips)
-    
-    leader_ip = get_zookeeper_leader_ip()
-    candidate_ips = []
-    if leader_ip:
-        candidate_ips.append(leader_ip)
-    candidate_ips += ["127.0.0.1"] + ips
-    
-    seen = set()
-    ordered_candidates = []
-    for ip in candidate_ips:
-        if ip not in seen:
-            seen.add(ip)
-            ordered_candidates.append(ip)
-            
-    rc, stdout, stderr = -1, "", "No nodes available"
-    for cap_ip in ordered_candidates:
-        if cap_ip != "127.0.0.1" and cap_ip != LOCAL_IP:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.2)
-                s.connect((cap_ip, 9099))
-                s.close()
-            except Exception:
-                continue
-        cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor {linstor_args}"
-        rc, stdout, stderr = run_remote_spark(cap_ip, cmd)
-        if rc == 0:
-            return rc, stdout, stderr
-    return rc, stdout, stderr
-
 def slugify_image_name(filename):
     # Lowercase and replace non-alphanumeric characters with hyphens
     import re
@@ -369,7 +325,7 @@ def slugify_image_name(filename):
 # --------------------------------------------------------------------------
 # Input validation at the API boundary
 #
-# VM names are interpolated straight into root shell commands (linstor and
+# VM names are interpolated straight into root shell commands (virsh and
 # virsh, executed via spark-daemon's /api/v1/execute with shell=True) and into
 # CQL statements. Unlike image names, which slugify_image_name() rewrites, a VM
 # name is a user-visible identity: silently mangling it would leave operators
@@ -431,49 +387,6 @@ def validate_update_download_url(download_url):
         )
     return True, ""
 
-def get_vm_disk_res_names(vm_name):
-    """Linstor resource-definition names backing a VM's disks."""
-    disks_list = ""
-    try:
-        rc, stdout, _ = run_cql_query(
-            f"SELECT JSON disks_list FROM hydra.vms WHERE name = '{vm_name}';"
-        )
-        if rc == 0:
-            for line in stdout.splitlines():
-                line = line.strip()
-                if line.startswith("{") and line.endswith("}"):
-                    try:
-                        disks_list = json.loads(line).get("disks_list") or ""
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    num_disks = 1
-    if disks_list and disks_list.strip().upper() != "NONE":
-        parsed_disks = [d for d in disks_list.split(",") if d.strip()]
-        if parsed_disks:
-            num_disks = len(parsed_disks)
-    return [f"{vm_name}-disk{idx}" for idx in range(num_disks)]
-
-def set_vm_disks_two_primaries(vm_name, enabled):
-    """Toggle DRBD dual-primary on every disk of a VM.
-
-    Dual-primary is only legitimate for the live-migration hand-over window,
-    when source and target qemu both hold the device open. Outside that window
-    it means two qemu processes can write one raw device, which corrupts it, so
-    it is enabled immediately before a migration and disabled immediately after
-    rather than being set permanently at VM creation time.
-    """
-    value = "yes" if enabled else "no"
-    failures = []
-    for res_name in get_vm_disk_res_names(vm_name):
-        rc, out, err = run_linstor_cmd(
-            f"resource-definition drbd-options --allow-two-primaries {value} {res_name}"
-        )
-        if rc != 0:
-            failures.append(f"{res_name}: {(err or out or '').strip()}")
-    return failures
-
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
@@ -505,25 +418,6 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         return -1, {"error": detail or str(e)}, detail or str(e)
     except Exception as e:
         return -1, {}, str(e)
-
-def demote_drbd_secondary(res_name):
-    """Demote a DRBD resource to Secondary, reporting a demotion that did not take.
-
-    Failure here is not fatal -- the caller is either finishing or already
-    unwinding -- but it used to be invisible, because the shell form ran with
-    `|| true` and its result was discarded. The typed endpoint returns the
-    resulting role, so a node left holding Primary is at least logged.
-    """
-    rc, res, err = run_mtls_spark_api(
-        "127.0.0.1",
-        "/api/v1/storage/drbd/role",
-        {"resource": res_name, "role": "secondary", "force": False})
-    if rc != 0 or str(res.get("role", "")).strip().lower() != "secondary":
-        print(f"[VALHALLA] DRBD resource {res_name} was not demoted to Secondary "
-              f"(role is '{str(res.get('role', '')).strip() or 'unknown'}'): "
-              f"{(res.get('error') or err or '').strip()}", flush=True)
-        return False
-    return True
 
 def run_cql_query(cql_query, *args, **kwargs):
     import urllib.request
@@ -614,7 +508,7 @@ def reconcile_local_vm(name, host_ip, live_state):
     VM: a guest that had just been migrated away still had a local libvirt trace, the
     reconciler saw "not running here", and cleared host_ip on a row that now pointed at
     the new owner. The VM was then unplaced as far as Hydra was concerned and the next
-    start booted a second copy of it against the same DRBD device.
+    start booted a second copy of it against the same vdisk.
 
     Returns True when the write landed. A refusal is not an error -- it means this node is
     no longer the host of record and has nothing to say about the VM.
@@ -1016,7 +910,7 @@ def read_dagur_runs(per_job=DAGUR_RUNS_PER_JOB, cap=DAGUR_RUNS_MAX):
 # /api/images/delete deleted the catalogue row first, fired an unchecked
 # `resource-definition delete` and an unchecked fan-out `rm -f {path}` -- with the path
 # interpolated straight into a root shell -- and answered 200 whatever happened. A failed
-# LINSTOR delete therefore left a DRBD resource holding storage on every node that
+# A delete therefore left storage allocated on every node that
 # nothing in the UI could ever see again, and the operator was told it had worked.
 # --------------------------------------------------------------------------
 
@@ -1025,14 +919,14 @@ def read_dagur_runs(per_job=DAGUR_RUNS_PER_JOB, cap=DAGUR_RUNS_MAX):
 # prefix match.
 IMAGE_CONTAINER_ROOT = "/var/lib/hci/aether/volumes/"
 
-# A DRBD device is not a file. Removing one means deleting the LINSTOR resource, which
-# tears the device down on every node; `rm` on /dev/drbd/by-res/<res>/0 deletes a udev
-# symlink and leaves the resource -- and the storage it holds -- allocated.
-DRBD_DEVICE_PREFIX = "/dev/drbd/"
+# A vdisk is not a file either. Removing one means asking Sidon to delete it, which drops
+# the block map and lets Purah reclaim the extents; `rm` on the NBD socket removes a
+# socket and leaves every byte of the image allocated and unreachable.
+VDISK_SOCKET_ROOT = "/var/lib/hci/sidon/nbd/"
 
 
 def image_backing_kind(path):
-    """How an image's backing store must be removed: 'drbd', 'file', or None.
+    """How an image's backing store must be removed: 'vdisk', 'file', or None.
 
     None means the row points somewhere this file will not delete from, and the delete is
     refused and reported rather than attempted. Quoting the path is not the guard on its
@@ -1044,15 +938,15 @@ def image_backing_kind(path):
     path = path.strip()
     if not path or "\x00" in path or ".." in path:
         return None
-    if path.startswith(DRBD_DEVICE_PREFIX) and len(path) > len(DRBD_DEVICE_PREFIX):
-        return "drbd"
+    if path.startswith(VDISK_SOCKET_ROOT) and len(path) > len(VDISK_SOCKET_ROOT):
+        return "vdisk"
     if path.startswith(IMAGE_CONTAINER_ROOT) and len(path) > len(IMAGE_CONTAINER_ROOT):
         return "file"
     return None
 
 
-# LINSTOR is being asked to delete something that is already gone. That is the state the
-# call was trying to reach, so it is not a failure -- but every other non-zero exit is,
+# The storage layer is being asked to delete something that is already gone. That is the
+# state the call was trying to reach, so it is not a failure -- but every other error is,
 # and must not be swallowed the way the old code swallowed all of them.
 #
 # "no domain" is libvirt's wording, kept here because the VM delete path below applies
@@ -1078,19 +972,22 @@ def remove_image_backing(name, path):
             # saying so beats inventing a path to delete.
             return True, "no backing store recorded"
         return False, (f"Refusing to delete image '{name}': its recorded path {path!r} is "
-                       f"neither a DRBD device under {DRBD_DEVICE_PREFIX} nor a file under "
+                       f"neither a vdisk socket under {VDISK_SOCKET_ROOT} nor a file under "
                        f"{IMAGE_CONTAINER_ROOT}.")
 
-    if kind == "drbd":
+    if kind == "vdisk":
         res_name = f"img-{slugify_image_name(name)}"
-        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
-        if rc == 0:
-            return True, f"LINSTOR resource {res_name} deleted"
-        message = ((stderr or "") + " " + (stdout or "")).strip()
+        # Detach first, then delete. A sealed image may still be attached and serving
+        # reads to running guests; deleting it out from under them is the failure this
+        # ordering exists to avoid, and Sidon refuses an attached vdisk anyway.
+        sidon_call("detach", vdisk_id=res_name)
+        ok, body = sidon_call("delete", vdisk_id=res_name)
+        if ok:
+            return True, f"vdisk {res_name} deleted"
+        message = str(body)
         if _ALREADY_GONE_RE.search(message):
-            return True, f"LINSTOR resource {res_name} was already gone"
-        return False, (f"LINSTOR refused to delete resource {res_name}: "
-                       f"{message[:400] or 'no output'}")
+            return True, f"vdisk {res_name} was already gone"
+        return False, f"Sidon refused to delete vdisk {res_name}: {message[:400] or 'no output'}"
 
     # A staged image file exists on every node, so it has to be removed on every node.
     # A node that does not answer is reported: a copy left behind is what the next upload
@@ -1179,7 +1076,7 @@ def delete_catalogue_image(name):
 # nowhere -- the destroy went to the host it had left -- and its row disappeared anyway,
 # leaving a guest running on a host that nothing in the cluster still associates with it.
 # It cannot be found in the UI, it is not counted against the host's capacity, and it
-# holds its DRBD device open against the next thing that claims the name.
+# holds its vdisk open against the next thing that claims the name.
 #
 # The fix is to stop the VM from moving and to prove it has not moved, using Daruk's
 # typed compare-and-swap endpoints (docs/daruk.md):
@@ -1281,7 +1178,7 @@ def sidon_call(op, host_ip="127.0.0.1", **params):
 
 
 def _delete_vm_disks(name, disks_list):
-    """Delete the VM's LINSTOR resources, checked. Returns (ok, detail).
+    """Delete the VM's vdisks, checked. Returns (ok, detail).
 
     Unchecked, this is the images defect again in another table: the row goes, the
     resources stay, and the storage they hold is no longer reachable from anything the
@@ -1290,33 +1187,19 @@ def _delete_vm_disks(name, disks_list):
     count = len(disks_list.split(",")) if disks_list else 1
     failures = []
 
-    if using_sidon():
-        module = sidon_module()
-        for idx in range(count):
-            vdisk_id = module.vdisk_id_for(name, idx)
-            # Detach first: delete refuses an attached vdisk rather than pulling storage
-            # out from under a running qemu. A vdisk that is not attached here is the
-            # state being asked for, so that refusal is not a failure.
-            sidon_call("detach", vdisk_id=vdisk_id)
-            ok, body = sidon_call("delete", vdisk_id=vdisk_id)
-            if not ok and "does not exist" not in str(body):
-                failures.append(f"{vdisk_id}: {str(body)[:200]}")
-        if failures:
-            return False, "Sidon refused to delete " + "; ".join(failures)
-        return True, f"{count} vdisk(s) deleted"
-
+    module = sidon_module()
     for idx in range(count):
-        res_name = f"{name}-disk{idx}"
-        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
-        if rc == 0:
-            continue
-        message = ((stderr or "") + " " + (stdout or "")).strip()
-        if _ALREADY_GONE_RE.search(message):
-            continue
-        failures.append(f"{res_name}: {message[:200] or 'no output'}")
+        vdisk_id = module.vdisk_id_for(name, idx)
+        # Detach first: delete refuses an attached vdisk rather than pulling storage out
+        # from under a running qemu. A vdisk that is not attached here is the state being
+        # asked for, so that refusal is not a failure.
+        sidon_call("detach", vdisk_id=vdisk_id)
+        ok, body = sidon_call("delete", vdisk_id=vdisk_id)
+        if not ok and not _ALREADY_GONE_RE.search(str(body)):
+            failures.append(f"{vdisk_id}: {str(body)[:200]}")
     if failures:
-        return False, "LINSTOR refused to delete " + "; ".join(failures)
-    return True, f"{count} disk resource(s) deleted"
+        return False, "Sidon refused to delete " + "; ".join(failures)
+    return True, f"{count} vdisk(s) deleted"
 
 
 def delete_vm(name):
@@ -1752,7 +1635,10 @@ def init_db():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('mimir_diagnostics', 'mimir_health', '0 * * * *', 3600, true, 0, '/usr/local/bin/mcli health_checks run_all') IF NOT EXISTS;
     """
-    scrub_cmd = "drbdadm status || true"
+    # Purah's scrub, not drbdadm's status. `drbdadm status` reported connection state
+    # and called it a scrub; this recomputes every sealed extent group's checksum against
+    # the hash taken when it was known good, which is what the job was always named for.
+    scrub_cmd = "printf '{\"op\":\"purah-scrub\"}\n' | nc -U /run/sidon/control.sock || true"
     insert_storage_scrub = f"""
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('storage_scrub', 'storage_scrub', '0 */6 * * *', 21600, true, 0, '{scrub_cmd}') IF NOT EXISTS;
@@ -1838,7 +1724,7 @@ def init_db():
                 run_cql_query("DELETE FROM hydra.storage_containers WHERE name IN ('default-vm-container', 'default-image-container');")
                 run_cql_query(insert_diagnostics)
                 run_cql_query(insert_storage_scrub)
-                run_cql_query("UPDATE hydra.dagur_schedules SET command = 'drbdadm status || true' WHERE job_name = 'storage_scrub';")
+                run_cql_query(f"UPDATE hydra.dagur_schedules SET command = '{scrub_cmd}' WHERE job_name = 'storage_scrub';")
                 run_cql_query(insert_storage_auto_heal)
                 # Migrate clusters provisioned before this job pointed at a real command.
                 # The INSERT above is IF NOT EXISTS, so it cannot repair an existing row --
@@ -2034,24 +1920,13 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
 
     disk_count = len(disks_list.split(",")) if disks_list else 1
 
-    if using_sidon():
-        # A network disk over a unix socket: qemu speaks NBD to the local Sidon and never
-        # touches a block device, so there is no /dev node to promote, demote or leak,
-        # and no kernel client in the path.
-        module = sidon_module()
-        for idx in range(disk_count):
-            disk_devices_xml += module.disk_xml(
-                module.vdisk_id_for(name, idx), letters[idx % 26], vcpu)
-    else:
-        disk_paths = [f"/dev/drbd/by-res/{name}-disk{idx}/0" for idx in range(disk_count)]
-        for idx, d_path in enumerate(disk_paths):
-            dev_letter = letters[idx % 26]
-            disk_devices_xml += f"""
-    <disk type='block' device='disk'>
-      <driver name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'/>
-      <source dev='{d_path}'/>
-      <target dev='vd{dev_letter}' bus='virtio'/>
-    </disk>"""
+    # A network disk over a unix socket: qemu speaks NBD to the local Sidon and never
+    # touches a block device, so there is no /dev node to promote, demote or leak, and no
+    # kernel client in the path.
+    module = sidon_module()
+    for idx in range(disk_count):
+        disk_devices_xml += module.disk_xml(
+            module.vdisk_id_for(name, idx), letters[idx % 26], vcpu)
 
     # CD-ROM device XML
     if iso:
@@ -2072,7 +1947,7 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
                 except Exception:
                     pass
                 if not iso_path:
-                    iso_path = f"/dev/drbd/by-res/img-{slugify_image_name(spec)}/0"
+                    iso_path = sidon_module().nbd_socket(f"img-{slugify_image_name(spec)}")
                 
                 disk_devices_xml += f"""
     <disk type='block' device='cdrom'>
@@ -2343,107 +2218,42 @@ def metrics_and_cluster_monitor_loop():
                     nodes_info_local.append({
                         "name": hostname, "ip": ip, "status": "OFFLINE", "role": "Follower", "disks": 0, "maintenance_status": "UNKNOWN", "maintenance_mode": maint_mode
                     })
-            # 2. Get Linstor/GlusterFS volume storage usage
+            # 2. Storage usage, asked of each node's Sidon rather than of a controller.
+            #
+            # This used to shell into the Aether container and parse `linstor storage-pool
+            # list` output with a regex. Sidon answers with bytes, from statvfs on the
+            # filesystem that actually holds the extents -- which is the number a capacity
+            # gate needs, not the number a map claims.
             storage_usage_local = {"total_gb": 0, "used_gb": 0, "pools": []}
             try:
                 total_gb = 0
                 used_gb = 0
                 pools = []
-
-                # Query Linstor controller once to get all storage pools info
-                hosts = []
-                try:
-                    with open("/etc/hci/cluster.json", "r") as f:
-                        cdata = json.load(f)
-                        hosts = cdata.get("hosts", [])
-                except Exception:
-                    pass
-                
-                ips = [h["ip"] for h in hosts] if hosts else ["127.0.0.1"]
-                controllers_str = ",".join(ips)
-                
-                candidate_ips = ["127.0.0.1"] + ips
-                rc_sp = -1
-                stdout_sp = ""
-                for cap_ip in candidate_ips:
-                    cmd_sp = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor storage-pool list"
-                    rc_sp, stdout_sp, _ = run_remote_spark(cap_ip, cmd_sp)
-                    if rc_sp == 0 and stdout_sp.strip():
-                        break
-                if rc_sp == 0 and stdout_sp.strip():
-                    import re
-                    def parse_capacity(cap_str):
-                        if not cap_str or cap_str.strip() == "":
-                            return 0.0
-                        match = re.search(r"([0-9.]+)\s*(gib|tib|mib|gb|tb|mb|b)?", cap_str.lower())
-                        if not match:
-                            return 0.0
-                        val = float(match.group(1))
-                        unit = match.group(2)
-                        if unit in ["tib", "tb"]:
-                            val *= 1024
-                        elif unit in ["mib", "mb"]:
-                            val /= 1024
-                        return val
-
-                    for line in stdout_sp.splitlines():
-                        if "|" in line and "driver" not in line.lower() and "diskless" not in line.lower():
-                            parts = [p.strip() for p in line.split("|") if p.strip()]
-                            if len(parts) >= 8:
-                                pool_name = parts[0]
-                                node_name = parts[1]
-                                driver = parts[2]
-                                dev_name = parts[3]
-                                free_cap = parse_capacity(parts[4])
-                                total_cap = parse_capacity(parts[5])
-                                state = parts[7]
-                                
-                                used_cap = total_cap - free_cap
-                                total_gb += int(total_cap)
-                                used_gb += int(used_cap)
-                                
-                                pools.append({
-                                    "name": f"Physical Disk ({dev_name}) on {node_name}",
-                                    "type": f"{driver} Pool",
-                                    "path": f"{node_name}:{dev_name}",
-                                    "size": f"{int(total_cap)} GB",
-                                    "total_gb": int(total_cap),
-                                    "used_gb": int(used_cap),
-                                    "status": "ONLINE" if "ok" in state.lower() else "DEGRADED"
-                                })
-                
-                # Get replication factor to compute usable capacity
-                redundancy_factor = 1
-                hosts_count = 1
-                try:
-                    if os.path.exists("/etc/hci/cluster.json"):
-                        with open("/etc/hci/cluster.json", "r") as f:
-                            cdata = json.load(f)
-                            redundancy_factor = int(cdata.get("redundancy_factor", 1))
-                            hosts_count = len(cdata.get("hosts", []))
-                except Exception:
-                    pass
-                
-                # Usable capacity = Raw capacity / (redundancy_factor + 1)
-                rep_factor = redundancy_factor + 1 if hosts_count > 1 else 1
-                usable_total_gb = total_gb // rep_factor
-                usable_used_gb = used_gb // rep_factor
-
-                # Insert the logical storage pool summary first
-                pools.insert(0, {
-                    "name": "default-pool (Logical Storage Pool)",
-                    "type": "Aether Distributed DRBD",
-                    "path": "/var/lib/hci/aether/volumes",
-                    "size": f"{usable_total_gb} GB",
-                    "total_gb": usable_total_gb,
-                    "used_gb": usable_used_gb,
-                    "status": "ONLINE"
-                })
-                
+                for node in (get_cluster_nodes() or [{"ip": LOCAL_IP or "127.0.0.1"}]):
+                    ip = node.get("ip")
+                    if not ip:
+                        continue
+                    ok_c, body_c = sidon_call("capacity", host_ip=ip)
+                    if not ok_c or not isinstance(body_c, dict):
+                        continue
+                    total = int(body_c.get("total_bytes") or 0)
+                    avail = int(body_c.get("available_bytes") or 0)
+                    node_total_gb = total / (1024 ** 3)
+                    node_used_gb = (total - avail) / (1024 ** 3)
+                    total_gb += node_total_gb
+                    used_gb += node_used_gb
+                    pools.append({
+                        "node": body_c.get("node") or ip,
+                        "total_gb": round(node_total_gb, 2),
+                        "used_gb": round(node_used_gb, 2),
+                        "egroups": body_c.get("egroup_count", 0),
+                        "journal_bytes": body_c.get("journal_bytes", 0),
+                    })
                 storage_usage_local = {
-                    "total_gb": usable_total_gb,
-                    "used_gb": usable_used_gb,
-                    "pools": pools
+                    "total_gb": round(total_gb, 2),
+                    "used_gb": round(used_gb, 2),
+                    "pools": pools,
+                    "type": "Sidon extent store",
                 }
             except Exception:
                 pass
@@ -3220,18 +3030,34 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     db_status = "warning"
                     db_msg = f"ScyllaDB consensus warning: only {un_nodes}/{expected_nodes} nodes active (UN)."
             
-            # Linstor storage check - run command to get storage pools
-            controller_ips = ",".join([node["ip"] for node in get_cluster_nodes()]) if get_cluster_nodes() else "127.0.0.1"
-            rc_storage, stdout_st, _ = run_remote_spark(LOCAL_IP, f"podman exec -e LS_CONTROLLERS={controller_ips} systemd-aether linstor storage-pool list || true")
+            # Storage check: ask Sidon, and treat "nearly full" as a warning rather than
+            # waiting for writes to start failing. The old check parsed `linstor
+            # storage-pool list` for the word THIN and reported "verified and replicated"
+            # on that basis, which said nothing about free space at all.
             storage_status = "error"
-            storage_msg = "Linstor thin storage pool unreachable or offline."
-            if rc_storage == 0 and stdout_st:
-                if "THIN" in stdout_st or "lvm" in stdout_st.lower() or "drbd" in stdout_st.lower():
-                    storage_status = "ready"
-                    storage_msg = "Linstor thin storage pool verified and replicated."
-                else:
-                    storage_status = "warning"
-                    storage_msg = "Linstor pools online but thin provisioning not found."
+            storage_msg = "Sidon extent store unreachable."
+            ok_st, body_st = sidon_call("capacity")
+            if ok_st and isinstance(body_st, dict):
+                total_b = int(body_st.get("total_bytes") or 0)
+                avail_b = int(body_st.get("available_bytes") or 0)
+                if total_b > 0:
+                    free_pct = (avail_b / total_b) * 100
+                    used_gb = (total_b - avail_b) / (1024 ** 3)
+                    total_gb_st = total_b / (1024 ** 3)
+                    if free_pct < 5:
+                        storage_status = "error"
+                        storage_msg = (f"Sidon extent store is {100 - free_pct:.1f}% full "
+                                       f"({used_gb:.1f} of {total_gb_st:.1f} GiB). Writes will "
+                                       f"fail once the journal cannot drain.")
+                    elif free_pct < 20:
+                        storage_status = "warning"
+                        storage_msg = (f"Sidon extent store is {100 - free_pct:.1f}% full "
+                                       f"({used_gb:.1f} of {total_gb_st:.1f} GiB).")
+                    else:
+                        storage_status = "ready"
+                        storage_msg = (f"Sidon extent store healthy: {used_gb:.1f} of "
+                                       f"{total_gb_st:.1f} GiB used, "
+                                       f"{body_st.get('egroup_count', 0)} extent groups.")
             
             # Node memory check using LOCAL_IP
             rc_mem, res_mem, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/host/memory", None, method="GET")
@@ -4136,9 +3962,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             # to the database -- from every tab, on every refresh.
             #
             # The rows it wrote were also guesses. Upload puts an image on a replicated
-            # DRBD device (/dev/drbd/by-res/img-<slug>/0), not in that directory, so the
+            # vdisk socket (/var/lib/hci/sidon/nbd/img-<slug>.sock), not in that directory, so the
             # only files the scan ever caught were ones nobody registered; it recorded
-            # them with a `path` no LINSTOR resource backs, and only as this node sees
+            # them with a `path` no vdisk backs, and only as this node sees
             # them. Reconciling the catalogue against the filesystem is a cluster-wide
             # job, and belongs in hydra.dagur_schedules where it can run once and be
             # retried, not in a GET.
@@ -5618,80 +5444,32 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             log_catalyst_task("valhalla", "upload_image", "processing", 0, {"filename": filename, "size_bytes": content_length}, task_id=task_id, created_at=created_at_ms)
             
             res_name = f"img-{slugify_image_name(filename)}"
-            block_dev_path = f"/dev/drbd/by-res/{res_name}/0"
-            
+            vdisk_socket = sidon_module().nbd_socket(res_name) if sidon_module() else ""
+
             try:
-                # 1. Create Linstor resource definition
-                run_linstor_cmd(f"resource-definition create {res_name}")
-                
-                # Convert content_length to KiB for volume definition
-                size_kb = (content_length + 1023) // 1024
-                run_linstor_cmd(f"volume-definition create {res_name} {size_kb}KiB")
-                
-                # Get nodes from cluster.json to spawn resource on all hosts
-                hosts = []
-                try:
-                    if os.path.exists("/etc/hci/cluster.json"):
-                        with open("/etc/hci/cluster.json", "r") as f:
-                            hosts = json.load(f).get("hosts", [])
-                except Exception:
-                    pass
-                
-                for h in hosts:
-                    run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
-                    
-                # Configure DRBD options (auto-resync policies).
-                # Dual-primary is intentionally kept for image resources only:
-                # the golden image is attached to guests as a read-only cdrom
-                # (see generate_vm_xml), so VMs on several hosts open it at the
-                # same time and each host must hold Primary to do so. It is
-                # written exactly once, here, while this node is the only
-                # Primary. VM disks are read-write and must NOT get this.
-                run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
-                run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
-                
-                # Wait up to 10 seconds for the block device to appear locally
-                found = False
-                for _ in range(20):
-                    rc_chk, res_chk, _ = run_mtls_spark_api(
-                        "127.0.0.1",
-                        "/api/v1/storage/device?path=" + urllib.parse.quote(block_dev_path, safe=""),
-                        None,
-                        method="GET")
-                    if rc_chk == 0 and res_chk.get("is_block"):
-                        found = True
-                        break
-                    time.sleep(0.5)
-                if not found:
-                    raise Exception(f"DRBD block device {block_dev_path} did not appear on local host.")
-                
-                # Promote to Primary locally on host to write the data.
-                # The typed endpoint returns the role the resource actually ends
-                # up in. A promotion that did not take -- typically because the
-                # peer still holds Primary -- must abort the upload: writing the
-                # block device from a Secondary is exactly the split-brain the
-                # role check exists to prevent, and the old fire-and-forget call
-                # could not see it.
-                rc_pri, res_pri, err_pri = run_mtls_spark_api(
-                    "127.0.0.1",
-                    "/api/v1/storage/drbd/role",
-                    {"resource": res_name, "role": "primary", "force": False})
-                role_now = str(res_pri.get("role", "")).strip().lower() if rc_pri == 0 else ""
-                if role_now != "primary":
-                    raise Exception(
-                        f"Failed to promote DRBD resource {res_name} to Primary "
-                        f"(role is '{role_now or 'unknown'}'; the peer may still hold Primary): "
-                        f"{(res_pri.get('error') or err_pri or '').strip()}")
-                
-                # Stream the upload through Spark rather than writing the device here.
+                # A golden image is an ordinary vdisk, written once, then sealed to the
+                # immutable class. This is what replaced --allow-two-primaries. That
+                # option existed because a template is attached read-only by guests on
+                # several hosts at once and DRBD required each host to hold Primary to
+                # read it -- and holding Primary on several hosts is exactly the state
+                # that corrupts a device if anything ever writes. An immutable vdisk
+                # cannot reach that state: reads are served by any node without a lease,
+                # and writes are refused by class at the NBD layer.
+                ok, body = sidon_call("create", vdisk_id=res_name, size_bytes=content_length)
+                if not ok and "already exists" not in str(body):
+                    raise Exception(f"Sidon could not create image vdisk {res_name}: {body}")
+                ok, body = sidon_call("attach", vdisk_id=res_name)
+                if not ok:
+                    raise Exception(f"Sidon could not attach image vdisk {res_name}: {body}")
+
+                # Stream the upload through Spark rather than writing storage here.
                 #
-                # The web tier must not touch the data path. Its container mounts no /dev,
-                # so opening a DRBD device failed with ENOENT and image upload never
-                # worked in this deployment -- but mounting /dev would be the wrong fix.
-                # Spark owns host storage, the way Stargate rather than Prism owns it on
-                # Nutanix, so the bytes are proxied to it and it performs the write.
-                # http.client rather than urllib: urllib does not reliably stream a
-                # file-like body, and the framing it produced was rejected mid-transfer.
+                # The web tier must not touch the data path. Its container has no access
+                # to the vdisk socket and should not -- mounting it in would be the wrong
+                # fix. Spark is native to the host and owns storage, so the bytes are
+                # proxied to it and it performs the write. http.client rather than urllib:
+                # urllib does not reliably stream a file-like body, and the framing it
+                # produced was rejected mid-transfer.
                 ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
                 ctx.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
                 _relay_ip, _relay_verify = spark_endpoint(LOCAL_IP)
@@ -5727,7 +5505,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 try:
                     conn.request(
                         "POST",
-                        "/api/v1/storage/device/write?device=" + urllib.parse.quote(block_dev_path, safe=""),
+                        "/api/v1/dfs/write?vdisk=" + urllib.parse.quote(res_name, safe=""),
                         body=_UploadRelay(self.rfile, content_length),
                         headers={
                             "Content-Type": "application/octet-stream",
@@ -5748,18 +5526,15 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         "Image upload was truncated: Spark wrote %d of %d bytes."
                         % (written, content_length))
 
-                # Adjust block device permissions. 0660 root:qemu, not 0666:
-                # qemu/libvirt is the only consumer that needs the device, and
-                # world-writable let any local user or mapped container corrupt
-                # the golden image every VM is cloned from.
-                run_mtls_spark_api(
-                    "127.0.0.1",
-                    "/api/v1/storage/device/prepare",
-                    {"path": block_dev_path, "owner": "root:qemu", "mode": "0660"})
+                # Seal it. Drains first, so every byte is in extent groups before the
+                # class changes -- the drain is itself a write path, and an immutable
+                # vdisk frozen around an un-drained journal could never finish draining
+                # it. After this the image is permanently read-only and needs no
+                # permissions dance: it is served over a socket, not a device node.
+                ok, body = sidon_call("seal", vdisk_id=res_name)
+                if not ok:
+                    raise Exception(f"Image {res_name} was written but could not be sealed: {body}")
 
-                # Flush kernel buffers for the device, then demote to Secondary
-                run_mtls_spark_api("127.0.0.1", "/api/v1/storage/device/flush", {"path": block_dev_path})
-                demote_drbd_secondary(res_name)
                 
                 created_at = int(datetime.datetime.now().timestamp() * 1000)
                 image_meta = {
@@ -5767,7 +5542,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "filename": filename,
                     "size_bytes": content_length,
                     "type": "iso" if filename.lower().endswith(".iso") else "template",
-                    "path": block_dev_path,
+                    "path": vdisk_socket,
                     "created_at": created_at
                 }
                 # json.dumps escapes double quotes and backslashes but NOT single quotes,
@@ -5781,10 +5556,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 
                 self.send_json(200, {"message": "Image uploaded successfully", "image": image_meta, "task_id": task_id})
             except Exception as e:
-                # Ensure we attempt to demote back to secondary on failure
-                demote_drbd_secondary(res_name)
-                # Cleanup Linstor definition on failure
-                run_linstor_cmd(f"resource-definition delete {res_name}")
+                # A half-written image is worse than none: it looks like a template in the
+                # UI and produces a VM that will not boot. Detach then delete, and let a
+                # refusal to delete surface rather than be swallowed.
+                sidon_call("detach", vdisk_id=res_name)
+                sidon_call("delete", vdisk_id=res_name)
                 log_catalyst_task("valhalla", "upload_image", "failed", 100, {"filename": filename, "size_bytes": content_length}, error_msg=str(e), task_id=task_id, created_at=created_at_ms)
                 self.send_json(500, {"error": f"Failed to save image: {str(e)}"})
             return
@@ -5918,7 +5694,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 return
 
             # Validate before anything is created or written: this name is
-            # interpolated into root linstor/virsh shell commands and into CQL.
+            # interpolated into root virsh shell commands and into CQL.
             if not is_valid_vm_name(name):
                 self.send_json(400, {"error": VM_NAME_ERROR})
                 return
@@ -5948,89 +5724,35 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 prog = 10 + int((idx / len(disks_parsed)) * 80)
                 log_catalyst_task("vm", "create", "processing", prog, {"vm_name": name}, task_id=task_id, created_at=created_at)
                 
-                res_name = f"{name}-disk{idx}"
-                d_path = f"/dev/drbd/by-res/{res_name}/0"
-
-                if using_sidon():
-                    module = sidon_module()
-                    vdisk_id = module.vdisk_id_for(name, idx)
-                    d_path = module.nbd_socket(vdisk_id)
-                    try:
-                        ok, body = sidon_call(
-                            "create", vdisk_id=vdisk_id,
-                            size_bytes=int(primary_size) * 1024 * 1024 * 1024)
-                        if not ok and "already exists" not in str(body):
-                            raise Exception(f"Sidon could not create vdisk {vdisk_id}: {body}")
-                        # Attached here rather than at boot: the socket has to exist
-                        # before libvirt starts the domain, and attaching is what claims
-                        # ownership and fixes the epoch every write of this disk carries.
-                        ok, body = sidon_call("attach", vdisk_id=vdisk_id)
-                        if not ok:
-                            raise Exception(f"Sidon could not attach vdisk {vdisk_id}: {body}")
-                    except Exception as e:
-                        # Same unwind as the LINSTOR path below: a half-created VM leaves
-                        # storage nothing in the UI can reach, which is the defect the
-                        # checked deleter exists to stop being recreated here.
-                        for created in created_disks:
-                            stale = os.path.basename(created).rsplit(".sock", 1)[0]
-                            sidon_call("detach", vdisk_id=stale)
-                            sidon_call("delete", vdisk_id=stale)
-                        log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name},
-                                          error_msg=str(e), task_id=task_id, created_at=created_at)
-                        self.send_json(500, {"error": f"Failed to allocate storage disk {idx}: {str(e)}"})
-                        return
-                    if idx == 0:
-                        primary_disk_size_gb = primary_size
-                    disk_paths.append(d_path)
-                    created_disks.append(d_path)
-                    continue
-
+                module = sidon_module()
+                vdisk_id = module.vdisk_id_for(name, idx)
+                d_path = module.nbd_socket(vdisk_id)
                 try:
-                    # 1. Create resource definition
-                    rc, out, err = run_linstor_cmd(f"resource-definition create {res_name}")
-                    if rc != 0 and "already exists" not in (err or out):
-                        raise Exception(f"Failed to create Linstor resource-definition {res_name}: {err or out}")
-                        
-                    # 2. Create volume definition
-                    rc, out, err = run_linstor_cmd(f"volume-definition create {res_name} {primary_size}GiB")
-                    if rc != 0 and "already exists" not in (err or out):
-                        raise Exception(f"Failed to create Linstor volume-definition {res_name}: {err or out}")
-                        
-                    # 3. Create resource on all hosts in default-pool
-                    hosts = []
-                    try:
-                        if os.path.exists("/etc/hci/cluster.json"):
-                            with open("/etc/hci/cluster.json", "r") as f:
-                                hosts = json.load(f).get("hosts", [])
-                    except Exception:
-                        pass
-                        
-                    for h in hosts:
-                        run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
-                        
-                    # 4. Set DRBD options (split-brain policies).
-                    # Dual-primary is deliberately NOT set here. Two nodes
-                    # holding Primary on a read-write VM disk means two qemu
-                    # processes can write one raw device, which corrupts it.
-                    # Live migration needs it only for the hand-over window, so
-                    # /api/vms/migrate enables it around that call and turns it
-                    # back off afterwards.
-                    run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
-                    
-                    if idx == 0:
-                        primary_disk_size_gb = primary_size
-                    disk_paths.append(d_path)
-                    created_disks.append(d_path)
+                    ok, body = sidon_call(
+                        "create", vdisk_id=vdisk_id,
+                        size_bytes=int(primary_size) * 1024 * 1024 * 1024)
+                    if not ok and "already exists" not in str(body):
+                        raise Exception(f"Sidon could not create vdisk {vdisk_id}: {body}")
+                    # Attached here rather than at boot: the socket has to exist before
+                    # libvirt starts the domain, and attaching is what claims ownership
+                    # and fixes the epoch every write of this disk carries.
+                    ok, body = sidon_call("attach", vdisk_id=vdisk_id)
+                    if not ok:
+                        raise Exception(f"Sidon could not attach vdisk {vdisk_id}: {body}")
                 except Exception as e:
-                    for p in created_disks:
-                        try:
-                            rname = p.split("/")[-2]
-                            run_linstor_cmd(f"resource-definition delete {rname}")
-                        except:
-                            pass
-                    log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name}, error_msg=str(e), task_id=task_id, created_at=created_at)
+                    # A half-created VM leaves storage nothing in the UI can reach.
+                    for created in created_disks:
+                        stale = os.path.basename(created).rsplit(".sock", 1)[0]
+                        sidon_call("detach", vdisk_id=stale)
+                        sidon_call("delete", vdisk_id=stale)
+                    log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name},
+                                      error_msg=str(e), task_id=task_id, created_at=created_at)
                     self.send_json(500, {"error": f"Failed to allocate storage disk {idx}: {str(e)}"})
                     return
+                if idx == 0:
+                    primary_disk_size_gb = primary_size
+                disk_paths.append(d_path)
+                created_disks.append(d_path)
 
             # 3. Write VM record to ScyllaDB
             network_id = payload.get("network_id", "7a68e0d6-11f8-4e89-9430-b3b44b8bc438")
@@ -6242,38 +5964,19 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": VM_NAME_ERROR})
                     return
 
-                # Live migration is the one case where source and target qemu
-                # legitimately hold the same disk open at once, so DRBD
-                # dual-primary is enabled for exactly this window and turned
-                # back off as soon as the call returns. VM disks are no longer
-                # created with it permanently set.
-                enable_failures = set_vm_disks_two_primaries(name, True)
-                if enable_failures:
-                    self.send_json(500, {
-                        "error": "Failed to enable DRBD dual-primary for the migration window: "
-                                 + "; ".join(enable_failures)
-                    })
-                    return
-
-                two_primaries_still_on = False
-                rc, res, err = -1, {}, ""
-                try:
-                    rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
-                finally:
-                    # rc == -1 with an empty result means the mTLS call itself
-                    # failed or timed out; the migration may still be running on
-                    # the hypervisor, and revoking dual-primary underneath it
-                    # would break it. Leave it on in that case and say so.
-                    if rc == -1 and not res:
-                        two_primaries_still_on = True
-                        print(f"[MIGRATE] No definitive result for VM '{name}'; leaving DRBD dual-primary enabled. "
-                              f"Disable it manually once the migration settles.", flush=True)
-                    else:
-                        disable_failures = set_vm_disks_two_primaries(name, False)
-                        if disable_failures:
-                            two_primaries_still_on = True
-                            print(f"[MIGRATE] Failed to disable DRBD dual-primary for VM '{name}': "
-                                  f"{'; '.join(disable_failures)}", flush=True)
+                # Storage needs nothing from a migration any more.
+                #
+                # This used to enable DRBD dual-primary for the hand-over window, because
+                # source and target qemu both hold the disk open across it, and then turn
+                # it off again -- with a whole failure mode around an indeterminate result
+                # leaving it on, which is why the old code ended by telling an operator
+                # which linstor command to run by hand. Under Sidon a vdisk has an owner
+                # and an epoch rather than a role per host: the destination takes
+                # ownership when it is ready, and the deposed owner's writes are refused
+                # by the replicas rather than being prevented by a flag somebody has to
+                # remember to clear.
+                rc, res, err = run_mtls_spark_api(
+                    "127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
 
                 if rc == 0 and "error" not in res:
                     EVENT_LOGS.append({
@@ -6281,22 +5984,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         "time": "Just now"
                     })
                     invalidate_status_cache()
-
-                    if two_primaries_still_on:
-                        res = dict(res)
-                        res["warning"] = ("DRBD dual-primary could not be disabled after migration. "
-                                          "Clear it manually before the VM is started elsewhere.")
                     self.send_json(200, res)
                 else:
-                    err_msg = res.get("error", err)
-                    error_body = {"error": f"Failed to migrate VM: {err_msg}"}
-                    if two_primaries_still_on:
-                        error_body["warning"] = (
-                            "DRBD dual-primary is still enabled on this VM's disks because the migration "
-                            "result was indeterminate. If the migration is not still running, clear it with: "
-                            "linstor resource-definition drbd-options --allow-two-primaries no <vm>-disk<N>."
-                        )
-                    self.send_json(500, error_body)
+                    self.send_json(500, {"error": f"Failed to migrate VM: {res.get('error', err)}"})
                 return
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -6461,8 +6151,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         prog = 10 + int((idx / len(new_parsed)) * 80)
                         log_catalyst_task("vm", "update", "processing", prog, {"vm_name": name}, task_id=task_id, created_at=created_at)
 
-                        res_name = f"{name}-disk{idx}"
-                        new_path = f"/dev/drbd/by-res/{res_name}/0"
+                        res_name = sidon_module().vdisk_id_for(name, idx)
+                        new_path = sidon_module().nbd_socket(res_name)
 
                         size_val = 20
                         if clean_new_size.endswith("T"):
@@ -6474,11 +6164,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             # Existing disk
                             old_disk = old_parsed[idx]
                             
-                            # Size changed -> Resize Linstor volume definition
+                            # Size changed -> grow the vdisk
                             if old_disk["size"] != new_size_str:
-                                rc_res, out_res, err_res = run_linstor_cmd(f"volume-definition set-size {res_name} 0 {size_val}GiB")
-                                if rc_res != 0:
-                                    raise Exception(f"Failed to resize Linstor volume {res_name} to {size_val}GiB: {err_res or out_res}")
+                                ok_res, body_res = sidon_call(
+                                    "resize", vdisk_id=res_name,
+                                    size_bytes=int(size_val) * 1024 * 1024 * 1024)
+                                if not ok_res:
+                                    raise Exception(f"Failed to resize vdisk {res_name} to {size_val}GiB: {body_res}")
                                 
                                 # Notify QEMU about the resized block device live
                                 if is_running and host_ip:
@@ -6491,47 +6183,44 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                             bus = old_parts[2]
                                     dev_prefix = "vd" if bus == "virtio" else "sd"
                                     
-                                    # 1. Resize DRBD device in the kernel on VM's host
-                                    run_remote_spark(host_ip, f"drbdadm resize {res_name} || true")
+                                    # 1. Tell the guest's qemu the disk grew
+                                    # Nothing to resize underneath: the vdisk is sparse and
+                                    # the map is keyed by extent index, so the new range simply
+                                    # has no entries and reads as zeroes. Only qemu needs telling.
                                     
                                     # 2. Tell QEMU block layer to resize
                                     blockresize_cmd = f"virsh -c qemu:///system blockresize {name} {dev_prefix}{dev_letter} {clean_new_size}"
                                     run_remote_spark(host_ip, blockresize_cmd)
                         else:
-                            # New disk to add in Linstor
-                            rc_rd, out_rd, err_rd = run_linstor_cmd(f"resource-definition create {res_name}")
-                            if rc_rd != 0 and "already exists" not in (err_rd or out_rd):
-                                raise Exception(f"Failed to create Linstor resource-definition {res_name}: {err_rd or out_rd}")
-                                
-                            rc_vd, out_vd, err_vd = run_linstor_cmd(f"volume-definition create {res_name} {size_val}GiB")
-                            if rc_vd != 0 and "already exists" not in (err_vd or out_vd):
-                                raise Exception(f"Failed to create Linstor volume-definition {res_name}: {err_vd or out_vd}")
-                                
-                            hosts = []
-                            try:
-                                if os.path.exists("/etc/hci/cluster.json"):
-                                    with open("/etc/hci/cluster.json", "r") as f_c:
-                                        hosts = json.load(f_c).get("hosts", [])
-                            except Exception:
-                                pass
-                                
-                            for h in hosts:
-                                run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
-                                
-                            # No dual-primary here either: a disk added to a VM
-                            # is read-write and gets the same treatment as one
-                            # created by /api/vms/create.
-                            run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
-                            
+                            # A new disk gets the same treatment as one made by
+                            # /api/vms/create: a vdisk, then a claim. There is no
+                            # per-host resource to place and no split-brain policy to
+                            # set, because a vdisk has one owner rather than a role on
+                            # every node.
+                            ok_c, body_c = sidon_call(
+                                "create", vdisk_id=res_name,
+                                size_bytes=int(size_val) * 1024 * 1024 * 1024)
+                            if not ok_c and "already exists" not in str(body_c):
+                                raise Exception(f"Failed to create vdisk {res_name}: {body_c}")
+                            ok_a, body_a = sidon_call("attach", vdisk_id=res_name)
+                            if not ok_a:
+                                raise Exception(f"Failed to attach vdisk {res_name}: {body_a}")
+
                             # Attach disk live to the running VM
                             if is_running and host_ip:
                                 dev_letter = letters[idx % 26]
-                                attach_cmd = f"virsh -c qemu:///system attach-disk {name} --source {new_path} --target vd{dev_letter} --persistent --live"
+                                # --source-protocol nbd: the disk is a socket, not a
+                                # device node, so attach-disk has to be told the protocol
+                                # rather than being handed a path it would open directly.
+                                attach_cmd = (
+                                    f"virsh -c qemu:///system attach-disk {name} "
+                                    f"--source {new_path} --source-protocol nbd "
+                                    f"--target vd{dev_letter} --persistent --live")
                                 run_remote_spark(host_ip, attach_cmd)
 
                     # Step B: Remove deleted disks
                     for idx in range(len(new_parsed), len(old_parsed)):
-                        res_name = f"{name}-disk{idx}"
+                        res_name = sidon_module().vdisk_id_for(name, idx)
                         
                         # Detach disk live from the running VM first
                         if is_running and host_ip:
@@ -6539,8 +6228,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             detach_cmd = f"virsh -c qemu:///system detach-disk {name} vd{dev_letter} --persistent --live"
                             run_remote_spark(host_ip, detach_cmd)
                             
-                        # Delete from Linstor
-                        run_linstor_cmd(f"resource-definition delete {res_name}")
+                        # Detach then delete: Sidon refuses to delete a vdisk it is still
+                        # serving, which is the guard against removing storage from under
+                        # a guest that has not actually let go of it yet.
+                        sidon_call("detach", vdisk_id=res_name)
+                        sidon_call("delete", vdisk_id=res_name)
 
                     # Resolve new primary disk details
                     if len(new_parsed) > 0:
@@ -6551,7 +6243,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         else:
                             primary_size_gb = int(primary_clean.replace("G", "").strip() or 10)
 
-                        primary_path = f"/dev/drbd/by-res/{name}-disk0/0"
+                        primary_path = sidon_module().nbd_socket(
+                            sidon_module().vdisk_id_for(name, 0))
                         disks_list = ",".join(disks_payload)
                     else:
                         primary_size_gb = 0
@@ -6559,7 +6252,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         disks_list = "NONE"
                 else:
                     primary_size_gb = vm_data.get("disk_size", 10)
-                    primary_path = vm_data.get("disk_path", f"/dev/drbd/by-res/{name}-disk0/0")
+                    primary_path = vm_data.get(
+                        "disk_path",
+                        sidon_module().nbd_socket(sidon_module().vdisk_id_for(name, 0)))
                     disks_list = vm_data.get("disks_list", "")
 
                 audio_enabled = bool(payload.get("audio_enabled", vm_data.get("audio_enabled", False)))
@@ -6653,7 +6348,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
 
-            self.send_json(400, {"error": "Dynamic storage container creation is not supported on Linstor/DRBD storage engine."})
+            self.send_json(400, {"error": "Storage containers are a policy object, not an allocation: a Sidon container names an ftt, and vdisks reference it. There is nothing to create at the storage layer."})
             return
 
         elif self.path == "/api/storage/containers/delete":
@@ -6664,7 +6359,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            self.send_json(400, {"error": "Dynamic storage container deletion is not supported on Linstor/DRBD storage engine."})
+            self.send_json(400, {"error": "Storage containers are a policy object, not an allocation, so there is nothing at the storage layer to delete."})
             return
 
         elif self.path == "/api/networks/create":
@@ -7289,7 +6984,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            # Storage quotas are not dynamically set on Linstor/DRBD engine in this manner
+            # Storage quotas are a container policy, not a per-vdisk allocation
             pass
 
             # Update ScyllaDB
@@ -7360,7 +7055,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             command = ""
             if self.path == "/api/maintenance/rebalance":
                 job_name = "disk_rebalance"
-                command = "echo 'Linstor/DRBD storage is balanced.'"
+                command = "echo 'Sidon places new vdisks by free space; there is no rebalance to run.'"
             elif self.path == "/api/maintenance/cleanup":
                 job_name = "disk_cleanup"
                 command = "rm -rf /tmp/spectrum_build* /tmp/mimir_check_* && podman system prune -f || true"

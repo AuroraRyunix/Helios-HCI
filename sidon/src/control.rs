@@ -175,6 +175,9 @@ impl Daemon {
             "list" => self.op_list(),
             "status" => self.op_status(req),
             "flush" => self.op_flush(req),
+            "seal" => self.op_seal(req),
+            "resize" => self.op_resize(req),
+            "capacity" => self.op_capacity(),
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
@@ -382,6 +385,135 @@ impl Daemon {
         Ok(json!({"vdisk_id": id, "deleted": true, "egroups": "left for purah"}))
     }
 
+    /// Freeze a vdisk: rw -> immutable, permanently.
+    ///
+    /// Drains first, so everything the writer put there is in extent groups before the
+    /// class changes -- an immutable vdisk whose journal still held un-drained writes
+    /// would be frozen around data it could no longer drain, since the drain itself is a
+    /// write path. Then detaches: an immutable vdisk has no owner and no epoch, and any
+    /// node may serve reads from it.
+    fn op_seal(&self, req: &Value) -> Result<Value> {
+        let id = str_field(req, "vdisk_id")?;
+        let vdisk = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            map.get(&id)
+                .map(|a| Arc::clone(&a.vdisk))
+                .ok_or_else(|| Error::refused(format!("vdisk {id} must be attached to be sealed")))?
+        };
+        {
+            let mut v = vdisk.lock().expect("vdisk mutex poisoned");
+            if v.class == "immutable" {
+                return Ok(json!({"vdisk_id": id, "class": "immutable", "already_sealed": true}));
+            }
+            v.close()?;
+        }
+        let cas = self.daruk().cas(
+            "/v1/dfs/vdisk-seal",
+            json_params(vec![
+                ("vdisk_id", json!(id)),
+                ("expected_class", json!("rw")),
+            ]),
+        )?;
+        if !cas.applied {
+            return Err(Error::refused(format!(
+                "vdisk {id} could not be sealed: its class is {}",
+                cas.current_str("class")
+            )));
+        }
+        self.op_detach(req)?;
+        Ok(json!({"vdisk_id": id, "class": "immutable", "sealed": true}))
+    }
+
+    /// Grow a vdisk. Refuses to shrink, always.
+    ///
+    /// A vdisk is sparse and the map is keyed by extent index, so growing needs no data
+    /// movement: the new range simply has no map entries and reads as zeroes, which is
+    /// exactly what a freshly grown disk should contain.
+    fn op_resize(&self, req: &Value) -> Result<Value> {
+        let id = str_field(req, "vdisk_id")?;
+        let new_size = u64_field(req, "size_bytes")?;
+        let vdisk = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            map.get(&id)
+                .map(|a| Arc::clone(&a.vdisk))
+                .ok_or_else(|| Error::refused(format!("vdisk {id} is not attached")))?
+        };
+        let mut v = vdisk.lock().expect("vdisk mutex poisoned");
+        if v.class == "immutable" {
+            return Err(Error::refused(format!("vdisk {id} is immutable and cannot be resized")));
+        }
+        if new_size == v.size {
+            return Ok(json!({"vdisk_id": id, "size_bytes": v.size, "unchanged": true}));
+        }
+        if new_size < v.size {
+            return Err(Error::refused(format!(
+                "refusing to shrink vdisk {id} from {} to {new_size} bytes: everything past                  the new end would be discarded, which no guest filesystem survives",
+                v.size
+            )));
+        }
+        let cas = self.daruk().cas(
+            "/v1/dfs/vdisk-resize",
+            json_params(vec![
+                ("vdisk_id", json!(id)),
+                ("size_bytes", json!(new_size as i64)),
+                ("expected_size_bytes", json!(v.size as i64)),
+            ]),
+        )?;
+        if !cas.applied {
+            return Err(Error::refused(format!(
+                "vdisk {id} was resized by someone else: the map says {} bytes, this caller                  read {}",
+                cas.current_i64("size_bytes").unwrap_or(-1),
+                v.size
+            )));
+        }
+        v.size = new_size;
+        // Connected guests keep the size they were told at handshake; libvirt's
+        // blockresize is what makes qemu re-read it. New connections see it immediately.
+        Ok(json!({"vdisk_id": id, "size_bytes": new_size}))
+    }
+
+    /// What this node's extent store holds and how much room is left.
+    ///
+    /// Read from the filesystem rather than summed from the map, deliberately. The map
+    /// says how many bytes vdisks *claim*; the filesystem says how many are actually
+    /// consumed, and those differ by every sparse hole, every extent group not yet
+    /// reclaimed, and every footer. A capacity gate that refuses a VM needs the second
+    /// number -- the DRS gate failing open for a year was exactly this distinction going
+    /// unnoticed.
+    fn op_capacity(&self) -> Result<Value> {
+        let root = self.cfg.root.join("egroups");
+        let (total, avail) = statfs(&root)?;
+        let mut used = 0u64;
+        let mut groups = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        used += meta.len();
+                        groups += 1;
+                    }
+                }
+            }
+        }
+        let mut journal = 0u64;
+        if let Ok(entries) = std::fs::read_dir(self.cfg.root.join("journal")) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    journal += meta.len();
+                }
+            }
+        }
+        Ok(json!({
+            "node": self.cfg.node,
+            "path": root.to_string_lossy(),
+            "total_bytes": total,
+            "available_bytes": avail,
+            "egroup_bytes": used,
+            "egroup_count": groups,
+            "journal_bytes": journal,
+        }))
+    }
+
     fn op_list(&self) -> Result<Value> {
         let map = self.attached.lock().expect("attached mutex poisoned");
         let mut out = Vec::new();
@@ -502,6 +634,44 @@ impl Daemon {
             }
         });
     }
+}
+
+/// Total and available bytes of the filesystem holding `path`.
+///
+/// `statvfs` through a direct syscall rather than a crate: it is one call with a
+/// well-known struct layout, and pulling in a libc binding for it would be the only C
+/// dependency in the daemon.
+fn statfs(path: &std::path::Path) -> Result<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    #[repr(C)]
+    #[derive(Default)]
+    struct StatVfs {
+        f_bsize: u64,
+        f_frsize: u64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_favail: u64,
+        f_fsid: u64,
+        f_flag: u64,
+        f_namemax: u64,
+        f_spare: [u32; 6],
+    }
+    extern "C" {
+        fn statvfs(path: *const u8, buf: *mut StatVfs) -> i32;
+    }
+    let mut c_path: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+    c_path.push(0);
+    let mut buf = StatVfs::default();
+    // SAFETY: c_path is NUL-terminated and buf is a correctly sized, owned struct.
+    let rc = unsafe { statvfs(c_path.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return Err(Error::io(format!("statvfs({}) failed", path.display())));
+    }
+    let unit = if buf.f_frsize > 0 { buf.f_frsize } else { buf.f_bsize };
+    Ok((buf.f_blocks.saturating_mul(unit), buf.f_bavail.saturating_mul(unit)))
 }
 
 fn str_field(req: &Value, name: &str) -> Result<String> {
