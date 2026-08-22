@@ -189,7 +189,8 @@ question, and a control plane answering in twenty seconds is about to stop answe
 
 ## 7. Ports, and the lack of them
 
-Sidon adds **no client-facing TCP port**.
+Sidon adds **no client-facing TCP port**. 9105 is peer-to-peer and mutually
+authenticated; nothing outside the cluster can speak to it.
 
 - **Control** is a unix socket at `/run/sidon/control.sock`, reached from spark-daemon.
   Callers are authenticated once by the existing mutual-TLS mesh on 9099 rather than by a
@@ -199,15 +200,28 @@ Sidon adds **no client-facing TCP port**.
   group-owned by `qemu`.
 - **Replication** uses port **9105**, one connection per node pair.
 
-> [!WARNING]
-> The replication port carries guest data and **mTLS is not implemented yet**. Until it
-> is, Sidon refuses to bind 9105 to anything but loopback — so a plaintext cluster data
-> path cannot ship by someone forgetting. Multi-node replication needs that work finished
-> first.
+**Replication is mutually authenticated**, against the cluster CA in
+`/etc/hci/spark/certs` — the same material Impa already issues and renews, so the storage
+tier introduces no second credential for someone to discover has expired.
+
+Mutual, not server-only. Encrypting the bytes while accepting any connection would miss
+the point: this port carries `FENCE` as well as `APPEND`, so an unauthenticated peer
+could raise the epoch on a vdisk and make every replica refuse the real owner's writes.
+The fencing proof assumes only cluster members can speak the protocol, and this is what
+makes that true.
+
+Loopback is the one exception and stays plaintext: a connection that cannot leave the
+host cannot be intercepted off it, and it is how the protocol is exercised on a machine
+with no certificates. Everything else is refused without the material rather than
+downgraded — a daemon that quietly serves guest data in the clear because a file was
+missing is worse than one that will not start.
+
+The bind address and the peer list are read from `/etc/hci/cluster.json` rather than
+configured into the unit. A one-host cluster binds loopback, because at ftt=0 there is
+nothing to replicate to; a second host appearing in that document is all it takes.
 
 ## 8. What is not built
 
-- **mTLS on 9105**, as above.
 - **Scheduled snapshots.** Taking one is a command; nothing takes them on a timer, prunes
   them by a retention policy, or presents them in the console. The mechanism is done and
   the policy around it is not.

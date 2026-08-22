@@ -708,9 +708,22 @@ as data* by DRBD and refused with EIO by Sidon.
 
 **Left, in the order it probably matters:**
 
-* **mTLS on the replication port.** The daemon refuses to bind 9105 to anything but
-  loopback until this exists, so multi-node replication is blocked on it — deliberately,
-  rather than relying on someone remembering not to ship a plaintext cluster data path.
+* ~~mTLS on the replication port.~~ **Built 2026-08-22.** `rustls` 0.21 over the
+  existing blocking socket, mutual against the cluster CA in `/etc/hci/spark/certs`.
+  Plain rustls rather than `tokio-rustls`, which agahnim uses: this daemon's byte path is
+  blocking threads and std, and an async runtime for the transport would restructure the
+  data path to solve a problem it does not have. The crates were already on the nodes.
+
+  Verified on one host with two instances bound to its real address, so the traffic was
+  genuinely TLS rather than loopback-exempt: the peers completed a mutual handshake, an
+  RF2 vdisk replicated and the guest's bytes landed in the replica's journal, a plaintext
+  client got a TLS fatal alert, a client presenting no certificate got
+  `TLSV13_ALERT_CERTIFICATE_REQUIRED`, and the node's own certificate completed the
+  handshake as the positive control.
+
+  The bind address and peer list now come from `cluster.json` rather than the unit file,
+  so membership changes do not need the unit regenerating. Still untested across real
+  hosts, which needs the other nodes.
 * **Multi-host soaks.** Everything above was verified with several daemon instances on one
   machine, which proves the protocol and the state machine and cannot prove independence
   from one machine: the instances share a clock and a page cache. Real hosts are what

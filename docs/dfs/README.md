@@ -13,8 +13,10 @@ Snapshots and clones are built: a map copy sharing every extent with the parent,
 bytes copied, and no reference counting anywhere -- see D-18 and D-19 in
 [decisions.md](./decisions.md).
 
-Not built: mTLS on the replication port (the daemon refuses a non-loopback bind until
-it exists), scheduled snapshots and rollback, compression, erasure coding, and
+Replication is mutually authenticated against the cluster CA -- see D-20 in
+[decisions.md](./decisions.md).
+
+Not built: scheduled snapshots and rollback, compression, erasure coding, and
 `vhost-user-blk`.
 
 The documents remain the specification -- where code and document disagree, that is a bug

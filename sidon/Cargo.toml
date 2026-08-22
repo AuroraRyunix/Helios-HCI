@@ -10,6 +10,13 @@ edition = "2021"
 # day the output changes.
 [dependencies]
 serde_json = "1.0"
+# Mutual TLS on the replication port. 0.21 to match agahnim, which already ships rustls
+# on these nodes -- same version means one copy in the registry and one audit surface.
+# Plain rustls, not tokio-rustls: this daemon's byte path is blocking threads and std,
+# and pulling in an async runtime for the transport would restructure the data path to
+# solve a problem it does not have.
+rustls = "0.21"
+rustls-pemfile = "1.0"
 
 [profile.release]
 opt-level = 2

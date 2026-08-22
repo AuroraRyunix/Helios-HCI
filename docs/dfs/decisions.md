@@ -156,3 +156,43 @@ one wrong.
 Had the design kept refcounts, every one of these would have needed a matching increment
 or decrement, each with its own crash window, and the interesting bug would not be "the
 snapshot is missing" but "the extents under a live snapshot were freed".
+
+**D-20 — mutual TLS on 9105, in-process, with plain rustls.** The port carries guest
+data: an `APPEND` payload is the literal bytes a VM just wrote. It also carries `FENCE`,
+which is the part that decided this. Encryption alone would have left the fencing
+mechanism open to anyone who could reach the port -- raise the epoch on a vdisk and every
+replica refuses the real owner's writes -- so the requirement was authentication, and it
+had to be mutual because both ends are peers rather than a client and a service.
+
+Alternatives: **system OpenSSL via the `openssl` crate** (fewer vendored crates, and the
+distro patches it; rejected for putting a C FFI on the byte path and coupling the build to
+whichever OpenSSL the distro ships); **out-of-band encryption, WireGuard between nodes**
+(keeps sidon at one dependency and moves peer identity into the kernel; rejected because
+it adds an operational component and an ordering problem -- sidon must not start before
+the tunnel, or the bind guard protects nothing); **routing replication through
+spark-daemon's existing mTLS** (rejected outright: it would put a Python HTTP hop on every
+guest write, breaking the one rule that acknowledgement never waits on anything slow).
+
+Decided: `rustls` 0.21, matching agahnim, whose crates were already on every node.
+**Plain rustls, not `tokio-rustls`** -- agahnim is async and sidon is not, and pulling in
+a runtime for the transport would restructure the data path to solve a problem the data
+path does not have. The certificates are the cluster's own, from Impa, so the storage tier
+introduces no second credential to forget to renew.
+
+Two things follow that are worth stating because both are easy to reverse by accident.
+**Missing material is a refusal, never a downgrade**: a daemon that quietly serves guest
+data in the clear because a file was absent is worse than one that will not start.
+**Loopback stays plaintext**, because a connection that cannot leave the host cannot be
+intercepted off it, and single-host multi-instance testing is how the protocol gets
+exercised without three nodes. The rule lives in one function, `wire_policy`, consulted by
+both the listener and the client -- the way two ends of a policy stop agreeing is by each
+implementing it separately.
+
+**D-21 — the peer list comes from `cluster.json`, not from the unit file.** The
+alternative is generating `SIDON_PEERS=` into `sidon.service` at provision time, which is
+one source of truth too many: adding or decommissioning a node rewrites `cluster.json` on
+every host already, while a unit generated once describes the cluster as it was the day
+the node was built. `SIDON_PEERS` still overrides, because tests need to name peers that
+are in no cluster document. A single-host document binds loopback, since at ftt=0 there is
+nothing to replicate to and demanding certificates to serve traffic that will never arrive
+is a provisioning failure waiting to happen.

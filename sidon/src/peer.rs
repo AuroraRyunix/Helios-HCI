@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use crate::crc::crc32c;
 use crate::err::{Error, Result};
+use crate::tls::{self, TlsMaterial, Wire};
 
 pub const MAGIC: u32 = 0x5344_5052; // "SDPR"
 pub const REQ_HEADER: usize = 44;
@@ -434,31 +435,53 @@ pub fn serve_with_owner(store: &ReplicaStore, owner: &dyn Owned, req: &Request) 
 /// The listener. One thread per peer connection; a connection carries every vdisk this
 /// pair replicates, which is the whole point of the shape.
 pub fn listen(bind: &str, store: Arc<ReplicaStore>, owner: Arc<dyn Owned>) -> Result<()> {
-    // Plaintext replication must never leave the machine. The design calls for mTLS with
-    // the cluster CA on this port; until that exists, binding anywhere but loopback is
-    // refused outright rather than left to whoever remembers. This is what makes
-    // single-host multi-instance testing possible without shipping an unencrypted
-    // cluster data path by accident.
-    let host = bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
-    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
-    if !loopback {
-        return Err(Error::refused(format!(
-            "refusing to bind the replication port to {bind}: it carries guest data in \
-             plaintext and mTLS is not implemented yet. Bind it to 127.0.0.1, or finish \
-             the TLS work before replicating between hosts."
-        )));
-    }
+    // Plaintext replication must never leave the machine.
+    //
+    // Anything that is not loopback gets mutual TLS against the cluster CA, and a missing
+    // or unreadable certificate is a refusal to start rather than a fall back to
+    // plaintext. The guard is on the bind rather than on an operator's memory: a daemon
+    // that quietly serves guest data in the clear because a file was absent is worse than
+    // one that does not start.
+    //
+    // Loopback stays plaintext on purpose. A connection that cannot leave the host cannot
+    // be intercepted off it, and it is how the protocol and the state machine are
+    // exercised on a machine with no certificates at all.
+    let material = if tls::is_loopback(bind) { None } else { TlsMaterial::load_default() };
+    let tls: Option<Arc<TlsMaterial>> = if tls::wire_policy(bind, material.is_some())? {
+        material.map(Arc::new)
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(bind)
         .map_err(|e| Error::io(format!("cannot bind peer port {bind}: {e}")))?;
-    println!("sidon: replication listener on {bind}");
+    println!(
+        "sidon: replication listener on {bind} ({})",
+        if tls.is_some() { "mutual TLS" } else { "plaintext, loopback only" }
+    );
     thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
                     let store = Arc::clone(&store);
                     let owner = Arc::clone(&owner);
+                    let tls = tls.clone();
                     thread::spawn(move || {
-                        if let Err(e) = serve_connection(stream, &store, owner.as_ref()) {
+                        stream.set_nodelay(true).ok();
+                        // The handshake runs inside the per-connection thread, so a peer
+                        // that opens a socket and never speaks costs one thread rather
+                        // than blocking the accept loop for everyone.
+                        let wire: Box<dyn Wire> = match &tls {
+                            Some(m) => match m.accept(stream) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    eprintln!("sidon: peer handshake refused: {e}");
+                                    return;
+                                }
+                            },
+                            None => Box::new(stream),
+                        };
+                        if let Err(e) = serve_connection(wire, &store, owner.as_ref()) {
                             eprintln!("sidon: peer connection ended: {e}");
                         }
                     });
@@ -473,8 +496,7 @@ pub fn listen(bind: &str, store: Arc<ReplicaStore>, owner: Arc<dyn Owned>) -> Re
     Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, store: &ReplicaStore, owner: &dyn Owned) -> Result<()> {
-    stream.set_nodelay(true).ok();
+fn serve_connection(mut stream: Box<dyn Wire>, store: &ReplicaStore, owner: &dyn Owned) -> Result<()> {
     loop {
         // A decode failure is a desynchronised stream, so the connection is dropped
         // rather than answered: replying would let shifted bytes be read as a plausible
@@ -501,7 +523,11 @@ pub struct PeerClient {
     /// because an append needs all of them -- and costs a second full timeout against a
     /// peer that is wedged rather than gone, which is the exact case a failover is racing.
     attempts: u32,
-    conn: Mutex<Option<TcpStream>>,
+    conn: Mutex<Option<Box<dyn Wire>>>,
+    /// Loaded once per client rather than per connection: building a rustls config parses
+    /// PEM and validates the key against the certificate, which is not work to repeat on
+    /// every reconnect of a flapping peer.
+    tls: Option<Arc<TlsMaterial>>,
 }
 
 impl PeerClient {
@@ -511,12 +537,22 @@ impl PeerClient {
 
     /// A client that gives up after `attempts` tries. Used for fencing.
     pub fn with_attempts(node: &str, addr: &str, timeout: Duration, attempts: u32) -> PeerClient {
+        // Same rule as the listener, from the other end: loopback is plaintext, anything
+        // else needs the cluster CA. A client with no material for a routable peer is
+        // built anyway and fails at `call`, because refusing to construct it would turn a
+        // certificate problem into a daemon that will not start.
+        let tls = if tls::is_loopback(addr) {
+            None
+        } else {
+            TlsMaterial::load_default().map(Arc::new)
+        };
         PeerClient {
             node: node.to_string(),
             addr: addr.to_string(),
             timeout,
             attempts: attempts.max(1),
             conn: Mutex::new(None),
+            tls,
         }
     }
 
@@ -527,11 +563,8 @@ impl PeerClient {
         let last = self.attempts - 1;
         for attempt in 0..self.attempts {
             if guard.is_none() {
-                match TcpStream::connect(&self.addr) {
+                match self.dial() {
                     Ok(s) => {
-                        s.set_read_timeout(Some(self.timeout)).ok();
-                        s.set_write_timeout(Some(self.timeout)).ok();
-                        s.set_nodelay(true).ok();
                         *guard = Some(s);
                     }
                     Err(e) => {
@@ -561,6 +594,23 @@ impl PeerClient {
             }
         }
         Err(Error::io(format!("peer {} did not answer", self.node)))
+    }
+
+    /// Open one connection, wrapped in TLS unless the peer is on this machine.
+    fn dial(&self) -> Result<Box<dyn Wire>> {
+        // The same rule the listener applied, from the other end.
+        tls::wire_policy(&self.addr, self.tls.is_some())?;
+        let sock = TcpStream::connect(&self.addr)
+            .map_err(|e| Error::io(format!(
+                "peer {} at {} is unreachable: {e}", self.node, self.addr
+            )))?;
+        sock.set_read_timeout(Some(self.timeout)).ok();
+        sock.set_write_timeout(Some(self.timeout)).ok();
+        sock.set_nodelay(true).ok();
+        match &self.tls {
+            Some(m) => m.connect(tls::server_name_for(&self.addr)?, sock),
+            None => Ok(Box::new(sock)),
+        }
     }
 
     pub fn ping(&self) -> Result<()> {
@@ -785,17 +835,23 @@ mod tests {
     }
 
     #[test]
-    fn the_replication_port_refuses_a_routable_bind_without_tls() {
-        let dir = tmpdir("bind-guard");
+    fn a_routable_bind_is_refused_when_there_is_no_tls_material() {
+        // The rule itself is checked in tls.rs, without a socket. This checks that
+        // `listen` consults it: the guard is only worth anything if the code path that
+        // opens the port actually asks.
+        let dir = tmpdir("no-certs");
+        std::env::set_var("SIDON_CERT_DIR", dir.join("absent"));
         struct NoVdisks;
         impl Owned for NoVdisks {
             fn owned_read(&self, _v: &str, _o: u64, _l: u32) -> Option<Result<Vec<u8>>> { None }
             fn owned_write(&self, _v: &str, _o: u64, _d: &[u8]) -> Option<Result<()>> { None }
         }
         let store = Arc::new(ReplicaStore::new(&dir).unwrap());
-        match listen("0.0.0.0:9105", Arc::clone(&store), Arc::new(NoVdisks)) {
+        let outcome = listen("10.255.255.1:9105", Arc::clone(&store), Arc::new(NoVdisks));
+        std::env::remove_var("SIDON_CERT_DIR");
+        match outcome {
             Err(Error::Refused(m)) => assert!(m.contains("plaintext"), "{m}"),
-            other => panic!("a routable bind must be refused, got {other:?}"),
+            other => panic!("a routable bind without certificates must be refused, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
     }

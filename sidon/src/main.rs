@@ -22,10 +22,13 @@ mod nbd;
 mod overlay;
 mod peer;
 mod purah;
+mod tls;
 mod vdisk;
 
 use std::path::PathBuf;
 use std::time::Duration;
+
+use serde_json::Value;
 
 use crate::control::{Daemon, DaemonConfig};
 
@@ -64,6 +67,77 @@ fn parse_peers(spec: &str) -> Vec<(String, String)> {
     out
 }
 
+/// `/etc/hci/cluster.json`, or `None` when it cannot be read.
+fn cluster_document() -> Option<Value> {
+    let path = std::env::var("SIDON_CLUSTER_JSON")
+        .unwrap_or_else(|_| "/etc/hci/cluster.json".to_string());
+    let text = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Every other node in the cluster, as `(name, "ip:port")`.
+///
+/// Derived rather than configured. The alternative is generating `SIDON_PEERS=` into the
+/// unit file at provision time, which is one source of truth too many: membership changes
+/// -- a node added, a node decommissioned -- rewrite `cluster.json` on every host
+/// already, and a unit file generated once would describe the cluster as it was on the
+/// day the node was built.
+///
+/// `SIDON_PEERS` still wins when set, because the tests need to name peers that are not
+/// in any cluster document.
+fn peers_from_cluster(me: &str, port: u16) -> Vec<(String, String)> {
+    let doc = match cluster_document() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+    let hosts = match doc.get("hosts").and_then(Value::as_array) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for host in hosts {
+        let name = host.get("hostname").and_then(Value::as_str).unwrap_or("").trim();
+        let ip = host.get("ip").and_then(Value::as_str).unwrap_or("").trim();
+        if name.is_empty() || ip.is_empty() || name == me {
+            continue;
+        }
+        out.push((name.to_string(), format!("{ip}:{port}")));
+    }
+    out
+}
+
+/// What to bind the replication port to.
+///
+/// This node's own address from `cluster.json`, so peers can reach it -- but loopback
+/// when the cluster has one host, because at ftt=0 there is nothing to replicate to and
+/// binding a routable port would demand certificates to serve traffic that will never
+/// arrive.
+fn peer_bind_address(me: &str, port: u16) -> String {
+    let doc = match cluster_document() {
+        Some(d) => d,
+        None => return format!("127.0.0.1:{port}"),
+    };
+    let hosts = doc.get("hosts").and_then(Value::as_array).cloned().unwrap_or_default();
+    if hosts.len() < 2 {
+        return format!("127.0.0.1:{port}");
+    }
+    for host in &hosts {
+        if host.get("hostname").and_then(Value::as_str).map(str::trim) == Some(me) {
+            if let Some(ip) = host.get("ip").and_then(Value::as_str) {
+                return format!("{}:{port}", ip.trim());
+            }
+        }
+    }
+    // In a multi-node document but not in it by name. Refusing to guess: binding
+    // loopback here keeps this node serving its own guests while making it obvious in
+    // `peers` that nothing can reach it.
+    eprintln!(
+        "sidon: this node ({me}) is not listed in the cluster document, so the \
+         replication port stays on loopback and no peer can reach it"
+    );
+    format!("127.0.0.1:{port}")
+}
+
 fn node_name() -> String {
     if let Ok(n) = std::env::var("SIDON_NODE") {
         return n;
@@ -76,11 +150,14 @@ fn node_name() -> String {
 }
 
 fn main() {
+    // Resolved before the config, because the bind address and the peer list are both
+    // "everyone in the cluster document except me" and need to know which one is me.
+    let node = node_name();
     let cfg = DaemonConfig {
         root: PathBuf::from(env_or("SIDON_ROOT", "/var/lib/hci/sidon")),
         control_socket: PathBuf::from(env_or("SIDON_CONTROL", "/run/sidon/control.sock")),
         daruk_addr: env_or("SIDON_DARUK", "127.0.0.1:9043"),
-        node: node_name(),
+        node: node.clone(),
         // 64 MiB of journal before a drain. Large enough that a burst of guest writes
         // never waits on one, small enough that replay after a crash is seconds.
         high_water: env_bytes("SIDON_HIGH_WATER", 64 << 20),
@@ -96,8 +173,14 @@ fn main() {
         // SIDON_PEERS is "node=host:port,node=host:port". Generated from cluster.json on
         // a real cluster; set by hand to run several instances on one host, which is how
         // the replication semantics are tested without needing several hosts.
-        peer_bind: env_or("SIDON_PEER_BIND", "127.0.0.1:9105"),
-        peers: parse_peers(&env_or("SIDON_PEERS", "")),
+        peer_bind: match std::env::var("SIDON_PEER_BIND") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => peer_bind_address(&node, 9105),
+        },
+        peers: match std::env::var("SIDON_PEERS") {
+            Ok(v) if !v.trim().is_empty() => parse_peers(&v),
+            _ => peers_from_cluster(&node, 9105),
+        },
         // 20s suits a bulk append to a busy peer. Fencing during a takeover gets its
         // own, shorter budget: the whole point of that path is to be fast, and a
         // replica that has not answered in five seconds is not going to make the

@@ -49,8 +49,8 @@ graph TD
 *   **9043 (TCP)**: Daruk query proxy port (redirects to ScyllaDB).
 *   **9105 (TCP)**: Sidon replication. Journal appends, extent-group transfer, epoch
     fencing and forwarded guest I/O. One connection per node **pair**, independent of VM
-    count. mTLS is not implemented yet, so the daemon refuses to bind this port to
-    anything but loopback.
+    count, and mutually authenticated against the cluster CA. A one-host cluster binds
+    loopback and skips TLS, because at ftt=0 there is nothing to replicate to.
 
 ---
 
