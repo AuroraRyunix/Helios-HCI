@@ -105,9 +105,9 @@ methods in order and each must read back the state it claims to have produced:
 | Rung | Confirms when |
 | :--- | :--- |
 | `self` | the host already fenced itself and recorded `FENCED` in `hydra.nodes` |
-| `spark` | `POST /api/v1/host/fence` reports no guest process, no open DRBD device and no Primary resource |
+| `spark` | `POST /api/v1/host/fence` reports no guest process and no vdisk still attached |
 | `bmc` | `ipmitool chassis power status` reads `off` after a power-off |
-| `storage` | every resource the host backs is quorate here and disconnected there, so DRBD is already failing its writes |
+| `storage` | the epoch on every vdisk the host owns has been raised and every reachable replica has acknowledged the fence, so the host's next append is refused whether or not it knows |
 
 A host already confirmed fenced during this outage is not fenced again; a fence that
 *failed* is retried on the next pass.
@@ -115,7 +115,7 @@ A host already confirmed fenced during this outage is not fenced again; a fence 
 If no rung confirms, the default `unconfirmed_fence_policy: "block"` marks the host `DOWN`
 — which stops Vali placing new work there — and then **stops**. Nothing is released and
 nothing is restarted, the Catalyst parent task is marked `failed` with the reason, and the
-failover starts by itself once the operator powers the host off or arms DRBD quorum.
+failover starts by itself once the operator powers the host off.
 
 This replaces `ssh_fence_host()`, which sent a shell string whose every clause ended in
 `|| true` (so its exit status was 0 whatever happened), discarded that status anyway, and
@@ -141,7 +141,7 @@ For each VM where `host_ip == <dead_host_ip>` and `state == 'Running'`:
    earlier, and in that window the guest can have been recovered elsewhere — by a previous
    failover pass whose start task only just landed, by an operator, or by a Vali start that
    was already in flight. The blind write then unplaced a *running* VM, and the start task
-   below booted a second copy of it against the same DRBD device. Two qemu processes on one
+   below booted a second copy of it against the same disk. Two qemu processes on one
    raw device is the corruption failover exists to prevent.
 
    A refusal means the VM is somewhere else and needs nothing from this failover, so it is
@@ -193,7 +193,7 @@ mipha --clear-self-fence
 ### C. Simulating a Host Failover
 To simulate a host crash and observe Mipha's recovery orchestration:
 1. Check first that a fence can be confirmed at all — `mipha --fence-status` on the leader.
-   With no BMC and no DRBD quorum the failover will be refused by design, and the
+   With Hydra unreachable the failover will be refused by design, and the
    simulation will show you that refusal rather than a failover.
 2. Stop the target host's Spark Daemon and block network access (or shut down the host).
 3. Monitor Mipha logs on the active leader:
@@ -216,6 +216,6 @@ To simulate a host crash and observe Mipha's recovery orchestration:
 
 For the internal code structure, class/function details, and execution flowcharts, see the [Technical Guide](./mipha_technical.md).
 
-For fencing — the ladder, where BMC credentials live, what DRBD quorum does and does not
+For fencing — the ladder, where BMC credentials live, what the storage rung does and does not
 prove, self-fencing, and the cases that are still not safe — see
 [fencing.md](./fencing.md).

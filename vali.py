@@ -1814,23 +1814,15 @@ def process_queue_task(task):
             
 
 
-            # Nothing to wait for. This used to announce a satellite auto-heal, create a
-            # child Catalyst task and poll get_linstor_pending_sync() every three seconds
-            # until DRBD had finished copying. Extent groups are immutable and Purah
-            # re-replicates them in the background, so a returning node is usable the
-            # moment it is up.
-            synced = True
-            if synced:
-                release_maintenance_lock_for_host(hostname)
-            else:
-                err_msg = "the host did not finish rejoining."
-                cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
-                run_cql_query(cql_child_end)
-                # The lock stays held. The host did not finish rejoining, so the cluster
-                # is still short a replica and no other host should start draining. Mipha
-                # keeps renewing it while hydra.nodes says RECOVERING; if this node is
-                # abandoned instead of fixed, the TTL frees it.
-                print(f"[Maintenance Catalyst Task] ERROR: Sync not complete for {hostname}. The cluster maintenance lock is still held by {hostname}.")
+            # Nothing to wait for, so the lock comes off here. This used to announce a
+            # satellite auto-heal, create a child Catalyst task and poll
+            # get_linstor_pending_sync() every three seconds until DRBD had finished
+            # copying -- and hold the maintenance lock through all of it, because a node
+            # whose replicas were still catching up could not be trusted with a guest.
+            # Extent groups are immutable, so a returning node's copies are correct or
+            # absent and Purah replaces the absent ones in the background. There is no
+            # in-between state to wait out, and so no failure branch either.
+            release_maintenance_lock_for_host(hostname)
 
             # Spawn subtask to run Mimir Health Check
             print(f"[Maintenance Catalyst Task] Spawning Mimir health checks subtask for host {hostname}...")

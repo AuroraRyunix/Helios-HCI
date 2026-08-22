@@ -59,8 +59,9 @@ When the Vali Leader processes a `start` task from the queue:
    when it decided to start. A VM another host already owns is refused here, and the error
    names that host.
 5. It compiles the VM's XML and calls the target node's `spark-daemon` `/api/v1/execute` to define and start the VM.
-6. If the DRBD promotion or the start itself fails, the claim is given back — conditionally,
-   so a VM something else has taken in the meantime is left alone.
+6. If the vdisk attach or the start itself fails, the claim is given back — conditionally,
+   so a VM something else has taken in the meantime is left alone, and any vdisk already
+   attached on this attempt is detached again.
 
 ### Placement is a compare-and-swap, not a write
 
@@ -68,10 +69,15 @@ The claim used to be the *last* step of a start: the resources were promoted, th
 defined and booted, and only then was `host_ip` written unconditionally. Two callers racing
 on the same VM — a manual start against a DRS placement, or a start issued while a stale
 `host_ip` was still in the row — both reached that point and both wrote, so two qemu
-processes ended up on the same raw DRBD device.
+processes ended up on the same disk.
 
-Claiming first means one of them is turned away before anything touches the disks. The DRBD
-promotion check that follows is the second gate, not the only one.
+Claiming first means one of them is turned away before anything touches the disks. The
+vdisk attach that follows is the second gate, not the only one — and it is the stronger of
+the two: attaching wins the ownership compare-and-swap in Hydra and fences every journal
+replica at the new epoch, so a previous owner that is wedged, lying about its state, or
+unreachable cannot complete another write. `drbdadm primary` could only *infer* that the
+peer had stopped, and only where quorum was armed. A refused attach names the host that
+actually holds the disk.
 
 The same applies in reverse: `stop` releases the placement conditionally on Vali still being
 the host of record. An unconditional release frees the row of a VM a concurrent migration had
@@ -100,9 +106,12 @@ which is `UPDATE ... SET status = 'migrating' ... IF status != 'migrating'` — 
 and the write are one Paxos round.
 
 This replaces a read of `status` followed by a separate write, which two callers could both
-pass. That mattered because **live migration is exactly the window in which DRBD
-dual-primary is open**: two concurrent migrations of one VM is disk corruption, not a
-scheduling annoyance. A failed lock aborts the migration; it is never logged and stepped
+pass. That mattered because live migration used to be the window in which DRBD
+dual-primary was open, and two concurrent migrations of one VM was disk corruption. The
+corruption is gone — a vdisk has one owner per epoch and a deposed owner's writes are
+refused by every replica — but the lock is not redundant, because what it now prevents is
+two migrations racing each other's ownership CAS and leaving a VM defined on a host that
+does not own its disk. A failed lock aborts the migration; it is never logged and stepped
 over.
 
 On success the hand-over runs through `POST /v1/vm/migrate-commit`, which moves `host_ip` to
@@ -135,20 +144,22 @@ To ensure compatibility across all hypervisor nodes:
 To ensure guest OS virtual machines correctly recognize disk capacity increases (both while running and during initial boot), Vali orchestrates storage synchronization and device mapping resize operations.
 
 ### A. Guest VM Boot Disk Synchronization
-If a virtual machine's disk is resized while the VM is stopped, the underlying DRBD block device exists in a `Secondary` role on the host hypervisor and cannot be directly queried or updated by the kernel automatically. To resolve this:
-1. During the VM power-on sequence, Vali parses the disk definitions from ScyllaDB.
-2. Vali prepends commands to promote (`drbdadm primary`) and sync/resize (`drbdadm resize`) the DRBD resource definition on the destination host before the VM is defined and booted:
-   ```bash
-   drbdadm primary res-img-virtio-win && drbdadm resize res-img-virtio-win
-   ```
-3. This updates the physical block device capacity in the host kernel before libvirt defines the domain, guaranteeing that the guest OS installer (e.g. Windows Server) detects the full resized capacity immediately upon boot.
+This step no longer exists, and the reason is worth recording. A DRBD volume was a kernel
+block device with a size the kernel had to be told about, and a stopped VM's device sat
+`Secondary` where it could not be resized at all — so the power-on path had to prepend
+`drbdadm primary` and `drbdadm resize` before libvirt could define the domain, or the guest
+installer would see the old capacity.
+
+A vdisk has no kernel object and no size the host has to agree with. It is sparse, and its
+block map is keyed by extent index, so a grown range simply has no entries yet and reads as
+zeroes. The recorded size is the whole of it, and a VM starting after a resize gets the new
+size because that is what the record says.
 
 ### B. Live VM Disk Resizing
 When a VM is running (`state = 'Running'`) and its disk is resized using `valcli vm.edit` or the Spectrum API:
-1. **Host Block Device Resize**: The hypervisor first updates the host kernel's block size mapping by running:
-   ```bash
-   drbdadm resize res-img-virtio-win
-   ```
+1. **Vdisk resize**: the recorded size is raised through sidon's `resize` op. Nothing is
+   resized underneath it — the vdisk is sparse and the map is keyed by extent index, so the
+   new range has no entries and reads as zeroes until something writes there.
 2. **Device Prefix Resolution**: The hypervisor dynamically resolves the correct disk prefix (`vd` for VirtIO controllers vs `sd` for SATA/SCSI controllers) based on the configured bus type in the VM metadata, avoiding hardcoded device guesses.
 3. **QEMU Notification**: Finally, the hypervisor sends a live block-resize notification to QEMU via libvirt:
    ```bash

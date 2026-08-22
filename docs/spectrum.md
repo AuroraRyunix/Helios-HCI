@@ -91,10 +91,10 @@ of order. Runs are now read per job (`WHERE job_name = ? LIMIT n`) and merged ne
 ### 2b. Deleting removes the storage first, and checks
 
 `POST /api/images/delete` used to delete the catalogue row, then fire
-`linstor resource-definition delete` and a fan-out `rm -f {path}` without checking either,
+a vdisk delete and a fan-out `rm -f {path}` without checking either,
 and answer `200` regardless. That ordering is the one where a downstream failure is
 unrecoverable from the UI: the storage is still allocated and the only handle on it — the
-row naming its path — has already been thrown away. The DRBD resource sits on every node
+row naming its path — has already been thrown away. The vdisk's extent groups sit on every replica
 holding space that nothing in the console can see, and the operator has been told the
 delete worked.
 
@@ -104,11 +104,11 @@ once there is nothing left for the row to point at is the row removed. A `404` i
 for an image that is not in the catalogue rather than a cheerful `200`.
 
 The path is validated, not merely quoted. A correctly quoted `rm -f /etc` is still
-`rm -f /etc`, so the recorded path must be a DRBD device under `/dev/drbd/` or a file
+`rm -f /etc`, so the recorded path must be a vdisk socket under `/var/lib/hci/sidon/nbd/` or a file
 under `/var/lib/hci/aether/volumes/`, with no `..` segment; anything else is refused and
-reported. A `/dev/drbd/...` path is never removed with `rm` at all — that would delete a
+reported. A vdisk path is never removed with `rm` at all — that would delete a
 udev symlink and leave the resource, and its storage, behind. It is removed by deleting
-the LINSTOR resource definition, which tears the device down on every node.
+the vdisk through sidon, which frees its extent groups on every replica.
 
 `GET /api/images` is now a read. It used to scan
 `/var/lib/hci/aether/volumes/default-image-container` and `INSERT` a catalogue row for
@@ -123,7 +123,7 @@ then delete the row unconditionally. A VM that migrated between the read and the
 was destroyed nowhere — the destroy went to the host it had just left — and its row
 disappeared anyway. The result is a guest running on a host that nothing in the cluster
 associates with it: invisible in the console, uncounted against the host's capacity, and
-holding its DRBD device open against the next thing to claim the name.
+holding its vdisk attached against the next thing to claim the name.
 
 The delete now uses [Daruk](./daruk.md)'s typed compare-and-swap endpoints:
 
@@ -137,7 +137,7 @@ The delete now uses [Daruk](./daruk.md)'s typed compare-and-swap endpoints:
 3. **Prove the placement** (`/v1/vm/set-state`, conditioned `IF host_ip = ?`). Migration
    is not the only writer — the reconciler releases a placement too — so the address the
    destroy is about to be sent to is confirmed by a compare-and-swap, not by a read.
-4. **Destroy, undefine and delete storage, checked.** A domain or LINSTOR resource that is
+4. **Destroy, undefine and delete storage, checked.** A domain or vdisk that is
    already gone is the state being asked for and is not an error; anything else is, and
    leaves the row in place.
 
@@ -155,9 +155,9 @@ about; a `DELETE ... IF host_ip = ?` would close it outright.
 `GET /api/images` no longer writes, and nothing replaces the scan it used to perform. That
 is deliberate, and the reason is not only "a GET should not write":
 
-- The rows it wrote were guesses. Image upload puts an image on a replicated DRBD device
-  (`/dev/drbd/by-res/img-<slug>/0`), not in that directory, so the only files the scan
-  ever caught were ones nobody registered. It recorded them with a `path` that no LINSTOR
+- The rows it wrote were guesses. Image upload puts an image in a replicated vdisk, reached
+  at `/var/lib/hci/sidon/nbd/<vdisk>.sock`, not in that directory, so the only files the
+  scan ever caught were ones nobody registered. It recorded them with a `path` that no
   resource backs — which is exactly the row shape the delete path then has to treat as a
   special case.
 - It only ever saw one node. The console runs in a container whose view of

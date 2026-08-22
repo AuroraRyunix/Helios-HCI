@@ -831,7 +831,16 @@ NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
 # out of the tree, a bare /dev entry) is refused.
 ALLOWED_PATH_ROOTS = ("/var/lib/hci/aether/", "/var/lib/hci/sidon/", "/var/lib/hci/images/")
 
+ALLOWED_OWNERS = ("root:qemu", "root:root")
+ALLOWED_MODES = ("0600", "0640", "0644", "0660", "0664", "0666", "0700", "0750", "0755", "0770")
 
+# Image and NVRAM files still live here. The name is Aether's, and the path is kept
+# rather than renamed because it is on disk on every provisioned node; a rename is a
+# migration, not an edit.
+AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
+
+HYDRA_DB_CONTAINER = "systemd-hydra-db"
+VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
 
 IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
 
@@ -945,15 +954,6 @@ def validate_mode(value):
     return None, "mode must be one of " + ", ".join(ALLOWED_MODES)
 
 
-def validate_storage_pool(value):
-    """Storage pool comes from a fixed allowlist, never from caller text."""
-    if value is None:
-        return DEFAULT_STORAGE_POOL, None
-    if value in ALLOWED_STORAGE_POOLS:
-        return value, None
-    return None, "storage_pool must be one of " + ", ".join(ALLOWED_STORAGE_POOLS)
-
-
 VIRSH = ["virsh", "-c", "qemu:///system"]
 
 # 1 GiB .. 64 TiB. The floor rejects a zero-sized volume; the ceiling is a sanity bound on
@@ -1037,35 +1037,6 @@ def validate_flag(value, name):
     if isinstance(value, bool):
         return value, None
     return None, "%s must be true or false" % name
-
-
-def validate_node_names(value):
-    """Node names for a placement: a list of names, or the cluster's own nodes.
-
-    Omitting `nodes` places on every node in the cluster document, which is what the
-    Python tier's create path did. An explicit empty list is an error rather than a
-    silent no-op: a resource definition with no resources backs no disk.
-    """
-    if value is None:
-        nodes = cluster_node_names()
-        if not nodes:
-            return None, "No nodes are configured on this host and none were supplied"
-        return nodes, None
-
-    if not isinstance(value, list):
-        return None, "nodes must be a list of node names"
-    if not value:
-        return None, "nodes must not be empty"
-    if len(value) > 32:
-        return None, "nodes must contain at most 32 names"
-
-    nodes = []
-    for name in value:
-        if not valid_name(name):
-            return None, "Invalid node name"
-        if name not in nodes:
-            nodes.append(name)
-    return nodes, None
 
 
 def virsh_status_for(stderr):
@@ -1634,8 +1605,24 @@ def read_dhcp_leases():
 
 
 def read_host_capabilities():
-    """{"kvm","secure_boot"} read straight from the kernel."""
+    """{"kvm","secure_boot"} read straight from the kernel.
+
+    `secure_boot` is reported but no longer gates anything. It used to, because DRBD was
+    an out-of-tree module the kernel refuses to load unenrolled, so a host with Secure
+    Boot on had no storage at all. Sidon is a userspace daemon; the value is still worth
+    surfacing for the operator, and worth *not* acting on.
+    """
     kvm = os.path.exists("/dev/kvm")
+
+    secure_boot = False
+    try:
+        with open(SECURE_BOOT_EFIVAR, "rb") as handle:
+            data = handle.read()
+        # 4-byte EFI attribute prefix followed by the one-byte value.
+        if data:
+            secure_boot = data[-1] == 1
+    except OSError:
+        secure_boot = False
 
     return {"kvm": kvm, "secure_boot": secure_boot}
 

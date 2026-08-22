@@ -19,6 +19,21 @@ def run_command_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
 
+
+LOCAL_IP = "127.0.0.1"
+
+# Load local environment settings if available
+try:
+    with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                if k == "LOCAL_HYPERVISOR_IP":
+                    LOCAL_IP = v
+except Exception:
+    pass
+
+
 def spark_endpoint(ip):
     """Return (address, verify_identity) for an mTLS call to a spark-daemon.
 
