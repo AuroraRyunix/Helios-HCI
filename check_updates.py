@@ -306,6 +306,7 @@ def collect_inventory():
             "lanayru": "/usr/local/bin/lanayru.py",
             "helios-zk": "/usr/local/bin/helios_zk.py",
             "helios-sig": "/usr/local/bin/helios_sig.py",
+            "helios-sidon": "/usr/local/bin/helios_sidon.py",
             "check-updates": "/usr/local/bin/check-updates",
             "nodetool": "/usr/local/bin/nodetool",
             "allssh": "/usr/local/bin/allssh",

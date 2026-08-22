@@ -59,6 +59,7 @@ components_map = {
     # Imported by check-updates (and by hylia when it verifies a package manifest), so
     # it keeps its .py suffix like the other importable modules here.
     "helios-sig": {"src": "helios_sig.py", "target": "/usr/local/bin/helios_sig.py"},
+    "helios-sidon": {"src": "helios_sidon.py", "target": "/usr/local/bin/helios_sidon.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 

@@ -1240,6 +1240,46 @@ def _destroy_vm_on_host(name, host_ip):
     return True, f"guest destroyed and undefined on {host_ip}"
 
 
+_SIDON = None
+
+
+def sidon_module():
+    """helios_sidon, loaded from wherever the image put it. None if unavailable."""
+    global _SIDON
+    if _SIDON is not None:
+        return _SIDON or None
+    try:
+        import helios_sidon
+        _SIDON = helios_sidon
+        return _SIDON
+    except ImportError:
+        _SIDON = False
+        return None
+
+
+def using_sidon():
+    module = sidon_module()
+    return bool(module and module.using_sidon())
+
+
+def sidon_call(op, host_ip="127.0.0.1", **params):
+    """Ask spark to run a Sidon operation on `host_ip`.
+
+    Spectrum is a container; Sidon's control socket is on the host. Rather than mounting
+    /run into this container, the call goes over the mTLS mesh spark already terminates,
+    so a storage tier adds no second credential. Returns (ok, body_or_error_string).
+    """
+    payload = dict(params)
+    payload["op"] = op
+    rc, body, err = run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", payload)
+    if rc != 0:
+        detail = ""
+        if isinstance(body, dict):
+            detail = body.get("error") or ""
+        return False, detail or err or "spark did not answer the DFS endpoint"
+    return True, body
+
+
 def _delete_vm_disks(name, disks_list):
     """Delete the VM's LINSTOR resources, checked. Returns (ok, detail).
 
@@ -1249,6 +1289,22 @@ def _delete_vm_disks(name, disks_list):
     """
     count = len(disks_list.split(",")) if disks_list else 1
     failures = []
+
+    if using_sidon():
+        module = sidon_module()
+        for idx in range(count):
+            vdisk_id = module.vdisk_id_for(name, idx)
+            # Detach first: delete refuses an attached vdisk rather than pulling storage
+            # out from under a running qemu. A vdisk that is not attached here is the
+            # state being asked for, so that refusal is not a failure.
+            sidon_call("detach", vdisk_id=vdisk_id)
+            ok, body = sidon_call("delete", vdisk_id=vdisk_id)
+            if not ok and "does not exist" not in str(body):
+                failures.append(f"{vdisk_id}: {str(body)[:200]}")
+        if failures:
+            return False, "Sidon refused to delete " + "; ".join(failures)
+        return True, f"{count} vdisk(s) deleted"
+
     for idx in range(count):
         res_name = f"{name}-disk{idx}"
         rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
@@ -1976,19 +2032,21 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
     letters = string.ascii_lowercase
     disk_devices_xml = ""
 
-    # Reconstruct disk paths
-    disk_paths = []
-    if disks_list:
-        disks_payload = disks_list.split(",")
-        for idx, entry in enumerate(disks_payload):
-            d_path = f"/dev/drbd/by-res/{name}-disk{idx}/0"
-            disk_paths.append(d_path)
-    else:
-        disk_paths = [f"/dev/drbd/by-res/{name}-disk0/0"]
+    disk_count = len(disks_list.split(",")) if disks_list else 1
 
-    for idx, d_path in enumerate(disk_paths):
-        dev_letter = letters[idx % 26]
-        disk_devices_xml += f"""
+    if using_sidon():
+        # A network disk over a unix socket: qemu speaks NBD to the local Sidon and never
+        # touches a block device, so there is no /dev node to promote, demote or leak,
+        # and no kernel client in the path.
+        module = sidon_module()
+        for idx in range(disk_count):
+            disk_devices_xml += module.disk_xml(
+                module.vdisk_id_for(name, idx), letters[idx % 26], vcpu)
+    else:
+        disk_paths = [f"/dev/drbd/by-res/{name}-disk{idx}/0" for idx in range(disk_count)]
+        for idx, d_path in enumerate(disk_paths):
+            dev_letter = letters[idx % 26]
+            disk_devices_xml += f"""
     <disk type='block' device='disk'>
       <driver name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'/>
       <source dev='{d_path}'/>
@@ -5892,7 +5950,41 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 
                 res_name = f"{name}-disk{idx}"
                 d_path = f"/dev/drbd/by-res/{res_name}/0"
-                
+
+                if using_sidon():
+                    module = sidon_module()
+                    vdisk_id = module.vdisk_id_for(name, idx)
+                    d_path = module.nbd_socket(vdisk_id)
+                    try:
+                        ok, body = sidon_call(
+                            "create", vdisk_id=vdisk_id,
+                            size_bytes=int(primary_size) * 1024 * 1024 * 1024)
+                        if not ok and "already exists" not in str(body):
+                            raise Exception(f"Sidon could not create vdisk {vdisk_id}: {body}")
+                        # Attached here rather than at boot: the socket has to exist
+                        # before libvirt starts the domain, and attaching is what claims
+                        # ownership and fixes the epoch every write of this disk carries.
+                        ok, body = sidon_call("attach", vdisk_id=vdisk_id)
+                        if not ok:
+                            raise Exception(f"Sidon could not attach vdisk {vdisk_id}: {body}")
+                    except Exception as e:
+                        # Same unwind as the LINSTOR path below: a half-created VM leaves
+                        # storage nothing in the UI can reach, which is the defect the
+                        # checked deleter exists to stop being recreated here.
+                        for created in created_disks:
+                            stale = os.path.basename(created).rsplit(".sock", 1)[0]
+                            sidon_call("detach", vdisk_id=stale)
+                            sidon_call("delete", vdisk_id=stale)
+                        log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name},
+                                          error_msg=str(e), task_id=task_id, created_at=created_at)
+                        self.send_json(500, {"error": f"Failed to allocate storage disk {idx}: {str(e)}"})
+                        return
+                    if idx == 0:
+                        primary_disk_size_gb = primary_size
+                    disk_paths.append(d_path)
+                    created_disks.append(d_path)
+                    continue
+
                 try:
                     # 1. Create resource definition
                     rc, out, err = run_linstor_cmd(f"resource-definition create {res_name}")

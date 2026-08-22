@@ -923,6 +923,40 @@ def run_argv(argv, timeout=45):
             res.stderr.decode("utf-8", errors="ignore"))
 
 
+_SIDON_MODULE = None
+
+
+def load_sidon_module():
+    """Import helios_sidon from wherever provisioning put it.
+
+    Same shape as the other cross-module imports here: the file ships to
+    /usr/local/bin, which is not on sys.path, and it also sits beside this daemon in a
+    source checkout. Cached because the alternative is re-reading the file on every
+    vdisk operation.
+    """
+    global _SIDON_MODULE
+    if _SIDON_MODULE is not None:
+        return _SIDON_MODULE
+    try:
+        import helios_sidon as module
+        _SIDON_MODULE = module
+        return module
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sidon.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "helios_sidon.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_sidon", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SIDON_MODULE = module
+        return module
+    raise ImportError("helios_sidon.py was not found")
+
+
 def valid_name(value):
     """True when value is a name safe to pass as a single argument."""
     return isinstance(value, str) and NAME_RE.match(value) is not None
@@ -3428,6 +3462,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/storage/container/ensure":
             self.handle_storage_container_ensure()
             return True
+        if path == "/api/v1/dfs/vdisk":
+            self.handle_dfs_vdisk()
+            return True
         if path == "/api/v1/storage/linstor/resource":
             self.handle_storage_linstor_resource()
             return True
@@ -3862,6 +3899,55 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject(str(exc), 500)
             return
         self.send_json_response(200, {"path": path, "created": not existed})
+
+    # -- Storage: Sidon (the extent-based DFS) --------------------------
+
+    # Sidon listens on a unix socket, not a port, so it is reachable only from code
+    # running natively on this host. Spectrum runs in a container and asks here instead,
+    # over the mutual TLS this daemon already terminates. That is the whole reason this
+    # endpoint exists: one authenticated surface for the cluster rather than a second
+    # certificate, a second port and a second thing to rotate, per storage tier.
+    DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping")
+
+    def handle_dfs_vdisk(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        op = payload.get("op")
+        if op not in self.DFS_OPS:
+            # An allow-list rather than a pass-through. Forwarding whatever arrives would
+            # make this endpoint exactly as powerful as the control socket it fronts,
+            # which defeats the point of fronting it.
+            self.reject("Unsupported DFS operation: %r" % (op,))
+            return
+
+        vdisk_id = payload.get("vdisk_id")
+        if op not in ("list", "ping") and not valid_name(vdisk_id):
+            self.reject("Invalid vdisk id")
+            return
+
+        try:
+            sidon = load_sidon_module()
+        except Exception as exc:
+            self.reject("helios_sidon is unavailable: %s" % exc, 500)
+            return
+
+        params = {k: v for k, v in payload.items() if k != "op"}
+        try:
+            result = sidon.call(op, **params)
+        except sidon.SidonError as exc:
+            # `kind` decides the status code, so a caller can tell a lost race from an
+            # outage without parsing prose: 409 means the answer will not change on a
+            # retry, 503 means it might.
+            status = 409 if exc.kind == "refused" else 503
+            self.send_json_response(status, {"error": str(exc), "kind": exc.kind})
+            return
+        except Exception as exc:
+            self.reject("sidon call failed: %s" % exc, 500)
+            return
+        self.send_json_response(200, result)
 
     # -- Storage: Linstor ----------------------------------------------
 
