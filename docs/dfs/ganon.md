@@ -78,18 +78,25 @@ easy case and real clusters do not fail cleanly:
 The matrix is the test plan; each cell is a named scenario with a seed, so every failure
 replays. The load-bearing rows:
 
-| Scenario | Attacks | DRBD adapter | Sidon adapter |
-|---|---|---|---|
-| Kill writer mid-burst, restart, verify | I-1, I-2 | ✓ | ✓ (journal replay) |
-| Kill one replica mid-burst, verify, heal, verify | I-1, I-6 | ✓ (resync) | ✓ (redirect + Purah) |
-| Partition writer from a replica, keep writing, heal | I-2, I-4 | ✓ (quorum armed) | ✓ |
-| **Stall owner, force takeover, resume the zombie, let it try** | **I-4** | primary switch + resume | fence + epoch rejection — *the* scenario |
-| Asymmetric partition during takeover | I-4 | ~ (where expressible) | ✓ |
-| Corrupt a replica, read everything | I-5 | ✗ — DRBD without integrity options is *expected to fail this*, which is itself a finding to document, not a harness bug | ✓ |
-| Kill during drain; kill during replay; kill between data-durable and map-commit | I-3 | n/a | ✓ |
-| Ownership transfer under load ×100, no faults | I-2, I-4 | primary switches | takeovers |
-| ENOSPC during drain | I-3 | ~ | ✓ |
-| Two Ganons race to attach one vdisk | I-4 | dual-primary refusal | lease refusal |
+| Scenario | Attacks | Nodes | DRBD adapter | Sidon adapter |
+|---|---|---|---|---|
+| Kill writer mid-burst, restart, verify | I-1, I-2 | 1 | ✓ | ✓ (journal replay) |
+| Kill during drain; kill during replay; kill between data-durable and map-commit | I-3 | 1 | n/a | ✓ |
+| ENOSPC during drain | I-3 | 1 | ~ | ✓ |
+| Corrupt a replica, read everything | I-5 | 1 | ✗ — DRBD without integrity options is *expected to fail this*, which is itself a finding to document, not a harness bug | ✓ (detect at any RF; repair only at RF≥2) |
+| Two Ganons race to attach one vdisk | I-4 | 1 | dual-primary refusal | lease refusal |
+| **Stall the owner, take over, resume the zombie, let it try** | **I-4** | 1 process-level / 2 host-level | primary switch + resume | fence + epoch rejection — *the* scenario. At RF1 the deposed writer is a stalled **process**, not a stalled host, and the rejection path is identical; the host-level form adds the network, not the mechanism. |
+| Kill one replica mid-burst, verify, heal, verify | I-1, I-6 | 2 | ✓ (resync) | ✓ (redirect + Purah) |
+| Partition writer from a replica, keep writing, heal | I-2, I-4 | 2 | ✓ (quorum armed) | ✓ |
+| Ownership transfer under load ×100, no faults | I-2, I-4 | 2 | primary switches | takeovers |
+| Asymmetric partition during takeover | I-4 | 3 | ~ (where expressible) | ✓ |
+
+Sorted by node requirement on purpose: **six of the ten rows run on one node**, including
+every I-3 row. That is not a consolation prize. The ordering bugs — data durable before
+the map says so, replay after a kill mid-drain, the commit that lands twice — are the
+ones that corrupt data silently and survive review, and they are all reachable on a
+single box. The rows that need peers are the ones about *reaching* the data, which fail
+loudly.
 
 ## 6. Adapters
 
@@ -105,12 +112,20 @@ the cells that only one substrate can express.
 
 ## 7. Where it runs
 
-- **CI tier**: single-node, minutes — kill/restart/verify, corruption/read-repair, the
-  deterministic subset. Green is a merge gate for every data-path change, enforced the
-  same way the rest of CI now is (discovery, not enumeration).
-- **Soak tier**: multi-node, hours to days, randomised scenario schedule from a printed
-  seed. Runs on the test cluster; a soak failure ships the seed, the ack journal and the
-  verdict as one artefact, because a distributed-storage bug report without a replay
+- **CI tier**: single-node, minutes — the deterministic subset of the rows above: kill and
+  restart, corruption detection, the I-3 ordering scenarios, ENOSPC, double-attach
+  refusal. Green is a merge gate for every data-path change, enforced the way the rest of
+  CI now is (discovery, not enumeration).
+- **Single-node soak**: hours to days on one box, randomised from a printed seed. This
+  tier exists because single-node is a supported topology
+  ([architecture.md §5](./architecture.md)), not because it is all the hardware we have.
+  It runs the process-level zombie scenario, the disk-misbehaviour injectors and the
+  power-loss proxy, none of which need a peer. A single-node cluster is a shipping
+  configuration and gets soaked like one.
+- **Multi-node soak**: three nodes, hours to days — the partition rows, the host-level
+  fencing rows, asymmetric partitions, and the kernel-death injector, which needs a node
+  you are willing to lose. A soak failure at any tier ships the seed, the ack journal and
+  the verdict as one artefact, because a distributed-storage bug report without a replay
   recipe is a rumour.
 - Implementation language: Rust, sharing the stamp/verify code with nothing — Ganon
   deliberately does not link Sidon's libraries, so a shared bug cannot vouch for itself.

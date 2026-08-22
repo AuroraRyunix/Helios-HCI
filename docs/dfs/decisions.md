@@ -89,4 +89,23 @@ final rule).
 **D-16 — Names: Sidon, Purah, Ganon.** Sidon (data path — Mipha's sibling, as HA and
 storage fencing genuinely are here), Purah (the scanner), Ganon (the recurring calamity
 the kingdom prepares for). Rejected: Revali — completes the champions set but greps as a
-substring of `revalidate`, which already appears in `spectrum_server.py` — and a name you cannot grep for cleanly is a name that costs debugging time on every future search. (The collision is with `revalidate`, not with `vali` itself; `vali` and `revali` are distinct tokens.) **Aether is not renamed**: it keeps its name, its documents and its meaning as the Linstor/DRBD substrate, and the two run side by side — reusing the name would make every sentence in every older document ambiguous about which layer it meant. `vg_aether` likewise stays, historical rather than descriptive, because renaming a volume group under live data to fix an aesthetic is not a trade worth making. The CLI is deliberately unnamed until milestone 7 rather than named badly now.
+substring of `revalidate`, which already appears in `spectrum_server.py` — and a name
+you cannot grep for cleanly is a name that costs debugging time on every future search.
+(The collision is with `revalidate`, not with `vali` itself; `vali` and `revali` are
+distinct tokens.) **Aether is not renamed**: it keeps its name, its documents and its
+meaning as the Linstor/DRBD substrate, and the two run side by side — reusing the name
+would make every sentence in every older document ambiguous about which layer it meant.
+`vg_aether` likewise stays, historical rather than descriptive, because renaming a
+volume group under live data to fix an aesthetic is not a trade worth making. The CLI is
+deliberately unnamed until milestone 7 rather than named badly now.
+
+**D-17 — A single node is a supported topology, not a stepping stone.** The alternative,
+adopted by most distributed stores, is to treat ftt=0 as a development mode: correctness
+arguments assume peers, the single-node path is the one nobody soaks, and the smallest
+deployment gets the least-tested code. Rejected because the reference cluster *is*
+single-node and many installs will never be otherwise. Concretely this commits three
+things: epoch fencing is never conditional on peer count (at RF1 it fences the previous
+*process*, which is a real hazard, not a formality); ftt=0's durability limit is stated in
+the invariant rather than hidden in a footnote; and Ganon gets a single-node soak tier
+that runs because the configuration ships, not because the lab is small. See
+[architecture.md §5](./architecture.md) and [ganon.md §5](./ganon.md).

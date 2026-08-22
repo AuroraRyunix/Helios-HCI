@@ -105,7 +105,52 @@ the filesystem gives us allocation, naming and fsync semantics that are boring a
 correct, and boring is the highest compliment a storage substrate's bottom layer can be
 paid.
 
-## 5. Deliberately out of scope
+## 5. Topologies: one node, two nodes, many
+
+**A single-node cluster is a supported topology, not a degraded one.** The reference
+cluster is single-node today (`redundancy_factor: 0` in `cluster.json`), and plenty of
+Helios installs will never be anything else — an edge box, a lab, a branch office, the
+first node of a cluster that grows later. A design that only becomes correct at three
+nodes is a design that does not work for its most common deployment.
+
+Nothing structural changes at RF=1. Write-all to one replica is a local write. The
+ownership CAS still runs, because Hydra is Hydra whether it is one node or five. Epoch
+fencing still does real work, and this is the part worth stating clearly: at RF=1 the
+epoch fences the *previous process*, not a previous host. A killed Sidon whose successor
+starts while the old one is still unwinding a drain is exactly the zombie-writer hazard
+of [ownership.md §3](./ownership.md), minus the network. The mechanism that makes
+multi-node takeover safe is the same mechanism that makes daemon restart safe, which is
+why it is not conditional on peer count.
+
+What genuinely changes:
+
+| At ftt=0 | Consequence |
+|---|---|
+| Durability (I-1) | Bounded by the container's `ftt`, and `ftt=0` tolerates nothing. Losing the node loses the data. The design does not pretend otherwise, and neither should any UI that offers the option. |
+| Scrub (I-5) | Still detects corruption; **cannot repair it** — there is no second copy to repair from. A corrupted extent becomes EIO, not a wrong answer. That is I-5 honoured and I-1 violated, and it is the correct trade: a loud failure beats a quiet lie. |
+| Purah | Re-replication has no work. GC, scrub and chain collapse all still run, and scrub matters *more* here, because detection is the only defence left. |
+| Takeover | Trivially local. The protocol is unchanged; step 2 fences the one replica, which happens to be this node's. |
+
+Why bother with the DFS at all on one node — since the port ceiling that motivated it is
+a multi-node symptom, and honesty requires answering this rather than assuming it:
+snapshots and clone-from-image become map operations instead of byte copies; thin
+allocation stops costing a kernel object per volume; reads are checksummed, which DRBD
+gives you only with integrity options nobody enables; and the same code path grows into
+RF2 by raising a number on a container, not by migrating substrate. If the cluster never
+grows, those still apply. If it does grow, nothing has to be redone.
+
+**Two nodes is the topology that improves most.** It is the case the current stack
+handles worst: with DRBD there is no storage fence at two nodes at all, because quorum
+arithmetic cannot distinguish a dead peer from an unreachable one, and `fencing.md` §8
+records that gap as residual-unsafe. Under Sidon a fence is a *message to a replica*,
+not an inference from a vote count, so two nodes get the same exact fence three nodes do.
+
+**Growth is a container property.** RF comes from `storage_containers.ftt` (D-10), so a
+one-node cluster that gains peers raises `ftt` on new containers and lets Purah
+re-replicate the existing ones in the background. There is no substrate migration and no
+flag day.
+
+## 6. Deliberately out of scope
 
 Stated here so their absence is a decision, not an accident. None of these is in v1, and
 several should never be built:
@@ -125,7 +170,7 @@ several should never be built:
   a C++ database fork is a treadmill with no payoff here; this is the recorded answer to
   "should we customise Scylla like Nutanix did Cassandra".
 
-## 6. Implementation language
+## 7. Implementation language
 
 Rust. Not by taste: this is the one component where a stray pointer or a data race *is*
 silent corruption discovered weeks later, the repo already ships a Rust daemon (Agahnim,

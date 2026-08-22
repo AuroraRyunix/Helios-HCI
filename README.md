@@ -124,7 +124,7 @@ Helios-HCI/
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed replicated block storage engine (replaced an earlier GlusterFS-based design). |
 | [Sidon](./docs/dfs/README.md) | **Stargate** (successor) | Native Rust systemd service — *designed, not built* | Per-node data-path daemon for the extent-based DFS. Serves VM disks to qemu over NBD, owns the replicated journal and the drain, and forwards to the vdisk's owner when it is not the owner itself. Intended to replace Aether's per-device DRBD replication. |
-| Purah | **Curator** — *designed, not built* | Leader-elected role inside Sidon | Re-replication after node loss, mark-sweep garbage collection, background scrub against seal hashes, and locality rebuild after ownership moves. |
+| [Purah](./docs/dfs/data-path.md) | **Curator** — *designed, not built* | Leader-elected role inside Sidon | Re-replication after node loss, mark-sweep garbage collection, background scrub against seal hashes, and locality rebuild after ownership moves. |
 | [Ganon](./docs/dfs/ganon.md) | — *designed, not built* | Rust test harness | Fault-injection harness: kills, stalls, partitions and corrupts a storage substrate, then asserts every read returned a legal value. Built and calibrated against DRBD **before** any DFS code exists, and useful against the shipping product on its own. |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Spectrum (Phoenix)](./docs/spectrum_phx.md) | **Prism** | Podman + Elixir/Phoenix LiveView | The console rewrite, running beside the Python tier on port 8444 and taking over routes as they are ported. Renders server-side and never touches the data path. |
@@ -269,7 +269,7 @@ All configuration parameters and certificates reside under standardized director
 
 Helios-HCI uses a lightweight, secure network layout for inter-node orchestration, consensus, and storage replication:
 
-* **Host-Network Service Ports**: Internal service APIs (Catalyst task queue on `9091`, Vali scheduler on `9095`) run in Quadlet containers with `Network=host` and bind to `0.0.0.0`, so they are reachable on the cluster network from any host that can route to them — there is no loopback-only restriction or request-level authentication in these handlers today (see [TODO.md](./TODO.md)).
+* **Host-Network Service Ports**: Internal service APIs (Catalyst task queue on `9091`, Vali scheduler on `9095`) run in Quadlet containers with `Network=host` and bind to `0.0.0.0`, so they are reachable on the cluster network from any host that can route to them. Both now terminate mutual TLS against the cluster CA with `verify_mode = CERT_REQUIRED`, so an unauthenticated caller is refused during the TLS handshake rather than inside a handler — the credential, not the bind address, is what confines them.
 * **Mutual TLS (mTLS) Mesh**: All cross-node administrative tasks and remote executions run securely over port `9099` via the **Spark Daemon**.
 * **Consensus & Metadata Mesh**: Database gossip (ScyllaDB on `7000`) and consensus election (ZooKeeper on `2888`/`3888`) route over cluster-facing networks.
 * **Floating Virtual IP (VIP)**: Managed dynamically by the **Bifrost** daemon, providing high-availability access to the Slate ingress on port `443`.

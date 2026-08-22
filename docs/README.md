@@ -62,7 +62,9 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Slate (Traefik) | [slate.md](./slate.md) | — |
 | Agahnim (Rust console proxy) | [agahnim.md](./agahnim.md) | — |
 
-## DFS design (Sidon)
+## DFS design (Sidon, Purah, Ganon)
+
+Design documents for the extent-based replacement of Linstor/DRBD. **None of this is implemented** — `sidon`, `purah` and `ganon` are names with specifications behind them and no code yet. The build order is in `milestones.md`; the first thing built is the harness.
 
 | Document | Covers |
 | :-- | :-- |

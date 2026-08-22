@@ -14,6 +14,12 @@ The documents are the deliverable. Review ends when every "named hard problem"
 (exactly-once drain, takeover proof, GC race) has a chosen solution and a rejected
 alternative on record.
 
+**Milestones 0–4 and 6 are gateable on a single node**, because single-node is a
+supported topology rather than a stepping stone ([architecture.md §5](./architecture.md))
+and because the invariants that fail *silently* — the I-3 ordering rules — are all
+reachable without a peer. Milestone 5 is where peers become mandatory: its whole subject
+is what happens between hosts. Plan the hardware for 5, not for 1.
+
 ## 1. Ganon vs DRBD
 
 Build the harness ([ganon.md](./ganon.md)); calibrate it against the substrate two
@@ -23,6 +29,11 @@ decades of production says is correct. Run the full applicable matrix against th
 - **Gate:** Ganon's verdicts on DRBD match DRBD's documented semantics — including the
   expected corruption-detection failure, which must be reported as a substrate property,
   not a harness bug.
+- **Hardware:** the single-node tier of [ganon.md §7](./ganon.md) is the gate for closing
+  this milestone; six of the ten matrix rows and the whole CI tier need one box, which is
+  what exists. The multi-node soak opens when peers exist and is a *continuing* activity,
+  not a prerequisite for milestone 2 — otherwise the entire schedule blocks on a
+  purchase order.
 - **Abandonment value: high.** A systematic attacker for the shipping product, wired
   into CI, plus whatever it finds. This milestone is worth funding even if the word
   "Sidon" is never spoken again.

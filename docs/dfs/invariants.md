@@ -16,6 +16,14 @@ every subsequent read of that range (until overwritten), across any combination 
 failures the container's `ftt` claims to tolerate: any single node/disk loss at ftt=1,
 any two at ftt=2. "Acknowledged" means the NBD reply left Sidon; there is no weaker ack.
 
+At **ftt=0** — the single-node case, which is supported
+([architecture.md §5](./architecture.md)) — this invariant tolerates *nothing*, by
+arithmetic rather than by weakness. The node is the failure domain and losing it loses the
+data. I-1 still binds within the node: a crash, a power cut, a killed daemon, a torn write
+must all leave every acknowledged write readable, and the journal exists precisely for that.
+What ftt=0 removes is the ability to survive the hardware, not the ability to survive the
+software. Ganon tests exactly that distinction on one node.
+
 **I-2 — Legal history.** A read of any range returns, for each atomicity unit, either
 the most recently acknowledged write of that unit or — during the window where a write
 was issued but never acknowledged — that unacknowledged write in full. Never a third
