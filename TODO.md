@@ -641,14 +641,24 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   must be identical cluster-wide — with per-node secrets, Slate moving a request to a
   different backend logs the operator out — and regenerating it on each rollout would do
   that to every live session.
-* **The signed upgrade package still cannot carry a binary or an image.**
-  `create_upgrade_zip.py` ships files to fixed paths, and `hylia` applies them by copying;
-  neither can build a crate or a container. So `sidon`, `ganon`, `agahnim` and the Phoenix
-  console reach a cluster only through `deploy_updates.py`, which is a developer pushing
-  from a checkout rather than an operator applying a signed release. That is a design
-  question about what a signed release contains — sources plus a build step, with the
-  reproducibility problem that implies, or binaries, with the "who signed this artefact"
-  problem that implies — and not a missing entry in a list.
+* ~~The signed upgrade package cannot carry a binary.~~ **Resolved for the Rust services
+  (2026-08-22): it carries sources and hylia builds them.** Signing a tarball of Rust a
+  reader can audit is a claim about the code; signing an ELF is a claim about whoever's
+  machine produced it. The cost is stated rather than hidden -- every node needs a
+  toolchain and the build takes minutes -- and the ordering makes it survivable: nothing
+  touches the live binary until the new one has compiled, so a failure is a node that did
+  not update rather than a node without storage.
+
+  Reproducibility is the whole argument, so it is pinned and tested: entries sorted, mtime
+  and ownership zeroed, CRLF normalised, and no filename in the gzip header. That last one
+  was a real defect the test caught and an ad-hoc check missed, because building to the
+  same path twice hides it. `Cargo.lock` is committed for all three crates and hylia
+  builds `--locked`; without it the signature would cover this repository's code and not
+  the two hundred-odd crates compiled in beside it.
+
+  **Still open, and different in kind: the console's container image.** It pulls base
+  images from a public registry at build time, so putting it in a signed package means
+  either vendoring those bases or admitting the build is not hermetic.
 * **`provision.py` does not know about the Phoenix console.** A fresh cluster gets the
   Python one and gains this one on its first `deploy_updates.py` run. Wiring it needs the
   cluster-wide `SECRET_KEY_BASE` generated at cluster-create time.
