@@ -44,33 +44,6 @@ VIP = ""
 PREFIX = ""
 GATEWAY = ""
 
-AETHER_STORAGE_JSON = """{
-    "storage_pool_name": "default-pool",
-    "dfs_engine": "linstor",
-    "local_disks": [
-        {
-            "device": "/dev/sdb",
-            "role": "data",
-            "fs_type": "xfs"
-        }
-    ],
-    "storage_containers": [
-        {
-            "name": "default-vm-container",
-            "path": "/default-pool/vms",
-            "ftt": 0,
-            "compression": "lz4",
-            "quota_bytes": 0
-        },
-        {
-            "name": "iso-container",
-            "path": "/default-pool/isos",
-            "ftt": 0,
-            "compression": "none",
-            "quota_bytes": 0
-        }
-    ]
-}"""
 
 # Podman Quadlet Unit Templates (systemd container configurations)
 
@@ -90,8 +63,6 @@ AETHER_STORAGE_JSON = """{
 IMAGES = {
     "zookeeper": "docker.io/library/zookeeper:3.9.2",
     "hydra-db": "docker.io/scylladb/scylla:5.4.0",
-    "aether": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
-    "linstor-controller": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
     "slate": "docker.io/library/traefik:v2.10",
 }
 
@@ -160,77 +131,9 @@ Exec=--listen-address {node_ip} --broadcast-address {node_ip} --broadcast-rpc-ad
 WantedBy=multi-user.target
 """,
 
-    "linstor-controller": """[Unit]
-Description=Linstor Controller Container (Aether Orchestrator)
-After=hydra-db.service
-
-[Service]
-Restart=always
-CPUWeight=200
-MemoryMax=1G
-MemoryHigh=900M
-
-[Container]
-Image={image}
-Network=host
-Volume=/var/lib/linstor:/var/lib/linstor:z
-Volume=/etc/linstor:/etc/linstor:z
-Exec=startController
-
-[Install]
-WantedBy=multi-user.target
-""",
-
-    "aether": """[Unit]
-Description=Linstor Satellite Container (Aether Storage Engine Backend)
-After=hydra-db.service
-
-[Service]
-Restart=always
-CPUWeight=500
-MemoryMax=1G
-MemoryHigh=900M
-ExecStartPre=-/usr/bin/mkdir -p /etc/systemd/system/drbd.service.d
-ExecStartPre=-/usr/bin/bash -c "printf '[Unit]\\\\nAfter=lvm2-monitor.service network-online.target\\\\nWants=lvm2-monitor.service network-online.target\\\\n' > /etc/systemd/system/drbd.service.d/override.conf"
-ExecStartPre=-/usr/bin/systemctl daemon-reload
-
-[Container]
-Image={image}
-Network=host
-Volume=/dev:/dev
-Volume=/lib/modules:/lib/modules:ro
-Volume=/run:/run
-Volume=/var/lib/linstor:/var/lib/linstor:z
-Volume=/etc/linstor:/etc/linstor:z
-Volume=/etc/drbd.d:/var/lib/linstor.d:z
-
-## --privileged stays here, unlike spectrum.container, and the difference is real.
-##
-## The Linstor satellite is the one component whose job *is* to manipulate the host:
-## it loads the DRBD kernel module, creates and tears down block devices, drives
-## device-mapper and LVM, and writes /etc/drbd.d. That needs at minimum SYS_MODULE,
-## SYS_ADMIN, MKNOD and access to every backing device -- and the set is not stable,
-## because it depends on which storage layer a pool is configured with.
-##
-## Scoping it to explicit AddDevice/AddCapability grants is the right end state, but
-## it has to be derived from an audit of what the satellite actually calls rather
-## than guessed, and got wrong it fails as silent storage corruption rather than a
-## clean permission error. Tracked in TODO.md.
-PodmanArgs=--privileged
-Exec=startSatellite
-
-[Install]
-WantedBy=multi-user.target
-""",
-
-    # NOTE: /etc/hci/spectrum is mounted :z (shared label), not :Z (private MCS category).
-# :Z relabels recursively, which includes /etc/hci/spectrum/certs -- and slate.container
-# mounts that same certs directory to serve TLS. A private category there is unreadable
-# by any other container, so Slate would fail to load its certificate. It only works
-# today because these hosts run SELinux in Permissive mode; under Enforcing it breaks.
     "spectrum": """[Unit]
 Description=Spectrum (Prism) Web Console & Management UI
-After=hydra-db.service aether.service
+After=hydra-db.service
 
 [Service]
 Restart=always
@@ -256,10 +159,11 @@ Volume=/var/lib/hci/aether/volumes:/var/lib/hci/aether/volumes:rslave
 ## cluster, and a compromise of it was a compromise of the boot disk.
 ##
 ## What it did not grant: any working path to storage. Podman's /dev carries device
-## nodes but not udev's subdirectories, so /dev/drbd/by-res/<resource>/0 -- which is
-## the form every code path here uses -- does not exist in the container at all.
-## That is why image upload failed with ENOENT for as long as it existed: not a
-## missing permission, a missing path. Adding privilege could never have fixed it.
+## nodes but not udev's subdirectories, so the /dev/drbd/by-res/<resource>/0 path every
+## code path then used did not exist in the container at all. That is why image upload
+## failed with ENOENT for as long as it existed: not a missing permission, a missing
+## path. Adding privilege could never have fixed it. Storage now reaches the container
+## not at all -- it relays uploads to spark, which owns the data path.
 ##
 ## Storage operations belong to spark-daemon, which runs on the host and owns the
 ## data path the way Stargate rather than Prism does on Nutanix. See docs/spark_api.md.
@@ -407,38 +311,6 @@ class RemoteNode:
         
         return exit_status, out_str, err_str
 
-    def check_secure_boot(self):
-        """Return 'enabled', 'disabled', or 'unknown' for this host's Secure Boot state.
-
-        DRBD is shipped as an out-of-tree kernel module (kmod-drbd9x from ELRepo). With
-        Secure Boot active and the ELRepo key not enrolled in the MOK database, the
-        module is refused at load time with "Key was rejected by service", which takes
-        the entire storage layer down. Detect it up front rather than discovering it
-        after the host has already been renamed, re-addressed and repackaged.
-        """
-        # Legacy/BIOS boot cannot have Secure Boot active at all.
-        _, firmware, _ = self.execute(
-            "test -d /sys/firmware/efi && echo efi || echo bios", check_exit=False)
-        if firmware.strip() == "bios":
-            return "disabled"
-
-        _, out, _ = self.execute("mokutil --sb-state 2>/dev/null", check_exit=False)
-        state = out.strip().lower()
-        if "disabled" in state:
-            return "disabled"
-        if "enabled" in state:
-            return "enabled"
-
-        # mokutil is not installed on a minimal image; read the EFI variable directly.
-        # The SecureBoot variable's final byte is 1 when enabled, 0 when disabled.
-        _, raw, _ = self.execute(
-            "od -An -t u1 /sys/firmware/efi/efivars/"
-            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -s ' '",
-            check_exit=False)
-        parts = raw.split()
-        if parts:
-            return "enabled" if parts[-1] == "1" else "disabled"
-        return "unknown"
 
     def write_file(self, path, content):
         """Write content to a file on the remote host using SFTP.
@@ -709,26 +581,12 @@ def main():
                 print(f"[FATAL] [{target_ip}] Could not connect to either target IP or DHCP IP {dhcp_ip}.")
                 return
 
-        # Pre-flight: refuse to provision a host that cannot load the DRBD module.
-        # This runs before the host is re-addressed, renamed or repackaged, so a failure
-        # here leaves the node exactly as it was found.
-        sb_state = node.check_secure_boot()
-        if sb_state == "enabled":
-            print(f"[FATAL] [{connected_ip}] Secure Boot is ENABLED on this host. Refusing to provision.")
-            print(f"[{connected_ip}]   DRBD ships as an out-of-tree kernel module (kmod-drbd9x). With Secure Boot")
-            print(f"[{connected_ip}]   active and the ELRepo key not enrolled, 'modprobe drbd' is refused with")
-            print(f"[{connected_ip}]   \"Key was rejected by service\" and the entire storage layer is dead.")
-            print(f"[{connected_ip}]   Resolve it in one of two ways, then re-run this provisioner:")
-            print(f"[{connected_ip}]     1. Disable Secure Boot in the host/VM firmware settings (simplest), or")
-            print(f"[{connected_ip}]     2. Enroll the ELRepo signing key and reboot to confirm at the console:")
-            print(f"[{connected_ip}]        mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
-            print(f"[{connected_ip}]   Nothing on this node has been modified.")
-            node.close()
-            return
-        elif sb_state == "unknown":
-            print(f"[{connected_ip}] [WARNING] Could not determine Secure Boot state (mokutil absent and EFI")
-            print(f"[{connected_ip}]           variable unreadable). Continuing, but if 'modprobe drbd' fails")
-            print(f"[{connected_ip}]           with \"Key was rejected by service\", Secure Boot is the cause.")
+        # There is no Secure Boot pre-flight any more, and that is worth stating rather
+        # than silently dropping. This used to refuse to provision a host with Secure Boot
+        # enabled, because DRBD shipped as an out-of-tree kernel module (kmod-drbd9x) that
+        # the kernel rejects when the ELRepo key is not enrolled -- taking the whole
+        # storage layer down. Sidon is a userspace daemon speaking NBD over a unix socket,
+        # so it loads no module, and Secure Boot can simply stay on.
 
         # NMCLI static IP migration
         if connected_ip != target_ip:
@@ -791,29 +649,10 @@ def main():
                 "rm -f /etc/yum.repos.d/*elrepo-release-10*.repo || true",
                 "dnf install -y --nogpgcheck dnf-plugins-core || true",
                 "dnf install -y --nogpgcheck https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm || true",
-                "dnf install -y --nogpgcheck openssl podman qemu-kvm libvirt nfs-utils lvm2 iproute grep drbd9x-utils kmod-drbd9x cargo clang lld ipmitool"
+                "dnf install -y --nogpgcheck openssl podman qemu-kvm libvirt nfs-utils lvm2 iproute grep cargo clang lld ipmitool"
             ]
             for cmd in dnf_cmds:
                 node.execute(cmd, check_exit=True)
-
-            print(f"[{node.ip}] Loading DRBD kernel module...")
-            # Not `|| true`: if the module will not load, every storage operation from
-            # here on is broken, and swallowing it only defers the failure to a much
-            # more confusing point. The Secure Boot pre-flight catches the common cause
-            # before provisioning starts; this catches the rest (missing kmod build for
-            # the running kernel, ELRepo install failure above, etc.).
-            rc_drbd, out_drbd, err_drbd = node.execute("modprobe drbd", check_exit=False)
-            if rc_drbd != 0:
-                detail = (err_drbd or out_drbd).strip()
-                print(f"[FATAL] [{node.ip}] Could not load the DRBD kernel module: {detail}")
-                if "key was rejected" in detail.lower():
-                    print(f"[{node.ip}]   This is Secure Boot rejecting the unsigned out-of-tree module.")
-                    print(f"[{node.ip}]   Disable Secure Boot in firmware, or enroll the ELRepo key with:")
-                    print(f"[{node.ip}]     mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
-                else:
-                    print(f"[{node.ip}]   Check that kmod-drbd9x matches the running kernel ({{uname -r}}):")
-                    print(f"[{node.ip}]     dnf install -y kmod-drbd9x && uname -r && rpm -q kmod-drbd9x")
-                raise Exception(f"DRBD kernel module failed to load on {node.ip}: {detail}")
 
             print(f"[{node.ip}] Enabling KVM ignore_msrs for nested virtualization stability...")
             node.execute("echo 'options kvm ignore_msrs=Y' > /etc/modprobe.d/kvm.conf")
@@ -834,8 +673,9 @@ def main():
 
             print(f"[{node.ip}] Creating host storage mount directories...")
             node.execute("mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log "
-                         "/var/lib/hci/hydra/data /var/lib/linstor /etc/linstor /run/hci "
-                         "/etc/hci/spectrum/certs /etc/hci/slate /var/lib/hci/aether/volumes")
+                         "/var/lib/hci/hydra/data /run/hci "
+                         "/etc/hci/spectrum/certs /etc/hci/slate /var/lib/hci/aether/volumes "
+                         "/var/lib/hci/images")
         except Exception as e:
             print(f"[{node.ip}] Package/Directory setup failed: {e}")
             node.close()
@@ -1214,8 +1054,8 @@ WantedBy=multi-user.target
             node.execute("chmod +x /usr/local/bin/impa")
 
             # Metadata backup and restore. The keyspace is the only statement of which
-            # DRBD volume belongs to which VM -- the volumes survive a node loss and
-            # mean nothing without it.
+            # extent group holds which part of which vdisk -- the extents survive a node
+            # loss and mean nothing without the map.
             node.write_file("/usr/local/bin/saga", base64.b64decode(SAGA_B64).decode('utf-8'))
             node.execute("chmod +x /usr/local/bin/saga")
 
@@ -1303,7 +1143,7 @@ WantedBy=multi-user.target
             cluster_json_data = {
                 "cluster_name": "hci-01",
                 "redundancy_factor": 1,
-                "dfs_engine": "linstor",
+                "dfs_engine": "sidon",
                 "vip": VIP,
                 "hosts": []
             }
@@ -1316,14 +1156,10 @@ WantedBy=multi-user.target
             cluster_json_str = json.dumps(cluster_json_data, indent=4)
             node.write_file("/etc/hci/cluster.json", cluster_json_str)
 
-            # Aether Storage configuration
-            AETHER_STORAGE_JSON = '''{
-                "storage_pool_name": "default-pool",
-                "dfs_engine": "linstor",
-                "thin_pool_name": "thin-pool",
-                "vg_name": "linstor_vg"
-            }'''
-            node.write_file("/etc/hci/aether/storage-pools.json", AETHER_STORAGE_JSON)
+            # No storage-pools.json. It described LINSTOR's view of the disks -- a pool
+            # name, a thin pool, a volume group -- and Sidon has none of that: it writes
+            # extent groups as files onto one filesystem, and where that filesystem lives
+            # is decided by the mount, not by a configuration file.
 
             node.write_file("/etc/hci/zookeeper/myid", str(idx))
 
@@ -1472,27 +1308,26 @@ WantedBy=multi-user.target
                 image=resolve_image("zookeeper"))
             db_quad = QUADLETS["hydra-db"].format(
                 seeds=seed_ips, node_ip=node.ip, image=resolve_image("hydra-db"))
-            aether_quad = QUADLETS["aether"].format(image=resolve_image("aether"))
             spec_quad = QUADLETS["spectrum"]
             
             node.write_file("/etc/containers/systemd/zookeeper.container", zoo_quad)
             node.write_file("/etc/containers/systemd/hydra-db.container", db_quad)
-            node.write_file("/etc/containers/systemd/aether.container", aether_quad)
             node.write_file("/etc/containers/systemd/spectrum.container", spec_quad)
             
             slate_quad = QUADLETS["slate"].format(image=resolve_image("slate"))
             node.write_file("/etc/containers/systemd/slate.container", slate_quad)
-            
-            controller_quad = QUADLETS["linstor-controller"].format(
-                image=resolve_image("linstor-controller"))
-            node.write_file("/etc/containers/systemd/linstor-controller.container", controller_quad)
             
             # Remove stale Quadlets. spark/odin are legacy names; the rest are from the
             # abandoned Quadlet migration (75b3203) that pointed 11 services at a
             # localhost/helios-base image no commit ever built. They are native units
             # again, so any leftover .container here would generate a conflicting unit.
             stale_quadlets = ["spark", "odin", "spark-daemon", "bifrost", "dagur", "mimir", "vali",
-                              "gatoway", "urbosa", "logos", "mipha", "catalyst", "hylia"]
+                              "gatoway", "urbosa", "logos", "mipha", "catalyst", "hylia",
+                              # The storage tier that used to live here. A node upgraded
+                              # from a DRBD cluster still has these on disk, and a leftover
+                              # .container generates a unit that starts a satellite against
+                              # a controller which no longer exists.
+                              "aether", "linstor-controller"]
             node.execute("rm -f " + " ".join(f"/etc/containers/systemd/{q}.container" for q in stale_quadlets))
             node.execute("systemctl daemon-reload")
         except Exception as e:
@@ -1503,12 +1338,7 @@ WantedBy=multi-user.target
         # Phase 5: Starting Core Platform Services
         try:
             print(f"[{node.ip}] Activating services via systemd...")
-            try:
-                node.execute("systemctl start linstor-controller")
-            except Exception as e:
-                print(f"[{node.ip}] Warning: linstor-controller failed to start: {e}")
-                    
-            services = ["zookeeper", "hydra-db", "aether", "slate"]
+            services = ["zookeeper", "hydra-db", "slate"]
             for svc in services:
                 try:
                     node.execute(f"systemctl start {svc}")

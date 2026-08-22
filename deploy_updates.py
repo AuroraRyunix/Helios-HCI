@@ -181,8 +181,6 @@ local_static_dir = os.path.join(local_dir, "static")
 # quadlet bodies are a second copy of the ones there, and a rolling update that wrote a
 # different image than provisioning did would silently downgrade a service.
 IMAGES = {
-    "aether": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
-    "linstor-controller": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
     "slate": "docker.io/library/traefik:v2.10",
 }
 
@@ -434,59 +432,9 @@ Environment=PYTHONUNBUFFERED=1
 CPUWeight=200
 """
 
-aether_container_content = """[Unit]
-Description=Linstor Satellite Container (Aether Storage Engine Backend)
-After=hydra-db.service
-
-[Service]
-Restart=always
-CPUWeight=500
-MemoryMax=1G
-MemoryHigh=900M
-ExecStartPre=-/usr/bin/mkdir -p /etc/systemd/system/drbd.service.d
-ExecStartPre=-/usr/bin/bash -c "printf '[Unit]\\\\nAfter=lvm2-monitor.service network-online.target\\\\nWants=lvm2-monitor.service network-online.target\\\\n' > /etc/systemd/system/drbd.service.d/override.conf"
-ExecStartPre=-/usr/bin/systemctl daemon-reload
-
-[Container]
-Image=""" + resolve_image("aether") + """
-Network=host
-Volume=/dev:/dev
-Volume=/lib/modules:/lib/modules:ro
-Volume=/run:/run
-Volume=/var/lib/linstor:/var/lib/linstor:z
-Volume=/etc/linstor:/etc/linstor:z
-Volume=/etc/drbd.d:/var/lib/linstor.d:z
-PodmanArgs=--privileged
-Exec=startSatellite
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-linstor_controller_content = """[Unit]
-Description=Linstor Controller Container (Aether Orchestrator)
-After=hydra-db.service
-
-[Service]
-Restart=always
-CPUWeight=200
-MemoryMax=1G
-MemoryHigh=900M
-
-[Container]
-Image=""" + resolve_image("linstor-controller") + """
-Network=host
-Volume=/var/lib/linstor:/var/lib/linstor:z
-Volume=/etc/linstor:/etc/linstor:z
-Exec=startController
-
-[Install]
-WantedBy=multi-user.target
-"""
-
 spectrum_container_content = """[Unit]
 Description=Spectrum (Prism) Web Console & Management UI
-After=hydra-db.service aether.service
+After=hydra-db.service
 ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
@@ -570,7 +518,7 @@ def deploy_to_node(ip):
             put_text_file(sftp, local_impa, "/usr/local/bin/impa")
 
             # Metadata backup and restore. The keyspace is the only statement of
-            # which DRBD volume belongs to which VM.
+            # which extent group holds which part of which vdisk.
             print(f"[{ip}] Uploading saga to /usr/local/bin/saga...")
             put_text_file(sftp, local_saga, "/usr/local/bin/saga")
 
@@ -736,18 +684,17 @@ def deploy_to_node(ip):
             f_proxy.write(daruk_service_content)
             f_proxy.close()
             
-            # 3. Update aether.container Quadlet
-            print(f"[{ip}] Writing updated aether.container Quadlet...")
-            f = sftp.open("/etc/containers/systemd/aether.container", "w")
-            f.write(aether_container_content)
-            f.close()
-            
-            # Write controller on all nodes for HA control plane
-            print(f"[{ip}] Writing linstor-controller.container Quadlet...")
-            f_ctrl = sftp.open("/etc/containers/systemd/linstor-controller.container", "w")
-            f_ctrl.write(linstor_controller_content)
-            f_ctrl.close()
-            
+            # The satellite and controller Quadlets are removed rather than written.
+            # A node upgraded from a DRBD cluster still carries both, and a leftover
+            # .container generates a unit that starts a satellite against a controller
+            # which no longer exists.
+            for stale in ("aether", "linstor-controller"):
+                try:
+                    sftp.remove(f"/etc/containers/systemd/{stale}.container")
+                    print(f"[{ip}] Removed stale {stale}.container Quadlet.")
+                except IOError:
+                    pass
+
             # 3a. Update spectrum.container Quadlet
             print(f"[{ip}] Writing updated spectrum.container Quadlet...")
             f_spec = sftp.open("/etc/containers/systemd/spectrum.container", "w")
@@ -895,39 +842,15 @@ def deploy_to_node(ip):
             if exit_code != 0:
                 print(f"[{ip}] Error enabling/restarting spark-daemon and bifrost: {stderr.read().decode()}")
                 
-            # 8. Force unmount and remount Aether volume locally to clear any stale mount points immediately, but ONLY if no VMs are running to avoid storage disruption.
-            stdin, stdout, stderr = ssh.exec_command("virsh -c qemu:///system list --name | grep -v '^$'")
-            running_vms = stdout.read().decode().strip()
-            if running_vms:
-                print(f"[{ip}] VM(s) running ({running_vms.replace(chr(10), ', ')}). Skipping Aether storage remount and restart to prevent VM storage failure.")
-                # Dynamically apply CPUWeight to aether on host without restart
-                ssh.exec_command("systemctl set-property aether CPUWeight=500")
-            else:
-                print(f"[{ip}] Remounting Aether DRBD volume and opening firewall ports...")
-                cmd_remount = (
-                    "umount -l /var/lib/hci/aether/volumes/default-vm-container || true; "
-                    "umount -l /var/lib/hci/aether/volumes/default-image-container || true; "
-                    "mkdir -p /var/lib/hci/aether/volumes/default-vm-container || true; "
-                    "mountpoint -q /var/lib/hci/aether/volumes/default-vm-container || "
-                    "mount -t xfs /dev/drbd/by-res/default-vm-container/0 /var/lib/hci/aether/volumes/default-vm-container || true; "
-                    "mkdir -p /var/lib/hci/aether/volumes/default-image-container || true; "
-                    "mountpoint -q /var/lib/hci/aether/volumes/default-image-container || "
-                    "mount -t xfs /dev/drbd/by-res/default-image-container/0 /var/lib/hci/aether/volumes/default-image-container || true; "
-                    "firewall-cmd --permanent --add-port=49152-49215/tcp && firewall-cmd --reload || true"
-                )
-                stdin, stdout, stderr = ssh.exec_command(cmd_remount)
-                exit_code = stdout.channel.recv_exit_status()
-                if exit_code != 0:
-                    print(f"[{ip}] Error remounting Aether or configuring firewall: {stderr.read().decode()}")
-                    
-                # 9. Restart aether to make sure systemd registers everything cleanly
-                print(f"[{ip}] Restarting aether storage service...")
-                stdin, stdout, stderr = ssh.exec_command("systemctl restart aether")
-                exit_code = stdout.channel.recv_exit_status()
-                if exit_code != 0:
-                    print(f"[{ip}] Error restarting aether: {stderr.read().decode()}")
-    
-                
+            # 8. Open the migration port range. There is no storage remount any more:
+            # the extent store is one XFS filesystem mounted by fstab at boot, not two
+            # DRBD devices that had to be unmounted and remounted to clear stale mount
+            # points -- and which this had to skip whenever a VM was running, because
+            # remounting storage under a live guest breaks it.
+            ssh.exec_command(
+                "firewall-cmd --permanent --add-port=49152-49215/tcp && "
+                "firewall-cmd --reload || true")
+
             if not fast_mode:
                 # Ensure clang and lld are installed on target host
                 stdin_chk, stdout_chk, stderr_chk = ssh.exec_command("which clang && which lld")

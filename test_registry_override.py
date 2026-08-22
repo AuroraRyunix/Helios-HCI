@@ -68,8 +68,8 @@ class ResolverTests(unittest.TestCase):
         provision.REGISTRY = "mirror.local:5000"
         self.assertEqual(provision.resolve_image("zookeeper"),
                          "mirror.local:5000/library/zookeeper:3.9.2")
-        self.assertEqual(provision.resolve_image("aether"),
-                         "mirror.local:5000/piraeusdatastore/piraeus-server:v1.31.0")
+        self.assertEqual(provision.resolve_image("hydra-db"),
+                         "mirror.local:5000/scylladb/scylla:5.4.0")
 
     def test_a_trailing_slash_does_not_double_up(self):
         provision.REGISTRY = "mirror.local:5000/"
@@ -95,8 +95,6 @@ class QuadletTests(unittest.TestCase):
     FORMAT_ARGS = {
         "zookeeper": dict(node_id=1, zoo_servers="s", peer_type=""),
         "hydra-db": dict(seeds="10.0.0.1", node_ip="10.0.0.1"),
-        "aether": {},
-        "linstor-controller": {},
         "slate": {},
     }
 
@@ -129,19 +127,19 @@ class CatalogueAgreementTests(unittest.TestCase):
                     "a rolling update would write a different image than provisioning did")
 
     def test_deploy_updates_covers_the_quadlets_it_rewrites(self):
-        # It rewrites aether, the linstor controller and slate. Any of those missing from
-        # its catalogue means that quadlet still carries a hardcoded registry.
+        # Any Quadlet it writes must be in its catalogue, or that Quadlet still carries a
+        # hardcoded registry and a mirrored install pulls from the internet.
         theirs = literal_images_from("deploy_updates.py")
-        for name in ("aether", "linstor-controller", "slate"):
-            self.assertIn(name, theirs)
+        self.assertIn("slate", theirs)
 
-    def test_each_component_resolves_under_its_own_key(self):
-        # aether and the linstor controller happen to be the same image today. Resolving
-        # the controller under the aether key works by coincidence and would break
-        # silently the moment either moved.
+    def test_the_storage_quadlets_are_gone_rather_than_merely_unused(self):
+        # aether and linstor-controller were the satellite and controller. Leaving their
+        # image references behind would have a mirrored install pulling a storage engine
+        # nothing starts -- and would be the first thing someone reinstated by accident.
         source = io.open(os.path.join(HERE, "deploy_updates.py"), encoding="utf-8").read()
-        self.assertIn('resolve_image("linstor-controller")', source)
-        self.assertEqual(source.count('resolve_image("aether")'), 1)
+        self.assertNotIn("piraeusdatastore", source)
+        self.assertNotIn('resolve_image("aether")', source)
+        self.assertNotIn('resolve_image("linstor-controller")', source)
 
 
 class DockerfileTests(unittest.TestCase):
