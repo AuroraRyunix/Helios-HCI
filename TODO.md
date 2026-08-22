@@ -225,6 +225,22 @@ already-fixed when it had never worked.
 
 ## P1 — Metadata layer (Daruk as a Medusa Store)
 
+* **ZooKeeper observers cannot be promoted, so quorum is bound to three arbitrary nodes.**
+  `provision.py` makes the first three provisioned nodes voters and everything above node 3 an
+  observer (`ZOO_PEER_TYPE=observer if idx > 3`). That part is right -- observers scale reads without
+  slowing writes. The gap is that there is no way to change the set afterwards: lose two of those three
+  and cluster coordination stops with every other node healthy and idle, and a decommissioned voter
+  takes its vote with it.
+  ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed version is **3.9.2**, so
+  the mechanism is present and merely switched off -- `/conf/zoo.cfg` sets `standaloneEnabled=true` and
+  never sets `reconfigEnabled`, so `reconfig` is refused. Verified on the live node.
+  Needs: `reconfigEnabled=true` in the Quadlet config, a `cluster zk-promote` / `zk-demote` path that
+  refuses any change that would lose quorum mid-reconfiguration, promotion wired into
+  `cluster decommission` so removing a voter hands its vote on, and the dynamic config file
+  (`zoo.cfg.dynamic`) accounted for in provisioning -- once reconfig is enabled, ZooKeeper owns
+  membership and a provisioner that rewrites `zoo.cfg` wholesale will fight it.
+  Nutanix migrates the ZooKeeper role off a permanently-failed node; this is the same idea.
+
 * ~~Catalyst double-claims scheduled jobs.~~ **Resolved (2026-08-21)**: `claim_scheduled_run()` takes
   the tick with `IF last_run_epoch = ?` through Daruk's `/v1/schedule/claim-job` before anything is
   written or queued; a refusal or an unreachable Daruk skips the tick, because a skipped tick runs ten
@@ -304,6 +320,26 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 ---
 
 ## P2 — Storage / DFS
+
+* **191 replicated volumes, cluster-wide, whatever the node count.** LINSTOR's
+  `TcpPortAutoRange` is its default `7700-7890` -- 191 ports, one per DRBD resource, and Helios never
+  sets it. That is the ceiling on VM disks plus images for the whole cluster: at twenty nodes it is
+  about nine VMs per host. It surfaces as a confusing LINSTOR error at create time, not as "out of
+  capacity". Verified on the live cluster, where four resources hold 7700-7703.
+  Widening the range and the documented firewall span is a one-property change and should happen
+  regardless. It buys roughly an order of magnitude, not an architecture: each DRBD resource still
+  costs a kernel object, its own threads and RF-1 standing TCP connections per node, so the real
+  ceiling after widening is somewhere in the low thousands and needs measuring rather than guessing.
+  The underlying issue is that DRBD replicates *devices* while a hyperconverged store wants to
+  replicate *extents* -- see the DFS entry under Design / future work.
+* **`hydra` uses SimpleStrategy, so all three replicas can land in one rack.** Replication factor is
+  `min(3, node_count)`, which is correct, but `SimpleStrategy` places replicas by token order alone and
+  knows nothing about racks or datacentres. On any cluster spanning more than one rack a single rack
+  loss can take the whole metadata layer with it -- and the metadata layer is what makes the surviving
+  DRBD volumes identifiable.
+  `NetworkTopologyStrategy` with a rack-aware snitch is the standard answer. This wants deciding
+  *before* anyone racks a second cabinet: changing the strategy later requires a full repair, and until
+  that repair completes the cluster is running with replicas it believes exist and does not.
 
 * ~~Mipha's HA failover write is unconditional.~~ **Resolved (2026-08-21)**: placement is released
   through `/v1/vm/release` conditioned on the dead host, so a VM already recovered elsewhere is skipped
@@ -578,6 +614,56 @@ deploy path still know only about the Python image.
 
 This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
 defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
+
+### Under consideration: an extent-based DFS, with Hydra as the metadata layer
+
+The storage substrate is the one architectural decision that is expensive to revisit later, and the
+port ceiling above is a symptom rather than the problem.
+
+**Why the current substrate limits this.** DRBD replicates *devices*: a replicated volume is a
+resource, a resource is a standing connection between named peers, and each one costs a port, a kernel
+object, threads and RF-1 TCP connections per node. That is the right shape for a handful of HA volumes
+and the wrong shape for one volume per VM disk. Widening the port range raises the ceiling by about an
+order of magnitude and changes nothing structural.
+
+**What the alternative looks like.** Nutanix, as publicly documented, cuts a vDisk into extents grouped
+into extent groups, has one Stargate per node write each group to two or three peers over a small
+number of shared channels, and keeps *only the map* -- which extent group lives where -- in Medusa, its
+modified Cassandra. Adding a VM adds metadata rows, not network sessions. Guest data never passes
+through Cassandra.
+
+**What Helios already has.** More than it looks. The metadata discipline an extent map needs is built
+and in production: Daruk's typed compare-and-swap endpoints, prepared statements at QUORUM with SERIAL,
+an ordered and recorded schema, ring lifecycle with a quorum gate, and a backup that has been restored.
+`hydra` is currently *management* metadata only -- it is not in the storage data path at all -- but the
+consistency machinery around it is the half that is usually got wrong.
+
+**What is missing is the data path**, and that is the whole project: the per-node I/O manager, extent
+placement and rebalancing, read repair, recovery after a partition, and the background scrubber. It is
+the hardest component in a hyperconverged stack, and its characteristic failure is not a crash but
+silent corruption discovered weeks later.
+
+**Therefore the first milestone is not an implementation.** It is a fault-injection harness that can
+kill a node mid-write, partition two peers, corrupt an extent on disk, and assert afterwards that a
+read returns either the old value or the new one and never a third thing. A DFS without that harness
+cannot be trusted no matter how carefully it is written, and building the harness first is what makes
+the rest reviewable.
+
+Suggested order, each step independently useful and abandonable:
+
+1. Fault-injection harness and the invariants it asserts, run against the *existing* DRBD path first --
+   it will find things there, and it validates the harness against a known-good implementation.
+2. The extent map schema in `helios_schema.py`, with the placement and claim operations as Daruk LWT
+   endpoints. Testable with no data path at all.
+3. A single-extent-group vertical slice: write, replicate to two peers, read back, verify. No tiering,
+   no rebalancing, no compaction.
+4. Recovery paths -- peer loss, rejoin, divergence -- against the harness from step 1.
+5. Only then: placement policy, rebalancing, scrub.
+
+**Decide the density target first.** Under roughly a thousand volumes per cluster, widening the port
+range is sufficient and this is not worth starting. Materially above it, the honest choice is between
+this and adopting Ceph RBD, which removes the per-device model without writing a storage system --
+heavier operationally, years cheaper.
 
 ### Scale-out add-ons (blueprints only)
 
