@@ -1,13 +1,19 @@
 # The Helios DFS — design documents
 
-**Status: building.** Milestones 0-4 are done on a single node: Sidon serves vdisks to
-qemu over NBD, journals and drains into extent groups, commits the block map to Hydra,
-and a libvirt VM boots from it. Ganon is built and calibrated against DRBD. What is *not*
-built: replication to peers, ownership transfer between hosts, and Purah. The VM
-lifecycle is wired through the ordinary API -- create, start, delete -- on a cluster
-whose `dfs_engine` says `sidon`. The
-documents remain the specification -- where code and document disagree, that is a bug in
-one of them and the disagreement is the finding.
+**Status: built and running.** Journal replication, replica-side epoch fencing, ownership
+transfer, forwarding, extent replication with read repair, and Purah's re-replication,
+reclamation and scrub are all implemented and exercised. Ganon is built and calibrated
+against DRBD. LINSTOR and DRBD have been removed from the tree entirely.
+
+Verified with several daemon instances on one host, which proves the protocol and the
+state machine but not independence from a single machine -- the instances share a clock
+and a page cache. Multi-host soaks are what settle that.
+
+Not built: mTLS on the replication port (the daemon refuses a non-loopback bind until it
+exists), snapshots, compression, erasure coding, and `vhost-user-blk`.
+
+The documents remain the specification -- where code and document disagree, that is a bug
+in one of them and the disagreement is the finding.
 
 ## What this is
 

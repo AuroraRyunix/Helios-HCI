@@ -1,12 +1,23 @@
 # Backup and Disaster Recovery (Saga)
 
+> [!NOTE]
+> **The LINSTOR controller database is no longer captured, because there is no longer
+> one.** That database existed on exactly one node, so an artefact taken anywhere else
+> was incomplete and had to say so in its manifest. [Sidon](./sidon.md) keeps no
+> database of its own: the block map is in the `hydra` keyspace this already snapshots,
+> so a per-node artefact is now complete on every node.
+>
+> What that changes for a restore: nothing has to be put back by hand except
+> `cluster.json` and the CA. Extent groups are on the nodes and are useless without the
+> map, which is in the keyspace — which is the whole reason this tool exists.
+
 What a Helios cluster cannot rebuild by itself, how it is captured, and — the half that
 is usually missing — how it is put back.
 
 > [!WARNING]
-> **This does not back up guest data.** Nothing here copies a byte out of a DRBD
-> volume. A VM's disk lives in `vg_aether/thin_pool_aether` and is replicated by DRBD
-> across hosts; that protects it against a host dying, and against nothing else. If a
+> **This does not back up guest data.** Nothing here copies a byte out of a vdisk. A
+> VM's disk lives in extent groups under `/var/lib/hci/sidon` and is replicated by
+> Sidon across hosts; that protects it against a host dying, and against nothing else. If a
 > guest's filesystem is corrupted, or someone deletes the VM, or the storage tier is
 > lost on every replica at once, Saga does not help. Back guests up from inside the
 > guest, or with a product that does volume-level backup. Read [§7](#7-what-this-does-not-cover)

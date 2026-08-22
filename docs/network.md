@@ -20,7 +20,9 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
 | **DRBD Replication** | `7700`-`7890` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
 | **VXLAN Overlay** (Urbosa) | `4789` | **UDP** | Cluster Mesh | Tenant overlay segment traffic between hosts. Point-to-multipoint, no multicast required. |
-| **Sidon** (DFS data path) | `9105` | TCP (mTLS) | Cluster Mesh | *Reserved, not yet listening.* Extent replication, journal appends and forwarded guest I/O between per-node data-path daemons. One connection per node **pair**, independent of VM count — see [dfs/architecture.md](./dfs/architecture.md). |
+| **Sidon** (storage replication) | `9105` | TCP | Cluster Mesh | Journal appends, extent-group transfer, epoch fencing and forwarded guest I/O between per-node data-path daemons. One connection per node **pair**, independent of VM count — which was the whole complaint about DRBD's per-device model. **mTLS is not implemented yet, so the daemon refuses to bind this port to anything but loopback**; multi-node replication needs that work finished first. See [sidon.md](./sidon.md). |
+| **Sidon** (control) | — | unix socket | Local only | `/run/sidon/control.sock`, reached from spark-daemon. Cluster-facing storage control therefore arrives over the existing mTLS mesh on `9099` and is translated locally, so the storage tier adds no authenticated surface of its own. |
+| **Sidon** (guest I/O) | — | unix socket | Local only | One socket per attached vdisk under `/var/lib/hci/sidon/nbd/`, group-owned by `qemu`. qemu speaks NBD to it directly; there is no block device and no kernel client in the path. |
 
 ---
 

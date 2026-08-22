@@ -1,12 +1,16 @@
 # Aether (Distributed Storage I/O Engine - Linstor/DRBD)
 
-> **A successor is designed.** Aether replicates *devices*: every volume is a DRBD
-> resource holding a standing connection between named peers, which caps the cluster at
-> 191 replicated volumes and costs a kernel object and RF-1 sockets per volume per node.
-> An extent-based replacement is being built in [dfs/](./dfs/README.md), and the decision is
-> **replacement, not coexistence**: Linstor and DRBD are removed once the new substrate can
-> take their disks. This document describes what is running today, and will describe history
-> soon enough. The reasoning is in [dfs/architecture.md](./dfs/architecture.md) §1.
+> [!NOTE]
+> **This describes a storage layer that has been removed.** Aether — Linstor and
+> DRBD — was replaced by [Sidon](./sidon.md). No code in this tree speaks to it:
+> provisioning does not install `drbd9x-utils` or `kmod-drbd9x`, does not write the
+> satellite or controller Quadlets, and removes both from nodes upgraded from a
+> DRBD cluster.
+>
+> It is kept because the reasoning is still worth having. The 191-volume ceiling,
+> the dual-primary hazard, the fencing that could only *infer* that a dead host had
+> stopped writing — those are the problems Sidon was built to solve, and a design
+> whose predecessor's failures are forgotten gets to repeat them.
 
 Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
 

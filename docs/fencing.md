@@ -1,5 +1,34 @@
 # Fencing
 
+> [!IMPORTANT]
+> **The storage rung is no longer an inference, and the ladder's order changed.**
+>
+> Everything below describing DRBD quorum — arming it, what it proves, the cases where
+> it cannot be armed at all — describes a storage layer that has been removed. With
+> DRBD there was no way to reach into an unreachable host and stop it writing its own
+> local copy, so this rung read quorum and *inferred* that a host which could not see a
+> majority was already failing its own I/O. Sound, but conditional: it needed quorum
+> armed, it needed more than two nodes, and where those did not hold nothing could be
+> confirmed. That is the residual-unsafe case §8 records.
+>
+> Under [Sidon](./sidon.md) it is an action. Fencing raises the epoch on the vdisks the
+> dead host owns, and every replica then refuses its appends — no cooperation from the
+> host, no quorum arithmetic, no minimum node count. So it runs **first** rather than
+> last: it is the only unconditional rung, and spark and BMC drop to hygiene. A wedged
+> host still holds the VIP and still burns CPU, but data safety no longer waits on
+> either.
+>
+> The residual-unsafe case is gone with it. The only way to reach an unconfirmed fence
+> now is for Hydra itself to be unreachable — where refusing the failover is obviously
+> right rather than regrettable, because promoting a VM whose disk ownership cannot be
+> moved is precisely the split-brain this exists to prevent.
+>
+> One behaviour genuinely regressed and is worth naming: DRBD's quorum loss *was* a
+> majority test, so a node could self-fence without checking that any peer was
+> reachable. A failed drain proves nothing of the kind — the extent store may simply be
+> full — so the peer check now applies to every local storage fault, and with no peer
+> answering the outcome is quarantine rather than fence.
+
 How Helios establishes that a failed host has stopped writing, before it restarts that
 host's VMs somewhere else — and, precisely, when it cannot.
 

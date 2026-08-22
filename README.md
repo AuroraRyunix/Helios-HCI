@@ -6,7 +6,7 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 
 > [!WARNING]
 > **Secure Boot Requirement:** 
-> Because DRBD runs as an out-of-tree kernel module, **Secure Boot must be disabled** on all hypervisor hosts. Alternatively, the ELRepo secure boot public key (`/etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der`) must be imported into each host's MOK database (`mokutil --import`) and enrolled at boot. If Secure Boot is enabled without enrolling the key, loading the DRBD driver will fail with `Key was rejected by service`.
+> **Secure Boot can stay enabled.** It used to have to be disabled on every hypervisor, or the ELRepo signing key enrolled by hand at each host's console, because DRBD shipped as an out-of-tree kernel module that the kernel refuses to load without it. The storage layer is now [Sidon](./docs/sidon.md), a userspace daemon speaking NBD over a unix socket: it loads no module, so provisioning has one fewer way to fail before it has touched anything.
 
 ---
 
@@ -15,9 +15,9 @@ It eliminates resource-heavy Controller VMs (CVMs) by co-locating metadata, stor
 * **Orchestration/control-plane code**: Python 3, deliberately stdlib-heavy. The only third-party dependencies are `paramiko` (`deploy_updates.py`, `provision.py`) and `cassandra-driver` (`daruk.py`), pinned in [requirements.txt](./requirements.txt); every daemon that runs on a hypervisor is stdlib-only.
 * **Native Rust services**: three, all native systemd units rather than containers. `agahnim/` (Tokio + `tokio-tungstenite` + `tokio-rustls`) proxies VNC/SPICE WebSocket console traffic. `sidon/` is the storage data path — it serves VM disks to qemu over NBD and is dependency-thin on purpose (`serde_json` only; everything on the byte path is std). `ganon/` is the fault-injection harness that gates changes to it, and depends on nothing at all.
 * **Frontend**: Vanilla HTML/CSS/JS under `static/` (no build step), with vendored noVNC (`static/novnc/`), SPICE-HTML5 (`static/spice-html5/`), and pako (`static/vendor/pako/`).
-* **Deployment model**: a deliberate split (see [docs/deployment.md](./docs/deployment.md)). Third-party services with real dependency trees run as **Podman Quadlets** (`.container` files in `/etc/containers/systemd/`): ZooKeeper, ScyllaDB, Aether/Linstor, the Linstor controller, Spectrum, and Slate. The Helios daemons themselves are **native `systemd` units** (`/etc/systemd/system/*.service`) — they are stdlib-only Python whose job is to configure the host (network namespaces, VLAN bridges, IP addresses, DRBD), so a container boundary would isolate nothing while adding an image to build and version.
+* **Deployment model**: a deliberate split (see [docs/deployment.md](./docs/deployment.md)). Third-party services with real dependency trees run as **Podman Quadlets** (`.container` files in `/etc/containers/systemd/`): ZooKeeper, ScyllaDB, Spectrum, and Slate. The Helios daemons themselves are **native `systemd` units** (`/etc/systemd/system/*.service`) — they are stdlib-only Python (or, for the storage and console tiers, Rust) whose job is to configure the host: network namespaces, VLAN bridges, IP addresses, and the filesystem holding the extent store. A container boundary would isolate nothing while adding an image to build and version.
 * **Data & consensus**: ScyllaDB ("Hydra", Cassandra-compatible, port `9042`) for cluster/VM metadata, and Apache ZooKeeper ("Odin"/"Zeus", port `2181`) for distributed consensus and leader election.
-* **Storage**: in transition. Linstor + DRBD ("Aether") is what runs today for replicated block storage (itself a replacement for an earlier GlusterFS design — no GlusterFS code remains). **Sidon** is its successor: an extent-based store whose placement map lives in Hydra, replicating extent groups instead of devices. It boots VMs today on a single node; the decision is replacement, not coexistence, and DRBD comes off the nodes when its disks have moved. See [docs/dfs/](./docs/dfs/README.md).
+* **Storage**: **Sidon**, a native Rust daemon serving VM disks to qemu over NBD. Extent-based, with the placement map in Hydra and replication write-all between peers. It replaced Linstor + DRBD ("Aether"), which itself replaced a GlusterFS design; neither leaves any code in the tree. Since Sidon loads no kernel module, Secure Boot no longer has to be disabled to provision a host. See [docs/sidon.md](./docs/sidon.md).
 * **Ingress**: Traefik ("Slate") terminating all client-facing WebUI/API/console traffic on port `443`.
 * **CI**: [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) byte-compiles every Python module, runs the unit and deployment-manifest tests, builds the Elixir app against the same toolchain the release image uses, checks all three Rust crates (`agahnim`, `sidon`, `ganon`) and runs the storage crates' test suites, and builds the Spectrum container image.
 
@@ -63,7 +63,7 @@ export HELIOS_GATEWAY="10.10.102.1"   # default gateway (auto-detected if omitte
 python3 provision.py
 ```
 
-`provision.py` reassigns static IPs/hostnames, installs Podman/DRBD/Linstor packages, builds and installs `agahnim` (Rust) from source, base64-decodes and writes every daemon/CLI it embeds (see [docs/AGENTS.md](./docs/AGENTS.md) for the `*_B64` embedding mechanism), and writes the Quadlet unit files. On success it prints the exact follow-up command to run on the first node to actually bring the cluster online, e.g.:
+`provision.py` reassigns static IPs/hostnames, installs the host package set, builds and installs the Rust services (`agahnim`, `sidon`, `ganon`) from source, carves and mounts the extent store's thin volume, base64-decodes and writes every daemon/CLI it embeds (see [docs/AGENTS.md](./docs/AGENTS.md) for the `*_B64` embedding mechanism), and writes the Quadlet unit files. On success it prints the exact follow-up command to run on the first node to actually bring the cluster online, e.g.:
 
 ```bash
 ssh root@10.10.102.220
@@ -129,10 +129,10 @@ Helios-HCI/
 | [Odin](./docs/odin.md) / [ZooKeeper](./docs/zookeeper.md) | **Zeus (ZooKeeper)** | Podman + Apache ZooKeeper | Distributed consensus store for cluster metadata and active leader election. |
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
-| [Aether](./docs/aether.md) | **Stargate** | Podman + Linstor + DRBD | Software-defined distributed replicated block storage engine (replaced an earlier GlusterFS-based design). |
-| [Sidon](./docs/dfs/README.md) | **Stargate** (successor) | Native Rust systemd service | Per-node data-path daemon for the extent-based DFS. Serves VM disks to qemu over NBD on a unix socket; guest writes land in a per-vdisk journal and are acknowledged after one `fdatasync`, then a background drain coalesces them into extent groups and commits the block map to Hydra. **Working on a single node** — a libvirt VM boots from it. Replication to peers and ownership forwarding are the next milestones. |
-| [Purah](./docs/dfs/data-path.md) | **Curator** — *designed, not built* | Leader-elected role inside Sidon | Re-replication after node loss, mark-sweep garbage collection, background scrub against seal hashes, and locality rebuild after ownership moves. Extent groups orphaned by redirect-on-write accumulate until this exists. |
-| [Ganon](./docs/dfs/ganon.md) | — | Rust test harness | Fault-injection harness. Writes self-describing stamped blocks, keeps an ack journal off the system under test, and asserts every read returned a *legal* value — the newest acknowledged generation, or one that was in flight when the world ended, and nothing else. Speaks to a DRBD device and to an NBD socket through the same adapter trait, so a scenario never knows its substrate. **Working**, and calibrated against DRBD first as designed. |
+| [Aether](./docs/aether.md) | **Stargate** | *removed* | The Linstor + DRBD storage engine, replaced by Sidon. Nothing in the tree speaks to it any more: the packages are not installed, the Quadlets are not written, and provisioning removes them from nodes upgraded from a DRBD cluster. Its document is kept as history. |
+| [Sidon](./docs/sidon.md) | **Stargate** | Native Rust systemd service | The storage data path, and the only one. Serves VM disks to qemu over NBD on a unix socket; a guest write lands in a per-vdisk journal, is replicated write-all to every replica, and is acknowledged after that — nothing on the path touches Hydra. A background drain coalesces the journal into immutable extent groups and commits the block map. Ownership is an `(owner, epoch)` compare-and-swap, and replicas refuse writes from a fenced-out epoch, which is what makes split-brain a rejected request rather than a corrupted disk. Adds no client-facing port. |
+| [Purah](./docs/sidon.md) | **Curator** | Background role inside Sidon | Re-replication after a node is lost — within seconds of a write failing, not on the next timer tick — plus mark-sweep reclamation with no reference counts anywhere, and a scrub of every sealed extent group against the hash taken when it was known good. |
+| [Ganon](./docs/dfs/ganon.md) | — | Rust test harness | Fault-injection harness. Writes self-describing stamped blocks, keeps an ack journal off the system under test, and asserts every read returned a *legal* value — the newest acknowledged generation, or one that was in flight when the world ended, and nothing else. Speaks to a block device and to an NBD socket through the same adapter trait, so a scenario never knows its substrate. Calibrated against DRBD before it was allowed to judge Sidon — which is how we learned DRBD serves corrupted bytes where Sidon returns EIO. |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Spectrum (Phoenix)](./docs/spectrum_phx.md) | **Prism** | Podman + Elixir/Phoenix LiveView | The console rewrite, running beside the Python tier on port 8444 and taking over routes as they are ported. Renders server-side and never touches the data path. |
 | [Catalyst](./docs/catalyst.md) | **Task Orchestrator** | Native Python service | Centralized task manager scheduling and tracking long-running asynchronous cluster operations. |
@@ -149,9 +149,9 @@ Helios-HCI/
 | [Lanayru](./docs/lanayru.md) | **Karbon / NKE** | Native Python service + Kine | Guest Kubernetes workload engine. Stores guest cluster state in ScyllaDB (Hydra) via Kine instead of dedicated `etcd` VMs. |
 | [Agahnim](./docs/agahnim.md) | **Prism console proxy** | Native Rust systemd service (Tokio) | WebSocket console-proxy sidecar bridging browser clients to VM VNC/SPICE TCP sockets on port `8081`. |
 | [Impa](./docs/mtls_lifecycle.md) | **Cluster certificate management** | Native Python CLI | mTLS certificate lifecycle for the cluster CA and every certificate it signed: `status` / `plan` / `renew` / `rollback` / `selftest`. Runs on the host holding `ca.key` and drives peers over SSH rather than mTLS, because renewal has to work after the certificates it repairs have already expired. |
-| [Saga](./docs/backup_restore.md) | **Cerebro** (metadata half) | Native Python CLI | Backup and restore of what the cluster cannot rebuild by itself: the `hydra` keyspace via `nodetool snapshot`, the Linstor controller database, and `/etc/hci`, archived to an operator-supplied external target. Talks to `cqlsh`/`nodetool` directly, not through Daruk, because the restore path must work when the metadata layer is what is broken. **Does not back up guest data** — see the warning in its document. |
+| [Saga](./docs/backup_restore.md) | **Cerebro** (metadata half) | Native Python CLI | Backup and restore of what the cluster cannot rebuild by itself: the `hydra` keyspace via `nodetool snapshot` — which holds the block map, and so the only statement of which extent group holds which part of which vdisk — and `/etc/hci`, archived to an operator-supplied external target. Talks to `cqlsh`/`nodetool` directly, not through Daruk, because the restore path must work when the metadata layer is what is broken. **Does not back up guest data** — see the warning in its document. |
 
-The three rows marked *designed, not built* are the extent-based DFS: a decision taken to replace per-device DRBD replication for VM disks with an extent store whose placement map lives in Hydra. Nothing is implemented — the design set is in [docs/dfs/](./docs/dfs/README.md) and the first milestone is the fault-injection harness, not the filesystem. **Linstor and DRBD are being removed, not kept alongside** — Aether stays running only until the replacement can take its disks, and then it goes.
+Sidon replaced Aether because DRBD replicates *devices*: every replicated volume was a standing connection between named peers, which capped a cluster at 191 replicated volumes and made the connection count a function of VM count. Sidon holds one connection per node *pair*. The removal is complete — no code in this tree speaks to LINSTOR or DRBD, and provisioning neither installs the packages nor writes the Quadlets. The reasoning is in [docs/dfs/](./docs/dfs/README.md); the operator's view is [docs/sidon.md](./docs/sidon.md).
 
 Each component above links to its narrative document. Most also have a `*_technical.md` companion covering internals (call flow, data structures, failure modes) — see [docs/README.md](./docs/README.md) for the complete index of both sets, plus the docs for the non-daemon tooling (`provision.py`, `sync_provision.py`, `deploy_updates.py`, `check_updates.py`, `create_upgrade_zip.py`, `valcli`, `test_hylia.py`) and the [scale-out add-on designs](./docs/add_ons_design.md).
 
@@ -197,7 +197,7 @@ valcli host.maintenance.enter <IP> # Enter maintenance mode (live-evacuates acti
 valcli host.maintenance.leave <IP> # Exit maintenance mode
 
 # Storage & Cleanup
-valcli storage.list                # List Aether storage containers and paths
+valcli storage.list                # Storage containers, per-node extent stores and vdisks
 valcli storage.benchmark <name>    # Run a raw write/read performance benchmark
 valcli storage.cleanup_orphaned    # Prune orphaned VM disk raw files and NVRAM files
 
@@ -244,13 +244,13 @@ Orchestrate cluster-wide lifecycle commands:
 # Bootstrap a 3-node cluster with virtual IP 10.10.102.240
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
 
-# Query cluster-wide status (verbose includes Aether/Linstor peer and volume info)
+# Query cluster-wide status (verbose includes per-node extent store and vdisk info)
 cluster status --verbose
 
 # Start all containerized and native services across the cluster
 cluster start
 
-# Stop all containerized and native services, wait for DRBD sync, and unmount Aether/Linstor volumes
+# Stop all services, drain every journal, and unmount the extent store
 cluster stop
 
 # Wipe cluster configurations, databases, and formats claimed drives
@@ -268,7 +268,7 @@ All configuration parameters and certificates reside under standardized director
 * `/etc/hci/spectrum/spectrum.env` - Node IP and API configuration.
 * `/etc/hci/spark/certs/` - Mutual TLS node certificates (`node.crt`, `node.key`, `ca.crt`) used by `spark-daemon` on port `9099`.
 * `/root/.certs/` - Client Mutual TLS certificates used by administrative utilities (`client.crt`, `client.key`).
-* `/var/lib/hci/aether/volumes/` - Mount directory where local virtual machine disk raw files are stored.
+* `/var/lib/hci/sidon/` - The extent store: one XFS filesystem on a thin LV in `vg_aether`, holding `journal/`, `egroups/` and the per-vdisk NBD sockets under `nbd/`. Mounted by UUID with `nofail`, so a missing volume degrades storage rather than stopping the host at an emergency shell.
 
 ---
 
@@ -295,7 +295,7 @@ flowchart TB
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK1["ZooKeeper (Consensus)<br>Port 2181"]
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether1["Aether (Linstor/DRBD Storage)<br>Port 3366/3370"]
+        Sidon1["Sidon (Storage Data Path)<br>unix sockets + 9105"]
     end
     Slate1 -->|"Proxy API/UI"| Spectrum1
     Slate1 -->|"Proxy Consoles"| Agahnim1
@@ -304,7 +304,7 @@ flowchart TB
         Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK2["ZooKeeper (Consensus)<br>Port 2181"]
         DB2["ScyllaDB (Metadata)<br>Port 9042"]
-        Aether2["Aether (Linstor/DRBD Storage)<br>Port 3366/3370"]
+        Sidon2["Sidon (Storage Data Path)<br>unix sockets + 9105"]
     end
 
     %% Internal service orchestration and query flows on Host1
@@ -323,7 +323,7 @@ flowchart TB
     %% Inter-node replication and consensus (Cluster Mesh)
     DB1 <===>|"ScyllaDB Gossip & Replication (Port 7000)"| DB2
     ZK1 <===>|"Consensus Election & Sync (Ports 2888/3888)"| ZK2
-    Aether1 <===>|"DRBD Data Replication (Port 7889)"| Aether2
+    Sidon1 <===>|"Journal + extent replication (9105, one connection per node pair)"| Sidon2
 
     %% Remote orchestration and fallbacks
     Spark1 -.->|"Orchestrate remote node (Port 9099)"| Spark2
@@ -349,7 +349,8 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 ## 9. Documentation
 
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
-* [docs/dfs/](./docs/dfs/README.md) - The extent-based DFS (Sidon) replacing per-device DRBD replication for VM disks: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, and the ADR list. Sidon and Ganon are built and running on a single node; replication, ownership transfer and Purah are not.
+* [docs/sidon.md](./docs/sidon.md) - The storage data path: what a write does, where the bytes live, how ownership moves, what Purah does, and how to operate it.
+* [docs/dfs/](./docs/dfs/README.md) - The reasoning behind it: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, and the ADR list with every rejected alternative.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.
