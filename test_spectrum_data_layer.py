@@ -170,7 +170,7 @@ def drive(method, path, body=None, headers=None):
 class SpectrumTestCase(unittest.TestCase):
     """Restores every module global a test replaces."""
 
-    PATCHED = ("run_cql_query", "run_lwt", "run_remote_spark", "run_linstor_cmd",
+    PATCHED = ("run_cql_query", "run_lwt", "run_remote_spark", "sidon_call",
                "run_mtls_spark_api", "get_cluster_nodes", "log_catalyst_task",
                "invalidate_status_cache", "invalidate_tasks_cache")
 
@@ -183,7 +183,7 @@ class SpectrumTestCase(unittest.TestCase):
         spectrum.invalidate_tasks_cache = lambda *a, **k: None
         # Anything a test does not deliberately arrange must not reach a real cluster.
         spectrum.run_remote_spark = Recorder((0, "", ""))
-        spectrum.run_linstor_cmd = Recorder((0, "", ""))
+        spectrum.sidon_call = Recorder((True, {}))
         spectrum.run_mtls_spark_api = Recorder((0, {}, ""))
         spectrum.run_lwt = Recorder((True, True, {}, ""))
 
@@ -367,7 +367,7 @@ class ImageListTests(SpectrumTestCase):
         super().setUp()
         self.hydra.returns(r"FROM hydra\.valhalla_images", [
             {"name": "test.iso", "filename": "test.iso", "size_bytes": 10,
-             "type": "iso", "path": "/dev/drbd/by-res/img-test/0", "created_at": 1},
+             "type": "iso", "path": "/var/lib/hci/sidon/nbd/img-test.sock", "created_at": 1},
         ])
 
     def test_the_page_load_writes_nothing(self):
@@ -404,8 +404,9 @@ class ImagePathTests(unittest.TestCase):
     still `rm -f /etc`. The path has to be one of the two shapes an image can have.
     """
 
-    def test_a_drbd_device_is_removed_through_linstor(self):
-        self.assertEqual(spectrum.image_backing_kind("/dev/drbd/by-res/img-test/0"), "drbd")
+    def test_a_vdisk_is_removed_through_sidon(self):
+        self.assertEqual(
+            spectrum.image_backing_kind("/var/lib/hci/sidon/nbd/img-test.sock"), "vdisk")
 
     def test_a_staged_file_under_the_container_root_is_a_file(self):
         self.assertEqual(
@@ -419,7 +420,7 @@ class ImagePathTests(unittest.TestCase):
                      "/dev/sda",
                      "relative.iso",
                      "/var/lib/hci/aether/volumes",
-                     "/dev/drbd/"):
+                     "/var/lib/hci/sidon/nbd/"):
             self.assertIsNone(spectrum.image_backing_kind(path), path)
 
     def test_a_traversal_segment_is_refused_even_under_an_allowed_root(self):
@@ -438,49 +439,49 @@ class ImagePathTests(unittest.TestCase):
 class ImageDeleteTests(SpectrumTestCase):
     """The backing store goes first, checked, and the row only goes after it."""
 
-    DRBD_ROW = {"name": "scratch.iso", "path": "/dev/drbd/by-res/img-scratch/0"}
+    VDISK_ROW = {"name": "scratch.iso",
+                 "path": "/var/lib/hci/sidon/nbd/img-scratch.sock"}
     FILE_ROW = {"name": "staged.iso",
                 "path": "/var/lib/hci/aether/volumes/default-image-container/staged.iso"}
 
     def catalogue(self, row):
         self.hydra.returns(r"FROM hydra\.valhalla_images", [row])
 
-    def test_a_failed_linstor_delete_keeps_the_row_and_says_so(self):
-        # This is the defect: the row used to be deleted first, so a LINSTOR failure left
-        # a DRBD resource holding storage on every node with nothing in the UI pointing
-        # at it -- and the operator was told the delete worked.
-        self.catalogue(self.DRBD_ROW)
-        spectrum.run_linstor_cmd = Recorder(
-            (10, "", "Resource is still in use by a running VM"))
+    def test_a_failed_vdisk_delete_keeps_the_row_and_says_so(self):
+        # This is the defect: the row used to be deleted first, so a storage failure left
+        # the image allocated with nothing in the UI pointing at it -- and the operator
+        # was told the delete worked.
+        self.catalogue(self.VDISK_ROW)
+        spectrum.sidon_call = Recorder((False, "vdisk is attached and still serving reads"))
         status, body = spectrum.delete_catalogue_image("scratch.iso")
         self.assertEqual(status, 500)
-        self.assertIn("still in use", body["error"])
+        self.assertIn("still serving", body["error"])
         self.assertEqual(body["catalogue_row"], "kept")
         self.assertEqual(self.hydra.matching(r"DELETE FROM hydra\.valhalla_images"), [])
 
     def test_the_backing_store_is_removed_before_the_row(self):
-        self.catalogue(self.DRBD_ROW)
-        linstor = Recorder((0, "", ""))
-        spectrum.run_linstor_cmd = linstor
+        self.catalogue(self.VDISK_ROW)
+        storage = Recorder((True, {}))
+        spectrum.sidon_call = storage
         status, _ = spectrum.delete_catalogue_image("scratch.iso")
         self.assertEqual(status, 200)
-        self.assertEqual(len(linstor.calls), 1)
-        self.assertIn("resource-definition delete img-scratch", linstor.arguments()[0])
+        # detach then delete: two calls, in that order.
+        self.assertEqual([c[0][0] for c in storage.calls], ["detach", "delete"])
+        self.assertEqual(storage.calls[-1][1]["vdisk_id"], "img-scratch")
         self.assertGreaterEqual(self.hydra.index_of(r"DELETE FROM hydra\.valhalla_images"), 0)
 
-    def test_a_drbd_device_is_never_removed_with_rm(self):
-        # `rm` on /dev/drbd/by-res/<res>/0 deletes a udev symlink and leaves the resource
+    def test_a_vdisk_is_never_removed_with_rm(self):
+        # `rm` on the NBD socket removes a socket and leaves every byte of the image
         # -- and the storage it holds on every node -- allocated.
-        self.catalogue(self.DRBD_ROW)
+        self.catalogue(self.VDISK_ROW)
         remote = Recorder((0, "", ""))
         spectrum.run_remote_spark = remote
         spectrum.delete_catalogue_image("scratch.iso")
         self.assertEqual([a for a in remote.arguments() if "rm " in a], [])
 
-    def test_a_linstor_resource_that_is_already_gone_is_not_a_failure(self):
-        self.catalogue(self.DRBD_ROW)
-        spectrum.run_linstor_cmd = Recorder(
-            (10, "", "Resource definition 'img-scratch' not found."))
+    def test_a_vdisk_that_is_already_gone_is_not_a_failure(self):
+        self.catalogue(self.VDISK_ROW)
+        spectrum.sidon_call = Recorder((False, "refused: vdisk img-scratch does not exist"))
         status, _ = spectrum.delete_catalogue_image("scratch.iso")
         self.assertEqual(status, 200)
         self.assertEqual(len(self.hydra.matching(r"DELETE FROM hydra\.valhalla_images")), 1)
@@ -542,11 +543,11 @@ class ImageDeleteTests(SpectrumTestCase):
         self.assertEqual(len(self.hydra.matching(r"DELETE FROM hydra\.valhalla_images")), 1)
 
     def test_the_endpoint_reports_the_failure_rather_than_answering_200(self):
-        self.catalogue(self.DRBD_ROW)
-        spectrum.run_linstor_cmd = Recorder((10, "", "controller not reachable"))
+        self.catalogue(self.VDISK_ROW)
+        spectrum.sidon_call = Recorder((False, "sidon is not answering"))
         status, body = drive("do_POST", "/api/images/delete", {"name": "scratch.iso"})
         self.assertEqual(status, 500)
-        self.assertIn("controller not reachable", body["error"])
+        self.assertIn("not answering", body["error"])
 
 
 # -- VM delete ----------------------------------------------------------------------------
@@ -664,23 +665,23 @@ class VmDeleteTests(SpectrumTestCase):
         # Same reasoning as the image catalogue: unchecked, the row goes and the LINSTOR
         # resources stay, holding storage nothing in the UI can reach.
         self.lwt()
-        spectrum.run_linstor_cmd = Recorder((10, "", "Resource is still in use"))
+        spectrum.sidon_call = Recorder((False, "vdisk is attached"))
         status, body = spectrum.delete_vm("web-01")
         self.assertEqual(status, 500)
-        self.assertIn("still in use", body["error"])
+        self.assertIn("is attached", body["error"])
         self.assertEqual(self.hydra.matching(r"DELETE FROM hydra\.vms"), [])
 
     def test_the_happy_path_destroys_on_the_host_of_record_then_deletes(self):
         recorder = self.lwt()
         spark = Recorder((0, {}, ""))
         spectrum.run_mtls_spark_api = spark
-        linstor = Recorder((0, "", ""))
-        spectrum.run_linstor_cmd = linstor
+        storage = Recorder((True, {}))
+        spectrum.sidon_call = storage
         status, _ = spectrum.delete_vm("web-01")
         self.assertEqual(status, 200)
         # The destroy went to the host the compare-and-swap confirmed.
         self.assertTrue(all("10.10.102.41" in a for a in spark.arguments()))
-        self.assertIn("resource-definition delete web-01-disk0", linstor.arguments()[0])
+        self.assertIn("web-01-disk0", [c[1].get("vdisk_id") for c in storage.calls])
         self.assertEqual(len(self.hydra.matching(r"DELETE FROM hydra\.vms")), 1)
         # The row carried the lock, so there is nothing left to unlock.
         self.assertNotIn("/v1/vm/migrate-unlock", self.endpoints_called(recorder))

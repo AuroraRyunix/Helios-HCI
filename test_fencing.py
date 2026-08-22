@@ -27,6 +27,7 @@ Run with:  python -m unittest test_fencing
 import importlib.util
 import io
 import json
+import json
 import os
 import sys
 import tempfile
@@ -53,31 +54,23 @@ def base_config(**overrides):
     return mipha._merge_defaults(mipha.DEFAULT_FENCING_CONFIG, overrides)
 
 
-def probe(libvirt="ok", drbd_control="ok", unserviceable=(), detail=None):
-    return {"libvirt": libvirt, "drbd_control": drbd_control,
+def probe(libvirt="ok", storage="ok", unserviceable=(), detail=None):
+    return {"libvirt": libvirt, "storage": storage,
             "unserviceable": list(unserviceable), "detail": detail or {}}
 
 
-def unserviceable(cause="quorum-lost", resource="vm-disk0"):
+def unserviceable(cause="drain-failed", resource="vm-disk0"):
     return {"resource": resource, "cause": cause,
-            "detail": f"{resource}/0 is Primary without quorum"}
+            "detail": f"{resource}: drain failed, journal is not emptying"}
 
 
-def resource(name="vm-disk0", role="Secondary", devices=None, connections=None, **extra):
-    entry = {"name": name, "role": role,
-             "devices": devices if devices is not None else [],
-             "connections": connections if connections is not None else []}
-    entry.update(extra)
-    return entry
+def vdisk_rows(*rows):
+    """A `SELECT JSON` result the way run_cql_query hands it back."""
+    return "\n".join(json.dumps(row) for row in rows)
 
 
-def device(volume=0, quorum=True, disk_state="UpToDate", open_=False):
-    return {"volume": volume, "quorum": quorum, "disk-state": disk_state, "open": open_}
-
-
-def connection(name="node-b", state="Connecting", peer_devices=None):
-    return {"name": name, "connection": state,
-            "peer_devices": peer_devices if peer_devices is not None else []}
+def owned(vdisk_id="vm-disk0", owner="node-b", epoch=4):
+    return {"vdisk_id": vdisk_id, "owner": owner, "epoch": epoch}
 
 
 class FenceTestCase(unittest.TestCase):
@@ -204,12 +197,10 @@ class SparkFenceTests(FenceTestCase):
 
         self.patch(mipha, "run_mtls_spark_api_full", lambda *a, **k: (404, {}, "HTTP 404"))
         self.patch(mipha, "run_remote_spark", fake_remote)
-        self.patch(mipha, "run_mtls_spark_api",
-                   lambda *a, **k: (0, [resource(role="Secondary",
-                                                 devices=[device(open_=False)])], ""))
+        self.patch(mipha, "run_mtls_spark_api", lambda *a, **k: (0, {"attached": []}, ""))
         confirmed, detail = mipha.spark_fence_host("10.0.0.2")
         self.assertTrue(confirmed)
-        self.assertIn("legacy", detail)
+        self.assertIn("serving no vdisk", detail)
         self.assertTrue(any(c.startswith("systemctl stop libvirtd") for c in calls))
 
     def test_the_legacy_commands_exit_status_is_not_evidence(self):
@@ -232,17 +223,16 @@ class SparkFenceTests(FenceTestCase):
         self.patch(mipha, "run_remote_spark",
                    lambda ip, command: (1, "", "") if command.startswith("pgrep") else (0, "", ""))
         self.patch(mipha, "run_mtls_spark_api",
-                   lambda *a, **k: (0, [resource(role="Primary",
-                                                 devices=[device(open_=True)])], ""))
+                   lambda *a, **k: (0, {"attached": [{"vdisk_id": "vm-disk0"}]}, ""))
         confirmed, detail = mipha.spark_fence_host("10.0.0.2")
         self.assertFalse(confirmed)
-        self.assertIn("Primary", detail)
+        self.assertIn("vm-disk0", detail)
 
     def test_storage_state_that_cannot_be_read_is_not_confirmed(self):
         self.patch(mipha, "run_mtls_spark_api_full", lambda *a, **k: (404, {}, "HTTP 404"))
         self.patch(mipha, "run_remote_spark",
                    lambda ip, command: (1, "", "") if command.startswith("pgrep") else (0, "", ""))
-        self.patch(mipha, "run_mtls_spark_api", lambda *a, **k: (-1, {}, "connection reset"))
+        self.patch(mipha, "run_mtls_spark_api", lambda *a, **k: (-1, "", "connection reset"))
         confirmed, detail = mipha.spark_fence_host("10.0.0.2")
         self.assertFalse(confirmed)
         self.assertIn("not proven", detail)
@@ -373,149 +363,102 @@ class BmcFenceTests(FenceTestCase):
 
 # -- the storage rung ----------------------------------------------------------------------
 
-class QuorumArithmeticTests(FenceTestCase):
-    """`quorum majority` is a proof; `quorum 1` is a coin toss dressed as one."""
-
-    def test_majority_with_io_error_arms_the_fence(self):
-        armed, why = mipha.quorum_arms_the_fence(
-            {"quorum": "majority", "on-no-quorum": "io-error"}, 3)
-        self.assertTrue(armed, why)
-
-    def test_suspend_io_also_arms_it(self):
-        # A suspended writer is not writing. The guest hangs instead of erroring, which
-        # is a different user experience and the same safety property.
-        armed, _why = mipha.quorum_arms_the_fence(
-            {"quorum": "all", "on-no-quorum": "suspend-io"}, 2)
-        self.assertTrue(armed)
-
-    def test_quorum_off_does_not_arm_it(self):
-        # This is what LINSTOR writes for a single-replica resource, and what the live
-        # test cluster actually has -- so the storage rung correctly refuses there.
-        armed, why = mipha.quorum_arms_the_fence(
-            {"quorum": "off", "on-no-quorum": "io-error"}, 1)
-        self.assertFalse(armed)
-        self.assertIn("quorum is off", why)
-
-    def test_a_quorum_both_sides_can_hold_does_not_arm_it(self):
-        armed, why = mipha.quorum_arms_the_fence(
-            {"quorum": "1", "on-no-quorum": "io-error"}, 3)
-        self.assertFalse(armed)
-        self.assertIn("both sides", why)
-
-    def test_a_numeric_majority_arms_it(self):
-        armed, _why = mipha.quorum_arms_the_fence(
-            {"quorum": "2", "on-no-quorum": "io-error"}, 3)
-        self.assertTrue(_why == "" and armed)
-
-    def test_a_policy_that_keeps_writing_does_not_arm_it(self):
-        armed, why = mipha.quorum_arms_the_fence({"quorum": "majority"}, 3)
-        self.assertFalse(armed)
-        self.assertIn("on-no-quorum", why)
-
-    def test_unreadable_options_are_never_assumed_safe(self):
-        armed, why = mipha.quorum_arms_the_fence(None, 3)
-        self.assertFalse(armed)
-        self.assertIn("could not be read", why)
-
-
 class StorageFenceTests(FenceTestCase):
+    """The rung that used to be an inference and is now an action.
+
+    With DRBD this read quorum and argued that a host which could not see a majority was
+    already failing its own I/O. It now raises the epoch on every vdisk the dead host
+    owns, which every replica then enforces without the dead host's cooperation.
+    """
 
     HOSTS = [{"hostname": "node-a", "ip": "10.0.0.1"},
              {"hostname": "node-b", "ip": "10.0.0.2"},
              {"hostname": "node-c", "ip": "10.0.0.3"}]
 
-    def arrange(self, status, options):
-        self.patch(mipha, "_drbd_status_from",
-                   lambda ip: status.get(ip) if isinstance(status, dict) else status)
-        self.patch(mipha, "_drbd_options_from", lambda ip, res: options)
+    def setUp(self):
+        super().setUp()
+        self.claims = []
+        self.patch(mipha, "sidon_module", lambda: types.SimpleNamespace())
+        self.patch(mipha, "local_hostname", lambda: "node-a")
 
-    def quorate_resource(self, peer_state="Connecting"):
-        return resource(name="vm-disk0", role="Primary",
-                        devices=[device(quorum=True)],
-                        connections=[connection("node-b", peer_state),
-                                     connection("node-c", "Connected")])
+    def arrange_map(self, rows, rc=0):
+        self.patch(mipha, "run_cql_query",
+                   lambda *a, **k: (rc, vdisk_rows(*rows), ""))
 
-    def test_a_quorate_survivor_with_a_disconnected_peer_is_a_fence(self):
-        self.arrange({"10.0.0.1": [self.quorate_resource()], "10.0.0.3": []},
-                     {"quorum": "majority", "on-no-quorum": "io-error"})
-        self.patch(mipha, "LOCAL_IP", "10.0.0.1")
+    def arrange_claims(self, responder):
+        def fake_claim(ip, path, payload, method="POST"):
+            self.claims.append(payload)
+            return responder(payload)
+
+        self.patch(mipha, "run_mtls_spark_api_full", fake_claim)
+
+    def test_raising_the_epoch_on_every_owned_vdisk_is_a_fence(self):
+        self.arrange_map([owned("vm-disk0", "node-b", 4), owned("vm-disk1", "node-b", 1)])
+        self.arrange_claims(lambda payload: (0, {"applied": True}, ""))
         confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
         self.assertTrue(confirmed, detail)
-        self.assertIn("already failing", detail)
+        self.assertIn("2 vdisk(s)", detail)
+        # Conditioned on the owner and epoch that were read, and set one past them.
+        self.assertEqual([c["expected_epoch"] for c in self.claims], [4, 1])
+        self.assertEqual([c["epoch"] for c in self.claims], [5, 2])
+        self.assertEqual({c["expected_owner"] for c in self.claims}, {"node-b"})
 
-    def test_quorum_switched_off_is_not_a_fence(self):
-        # Reading only the device's `quorum: true` flag would have called this confirmed.
-        # It is true here because quorum is not enforced at all, not because a majority is
-        # held -- and the partitioned host is writing away regardless.
-        self.arrange({"10.0.0.1": [self.quorate_resource()], "10.0.0.3": []},
-                     {"quorum": "off", "on-no-quorum": "io-error"})
+    def test_a_host_that_owns_nothing_is_already_fenced(self):
+        self.arrange_map([owned("vm-disk0", "node-c", 2)])
+        self.arrange_claims(lambda payload: (0, {"applied": True}, ""))
+        confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
+        self.assertTrue(confirmed)
+        self.assertIn("owns no vdisk", detail)
+        self.assertEqual(self.claims, [], "nothing should have been claimed")
+
+    def test_a_claim_lost_to_a_third_host_still_fences_the_dead_one(self):
+        # Somebody else got there first. The dead host is off the vdisk either way, which
+        # is the only thing this rung is asserting.
+        self.arrange_map([owned("vm-disk0", "node-b", 4)])
+        self.arrange_claims(
+            lambda payload: (0, {"applied": False,
+                                 "current": {"owner": "node-c", "epoch": 5}}, ""))
+        confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
+        self.assertTrue(confirmed, detail)
+
+    def test_a_claim_that_leaves_the_dead_host_owning_it_is_not_a_fence(self):
+        self.arrange_map([owned("vm-disk0", "node-b", 4)])
+        self.arrange_claims(
+            lambda payload: (0, {"applied": False,
+                                 "current": {"owner": "node-b", "epoch": 4}}, ""))
         confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
         self.assertFalse(confirmed)
-        self.assertIn("quorum is off", detail)
+        self.assertIn("vm-disk0", detail)
 
-    def test_a_peer_that_is_still_connected_is_not_cut_off(self):
-        self.arrange({"10.0.0.1": [self.quorate_resource(peer_state="Connected")],
-                      "10.0.0.3": []},
-                     {"quorum": "majority", "on-no-quorum": "io-error"})
+    def test_one_unfenced_vdisk_out_of_two_blocks_the_assertion(self):
+        self.arrange_map([owned("vm-disk0", "node-b", 4), owned("vm-disk1", "node-b", 1)])
+        self.arrange_claims(
+            lambda payload: (0, {"applied": True}, "") if payload["vdisk_id"] == "vm-disk0"
+            else (0, {"applied": False, "current": {"owner": "node-b", "epoch": 1}}, ""))
         confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
-        self.assertFalse(confirmed)
-        self.assertIn("still Connected", detail)
+        self.assertFalse(confirmed, "a partial fence is not a fence")
+        self.assertIn("vm-disk1", detail)
 
-    def test_a_survivor_that_does_not_hold_quorum_is_not_a_fence(self):
-        # If we are the minority, the other side may be the one still serving. Failing
-        # over here would be the split-brain, not the cure for it.
-        losing = resource(name="vm-disk0", role="Secondary",
-                          devices=[device(quorum=False)],
-                          connections=[connection("node-b", "Connecting")])
-        self.arrange({"10.0.0.1": [losing], "10.0.0.3": []},
-                     {"quorum": "majority", "on-no-quorum": "io-error"})
-        confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
-        self.assertFalse(confirmed)
-        self.assertIn("does not hold quorum", detail)
-
-    def test_options_that_cannot_be_read_are_not_a_fence(self):
-        self.arrange({"10.0.0.1": [self.quorate_resource()], "10.0.0.3": []}, None)
+    def test_a_map_that_cannot_be_read_is_not_a_fence(self):
+        self.arrange_map([], rc=1)
         confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
         self.assertFalse(confirmed)
         self.assertIn("could not be read", detail)
 
-    def test_a_host_that_shares_no_storage_gives_no_evidence(self):
-        # Deliberately not "confirmed": no shared disk means no corruption from *this*
-        # resource set, but it also means DRBD has nothing to say about whether the host
-        # stopped. Silence is not proof.
-        self.arrange({"10.0.0.1": [resource(name="other", role="Primary",
-                                            devices=[device()],
-                                            connections=[connection("node-c", "Connected")])],
-                      "10.0.0.3": []},
-                     {"quorum": "majority", "on-no-quorum": "io-error"})
+    def test_a_host_matched_by_ip_is_fenced_too(self):
+        # hydra.dfs_vdisks records whatever the owner called itself. Both spellings have
+        # to fence, or a cluster that mixes them silently fences nothing.
+        self.arrange_map([owned("vm-disk0", "10.0.0.2", 7)])
+        self.arrange_claims(lambda payload: (0, {"applied": True}, ""))
+        confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
+        self.assertTrue(confirmed, detail)
+        self.assertEqual(self.claims[0]["expected_owner"], "10.0.0.2")
+
+    def test_without_helios_sidon_nothing_can_be_fenced(self):
+        self.patch(mipha, "sidon_module", lambda: None)
         confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
         self.assertFalse(confirmed)
-        self.assertIn("no evidence", detail)
-
-    def test_one_unarmed_resource_out_of_two_blocks_the_assertion(self):
-        # Partial safety is not safety: the VM on the unarmed resource is the one that
-        # gets two writers.
-        armed = self.quorate_resource()
-        unarmed = resource(name="vm-disk1", role="Primary", devices=[device(quorum=True)],
-                           connections=[connection("node-b", "Connecting")])
-
-        def options_for(_ip, res):
-            if res == "vm-disk1":
-                return {"quorum": "off", "on-no-quorum": "io-error"}
-            return {"quorum": "majority", "on-no-quorum": "io-error"}
-
-        self.patch(mipha, "_drbd_status_from",
-                   lambda ip: [armed, unarmed] if ip == "10.0.0.1" else [])
-        self.patch(mipha, "_drbd_options_from", options_for)
-        confirmed, detail = mipha.storage_fence_assert("node-b", "10.0.0.2", self.HOSTS)
-        self.assertFalse(confirmed)
-        self.assertIn("vm-disk1", detail)
-
-    def test_no_surviving_host_is_not_a_fence(self):
-        confirmed, detail = mipha.storage_fence_assert(
-            "node-b", "10.0.0.2", [{"hostname": "node-b", "ip": "10.0.0.2"}])
-        self.assertFalse(confirmed)
-        self.assertIn("no surviving host", detail)
+        self.assertIn("helios_sidon", detail)
 
 
 # -- the ladder and its ledger -------------------------------------------------------------
@@ -533,7 +476,7 @@ class FenceLadderTests(FenceTestCase):
         self.patch(mipha, "load_fencing_config", lambda path=None: (base_config(), []))
 
     def arrange(self, spark=(False, "no answer"), bmc=(False, "no BMC entry"),
-                storage=(False, "quorum is off")):
+                storage=(False, "hydra is unreachable")):
         def fake_spark(ip):
             self.spark_calls.append(ip)
             return spark
@@ -551,21 +494,24 @@ class FenceLadderTests(FenceTestCase):
         self.patch(mipha, "storage_fence_assert", fake_storage)
 
     def test_the_ladder_stops_at_the_first_rung_that_confirms(self):
+        # Storage is first now: it is the only rung that works unconditionally, so a
+        # confirmed epoch bump means the other two are never needed for safety.
+        self.arrange(storage=(True, "2 vdisk(s) moved past node-b's epoch"))
+        result = mipha.fence_host("node-b", "10.0.0.2", self.HOSTS)
+        self.assertTrue(result.confirmed)
+        self.assertEqual(result.method, mipha.FENCE_METHOD_STORAGE)
+        self.assertEqual(self.spark_calls, [])
+        self.assertEqual(self.bmc_calls, [])
+
+    def test_the_ladder_escalates_when_a_rung_cannot_confirm(self):
+        # Storage could not confirm -- which now means Hydra itself is unreachable -- so
+        # the hygiene rungs are tried in turn.
         self.arrange(spark=(True, "nothing is left running"))
         result = mipha.fence_host("node-b", "10.0.0.2", self.HOSTS)
         self.assertTrue(result.confirmed)
         self.assertEqual(result.method, mipha.FENCE_METHOD_SPARK)
-        self.assertEqual(self.bmc_calls, [])
-        self.assertEqual(self.storage_calls, [])
-
-    def test_the_ladder_escalates_when_a_rung_cannot_confirm(self):
-        self.arrange(storage=(True, "quorum held here"))
-        result = mipha.fence_host("node-b", "10.0.0.2", self.HOSTS)
-        self.assertTrue(result.confirmed)
-        self.assertEqual(result.method, mipha.FENCE_METHOD_STORAGE)
         self.assertEqual([step["method"] for step in result.steps],
-                         [mipha.FENCE_METHOD_SPARK, mipha.FENCE_METHOD_BMC,
-                          mipha.FENCE_METHOD_STORAGE])
+                         [mipha.FENCE_METHOD_STORAGE, mipha.FENCE_METHOD_SPARK])
 
     def test_every_rung_failing_is_an_unconfirmed_fence(self):
         self.arrange()
@@ -577,11 +523,13 @@ class FenceLadderTests(FenceTestCase):
         def explode(ip):
             raise RuntimeError("ipmitool segfaulted")
 
-        self.arrange(storage=(True, "quorum held here"))
+        self.arrange(bmc=(True, "the BMC reports the chassis off"))
         self.patch(mipha, "spark_fence_host", explode)
         result = mipha.fence_host("node-b", "10.0.0.2", self.HOSTS)
         self.assertTrue(result.confirmed)
-        self.assertIn("RuntimeError", result.steps[0]["detail"])
+        # storage could not confirm, spark raised, BMC carried it -- and the raise is
+        # recorded as a failed rung rather than taking the whole ladder down.
+        self.assertIn("RuntimeError", result.steps[1]["detail"])
 
     def test_a_host_already_fenced_is_not_fenced_again(self):
         self.arrange(bmc=(True, "the BMC reports the chassis off"))
@@ -617,47 +565,6 @@ class FenceLadderTests(FenceTestCase):
 
 
 # -- self-fencing --------------------------------------------------------------------------
-
-class UnserviceableResourceTests(FenceTestCase):
-
-    def test_primary_without_quorum_is_unserviceable(self):
-        bad, cause, detail = mipha.resource_is_unserviceable(
-            resource(role="Primary", devices=[device(quorum=False)]))
-        self.assertTrue(bad)
-        self.assertEqual(cause, "quorum-lost")
-        self.assertIn("without quorum", detail)
-
-    def test_a_secondary_is_never_unserviceable(self):
-        # A Secondary is not writing, so it has nothing to be fenced off.
-        bad, _cause, _detail = mipha.resource_is_unserviceable(
-            resource(role="Secondary", devices=[device(quorum=False)]))
-        self.assertFalse(bad)
-
-    def test_a_failed_disk_with_a_healthy_peer_keeps_serving(self):
-        # DRBD 9 turns the local node into a diskless client and reads over the network.
-        # The guest never notices, and fencing it would be an outage we caused.
-        bad, _cause, _detail = mipha.resource_is_unserviceable(resource(
-            role="Primary",
-            devices=[device(disk_state="Failed")],
-            connections=[connection("node-b", "Connected",
-                                    [{"volume": 0, "peer-disk-state": "UpToDate"}])]))
-        self.assertFalse(bad)
-
-    def test_a_failed_disk_with_no_healthy_peer_is_unserviceable(self):
-        bad, cause, _detail = mipha.resource_is_unserviceable(resource(
-            role="Primary",
-            devices=[device(disk_state="Failed")],
-            connections=[connection("node-b", "Connecting",
-                                    [{"volume": 0, "peer-disk-state": "DUnknown"}])]))
-        self.assertTrue(bad)
-        self.assertEqual(cause, "no-data")
-
-    def test_forced_io_failures_are_unserviceable(self):
-        bad, cause, _detail = mipha.resource_is_unserviceable(
-            resource(role="Primary", devices=[device()], **{"force-io-failures": True}))
-        self.assertTrue(bad)
-        self.assertEqual(cause, "io-failures")
-
 
 class SelfFenceDecisionTests(FenceTestCase):
 
@@ -695,19 +602,25 @@ class SelfFenceDecisionTests(FenceTestCase):
         action, _reason = self.decide(probe(unserviceable=[unserviceable()]))
         self.assertEqual(action, "none")
 
-    def test_three_consecutive_quorum_losses_self_fence(self):
+    def test_three_consecutive_drain_failures_self_fence(self):
         for _ in range(3):
             action, reason = self.decide(probe(unserviceable=[unserviceable()]))
         self.assertEqual(action, "fence")
-        self.assertIn("quorum", reason)
+        self.assertIn("cannot serve I/O", reason)
 
-    def test_quorum_loss_does_not_wait_for_a_healthy_peer(self):
-        # Losing quorum *is* the majority test. If this node lost it, some other set of
-        # nodes holds it, whether or not they are answering us right now.
+    def test_a_failed_drain_with_no_peer_only_quarantines(self):
+        # DRBD had a shortcut here: losing quorum *was* the majority test, so a node that
+        # lost it knew some other set of nodes held it and could fence itself without
+        # checking whether any peer was reachable. A failed drain proves nothing of the
+        # kind -- the journal may be un-drainable because the extent store is full, which
+        # says nothing about whether anywhere else can run these guests. So the peer check
+        # now applies to every local storage fault, and with no peer the honest outcome is
+        # to keep the guests running here rather than kill them for nothing.
         self.patch(mipha, "healthy_peer_exists", lambda hosts=None: False)
         for _ in range(3):
-            action, _reason = self.decide(probe(unserviceable=[unserviceable()]))
-        self.assertEqual(action, "fence")
+            action, reason = self.decide(probe(unserviceable=[unserviceable()]))
+        self.assertEqual(action, "quarantine")
+        self.assertIn("no peer is answering", reason)
 
     def test_a_local_storage_fault_with_nowhere_to_go_only_quarantines(self):
         self.patch(mipha, "healthy_peer_exists", lambda hosts=None: False)
@@ -735,7 +648,7 @@ class SelfFenceDecisionTests(FenceTestCase):
 
     def test_a_probe_that_cannot_reach_a_verdict_never_escalates(self):
         for _ in range(10):
-            action, _reason = self.decide(probe(libvirt="unknown", drbd_control="unknown"))
+            action, _reason = self.decide(probe(libvirt="unknown", storage="unknown"))
         self.assertEqual(action, "none")
 
     def test_a_single_node_cluster_never_self_fences(self):
@@ -769,10 +682,10 @@ class SelfFenceDecisionTests(FenceTestCase):
 
     def test_recovery_leaves_quarantine(self):
         for _ in range(3):
-            self.decide(probe(drbd_control="failed"))
+            self.decide(probe(storage="failed"))
         action, _reason = self.decide(probe())
         self.assertEqual(action, "none")
-        self.assertEqual(self.counters["drbd_control"], 0)
+        self.assertEqual(self.counters["storage"], 0)
 
 
 class SelfFenceAnnouncementTests(FenceTestCase):
@@ -802,47 +715,55 @@ class SelfFenceAnnouncementTests(FenceTestCase):
 class SelfFenceProbeTests(FenceTestCase):
     """`probe_local_health` has to distinguish "broken" from "could not tell"."""
 
-    def test_drbdsetup_failing_on_a_host_with_resources_is_a_failure(self):
-        self.patch(mipha, "get_all_drbd_resources", lambda: ["vm-disk0"])
-        self.patch(mipha.shutil, "which", lambda _n: None)
-        self.patch(mipha, "run_argv_local",
-                   lambda argv, timeout=45: (1, "", "drbdsetup: cannot open netlink"))
-        current = mipha.probe_local_health()
-        self.assertEqual(current["drbd_control"], "failed")
+    def arrange_sidon(self, attached=None, raises=None):
+        def list_attached(timeout=15):
+            if raises:
+                raise raises
+            return {"attached": attached or []}
 
-    def test_drbdsetup_failing_on_a_host_with_no_resources_is_unknown(self):
-        # A node that simply does not back any DRBD resource must not read as a node
-        # whose storage stack has died.
-        self.patch(mipha, "get_all_drbd_resources", lambda: [])
+        self.patch(mipha, "sidon_module",
+                   lambda: types.SimpleNamespace(list_attached=list_attached))
+
+    def test_sidon_not_answering_is_a_storage_failure(self):
+        self.arrange_sidon(raises=RuntimeError("control socket is unreachable"))
         self.patch(mipha.shutil, "which", lambda _n: None)
-        self.patch(mipha, "run_argv_local", lambda argv, timeout=45: (1, "", "no such module"))
         current = mipha.probe_local_health()
-        self.assertEqual(current["drbd_control"], "unknown")
+        self.assertEqual(current["storage"], "failed")
+        self.assertIn("unreachable", current["detail"]["storage"])
+
+    def test_a_node_without_helios_sidon_is_unknown_not_failed(self):
+        # A node that has not been updated yet must not read as a node whose storage has
+        # died -- "unknown" is the verdict that never escalates to killing guests.
+        self.patch(mipha, "sidon_module", lambda: None)
+        self.patch(mipha.shutil, "which", lambda _n: None)
+        current = mipha.probe_local_health()
+        self.assertEqual(current["storage"], "unknown")
 
     def test_a_missing_virsh_is_unknown_rather_than_failed(self):
-        self.patch(mipha, "get_all_drbd_resources", lambda: [])
+        self.arrange_sidon()
         self.patch(mipha.shutil, "which", lambda _n: None)
-        self.patch(mipha, "run_argv_local", lambda argv, timeout=45: (0, "[]", ""))
         current = mipha.probe_local_health()
         self.assertEqual(current["libvirt"], "unknown")
 
-    def test_unserviceable_resources_are_collected_from_the_status_document(self):
-        self.patch(mipha, "get_all_drbd_resources", lambda: ["vm-disk0"])
+    def test_a_degraded_vdisk_is_collected_as_unserviceable(self):
+        self.arrange_sidon(attached=[
+            {"vdisk_id": "vm-disk0", "degraded": "drain failed: No space left on device"},
+            {"vdisk_id": "vm-disk1", "degraded": None},
+        ])
         self.patch(mipha.shutil, "which", lambda _n: "/usr/bin/virsh")
-        status = json.dumps([resource(name="vm-disk0", role="Primary",
-                                      devices=[device(quorum=False)])])
-
-        def fake_argv(argv, timeout=45):
-            if argv[0] == "drbdsetup":
-                return 0, status, ""
-            return 0, "", ""
-
-        self.patch(mipha, "run_argv_local", fake_argv)
+        self.patch(mipha, "run_argv_local", lambda argv, timeout=45: (0, "", ""))
         current = mipha.probe_local_health()
-        self.assertEqual(current["libvirt"], "ok")
-        self.assertEqual(current["drbd_control"], "ok")
-        self.assertEqual([item["cause"] for item in current["unserviceable"]],
-                         ["quorum-lost"])
+        self.assertEqual(current["storage"], "ok")
+        self.assertEqual([u["resource"] for u in current["unserviceable"]], ["vm-disk0"])
+        self.assertEqual(current["unserviceable"][0]["cause"], "drain-failed")
+
+    def test_serving_healthy_vdisks_is_ok_with_nothing_unserviceable(self):
+        self.arrange_sidon(attached=[{"vdisk_id": "vm-disk0", "degraded": None}])
+        self.patch(mipha.shutil, "which", lambda _n: "/usr/bin/virsh")
+        self.patch(mipha, "run_argv_local", lambda argv, timeout=45: (0, "", ""))
+        current = mipha.probe_local_health()
+        self.assertEqual(current["storage"], "ok")
+        self.assertEqual(current["unserviceable"], [])
 
 
 # -- the daemon side: a fence that reads back what it did ----------------------------------

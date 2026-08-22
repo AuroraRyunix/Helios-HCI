@@ -356,13 +356,14 @@ class LanayruDeploymentTests(ConditionalWriteTestCase):
     def setUp(self):
         super().setUp()
         self.spark_commands = []
-        self.linstor_commands = []
+        self.storage_calls = []
         self.tasks = []
         self._patched = {}
         self.patch(spectrum, "run_remote_spark",
                    lambda ip, cmd: (self.spark_commands.append((ip, cmd)), (0, "", ""))[1])
-        self.patch(spectrum, "run_linstor_cmd",
-                   lambda args: (self.linstor_commands.append(args), (0, "", ""))[1])
+        self.patch(spectrum, "sidon_call",
+                   lambda op, host_ip="127.0.0.1", **params: (
+                       self.storage_calls.append((op, params)), (True, {}))[1])
         self.patch(spectrum, "log_catalyst_task",
                    lambda *args, **kwargs: self.tasks.append((args, kwargs)))
         self.patch(spectrum, "get_cluster_nodes",
@@ -431,7 +432,7 @@ class LanayruDeploymentTests(ConditionalWriteTestCase):
         row = SESSION.row(VMS, "lke-control-01")
         self.assertEqual(row["host_ip"], "10.0.0.9")
         self.assertEqual(row["vcpu"], 8)
-        self.assertEqual(self.linstor_commands, [],
+        self.assertEqual(self.storage_calls, [],
                          "storage was built for a VM whose name was already taken")
         self.assertEqual(self.tasks[-1][0][2], "failed")
 

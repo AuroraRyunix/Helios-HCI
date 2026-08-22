@@ -41,7 +41,8 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         run_cql_query,
         run_lwt,
         run_remote_spark,
-        run_linstor_cmd,
+        sidon_call,
+        sidon_module,
         log_catalyst_task,
         get_cluster_nodes,
         get_catalyst_target_ip,
@@ -161,7 +162,7 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             vm_ips.append((vm_name, assigned_ip))
 
             res_name = f"{vm_name}-disk0"
-            disk_path = f"/dev/drbd/by-res/{res_name}/0"
+            disk_path = sidon_module().nbd_socket(res_name)
             target_host = hosts[i % len(hosts)]["ip"]
 
             # Register the VM before anything is built for it.
@@ -170,7 +171,7 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
             # created and the OS image written to it. INSERT is an upsert in CQL, so
             # deploying a cluster whose name collided with an existing VM reset that VM's
             # placement to this target host -- after which two hosts could start it
-            # against the same DRBD device. Claiming the name first means a collision
+            # against the same vdisk. Claiming the name first means a collision
             # costs a refused deployment rather than somebody else's guest.
             #
             # (The old statement also named columns hydra.vms does not have -- uuid,
@@ -197,21 +198,35 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
                     f"'{current.get('host_ip')}'). Choose a different cluster name.", "error")
                 raise RuntimeError(f"VM {vm_name} is already registered")
 
-            # 1. Create Linstor storage volumes (Allocating 50 GiB thin storage per Tanzu/LKE specifications)
-            log(f"Creating Linstor storage resource definition '{res_name}' (50 GiB)...", "info")
-            run_linstor_cmd(f"resource-definition create {res_name}")
-            run_linstor_cmd(f"volume-definition create {res_name} 50GiB")
+            # 1. Create the node's vdisk (50 GiB, per Tanzu/LKE sizing)
+            log(f"Creating vdisk '{res_name}' (50 GiB)...", "info")
+            ok_c, body_c = sidon_call("create", vdisk_id=res_name,
+                                      size_bytes=50 * 1024 * 1024 * 1024)
+            if not ok_c and "already exists" not in str(body_c):
+                raise Exception(f"Could not create vdisk {res_name}: {body_c}")
 
-            # Autoplace volume on target nodes
-            log(f"Autoplacing storage resource '{res_name}' to cluster node {target_host}...", "info")
-            run_linstor_cmd(f"resource create {res_name} --auto-place 3")
-            time.sleep(0.5)
+            # Attach it on the node that will run the guest. There is no placement to
+            # do here any more -- no --auto-place, no copy per node. A vdisk has one
+            # owner, and attaching is what claims it.
+            log(f"Attaching vdisk '{res_name}' on {target_host}...", "info")
+            ok_a, body_a = sidon_call("attach", vdisk_id=res_name, host_ip=target_host)
+            if not ok_a:
+                raise Exception(
+                    f"Could not attach vdisk {res_name} on {target_host}: {body_a}")
 
-            # Copy guest OS image to Linstor block device
-            log(f"Copying OS template image to Linstor block device for VM '{vm_name}'...", "info")
-            run_remote_spark(target_host, f"drbdadm primary {res_name} || true")
-            run_remote_spark(target_host, f"qemu-img convert -O raw /var/lib/hci/aether/images/cirros.img {disk_path} || dd if=/var/lib/hci/aether/images/cirros.img of={disk_path} bs=4M conv=sparse || true")
-            run_remote_spark(target_host, f"drbdadm secondary {res_name} || true")
+            # Copy the guest OS image in through the NBD socket. No promotion before
+            # and no demotion after: qemu-img talks to the local Sidon, which owns the
+            # disk, and the old `|| dd ... || true` fallback chain could not fail --
+            # a copy that never happened looked exactly like one that did.
+            log(f"Copying OS template image into the vdisk for VM '{vm_name}'...", "info")
+            rc_cp, out_cp, err_cp = run_remote_spark(
+                target_host,
+                f"qemu-img convert -O raw /var/lib/hci/images/cirros.img "
+                f"'nbd+unix:///{res_name}?socket={disk_path}'")
+            if rc_cp != 0:
+                raise Exception(
+                    f"Could not copy the OS image into vdisk {res_name}: "
+                    f"{(err_cp or out_cp or '').strip()[:300]}")
 
             # Generate cloud-init configuration ISO dynamically on host
             log(f"Generating cloud-init metadata ISO for VM '{vm_name}'...", "info")
@@ -409,7 +424,8 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
     from spectrum_server import (
         run_cql_query,
         run_remote_spark,
-        run_linstor_cmd,
+        sidon_call,
+        sidon_module,
         log_catalyst_task,
         get_cluster_nodes,
         LOCAL_IP,
@@ -473,23 +489,17 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
             else:
                 run_remote_spark(LOCAL_IP, f"rm -rf {ci_dir} {iso_path}")
 
-            # Delete Linstor resources (clean order: node instances first, then resource-definition)
+            # Delete the vdisks. One call per disk rather than a demote on every host
+            # and then a delete per node: a vdisk exists once, wherever its owner is.
             num_disks = len(disks_list.split(",")) if disks_list else 1
             for idx in range(num_disks):
                 res_name = f"{vm_name}-disk{idx}"
-                run_remote_spark(LOCAL_IP, f"drbdadm secondary {res_name} || true")
-                if host_ip:
-                    run_remote_spark(host_ip, f"drbdadm secondary {res_name} || true")
-                
-                # Delete Linstor instances on all nodes
-                for h in hosts:
-                    node_name = h.get("hostname", "")
-                    if node_name:
-                        run_linstor_cmd(f"resource delete {node_name} {res_name}")
-                
-                # Delete resource definition
-                run_linstor_cmd(f"resource-definition delete {res_name}")
-            
+                # Detach first -- delete refuses a vdisk that is still being served,
+                # which is the guard against removing storage from under a guest that
+                # has not actually let go of it yet.
+                sidon_call("detach", vdisk_id=res_name, host_ip=host_ip or LOCAL_IP)
+                sidon_call("delete", vdisk_id=res_name, host_ip=host_ip or LOCAL_IP)
+
             # Remove metadata record from ScyllaDB
             run_cql_query(f"DELETE FROM hydra.vms WHERE name = '{vm_name}';")
             time.sleep(0.5)

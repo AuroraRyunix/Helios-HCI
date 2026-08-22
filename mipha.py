@@ -19,435 +19,6 @@ def run_command_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
 
-def check_linstor_db_mount():
-    rc, stdout, stderr = run_command_local("mountpoint -q /var/lib/linstor")
-    return rc == 0
-
-def check_linstor_controller_active():
-    rc, stdout, stderr = run_command_local("systemctl is-active linstor-controller")
-    return stdout == "active"
-
-def get_local_drbd_role(resource_name):
-    rc, stdout, stderr = run_command_local(f"drbdadm role {resource_name}")
-    if rc == 0:
-        return stdout.split("/", 1)[0].strip()
-    return "Unknown"
-
-import glob
-
-def get_all_drbd_resources():
-    resources = []
-    try:
-        for path in glob.glob("/etc/drbd.d/*.res"):
-            name = os.path.basename(path).replace(".res", "")
-            if name != "global_common" and name != "loop_device_mapping":
-                resources.append(name)
-    except Exception:
-        pass
-    return resources
-
-def ensure_drbd_resource_up(resource_name):
-    rc, stdout, stderr = run_command_local(f"drbdadm status {resource_name}")
-    if rc != 0:
-        print(f"[Mipha HA] DRBD resource {resource_name} is not loaded. Loading with drbdadm up...")
-        run_command_local(f"drbdadm up {resource_name}")
-
-def get_drbd_resource_state(resource_name):
-    # Per-resource view (local role, devices and peer connections) taken from drbdsetup JSON
-    rc, stdout, stderr = run_command_local("drbdsetup status --json")
-    if rc != 0 or not stdout.strip():
-        return None
-
-    try:
-        data = json.loads(stdout)
-    except Exception:
-        return None
-
-    for resource in data:
-        if resource.get("name") != resource_name:
-            continue
-        return {
-            "role": resource.get("role", "Unknown"),
-            "devices": resource.get("devices", []),
-            "connections": resource.get("connections", [])
-        }
-    return None
-
-def get_drbd_device_holders(resource_name, devices):
-    # Returns a list of everything currently holding the DRBD device(s) of this resource open:
-    # a mounted filesystem, a stacked block device, or a live process (qemu keeps the raw device
-    # open for as long as the guest runs). A resource with holders must never discard its writes.
-    holders = []
-    rdev_map = {}
-
-    for dev in devices:
-        vol = dev.get("volume", 0)
-        minor = dev.get("minor")
-        candidates = []
-        if minor is not None:
-            candidates.append(f"/dev/drbd{minor}")
-        candidates.append(f"/dev/drbd/by-res/{resource_name}/{vol}")
-        for path in candidates:
-            try:
-                st = os.stat(path)
-            except Exception:
-                continue
-            if stat.S_ISBLK(st.st_mode):
-                rdev_map[st.st_rdev] = (candidates[0], minor)
-
-    if not rdev_map:
-        return holders
-
-    # Mounted filesystems on top of the device
-    try:
-        with open("/proc/mounts", "r") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 2 or not parts[0].startswith("/dev/"):
-                    continue
-                try:
-                    st = os.stat(parts[0])
-                except Exception:
-                    continue
-                if stat.S_ISBLK(st.st_mode) and st.st_rdev in rdev_map:
-                    holders.append(f"{rdev_map[st.st_rdev][0]} is mounted at {parts[1]}")
-    except Exception:
-        pass
-
-    # Stacked block devices (LVM/md/dm layered on top of the DRBD device)
-    for dev_path, minor in rdev_map.values():
-        if minor is None:
-            continue
-        try:
-            for h in os.listdir(f"/sys/block/drbd{minor}/holders"):
-                holders.append(f"{dev_path} is stacked under /dev/{h}")
-        except Exception:
-            pass
-
-    # Processes with the device open (running guest, dd, rsync, ...)
-    try:
-        pids = os.listdir("/proc")
-    except Exception:
-        pids = []
-    for pid in pids:
-        if not pid.isdigit():
-            continue
-        try:
-            fds = os.listdir(f"/proc/{pid}/fd")
-        except Exception:
-            continue
-        for fd in fds:
-            try:
-                st = os.stat(f"/proc/{pid}/fd/{fd}")
-            except Exception:
-                continue
-            if stat.S_ISBLK(st.st_mode) and st.st_rdev in rdev_map:
-                pname = "unknown"
-                try:
-                    with open(f"/proc/{pid}/comm", "r") as f:
-                        pname = f.read().strip()
-                except Exception:
-                    pass
-                holders.append(f"{rdev_map[st.st_rdev][0]} is open by pid {pid} ({pname})")
-                break
-
-    return holders
-
-def get_peer_drbd_role(resource_name, connections, probe_peers=False):
-    # Peer role for THIS resource. DRBD reports peer-role Unknown while the connection is
-    # StandAlone, so optionally fall back to asking the reachable cluster peers over spark-daemon.
-    # Returns "Primary", "Secondary" or "Unknown" (Unknown means: do not auto-discard).
-    roles = set()
-    for conn in connections:
-        peer_role = (conn.get("peer-role") or "").strip()
-        if peer_role and peer_role != "Unknown":
-            roles.add(peer_role)
-
-    if len(roles) == 1:
-        return roles.pop()
-    if len(roles) > 1:
-        return "Unknown"
-    if not probe_peers:
-        return "Unknown"
-
-    answered = 0
-    for h in get_cluster_hosts():
-        ip = h.get("ip")
-        if not ip or ip == LOCAL_IP:
-            continue
-        if not ping_host(ip):
-            continue
-        rc, stdout, stderr = run_remote_spark(ip, f"drbdadm role {resource_name}")
-        if rc != 0 or not stdout.strip():
-            # Peer is unreachable or does not host this resource
-            continue
-        answered += 1
-        roles.add(stdout.strip().splitlines()[-1].split("/", 1)[0].strip())
-
-    if answered == 0 or len(roles) != 1:
-        return "Unknown"
-    return roles.pop()
-
-def resolve_drbd_standalone(resource_name):
-    try:
-        ensure_drbd_resource_up(resource_name)
-        rc, stdout, stderr = run_command_local(f"drbdadm status {resource_name}")
-        if rc != 0 or "StandAlone" not in stdout:
-            return
-
-        # The victim of a split-brain is a per-resource question: ZooKeeper leadership is a single
-        # cluster-wide property and says nothing about which node holds the authoritative copy of
-        # this resource, so it must never gate a --discard-my-data.
-        state = get_drbd_resource_state(resource_name)
-        if not state:
-            print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone but drbdsetup returned no usable state for it. NOT discarding anything. Leaving {resource_name} StandAlone for manual resolution.")
-            return
-
-        role = state["role"]
-        if role in ("", "Unknown"):
-            role = get_local_drbd_role(resource_name)
-
-        # A live holder (running guest, mounted filesystem, stacked device) means the local copy is
-        # being served right now, so it must never be thrown away. Only a Primary can hold the device
-        # open, and a Primary is never the victim, so the peer only has to be probed when we are not
-        # Primary and could therefore end up discarding.
-        holders = []
-        if role != "Primary":
-            holders = get_drbd_device_holders(resource_name, state["devices"])
-            if holders:
-                print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone with role={role} but its device still has a live holder ({'; '.join(holders)}). Refusing to touch the connection so nothing can discard local writes. Operator intervention required for {resource_name}.")
-                return
-
-        peer_role = get_peer_drbd_role(resource_name, state["connections"], probe_peers=(role != "Primary"))
-        print(f"[Mipha HA] DRBD resource {resource_name} is in StandAlone state. Resolving (role={role}, peer role={peer_role})...")
-
-        if role == "Secondary" and peer_role == "Primary":
-            # Local is Secondary, nothing is using the device and the peer serves the resource,
-            # so the local copy is the safe victim.
-            print(f"[Mipha HA] Local node is Secondary on {resource_name} while the peer holds Primary. Discarding local writes to auto-heal...")
-            run_command_local(f"drbdadm disconnect {resource_name}")
-            rc_s, stdout_s, stderr_s = run_command_local(f"drbdadm secondary {resource_name}")
-            if rc_s != 0:
-                print(f"[Mipha HA] CRITICAL: Failed to demote {resource_name} to Secondary ({stderr_s or stdout_s}). Aborting discard. Operator intervention required for {resource_name}.")
-                return
-            run_command_local(f"drbdadm connect --discard-my-data {resource_name}")
-            return
-
-        if role == "Primary" and peer_role != "Primary":
-            print(f"[Mipha HA] Local node holds Primary on {resource_name} (peer role={peer_role}). Keeping local writes and reconnecting without discard...")
-        else:
-            # Both Primary, both Secondary or peer role undeterminable: no safe victim can be picked
-            # here. Reconnect without discarding anything and let the resource-definition split-brain
-            # policy (after-sb-0pri/1pri/2pri) settle it, or stay StandAlone for the operator.
-            print(f"[Mipha HA] WARNING: DRBD resource {resource_name} is StandAlone with local role={role} and peer role={peer_role}. No safe victim can be determined, so local writes are NOT discarded. Reconnecting without discard - operator intervention may be required for {resource_name}.")
-        run_command_local(f"drbdadm disconnect {resource_name}")
-        run_command_local(f"drbdadm connect {resource_name}")
-    except Exception as e:
-        sys.stderr.write(f"[Mipha HA] Error resolving DRBD standalone for {resource_name}: {e}\n")
-
-DRBD_SYNC_TRACKER = {}
-
-def check_and_resolve_stuck_resync():
-    global DRBD_SYNC_TRACKER
-    rc, stdout, stderr = run_command_local("drbdsetup status --json")
-    if rc != 0 or not stdout.strip():
-        return
-        
-    try:
-        data = json.loads(stdout)
-    except Exception:
-        return
-        
-    current_time = time.time()
-    current_keys = set()
-    
-    for resource in data:
-        rname = resource.get("name")
-        connections = resource.get("connections", [])
-        for conn in connections:
-            peer_name = conn.get("name")
-            peer_devices = conn.get("peer_devices", [])
-            for dev in peer_devices:
-                vol = dev.get("volume", 0)
-                repl_state = dev.get("replication-state", "")
-                out_of_sync = dev.get("out-of-sync", 0)
-                
-                if repl_state in ("SyncTarget", "SyncSource") and out_of_sync > 0:
-                    key = (rname, peer_name, vol)
-                    current_keys.add(key)
-                    
-                    tracker = DRBD_SYNC_TRACKER.get(key)
-                    if not tracker:
-                        DRBD_SYNC_TRACKER[key] = {
-                            "last_out_of_sync": out_of_sync,
-                            "stalled_count": 0,
-                            "last_check_time": current_time
-                        }
-                    else:
-                        # Check every 30 seconds
-                        if current_time - tracker["last_check_time"] >= 30:
-                            if out_of_sync == tracker["last_out_of_sync"]:
-                                tracker["stalled_count"] += 1
-                                print(f"[Mipha HA] DRBD resource {rname} resync with {peer_name} is stalled at {out_of_sync} bytes. Stalled count = {tracker['stalled_count']}/3.")
-                            else:
-                                tracker["stalled_count"] = 0
-                                tracker["last_out_of_sync"] = out_of_sync
-                            tracker["last_check_time"] = current_time
-                            
-                            if tracker["stalled_count"] >= 3:
-                                print(f"[Mipha HA] DRBD resource {rname} resync with {peer_name} is STUCK (no progress for 90s). Triggering self-heal disconnect/connect...")
-                                run_command_local(f"drbdadm disconnect {rname}")
-                                time.sleep(1)
-                                run_command_local(f"drbdadm connect {rname}")
-                                tracker["stalled_count"] = 0
-                                tracker["last_check_time"] = current_time
-                                
-    # Clean up keys that are no longer syncing
-    for k in list(DRBD_SYNC_TRACKER.keys()):
-        if k not in current_keys:
-            DRBD_SYNC_TRACKER.pop(k, None)
-
-def linstor_ha_loop():
-    print("[Mipha HA] Linstor Controller HA Thread started.")
-    while True:
-        try:
-            # A fenced host behaves as a follower whatever ZooKeeper says about it. This
-            # loop promotes linstor-db and the storage containers back to Primary within
-            # two seconds of a demotion, so without this check a fence on the leader node
-            # would undo itself immediately -- and the host would be holding Primary on
-            # storage it has just declared it cannot serve.
-            fenced = self_fence_is_active()
-            is_leader = is_zookeeper_leader() and not fenced
-            for r in get_all_drbd_resources():
-                resolve_drbd_standalone(r)
-            
-            check_and_resolve_stuck_resync()
-            
-            # Only manage database HA if the linstor-db resource definition exists on this node
-            if os.path.exists("/etc/drbd.d/linstor-db.res"):
-                if is_leader:
-                    mounted = check_linstor_db_mount()
-                    role = get_local_drbd_role("linstor-db")
-                    
-                    if not mounted or role != "Primary" or not check_linstor_controller_active():
-                        print(f"[Mipha HA] Leader State: linstor-db role={role}, mounted={mounted}. Aligning to active...")
-                        
-                        # Stop the local controller first if we are about to mount, so we don't hold file handles on the root directory
-                        if not mounted and check_linstor_controller_active():
-                            print("[Mipha HA] Stopping local linstor-controller prior to mounting...")
-                            run_command_local("systemctl stop linstor-controller")
-                        
-                        hosts = get_cluster_hosts()
-                        for h in hosts:
-                            ip = h.get("ip")
-                            if ip and ip != LOCAL_IP:
-                                if ping_host(ip):
-                                    print(f"[Mipha HA] Coordinating with standby node {h['hostname']} ({ip}) to release linstor-db...")
-                                    stop_cmd = (
-                                        "if mountpoint -q /var/lib/linstor || [ \"$(drbdadm role linstor-db 2>/dev/null)\" = \"Primary\" ]; then "
-                                        "systemctl stop linstor-controller || true; "
-                                        "systemctl stop aether || true; "
-                                        "umount -l /var/lib/linstor || true; "
-                                        "drbdadm secondary linstor-db || true; "
-                                        "systemctl start aether || true; "
-                                        "else "
-                                        "systemctl stop linstor-controller || true; "
-                                        "fi"
-                                    )
-                                    run_remote_spark(ip, stop_cmd)
-                                    
-                        if role != "Primary":
-                            print("[Mipha HA] Promoting linstor-db to Primary...")
-                            rc_p, stdout_p, stderr_p = run_command_local("drbdadm primary linstor-db")
-                            if rc_p != 0:
-                                print(f"[Mipha HA] drbdadm primary failed ({stderr_p or stdout_p}). Attempting forced promotion to bypass unresponsive host locks...")
-                                rc_p, stdout_p, stderr_p = run_command_local("drbdadm primary --force linstor-db")
-                                if rc_p != 0:
-                                    print(f"[Mipha HA] CRITICAL: Forced promotion of linstor-db failed: {stderr_p or stdout_p}")
-                                
-                        if not check_linstor_db_mount():
-                            print("[Mipha HA] Mounting linstor-db volume at /var/lib/linstor...")
-                            run_command_local("mkdir -p /var/lib/linstor")
-                            rc_m, stdout_m, stderr_m = run_command_local("mount -t xfs /dev/drbd/by-res/linstor-db/0 /var/lib/linstor")
-                            if rc_m != 0:
-                                print(f"[Mipha HA] ERROR: Failed to mount linstor-db volume: {stderr_m or stdout_m}")
-                                
-                        if check_linstor_db_mount():
-                            if not check_linstor_controller_active():
-                                print("[Mipha HA] Starting linstor-controller service...")
-                                run_command_local("systemctl start linstor-controller")
-                        else:
-                            print("[Mipha HA] Refusing to start linstor-controller because mount failed.")
-                else:
-                    if check_linstor_controller_active():
-                        print("[Mipha HA] Follower State: Stopping linstor-controller...")
-                        run_command_local("systemctl stop linstor-controller")
-                        
-                    role = get_local_drbd_role("linstor-db")
-                    if check_linstor_db_mount() or role == "Primary":
-                        print("[Mipha HA] Follower State: Unmounting /var/lib/linstor and demoting to Secondary...")
-                        run_command_local("systemctl stop aether || true")
-                        run_command_local("umount -l /var/lib/linstor || true")
-                        run_command_local("drbdadm secondary linstor-db || true")
-                        run_command_local("systemctl start aether || true")
-
-            # Align default storage containers (default-vm-container and default-image-container)
-            for container in ["default-vm-container", "default-image-container"]:
-                if os.path.exists(f"/etc/drbd.d/{container}.res"):
-                    mount_path = f"/var/lib/hci/aether/volumes/{container}"
-                    if is_leader:
-                        os.makedirs(mount_path, exist_ok=True)
-                        rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
-                        mounted = (rc_m == 0)
-                        role = get_local_drbd_role(container)
-                        
-                        if not mounted or role != "Primary":
-                            print(f"[Mipha HA] Leader State: {container} role={role}, mounted={mounted}. Aligning to active...")
-                            
-                            # Release on peer standby nodes
-                            hosts = get_cluster_hosts()
-                            for h in hosts:
-                                ip = h.get("ip")
-                                if ip and ip != LOCAL_IP:
-                                    if ping_host(ip):
-                                        stop_cmd = f"umount -l {mount_path} || true; drbdadm secondary {container} || true"
-                                        run_remote_spark(ip, stop_cmd)
-                                        
-                            if role != "Primary":
-                                run_command_local(f"drbdadm primary {container}")
-                            
-                            rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
-                            if rc_m != 0:
-                                run_command_local(f"mount -t xfs /dev/drbd/by-res/{container}/0 {mount_path}")
-                    else:
-                        rc_m, _, _ = run_command_local(f"mountpoint -q {mount_path}")
-                        if rc_m == 0:
-                            print(f"[Mipha HA] Follower State: Unmounting {container}...")
-                            run_command_local(f"umount -l {mount_path} || true")
-                        role = get_local_drbd_role(container)
-                        if role == "Primary":
-                            print(f"[Mipha HA] Follower State: Demoting {container} to Secondary...")
-                            run_command_local(f"drbdadm secondary {container} || true")
-                        
-        except Exception as ex:
-            sys.stderr.write(f"[Mipha HA] Error in Linstor HA loop: {ex}\n")
-            
-        time.sleep(2)
-
-
-LOCAL_IP = "127.0.0.1"
-
-# Load local environment settings if available
-try:
-    with open("/etc/hci/spectrum/spectrum.env", "r") as f:
-        for line in f:
-            if "=" in line:
-                k, v = line.strip().split("=", 1)
-                if k == "LOCAL_HYPERVISOR_IP":
-                    LOCAL_IP = v
-except Exception:
-    pass
-
 def spark_endpoint(ip):
     """Return (address, verify_identity) for an mTLS call to a spark-daemon.
 
@@ -472,7 +43,7 @@ def spark_mtls_context(verify_identity):
     """Build the mTLS context Mipha dials peers with, or None if no keypair is usable.
 
     None rather than ssl._create_unverified_context(): Mipha fences hosts and promotes
-    the LINSTOR controller off what these calls report, and an unverified context turned
+    storage decisions off what these calls report, and an unverified context turned
     a missing keypair into a connection that trusts whatever answers on 9099. Failing the
     call is the safe reading of "this node has no identity".
     """
@@ -572,7 +143,7 @@ class ConditionalStatementError(RuntimeError):
 def _cql_outside_string_literals(cql_query):
     """The statement with every single-quoted literal blanked out.
 
-    Task error messages, DRBD command output and operator-supplied text all end up inside
+    Task error messages, daemon output and operator-supplied text all end up inside
     CQL literals here, and any of them can contain the word "if". Searching the raw text
     for the keyword would refuse an ordinary INSERT because a resync failure happened to
     print "check if the peer is reachable". A doubled quote ('') is an escaped quote
@@ -778,27 +349,32 @@ def check_vali_health(ip):
     except Exception:
         return False
 
-def get_dfs_engine():
-    return "linstor"
+_SIDON = None
 
-def get_linstor_pending_sync():
-    hosts = get_cluster_hosts()
-    ips = [h["ip"] for h in hosts] if hosts else ["127.0.0.1"]
-    controllers_str = ",".join(ips)
-    cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume list"
-    candidate_ips = ["127.0.0.1"] + ips
-    rc = -1
-    stdout = ""
-    for ip in candidate_ips:
-        rc, stdout, stderr = run_remote_spark(ip, cmd)
-        if rc == 0:
-            break
-    if rc != 0:
-        return -1
-    if "Syncing" in stdout or "PausedSync" in stdout or "Inconsistent" in stdout:
-        return 1
-    return 0
 
+def sidon_module():
+    """helios_sidon, or None if this node has not been updated yet."""
+    global _SIDON
+    if _SIDON is not None:
+        return _SIDON or None
+    try:
+        import helios_sidon
+        _SIDON = helios_sidon
+        return _SIDON
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sidon.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "helios_sidon.py")):
+        if os.path.exists(candidate):
+            spec = importlib.util.spec_from_file_location("helios_sidon", candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _SIDON = module
+            return module
+    _SIDON = False
+    return None
 
 def submit_catalyst_task(leader_ip, service, action, payload):
     # Catalyst requires a cluster-signed certificate: it dispatches VM lifecycle
@@ -850,16 +426,19 @@ def submit_catalyst_task(leader_ip, service, action, payload):
 # recorded as a failure, never as a success:
 #
 #   self     the host already fenced itself and said so (hydra.nodes status FENCED).
-#   spark    in-band. Kill the guests, stop libvirt, demote DRBD -- then read back that
+#   spark    in-band. Kill the guests, stop libvirt, release every vdisk -- then read back that
 #            no qemu remains, nothing holds a device open and nothing is Primary.
 #   bmc      out-of-band. ipmitool chassis power off, then poll chassis power status
 #            until it reads off. A command that returned 0 is not a power-off.
 #   storage  the host cannot be reached or powered off, so prove instead that its kernel
 #            is already refusing its writes -- see storage_fence_assert().
 #
-# The honest part: with no BMC and no DRBD quorum there is a residual case that none of
-# these rungs can close, and it is documented in docs/fencing.md rather than papered
-# over. In that case the default is to refuse the failover.
+# The residual case this ladder used to carry is gone. With DRBD, a cluster with no BMC
+# and no armed quorum had no rung that could confirm anything, and the default was to
+# refuse the failover and say so. The storage rung is now a compare-and-swap in Hydra,
+# which needs neither a BMC nor a quorum nor the cooperation of the host being fenced, so
+# the only way to reach an unconfirmed fence is for Hydra itself to be unreachable --
+# where refusing is obviously right rather than regrettable.
 # ---------------------------------------------------------------------------
 
 FENCING_CONFIG_PATH = "/etc/hci/fencing.json"
@@ -873,24 +452,18 @@ FENCE_METHOD_NONE = "none"
 FENCE_METHOD_SELF = "self"
 FENCE_METHOD_SPARK = "spark"
 FENCE_METHOD_BMC = "bmc"
-FENCE_METHOD_STORAGE = "storage-quorum"
+# Not "storage-quorum" any more: nothing about this rung reads a quorum. It raises
+# the epoch on the dead host's vdisks and every replica enforces it.
+FENCE_METHOD_STORAGE = "storage-epoch"
 
 # `hydra.nodes.status` for a host that has fenced itself. Vali already refuses to place
 # on any host whose status is not exactly NORMAL, so this needs no scheduler change.
 NODE_STATUS_FENCED = "FENCED"
 NODE_STATUS_DEGRADED = "DEGRADED"
 
-# Only these make a DRBD node that loses quorum stop writing. `on-no-quorum` has no
-# other useful value, but reading it rather than assuming it is the difference between
-# checking and hoping.
-QUORUM_IO_POLICIES = ("io-error", "suspend-io")
-
-DRBD_RESOURCE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
-
-# Mount points Mipha's own storage loop puts on top of DRBD devices. A fence has to take
-# these down before a resource can be demoted, and the list is fixed rather than derived
-# so a fence never unmounts something it did not put there.
-FENCED_MOUNTS = ("/var/lib/linstor",
+# Mount points a fence has to take down before this host counts as released. Fixed rather
+# than derived, so a fence never unmounts something it did not put there.
+FENCED_MOUNTS = (
                  "/var/lib/hci/aether/volumes/default-vm-container",
                  "/var/lib/hci/aether/volumes/default-image-container")
 
@@ -909,8 +482,8 @@ DEFAULT_FENCING_CONFIG = {
         "enabled": True,
         "interval_seconds": 10,
         # Three consecutive passes, matching the cluster-side failover threshold. A
-        # single failed probe is a blip; DRBD reports no quorum for a moment during
-        # `drbdadm up` and virsh times out under load.
+        # single failed probe is a blip; Sidon is briefly unreachable across a restart
+        # and virsh times out under load.
         "threshold": 3,
         # Nothing self-fences during startup: resources come up Secondary without
         # quorum and every probe would fire at once.
@@ -919,7 +492,7 @@ DEFAULT_FENCING_CONFIG = {
         # automatically is how one flapping host takes VMs and drops them repeatedly, so
         # 0 means "an operator runs `mipha --clear-self-fence`".
         "auto_recover_after_clean_seconds": 0,
-        # Stopping ZooKeeper hands leadership -- Mipha's, LINSTOR's controller, Bifrost's
+        # Stopping ZooKeeper hands leadership -- Mipha's, Purah's, Bifrost's
         # VIP -- to a node that can still serve. Refused below three nodes, where the
         # remaining ensemble could not form a quorum anyway.
         "release_zookeeper_leadership": True,
@@ -1030,7 +603,7 @@ def load_fencing_config(path=None):
 def run_argv_local(argv, timeout=45):
     """Run a local command as an argv list, never through a shell.
 
-    The fencing paths pass DRBD resource names and BMC addresses into commands. A list
+    The fencing paths pass vdisk ids and BMC addresses into commands. A list
     with shell=False makes each of those exactly one argument whatever it contains.
     """
     try:
@@ -1116,7 +689,7 @@ def spark_fence_host(ip):
     if status in (200, 409) and isinstance(res, dict) and "fenced" in res:
         if res.get("fenced"):
             return True, (res.get("detail")
-                          or "spark-daemon reports no guest processes, no open DRBD "
+                          or "spark-daemon reports no guest processes and no served "
                              "device and no Primary resource")
         return False, ("spark-daemon ran the fence and it did not take: "
                        + (res.get("detail") or json.dumps(res))[:300])
@@ -1147,27 +720,16 @@ def legacy_spark_fence(ip):
         return False, ("guest processes are still running after the fence: "
                        + " | ".join(stdout.strip().splitlines()[:5]))
 
-    rc_s, status, err_s = run_mtls_spark_api(ip, "/api/v1/storage/drbd/status", None,
-                                             method="GET")
-    if rc_s != 0 or not isinstance(status, list):
-        return False, ("no qemu is left, but the host's DRBD state could not be read "
+    rc_s, status, err_s = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "list"})
+    if rc_s != 0 or not isinstance(status, dict):
+        return False, ("no qemu is left, but the host's vdisk state could not be read "
                        f"({err_s or 'unparseable response'}), so it is not proven that it "
                        "released its disks")
-    held = []
-    for resource in status:
-        if not isinstance(resource, dict):
-            continue
-        name = resource.get("name", "?")
-        if str(resource.get("role", "")).lower() == "primary":
-            held.append(f"{name} is Primary")
-        for device in resource.get("devices") or []:
-            if device.get("open"):
-                held.append(f"{name}/{device.get('volume', 0)} is open")
+    held = [v.get("vdisk_id", "?") for v in (status.get("attached") or [])
+            if isinstance(v, dict)]
     if held:
-        return False, "the host still holds its storage: " + "; ".join(held[:5])
-    return True, ("no guest process is left and no DRBD resource is Primary or open "
-                  "(verified through the legacy fence path)")
-
+        return False, "the host is still serving " + ", ".join(held[:5])
+    return True, "no guest process is left and the host is serving no vdisk"
 
 def bmc_entry_for(hostname, ip, config):
     """The BMC record for a host, looked up by hostname then by address."""
@@ -1268,184 +830,100 @@ def bmc_fence_host(hostname, ip, config):
                    "proven to be down.")
 
 
-def _drbd_status_from(ip):
-    """`drbdsetup status --json` for a host, as a list; None when it cannot be read."""
-    if ip in (LOCAL_IP, "127.0.0.1"):
-        rc, stdout, _ = run_argv_local(["drbdsetup", "status", "--json"], timeout=30)
-        if rc != 0:
-            return None
-        try:
-            parsed = json.loads(stdout.strip() or "[]")
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, list) else None
-    rc, res, _ = run_mtls_spark_api(ip, "/api/v1/storage/drbd/status", None, method="GET")
-    if rc != 0 or not isinstance(res, list):
-        return None
-    return res
+def parse_json_rows(stdout):
+    """Rows from a `SELECT JSON` result, as dicts.
 
-
-def _drbd_options_from(ip, resource):
-    """Configured resource options for one DRBD resource; None when unreadable.
-
-    The device-level `quorum` flag in `drbdsetup status` reads true both when quorum is
-    held and when quorum is switched off entirely, so the *configuration* has to be read
-    separately. Conflating the two is what would let a storage fence claim a majority on
-    a cluster that has no quorum at all.
+    cqlsh prints one JSON object per line with a header and a blank line around them, so
+    non-object lines are skipped rather than treated as an error. A row that will not
+    parse is dropped for the same reason: a single malformed line should not lose the
+    whole result, and the callers here all tolerate a short list better than an exception.
     """
-    if not DRBD_RESOURCE_RE.match(resource or ""):
-        return None
-    if ip in (LOCAL_IP, "127.0.0.1"):
-        rc, stdout, _ = run_argv_local(["drbdsetup", "show", "--json", resource], timeout=30)
-        if rc != 0:
-            return None
+    rows = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or not line.endswith("}"):
+            continue
         try:
-            parsed = json.loads(stdout.strip() or "[]")
-        except Exception:
-            return None
-        for entry in parsed if isinstance(parsed, list) else []:
-            if isinstance(entry, dict) and entry.get("resource") == resource:
-                options = entry.get("options")
-                return options if isinstance(options, dict) else None
-        return None
-    rc, res, _ = run_mtls_spark_api(
-        ip, f"/api/v1/storage/drbd/options?resource={resource}", None, method="GET")
-    if rc != 0 or not isinstance(res, dict):
-        return None
-    options = res.get("options")
-    return options if isinstance(options, dict) else None
-
-
-def quorum_arms_the_fence(options, node_count):
-    """Would losing quorum actually stop this resource's writes? (bool, why not).
-
-    `quorum majority` and `quorum all` are safe by construction: two disjoint sets cannot
-    both be a majority, and only one set can be all of them. A *numeric* quorum is only
-    safe when it is more than half the nodes -- `quorum 1` is satisfied by every node on
-    its own, so both sides of a partition would keep writing while `drbdsetup status`
-    reported quorum on both.
-    """
-    if not isinstance(options, dict):
-        return False, "the resource options could not be read"
-    policy = str(options.get("on-no-quorum", "")).strip().lower()
-    if policy not in QUORUM_IO_POLICIES:
-        return False, (f"on-no-quorum is '{policy or 'unset'}', so a node that loses "
-                       "quorum keeps writing")
-    setting = str(options.get("quorum", "off")).strip().lower()
-    if setting in ("majority", "all"):
-        return True, ""
-    if setting in ("off", "", "none"):
-        return False, ("quorum is off, so DRBD does not stop a partitioned node from "
-                       "writing")
-    try:
-        votes = int(setting)
-    except ValueError:
-        return False, f"quorum is '{setting}', which cannot be interpreted"
-    if node_count and 2 * votes > node_count:
-        return True, ""
-    return False, (f"quorum is {votes} of {node_count} nodes, which both sides of a "
-                   "partition can hold at once")
+            parsed = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
 
 
 def storage_fence_assert(dead_hostname, dead_ip, hosts):
-    """Prove, from DRBD, that the dead host's kernel is already refusing its writes.
+    """Stop the dead host's writes, and prove it. Returns (confirmed, detail).
 
-    Returns (confirmed, detail).
+    This used to be an argument rather than an action. With DRBD there was no way to reach
+    into an unreachable host and stop it writing its own local copy, so the rung read DRBD
+    quorum and *inferred* that a host which could not see a majority was already failing
+    its own I/O. The inference was sound but conditional: it needed quorum armed, it needed
+    more than two nodes, and where those did not hold the ladder could confirm nothing.
 
-    This is the rung that exists on every cluster, because the cluster always owns the
-    storage even when it owns no BMC. It is worth being exact about what it can and
-    cannot do, because the obvious readings of "cut the host off from its DRBD resources"
-    do not work:
+    Under Sidon it is a fact instead. Every vdisk carries an (owner, epoch) pair and every
+    journal append carries its writer's epoch. Raising the epoch through a compare-and-swap
+    makes every replica reject appends from the old one -- the deposed host does not have
+    to agree, or be reachable, or even be running. It can be wedged, lying about its own
+    state, or convinced it is still the owner; its next write meets a rejection.
 
-      * Disconnecting the resource on the survivors does nothing to the dead host: DRBD
-        replication is peer-to-peer and the old Primary goes on writing its own local
-        copy exactly as before.
-      * `linstor resource delete <deadnode> <res>` needs the satellite on that node to
-        carry it out. Against an unreachable node it records an intent, it does not stop
-        a writer. It is storage *cleanup*, and calling it a fence would be a lie.
-      * Promoting the resource here proves nothing either. DRBD's refusal to allow two
-        Primaries is enforced across a *connection*; once the connection is gone, the
-        promotion check has no peer to consult.
-
-    What does work is a property the dead host's own kernel enforces without cooperation
-    from its userspace: DRBD quorum. With `quorum majority` and `on-no-quorum io-error`,
-    a node that cannot see a majority of the resource's nodes fails every I/O on it. If
-    we hold quorum here, the dead host by definition does not hold it there, so its
-    writes are already erroring. That is a proof, not a mitigation -- and it is the only
-    thing in this file that makes an unreachable host safe to fail over.
-
-    LINSTOR arms this automatically (`DrbdOptions/auto-quorum`, on by default, plus
-    diskless tiebreakers for two-replica resources), so most real clusters have it. A
-    single-replica resource has no majority to hold and is reported as such.
+    So this rung works on two nodes, works with no BMC, works with no quorum, and is the
+    only one that has to succeed for a failover to be safe. It needs Hydra and nothing
+    else. When Hydra is unreachable the honest answer is that nothing can be fenced, which
+    is what it returns.
     """
-    hosts = hosts or get_cluster_hosts()
-    survivors = [h for h in hosts if h.get("ip") and h.get("ip") != dead_ip]
-    if not survivors:
-        return False, "there is no surviving host to read the storage state from"
+    module = sidon_module()
+    if module is None:
+        return False, "helios_sidon is not installed on this node, so no vdisk can be fenced"
 
-    # Which resources does the dead host back? Ask the survivors: a resource that
-    # replicates to the dead node has a connection named after it. This is DRBD's own
-    # view rather than an inventory that can be stale.
-    findings = []
-    checked = 0
-    seen = set()
-    for host in survivors:
-        ip = host.get("ip")
-        status = _drbd_status_from(ip)
-        if status is None:
-            findings.append(f"{host.get('hostname') or ip}: DRBD state unreadable")
+    rc, stdout, _ = run_cql_query("SELECT JSON vdisk_id, owner, epoch FROM hydra.dfs_vdisks;")
+    if rc != 0:
+        return False, "hydra.dfs_vdisks could not be read, so nothing can be fenced"
+
+    owned = []
+    for row in parse_json_rows(stdout):
+        owner = (row.get("owner") or "").strip()
+        if owner and owner in (dead_hostname, dead_ip):
+            owned.append((row.get("vdisk_id"), owner, int(row.get("epoch") or 0)))
+
+    if not owned:
+        # Nothing to fence is a confirmed fence, not a failed one: the dead host owns no
+        # vdisk, so there is no write left that it could land.
+        return True, f"{dead_hostname} owns no vdisk; there is nothing it can still write"
+
+    me = local_hostname()
+    fenced = []
+    failures = []
+    for vdisk_id, owner, epoch in owned:
+        payload = {
+            "vdisk_id": vdisk_id,
+            "owner": me,
+            "epoch": epoch + 1,
+            "expected_owner": owner,
+            "expected_epoch": epoch,
+        }
+        rc_c, body, err = run_mtls_spark_api_full("127.0.0.1", "/v1/dfs/claim", payload)
+        if isinstance(body, dict) and body.get("applied") is True:
+            fenced.append(vdisk_id)
             continue
-        for resource in status:
-            if not isinstance(resource, dict):
-                continue
-            name = resource.get("name")
-            if not name or (name, ip) in seen:
-                continue
-            connections = [c for c in (resource.get("connections") or [])
-                           if isinstance(c, dict)]
-            peer = next((c for c in connections if c.get("name") == dead_hostname), None)
-            if peer is None:
-                continue
-            seen.add((name, ip))
-            checked += 1
+        # A refused claim means somebody else already moved it on, which fences the dead
+        # host just as thoroughly -- provided the owner it names is not the dead host.
+        current_owner = ""
+        if isinstance(body, dict):
+            current_owner = str((body.get("current") or {}).get("owner") or "")
+        if current_owner and current_owner not in (dead_hostname, dead_ip):
+            fenced.append(vdisk_id)
+        else:
+            failures.append(f"{vdisk_id}: {err or 'claim refused, still owned by the dead host'}")
 
-            state = str(peer.get("connection", "")).strip()
-            if state.lower() == "connected":
-                findings.append(f"{name}: still Connected to {dead_hostname} from "
-                                f"{host.get('hostname') or ip}, so it is not cut off")
-                continue
+    if failures:
+        detail = "; ".join(failures[:5])
+        if len(failures) > 5:
+            detail += f" (and {len(failures) - 5} more)"
+        return False, "could not raise the epoch on " + detail
+    return True, (f"{len(fenced)} vdisk(s) moved past {dead_hostname}'s epoch; every replica "
+                  "now rejects its writes")
 
-            # node_count counts this survivor plus every peer DRBD knows about, which is
-            # what a numeric quorum setting is measured against.
-            node_count = 1 + len(connections)
-            options = _drbd_options_from(ip, name)
-            armed, why_not = quorum_arms_the_fence(options, node_count)
-            if not armed:
-                findings.append(f"{name}: {why_not}")
-                continue
-
-            devices = [d for d in (resource.get("devices") or []) if isinstance(d, dict)]
-            if not devices:
-                findings.append(f"{name}: no local device on {host.get('hostname') or ip} "
-                                "to read quorum from")
-                continue
-            without = [str(d.get("volume", 0)) for d in devices if d.get("quorum") is not True]
-            if without:
-                findings.append(f"{name}: this side does not hold quorum on volume(s) "
-                                + ", ".join(without))
-                continue
-            findings.append(f"{name}: quorum held here, {dead_hostname} is "
-                            f"{state or 'disconnected'} and its I/O is failing")
-
-    if not checked:
-        return False, ("no DRBD resource on any surviving host replicates to "
-                       f"{dead_hostname}, so storage gives no evidence either way")
-    bad = [f for f in findings if ": quorum held here" not in f]
-    if bad:
-        return False, ("storage fencing could not be asserted for every resource the "
-                       "host backs: " + "; ".join(bad[:6]))
-    return True, ("every DRBD resource the host backs is quorate here and disconnected "
-                  f"there, so its writes are already failing ({len(findings)} resource(s))")
 
 
 def fence_host(hostname, ip, hosts=None, db_status=None, config=None):
@@ -1482,10 +960,16 @@ def fence_host(hostname, ip, hosts=None, db_status=None, config=None):
         FENCE_LEDGER[ip] = result.as_dict()
         return result
 
-    for method, call in ((FENCE_METHOD_SPARK, lambda: spark_fence_host(ip)),
-                         (FENCE_METHOD_BMC, lambda: bmc_fence_host(hostname, ip, config)),
-                         (FENCE_METHOD_STORAGE,
-                          lambda: storage_fence_assert(hostname, ip, hosts))):
+    # Storage first now, and that reordering is the point of the whole change. It used to
+    # be last because it was the weakest rung -- an inference needing quorum armed and more
+    # than two nodes. It is now the strongest and the only unconditional one: a
+    # compare-and-swap in Hydra that no state of the dead host can defeat. Spark and BMC
+    # stay because a wedged host still holds the VIP and still burns CPU, but they are
+    # hygiene now rather than the thing data safety rests on.
+    for method, call in ((FENCE_METHOD_STORAGE,
+                          lambda: storage_fence_assert(hostname, ip, hosts)),
+                         (FENCE_METHOD_SPARK, lambda: spark_fence_host(ip)),
+                         (FENCE_METHOD_BMC, lambda: bmc_fence_host(hostname, ip, config))):
         try:
             confirmed, detail = call()
         except Exception as exc:
@@ -1504,11 +988,11 @@ def failover_permitted(fence, config):
     The whole point of the ladder is this decision, so it is one function rather than a
     condition buried in the control loop.
 
-    "block" is the default because the alternative is to assume a fence that could not be
-    confirmed worked, and that assumption is what puts a second qemu on a DRBD device
-    that the first one is still writing. A cluster with no BMC and no DRBD quorum will
-    sometimes reach this and stop; that is the honest outcome, and the operator is told
-    exactly which of the two to configure.
+    "block" is still the default, but it should now be nearly unreachable: the storage
+    rung is a compare-and-swap in Hydra rather than an inference about a host nobody can
+    reach, so the only way to arrive here is with Hydra itself unavailable. That is the one
+    case where blocking is obviously right -- promoting a VM whose disk ownership cannot be
+    moved is precisely the split-brain this exists to prevent.
     """
     if fence.confirmed:
         return True, f"the fence was confirmed by {fence.method}"
@@ -1539,9 +1023,9 @@ def failover_permitted(fence, config):
 #               outage, and failing them over while they are still writing would be
 #               corruption. Losing management of a working VM is not a reason to destroy
 #               it.
-#   fence       the host stops its guests, gives up Primary on every DRBD resource, and
+#   fence       the host stops its guests, gives up every vdisk it serves, and
 #               records itself FENCED so the leader evacuates it. This is reserved for
-#               conditions under which the guests are *already* broken: DRBD has lost
+#               conditions under which the guests are *already* broken: the drain has
 #               quorum, or the device has no usable data path. Under those conditions
 #               stopping is strictly better than continuing, and -- the point -- it makes
 #               the host provably safe to fail over without a BMC.
@@ -1576,7 +1060,7 @@ def self_fence_is_active():
 def load_self_fence_marker():
     """Re-adopt a fence recorded before this process started.
 
-    Without this a Mipha restart on a fenced host would promote DRBD straight back to
+    Without this a Mipha restart on a fenced host would claim its vdisks straight back to
     Primary, which is the fence undoing itself two seconds after it was applied.
     """
     try:
@@ -1610,61 +1094,15 @@ def write_self_fence_marker(reason, report):
         return False
 
 
-def resource_is_unserviceable(resource):
-    """Is this resource Primary here while unable to serve I/O? (bool, cause, detail).
-
-    Three causes, kept apart because they escalate differently:
-
-      quorum-lost   DRBD says we do not hold quorum. With on-no-quorum io-error the
-                    guest's writes are already failing, and a majority exists elsewhere.
-      io-failures   the resource has been put into forced I/O failure or suspended for
-                    quorum -- same effect on the guest, local origin.
-      no-data       the local disk failed and no connected peer is UpToDate, so there is
-                    nothing left to read from. A failed local disk *with* a good peer is
-                    not listed: DRBD 9 keeps serving over the network and the guest never
-                    notices, which is the whole point of replication.
-    """
-    if not isinstance(resource, dict):
-        return False, "", ""
-    if str(resource.get("role", "")).lower() != "primary":
-        return False, "", ""
-    name = resource.get("name", "?")
-
-    if resource.get("force-io-failures") or resource.get("suspended-quorum"):
-        return True, "io-failures", f"{name} is Primary with I/O failing or suspended for quorum"
-
-    connections = [c for c in (resource.get("connections") or []) if isinstance(c, dict)]
-    for device in resource.get("devices") or []:
-        if not isinstance(device, dict):
-            continue
-        volume = device.get("volume", 0)
-        if device.get("quorum") is False:
-            return True, "quorum-lost", f"{name}/{volume} is Primary without quorum"
-        if str(device.get("disk-state", "")).strip() in ("Failed", "Detaching"):
-            healthy_peer = False
-            for connection in connections:
-                if str(connection.get("connection", "")).lower() != "connected":
-                    continue
-                for peer_device in connection.get("peer_devices") or []:
-                    if (isinstance(peer_device, dict)
-                            and peer_device.get("volume") == volume
-                            and str(peer_device.get("peer-disk-state", "")) == "UpToDate"):
-                        healthy_peer = True
-            if not healthy_peer:
-                return True, "no-data", (f"{name}/{volume} disk is "
-                                         f"{device.get('disk-state')} with no UpToDate peer")
-    return False, "", ""
-
-
 def probe_local_health():
     """One pass of the local subsystem probes.
 
     Every probe returns one of "ok", "failed" or "unknown", and "unknown" is load-bearing:
     it means the probe could not reach a verdict, and it must never escalate to the tier
     that destroys running guests. That distinction is what keeps a slow virsh or a
-    momentarily unreadable drbdsetup from evacuating a healthy host.
+    momentarily unreachable Sidon from evacuating a healthy host.
     """
-    probe = {"libvirt": "unknown", "drbd_control": "unknown", "unserviceable": [],
+    probe = {"libvirt": "unknown", "storage": "unknown", "unserviceable": [],
              "detail": {}}
 
     if shutil.which("virsh") is None:
@@ -1680,30 +1118,30 @@ def probe_local_health():
             probe["libvirt"] = "failed"
             probe["detail"]["libvirt"] = (stderr or stdout).strip()[:200] or f"virsh exited {rc}"
 
-    configured = get_all_drbd_resources()
-    rc, stdout, stderr = run_argv_local(["drbdsetup", "status", "--json"], timeout=20)
-    if rc == 0:
-        try:
-            status = json.loads(stdout.strip() or "[]")
-        except Exception:
-            status = None
-        if isinstance(status, list):
-            probe["drbd_control"] = "ok"
-            for resource in status:
-                bad, cause, detail = resource_is_unserviceable(resource)
-                if bad:
-                    probe["unserviceable"].append(
-                        {"resource": resource.get("name", "?"), "cause": cause,
-                         "detail": detail})
-        else:
-            probe["detail"]["drbd_control"] = "drbdsetup returned output that is not JSON"
-    elif configured:
-        # Resources are configured on this host, so drbdsetup refusing to answer is a
-        # storage-stack failure rather than "this node has no DRBD".
-        probe["drbd_control"] = "failed"
-        probe["detail"]["drbd_control"] = (stderr or stdout).strip()[:200] or f"drbdsetup exited {rc}"
+    # The storage probe asks Sidon what it is serving. A vdisk reported degraded is one
+    # whose drain has failed: the guest's writes are still safe in the journal, but the
+    # journal is no longer emptying, so the disk will backpressure and stop. That is the
+    # local-origin equivalent of the old "Primary without quorum" -- the guest is not
+    # broken yet and will be.
+    module = sidon_module()
+    if module is None:
+        probe["detail"]["storage"] = "helios_sidon is not installed on this node"
     else:
-        probe["detail"]["drbd_control"] = "no DRBD resources are configured on this host"
+        try:
+            attached = module.list_attached(timeout=15).get("attached", [])
+            probe["storage"] = "ok"
+            for vdisk in attached:
+                if vdisk.get("degraded"):
+                    probe["unserviceable"].append({
+                        "resource": vdisk.get("vdisk_id", "?"),
+                        "cause": "drain-failed",
+                        "detail": str(vdisk.get("degraded"))[:200],
+                    })
+        except Exception as exc:
+            # Sidon not answering while it is meant to be serving disks is a storage-stack
+            # failure, and the self-fence tiers treat it as one.
+            probe["storage"] = "failed"
+            probe["detail"]["storage"] = str(exc)[:200]
 
     return probe
 
@@ -1751,24 +1189,20 @@ def self_fence_decide(probe, counters, config, hosts, uptime_seconds):
 
     hard = [item for item in probe["unserviceable"]]
     counters["unserviceable"] = counters.get("unserviceable", 0) + 1 if hard else 0
-    soft = [name for name in ("libvirt", "drbd_control") if probe.get(name) == "failed"]
-    for name in ("libvirt", "drbd_control"):
+    soft = [name for name in ("libvirt", "storage") if probe.get(name) == "failed"]
+    for name in ("libvirt", "storage"):
         counters[name] = counters.get(name, 0) + 1 if name in soft else 0
 
     if hard and counters["unserviceable"] >= threshold:
         causes = sorted({item["cause"] for item in hard})
         detail = "; ".join(item["detail"] for item in hard[:5])
-        if "quorum-lost" in causes:
-            # No peer check: losing quorum *is* the majority test. If we lost it, some
-            # other set of nodes holds it and can serve these resources.
-            return "fence", f"DRBD quorum lost while Primary ({detail})"
         if not healthy_peer_exists(hosts):
             return "quarantine", (f"local storage is unserviceable ({detail}) but no peer "
                                   "is answering, so stopping the guests here would not "
                                   "get them started anywhere else")
         return "fence", f"local storage cannot serve I/O ({detail})"
 
-    for name in ("drbd_control", "libvirt"):
+    for name in ("storage", "libvirt"):
         if counters.get(name, 0) >= threshold:
             return "quarantine", (f"{name} has failed {counters[name]} consecutive probes: "
                                   + probe["detail"].get(name, "no detail"))
@@ -1824,11 +1258,23 @@ def local_fence_fallback():
         if rc == 0:
             run_argv_local(["umount", "-l", mount], timeout=30)
 
-    for resource in get_all_drbd_resources():
-        if get_local_drbd_role(resource) == "Primary":
-            run_argv_local(["drbdadm", "secondary", resource], timeout=60)
-    still = [r for r in get_all_drbd_resources() if get_local_drbd_role(r) == "Primary"]
-    report["primary_resources"] = still
+    # Give up every vdisk. Detaching drains and releases, so the next owner's claim does
+    # not have to race a daemon that still believes it is serving.
+    still = []
+    module = sidon_module()
+    if module is not None:
+        try:
+            for vdisk in module.list_attached(timeout=15).get("attached", []):
+                vdisk_id = vdisk.get("vdisk_id")
+                if not vdisk_id:
+                    continue
+                try:
+                    module.detach(vdisk_id, timeout=30)
+                except Exception:
+                    still.append(vdisk_id)
+        except Exception:
+            still.append("sidon did not answer")
+    report["held_vdisks"] = still
     report["fenced"] = not report["qemu_pids"] and not still
     report["detail"] = ("fenced locally without spark-daemon" if report["fenced"]
                         else "local fence did not take: "
@@ -1838,14 +1284,15 @@ def local_fence_fallback():
 
 
 def execute_self_fence(reason, hosts=None, config=None):
-    """Take this host out: stop the guests, give up Primary, tell the cluster.
+    """Take this host out: stop the guests, give up every vdisk, tell the cluster.
 
-    The marker is written *first*. linstor_ha_loop() promotes resources back to Primary
-    within two seconds if this node holds ZooKeeper leadership, so a fence that demotes
-    before the loop knows to stand down undoes itself immediately.
+    The marker is written *first*, and it still matters even though nothing promotes
+    storage on a timer any more: without it, this node's own recovery path would re-claim
+    the vdisks it had just released and undo the fence within seconds.
 
     Returns the verification report. `fenced` false means the host is NOT safe to fail
-    over -- something still holds a device -- and that is reported rather than smoothed.
+    over -- something is still serving a vdisk -- and that is reported rather than
+    smoothed.
     """
     config = config or load_fencing_config()[0]
     settings = config.get("self_fence") or {}
@@ -1868,15 +1315,15 @@ def execute_self_fence(reason, hosts=None, config=None):
     write_self_fence_marker(reason, report)
 
     if report.get("fenced"):
-        print("[Mipha Self-Fence] This host holds no guest process and no Primary DRBD "
-              "resource. It is safe to restart its VMs elsewhere.")
+        print("[Mipha Self-Fence] This host holds no guest process and serves no vdisk. "
+              "It is safe to restart its VMs elsewhere.")
     else:
         print("[Mipha Self-Fence] CRITICAL: the fence did not fully take -- "
               f"{report.get('detail') or json.dumps(report)[:300]}. This host is NOT safe "
               "to fail over; an operator must power it off.")
 
     # Leadership has to move off a host that has just admitted it cannot serve storage,
-    # or nothing evacuates it: the Mipha leader does not monitor itself, and the LINSTOR
+    # or nothing evacuates it: the Mipha leader does not monitor itself, and the
     # controller would stay here on top of storage that does not work. Refused below three
     # nodes, where the remaining ZooKeeper ensemble could not form a quorum either.
     if settings.get("release_zookeeper_leadership", True):
@@ -1964,10 +1411,10 @@ def clear_self_fence(force=False):
     the fault is actually gone.
     """
     probe = probe_local_health()
-    still_bad = probe["unserviceable"] or probe["libvirt"] == "failed" or probe["drbd_control"] == "failed"
+    still_bad = probe["unserviceable"] or probe["libvirt"] == "failed" or probe["storage"] == "failed"
     print("[Mipha] Local health probe:")
     print(f"  libvirt      : {probe['libvirt']} {probe['detail'].get('libvirt', '')}".rstrip())
-    print(f"  drbd control : {probe['drbd_control']} {probe['detail'].get('drbd_control', '')}".rstrip())
+    print(f"  storage      : {probe['storage']} {probe['detail'].get('storage', '')}".rstrip())
     for item in probe["unserviceable"]:
         print(f"  storage      : {item['cause']} -- {item['detail']}")
     if still_bad and not force:
@@ -2048,7 +1495,7 @@ def self_fence_loop():
                     probe = probe_local_health()
                     healthy = (not probe["unserviceable"]
                                and probe["libvirt"] != "failed"
-                               and probe["drbd_control"] != "failed")
+                               and probe["storage"] != "failed")
                     clean_since = clean_since if healthy else None
                     if healthy and clean_since is None:
                         clean_since = time.time()
@@ -2119,35 +1566,29 @@ def report_fence_status():
         state = "usable" if password else f"UNUSABLE ({error})"
         print(f"  {hostname:<24} {entry.get('address')} as {entry.get('username')} -- {state}")
 
-    print("\nStorage fencing (DRBD quorum) for the resources on this host:")
-    status = _drbd_status_from(LOCAL_IP)
-    if status is None:
-        print("  drbdsetup status could not be read.")
-    elif not status:
-        print("  no DRBD resources on this host.")
+    # The storage rung needs no arming and no diagnosis any more, so this reports what
+    # it can do rather than what must be configured before it works. It used to print,
+    # per resource, whether DRBD quorum was armed -- and where it was not, the two
+    # linstor commands to run, plus the caveat that a resource with fewer than three
+    # nodes could not be armed at all and so had no storage fence whatsoever.
+    print("\nStorage fencing:")
+    if sidon_module() is None:
+        print("  UNAVAILABLE -- helios_sidon is not installed, so no vdisk can be fenced.")
     else:
-        unarmed = 0
-        for resource in status:
-            name = resource.get("name", "?")
-            connections = [c for c in (resource.get("connections") or []) if isinstance(c, dict)]
-            armed, why_not = quorum_arms_the_fence(_drbd_options_from(LOCAL_IP, name),
-                                                   1 + len(connections))
-            if armed:
-                print(f"  {name:<28} ARMED -- a partitioned peer stops writing")
-            else:
-                unarmed += 1
-                print(f"  {name:<28} NOT ARMED -- {why_not}")
-        if unarmed:
-            # Say what to run, not just what is wrong. Without quorum this rung can never
-            # confirm, and on a cluster with no BMC that is the whole storage fence.
-            print("\n  Arm it on the LINSTOR controller, per resource definition:")
-            print("    linstor resource-definition drbd-options --quorum majority "
-                  "--on-no-quorum io-error <resource>")
-            print("  or for everything LINSTOR creates from now on:")
-            print("    linstor controller set-property DrbdOptions/auto-quorum io-error")
-            print("  A resource with fewer than three nodes -- counting the diskless "
-                  "tiebreakers LINSTOR adds for two-replica resources -- has no majority "
-                  "to hold, so quorum cannot be armed for it at all.")
+        rc_v, stdout_v, _ = run_cql_query(
+            "SELECT JSON vdisk_id, owner FROM hydra.dfs_vdisks;")
+        if rc_v != 0:
+            print("  UNAVAILABLE -- hydra.dfs_vdisks could not be read. The fence is a "
+                  "compare-and-swap in Hydra, so it needs Hydra and nothing else.")
+        else:
+            rows = parse_json_rows(stdout_v)
+            here = local_hostname()
+            mine = sum(1 for r in rows if (r.get("owner") or "") == here)
+            print(f"  ARMED -- {len(rows)} vdisk(s) in the map, {mine} owned by this host.")
+            print("  Fencing a host raises the epoch on the vdisks it owns; every "
+                  "replica then rejects its writes.")
+            print("  This works on two nodes, with no BMC, and against a host that is "
+                  "wedged or unreachable. There is nothing to arm.")
 
     settings = config.get("self_fence") or {}
     print(f"\nSelf-fencing          : {'enabled' if settings.get('enabled', True) else 'disabled'}"
@@ -2280,7 +1721,7 @@ def release_orphaned_vm(vm_name, dead_host_ip):
     elsewhere: by a previous failover pass whose start task only just landed, by an
     operator, or by a Vali start that was already in flight. A blind
     `SET state='Stopped', host_ip=''` then unplaces a *running* VM, and the start task
-    that follows boots a second copy of it against the same DRBD device -- two qemu
+    that follows boots a second copy of it against the same vdisk -- two qemu
     processes on one raw device, which is the corruption failover exists to prevent.
 
     `IF host_ip = '<dead ip>'` scopes the reset to the host that actually died. A refusal
@@ -2377,139 +1818,93 @@ def report_ring_detach_candidate(hostname, ip):
 # Scheduled storage auto-heal.
 #
 # Invoked by the Dagur cron entry as `mipha --auto-heal`. This is deliberately a
-# subcommand on the existing daemon rather than a separate service: the DRBD healing
-# logic already lives here, and a second owner of DRBD state would race the HA loop.
+# subcommand on the existing daemon rather than a separate service: the storage healing
+# logic already lives here, and a second owner of storage state would race this loop.
 # It also avoids a fifth place for a component to drift out of (provision embedding,
 # sync_provision mapping, upgrade package, LCM inventory, deploy_updates).
 #
 # What belongs here is the slow work that must not run in a liveness loop: verify
 # scrubs, capacity reporting, and detecting under-replicated resources.
-LINSTOR_EXEC = "podman exec systemd-aether linstor"
 
 
 def _heal_log(msg):
     print(f"[AutoHeal] {msg}", flush=True)
 
 
-def auto_heal_drbd_verify():
-    """Run an online verify pass over every DRBD resource.
+def auto_heal_scrub():
+    """Run a scrub pass over every sealed extent group.
 
-    `drbdadm verify` checksums the peers against each other and marks any differing
-    blocks out-of-sync so the next resync repairs them. It is read-only with respect to
-    application data, but it is I/O heavy -- which is exactly why it belongs in a nightly
-    job rather than in Mipha's 10-second control loop.
+    `drbdadm verify` used to checksum peers against each other and mark differing blocks
+    out-of-sync for the next resync to repair. Purah's scrub is the same idea against a
+    better reference: a sealed extent group is immutable, so its hash was taken when the
+    data was known good and any difference is damage rather than drift. It needs no peer
+    and no lock, which is one of the things sealing buys.
+
+    Still nightly rather than in the 10-second loop: it reads every byte on the node.
     """
-    resources = get_all_drbd_resources()
-    if not resources:
-        _heal_log("No DRBD resources configured; skipping verify pass.")
+    module = sidon_module()
+    if module is None:
+        _heal_log("helios_sidon is not installed; skipping scrub pass.")
         return 0
-    failures = 0
-    for res in resources:
-        rc, out, err = run_command_local(f"drbdadm status {res}")
-        if rc != 0:
-            _heal_log(f"{res}: not loaded, skipping verify.")
-            continue
-        if "Connected" not in out and "UpToDate" not in out:
-            _heal_log(f"{res}: not in a connected/UpToDate state, skipping verify to avoid noise.")
-            continue
-        rc_v, out_v, err_v = run_command_local(f"drbdadm verify {res}")
-        if rc_v == 0:
-            _heal_log(f"{res}: verify started.")
-        else:
-            detail = (err_v or out_v).strip()
-            # A single-node resource has no peer to verify against; that is not a fault.
-            if "peer" in detail.lower() or "no connection" in detail.lower():
-                _heal_log(f"{res}: no peer to verify against (single-node resource).")
-            else:
-                _heal_log(f"{res}: verify FAILED: {detail}")
-                failures += 1
-    return failures
-
+    try:
+        report = module.call("purah-scrub", timeout=3600)
+    except Exception as exc:
+        _heal_log(f"scrub pass failed: {exc}")
+        return 1
+    checked = report.get("checked", 0)
+    mismatched = report.get("mismatched") or []
+    missing = report.get("missing") or []
+    if not mismatched and not missing:
+        _heal_log(f"scrub pass clean: {checked} sealed extent group(s) verified.")
+        return 0
+    for eg in mismatched:
+        _heal_log(f"SCRUB FAILURE: extent group {eg} no longer matches its seal hash.")
+    for eg in missing:
+        _heal_log(f"SCRUB FAILURE: extent group {eg} is referenced but its file is gone.")
+    return len(mismatched) + len(missing)
 
 def auto_heal_report_capacity():
-    """Report Linstor storage-pool usage, flagging thin-pool overcommit."""
-    rc, out, err = run_command_local(f"{LINSTOR_EXEC} --machine-readable storage-pool list")
-    if rc != 0:
-        _heal_log(f"Could not read storage pools: {(err or out).strip()[:200]}")
-        return 0
-    warnings = 0
-    try:
-        data = json.loads(out)
-        rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else data
-        for entry in rows if isinstance(rows, list) else []:
-            name = entry.get("storage_pool_name", "?")
-            node = entry.get("node_name", "?")
-            # Diskless pools carry no real capacity -- Linstor reports INT64_MAX for them,
-            # which would otherwise render as a meaningless 0.0% used line.
-            if entry.get("provider_kind") == "DISKLESS":
-                continue
-            free = entry.get("free_capacity")
-            total = entry.get("total_capacity")
-            if not total or total >= 2 ** 62:
-                continue
-            used_pct = 100.0 * (total - (free or 0)) / total
-            total_gib = total / (1024.0 * 1024.0)
-            level = "WARNING" if used_pct >= 85 else "ok"
-            _heal_log(f"pool {name} on {node}: {used_pct:.1f}% used of {total_gib:.0f} GiB ({level})")
-            if used_pct >= 85:
-                warnings += 1
-            # Thin pools overcommit: allocated volumes can exceed the backing pool, so
-            # report the metadata pressure Linstor tracks separately.
-            meta = (entry.get("props") or {}).get("StorDriver/internal/lvmthin/thinPoolMetadataPercent")
-            if meta:
-                try:
-                    if float(meta) >= 80.0:
-                        _heal_log(f"pool {name} on {node}: thin-pool metadata {float(meta):.1f}% used -- WARNING")
-                        warnings += 1
-                except ValueError:
-                    pass
-    except Exception as exc:
-        _heal_log(f"Could not parse storage-pool output: {exc}")
-    return warnings
+    """Report extent-store usage, flagging a node that is close to full.
 
-
-def auto_heal_check_replicas():
-    """Flag resources with fewer replicas than the cluster's redundancy factor."""
+    This used to parse `linstor --machine-readable storage-pool list` and derive thin-pool
+    overcommit from it. Sidon answers with bytes from the filesystem holding the extents,
+    which is the only number that decides whether a drain can complete.
+    """
+    module = sidon_module()
+    if module is None:
+        _heal_log("helios_sidon is not installed; skipping capacity report.")
+        return 0
     try:
-        with open("/etc/hci/cluster.json", "r") as f:
-            cfg = json.load(f)
-        rf = int(cfg.get("redundancy_factor", 0))
-        node_count = len(cfg.get("hosts", []))
+        cap = module.capacity(timeout=30)
     except Exception as exc:
-        _heal_log(f"Could not read cluster.json: {exc}")
+        _heal_log(f"Could not read extent-store capacity: {exc}")
         return 0
-    # FTT 0 on a single node means one copy is the intended state.
-    expected = rf + 1
-    if expected <= 1 or node_count <= 1:
-        _heal_log(f"Redundancy factor {rf} on {node_count} node(s): single-copy is expected, skipping replica check.")
+    total = int(cap.get("total_bytes") or 0)
+    avail = int(cap.get("available_bytes") or 0)
+    if total <= 0:
+        _heal_log("Extent store reported no capacity.")
         return 0
-    rc, out, err = run_command_local(f"{LINSTOR_EXEC} --machine-readable resource list")
-    if rc != 0:
-        _heal_log(f"Could not read resource list: {(err or out).strip()[:200]}")
-        return 0
-    warnings = 0
-    try:
-        data = json.loads(out)
-        rows = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else data
-        counts = {}
-        for entry in rows if isinstance(rows, list) else []:
-            counts[entry.get("name", "?")] = counts.get(entry.get("name", "?"), 0) + 1
-        for name, have in sorted(counts.items()):
-            if have < expected:
-                _heal_log(f"resource {name}: {have} replica(s), expected {expected} -- UNDER-REPLICATED")
-                warnings += 1
-    except Exception as exc:
-        _heal_log(f"Could not parse resource list: {exc}")
-    return warnings
+    used_pct = 100.0 * (total - avail) / total
+    gib = 1024 ** 3
+    _heal_log(f"Extent store: {(total - avail) / gib:.1f} of {total / gib:.1f} GiB used "
+              f"({used_pct:.1f}%), {cap.get('egroup_count', 0)} extent group(s), "
+              f"{int(cap.get('journal_bytes') or 0) / gib:.2f} GiB of journal.")
+    if used_pct >= 95:
+        _heal_log("CRITICAL: the extent store is nearly full. Drains will fail and guest "
+                  "writes will backpressure once the journal cannot empty.")
+        return 1
+    if used_pct >= 80:
+        _heal_log("WARNING: the extent store is over 80% full.")
+        return 1
+    return 0
 
 
 def run_auto_heal():
     """Entry point for `mipha --auto-heal`. Exit code 0 = clean, 1 = attention needed."""
     _heal_log("Starting scheduled storage auto-heal pass.")
     issues = 0
-    for step, fn in (("DRBD verify", auto_heal_drbd_verify),
-                     ("capacity report", auto_heal_report_capacity),
-                     ("replica check", auto_heal_check_replicas)):
+    for step, fn in (("scrub", auto_heal_scrub),
+                     ("capacity report", auto_heal_report_capacity)):
         try:
             issues += fn()
         except Exception as exc:
@@ -2525,10 +1920,6 @@ def run_auto_heal():
 def main():
     print("Mipha High-Availability Host Monitor and VM Failover Coordinator started.")
     
-    # Start the Linstor HA thread in the background
-    t = threading.Thread(target=linstor_ha_loop, daemon=True)
-    t.start()
-
     # The local subsystem watchdog runs on every host, not only the ZooKeeper leader:
     # the failure it exists to catch -- storage or libvirt dead while the network keeps
     # answering -- is invisible from anywhere else in the cluster.
@@ -2623,7 +2014,7 @@ def main():
 
                     # If host was previously marked DOWN, initiate rejoin/sync sequence
                     if db_status == "DOWN":
-                        print(f"[Mipha HA] Host {hostname} ({ip}) is back online! Starting rejoining and Linstor/DRBD sync sequence...")
+                        print(f"[Mipha HA] Host {hostname} ({ip}) is back online! Starting rejoin sequence...")
                         
                         # A1. Set host status to RECOVERING
                         cql_recovering = f"UPDATE hydra.nodes SET status = 'RECOVERING' WHERE hostname = '{hostname}';"
@@ -2641,7 +2032,7 @@ def main():
                         
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
-                        start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway logos mipha"
+                        start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway logos mipha"
                         run_remote_spark(ip, start_cmd)
                         
                         # Sleep 10 seconds to allow services (especially Aether/storage) to boot
@@ -2651,72 +2042,26 @@ def main():
                         cql_up = f"UPDATE hydra.catalyst_tasks SET progress = 20, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
                         run_cql_query(cql_up)
                         
-                        # C. Trigger self-heal (skipped for Linstor/DRBD)
-                        pass
-                        
-                        # D. Create child Catalyst task for Linstor/DRBD sync
-                        child_task_id = str(uuid.uuid4())
-                        child_payload = json.dumps({"hostname": hostname, "parent_task_id": parent_task_id})
-                        cql_child = f"""
-                        INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-                        VALUES ({child_task_id}, 'aether', 'sync', 'processing', '{child_payload.replace("'", "''")}', 10, {now_ms}, {now_ms});
-                        """
-                        run_cql_query(cql_child)
-                        
-                        # E. Poll sync status
-                        synced = False
-                        # Poll up to 60 iterations (3 minutes)
-                        for iteration in range(60):
-                            child_progress = min(95, 10 + iteration * 5)
-                            parent_progress = int(20 + (child_progress / 100.0) * 70)
-                            
-                            cql_up_child = f"UPDATE hydra.catalyst_tasks SET progress = {child_progress}, updated_at = {int(time.time()*1000)} WHERE task_id = {child_task_id};"
-                            run_cql_query(cql_up_child)
-                            
-                            cql_up_parent = f"UPDATE hydra.catalyst_tasks SET progress = {parent_progress}, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
-                            run_cql_query(cql_up_parent)
-                            
-                            pending = get_linstor_pending_sync()
-                            print(f"[Mipha HA] Linstor/DRBD sync status: pending_sync_active={pending}")
-                            if pending == 0:
-                                synced = True
-                                print(f"[Mipha HA] Linstor/DRBD resources fully synced on host {hostname}!")
-                                break
-                                
-                            time.sleep(3)
-                            
-                        # F. Conclude task and update node status
+                        # C. There is no resync to wait for.
+                        #
+                        # This used to create a child Catalyst task, poll
+                        # get_linstor_pending_sync() every three seconds, and hold the
+                        # rejoin open until DRBD had finished copying. Extent groups are
+                        # immutable and re-replicated by Purah in the background, so a
+                        # returning node has nothing to catch up on before it is usable: it
+                        # can serve any vdisk it is given the moment it is up, and
+                        # under-replicated groups are restored off the hot path.
                         now_ms_end = int(time.time() * 1000)
-                        if synced:
-                            # Set child & parent task to completed
-                            cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'completed', progress = 100, updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
-                            run_cql_query(cql_child_end)
-                            
-                            cql_parent_end = f"UPDATE hydra.catalyst_tasks SET status = 'completed', progress = 100, updated_at = {now_ms_end} WHERE task_id = {parent_task_id};"
-                            run_cql_query(cql_parent_end)
-                            
-                            # Set node status to NORMAL
-                            cql_normal = f"UPDATE hydra.nodes SET status = 'NORMAL' WHERE hostname = '{hostname}';"
-                            run_cql_query(cql_normal)
-                            print(f"[Mipha HA] Host {hostname} rejoin and sync completed successfully.")
-                        else:
-                            # Failed/timed out.
-                            #
-                            # `storage_name` was never defined anywhere in this file, so
-                            # this branch raised NameError, was swallowed by the control
-                            # loop's `except Exception`, and left both Catalyst tasks
-                            # stuck at 'processing' forever -- a rejoin that timed out
-                            # looked identical to one still in progress.
-                            err_msg = "Linstor/DRBD volume sync timed out or failed to complete self-heal."
-                            cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
-                            run_cql_query(cql_child_end)
-                            
-                            cql_parent_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {parent_task_id};"
-                            run_cql_query(cql_parent_end)
-                            
-                            # Leave status as RECOVERING so Vali does not use it
-                            print(f"[Mipha HA] ERROR: Host {hostname} rejoin failed. Linstor/DRBD sync not complete.")
-                    
+                        run_cql_query(
+                            f"UPDATE hydra.catalyst_tasks SET status = 'completed', "
+                            f"progress = 100, updated_at = {now_ms_end} "
+                            f"WHERE task_id = {parent_task_id};")
+                        run_cql_query(
+                            f"UPDATE hydra.nodes SET status = 'NORMAL' "
+                            f"WHERE hostname = '{hostname}';")
+                        print(f"[Mipha HA] Host {hostname} rejoined; Purah will restore "
+                              f"replica counts in the background.")
+
                 # 3. Trigger failover.
                 #
                 # Two triggers. The first is the original one, three consecutive failed
@@ -2775,9 +2120,9 @@ def main():
                                    "could not be confirmed. " + why)
                         print(f"[Mipha HA] CRITICAL: {err_msg}")
                         print("[Mipha HA] Its VMs are left placed on it. Restarting them "
-                              "elsewhere now could put two writers on one DRBD device. "
+                              "elsewhere now could put two writers on one vdisk. "
                               "Power the host off, or configure a BMC in "
-                              f"{FENCING_CONFIG_PATH} / enable DRBD quorum -- see "
+                              f"{FENCING_CONFIG_PATH} -- see "
                               "docs/fencing.md -- then this proceeds by itself.")
                         end_ms = int(time.time() * 1000)
                         run_cql_query(f"""
