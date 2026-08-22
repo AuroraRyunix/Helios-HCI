@@ -130,7 +130,46 @@ The curator, running inside Sidon. Three jobs, all background, none on the guest
 - **Scrub** — recompute every sealed group's hash against the one recorded at seal time.
   Needs no lock, because sealed means immutable.
 
-## 5. Operating it
+## 5. Snapshots and clones
+
+A snapshot copies the block map. It copies no data at all, and the number it reports for
+bytes copied is zero because that is the honest figure.
+
+```bash
+valcli storage.snapshot <vdisk> <name>   # point-in-time, read-only
+valcli storage.clone    <vdisk> <name>   # writable
+valcli storage.children <vdisk>          # what was taken from it
+```
+
+Sealed extent groups are immutable, so parent and child share every one of them and
+neither can disturb the other: a write to either is redirect-on-write, appending
+somewhere new and repointing only its own map. The cost is the number of extents in the
+map, not the bytes on disk, so a snapshot of a terabyte costs what a snapshot of a
+gigabyte costs.
+
+**Nothing keeps a reference count**, and this is where that decision pays. Purah marks
+from the whole of `dfs_block_map`, so a group the child points at is live whether or not
+the child is attached, and whether or not the parent still exists. Deleting a parent that
+has snapshots is safe and frees only what nothing else references — which looks alarming
+until you have `storage.children` to show you what is holding it.
+
+A clone is the same operation ending in a different class. That is what clone-from-image
+is: a template is already immutable, so a fleet cloned from it shares its extents until
+each VM writes its own. This is also the argument against deduplication in
+[decisions.md](./dfs/decisions.md) — the win dedup is usually bought for is identical OS
+images, and this has it without buying anything.
+
+**Where the call has to go.** A writable parent must be attached on the node the request
+reaches, because its journal has to be drained before its map is a complete answer and
+only its owner can drain it. An immutable parent has no journal and any node can copy it.
+`valcli` routes to the owner for you.
+
+**What a crash leaves.** The child's row is written first in class `forming`, then the
+map, then the class is set. Nothing attaches a `forming` vdisk, so an interrupted copy
+leaves a row that says what it is rather than a disk that reads as half zeroes. Delete it
+and take the snapshot again.
+
+## 6. Operating it
 
 ```bash
 valcli storage.list
@@ -148,7 +187,7 @@ extent groups, replica counts, and control-socket latency. The latency one exist
 every other check asks the daemon a question and believes the answer; this one times the
 question, and a control plane answering in twenty seconds is about to stop answering.
 
-## 6. Ports, and the lack of them
+## 7. Ports, and the lack of them
 
 Sidon adds **no client-facing TCP port**.
 
@@ -166,15 +205,20 @@ Sidon adds **no client-facing TCP port**.
 > path cannot ship by someone forgetting. Multi-node replication needs that work finished
 > first.
 
-## 7. What is not built
+## 8. What is not built
 
 - **mTLS on 9105**, as above.
-- **Snapshots and clones.** The schema and the immutability rules are already in place —
-  a snapshot is a map copy against a frozen parent — but nothing creates one yet.
+- **Scheduled snapshots.** Taking one is a command; nothing takes them on a timer, prunes
+  them by a retention policy, or presents them in the console. The mechanism is done and
+  the policy around it is not.
+- **Snapshot rollback.** A clone gives you the old contents under a new name, which is
+  enough to recover data and not the same as putting a VM back. Rolling a vdisk *back* to
+  a snapshot in place needs the ownership and epoch story thought through, because it
+  changes what an attached guest is reading underneath itself.
 - **Compression** at seal time, which is cheap because sealed groups are immutable and the
   footer already carries an algorithm byte. **Erasure coding** as a Purah job over cold
   sealed groups. **Deduplication** is argued against in
   [decisions.md](./dfs/decisions.md): the win on VM disks is identical OS images, which
-  clone-from-image already gets for free as a map copy.
+  clone-from-image now gets for free as a map copy.
 - **`vhost-user-blk`** beside NBD, deliberately last. Performance work reorders
   operations, and reordering is where invariants go to die.

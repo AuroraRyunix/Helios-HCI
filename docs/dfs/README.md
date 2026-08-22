@@ -9,8 +9,13 @@ Verified with several daemon instances on one host, which proves the protocol an
 state machine but not independence from a single machine -- the instances share a clock
 and a page cache. Multi-host soaks are what settle that.
 
-Not built: mTLS on the replication port (the daemon refuses a non-loopback bind until it
-exists), snapshots, compression, erasure coding, and `vhost-user-blk`.
+Snapshots and clones are built: a map copy sharing every extent with the parent, zero
+bytes copied, and no reference counting anywhere -- see D-18 and D-19 in
+[decisions.md](./decisions.md).
+
+Not built: mTLS on the replication port (the daemon refuses a non-loopback bind until
+it exists), scheduled snapshots and rollback, compression, erasure coding, and
+`vhost-user-blk`.
 
 The documents remain the specification -- where code and document disagree, that is a bug
 in one of them and the disagreement is the finding.

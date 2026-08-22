@@ -614,6 +614,113 @@ def cmd_storage_benchmark(container_name):
 
     print("Benchmark completed.")
 
+def cmd_storage_derive(parent, child, kind):
+    """`storage.snapshot` and `storage.clone`. One function; they differ by class.
+
+    Sent to the node that owns the parent, not to this one. A writable parent has to be
+    drained before its map is a complete answer, and only its owner can drain it -- so
+    addressing the wrong node produces a refusal rather than a half-copied disk. An
+    immutable parent has no journal and any node can copy it, which is the
+    clone-from-image case.
+    """
+    owner = None
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON vdisk_id, owner, class FROM hydra.dfs_vdisks WHERE vdisk_id = '%s';" % parent)
+    if rc == 0:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("vdisk_id") == parent:
+                owner = (row.get("owner") or "").strip()
+                parent_class = row.get("class") or "rw"
+                break
+    else:
+        print("Error: could not read hydra.dfs_vdisks.")
+        sys.exit(1)
+
+    if owner is None:
+        print("Error: no vdisk named '%s'." % parent)
+        sys.exit(1)
+
+    target = "127.0.0.1"
+    if owner:
+        target = _ip_for_host(owner) or "127.0.0.1"
+
+    rc, body, err = run_mtls_spark_api(
+        target, "/api/v1/dfs/vdisk",
+        {"op": kind, "vdisk_id": parent, "child_id": child})
+    if rc != 0:
+        detail = body.get("error") if isinstance(body, dict) else err
+        print("Error: %s of '%s' failed: %s" % (kind, parent, detail))
+        sys.exit(1)
+
+    print("%s '%s' created from '%s'." % (kind.capitalize(), child, parent))
+    print("  class    : %s" % body.get("class"))
+    print("  size     : %.1f GiB" % ((body.get("size_bytes") or 0) / (1024.0 ** 3)))
+    print("  extents  : %s shared with the parent" % body.get("extents"))
+    print("  copied   : %s bytes -- a %s copies the map, never the data."
+          % (body.get("bytes_copied", 0), kind))
+
+
+def _ip_for_host(hostname):
+    """The address of a node by its Sidon name, from cluster.json."""
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    for host in data.get("hosts", []):
+        if host.get("hostname") == hostname:
+            return host.get("ip")
+    return None
+
+
+def cmd_storage_children(parent):
+    """Which snapshots and clones came from a vdisk.
+
+    Worth having because nothing else can tell you. The extents are shared, so there is
+    no way to work out afterwards which vdisk was copied from which -- `parent_vdisk` on
+    the child's row is the only record, and it is why deleting a parent is safe and also
+    why it looks alarming without this.
+    """
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON vdisk_id, class, parent_vdisk, size_bytes FROM hydra.dfs_vdisks;")
+    if rc != 0:
+        print("Error: could not read hydra.dfs_vdisks.")
+        sys.exit(1)
+
+    rows = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (row.get("parent_vdisk") or "") == parent:
+            rows.append([
+                row.get("vdisk_id", "?"),
+                row.get("class", "?"),
+                "%.1f" % ((row.get("size_bytes") or 0) / (1024.0 ** 3)),
+            ])
+
+    if not rows:
+        print("No snapshots or clones were taken from '%s'." % parent)
+        return
+    print_table(["Child", "Class", "Size (GiB)"], sorted(rows))
+    print("")
+    print("These share extents with '%s'. Deleting it frees nothing they still point at:"
+          % parent)
+    print("mark-sweep reads the whole block map, so an extent group is live while any")
+    print("vdisk references it.")
+
+
 def cmd_storage_cleanup_orphaned():
     """Report reclaimable space, and ask Purah to reclaim it.
 
@@ -1829,6 +1936,9 @@ def print_usage():
     print("  valcli storage.list                List storage containers, per-node extent stores and vdisks")
     print("  valcli storage.benchmark <name>    Run safe read/write performance benchmark")
     print("  valcli storage.cleanup_orphaned    Delete orphaned virtual disk and NVRAM files")
+    print("  valcli storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
+    print("  valcli storage.clone <vdisk> <name>     Writable copy of a vdisk or snapshot")
+    print("  valcli storage.children <vdisk>         Snapshots and clones taken from a vdisk")
     print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
@@ -1943,6 +2053,21 @@ def main():
         cmd_storage_benchmark(sys.argv[2])
     elif cmd == "storage.cleanup_orphaned":
         cmd_storage_cleanup_orphaned()
+    elif cmd == "storage.snapshot":
+        if len(sys.argv) < 4:
+            print("Usage: valcli storage.snapshot <vdisk_id> <snapshot_name>")
+            sys.exit(1)
+        cmd_storage_derive(sys.argv[2], sys.argv[3], "snapshot")
+    elif cmd == "storage.clone":
+        if len(sys.argv) < 4:
+            print("Usage: valcli storage.clone <vdisk_id> <clone_name>")
+            sys.exit(1)
+        cmd_storage_derive(sys.argv[2], sys.argv[3], "clone")
+    elif cmd == "storage.children":
+        if len(sys.argv) < 3:
+            print("Usage: valcli storage.children <vdisk_id>")
+            sys.exit(1)
+        cmd_storage_children(sys.argv[2])
     elif cmd == "image.list":
         cmd_image_list()
     elif cmd == "image.delete":

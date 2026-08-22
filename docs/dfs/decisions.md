@@ -112,3 +112,47 @@ things: epoch fencing is never conditional on peer count (at RF1 it fences the p
 the invariant rather than hidden in a footnote; and Ganon gets a single-node soak tier
 that runs because the configuration ships, not because the lab is small. See
 [architecture.md §5](./architecture.md) and [ganon.md §5](./ganon.md).
+
+**D-18 — An extent's identity lives on the block-map row, not on the vdisk reading it.**
+The footer of every stored extent carries a checksum *and* an identity (which vdisk,
+which extent index), because a correct checksum proves the bytes are undamaged and only
+the identity proves they are the *right* bytes. Reads verified that identity against the
+reading vdisk's own hash, which is the same thing exactly until extents are legitimately
+shared — and a snapshot shares every one of them. The first snapshot ever taken returned
+EIO on every read.
+
+Alternatives: **check only the extent index** (keeps one field, throws away the half of
+the guarantee that catches a misdirected read landing on the right offset of the wrong
+disk — rejected, that is the case the identity exists for); **give the child the
+parent's hash** (works until the child writes, at which point one vdisk's map holds
+extents under two identities anyway, so it solves nothing and hides the problem);
+**rewrite the footers on copy** (restores the invariant and makes a snapshot a data copy,
+which is the entire thing a snapshot is not).
+
+Decided: the map row records the hash the extent was written under, and the reader
+verifies against that. Per row rather than per vdisk, because a clone genuinely holds a
+mix — inherited extents keep the parent's stamp, and anything it rewrites takes its own.
+What the check stops asserting is "the reader is the vdisk named in the footer", which
+was only ever a proxy for "these are the right bytes" and becomes false the moment
+sharing is legal. What it still asserts is unchanged: right extent, right index, right
+writer, undamaged.
+
+The migration needs no backfill. A row without the column was written by the vdisk that
+owns it, so falling back to the reader's own hash is correct for every row predating
+snapshots.
+
+**D-19 — Snapshots need no reference counts, and that is the whole reason they are
+cheap.** D-9 rejected refcounts for garbage collection on the grounds that a refcount is
+a distributed counter with a crash window between every data operation and its count
+operation. The bill for that decision was a full scan of `dfs_block_map` on every sweep.
+
+Snapshots are where it pays back. Purah marks from the entire block map, so an extent
+group referenced by a child is live whether or not the child is attached, whether or not
+the parent still exists, and with no bookkeeping performed at snapshot time at all.
+Taking a snapshot is a map copy and a class transition; deleting a parent is a row
+delete. Neither touches a counter, because there is none to touch, and neither can leave
+one wrong.
+
+Had the design kept refcounts, every one of these would have needed a matching increment
+or decrement, each with its own crash window, and the interesting bug would not be "the
+snapshot is missing" but "the extents under a live snapshot were freed".

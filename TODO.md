@@ -703,9 +703,20 @@ as data* by DRBD and refused with EIO by Sidon.
   reports them anywhere and they share the thin pool with the extent store. That is how
   they sat unnoticed on the test node for four days after the tree was clean; those four
   (`img-test`, `linstor-db`, `scratchtest`, `test-disk0`) have since been removed by hand.
-* **Snapshots and clones.** The schema and the immutability rules are already in place; a
-  snapshot is a map copy against a frozen parent. Nothing creates one yet. This is also
-  what closes saga's honest caveat about guest data.
+* ~~Snapshots and clones.~~ **Built 2026-08-22.** A map copy, sharing every extent with
+  the parent; zero bytes copied, and the cost is the number of extents rather than the
+  size of the disk. `valcli storage.snapshot|clone|children`. Mark-sweep needed no change
+  at all -- it marks from the whole block map, so a child's references keep extents alive
+  whether or not it is attached, which is the refcount decision paying for itself.
+
+  Two guards fired on the way, and one had never fired before: the footer identity check
+  refused every snapshot read (fixed by recording, per block-map row, which vdisk wrote
+  the extent), and `class` came back from Daruk as `field_2_` because namedtuple renames
+  Python keywords -- so *every* sealed image had been loading as writable and the
+  immutability check had never once run.
+
+  Still open around it: scheduled snapshots with a retention policy, rollback in place
+  (a clone recovers data; it is not the same as putting a VM back), and a console view.
 * **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
   already carries an algorithm byte, so it is off the write path entirely.
 * **Erasure coding**, as a Purah job over cold sealed groups — after the above, not

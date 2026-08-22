@@ -497,10 +497,12 @@ Stated plainly, because "backup" is a word that invites people to assume more:
   inside a guest, not against the storage tier being lost on every replica. There is no
   snapshot, no changed-block tracking, no off-site replication.
 
-  This is closer than it was. Sealed extent groups are immutable and the schema already
-  distinguishes a vdisk from the map that reads it, so a snapshot is a map copy against a
-  frozen parent — cheap, and most of the way built. Nothing creates one yet; see
-  [dfs/](./dfs/README.md).
+  Snapshots exist now (`valcli storage.snapshot`), and they are not a backup: they share
+  extents with the parent and live on the same nodes, so they protect against a mistake
+  inside a guest and against nothing that loses the storage itself. What they do give is
+  the thing an off-site backup needs — a frozen, read-only, self-consistent view of a
+  disk that can be read while the guest keeps running. Shipping one somewhere else is the
+  part that is missing.
 * **VM images in the Valhalla catalogue** (`hydra.valhalla_images` → the `img-*` vdisks)
   are metadata-only here. The rows come back; the image contents do not.
 * **The backup is not application-consistent for guests.** It never touches them, so
