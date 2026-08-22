@@ -3518,11 +3518,33 @@ def check_cluster_and_autostart():
     # Wait a few seconds to let systemd-spark finish starting up
     time.sleep(3)
     
-    # Unconditionally stop and undefine all local virtual machines on startup.
-    # Because hypervisors are stateless executors, Vali will dynamically define
-    # and start workloads when they are scheduled to run on this node.
-    print("[AUTOSTART] Cleaning up all local libvirt virtual machines to ensure clean compute startup...")
-    subprocess.run("for vm in $(virsh list --all --name); do virsh destroy $vm || true; virsh undefine $vm --nvram || true; done", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Clear stale *definitions*, and nothing that is running.
+    #
+    # Because hypervisors are stateless executors, Vali defines and starts a workload when
+    # it schedules one here, so a definition this host still carries on startup is left
+    # over from before and should go. That premise is about a host that just booted. This
+    # used to `virsh destroy` every domain unconditionally, which is the same thing at boot
+    # -- a freshly booted host has no running guests -- and something entirely different on
+    # a restart, where it kills the workloads the host is currently running.
+    #
+    # spark-daemon is restarted on every rollout, so that was not a rare case. It took a
+    # guest down mid-install, undefined it, deleted its nvram, and left nothing in the
+    # journal to say so, because both streams are captured rather than logged. The record
+    # in hydra.vms then said Stopped, and nothing brings a Stopped VM back.
+    #
+    # An inactive domain is exactly what the premise is about, so that is what is cleared.
+    print("[AUTOSTART] Clearing stale (inactive) libvirt definitions...", flush=True)
+    subprocess.run(
+        "for vm in $(virsh list --inactive --name); do virsh undefine $vm --nvram || true; done",
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _running = subprocess.run("virsh list --state-running --name", shell=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    _live = [n for n in _running.stdout.decode("utf-8", "replace").split() if n]
+    if _live:
+        # Said out loud: a restart that leaves guests running is the intended behaviour
+        # now, and the one that did not is what this replaced.
+        print("[AUTOSTART] Leaving %d running guest(s) untouched: %s"
+              % (len(_live), ", ".join(_live)), flush=True)
     
     # ZooKeeper is infrastructure, not a workload: it holds the desired cluster state,
     # so it must be running before that state can be read. Start it unconditionally and
@@ -3561,7 +3583,7 @@ def check_cluster_and_autostart():
                 if not os.path.exists("/etc/hci/maintenance.state"):
                     print("[WATCHDOG] Host left maintenance mode. Exiting maintenance watchdog loop to resume normal checks.")
                     break
-                for svc in ["zookeeper", "hydra-db", "aether"]:
+                for svc in ["zookeeper", "hydra-db", "sidon"]:
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()
                     if status_str not in ["active", "activating"]:
@@ -3624,7 +3646,7 @@ def check_cluster_and_autostart():
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
         # Autostarting local database, storage, and UI workloads...
-        services = ["hydra-db", "daruk", "aether", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+        services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
         for svc in services:
             res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
             if res.stdout.decode().strip() != "active":
@@ -3659,7 +3681,7 @@ def check_cluster_and_autostart():
             if not os.path.exists("/etc/hci/cluster.json"):
                 continue
             if os.path.exists("/etc/hci/maintenance.state"):
-                for svc in ["zookeeper", "hydra-db", "aether"]:
+                for svc in ["zookeeper", "hydra-db", "sidon"]:
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()
                     if status_str not in ["active", "activating"]:
@@ -3700,7 +3722,7 @@ def check_cluster_and_autostart():
                 pass
                 
             if cluster_state == "started":
-                services = ["hydra-db", "daruk", "aether", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+                services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
                 for svc in services:
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()

@@ -65,3 +65,46 @@ mindmap
   3. Polls local ZooKeeper port `2181` until quorum mode is reached.
   4. Queries ZooKeeper `/cluster_state` node. If manual stop was requested, exits start sequence.
   5. Starts local cluster database, storage, and logic daemons sequentially (via systemd commands acting on containerized Quadlet service targets).
+
+### What startup is allowed to clear
+
+`check_cluster_and_autostart()` opens by clearing libvirt definitions this host is still
+carrying. The premise is that a hypervisor is a stateless executor: Vali defines and starts
+a workload when it schedules one here, so a definition present at startup is left over from
+before and should go.
+
+That premise is about a host that just **booted**. It does not hold when the daemon is
+merely restarted, and spark-daemon is restarted on every `deploy_updates.py` rollout.
+
+| | Cleared | Left alone |
+| --- | --- | --- |
+| Inactive (defined, not running) | undefined with `--nvram` | — |
+| Running | — | untouched, and named in the log |
+
+Until 2026-08-22 this walked `virsh list --all --name` and ran `virsh destroy` before the
+undefine, so a rollout on a live host destroyed the guests it was running, deleted their
+nvram, and left `hydra.vms` saying `Stopped` — which nothing brings back. It produced no
+evidence: both streams go to `PIPE`, so no `virsh destroy` ever reached the journal, and
+the only trace was a `machine-qemu-*.scope: Deactivated successfully` line that reads like
+a guest shutting itself down.
+
+At boot the two behave identically, because a freshly booted host has no running domains.
+That is why the narrower version costs nothing where the reasoning applies.
+
+Running guests are now listed rather than passed over silently — a restart that
+deliberately leaves workloads up should say so, or the next person reads the same silence
+and concludes nothing happened.
+
+### The service lists name units that exist
+
+`check_cluster_and_autostart()` and the 30-second watchdog carry explicit service lists.
+Both named `aether`, which was removed with DRBD, so every watchdog cycle ran
+`systemctl start aether` and logged `Unit aether.service not found` — on every node,
+forever. `sidon` appeared in none of them, meaning the daemon that serves every guest disk
+was not among the services autostart brought up or the watchdog kept up.
+
+`AETHER_VOLUMES_ROOT` is *not* affected: the directory is still called that, and renaming
+it is a data migration rather than a rename. Only the unit names were wrong.
+
+`test_rollout_safety.py` covers both: that startup clears only inactive definitions and
+never destroys a domain, and that no service list names a unit that no longer exists.

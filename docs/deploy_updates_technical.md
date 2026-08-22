@@ -61,3 +61,40 @@ Iterates over node IPs:
    - Triggers `podman build -t localhost/spectrum:latest /tmp/spectrum_build` on the remote hosts to rebuild the UI container.
    - Purges old containers and restarts the systemd units.
 6. Calls `systemctl daemon-reload` and restarts services to load updates.
+
+### It refuses to roll out under running guests
+
+`hylia` drains a host before a rolling upgrade. This script does not: it restarts fourteen
+services in place. Whether that is acceptable while workloads are live is a judgement for
+whoever is running it, so the script asks rather than assumes.
+
+- **`running_guests(ssh)`** — `virsh list --state-running --name` on the node. A host that
+  cannot answer returns empty: an unanswerable question is not evidence that guests are
+  running, and a cluster with no hypervisor must still be deployable.
+- **`refuse_if_guests_running(ip, ssh)`** — runs immediately after the SSH connection is
+  established and **before anything is uploaded or restarted**, so a refusal costs nothing
+  and leaves the node exactly as it was. Names the guests it found. Set
+  `HELIOS_ALLOW_RUNNING_GUESTS=1` to proceed anyway; the override is matched exactly, so
+  `true`/`yes`/`0` are not accepted as permission.
+
+This was added after a rollout destroyed a guest mid-install. That specific defect was in
+spark-daemon's startup and is fixed there, but the shape of the operation has not changed —
+`slate`, `vali`, `mipha` and `urbosa` all restart underneath whatever is running.
+
+### SELinux labelling for guest nvram
+
+libvirt writes each UEFI guest's variables to `/var/lib/hci/aether/nvram/`. That is outside
+libvirt's own tree, so it inherits the generic `var_lib_t` label and `virtqemud` is denied
+`remove_name` and `unlink` there. On an **Enforcing** host the nvram cleanup during a VM
+delete fails *after* the domain is already gone, leaving the VM half removed.
+
+`NVRAM_SELINUX` applies `qemu_var_run_t` — the label libvirt's own
+`/var/lib/libvirt/qemu/nvram` carries — via `semanage fcontext` plus `restorecon`. It falls
+from `-a` to `-m` so an already-labelled node is not an error, and skips entirely where
+`semanage` is absent. `provision.py` applies it at install time; this script applies it to
+existing nodes.
+
+The test node runs **Permissive**, where this appears only as a denial in the journal and
+everything otherwise works — which is exactly the kind of difference that becomes a support
+call on somebody else's Enforcing cluster, so `test_rollout_safety.py` asserts both
+deployment paths carry it.

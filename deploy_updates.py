@@ -86,6 +86,30 @@ def new_ssh_client():
     return client
 
 
+# libvirt writes each UEFI guest's variables to /var/lib/hci/aether/nvram/, which is
+# outside its own tree and so inherits the generic var_lib_t label. virtqemud is then
+# denied remove_name and unlink on those files, which on an Enforcing host fails the
+# nvram cleanup during a VM delete -- after the domain is already gone, so the VM is half
+# removed. The test node runs Permissive, where this shows up only as a denial in the
+# journal and everything appears to work; that is exactly the kind of difference that
+# turns into a support call on somebody's Enforcing cluster.
+#
+# qemu_var_run_t is the label libvirt's own /var/lib/libvirt/qemu/nvram carries.
+NVRAM_SELINUX = """NVRAM_DIR=/var/lib/hci/aether/nvram
+mkdir -p "$NVRAM_DIR"
+if command -v semanage >/dev/null 2>&1; then
+    # -a fails if the rule is already there, so fall through to -m rather than treating an
+    # already-correct node as an error.
+    semanage fcontext -a -t qemu_var_run_t "${NVRAM_DIR}(/.*)?" 2>/dev/null \
+        || semanage fcontext -m -t qemu_var_run_t "${NVRAM_DIR}(/.*)?" 2>/dev/null \
+        || true
+    restorecon -R "$NVRAM_DIR" 2>/dev/null || true
+    echo "nvram label: $(ls -Zd "$NVRAM_DIR")"
+else
+    echo "nvram label: semanage unavailable, leaving SELinux context alone"
+fi
+"""
+
 DRBD_TEARDOWN = """# Tear down what is left of DRBD on a node upgraded from a DRBD cluster.
 #
 # Removing the Quadlets stops the satellite and the controller; it does nothing about
@@ -703,6 +727,48 @@ User=root
 """
 
 
+def running_guests(ssh):
+    """The names of domains running on this node, newest information available.
+
+    Empty on any failure to ask: a host that cannot answer "what is running here" is not
+    evidence that nothing is, but neither is it a reason to refuse a rollout on a cluster
+    with no hypervisor at all. The caller says which way it treats silence.
+    """
+    try:
+        _, stdout, _ = ssh.exec_command("virsh list --state-running --name 2>/dev/null")
+        return [n for n in stdout.read().decode("utf-8", "replace").split() if n]
+    except Exception:
+        return []
+
+
+def refuse_if_guests_running(ip, ssh):
+    """A rollout restarts the control plane under whatever is running. Say so first.
+
+    `hylia` drains a host before a rolling upgrade. This script does not: it restarts
+    fourteen services in place, and until recently spark-daemon's startup destroyed every
+    local domain, so a rollout could take a guest down mid-install and report success.
+    That specific defect is fixed, but the shape of the operation has not changed -- slate,
+    vali, mipha and urbosa all restart underneath a running guest -- so the decision to do
+    it while workloads are live belongs to whoever is running it.
+
+    Returns True when it is safe (or explicitly allowed) to continue.
+    """
+    guests = running_guests(ssh)
+    if not guests:
+        return True
+    if os.environ.get("HELIOS_ALLOW_RUNNING_GUESTS") == "1":
+        print(f"[{ip}] WARNING: {len(guests)} guest(s) running ({', '.join(guests)}). "
+              f"Continuing because HELIOS_ALLOW_RUNNING_GUESTS=1. Expect the control "
+              f"plane to restart underneath them.")
+        return True
+    print(f"[{ip}] REFUSING: {len(guests)} guest(s) are running here: {', '.join(guests)}.")
+    print(f"[{ip}]   This rollout restarts the control plane in place and does not drain "
+          f"the host first.")
+    print(f"[{ip}]   Migrate or stop them, or re-run with HELIOS_ALLOW_RUNNING_GUESTS=1 "
+          f"to proceed anyway.")
+    return False
+
+
 def deploy_to_node(ip):
         print(f"================ Deploying to {ip} ================")
         ssh = new_ssh_client()
@@ -715,6 +781,10 @@ def deploy_to_node(ip):
                 ssh.connect(ip, username=username, password=password, timeout=15)
             
             keep_alive(ssh)
+
+            # Before anything is uploaded or restarted, so a refusal costs nothing.
+            if not refuse_if_guests_running(ip, ssh):
+                return
 
             if not fast_mode:
                 # 1. Clean and recreate build directory for Spectrum
@@ -951,6 +1021,13 @@ def deploy_to_node(ip):
                 "podman rm -f systemd-aether systemd-linstor-controller 2>/dev/null; "
                 "systemctl reset-failed aether linstor-controller 2>/dev/null; true")
             stdout_stale.channel.recv_exit_status()
+
+            print(f"[{ip}] Labelling the UEFI nvram directory for SELinux...")
+            _, stdout_nv, _ = ssh.exec_command(NVRAM_SELINUX)
+            stdout_nv.channel.recv_exit_status()
+            for line in stdout_nv.read().decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    print(f"[{ip}] {line.strip()}")
 
             print(f"[{ip}] Tearing down any leftover DRBD...")
             _, stdout_drbd, _ = ssh.exec_command(DRBD_TEARDOWN)
