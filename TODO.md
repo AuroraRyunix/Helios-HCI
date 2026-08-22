@@ -607,6 +607,15 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   gained neither, so `podman build` failed with "no such file or directory" on every
   rollout — and the script printed that, continued, restarted spectrum onto the image
   already running, and reported success. A build failure is now fatal.
+* ~~No VM could be started at all.~~ **Fixed (2026-08-22).** spark-daemon's service
+  inventory still listed `aether` after the unit was removed, so every node reported
+  `Aether: DOWN` forever -- and `vali.select_best_start_host()` skips any host where
+  *all* services are not UP. Creates worked; starts refused with "No active hypervisor
+  host has sufficient memory" on a host with 9 GB free, because the loop passes over an
+  ineligible host and the caller's only message is about memory. The symptom named the
+  wrong subsystem entirely. `test_service_inventory.py` now compares the inventory
+  against the units the toolkit installs, in both directions, and refuses any name the
+  toolkit removes.
 * ~~The Phoenix console was deployed by hand.~~ **Resolved (2026-08-22)**:
   `deploy_updates.py` tars its build context, builds the image, installs the Quadlet from
   `spectrum_phx/quadlet/` rather than a duplicated string, and restarts the unit.

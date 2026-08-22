@@ -673,12 +673,17 @@ def build_node_status():
     if 'LAST_PIDS_CACHE_TIME' not in globals():
         globals()['LAST_PIDS_CACHE_TIME'] = 0
 
-    services = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    # `aether` is gone and `sidon` took its place. This list is not cosmetic: vali's
+    # select_best_start_host() requires *every* service here to report UP, so a name that
+    # can never be UP means no VM can ever be placed. Leaving `aether` in after removing
+    # it did exactly that -- creates succeeded, starts refused with "No active hypervisor
+    # host has sufficient memory", and the memory had nothing to do with it.
+    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
         "daruk": "Daruk",
-        "aether": "Aether",
+        "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
         "bifrost": "Bifrost",
@@ -2012,7 +2017,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Aether", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
+                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
                     if "Urbosa" in services:
                         svc_list.append("Urbosa")
                     for svc_name in svc_list:
