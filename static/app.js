@@ -5505,7 +5505,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             tbody.querySelectorAll('.delete-container-btn').forEach(btn => {
                 btn.addEventListener('click', () => {
                     const name = btn.getAttribute('data-name');
-                    if (confirm(`Are you sure you want to permanently delete storage container "${name}"? This will also stop and delete the associated Aether storage volume.`)) {
+                    if (confirm(`Are you sure you want to permanently delete storage container "${name}"? This will also stop and delete the associated Sidon storage volume.`)) {
                         btn.disabled = true;
                         fetch(`${state.apiHost}/api/storage/containers/delete`, {
                             method: 'POST',
@@ -5934,7 +5934,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'zookeeper_status': 'ZooKeeper',
             'hydra-db_status': 'Hydra DB',
             'daruk_status': 'Daruk DB Proxy',
-            'aether_status': 'Aether Engine',
+            'aether_status': 'Sidon Engine',
             'spectrum_status': 'Spectrum Web',
             'catalyst_status': 'Catalyst Task',
             'bifrost_status': 'Bifrost VIP',
@@ -6128,8 +6128,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function getFriendlyCheckName(checkName) {
         const friendly = {
-            'aether_heal_pending': 'Aether Heal Pending',
-            'aether_split_brain': 'Aether Split Brain',
+            'aether_heal_pending': 'Sidon Heal Pending',
+            'aether_split_brain': 'Sidon Split Brain',
             'storage_capacity': 'Storage Capacity Check',
             'storage_mount_options': 'Storage Mount Options',
             'storage_volume_writable': 'Storage Volume Writable Check',
