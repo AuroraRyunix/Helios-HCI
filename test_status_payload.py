@@ -132,5 +132,36 @@ class RenderFailureIsNotConnectionFailure(unittest.TestCase):
             "to prove it means the service is unreachable")
 
 
+class TheFixHasToReachTheBrowser(unittest.TestCase):
+    """`app.js` is served with a `?v=` cache-buster that browsers key their cache on.
+
+    A fix deployed without bumping it reaches the node and stops there: every console
+    already open keeps running the cached copy. That happened while diagnosing this bug --
+    the corrected file was on the node, served by Spectrum, and the browser went on
+    throwing the old exception from cache.
+
+    The version also has to be the *same* everywhere. Two pages sat on `1.1.1` while the
+    rest were on `1.1.2`, which means they were caching a separate copy of the same file
+    and could be a fix behind the others without anything looking wrong.
+    """
+
+    def test_every_page_requests_the_same_app_js_version(self):
+        import glob
+        versions = {}
+        for path in sorted(glob.glob(os.path.join(HERE, "static", "*.html"))):
+            found = re.findall(r"app\.js\?v=([0-9.]+)", read(path))
+            if found:
+                versions[os.path.basename(path)] = set(found)
+
+        self.assertTrue(versions, "no page references app.js with a cache-busting version")
+        distinct = set()
+        for found in versions.values():
+            distinct |= found
+        self.assertEqual(
+            len(distinct), 1,
+            "pages disagree about which app.js version to request, so some of them cache "
+            "a different copy of it: %s" % {k: sorted(v) for k, v in versions.items()})
+
+
 if __name__ == "__main__":
     unittest.main()
