@@ -615,55 +615,22 @@ deploy path still know only about the Python image.
 This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
 defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
 
-### Under consideration: an extent-based DFS, with Hydra as the metadata layer
+### Designed: the extent-based DFS (Sidon), with Hydra as the metadata layer
 
-The storage substrate is the one architectural decision that is expensive to revisit later, and the
-port ceiling above is a symptom rather than the problem.
+**Decision taken (2026-08-22): build in-house rather than adopt Ceph.** The full design
+is in [docs/dfs/](docs/dfs/README.md) — architecture, the invariant contract, the
+journal/drain data path, epoch-fenced ownership (which deletes the dual-primary class
+structurally), the metadata schema with exactly-once drain, the Ganon fault-injection
+harness, milestones with gates and abandonment values, and sixteen recorded decisions
+with their rejected alternatives.
 
-**Why the current substrate limits this.** DRBD replicates *devices*: a replicated volume is a
-resource, a resource is a standing connection between named peers, and each one costs a port, a kernel
-object, threads and RF-1 TCP connections per node. That is the right shape for a handful of HA volumes
-and the wrong shape for one volume per VM disk. Widening the port range raises the ceiling by about an
-order of magnitude and changes nothing structural.
+The build order's first milestone is **Ganon against DRBD** — the harness calibrated on
+a substrate known to be correct, attacking the *shipping* product, with standalone value
+whether or not the rest is ever built. No data-path code exists until it is green.
 
-**What the alternative looks like.** Nutanix, as publicly documented, cuts a vDisk into extents grouped
-into extent groups, has one Stargate per node write each group to two or three peers over a small
-number of shared channels, and keeps *only the map* -- which extent group lives where -- in Medusa, its
-modified Cassandra. Adding a VM adds metadata rows, not network sessions. Guest data never passes
-through Cassandra.
-
-**What Helios already has.** More than it looks. The metadata discipline an extent map needs is built
-and in production: Daruk's typed compare-and-swap endpoints, prepared statements at QUORUM with SERIAL,
-an ordered and recorded schema, ring lifecycle with a quorum gate, and a backup that has been restored.
-`hydra` is currently *management* metadata only -- it is not in the storage data path at all -- but the
-consistency machinery around it is the half that is usually got wrong.
-
-**What is missing is the data path**, and that is the whole project: the per-node I/O manager, extent
-placement and rebalancing, read repair, recovery after a partition, and the background scrubber. It is
-the hardest component in a hyperconverged stack, and its characteristic failure is not a crash but
-silent corruption discovered weeks later.
-
-**Therefore the first milestone is not an implementation.** It is a fault-injection harness that can
-kill a node mid-write, partition two peers, corrupt an extent on disk, and assert afterwards that a
-read returns either the old value or the new one and never a third thing. A DFS without that harness
-cannot be trusted no matter how carefully it is written, and building the harness first is what makes
-the rest reviewable.
-
-Suggested order, each step independently useful and abandonable:
-
-1. Fault-injection harness and the invariants it asserts, run against the *existing* DRBD path first --
-   it will find things there, and it validates the harness against a known-good implementation.
-2. The extent map schema in `helios_schema.py`, with the placement and claim operations as Daruk LWT
-   endpoints. Testable with no data path at all.
-3. A single-extent-group vertical slice: write, replicate to two peers, read back, verify. No tiering,
-   no rebalancing, no compaction.
-4. Recovery paths -- peer loss, rejoin, divergence -- against the harness from step 1.
-5. Only then: placement policy, rebalancing, scrub.
-
-**Decide the density target first.** Under roughly a thousand volumes per cluster, widening the port
-range is sufficient and this is not worth starting. Materially above it, the honest choice is between
-this and adopting Ceph RBD, which removes the per-device model without writing a storage system --
-heavier operationally, years cheaper.
+Interim measures stay worthwhile regardless: the `TcpPortAutoRange` widening above, and
+the two-substrates-one-thin-pool capacity accounting caveat recorded in
+[docs/dfs/architecture.md](docs/dfs/architecture.md) §4.
 
 ### Scale-out add-ons (blueprints only)
 

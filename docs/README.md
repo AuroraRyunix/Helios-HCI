@@ -62,6 +62,22 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Slate (Traefik) | [slate.md](./slate.md) | — |
 | Agahnim (Rust console proxy) | [agahnim.md](./agahnim.md) | — |
 
+## DFS design (Sidon)
+
+| Document | Covers |
+| :-- | :-- |
+| [dfs/README.md](./dfs/README.md) | Index, component names, the one-paragraph version. |
+| [dfs/architecture.md](./dfs/architecture.md) | Why DRBD's shape cannot get there; the extent model; what is deliberately out. |
+| [dfs/invariants.md](./dfs/invariants.md) | The contract (I-1..I-8) everything else exists to satisfy. |
+| [dfs/data-path.md](./dfs/data-path.md) | Journal, drain, extent store, checksums, mark-sweep GC. |
+| [dfs/ownership.md](./dfs/ownership.md) | Leases, epochs, the fencing proof, live migration by forwarding. |
+| [dfs/metadata.md](./dfs/metadata.md) | Schema sketch, Daruk endpoints, exactly-once drain, load arithmetic. |
+| [dfs/ganon.md](./dfs/ganon.md) | The fault-injection harness — built first, calibrated against DRBD. |
+| [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
+| [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
+
+Status: **designed, not building** — implementation begins with the harness, not the filesystem.
+
 ## Audit / Backlog
 
 | Doc | What it covers |
