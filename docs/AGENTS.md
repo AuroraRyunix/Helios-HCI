@@ -35,7 +35,7 @@ Every service below is named after its Nutanix analog (see the table in the top-
 | `sync_provision.py` | Regenerates those base64 payloads from the live source files — see §4. |
 | `spark.py` / `spark_daemon_decoded.py` | `spark` is the host CLI (`status`/`start`/`stop`/`restart`); `spark_daemon_decoded.py` is the mTLS daemon listening on port `9099` that actually executes remote commands, owns the boot autostart sequence, and runs the service-health watchdog loop (see §3). |
 | `deploy_updates.py` | Rolling update deployer, drives nodes over `paramiko`/SSH. |
-| `mipha.py` | HA monitor / VM failover coordinator; also resolves DRBD split-brain and manages `linstor-db` HA promotion. |
+| `mipha.py` | HA monitor / VM failover coordinator. Fencing is the first rung of its ladder and is an action, not an inference: it raises the epoch on the dead host's vdisks, after which every replica refuses that host's appends. |
 | `valcli.py` | Primary admin CLI — VM ops, storage benchmarking, DRS, DB queries (see README §5.B for the full command list, verified against `valcli.py`'s `cmd ==` dispatch). |
 | `vali.py` | VM scheduler/DRS daemon (Acropolis-equivalent); HTTP API on port `9095`. |
 | `urbosa.py` / `urbosa_bootstrap.py` | L3 SDN overlay daemon + bootstrap script. |
@@ -51,12 +51,12 @@ Every service below is named after its Nutanix analog (see the table in the top-
 | `check_updates.py`, `create_upgrade_zip.py`, `deploy_updates.py` | Update pipeline: check for a newer version → build an upgrade zip → push it to nodes. |
 | `push_to_github.py` | Manual GitHub Contents-API uploader (reads `GITHUB_TOKEN` from the environment). |
 | `test_hylia.py` | `unittest` suite for `hylia.py`. |
-| `saga.py` | Metadata backup/restore (`backup`/`list`/`verify`/`restore`/`prune`/`snapshots`/`target`). Snapshots the `hydra` keyspace with `nodetool snapshot`, captures the Linstor controller DB and `/etc/hci`, and archives them to an operator-supplied external target. Talks to `cqlsh`/`nodetool` directly rather than through Daruk, because the restore path must work when the metadata layer is what is broken. `valcli backup.*` are pass-throughs. See [backup_restore.md](./backup_restore.md). |
+| `saga.py` | Metadata backup/restore (`backup`/`list`/`verify`/`restore`/`prune`/`snapshots`/`target`). Snapshots the `hydra` keyspace with `nodetool snapshot`, captures `/etc/hci`, and archives them to an operator-supplied external target. Talks to `cqlsh`/`nodetool` directly rather than through Daruk, because the restore path must work when the metadata layer is what is broken. `valcli backup.*` are pass-throughs. See [backup_restore.md](./backup_restore.md). |
 | `nodetool` | Thin wrapper: `podman exec`s into the ScyllaDB container to run the real `nodetool`. |
 | `allssh` | Fan-out mTLS command executor across all cluster nodes. |
 | `agahnim/` (Rust) | WebSocket console-proxy sidecar for VNC/SPICE, runs as a native `systemd` unit built from source on each node (**not** a Quadlet container — see the note in §3). |
 
-**Nothing under [dfs/](./dfs/README.md) exists as code.** That directory is a design set for an extent-based replacement of Linstor/DRBD (`sidon`, `purah`, `ganon`). If a task sends you looking for those files, they are not missing — they were never written. Treat the documents as the specification and [dfs/decisions.md](./dfs/decisions.md) as the record of which alternatives were already rejected and why, so a rejected one does not get re-proposed as a fresh idea.
+**[dfs/](./dfs/README.md) is the specification `sidon/` and `ganon/` were built from.** Both crates exist and are the live storage layer; Purah is a role inside `sidon`, in `sidon/src/purah.rs`, not a separate binary. Where code and document disagree that is a bug in one of them, and the disagreement is the finding — do not quietly follow whichever you read first. [dfs/decisions.md](./dfs/decisions.md) records which alternatives were already rejected and why, so a rejected one does not get re-proposed as a fresh idea.
 
 ## 3. How the system actually starts
 
@@ -92,7 +92,7 @@ Client → Slate (Traefik, :443) → Spectrum (spectrum_server.py, WebUI/API)
               spark-daemon (mTLS, :9099) on the target host
                         │
                         ▼
-              libvirt/KVM, DRBD/Linstor, ScyllaDB (via Daruk proxy)
+              libvirt/KVM, Sidon, ScyllaDB (via Daruk proxy)
 ```
 
 * **ScyllaDB** (`hydra-db`, via the `daruk.py` CQL proxy) and **ZooKeeper** (`zookeeper`) are the two sources of truth: ScyllaDB holds cluster/VM/task/scheduling state (keyspace `hydra`), ZooKeeper holds leader election and small coordination znodes (e.g. `/cluster_state`).
@@ -129,7 +129,7 @@ If you need to test the Dockerfile build locally, you must replicate this rename
 Pulled from [docs/audit_findings.md](./audit_findings.md) and [docs/history/walkthrough.md](./history/walkthrough.md) — see those documents and [TODO.md](../TODO.md) for the full, current list. Highlights an agent should know before touching HA/quorum code:
 
 * **Quorum math is size-sensitive.** ZooKeeper's voting ensemble is capped at 3 members by `cluster_new.py`/`provision.py` (nodes beyond the 3rd are configured as `ZOO_PEER_TYPE=observer`); ScyllaDB's `daruk.py` proxy runs under `ConsistencyLevel.QUORUM` by default but now falls back to `ConsistencyLevel.ONE` if a query fails due to unavailable nodes (see `daruk.py` around line 67).
-* **DRBD split-brain resolution is ZooKeeper-leader-driven**: `mipha.py` uses ZK leadership as the tie-breaker for who force-demotes and reconnects with `--discard-my-data` when a resource is `StandAlone`. The `linstor-db` HA volume additionally falls back to `drbdadm primary --force linstor-db` if normal promotion fails because the previous leader is unreachable.
+* **Storage split-brain is not a state this stack can reach**, so nothing resolves it. Every journal append carries its writer's epoch and every replica persists the highest epoch it has been fenced at, fsynced before the fence is acknowledged; an append below that is refused. Two owners cannot both be accepted, so there is no divergence to discard and no tie-breaker to elect. ZooKeeper leadership still decides *who runs* Purah and who drives a failover — one actor, not one truth.
 * **Bifrost's VIP fallback is still IP-sort-based** (`candidates.sort(); return candidates[0]`) when ZooKeeper consensus is unavailable — this is a known open split-brain risk, not yet fixed (see TODO.md).
 * **Hardcoded IP fallback arrays were removed**, not just narrowed: `bifrost.py`, `catalyst.py`, `dagur.py`, `mimir.py`, `spectrum_server.py`, `valcli.py`, `vali.py`, and `mipha.py` all now fall back to a `LOCAL_IP`/`127.0.0.1`-based array instead of a hardcoded `10.10.102.x` list when `/etc/hci/cluster.json` can't be read.
 * **Internal legacy codename**: "Yggdrasil" still appears in `test_hylia.py` (its temp directory names, e.g. `/tmp/yggdrasil_test_env`) and as local variable names in `provision.py`'s Hylia deployment block (`yggdrasil_cli`, `yggdrasil_svc`, around line 915). It refers to what is now called Hylia — harmless, but don't be confused into thinking there's a separate "Yggdrasil" component.

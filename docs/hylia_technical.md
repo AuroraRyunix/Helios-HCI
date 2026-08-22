@@ -25,8 +25,8 @@ mindmap
       Leave Maintenance
     Storage Guard
       verify_node_storage_health
-      Queries drbdadm status
-      Validates local and peer disk synchronization
+      Asks sidon for capacity and its vdisk list
+      Refuses a node whose store is unmounted, full, or holding a degraded vdisk
 ```
 
 ## Function & Logic Breakdown
@@ -66,8 +66,9 @@ mindmap
 
 ### `verify_node_storage_health(job_id, node_ip, hostname)`
 - Health guard. Runs before entering maintenance and leaving.
-- Queries `drbdadm status` on target.
-- Verifies that all resources are in a synchronized state (no `"Inconsistent"`, `"Outdated"`, or `"DUnknown"` states unless a single-node cluster is running).
+- Asks the target's sidon for `capacity` and `list` over spark's mTLS API.
+- Refuses when the daemon does not answer, when the extent store reports no capacity (which usually means it is not mounted), when it is ≥95% full, or when the node holds a vdisk marked degraded.
+- **It no longer waits for a resync**, because there is nothing to resync: extent groups are immutable, so a returning node's copies are either correct or absent, and Purah restores absent ones in the background off the hot path. The DRBD version polled `drbdadm status` for minutes waiting for every peer to reach `UpToDate`.
 
 ### `hylia_rolling_upgrade(job_id)`
 - Asynchronous orchestration thread:
@@ -79,7 +80,7 @@ mindmap
   6. Copies files via base64 encoded chunks.
   7. If Spectrum is upgraded, rebuilds the container on the target node.
   8. Triggers reboot and polls connection.
-  9. Verifies DRBD sync health using `verify_node_storage_health()`.
+  9. Verifies storage health using `verify_node_storage_health()`.
   10. Clears maintenance mode (`action="leave"`).
   11. Transitions database job state to `COMPLETED` when all nodes finish.
 

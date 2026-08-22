@@ -28,7 +28,7 @@ flowchart TD
     
     %% Storage & High Availability
     Mipha[mipha.py HA Monitor] -->|Poll status 10s| ZK[ZooKeeper :2181]
-    Mipha -->|If Leader: Promote Primary| DRBD[DRBD Kernel Replication]
+    Mipha -->|Fence: raise vdisk epoch| Sidon[Sidon Extent Store]
     Mipha -->|Active Node Ping| Spark
     Mipha -->|If node DOWN: Fence host| SSH_Fence[SSH Fencing: kill qemu]
     SSH_Fence -->|Enqueue restarts| Catalyst
@@ -37,7 +37,7 @@ flowchart TD
     Hylia[hylia.py Upgrade Engine] -->|Validate Manifest Checksums| UpdateZip[update_package.zip]
     Hylia -->|Evacuate host| Vali
     Hylia -->|Copy binaries base64| Spark
-    Hylia -->|Verify replication sync| DRBD
+    Hylia -->|Verify store mounted, has room, no degraded vdisk| Sidon
     Hylia -->|Reboot node| Spark
     TestHylia[test_hylia.py] -->|Unit Test Verification| Hylia
     
@@ -84,7 +84,7 @@ flowchart TD
 
 ### 3. High Availability & consensus
 - **Mipha** monitors cluster nodes. It uses ZooKeeper consensus to elect a single active coordinator.
-- The coordinator leader handles mounting `/var/lib/linstor` and promoting the storage databases.
+- Fencing is an action, not an inference: the leader raises the epoch on the dead host's vdisks in Hydra, and every replica then refuses that host's appends whether or not the host is reachable.
 - If a host goes offline, Mipha coordinates fencing and resets VM states to allow Vali to schedule a restart on surviving hosts.
 - **Bifrost** queries ZooKeeper consensus and binds the floating VIP address to the active leader running Spectrum, allowing users a single ingress endpoint.
 

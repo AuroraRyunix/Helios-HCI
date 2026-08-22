@@ -18,7 +18,7 @@ mindmap
     Lifecycle Operations (main command parsing)
       create
         bootstrap cluster.json (witness-aware)
-        format disk pools (linstor) - skipped on witness
+        carve and mount the extent store - skipped on witness
         generate certs (Odin/Zookeeper/ScyllaDB)
         seed ssh known_hosts
       start
@@ -27,7 +27,7 @@ mindmap
         graceful unmount and service teardown - filtered for workload services
       destroy
         podman container purge
-        LinStor pool deletion - skipped on witness
+        extent store teardown - skipped on witness
         data path wipe
 ```
 
@@ -67,7 +67,7 @@ mindmap
 - `--verbose` prints detailed pool allocations, node roles, and disk layout.
 
 #### `cluster start`
-- Sends API commands to activate systemd units: `linstor-controller`, `linstor-satellite`, `odin`, `hydra-db`, `spectrum`, `bifrost`, `dagur`, `mimir`, `vali`, `catalyst`, `gatoway`, `logos`.
+- Sends API commands to activate systemd units: `sidon`, `daruk`, `odin`, `hydra-db`, `spectrum`, `bifrost`, `dagur`, `mimir`, `vali`, `catalyst`, `gatoway`, `logos`. Start verification refuses to declare the cluster up while `sidon` is inactive on any node, because a host whose storage daemon is down can neither attach a disk nor serve one it already owns.
 - Automatically filters out non-witness workloads (e.g. ScyllaDB, Daruk, and application services) to avoid service startup errors on the witness node.
 
 #### `cluster stop`
@@ -81,4 +81,4 @@ mindmap
 ### Witness Node Orchestration Logic
 - **`WITNESS_IP` Detection**: Loads host config from `/etc/hci/cluster.json` and evaluates the `is_witness` boolean (auto-flagged for the 3rd IP in a 3-node layout).
 - **Service & Volume Filtering**: Employs `non_witness_ips` lists to prevent SSH command execution for non-witness components (e.g. libvirt VM management, `hydra-db` nodetool checks, ScyllaDB cluster settings, and Spectrum UI reachability on port 8443).
-- **Linstor Client configuration**: Restricts client config `controllers` seeds list to `non_witness_ips` to avoid client request timeout attempts directed at the witness.
+- **Storage peer lists**: Sidon's peer set is drawn from `non_witness_ips`, so a witness is never dialled for replication and never appears in a vdisk's replica set.

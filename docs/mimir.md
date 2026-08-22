@@ -54,21 +54,21 @@ The triggered execution calls `mcli` tool which performs node check evaluations 
 
 - **DRS/Migration Storage Capacity Gate (`drs_storage_capacity_check`)**:
   - **Category**: `services` (stored under `service.vali.drs_storage_gate`)
-  - **Description**: Vali refuses a migration whose target cannot hold the guest's disk by comparing the disk size against `get_linstor_free_space(target)`. This check verifies the gate can actually answer, by calling vali's own function and comparing its result with the free capacity `linstor -m storage-pool list` reports for this node's backing pools. It imports the deployed `vali` rather than re-implementing the parser, so it follows a fix instead of rotting into a false alarm.
+  - **Description**: Vali refuses a migration whose target cannot hold the guest's disk by comparing the disk size against `get_storage_free_space(target)`. This check verifies the gate can actually answer, by calling vali's own function and comparing its result with the free capacity sidon's `capacity` op reports for this node's extent store. It imports the deployed `vali` rather than re-implementing the parser, so it follows a fix instead of rotting into a false alarm.
   - **Fails** when the gate reads materially *more* free space than the pool has — its failure mode is approval, not refusal, so a gate that cannot parse the listing waves every migration through. Also fails when a thin pool drops below 5% free, and warns below 15% or when provisioned volumes exceed the pool's total size.
   - Diskless pools are excluded: they report 2^63-1 bytes free and store nothing, so counting them would show unlimited headroom on a full node.
 
 - **Migration Lock Auditor (`migration_lock_status`)**:
   - **Category**: `services` (stored under `service.vali.migration_locks`)
-  - **Description**: `hydra.vms.status` is the per-VM migration lock, taken by daruk's `/v1/vm/migrate-lock` LWT and released by `migrate-commit` or `migrate-unlock`. Live migration is the window in which DRBD dual-primary is open, so the lock is the only thing standing between two concurrent migrations and a corrupted disk.
+  - **Description**: `hydra.vms.status` is the per-VM migration lock, taken by daruk's `/v1/vm/migrate-lock` LWT and released by `migrate-commit` or `migrate-unlock`. The lock's job changed with the storage layer, and the change is worth stating precisely: it no longer stands between two migrations and a corrupted disk, because a vdisk has exactly one owner per epoch and a deposed owner's writes are refused by every replica. What it guards now is the *control plane* — two concurrent migrations of one VM racing each other's ownership CAS, with the loser leaving a VM defined on a host that does not own its disk.
   - **Reports**: a lock held with no migration task in flight (orphaned — it refuses every later migration *and* every delete of that VM until cleared, and the output names the `migrate-unlock` call that clears it); two migration tasks in flight for one VM; a migration that has been running past vali's own 10-minute timeout; and, from `virsh domjobinfo`, a live migration running on this host while the lock is **not** held, which is the direction that corrupts data.
   - `hydra.catalyst_tasks` is only scanned when a VM claims a migration or libvirt reports one — it is a full partition scan of a table with 30-day retention, and it should not run hourly on every node just to confirm nothing is happening.
   - libvirt is asked through `virsh`, not through `systemctl is-active libvirtd`: a modular or socket-activated host leaves that unit `inactive` while `virsh` works perfectly, and gating on it would report "no migration can be running here" on a host that is migrating right now.
 
-- **LINSTOR Controller Latency (`linstor_latency_check`)**:
-  - **Category**: `storage` (stored under `storage.linstor.latency`)
-  - **Description**: Every other storage check asks the LINSTOR controller a question and believes the answer. This one times the question. `linstor node list` is a single round trip against an in-memory view, so seconds mean the controller is blocked — waiting on an unreachable satellite, or holding a lock in its embedded database — and every storage operation queued behind it (VM creation, disk attach, live migration) is blocked for the same reason.
-  - `WARN` above 5s, `FAIL` above 20s or if there is no answer within 60s. The check itself is bounded so a hung controller cannot stall the diagnostic run. The `podman exec` round trip into `systemd-aether` is measured separately and named in the output, so container overhead is not mistaken for controller latency.
+- **Sidon Control-Socket Latency (`sidon_latency_check`)**:
+  - **Category**: `storage`
+  - **Description**: Every other storage check asks the daemon a question and believes the answer. This one times the question, with a `ping` on `/run/sidon/control.sock`. There is no controller to ask any more; the equivalent chokepoint is the local daemon's own socket, which every storage operation on this node goes through — attach, detach, drain, fence. A daemon answering in twenty seconds is about to stop answering, and everything queued behind it is already stalled.
+  - `WARN` above 5s, `FAIL` above 20s or if there is no answer at all. The check is bounded so a wedged daemon cannot stall the diagnostic run.
 
 - **Stuck Catalyst Tasks (`stuck_tasks_check`)**:
   - **Category**: `services` (stored under `service.catalyst.stuck_tasks`)

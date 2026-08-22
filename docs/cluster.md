@@ -26,10 +26,10 @@ Bootstrap a new cluster across a set of physical hosts.
 
 #### 3-Node Layout (Witness Node Support)
 In a **3-node cluster layout**, the third host (Node 3, index 2 in the IP list) automatically acts as a low-overhead, diskless **Witness Node**.
-- **Role**: Serves as a quorum tie-breaker (ZooKeeper voter and DRBD diskless replica) to prevent split-brain conditions without requiring a third hypervisor or database license/hardware instance.
-- **Provisioned Services**: Runs only `spark-daemon`, `zookeeper`, and `aether` (Linstor satellite).
-- **Excluded Services**: Excludes virtualization layers (`libvirtd`/`qemu`), databases (`hydra-db`/ScyllaDB), Linstor controllers, API proxies (`daruk`), and user management or scheduling workloads.
-- **Storage**: Does not require physical storage claiming or LVM pool provisioning. Replicated database volumes (`linstor-db`) are automatically configured with `--diskless` on the witness host.
+- **Role**: a ZooKeeper voter, and nothing else — a quorum tie-breaker that costs neither a third hypervisor nor a third database instance.
+- **Provisioned Services**: `spark-daemon` and `zookeeper`.
+- **Excluded Services**: virtualization (`libvirtd`/`qemu`), the database (`hydra-db`/ScyllaDB), the CQL proxy (`daruk`), and every workload service.
+- **Storage**: none claimed, and no storage role. The DRBD design needed a diskless replica here to give each replicated volume an odd number of voters. Sidon does not vote — a vdisk has one owner and a fenced epoch, so the tie is broken by the CAS in Hydra, not by counting storage peers. A witness therefore holds no extent groups and is never a replica target.
 
 ```bash
 # Syntax

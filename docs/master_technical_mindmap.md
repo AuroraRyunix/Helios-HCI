@@ -41,7 +41,7 @@ mindmap
         Coordinates live migrations
         Backs up UEFI NVRAM variables
       HA Coordinator (mipha.py)
-        DRBD linstor-db lead promoter & mounter
+        Storage fencing: raises the vdisk epoch so replicas refuse the dead owner
         Fences dead hosts (pkill qemu)
         Submits VM restarts to Catalyst
       VIP Manager (bifrost.py)

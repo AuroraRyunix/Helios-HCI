@@ -90,14 +90,15 @@ The schema is declared once, in order, in `helios_schema.py`, and applied behind
 
 ### Backup
 
-Hydra is the only place the cluster records what its DRBD volumes *are*. The volumes are
-replicated and survive a host loss; the mapping from volume to VM, its placement, its
-network and its NVRAM is not replicated anywhere else. Losing the keyspace leaves a pile
-of anonymous block devices.
+Hydra is the only place the cluster records what its stored bytes *are*. Extent groups are
+replicated and survive a host loss; the block map that says which group holds which extent
+of which vdisk, and the mapping from vdisk to VM, its placement, its network and its NVRAM,
+is not replicated anywhere else. Losing the keyspace leaves a pile of four-megabyte files
+with no way to say what they are.
 
 `saga` snapshots the keyspace with `nodetool snapshot` and archives the SSTables, the
 keyspace definition and the migration ledger to an operator-supplied external target,
-alongside the LINSTOR controller database and `/etc/hci`. A restore refuses to load
+alongside `/etc/hci`. A restore refuses to load
 SSTables into a schema whose `hydra.schema_migrations` does not match the artefact's.
 
 Note that `nodetool snapshot` is **per node**: a node's snapshot holds only the SSTables

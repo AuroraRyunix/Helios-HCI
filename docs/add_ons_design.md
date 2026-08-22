@@ -44,12 +44,12 @@ graph TD
 
 ## 2. Helios Files (Scale-Out File Server)
 
-A scale-out shared storage add-on exposing NFS and SMB exports, backed by highly available Linstor/DRBD block volumes.
+A scale-out shared storage add-on exposing NFS and SMB exports, backed by replicated Sidon vdisks.
 
 ```mermaid
 graph LR
     subgraph Storage ["Helios Storage Fabric"]
-        DRBD["Linstor/DRBD HA Block Volume"]
+        Sidon["Replicated Sidon vdisk"]
     end
     subgraph VM ["Helios Files VM / Container"]
         Mount["XFS Mountpoint"]
@@ -59,7 +59,7 @@ graph LR
         C1["VM Guest"]
         C2["External Client"]
     end
-    DRBD --> Mount
+    Sidon --> Mount
     Mount --> Exp
     Exp -- NFSv4 / SMB3 --> C1
     Exp -- NFSv4 / SMB3 --> C2
@@ -68,10 +68,10 @@ graph LR
 ### Architectural Layout:
 *   **Deployment Model**: Deployed as a highly available Virtual Machine (or containerized exporter) orchestrated by Vali.
 *   **Storage Integration**:
-    1.  Catalyst provisions a Linstor block device volume configured with a replication factor of 3 (SimpleStrategy).
+    1.  Catalyst provisions a vdisk at replication factor 3.
     2.  The block device is mounted inside the file server VM/container.
     3.  Standard sharing daemons (NFS Ganesha / Samba) export the mount point to the network.
-*   **High Availability**: If the primary file server VM fails, Mipha detects the failure, demotes the DRBD resource, and restarts the file server instance on a surviving host, mounting the replicated storage.
+*   **High Availability**: If the primary file server VM fails, Mipha fences it by raising the vdisk's epoch — after which every replica refuses the old host's writes, reachable or not — and restarts the file server on a surviving host, which takes ownership and serves the same extents.
 
 ---
 

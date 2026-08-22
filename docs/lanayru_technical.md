@@ -20,7 +20,7 @@ mindmap
         Host Bridges Setup
           br-ov-10010
           br-ov-10011
-        Provision Linstor Storage
+        Provision vdisks through sidon
           resource-definition create
           volume-definition 5GiB
         Libvirt VM Creation
@@ -31,7 +31,7 @@ mindmap
       destroy_lanayru_worker
         VM Destruction
           virsh destroy / undefine
-        Linstor Cleanup
+        vdisk cleanup
           resource-definition delete
         Overlay Segment Cleanup
           DELETE from urbosa_segments
@@ -41,7 +41,7 @@ mindmap
     External Helper Imports
       run_cql_query
       run_remote_spark
-      run_linstor_cmd
+      sidon control-socket call
       log_catalyst_task
       get_cluster_nodes
       LOCAL_IP
@@ -71,7 +71,7 @@ mindmap
           │
           ├─► Create ScyllaDB Schemas
           ├─► Setup L2 Overlay bridges
-          ├─► Provision thin Linstor disks (RF=3)
+          ├─► Create vdisks at RF=3
           └─► Define & Start Libvirt VMs
 ```
 

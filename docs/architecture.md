@@ -27,7 +27,7 @@ Slate (Traefik reverse proxy)
    │           spark-daemon (mTLS, :9099) on whichever host owns the operation
    │                     │
    │                     ▼
-   │          libvirt/KVM, Linstor/DRBD, ScyllaDB (via the Daruk CQL proxy)
+   │          libvirt/KVM, Sidon, ScyllaDB (via the Daruk CQL proxy)
    │
    └──── /console/* (VNC/SPICE) ────► Agahnim (Rust WebSocket console proxy, :8081)
                                             │
@@ -42,8 +42,8 @@ A typical read path (e.g. loading the VM list) goes straight from Spectrum to Sc
 ## 2. Control-plane vs. data-plane split
 
 * **Control plane** — the daemons that decide *what should happen* and *where*: Spectrum (API/UI), Catalyst (task queue/orchestration), Vali (VM placement/DRS), Mipha (HA/failover decisions), Bifrost (VIP ownership), Hylia (rolling-upgrade sequencing), Dagur (scheduled jobs), Mimir (health checks), Logos (telemetry collection). These are mostly stateless Python processes that read/write their shared state to ScyllaDB and ZooKeeper rather than holding authoritative state themselves — any one of them can restart without losing cluster state.
-* **Data plane** — the systems that actually hold or move data/traffic: ScyllaDB (`hydra-db`, cluster/VM/task metadata — the `hydra` keyspace), ZooKeeper (`zookeeper`, leader election + small coordination znodes like `/cluster_state`), Linstor/DRBD (`aether`, replicated VM disk block storage), libvirt/KVM (actual VM execution, driven locally by `spark-daemon`), and Slate/Agahnim (client-facing HTTP and console traffic).
-* **The storage half of that data plane is being replaced.** Linstor/DRBD replicates *devices*: one DRBD resource, one kernel object and RF-1 standing TCP connections per volume per node, which caps a cluster at 191 replicated volumes on the default port range and makes the connection count a function of VM count. The designed replacement is an extent-based DFS whose placement map lives in Hydra and whose per-node daemons hold one connection per node *pair* — the design set is [docs/dfs/](./dfs/README.md), nothing is implemented, and Aether stays the substrate until a migration completes.
+* **Data plane** — the systems that actually hold or move data/traffic: ScyllaDB (`hydra-db`, cluster/VM/task metadata — the `hydra` keyspace), ZooKeeper (`zookeeper`, leader election + small coordination znodes like `/cluster_state`), Sidon (per-node storage daemon; VM disks are extent groups on local disk, replicated between peers), libvirt/KVM (actual VM execution, driven locally by `spark-daemon`), and Slate/Agahnim (client-facing HTTP and console traffic).
+* **The storage half of that data plane was replaced.** Linstor/DRBD replicated *devices*: one DRBD resource, one kernel object and RF-1 standing TCP connections per volume per node, which capped a cluster at 191 replicated volumes on the default port range and made the connection count a function of VM count. [Sidon](./sidon.md) is extent-based, keeps its placement map in Hydra, and holds one connection per node *pair*. Nothing in the tree speaks to LINSTOR or DRBD any more; the reasoning is in [docs/dfs/](./dfs/README.md).
 * Gatoway (L2 VLAN sync) and Urbosa (L3 SDN overlay) sit at the boundary — they are control-plane daemons whose job is to configure the data-plane networking (bridges, VXLANs) that guest VM traffic actually flows over.
 
 There is deliberately no separate "Controller VM" tier the way Nutanix AHV uses CVMs: every one of the above daemons runs directly on the hypervisor host (as a Quadlet container or native `systemd` unit — see [docs/deployment.md](./deployment.md)), which is the core value proposition of the project (see the top-level [README.md](../README.md) §1).
@@ -54,14 +54,14 @@ The cluster's network traffic falls into three tiers, verified against the code 
 
 1. **Client-facing ingress**: only Slate (port `443`) is meant to be exposed to end users; it reverse-proxies to Spectrum and Agahnim same-origin.
 2. **mTLS orchestration mesh**: every cross-node administrative action (remote command execution, VM start/stop/migrate, node-to-node coordination) goes over `spark-daemon`'s mutual-TLS API on port `9099`. This is the only channel that crosses the trust boundary between hosts for arbitrary command execution.
-3. **Cluster-internal consensus/data mesh**: ScyllaDB gossip/replication (`7000`) and client queries (`9042`), and ZooKeeper's leader election/sync ports (`2888`/`3888`) and client port (`2181`), plus DRBD's replication traffic and Linstor's controller/satellite ports (`3366`/`3370`).
+3. **Cluster-internal consensus/data mesh**: ScyllaDB gossip/replication (`7000`) and client queries (`9042`), and ZooKeeper's leader election/sync ports (`2888`/`3888`) and client port (`2181`), plus Sidon's replication port (`9105`), which carries journal appends, extent transfer and epoch fencing between per-node storage daemons.
 
 Catalyst (`:9091`) and Vali (`:9095`) used to be the exception here: both bind `0.0.0.0` under `Network=host`, and until recently accepted any caller that could reach the port. Both now terminate mTLS against the cluster CA with `verify_mode = CERT_REQUIRED`, so an unauthenticated connection is refused during the handshake rather than inside a handler — verified on the test cluster by confirming that plain HTTP and a certificate-less TLS handshake are both rejected, and that a cluster-signed certificate reaches the handler. They remain bound to all interfaces; the credential, not the bind address, is what confines them.
 
 ## 4. Where storage and networking config actually live
 
 * `/etc/hci/cluster.json` — the single source of truth for host list, VIP, and redundancy factor that most daemons fall back to reading when ZooKeeper/ScyllaDB state is unavailable.
-* `/var/lib/hci/aether/volumes/` — where local VM disk raw files live once a Linstor/DRBD volume is mounted.
+* `/var/lib/hci/sidon/` — the extent store: `egroups/` holds the 4 MiB append-only extent groups a VM disk is actually made of, `journals/` the per-vdisk write-ahead logs, and `nbd/` the per-vdisk unix sockets qemu attaches to. Its own XFS filesystem on a thin LV, so filling it cannot stop the host.
 * `/etc/hci/spark/certs/` and `/root/.certs/` — the mTLS certificate material securing the port-`9099` mesh.
 
 See the top-level [README.md](../README.md) §6 for the complete directory layout.

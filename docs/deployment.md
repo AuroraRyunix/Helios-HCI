@@ -11,10 +11,10 @@ Helios splits deployment deliberately between two mechanisms.
 **Third-party services run as Podman Quadlets** — a `.container` unit file under `/etc/containers/systemd/` that `podman-system-generator` turns into a regular `systemd` unit (`systemd-<name>.service`) at boot. `provision.py` writes these (grep for `node.write_file("/etc/containers/systemd/...")`). They are:
 
 ```
-zookeeper, hydra-db, aether, linstor-controller, spectrum, slate
+zookeeper, hydra-db, spectrum, slate
 ```
 
-These are genuine third-party services with real dependency trees — ZooKeeper, ScyllaDB, Linstor, Traefik — plus the Spectrum image built from the repo `Dockerfile`.
+These are genuine third-party services with real dependency trees — ZooKeeper, ScyllaDB, Traefik — plus the Spectrum image built from the repo `Dockerfile`.
 
 **The Helios daemons themselves run as native `systemd` units** in `/etc/systemd/system/`:
 
@@ -23,7 +23,7 @@ spark-daemon, bifrost, dagur, mimir, vali, gatoway, urbosa, logos, mipha,
 catalyst, hylia, daruk, agahnim
 ```
 
-They are stdlib-only Python (or, for `agahnim`, a compiled Rust binary), and their job is to *configure the host*: `urbosa` creates network namespaces, `gatoway` builds VLAN bridges, `bifrost` moves IP addresses, `mipha` drives `drbdadm`. Containerising an agent whose purpose is to reconfigure the host it runs on requires handing it `Network=host`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `/dev` and the systemd runtime — at which point the boundary isolates nothing while adding an image to build, version and fail to pull. Resource governance is unaffected either way: containers take their limits from cgroups v2, the same mechanism `MemoryMax=`/`CPUWeight=` use in a `.service`.
+They are stdlib-only Python (or, for `agahnim` and `sidon`, a compiled Rust binary), and their job is to *configure the host*: `urbosa` creates network namespaces, `gatoway` builds VLAN bridges, `bifrost` moves IP addresses, `sidon` owns a filesystem and hands qemu unix sockets. Containerising an agent whose purpose is to reconfigure the host it runs on requires handing it `Network=host`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `/dev` and the systemd runtime — at which point the boundary isolates nothing while adding an image to build, version and fail to pull. Resource governance is unaffected either way: containers take their limits from cgroups v2, the same mechanism `MemoryMax=`/`CPUWeight=` use in a `.service`.
 
 > [!NOTE]
 > An earlier commit migrated these eleven daemons to Quadlets pointing at `Image=localhost/helios-base:latest`. **No commit ever built or pulled that image**, so none of them could start; the migration also silently dropped `ConditionPathExists=!/etc/hci/maintenance.state` from nine units and most cgroup limits, and never updated `spark.py`, which still reads `systemctl show -p MainPID` for exactly these services. It has been reverted. Do not reintroduce it without first creating the image and updating `spark.py`.

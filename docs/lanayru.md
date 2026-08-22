@@ -139,7 +139,7 @@ Before initiating a Lanayru deployment, the Spectrum API executes a series of ri
    * Query `nodetool status` via Spark on all nodes.
    * *Requirement:* All metadata database seeds must report `UN` (Up Normal).
 2. **Storage Space Allocation:**
-   * Query the Linstor physical storage pool (`vg_aether`).
+   * Ask each node's sidon for its extent store capacity.
    * *Requirement:* Minimum `50 GB` of thin-provisioned storage available per control VM.
 3. **Compute Capacity Validation:**
    * Check physical host RAM utilization via `free -m`.

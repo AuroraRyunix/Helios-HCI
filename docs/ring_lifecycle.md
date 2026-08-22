@@ -226,8 +226,11 @@ identical.
 1. **Drain the host.** Maintenance mode migrates its VMs off. The quorum gate refuses this
    when the cluster cannot spare the replica — the same condition that makes step 4
    unsafe, caught before anything moves.
-2. **Move its storage.** LINSTOR replicas to surviving nodes; wait for the DRBD resync.
-   *(Manual: data movement with capacity preconditions this tool does not evaluate.)*
+2. **Move its storage.** Nothing to do by hand in the normal case: Purah restores the
+   replica count onto surviving nodes on its own, and `valcli storage.list` shows when it
+   has finished. Confirm no vdisk still lists this node before continuing — a vdisk that
+   does is one that has not been re-replicated yet, and removing the node makes it
+   unavailable rather than degraded.
 3. **Lower the replication factor** if it no longer fits the smaller ring, then
    `nodetool repair -pr hydra` on every remaining node. `ALTER KEYSPACE` changes the
    strategy only — existing data is not copied to the new replicas until a repair runs, so
@@ -241,10 +244,10 @@ identical.
    node is genuinely out of the ring: it rewrites `/etc/hci/cluster.json` on the surviving
    nodes, renumbers `node_id` (position identifies the witness in a three-node layout),
    and deletes the `hydra.nodes` row.
-6. **LINSTOR `node delete` and ZooKeeper ensemble reconfiguration.** *(Manual: deleting a
-   LINSTOR node that still holds the only copy of a volume loses that volume, and a
-   ZooKeeper voter that is gone still counts toward the ensemble's quorum until it is
-   removed from every remaining host's config and they are restarted one at a time.)*
+6. **ZooKeeper ensemble reconfiguration.** *(Manual: a voter that is gone still counts
+   toward the ensemble's quorum until it is removed from every remaining host's config and
+   they are restarted one at a time.)* There is no storage-side counterpart — a node with no
+   vdisks listing it holds nothing the cluster needs.
 
 ### What the preflight blocks
 
@@ -285,7 +288,9 @@ The dangerous part of a rejoin is not the ring operation. It is the data still o
 4. Raise the replication factor back if it was lowered, then `nodetool repair -pr hydra`
    on every node. Bootstrapping streams the ranges the new node now owns; it does not
    reconcile what the survivors wrote while it was gone. *(Manual.)*
-5. LINSTOR: re-create its storage replicas, wait for the resync. *(Manual.)*
+5. Storage needs nothing: Purah places new replicas onto the returned node as vdisks come
+   to need them, and its old extent groups — if any survived — are immutable, so they are
+   either correct or swept as orphans.
 6. `cluster rejoin --node <ip> --finalize` again — registers it in `hydra.nodes` as
    `NORMAL`, but **only once it is `UN` in the ring**. Registering it while it is still
    bootstrapping hands it VMs it cannot run.

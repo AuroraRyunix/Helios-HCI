@@ -75,14 +75,14 @@ to its last 40 points before drawing it. Anything beyond that was read out of Hy
 discarded in JavaScript.
 
 ### The Valhalla image catalogue
-- **`image_backing_kind(path)`**: `'drbd'`, `'file'`, or `None`. `None` means the row
+- **`image_backing_kind(path)`**: `'vdisk'`, `'file'`, or `None`. `None` means the row
   points somewhere this file will not delete from, and the delete is refused rather than
   attempted. Quoting is not the guard on its own — a correctly quoted `rm -f /etc` is
-  still `rm -f /etc` — so the path must be under `/dev/drbd/` or under
+  still `rm -f /etc` — so the path must be under `/var/lib/hci/sidon/nbd/` or under
   `/var/lib/hci/aether/volumes/`, with no `..` segment and no NUL.
-- **`remove_image_backing(name, path)`**: a DRBD-backed image is removed by deleting its
-  LINSTOR resource definition (`img-<slug>`), which tears the device down on every node;
-  `rm` on `/dev/drbd/by-res/<res>/0` would delete a udev symlink and leave the resource,
+- **`remove_image_backing(name, path)`**: a vdisk-backed image is removed by asking sidon to
+  delete the vdisk, which frees its extent groups on every replica;
+  `rm` on the socket path would delete a unix socket and leave the vdisk allocated,
   and the storage it holds, allocated. A staged file is removed on every node and each
   result is checked. Returns `(ok, detail)`.
 - **`delete_catalogue_image(name)`**: backing store first and checked, then the row.
@@ -109,5 +109,5 @@ write sequence, not only on the result.
 Serves static assets, routes frontend routes, and handles REST APIs:
 - **`GET /api/status`**: Returns health, services state, and cluster storage mappings.
 - **`GET /api/catalyst/tasks`**: Returns recent task progression.
-- **`POST /api/v1/vms/create`**: Provisions virtual disks via Linstor, creates VM metadata in `hydra.vms`, and registers QEMU guest configuration in libvirt.
+- **`POST /api/v1/vms/create`**: Provisions vdisks through sidon, creates VM metadata in `hydra.vms`, and registers QEMU guest configuration in libvirt.
 - **`DELETE /api/v1/vms/<name>`**: Stops guest and purges volume resources.

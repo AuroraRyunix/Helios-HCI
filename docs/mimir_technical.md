@@ -82,7 +82,7 @@ on the healthy case, and answer `WARN` — never `PASS` — on an input it could
 | Check | Collector | Classifier |
 | :--- | :--- | :--- |
 | `watchdog_daemon_status` | `collect_watchdog_facts()` | `classify_watchdog()` |
-| `linstor_latency_check` | `collect_linstor_latency_facts(controller_ip)` | `classify_linstor_latency()` |
+| `sidon_latency_check` | inline — times a `ping` on `/run/sidon/control.sock` | inline thresholds |
 | `drs_storage_capacity_check` | `collect_drs_storage_facts(local_ip, controller_ip)` | `classify_drs_storage_gate()` |
 | `migration_lock_status` | `collect_migration_lock_facts()` | `classify_migration_locks()` |
 
@@ -114,9 +114,9 @@ yet, so a `FAIL` there would fire on every reboot.
 
 ### `collect_drs_storage_facts()`
 
-Imports the deployed `vali` and calls `vali.get_linstor_free_space(local_ip)` — the same
+Imports the deployed `vali` and calls `vali.get_storage_free_space(local_ip)` — the same
 function the migrate task handler gates on — then compares its answer against
-`linstor -m --output-version v1 storage-pool list` for this host's LINSTOR node name.
+sidon's own `capacity` op reports for this host's extent store.
 Calling the real function rather than copying its parser is what keeps the check honest in
 both directions: a private copy would keep reporting the gate broken after it was fixed,
 and would keep reporting it healthy if it broke in some new way.

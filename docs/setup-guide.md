@@ -20,7 +20,7 @@ This covers what you need on a dev machine to work on this repo, and what actual
   cargo check                # faster, for iterating without a full build
   ```
 * **Podman** (with the Quadlet/`podman-system-generator` support your distro ships) only if you actually intend to test `.container` unit files locally — this repo's Quadlet units assume EL10.2-style paths (`/etc/containers/systemd/`) and several assume they're running on a real hypervisor host (libvirt socket mounts, `/var/lib/hci/...` paths), so testing them meaningfully generally means testing against a real or VM-based EL10.2 node, not a laptop container runtime.
-* **libvirt/QEMU/DRBD/Linstor** are only needed if you're standing up an actual cluster node — see the Quick Start in the top-level [README.md](../README.md) §2 and the Secure Boot warning at the top of that file (DRBD is an out-of-tree kernel module).
+* **libvirt/QEMU** are only needed if you're standing up an actual cluster node — see the Quick Start in the top-level [README.md](../README.md) §2. Storage needs no kernel module: [Sidon](./sidon.md) is a userspace daemon speaking NBD over a unix socket, which is why Secure Boot no longer has to be turned off to provision a host.
 
 ## 2. What actually runs standalone
 
