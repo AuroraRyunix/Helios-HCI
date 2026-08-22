@@ -20,6 +20,7 @@ mod journal;
 mod meta;
 mod nbd;
 mod overlay;
+mod peer;
 mod purah;
 mod vdisk;
 
@@ -41,6 +42,28 @@ fn env_bytes(key: &str, default: u64) -> u64 {
 
 /// This node's name, matching what LINSTOR and the rest of the stack already use as a
 /// node identity so the map's `owner` column means the same thing everywhere.
+/// Parse "node=host:port,node=host:port" into pairs.
+///
+/// A malformed entry is dropped with a warning rather than failing startup: a daemon that
+/// refuses to boot because one peer address has a typo cannot serve the disks it owns
+/// locally either, and those are unaffected by a peer it cannot name.
+fn parse_peers(spec: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in spec.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once('=') {
+            Some((node, addr)) if !node.is_empty() && addr.contains(':') => {
+                out.push((node.trim().to_string(), addr.trim().to_string()));
+            }
+            _ => eprintln!("sidon: ignoring malformed SIDON_PEERS entry {entry:?}"),
+        }
+    }
+    out
+}
+
 fn node_name() -> String {
     if let Ok(n) = std::env::var("SIDON_NODE") {
         return n;
@@ -68,14 +91,30 @@ fn main() {
         // costs disk, reclaiming early costs data, and those are not comparable.
         purah_interval: Duration::from_secs(env_bytes("SIDON_PURAH_INTERVAL", 300)),
         purah_grace: Duration::from_secs(env_bytes("SIDON_PURAH_GRACE", 600)),
+        // Where this node listens for replication, and how to reach the others.
+        //
+        // SIDON_PEERS is "node=host:port,node=host:port". Generated from cluster.json on
+        // a real cluster; set by hand to run several instances on one host, which is how
+        // the replication semantics are tested without needing several hosts.
+        peer_bind: env_or("SIDON_PEER_BIND", "127.0.0.1:9105"),
+        peers: parse_peers(&env_or("SIDON_PEERS", "")),
+        // 20s suits a bulk append to a busy peer. Fencing during a takeover gets its
+        // own, shorter budget: the whole point of that path is to be fast, and a
+        // replica that has not answered in five seconds is not going to make the
+        // difference between a safe failover and an unsafe one -- an append needs all
+        // of them, so fencing any one is already sufficient.
+        peer_timeout: Duration::from_secs(env_bytes("SIDON_PEER_TIMEOUT", 20)),
+        fence_timeout: Duration::from_secs(env_bytes("SIDON_FENCE_TIMEOUT", 5)),
     };
 
     println!(
-        "sidon: node={} root={} control={} daruk={}",
+        "sidon: node={} root={} control={} daruk={} peer_bind={} peers=[{}]",
         cfg.node,
         cfg.root.display(),
         cfg.control_socket.display(),
-        cfg.daruk_addr
+        cfg.daruk_addr,
+        cfg.peer_bind,
+        cfg.peers.iter().map(|(n, a)| format!("{n}@{a}")).collect::<Vec<_>>().join(" ")
     );
 
     let daemon = match Daemon::new(cfg) {

@@ -391,11 +391,12 @@ LWT_OPS = {
     "/v1/dfs/vdisk-create": {
         "cql": (
             "INSERT INTO hydra.dfs_vdisks (vdisk_id, container, size_bytes, class, owner, "
-            "epoch, drain_seq, extent_bytes, egroup_bytes, created_at_ms) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+            "epoch, drain_seq, extent_bytes, egroup_bytes, created_at_ms, replicas, rf) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
         ),
         "binds": ("vdisk_id", "container", "size_bytes", "class", "owner", "epoch",
-                  "drain_seq", "extent_bytes", "egroup_bytes", "created_at_ms"),
+                  "drain_seq", "extent_bytes", "egroup_bytes", "created_at_ms",
+                  "replicas", "rf"),
         "params": {
             "vdisk_id": {"type": "text", "required": True},
             "container": {"type": "text", "default": "default"},
@@ -407,6 +408,10 @@ LWT_OPS = {
             "extent_bytes": {"type": "int", "default": 1048576},
             "egroup_bytes": {"type": "int", "default": 4194304},
             "created_at_ms": {"type": "int", "required": True},
+            # The write-all set. A list rather than a count: which nodes, not how many,
+            # because an append has to reach named hosts and a takeover has to fence them.
+            "replicas": {"type": "list", "required": True},
+            "rf": {"type": "int", "default": 1},
         },
     },
     # Ownership transfer. Conditional on *both* halves of the pair: owner alone would
@@ -550,6 +555,18 @@ def _coerce(op_path, key, spec, value):
         if not isinstance(value, bool):
             raise ValueError(f"{op_path}: parameter '{key}' must be a boolean")
         return value
+    if kind == "list":
+        # A CQL list<text>. Elements are checked individually rather than trusting the
+        # container: a list carrying a dict or a number binds without complaint and lands
+        # in the column as something no reader expects, which for the replica set would
+        # mean a vdisk whose write-all target cannot be resolved to a host.
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{op_path}: parameter '{key}' must be a list")
+        for element in value:
+            if not isinstance(element, str):
+                raise ValueError(
+                    f"{op_path}: parameter '{key}' must contain only strings")
+        return list(value)
     raise ValueError(f"{op_path}: parameter '{key}' has an unsupported type '{kind}'")
 
 

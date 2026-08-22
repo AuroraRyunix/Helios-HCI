@@ -194,6 +194,38 @@ MIGRATIONS = [
             "CREATE TABLE IF NOT EXISTS hydra.dfs_egroups ( egroup_id text PRIMARY KEY, state text, node text, path text, size int, seal_hash text, vdisk_hint text, created_at_ms bigint );",
         ],
     },
+    {
+        "id": "0006-dfs-replication",
+        "description": (
+            "Replica placement. Serves invariant I-1 (durability across the failures "
+            "the container's ftt claims to tolerate) and I-4 (single writer), neither of "
+            "which can be satisfied at all until the map records where a vdisk's copies "
+            "actually are. Two columns and one table. "
+            "dfs_vdisks.replicas is the journal replica set: the nodes an append must "
+            "reach before the write is acknowledged, which is what makes the takeover "
+            "proof three lines -- fencing one replica stops the old owner because it "
+            "needed all of them, and reading one replica sees every acknowledged write. "
+            "dfs_egroup_replicas is a table rather than a list column because Purah "
+            "queries it by node when a host is lost, and a collection column cannot be "
+            "indexed that way without a secondary index nobody wants on the hot path."
+        ),
+        "statements": [
+            # Nodes that must acknowledge a journal append. Ordered, and the owner is not
+            # necessarily a member: a vdisk whose owner holds no local replica is the
+            # normal state immediately after a failover, and it stays correct -- just
+            # slower -- until Purah rebuilds locality.
+            "ALTER TABLE hydra.dfs_vdisks ADD replicas list<text>;",
+            # Redundancy factor at creation, copied from the container's ftt so a later
+            # change to the container does not silently re-interpret the write-all set of
+            # a vdisk that already exists.
+            "ALTER TABLE hydra.dfs_vdisks ADD rf int;",
+            # Which nodes hold a copy of an extent group. Keyed by egroup with the node as
+            # the clustering column, so a group's replicas are one partition read; the
+            # by-node direction Purah needs after a host is lost is a full scan, which is
+            # what a curator pass already is.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_egroup_replicas ( egroup_id text, node text, path text, state text, PRIMARY KEY ((egroup_id), node) );",
+        ],
+    },
 ]
 
 

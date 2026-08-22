@@ -175,6 +175,13 @@ def capacity(**kw):
     return call("capacity", **kw)
 
 
+def peers(**kw):
+    """Which peers this node can reach. Reachability is not safety -- an append needs
+    every replica and an unreachable one fails the write -- but it is what an operator
+    needs to see when a vdisk stops accepting writes."""
+    return call("peers", **kw)
+
+
 def list_attached(**kw):
     return call("list", **kw)
 

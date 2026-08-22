@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::err::{Error, Result};
 use crate::meta::{cql_str, json_params, now_ms, Daruk};
 use crate::nbd::{self, Export};
+use crate::peer::{self, PeerClient, ReplicaStore};
 use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
@@ -37,6 +38,10 @@ pub struct DaemonConfig {
     pub daruk_timeout: Duration,
     pub purah_interval: Duration,
     pub purah_grace: Duration,
+    pub peer_bind: String,
+    pub peers: Vec<(String, String)>,
+    pub peer_timeout: Duration,
+    pub fence_timeout: Duration,
 }
 
 struct Attached {
@@ -49,6 +54,16 @@ pub struct Daemon {
     cfg: DaemonConfig,
     attached: Mutex<HashMap<String, Attached>>,
     purah_state: Mutex<Purah>,
+    /// One client per peer, shared by every vdisk that replicates to it -- the whole
+    /// point of the shape: connections scale with the node count, not the disk count.
+    peers: HashMap<String, Arc<PeerClient>>,
+    /// A second client per peer, with a shorter timeout, used only for fencing during a
+    /// takeover. A client owns its socket timeouts, so the fast path and the bulk path
+    /// cannot share one -- and a takeover inheriting the replication timeout is what made
+    /// failing over away from a wedged host take twenty seconds.
+    fence_peers: HashMap<String, Arc<PeerClient>>,
+    /// What this node stores on behalf of vdisks it does not own.
+    replica_store: Arc<ReplicaStore>,
 }
 
 impl Daemon {
@@ -70,10 +85,26 @@ impl Daemon {
             // than letting an operator who asked for no grace have none.
             cfg.purah_grace,
         );
+        let replica_store = Arc::new(ReplicaStore::new(&cfg.root)?);
+        let mut peers = HashMap::new();
+        let mut fence_peers = HashMap::new();
+        for (node, addr) in &cfg.peers {
+            peers.insert(
+                node.clone(),
+                Arc::new(PeerClient::new(node, addr, cfg.peer_timeout)),
+            );
+            fence_peers.insert(
+                node.clone(),
+                Arc::new(PeerClient::with_attempts(node, addr, cfg.fence_timeout, 1)),
+            );
+        }
         Ok(Arc::new(Daemon {
             cfg,
             attached: Mutex::new(HashMap::new()),
             purah_state: Mutex::new(purah),
+            peers,
+            fence_peers,
+            replica_store,
         }))
     }
 
@@ -101,6 +132,7 @@ impl Daemon {
             ))
         })?;
         std::fs::set_permissions(&self.cfg.control_socket, std::fs::Permissions::from_mode(0o600))?;
+        peer::listen(&self.cfg.peer_bind, Arc::clone(&self.replica_store))?;
         self.start_purah();
         println!("sidon: control socket ready");
 
@@ -178,6 +210,7 @@ impl Daemon {
             "seal" => self.op_seal(req),
             "resize" => self.op_resize(req),
             "capacity" => self.op_capacity(),
+            "peers" => self.op_peers(),
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
@@ -200,6 +233,34 @@ impl Daemon {
         let extent_bytes = req.get("extent_bytes").and_then(Value::as_u64).unwrap_or(1 << 20);
         let egroup_bytes = req.get("egroup_bytes").and_then(Value::as_u64).unwrap_or(4 << 20);
 
+        // Replica placement. Explicit `replicas` wins; otherwise this node plus as many
+        // peers as `rf` calls for, in the order they were configured. Deliberately simple:
+        // a real placement policy (racks, free space, locality) belongs in Vali, which
+        // already places VMs, rather than in the daemon serving the bytes.
+        let rf = req.get("rf").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        let replicas: Vec<String> = match req.get("replicas").and_then(Value::as_array) {
+            Some(list) => list.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            None => {
+                let mut chosen = vec![self.cfg.node.clone()];
+                for (node, _) in self.cfg.peers.iter() {
+                    if chosen.len() >= rf {
+                        break;
+                    }
+                    if node != &self.cfg.node {
+                        chosen.push(node.clone());
+                    }
+                }
+                chosen
+            }
+        };
+        if replicas.len() < rf {
+            return Err(Error::refused(format!(
+                "vdisk {id} asks for rf={rf} but only {} node(s) are available. Creating it \
+                 anyway would record a durability guarantee the cluster cannot keep.",
+                replicas.len()
+            )));
+        }
+
         let cas = self.daruk().cas(
             "/v1/dfs/vdisk-create",
             json_params(vec![
@@ -213,12 +274,17 @@ impl Daemon {
                 ("extent_bytes", json!(extent_bytes as i64)),
                 ("egroup_bytes", json!(egroup_bytes as i64)),
                 ("created_at_ms", json!(now_ms())),
+                ("replicas", json!(replicas)),
+                ("rf", json!(rf as i64)),
             ]),
         )?;
         if !cas.applied {
             return Err(Error::refused(format!("vdisk {id} already exists")));
         }
-        Ok(json!({"vdisk_id": id, "size_bytes": size, "class": class}))
+        Ok(json!({
+            "vdisk_id": id, "size_bytes": size, "class": class,
+            "replicas": replicas, "rf": rf,
+        }))
     }
 
     fn op_attach(self: &Arc<Self>, req: &Value) -> Result<Value> {
@@ -238,7 +304,7 @@ impl Daemon {
 
         let daruk = self.daruk();
         let rows = daruk.query(&format!(
-            "SELECT owner, epoch FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+            "SELECT owner, epoch, replicas FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(&id)
         ))?;
         let row = rows
@@ -269,7 +335,44 @@ impl Daemon {
             )));
         }
 
-        let vdisk = Vdisk::open(&id, new_epoch as u64, &self.vdisk_cfg(), self.daruk())?;
+        // The replica set is whatever the map says, minus this node: a vdisk does not
+        // replicate to itself over TCP.
+        let replica_nodes: Vec<String> = row
+            .get("replicas")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let mut replicas = Vec::new();
+        for node in &replica_nodes {
+            if node == &self.cfg.node {
+                continue;
+            }
+            match self.peers.get(node) {
+                Some(client) => replicas.push(Arc::clone(client)),
+                None => {
+                    return Err(Error::refused(format!(
+                        "vdisk {id} replicates to {node}, which this daemon has no address \
+                         for. Refusing to serve it: attaching without every replica would \
+                         acknowledge writes that are not on the nodes the map claims."
+                    )))
+                }
+            }
+        }
+
+        let mut fence_clients = Vec::new();
+        for node in &replica_nodes {
+            if node != &self.cfg.node {
+                if let Some(c) = self.fence_peers.get(node) {
+                    fence_clients.push(Arc::clone(c));
+                }
+            }
+        }
+
+        let mut vdisk = Vdisk::open(&id, new_epoch as u64, &self.vdisk_cfg(), self.daruk(), replicas)?;
+        // Steps 2 and 3 of the takeover: fence every reachable replica at the epoch just
+        // won, then rebuild from one of them. Done before a single byte is served, so a
+        // guest never reads a state the previous owner could still add to.
+        let fenced = vdisk.fence_and_recover(&fence_clients)?;
         let vdisk = Arc::new(Mutex::new(vdisk));
 
         let socket = self.cfg.root.join("nbd").join(format!("{id}.sock"));
@@ -324,6 +427,8 @@ impl Daemon {
             "socket": socket.to_string_lossy(),
             "epoch": new_epoch,
             "previous_owner": cur_owner,
+            "replicas": replica_nodes,
+            "replicas_fenced": fenced,
         }))
     }
 
@@ -512,6 +617,25 @@ impl Daemon {
             "egroup_count": groups,
             "journal_bytes": journal,
         }))
+    }
+
+    /// Which peers this node can reach right now.
+    ///
+    /// Reachability is not safety -- an append needs every replica, and an unreachable
+    /// one fails the write rather than being skipped -- but an operator looking at a
+    /// vdisk that will not accept writes needs to see which peer is down without reading
+    /// a log.
+    fn op_peers(&self) -> Result<Value> {
+        let mut out = Vec::new();
+        for (node, client) in self.peers.iter() {
+            let (reachable, detail) = match client.ping() {
+                Ok(()) => (true, String::new()),
+                Err(e) => (false, e.to_string()),
+            };
+            out.push(json!({"node": node, "reachable": reachable, "detail": detail}));
+        }
+        out.sort_by(|a, b| a["node"].as_str().cmp(&b["node"].as_str()));
+        Ok(json!({"node": self.cfg.node, "peers": out}))
     }
 
     fn op_list(&self) -> Result<Value> {

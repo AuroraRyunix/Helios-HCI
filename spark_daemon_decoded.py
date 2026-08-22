@@ -3285,7 +3285,7 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     # endpoint exists: one authenticated surface for the cluster rather than a second
     # certificate, a second port and a second thing to rotate, per storage tier.
     DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping",
-               "seal", "resize", "capacity", "purah-sweep", "purah-scrub")
+               "seal", "resize", "capacity", "peers", "purah-sweep", "purah-scrub")
 
     def handle_dfs_vdisk(self):
         payload, error = self.read_json_payload()

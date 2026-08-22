@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -22,6 +23,7 @@ use crate::extent::{vdisk_hash, EgroupStore, OpenEgroup};
 use crate::journal::{Journal, FLAG_COMMIT};
 use crate::meta::{block_map_batches, cql_str, json_params, now_ms, Daruk};
 use crate::overlay::Overlay;
+use crate::peer::{self, PeerClient, Request};
 
 /// Guest writes larger than this become several journal records terminated by one commit
 /// marker. Bounded so a single enormous write cannot pin an unbounded buffer.
@@ -55,6 +57,12 @@ pub struct Vdisk {
     open_eg: Option<OpenEgroup>,
     high_water: u64,
     daruk: Daruk,
+    /// The peers an append must reach before it is acknowledged. Write-all, not quorum:
+    /// the takeover proof in ownership.md is three lines *because* fencing one replica
+    /// stops the old owner (it needed all of them) and reading one replica sees every
+    /// acknowledged write. Quorum buys availability during single-replica loss and costs
+    /// exactly that proof.
+    replicas: Vec<Arc<PeerClient>>,
     /// Set when a drain fails after its bytes are durable. Reads stay correct (the
     /// overlay still holds the newest data), but the journal must not be truncated and
     /// the condition has to be visible rather than retried into silence.
@@ -75,6 +83,7 @@ impl Vdisk {
         epoch: u64,
         cfg: &VdiskConfig,
         daruk: Daruk,
+        replicas: Vec<Arc<PeerClient>>,
     ) -> Result<Vdisk> {
         let rows = daruk.query(&format!(
             "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes \
@@ -113,6 +122,7 @@ impl Vdisk {
             open_eg: None,
             high_water: cfg.high_water,
             daruk,
+            replicas,
             degraded: None,
             journal: Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?,
         };
@@ -122,11 +132,20 @@ impl Vdisk {
         drop(journal);
 
         v.load_map()?;
-        let discarded = v.replay_journal()?;
-        if discarded > 0 {
-            eprintln!(
-                "sidon: vdisk {id}: discarded {discarded} bytes of unacknowledged journal tail"
-            );
+        // At ftt=0 the local journal is the only copy there is, so it is authoritative and
+        // replayed here. With replicas it is *not*: this node may have owned the vdisk
+        // before, in which case its file is a stale history from an earlier ownership
+        // while the replicas hold what was actually acknowledged since. Replaying the
+        // stale one and then appending to it is how a journal ends up with a sequence
+        // hole -- which replay refuses, correctly, but only after the damage is on disk.
+        // So with replicas, recovery waits for fence_and_recover().
+        if v.replicas.is_empty() {
+            let discarded = v.replay_journal()?;
+            if discarded > 0 {
+                eprintln!(
+                    "sidon: vdisk {id}: discarded {discarded} bytes of unacknowledged journal tail"
+                );
+            }
         }
         Ok(v)
     }
@@ -284,6 +303,12 @@ impl Vdisk {
         for (i, (off, chunk)) in chunks.into_iter().enumerate() {
             let flags = if i == last { FLAG_COMMIT } else { 0 };
             let rec = self.journal.append(self.epoch, off, flags, chunk)?;
+            // Every replica, before the guest hears anything. A partial write-all is not
+            // an acknowledged write: if any replica refuses or cannot be reached, this
+            // returns an error and the guest sees EIO, which is the honest outcome --
+            // acknowledging on a subset would mean the takeover proof's "read one replica
+            // sees every acknowledged write" is false.
+            self.replicate(&rec.framed)?;
             written.push((off, rec.data_len, rec.data_pos));
         }
         // Overlay updates only after every record is durable, so a partially written
@@ -299,6 +324,185 @@ impl Vdisk {
                 // than retrying forever against a full disk or an unreachable Hydra.
                 self.degraded = Some(e.to_string());
                 eprintln!("sidon: vdisk {}: drain failed: {e}", self.id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Ship one framed journal record to every replica and wait for all of them.
+    fn replicate(&mut self, framed: &[u8]) -> Result<()> {
+        if self.replicas.is_empty() {
+            return Ok(());
+        }
+        for replica in &self.replicas {
+            let resp = replica.call(&Request {
+                opcode: peer::OP_APPEND,
+                vdisk: self.id.clone(),
+                epoch: self.epoch,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: framed.to_vec(),
+            })?;
+            if resp.status == peer::ST_STALE_EPOCH {
+                // Deposed. Not an I/O problem to retry -- somebody else owns this disk
+                // now, and the correct behaviour is to stop, loudly and immediately.
+                self.degraded = Some(format!(
+                    "deposed: replica {} is fenced at epoch {}, this owner holds {}",
+                    replica.node, resp.epoch, self.epoch
+                ));
+                return Err(Error::refused(format!(
+                    "vdisk {} is no longer owned by this node: replica {} is fenced at \
+                     epoch {} and refused a write at epoch {}",
+                    self.id, replica.node, resp.epoch, self.epoch
+                )));
+            }
+            if !resp.is_ok() {
+                return Err(Error::io(format!(
+                    "replica {} refused a journal append for {} with status {}",
+                    replica.node, self.id, resp.status
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fence every reachable replica at this vdisk's epoch, and rebuild from one of them.
+    ///
+    /// Step 2 and 3 of the takeover in ownership.md. Every *reachable* replica is fenced
+    /// so that step 3 can read any of them and so returning replicas rejoin already
+    /// fenced; safety needs only one to have taken, because an append needs all of them.
+    pub fn fence_and_recover(&mut self, fence_clients: &[Arc<PeerClient>]) -> Result<usize> {
+        if fence_clients.is_empty() {
+            return Ok(0);
+        }
+        // Fence every replica at once, not one after another.
+        //
+        // Found by testing: with serial fencing a takeover waits the full per-peer
+        // timeout for each unreachable replica, so failing over away from a wedged host
+        // in a three-replica set took twenty seconds before it did anything. HA has a
+        // time budget and that spends all of it. Safety is unaffected either way -- an
+        // append needs *every* replica, so fencing one is enough to stop the old owner --
+        // which is exactly why the slow ones can be waited on in parallel and then
+        // ignored.
+        let mut handles = Vec::with_capacity(self.replicas.len());
+        for replica in fence_clients {
+            let replica = Arc::clone(replica);
+            let vdisk = self.id.clone();
+            let epoch = self.epoch;
+            handles.push(std::thread::spawn(move || {
+                let outcome = replica.call(&Request {
+                    opcode: peer::OP_FENCE,
+                    vdisk,
+                    epoch,
+                    seq: 0,
+                    offset: 0,
+                    flags: 0,
+                    data: Vec::new(),
+                });
+                (replica, outcome)
+            }));
+        }
+
+        let mut fenced = Vec::new();
+        let mut unreachable = Vec::new();
+        for handle in handles {
+            match handle.join() {
+                Ok((replica, Ok(resp))) if resp.is_ok() => fenced.push(replica),
+                Ok((replica, Ok(resp))) => {
+                    unreachable.push(format!("{} (status {})", replica.node, resp.status))
+                }
+                Ok((replica, Err(e))) => unreachable.push(format!("{}: {e}", replica.node)),
+                // A panicked fence thread is not a fenced replica. Saying so beats
+                // treating a crash as a success.
+                Err(_) => unreachable.push("a fence thread panicked".to_string()),
+            }
+        }
+        if fenced.is_empty() {
+            return Err(Error::refused(format!(
+                "no replica of {} could be fenced ({}), so the previous owner cannot be \
+                 shown to have stopped writing",
+                self.id,
+                unreachable.join("; ")
+            )));
+        }
+        if !unreachable.is_empty() {
+            eprintln!(
+                "sidon: vdisk {}: fenced {} replica(s); could not reach {}. Safe -- an \
+                 append needs all of them -- but those will be fenced when they return.",
+                self.id, fenced.len(), unreachable.join("; ")
+            );
+        }
+
+        // Step 3: read the journal tail from the replicas just fenced. By write-all each
+        // of them holds every acknowledged write, so any one is a complete history -- but
+        // take the longest, because a replica that died mid-append has a torn tail and a
+        // shorter file. They agree on every byte they share; only the end can differ.
+        let mut best: Option<(String, Vec<u8>)> = None;
+        for replica in &fenced {
+            let resp = match replica.call(&Request {
+                opcode: peer::OP_READ_TAIL,
+                vdisk: self.id.clone(),
+                epoch: self.epoch,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: Vec::new(),
+            }) {
+                Ok(r) if r.is_ok() => r,
+                _ => continue,
+            };
+            let longer = best.as_ref().map(|(_, d)| resp.data.len() > d.len()).unwrap_or(true);
+            if longer {
+                best = Some((replica.node.clone(), resp.data));
+            }
+        }
+
+        // Adopt it unconditionally, even when it is shorter than the local file or empty.
+        // "Shorter than what is here" is precisely the stale-previous-ownership case: this
+        // node's own journal is not evidence of anything once another node has owned the
+        // disk, and an empty tail means the last owner drained everything, which is a fact
+        // and not a failure to recover.
+        let (from, tail) = match best {
+            Some(v) => v,
+            None => {
+                return Err(Error::refused(format!(
+                    "vdisk {} was fenced but no replica would return its journal, so the \
+                     acknowledged history cannot be established",
+                    self.id
+                )))
+            }
+        };
+        let bytes = tail.len();
+        self.journal.replace(&tail)?;
+        self.overlay.clear();
+        let discarded = self.replay_journal()?;
+        eprintln!(
+            "sidon: vdisk {}: adopted {bytes} byte(s) of journal from replica {from} \
+             ({discarded} discarded as a torn tail)",
+            self.id
+        );
+        Ok(fenced.len())
+    }
+
+    /// Tell every replica the journal has been drained and may be dropped.
+    fn replicate_truncate(&mut self) -> Result<()> {
+        for replica in &self.replicas {
+            // A failure here wastes disk on a replica; it does not endanger data, because
+            // the map already points at the drained extents. Logged, not fatal.
+            if let Err(e) = replica.call(&Request {
+                opcode: peer::OP_TRUNCATE,
+                vdisk: self.id.clone(),
+                epoch: self.epoch,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: Vec::new(),
+            }) {
+                eprintln!(
+                    "sidon: vdisk {}: replica {} did not drop its drained journal: {e}",
+                    self.id, replica.node
+                );
             }
         }
         Ok(())
@@ -445,9 +649,10 @@ impl Vdisk {
             eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
         }
 
-        // Rule 3: only now is the journal allowed to forget.
+        // Rule 3: only now is the journal allowed to forget -- here and on every replica.
         self.overlay.clear();
         self.journal.reset()?;
+        self.replicate_truncate()?;
         Ok(())
     }
 
@@ -540,6 +745,7 @@ impl Vdisk {
             "journal_bytes": self.journal.len(),
             "overlay_segments": self.overlay.len(),
             "mapped_extents": self.map.len(),
+            "replicas": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
             "degraded": self.degraded,
         })
     }

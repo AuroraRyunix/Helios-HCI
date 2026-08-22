@@ -48,6 +48,9 @@ pub struct Record {
     /// segment back without holding every acknowledged write in memory.
     pub data_pos: u64,
     pub data_len: u32,
+    /// The exact bytes written, for replication. Empty for records rebuilt by replay --
+    /// nothing replicates a record it just read back off its own disk.
+    pub framed: Vec<u8>,
 }
 
 pub struct Journal {
@@ -81,8 +84,14 @@ impl Journal {
     /// survive, and the journal's directory entry was created and synced at open. This is
     /// the single fsync on the guest's critical path, and adding a second one here would
     /// double every write's latency for a guarantee already held.
-    pub fn append(&mut self, epoch: u64, offset: u64, flags: u32, data: &[u8]) -> Result<Record> {
-        let seq = self.next_seq;
+    /// Frame a record without writing it.
+    ///
+    /// Split out from `append` so that the bytes replicated to a peer are byte-identical
+    /// to the bytes written locally, rather than re-encoded at the far end from parsed
+    /// fields. Re-encoding would mean two implementations of the format that have to stay
+    /// agreeing, and a replica's copy differing from the owner's is exactly the divergence
+    /// this design refuses to have a repair protocol for.
+    pub fn encode(seq: u64, epoch: u64, offset: u64, flags: u32, data: &[u8]) -> Vec<u8> {
         let mut header = [0u8; HEADER_LEN];
         header[0..4].copy_from_slice(&MAGIC.to_le_bytes());
         header[4..8].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -93,12 +102,18 @@ impl Journal {
         let crc = crc32c(crc32c(0, &header[0..36]), data);
         header[36..40].copy_from_slice(&crc.to_le_bytes());
 
-        // One write_all for header+payload. Two calls could interleave with another
-        // thread's record; the vdisk lock prevents that today, but a single buffer means
-        // the format does not depend on that lock still being there tomorrow.
         let mut buf = Vec::with_capacity(HEADER_LEN + data.len());
         buf.extend_from_slice(&header);
         buf.extend_from_slice(data);
+        buf
+    }
+
+    pub fn append(&mut self, epoch: u64, offset: u64, flags: u32, data: &[u8]) -> Result<Record> {
+        let seq = self.next_seq;
+        // One write_all for header+payload. Two calls could interleave with another
+        // thread's record; the vdisk lock prevents that today, but a single buffer means
+        // the format does not depend on that lock still being there tomorrow.
+        let buf = Journal::encode(seq, epoch, offset, flags, data);
 
         self.file.seek(SeekFrom::Start(self.len))?;
         self.file.write_all(&buf)?;
@@ -107,7 +122,15 @@ impl Journal {
         let data_pos = self.len + HEADER_LEN as u64;
         self.len += buf.len() as u64;
         self.next_seq = seq + 1;
-        Ok(Record { seq, epoch, offset, flags, data_pos, data_len: data.len() as u32 })
+        Ok(Record {
+            seq,
+            epoch,
+            offset,
+            flags,
+            data_pos,
+            data_len: data.len() as u32,
+            framed: buf,
+        })
     }
 
     pub fn read_at(&mut self, pos: u64, len: usize) -> Result<Vec<u8>> {
@@ -176,6 +199,7 @@ impl Journal {
                 flags,
                 data_pos: pos + HEADER_LEN as u64,
                 data_len,
+                framed: Vec::new(),
             });
             pos = end;
         }
@@ -189,6 +213,21 @@ impl Journal {
             self.len = pos;
         }
         Ok((records, discarded))
+    }
+
+    /// Adopt a journal recovered from a replica, replacing whatever is here.
+    ///
+    /// Used by takeover only. The bytes are written and synced before the caller replays
+    /// them, so a crash mid-takeover leaves a journal that replay can read rather than a
+    /// half-written one -- and replay's torn-tail handling covers the rest.
+    pub fn replace(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(bytes)?;
+        self.file.sync_all()?;
+        self.len = bytes.len() as u64;
+        self.next_seq = 0;
+        Ok(())
     }
 
     /// Drop every record. Called only after a drain has committed the corresponding
