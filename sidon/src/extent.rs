@@ -123,6 +123,21 @@ impl EgroupStore {
         vdisk_hash: u64,
         extent_index: u64,
     ) -> Result<u32> {
+        self.append_framed(eg, data, vdisk_hash, extent_index).map(|(off, _)| off)
+    }
+
+    /// Append, and hand back the exact bytes written.
+    ///
+    /// The caller ships those bytes to the replicas rather than re-framing there, so every
+    /// copy is byte-identical and repair stays a checksum comparison instead of a
+    /// divergence protocol.
+    pub fn append_framed(
+        &self,
+        eg: &mut OpenEgroup,
+        data: &[u8],
+        vdisk_hash: u64,
+        extent_index: u64,
+    ) -> Result<(u32, Vec<u8>)> {
         let footer = footer_for(data, vdisk_hash, extent_index);
         let offset = eg.size;
         let mut buf = Vec::with_capacity(data.len() + FOOTER_LEN);
@@ -131,7 +146,7 @@ impl EgroupStore {
         eg.file.seek(SeekFrom::Start(offset))?;
         eg.file.write_all(&buf)?;
         eg.size += buf.len() as u64;
-        Ok(offset as u32)
+        Ok((offset as u32, buf))
     }
 
     /// Make everything appended so far durable. Called once per drain batch, before the
@@ -170,6 +185,24 @@ impl EgroupStore {
         let (data, footer) = buf.split_at(length as usize);
         verify_footer(data, footer, vdisk_hash, extent_index)?;
         Ok(data.to_vec())
+    }
+
+    /// One extent plus its footer, exactly as stored.
+    ///
+    /// Deliberately unverified: this is for copying bytes to a new replica, and verifying
+    /// here would mean a single damaged extent aborts a whole re-replication. The copy is
+    /// verified where it is *used* -- every read checks the footer, on the local copy and
+    /// on a replica's alike.
+    pub fn read_extent_framed(&self, egroup_id: &str, offset: u32, length: u32) -> Result<Vec<u8>> {
+        let path = self.path_for(egroup_id);
+        let mut file = File::open(&path)
+            .map_err(|e| Error::io(format!("extent group {} unreadable: {e}", path.display())))?;
+        let mut buf = vec![0u8; length as usize + FOOTER_LEN];
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read_exact(&mut buf).map_err(|e| {
+            Error::corrupt(format!("extent group {egroup_id} is shorter than the map claims: {e}"))
+        })?;
+        Ok(buf)
     }
 
     /// The seal hash over a whole egroup file, recorded at seal time so scrub has

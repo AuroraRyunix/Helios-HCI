@@ -215,6 +215,16 @@ impl Journal {
         Ok((records, discarded))
     }
 
+    /// The whole journal as bytes, for backfilling a new replica.
+    pub fn read_all(&mut self) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.len as usize];
+        if self.len > 0 {
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.read_exact(&mut buf)?;
+        }
+        Ok(buf)
+    }
+
     /// Adopt a journal recovered from a replica, replacing whatever is here.
     ///
     /// Used by takeover only. The bytes are written and synced before the caller replays

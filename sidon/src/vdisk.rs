@@ -57,6 +57,13 @@ pub struct Vdisk {
     open_eg: Option<OpenEgroup>,
     high_water: u64,
     daruk: Daruk,
+    /// The replica set exactly as the map records it, this node included.
+    ///
+    /// Distinct from `replicas` below, which holds only the peers this node dials -- a
+    /// node does not replicate to itself over TCP. Conflating the two made the heal's
+    /// compare-and-swap condition the wrong list, so it never matched and every heal
+    /// backed itself out reporting a race that had not happened.
+    map_replicas: Vec<String>,
     /// The peers an append must reach before it is acknowledged. Write-all, not quorum:
     /// the takeover proof in ownership.md is three lines *because* fencing one replica
     /// stops the old owner (it needed all of them) and reading one replica sees every
@@ -84,6 +91,7 @@ impl Vdisk {
         cfg: &VdiskConfig,
         daruk: Daruk,
         replicas: Vec<Arc<PeerClient>>,
+        map_replicas: Vec<String>,
     ) -> Result<Vdisk> {
         let rows = daruk.query(&format!(
             "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes \
@@ -123,6 +131,7 @@ impl Vdisk {
             high_water: cfg.high_water,
             daruk,
             replicas,
+            map_replicas,
             degraded: None,
             journal: Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?,
         };
@@ -234,9 +243,30 @@ impl Vdisk {
                 Some(l) => l.clone(),
                 None => continue,
             };
-            let extent = self
+            let extent = match self
                 .store
-                .read_extent(&loc.egroup_id, loc.offset, loc.length, self.vh, idx)?;
+                .read_extent(&loc.egroup_id, loc.offset, loc.length, self.vh, idx)
+            {
+                Ok(bytes) => bytes,
+                Err(local) => {
+                    // The local copy is damaged or missing. Ask a replica before giving up:
+                    // this is the read-repair path, and it is the difference between one
+                    // rotted extent costing a byte range and costing the disk. A replica's
+                    // answer is verified against the same footer, so a second bad copy is
+                    // refused too rather than quietly replacing a first.
+                    match self.read_extent_from_replica(&loc, idx) {
+                        Some(bytes) => {
+                            eprintln!(
+                                "sidon: vdisk {}: extent {idx} unreadable locally ({local}); \
+                                 served from a replica",
+                                self.id
+                            );
+                            bytes
+                        }
+                        None => return Err(local),
+                    }
+                }
+            };
             let ext_start = idx * self.extent_bytes;
             let copy_start = offset.max(ext_start);
             let copy_end = end.min(ext_start + extent.len() as u64);
@@ -327,6 +357,199 @@ impl Vdisk {
             }
         }
         Ok(())
+    }
+
+    /// Which replicas are answering, and which are not.
+    pub fn replica_health(&self) -> (Vec<String>, Vec<String>) {
+        let mut up = Vec::new();
+        let mut down = Vec::new();
+        for replica in &self.replicas {
+            match replica.ping() {
+                Ok(()) => up.push(replica.node.clone()),
+                Err(_) => down.push(replica.node.clone()),
+            }
+        }
+        (up, down)
+    }
+
+    /// Bring a new replica up to date, then start writing to it.
+    ///
+    /// Order matters and is the opposite of the obvious one. The new node joins the
+    /// write-all set **first**, so every append from this moment reaches it; only then is
+    /// the history backfilled. Backfilling first and joining after leaves a window where
+    /// a write lands on the old set and not the new member, and nothing afterwards would
+    /// notice the hole -- the backfill has already run.
+    ///
+    /// A crash midway leaves a node holding a partial copy that the map does not list.
+    /// That is garbage, not damage: nothing reads a replica the map does not name, and
+    /// Purah sweeps what is left.
+    pub fn add_replica(&mut self, client: Arc<PeerClient>) -> Result<usize> {
+        if self.replicas.iter().any(|r| r.node == client.node) {
+            return Ok(0);
+        }
+        let node = client.node.clone();
+        self.replicas.push(client);
+
+        // Every extent the map currently points at. Read locally and pushed as-is, so the
+        // new copy is byte-identical rather than re-framed.
+        let mut copied = 0usize;
+        let entries: Vec<(u64, ExtentLoc)> =
+            self.map.iter().map(|(i, l)| (*i, l.clone())).collect();
+        for (idx, loc) in entries {
+            let framed = match self.store.read_extent_framed(&loc.egroup_id, loc.offset, loc.length)
+            {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    // A local extent that cannot be read is not something to paper over by
+                    // silently shipping a shorter set. Undo the join and report it.
+                    self.replicas.retain(|r| r.node != node);
+                    return Err(Error::corrupt(format!(
+                        "cannot re-replicate {}: extent {idx} is unreadable here ({e})",
+                        self.id
+                    )));
+                }
+            };
+            self.replicate_extent_to(&node, &loc.egroup_id, loc.offset as u64, &framed)?;
+            copied += 1;
+        }
+
+        // Then the journal: everything acknowledged but not yet drained.
+        let journal = self.journal.read_all()?;
+        if !journal.is_empty() {
+            let replica = self
+                .replicas
+                .iter()
+                .find(|r| r.node == node)
+                .expect("just pushed")
+                .clone();
+            let resp = replica.call(&Request {
+                opcode: peer::OP_APPEND,
+                vdisk: self.id.clone(),
+                epoch: self.epoch,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: journal,
+            })?;
+            if !resp.is_ok() {
+                self.replicas.retain(|r| r.node != node);
+                return Err(Error::io(format!(
+                    "replica {node} refused the journal backfill for {} with status {}",
+                    self.id, resp.status
+                )));
+            }
+        }
+        Ok(copied)
+    }
+
+    /// Drop a replica from the write-all set.
+    ///
+    /// Only ever after the map has been updated: a set that is narrower in memory than in
+    /// the map means acknowledged writes are not reaching a node the map claims has them,
+    /// which is a durability lie rather than a degraded state.
+    pub fn remove_replica(&mut self, node: &str) {
+        self.replicas.retain(|r| r.node != node);
+    }
+
+    /// The replica set as the map records it -- what a compare-and-swap on it must be
+    /// conditioned against.
+    pub fn map_replicas(&self) -> Vec<String> {
+        self.map_replicas.clone()
+    }
+
+    /// Record a new set after the map has accepted it, so the two do not drift.
+    pub fn set_map_replicas(&mut self, nodes: Vec<String>) {
+        self.map_replicas = nodes;
+    }
+
+    fn replicate_extent_to(
+        &self,
+        node: &str,
+        egroup_id: &str,
+        offset: u64,
+        framed: &[u8],
+    ) -> Result<()> {
+        let replica = self
+            .replicas
+            .iter()
+            .find(|r| r.node == node)
+            .ok_or_else(|| Error::refused(format!("{node} is not a replica of {}", self.id)))?;
+        let resp = replica.call(&Request {
+            opcode: peer::OP_EGROUP_PUT,
+            vdisk: egroup_id.to_string(),
+            epoch: self.epoch,
+            seq: 0,
+            offset,
+            flags: 0,
+            data: framed.to_vec(),
+        })?;
+        if !resp.is_ok() {
+            return Err(Error::io(format!(
+                "replica {node} refused extent group {egroup_id} with status {}",
+                resp.status
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ship one extent (payload plus footer) to every replica.
+    fn replicate_extent(&mut self, egroup_id: &str, offset: u64, framed: &[u8]) -> Result<()> {
+        for replica in &self.replicas {
+            let resp = replica.call(&Request {
+                opcode: peer::OP_EGROUP_PUT,
+                vdisk: egroup_id.to_string(),
+                epoch: self.epoch,
+                seq: 0,
+                offset,
+                flags: 0,
+                data: framed.to_vec(),
+            })?;
+            if !resp.is_ok() {
+                return Err(Error::io(format!(
+                    "replica {} refused extent group {egroup_id} at offset {offset} \
+                     with status {}",
+                    replica.node, resp.status
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch one extent from whichever replica still has a good copy.
+    ///
+    /// Returns None when no replica could supply one that passes its footer, which keeps
+    /// the caller's original local error as the thing reported -- "a replica also failed"
+    /// is less useful to an operator than what went wrong here.
+    fn read_extent_from_replica(&self, loc: &ExtentLoc, idx: u64) -> Option<Vec<u8>> {
+        for replica in &self.replicas {
+            let resp = match replica.call(&Request {
+                opcode: peer::OP_EGROUP_GET,
+                vdisk: loc.egroup_id.clone(),
+                epoch: self.epoch,
+                seq: (loc.length as usize + crate::extent::FOOTER_LEN) as u64,
+                offset: loc.offset as u64,
+                flags: 0,
+                data: Vec::new(),
+            }) {
+                Ok(r) if r.is_ok() => r,
+                _ => continue,
+            };
+            if resp.data.len() < loc.length as usize + crate::extent::FOOTER_LEN {
+                continue;
+            }
+            let (data, footer) = resp.data.split_at(loc.length as usize);
+            // Verified exactly as a local read is. A replica is not more trustworthy for
+            // being remote, and accepting its bytes unchecked would turn one damaged copy
+            // into a silently propagated one.
+            if crate::extent::verify_footer(data, footer, self.vh, idx).is_ok() {
+                return Some(data.to_vec());
+            }
+            eprintln!(
+                "sidon: vdisk {}: replica {} also has a damaged copy of extent {idx}",
+                self.id, replica.node
+            );
+        }
+        None
     }
 
     /// Ship one framed journal record to every replica and wait for all of them.
@@ -590,11 +813,16 @@ impl Vdisk {
             }
 
             let eg_id = self.ensure_open_egroup()?;
-            let offset = {
+            let (offset, framed) = {
                 let store = &self.store;
                 let eg = self.open_eg.as_mut().expect("ensure_open_egroup set it");
-                store.append(eg, &buf, self.vh, idx)?
+                store.append_framed(eg, &buf, self.vh, idx)?
             };
+            // The same bytes to every replica, extent plus footer. Without this a drained
+            // extent exists once: the journal is replicated, so an un-drained write
+            // survives a node loss, and draining it would *reduce* its durability. Data
+            // that becomes less safe by being tidied up is not a tidy-up.
+            self.replicate_extent(&eg_id, offset as u64, &framed)?;
             new_rows.push((idx, eg_id.clone(), offset, ext_len as u32));
             new_locs.push((idx, ExtentLoc { egroup_id: eg_id, offset, length: ext_len as u32 }));
 

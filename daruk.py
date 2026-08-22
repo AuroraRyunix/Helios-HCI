@@ -463,6 +463,23 @@ LWT_OPS = {
             "expected_size_bytes": {"type": "int", "required": True},
         },
     },
+    # Replacing a lost replica. Conditional on the set the caller read *and* on the
+    # epoch, so a node that has since been deposed cannot rewrite the durability
+    # guarantee of a disk it no longer owns -- and two curators racing to heal the same
+    # vdisk produce one winner rather than a set that lost a member to each of them.
+    "/v1/dfs/set-replicas": {
+        "cql": (
+            "UPDATE hydra.dfs_vdisks SET replicas = ? WHERE vdisk_id = ? "
+            "IF replicas = ? AND epoch = ?"
+        ),
+        "binds": ("replicas", "vdisk_id", "expected_replicas", "expected_epoch"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "replicas": {"type": "list", "required": True},
+            "expected_replicas": {"type": "list", "required": True},
+            "expected_epoch": {"type": "int", "required": True},
+        },
+    },
     "/v1/dfs/egroup-create": {
         "cql": (
             "INSERT INTO hydra.dfs_egroups (egroup_id, state, node, path, size, "

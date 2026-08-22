@@ -56,6 +56,10 @@ pub const OP_READ_TAIL: u16 = 4;
 pub const OP_TRUNCATE: u16 = 5;
 pub const OP_EGROUP_PUT: u16 = 6;
 pub const OP_EGROUP_GET: u16 = 7;
+/// Guest I/O relayed from a node that does not own the vdisk to the node that does.
+/// `offset` is the guest offset; for a read, `seq` carries the length.
+pub const OP_FORWARD_READ: u16 = 8;
+pub const OP_FORWARD_WRITE: u16 = 9;
 
 pub const ST_OK: u16 = 0;
 /// The caller's epoch is below the highest this replica has been fenced at. The response
@@ -73,8 +77,14 @@ const MAX_FRAME: u32 = 80 << 20;
 #[derive(Debug)]
 pub struct Request {
     pub opcode: u16,
+    /// The name this operation is about. A vdisk id for journal operations; an **extent
+    /// group id** for OP_EGROUP_PUT and OP_EGROUP_GET. One name field rather than two,
+    /// because no operation needs both, and a second field that is empty most of the time
+    /// is a field somebody eventually fills in wrongly.
     pub vdisk: String,
     pub epoch: u64,
+    /// Sequence number for journal operations; **byte length** for OP_EGROUP_GET, which
+    /// has to say how much to read and carries no payload of its own.
     pub seq: u64,
     pub offset: u64,
     pub flags: u16,
@@ -335,6 +345,18 @@ impl ReplicaStore {
     }
 }
 
+/// What can answer guest I/O for a vdisk this node owns.
+///
+/// A trait so the peer listener does not have to know about the daemon's attach table:
+/// peer.rs stays a transport and a replica store, and the thing that owns vdisks passes
+/// itself in. Forwarded I/O is the only reason the two need to meet at all.
+pub trait Owned: Send + Sync {
+    /// Read from a vdisk this node owns, or None if it does not own it.
+    fn owned_read(&self, vdisk: &str, offset: u64, len: u32) -> Option<Result<Vec<u8>>>;
+    /// Write to a vdisk this node owns, or None if it does not own it.
+    fn owned_write(&self, vdisk: &str, offset: u64, data: &[u8]) -> Option<Result<()>>;
+}
+
 /// Answer one request against the local replica store.
 pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
     match req.opcode {
@@ -383,9 +405,35 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
     }
 }
 
+/// Answer a request, trying forwarded guest I/O first.
+pub fn serve_with_owner(store: &ReplicaStore, owner: &dyn Owned, req: &Request) -> Response {
+    match req.opcode {
+        OP_FORWARD_READ => match owner.owned_read(&req.vdisk, req.offset, req.seq as u32) {
+            Some(Ok(data)) => Response::ok(data),
+            Some(Err(e)) => {
+                eprintln!("sidon: forwarded read of {}: {e}", req.vdisk);
+                Response::err(ST_IO, 0)
+            }
+            // Not the owner either. The forwarder was working from a stale map; answering
+            // NOT_FOUND lets it re-read ownership rather than retrying into a node that
+            // will never be able to help.
+            None => Response::err(ST_NOT_FOUND, 0),
+        },
+        OP_FORWARD_WRITE => match owner.owned_write(&req.vdisk, req.offset, &req.data) {
+            Some(Ok(())) => Response::ok(Vec::new()),
+            Some(Err(e)) => {
+                eprintln!("sidon: forwarded write to {}: {e}", req.vdisk);
+                Response::err(ST_IO, 0)
+            }
+            None => Response::err(ST_NOT_FOUND, 0),
+        },
+        _ => serve_request(store, req),
+    }
+}
+
 /// The listener. One thread per peer connection; a connection carries every vdisk this
 /// pair replicates, which is the whole point of the shape.
-pub fn listen(bind: &str, store: Arc<ReplicaStore>) -> Result<()> {
+pub fn listen(bind: &str, store: Arc<ReplicaStore>, owner: Arc<dyn Owned>) -> Result<()> {
     // Plaintext replication must never leave the machine. The design calls for mTLS with
     // the cluster CA on this port; until that exists, binding anywhere but loopback is
     // refused outright rather than left to whoever remembers. This is what makes
@@ -408,8 +456,9 @@ pub fn listen(bind: &str, store: Arc<ReplicaStore>) -> Result<()> {
             match conn {
                 Ok(stream) => {
                     let store = Arc::clone(&store);
+                    let owner = Arc::clone(&owner);
                     thread::spawn(move || {
-                        if let Err(e) = serve_connection(stream, &store) {
+                        if let Err(e) = serve_connection(stream, &store, owner.as_ref()) {
                             eprintln!("sidon: peer connection ended: {e}");
                         }
                     });
@@ -424,14 +473,14 @@ pub fn listen(bind: &str, store: Arc<ReplicaStore>) -> Result<()> {
     Ok(())
 }
 
-fn serve_connection(mut stream: TcpStream, store: &ReplicaStore) -> Result<()> {
+fn serve_connection(mut stream: TcpStream, store: &ReplicaStore, owner: &dyn Owned) -> Result<()> {
     stream.set_nodelay(true).ok();
     loop {
         // A decode failure is a desynchronised stream, so the connection is dropped
         // rather than answered: replying would let shifted bytes be read as a plausible
         // sequence of commands.
         let req = decode_request(&mut stream)?;
-        let resp = serve_request(store, &req);
+        let resp = serve_with_owner(store, owner, &req);
         stream
             .write_all(&encode_response(&resp))
             .map_err(|e| Error::io(format!("peer write: {e}")))?;
@@ -529,6 +578,79 @@ impl PeerClient {
         } else {
             Err(Error::io(format!("peer {} answered ping with status {}", self.node, resp.status)))
         }
+    }
+}
+
+/// Serves a vdisk by relaying every operation to the node that owns it.
+///
+/// Correct and slower, which is the whole trade. A VM can resume on a destination host
+/// before its storage has moved, and the destination takes ownership at leisure -- so
+/// there is no instant at which storage must hand off synchronously with the guest, and
+/// the migration window that dual-primary existed to cover simply does not occur.
+pub struct Forwarder {
+    pub vdisk: String,
+    pub size: u64,
+    pub read_only: bool,
+    pub owner: Arc<PeerClient>,
+}
+
+impl Forwarder {
+    fn relay(&self, opcode: u16, offset: u64, len: u64, data: Vec<u8>) -> Result<Vec<u8>> {
+        let resp = self.owner.call(&Request {
+            opcode,
+            vdisk: self.vdisk.clone(),
+            epoch: 0,
+            seq: len,
+            offset,
+            flags: 0,
+            data,
+        })?;
+        match resp.status {
+            ST_OK => Ok(resp.data),
+            // The owner moved. Surfaced rather than retried: this node's view of
+            // ownership is stale, and the control plane has to re-resolve it -- retrying
+            // against a node that has already said "not mine" is a loop.
+            ST_NOT_FOUND => Err(Error::refused(format!(
+                "{} no longer owns {}; this node's forwarding target is stale",
+                self.owner.node, self.vdisk
+            ))),
+            other => Err(Error::io(format!(
+                "owner {} answered forwarded I/O for {} with status {other}",
+                self.owner.node, self.vdisk
+            ))),
+        }
+    }
+}
+
+impl crate::nbd::Backend for Forwarder {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+    fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.relay(OP_FORWARD_READ, offset, len as u64, Vec::new())
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.relay(OP_FORWARD_WRITE, offset, data.len() as u64, data.to_vec()).map(|_| ())
+    }
+    fn flush(&self) -> Result<()> {
+        // The owner acknowledges a forwarded write only after its own journal sync, so
+        // by the time a write returns here it is already durable on every replica. There
+        // is nothing weaker to flush.
+        Ok(())
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        let mut remaining = len;
+        let mut at = offset;
+        while remaining > 0 {
+            let chunk = remaining.min(1 << 20) as usize;
+            self.write(at, &vec![0u8; chunk])?;
+            at += chunk as u64;
+            remaining -= chunk as u64;
+        }
+        Ok(())
     }
 }
 
@@ -665,8 +787,13 @@ mod tests {
     #[test]
     fn the_replication_port_refuses_a_routable_bind_without_tls() {
         let dir = tmpdir("bind-guard");
+        struct NoVdisks;
+        impl Owned for NoVdisks {
+            fn owned_read(&self, _v: &str, _o: u64, _l: u32) -> Option<Result<Vec<u8>>> { None }
+            fn owned_write(&self, _v: &str, _o: u64, _d: &[u8]) -> Option<Result<()>> { None }
+        }
         let store = Arc::new(ReplicaStore::new(&dir).unwrap());
-        match listen("0.0.0.0:9105", Arc::clone(&store)) {
+        match listen("0.0.0.0:9105", Arc::clone(&store), Arc::new(NoVdisks)) {
             Err(Error::Refused(m)) => assert!(m.contains("plaintext"), "{m}"),
             other => panic!("a routable bind must be refused, got {other:?}"),
         }

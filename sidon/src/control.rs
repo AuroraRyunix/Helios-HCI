@@ -24,8 +24,8 @@ use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
 use crate::meta::{cql_str, json_params, now_ms, Daruk};
-use crate::nbd::{self, Export};
-use crate::peer::{self, PeerClient, ReplicaStore};
+use crate::nbd::{self, Export, LocalVdisk};
+use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
 use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
@@ -45,9 +45,13 @@ pub struct DaemonConfig {
 }
 
 struct Attached {
-    vdisk: Arc<Mutex<Vdisk>>,
+    /// None when this node is forwarding rather than owning. Everything that reaches into
+    /// the vdisk -- status, flush, drain, the held-egroup set -- is therefore an owner-only
+    /// operation, and says so rather than inventing an answer for a disk it does not have.
+    vdisk: Option<Arc<Mutex<Vdisk>>>,
     socket: PathBuf,
     stop: Arc<AtomicBool>,
+    forwarding_to: Option<String>,
 }
 
 pub struct Daemon {
@@ -132,7 +136,11 @@ impl Daemon {
             ))
         })?;
         std::fs::set_permissions(&self.cfg.control_socket, std::fs::Permissions::from_mode(0o600))?;
-        peer::listen(&self.cfg.peer_bind, Arc::clone(&self.replica_store))?;
+        peer::listen(
+            &self.cfg.peer_bind,
+            Arc::clone(&self.replica_store),
+            Arc::clone(self) as Arc<dyn Owned>,
+        )?;
         self.start_purah();
         println!("sidon: control socket ready");
 
@@ -211,6 +219,7 @@ impl Daemon {
             "resize" => self.op_resize(req),
             "capacity" => self.op_capacity(),
             "peers" => self.op_peers(),
+            "purah-heal" => self.op_purah_heal(),
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
@@ -304,7 +313,8 @@ impl Daemon {
 
         let daruk = self.daruk();
         let rows = daruk.query(&format!(
-            "SELECT owner, epoch, replicas FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+            "SELECT owner, epoch, replicas, size_bytes, class FROM hydra.dfs_vdisks \
+             WHERE vdisk_id = {}",
             cql_str(&id)
         ))?;
         let row = rows
@@ -313,6 +323,49 @@ impl Daemon {
         let cur_owner = row.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
         let cur_epoch = row.get("epoch").and_then(Value::as_i64).unwrap_or(0);
         let new_epoch = cur_epoch + 1;
+
+        // Forwarding mode: serve the disk without taking it.
+        //
+        // What a live migration uses. The guest resumes on this host and its I/O is
+        // relayed to whoever still owns the disk, so there is no instant where storage
+        // must hand over synchronously with the VM. Ownership follows later, at leisure.
+        if req.get("forward").and_then(Value::as_bool).unwrap_or(false) {
+            if cur_owner.is_empty() || cur_owner == self.cfg.node {
+                return Err(Error::refused(format!(
+                    "vdisk {id} is owned by {}; forwarding needs another node to forward to",
+                    if cur_owner.is_empty() { "nobody" } else { "this node" }
+                )));
+            }
+            let owner_client = self.peers.get(&cur_owner).ok_or_else(|| {
+                Error::refused(format!(
+                    "vdisk {id} is owned by {cur_owner}, which this daemon has no address for"
+                ))
+            })?;
+            let size = row.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+            let class = row.get("class").and_then(Value::as_str).unwrap_or("rw");
+            let backend = Arc::new(Forwarder {
+                vdisk: id.clone(),
+                size,
+                read_only: class == "immutable",
+                owner: Arc::clone(owner_client),
+            });
+            let socket = self.serve_socket(&id, backend)?;
+            self.attached.lock().expect("attached mutex poisoned").insert(
+                id.clone(),
+                Attached {
+                    vdisk: None,
+                    socket: socket.0.clone(),
+                    stop: socket.1,
+                    forwarding_to: Some(cur_owner.clone()),
+                },
+            );
+            return Ok(json!({
+                "vdisk_id": id,
+                "socket": socket.0.to_string_lossy(),
+                "forwarding_to": cur_owner,
+                "owner_epoch": cur_epoch,
+            }));
+        }
 
         // The claim is conditional on *both* the owner and the epoch as they were read.
         // Conditioning on owner alone would let a node that held this disk two takeovers
@@ -368,22 +421,72 @@ impl Daemon {
             }
         }
 
-        let mut vdisk = Vdisk::open(&id, new_epoch as u64, &self.vdisk_cfg(), self.daruk(), replicas)?;
+        let mut vdisk = Vdisk::open(
+            &id, new_epoch as u64, &self.vdisk_cfg(), self.daruk(), replicas,
+            replica_nodes.clone(),
+        )?;
         // Steps 2 and 3 of the takeover: fence every reachable replica at the epoch just
         // won, then rebuild from one of them. Done before a single byte is served, so a
         // guest never reads a state the previous owner could still add to.
         let fenced = vdisk.fence_and_recover(&fence_clients)?;
         let vdisk = Arc::new(Mutex::new(vdisk));
 
+        let (socket, stop) = self.serve_socket(&id, Arc::new(LocalVdisk(Arc::clone(&vdisk))))?;
+        self.attached.lock().expect("attached mutex poisoned").insert(
+            id.clone(),
+            Attached {
+                vdisk: Some(vdisk),
+                socket: socket.clone(),
+                stop,
+                forwarding_to: None,
+            },
+        );
+
+        Ok(json!({
+            "vdisk_id": id,
+            "socket": socket.to_string_lossy(),
+            "epoch": new_epoch,
+            "previous_owner": cur_owner,
+            "replicas": replica_nodes,
+            "replicas_fenced": fenced,
+        }))
+    }
+
+    /// The vdisk this node owns under `id`, or a refusal that says why not.
+    ///
+    /// Two different "no"s, kept apart: not attached at all, versus attached in
+    /// forwarding mode. The second is a normal state -- a VM that migrated here before
+    /// its storage did -- and an operator seeing "not attached" for a disk that is
+    /// visibly serving I/O would reasonably conclude something is broken.
+    fn owned_vdisk(&self, id: &str) -> Result<Arc<Mutex<Vdisk>>> {
+        let map = self.attached.lock().expect("attached mutex poisoned");
+        let attached = map
+            .get(id)
+            .ok_or_else(|| Error::refused(format!("vdisk {id} is not attached")))?;
+        match &attached.vdisk {
+            Some(v) => Ok(Arc::clone(v)),
+            None => Err(Error::refused(format!(
+                "vdisk {id} is being forwarded to {}, not owned here. Take ownership \
+                 before asking this node to act on it.",
+                attached.forwarding_to.as_deref().unwrap_or("another node")
+            ))),
+        }
+    }
+
+    /// Bind the per-vdisk NBD socket and start serving `backend` on it.
+    fn serve_socket(
+        &self,
+        id: &str,
+        backend: Arc<dyn nbd::Backend>,
+    ) -> Result<(PathBuf, Arc<AtomicBool>)> {
         let socket = self.cfg.root.join("nbd").join(format!("{id}.sock"));
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::io(format!("cannot bind {}: {e}", socket.display())))?;
+
         // qemu runs as the `qemu` user, so the socket has to be group-owned by it: 0660
         // on a root:root socket is 0000 as far as qemu is concerned, and the VM fails to
         // start with a permission error that names the socket rather than the reason.
-        // Group ownership plus 0660 is what grants qemu access without handing the world
-        // a writable block device.
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o660))?;
         if let Some(gid) = group_id("qemu") {
             if let Err(e) = std::os::unix::fs::chown(&socket, None, Some(gid)) {
@@ -394,7 +497,7 @@ impl Daemon {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let export = Export { vdisk: Arc::clone(&vdisk), name: id.clone() };
+        let export = Export { backend, name: id.to_string() };
         let stop_thread = Arc::clone(&stop);
         thread::spawn(move || {
             for conn in listener.incoming() {
@@ -416,20 +519,7 @@ impl Daemon {
                 }
             }
         });
-
-        self.attached.lock().expect("attached mutex poisoned").insert(
-            id.clone(),
-            Attached { vdisk, socket: socket.clone(), stop },
-        );
-
-        Ok(json!({
-            "vdisk_id": id,
-            "socket": socket.to_string_lossy(),
-            "epoch": new_epoch,
-            "previous_owner": cur_owner,
-            "replicas": replica_nodes,
-            "replicas_fenced": fenced,
-        }))
+        Ok((socket, stop))
     }
 
     fn op_detach(&self, req: &Value) -> Result<Value> {
@@ -443,9 +533,11 @@ impl Daemon {
         // Drain before releasing: a clean detach should leave an empty journal so the
         // next open has nothing to replay. A failure here is reported, not swallowed --
         // the data is still safe in the journal, but somebody needs to know.
-        let drain_result = {
-            let mut v = a.vdisk.lock().expect("vdisk mutex poisoned");
-            v.close()
+        let drain_result = match &a.vdisk {
+            Some(handle) => handle.lock().expect("vdisk mutex poisoned").close(),
+            // Forwarding: nothing local to drain. The owner still holds the journal, and
+            // draining is its business.
+            None => Ok(()),
         };
 
         a.stop.store(true, Ordering::SeqCst);
@@ -499,12 +591,7 @@ impl Daemon {
     /// node may serve reads from it.
     fn op_seal(&self, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
-        let vdisk = {
-            let map = self.attached.lock().expect("attached mutex poisoned");
-            map.get(&id)
-                .map(|a| Arc::clone(&a.vdisk))
-                .ok_or_else(|| Error::refused(format!("vdisk {id} must be attached to be sealed")))?
-        };
+        let vdisk = self.owned_vdisk(&id)?;
         {
             let mut v = vdisk.lock().expect("vdisk mutex poisoned");
             if v.class == "immutable" {
@@ -537,12 +624,7 @@ impl Daemon {
     fn op_resize(&self, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
         let new_size = u64_field(req, "size_bytes")?;
-        let vdisk = {
-            let map = self.attached.lock().expect("attached mutex poisoned");
-            map.get(&id)
-                .map(|a| Arc::clone(&a.vdisk))
-                .ok_or_else(|| Error::refused(format!("vdisk {id} is not attached")))?
-        };
+        let vdisk = self.owned_vdisk(&id)?;
         let mut v = vdisk.lock().expect("vdisk mutex poisoned");
         if v.class == "immutable" {
             return Err(Error::refused(format!("vdisk {id} is immutable and cannot be resized")));
@@ -642,36 +724,39 @@ impl Daemon {
         let map = self.attached.lock().expect("attached mutex poisoned");
         let mut out = Vec::new();
         for (id, a) in map.iter() {
-            let v = a.vdisk.lock().expect("vdisk mutex poisoned");
-            out.push(json!({
-                "vdisk_id": id,
-                "socket": a.socket.to_string_lossy(),
-                "epoch": v.epoch,
-                "size_bytes": v.size,
-                "degraded": v.degraded,
-            }));
+            match &a.vdisk {
+                Some(handle) => {
+                    let v = handle.lock().expect("vdisk mutex poisoned");
+                    out.push(json!({
+                        "vdisk_id": id,
+                        "socket": a.socket.to_string_lossy(),
+                        "epoch": v.epoch,
+                        "size_bytes": v.size,
+                        "degraded": v.degraded,
+                        "role": "owner",
+                    }));
+                }
+                None => out.push(json!({
+                    "vdisk_id": id,
+                    "socket": a.socket.to_string_lossy(),
+                    "role": "forwarding",
+                    "forwarding_to": a.forwarding_to,
+                })),
+            }
         }
         Ok(json!({"attached": out}))
     }
 
     fn op_status(&self, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
-        let map = self.attached.lock().expect("attached mutex poisoned");
-        let a = map
-            .get(&id)
-            .ok_or_else(|| Error::refused(format!("vdisk {id} is not attached")))?;
-        let v = a.vdisk.lock().expect("vdisk mutex poisoned");
+        let vdisk = self.owned_vdisk(&id)?;
+        let v = vdisk.lock().expect("vdisk mutex poisoned");
         Ok(v.stats())
     }
 
     fn op_flush(&self, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
-        let vdisk = {
-            let map = self.attached.lock().expect("attached mutex poisoned");
-            map.get(&id)
-                .map(|a| Arc::clone(&a.vdisk))
-                .ok_or_else(|| Error::refused(format!("vdisk {id} is not attached")))?
-        };
+        let vdisk = self.owned_vdisk(&id)?;
         let mut v = vdisk.lock().expect("vdisk mutex poisoned");
         if v.needs_drain() {
             v.drain()?;
@@ -703,10 +788,139 @@ impl Daemon {
         let map = self.attached.lock().expect("attached mutex poisoned");
         let mut held = HashSet::new();
         for a in map.values() {
-            let v = a.vdisk.lock().expect("vdisk mutex poisoned");
-            held.extend(v.held_egroups());
+            // A forwarded vdisk's extents are held on the owner, not here, and the sweep
+            // on this node has no business protecting them.
+            if let Some(handle) = &a.vdisk {
+                let v = handle.lock().expect("vdisk mutex poisoned");
+                held.extend(v.held_egroups());
+            }
         }
         held
+    }
+
+    /// Restore the replica count on every vdisk this node owns.
+    ///
+    /// Purah's re-replication, driven from the owner because the owner is the node that
+    /// has the data. Only owned vdisks: a forwarding node has nothing to copy, and a node
+    /// that merely holds a replica is not entitled to rewrite the set.
+    fn op_purah_heal(&self) -> Result<Value> {
+        let owned: Vec<(String, Arc<Mutex<Vdisk>>)> = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            map.iter()
+                .filter_map(|(id, a)| a.vdisk.as_ref().map(|v| (id.clone(), Arc::clone(v))))
+                .collect()
+        };
+
+        let mut healed = Vec::new();
+        let mut degraded = Vec::new();
+        for (id, handle) in owned {
+            let (before, down, epoch) = {
+                let v = handle.lock().expect("vdisk mutex poisoned");
+                let (_up, down) = v.replica_health();
+                // The map's set, this node included -- the CAS is conditioned on what the
+                // map holds, not on the subset this node happens to dial.
+                (v.map_replicas(), down, v.epoch)
+            };
+            if down.is_empty() {
+                continue;
+            }
+
+            // A spare is a configured peer that is answering and is not already a member.
+            let mut spare = None;
+            for (node, client) in self.peers.iter() {
+                if before.contains(node) || node == &self.cfg.node {
+                    continue;
+                }
+                if client.ping().is_ok() {
+                    spare = Some((node.clone(), Arc::clone(client)));
+                    break;
+                }
+            }
+            let (spare_node, spare_client) = match spare {
+                Some(v) => v,
+                None => {
+                    // Nothing to heal onto. Reported rather than retried silently: a
+                    // cluster that cannot restore its redundancy is a fact an operator
+                    // needs, and the vdisk keeps working in the meantime.
+                    degraded.push(json!({
+                        "vdisk_id": id, "unreachable": down,
+                        "detail": "no spare node is available to re-replicate onto",
+                    }));
+                    continue;
+                }
+            };
+
+            // The map first, then the data. The CAS is conditional on the set that was
+            // read and on the epoch, so a deposed owner loses this race rather than
+            // rewriting the durability guarantee of a disk it no longer owns.
+            let mut after: Vec<String> = before.iter().filter(|n| !down.contains(n)).cloned().collect();
+            after.push(spare_node.clone());
+
+            let copied = {
+                let mut v = handle.lock().expect("vdisk mutex poisoned");
+                match v.add_replica(Arc::clone(&spare_client)) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        degraded.push(json!({
+                            "vdisk_id": id, "unreachable": down,
+                            "detail": format!("re-replication onto {spare_node} failed: {e}"),
+                        }));
+                        continue;
+                    }
+                }
+            };
+
+            // A failed CAS and a refused CAS get the same treatment. An error here used
+            // to propagate and abort the loop, which left the new member in the write-all
+            // set while the map did not list it -- safe, since writes reaching more nodes
+            // than the map claims is not a durability lie, but inconsistent and forgotten
+            // on the next restart. Back it out either way.
+            let cas = match self.daruk().cas(
+                "/v1/dfs/set-replicas",
+                json_params(vec![
+                    ("vdisk_id", json!(id)),
+                    ("replicas", json!(after)),
+                    ("expected_replicas", json!(before)),
+                    ("expected_epoch", json!(epoch as i64)),
+                ]),
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    let mut v = handle.lock().expect("vdisk mutex poisoned");
+                    v.remove_replica(&spare_node);
+                    degraded.push(json!({
+                        "vdisk_id": id,
+                        "detail": format!("could not record the new replica set ({e}); backed out"),
+                    }));
+                    continue;
+                }
+            };
+            if !cas.applied {
+                // Somebody else changed the set, or this node was deposed. Back the new
+                // member out of the write-all set rather than acknowledging writes to a
+                // node the map does not list.
+                let mut v = handle.lock().expect("vdisk mutex poisoned");
+                v.remove_replica(&spare_node);
+                degraded.push(json!({
+                    "vdisk_id": id,
+                    "detail": "the replica set changed underneath this heal; backed out",
+                }));
+                continue;
+            }
+
+            {
+                let mut v = handle.lock().expect("vdisk mutex poisoned");
+                for lost in &down {
+                    v.remove_replica(lost);
+                }
+                v.set_map_replicas(after.clone());
+            }
+            healed.push(json!({
+                "vdisk_id": id, "replaced": down, "with": spare_node,
+                "extents_copied": copied,
+            }));
+        }
+        Ok(json!({"healed": healed, "degraded": degraded}))
     }
 
     fn op_purah_sweep(&self) -> Result<Value> {
@@ -747,6 +961,16 @@ impl Daemon {
                 // Hydra being unreachable is not a reason to stop curating forever; the
                 // next tick tries again. Reclamation is allowed to be late.
                 Err(e) => eprintln!("purah: sweep failed: {e}"),
+            }
+            match me.op_purah_heal() {
+                Ok(r) => {
+                    let healed = r.get("healed").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                    let degraded = r.get("degraded").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                    if healed > 0 || degraded > 0 {
+                        println!("purah: re-replicated {healed} vdisk(s), {degraded} still degraded");
+                    }
+                }
+                Err(e) => eprintln!("purah: re-replication failed: {e}"),
             }
             match me.op_purah_scrub() {
                 Ok(r) => {
@@ -796,6 +1020,32 @@ fn statfs(path: &std::path::Path) -> Result<(u64, u64)> {
     }
     let unit = if buf.f_frsize > 0 { buf.f_frsize } else { buf.f_bsize };
     Ok((buf.f_blocks.saturating_mul(unit), buf.f_bavail.saturating_mul(unit)))
+}
+
+/// Guest I/O arriving from a node that forwarded it here.
+///
+/// Answers only for vdisks this node is actually serving. Returning None rather than an
+/// error when it is not the owner is the distinction that matters: the forwarder learns
+/// its map is stale and re-reads ownership, instead of retrying against a node that can
+/// never help it.
+impl Owned for Daemon {
+    fn owned_read(&self, vdisk: &str, offset: u64, len: u32) -> Option<Result<Vec<u8>>> {
+        let handle = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            map.get(vdisk).and_then(|a| a.vdisk.clone())?
+        };
+        let mut v = handle.lock().expect("vdisk mutex poisoned");
+        Some(v.read(offset, len))
+    }
+
+    fn owned_write(&self, vdisk: &str, offset: u64, data: &[u8]) -> Option<Result<()>> {
+        let handle = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            map.get(vdisk).and_then(|a| a.vdisk.clone())?
+        };
+        let mut v = handle.lock().expect("vdisk mutex poisoned");
+        Some(v.write(offset, data))
+    }
 }
 
 fn str_field(req: &Value, name: &str) -> Result<String> {

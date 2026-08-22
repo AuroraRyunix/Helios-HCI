@@ -63,8 +63,47 @@ const CMD_FLAG_FUA: u16 = 1;
 /// process should not try to satisfy it.
 const MAX_IO: u32 = 64 << 20;
 
+/// What an NBD export reads and writes.
+///
+/// Two implementations: a vdisk this node owns, and a forwarder relaying to the node that
+/// does. The NBD layer cannot tell them apart, which is the point -- the guest always
+/// talks to its local Sidon, and whether that Sidon happens to own the disk is not the
+/// guest's problem and not this file's either.
+pub trait Backend: Send + Sync {
+    fn size(&self) -> u64;
+    fn read_only(&self) -> bool;
+    fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>>;
+    fn write(&self, offset: u64, data: &[u8]) -> Result<()>;
+    fn flush(&self) -> Result<()>;
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()>;
+}
+
+/// A vdisk served by the node that owns it.
+pub struct LocalVdisk(pub Arc<Mutex<Vdisk>>);
+
+impl Backend for LocalVdisk {
+    fn size(&self) -> u64 {
+        self.0.lock().expect("vdisk mutex poisoned").size
+    }
+    fn read_only(&self) -> bool {
+        self.0.lock().expect("vdisk mutex poisoned").class == "immutable"
+    }
+    fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.0.lock().expect("vdisk mutex poisoned").read(offset, len)
+    }
+    fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+        self.0.lock().expect("vdisk mutex poisoned").write(offset, data)
+    }
+    fn flush(&self) -> Result<()> {
+        self.0.lock().expect("vdisk mutex poisoned").flush()
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
+        self.0.lock().expect("vdisk mutex poisoned").write_zeroes(offset, len)
+    }
+}
+
 pub struct Export {
-    pub vdisk: Arc<Mutex<Vdisk>>,
+    pub backend: Arc<dyn Backend>,
     pub name: String,
 }
 
@@ -142,10 +181,7 @@ pub fn serve(stream: UnixStream, export: &Export) -> Result<()> {
     let mut reader = BufReader::new(peer);
     let mut writer = BufWriter::new(stream);
 
-    let (size, read_only) = {
-        let v = export.vdisk.lock().expect("vdisk mutex poisoned");
-        (v.size, v.class == "immutable")
-    };
+    let (size, read_only) = (export.backend.size(), export.backend.read_only());
 
     // ---- handshake ---------------------------------------------------------------
     let mut hello = Vec::with_capacity(18);
@@ -263,7 +299,7 @@ pub fn serve(stream: UnixStream, export: &Export) -> Result<()> {
         };
 
         let result: Result<Option<Vec<u8>>> = (|| {
-            let mut v = export.vdisk.lock().expect("vdisk mutex poisoned");
+            let backend = export.backend.as_ref();
             match cmd_type {
                 CMD_READ => {
                     if length > MAX_IO {
@@ -271,19 +307,19 @@ pub fn serve(stream: UnixStream, export: &Export) -> Result<()> {
                             "nbd read of {length} bytes is out of range"
                         )));
                     }
-                    v.read(offset, length).map(Some)
+                    backend.read(offset, length).map(Some)
                 }
                 CMD_WRITE => {
                     let data = payload.as_ref().expect("read above");
-                    v.write(offset, data)?;
+                    backend.write(offset, data)?;
                     if cmd_flags & CMD_FLAG_FUA != 0 {
-                        v.flush()?;
+                        backend.flush()?;
                     }
                     Ok(None)
                 }
-                CMD_FLUSH => v.flush().map(|_| None),
+                CMD_FLUSH => backend.flush().map(|_| None),
                 CMD_TRIM | CMD_WRITE_ZEROES => {
-                    v.write_zeroes(offset, length as u64)?;
+                    backend.write_zeroes(offset, length as u64)?;
                     Ok(None)
                 }
                 // A cache hint we honour by doing nothing, which is a complete
