@@ -1386,6 +1386,22 @@ WantedBy=multi-user.target
             # The qemu group owns the NBD socket directory: libvirt runs qemu as that
             # user, and it must be able to open a vdisk's socket without the sockets
             # being world-accessible.
+            # Sidon gets its own thin LV rather than sharing the root filesystem. Three
+            # reasons, and none of them is tidiness: a full extent store must not be able
+            # to wedge the host, dm-flakey needs a device of its own to sit under, and the
+            # design says egroups live on a thin LV in vg_aether. The pool already owns the
+            # whole VG, so this is carved from inside it and costs nothing until used.
+            node.execute(
+                "lvs vg_aether/sidon >/dev/null 2>&1 || "
+                "lvcreate -y -V 150G --thinpool thin_pool_aether -n sidon vg_aether",
+                check_exit=True)
+            node.execute("blkid /dev/vg_aether/sidon >/dev/null 2>&1 || mkfs.xfs -q /dev/vg_aether/sidon",
+                         check_exit=True)
+            node.execute("mkdir -p /var/lib/hci/sidon")
+            node.execute(
+                "grep -q ' /var/lib/hci/sidon ' /etc/fstab || "
+                "echo '/dev/vg_aether/sidon /var/lib/hci/sidon xfs defaults,noatime 0 0' >> /etc/fstab")
+            node.execute("mountpoint -q /var/lib/hci/sidon || mount /var/lib/hci/sidon", check_exit=True)
             node.execute("mkdir -p /var/lib/hci/sidon/journal /var/lib/hci/sidon/egroups /var/lib/hci/sidon/nbd")
             node.execute("chgrp -R qemu /var/lib/hci/sidon/nbd && chmod 0750 /var/lib/hci/sidon/nbd")
 
