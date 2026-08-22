@@ -1,0 +1,16 @@
+[package]
+name = "sidon"
+version = "0.1.0"
+license = "BUSL-1.1"
+edition = "2021"
+
+# Deliberately thin. Everything on the byte path is std: files, threads, unix sockets.
+# serde_json is here because the metadata layer speaks JSON to Daruk and hand-rolling a
+# parser for someone else's output is how you get a parser that is subtly wrong on the
+# day the output changes.
+[dependencies]
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 2
+panic = "unwind"

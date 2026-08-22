@@ -166,6 +166,34 @@ MIGRATIONS = [
             "CREATE TABLE IF NOT EXISTS hydra.urbosa_transit_pool ( subnet_index int PRIMARY KEY, router_id text, node_id text, allocated_at_ms bigint );",
         ],
     },
+    {
+        "id": "0005-dfs-extent-store",
+        "description": (
+            "The extent-based DFS map: which extent group holds each 1 MiB extent of "
+            "each vdisk, and where those groups physically live. Guest bytes never "
+            "appear here -- the map says where data is, never what it is. Serves "
+            "invariant I-3 (no silent corruption of the map) by making the block map "
+            "single-writer-per-partition: partitioned by vdisk, clustered by extent "
+            "index, so the owner's lookups and drain commits are single-partition "
+            "operations and last-write-wins is not a euphemism for data loss. "
+            "dfs_vdisks carries the (owner, epoch) CAS pair that makes ownership "
+            "transfer safe and the drain_seq counter that makes the drain exactly-once."
+        ),
+        "statements": [
+            # text ids rather than uuid, epoch-ms bigints rather than timestamp: the
+            # convention cluster_locks and urbosa_transit_pool set, and the shape Daruk's
+            # serializer and the Rust client both handle without type negotiation.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_vdisks ( vdisk_id text PRIMARY KEY, container text, size_bytes bigint, class text, owner text, epoch bigint, drain_seq bigint, extent_bytes int, egroup_bytes int, created_at_ms bigint, parent_vdisk text );",
+            # One partition per vdisk, clustered by extent index. A 1 TiB vdisk is ~1M
+            # rows in one partition: large but bounded, read once at open, maintained
+            # incrementally thereafter.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_block_map ( vdisk_id text, extent_index bigint, egroup_id text, egroup_offset int, length int, epoch bigint, PRIMARY KEY ((vdisk_id), extent_index) );",
+            # No refcount column, now or ever: reclamation is Purah's mark-sweep. A
+            # refcount here would be a distributed counter with a crash window between
+            # every data operation and its count operation.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_egroups ( egroup_id text PRIMARY KEY, state text, node text, path text, size int, seal_hash text, vdisk_hint text, created_at_ms bigint );",
+        ],
+    },
 ]
 
 

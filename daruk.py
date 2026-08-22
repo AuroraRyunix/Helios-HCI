@@ -380,6 +380,108 @@ LWT_OPS = {
             "holder_token": {"type": "text", "required": True},
         },
     },
+
+    # ---- The extent-based DFS (Sidon) --------------------------------------------
+    # Explicit columns, never `INSERT ... JSON ? IF NOT EXISTS`: that form silently
+    # ignores the condition and overwrites the row, which was verified against this
+    # cluster's Scylla and is recorded in daruk_technical.md. A vdisk create that
+    # quietly overwrote an existing vdisk's (owner, epoch) would hand two daemons the
+    # same disk at the same epoch, which is the corruption every other line here exists
+    # to prevent.
+    "/v1/dfs/vdisk-create": {
+        "cql": (
+            "INSERT INTO hydra.dfs_vdisks (vdisk_id, container, size_bytes, class, owner, "
+            "epoch, drain_seq, extent_bytes, egroup_bytes, created_at_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+        ),
+        "binds": ("vdisk_id", "container", "size_bytes", "class", "owner", "epoch",
+                  "drain_seq", "extent_bytes", "egroup_bytes", "created_at_ms"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "container": {"type": "text", "default": "default"},
+            "size_bytes": {"type": "int", "required": True},
+            "class": {"type": "text", "default": "rw"},
+            "owner": {"type": "text", "default": ""},
+            "epoch": {"type": "int", "default": 0},
+            "drain_seq": {"type": "int", "default": 0},
+            "extent_bytes": {"type": "int", "default": 1048576},
+            "egroup_bytes": {"type": "int", "default": 4194304},
+            "created_at_ms": {"type": "int", "required": True},
+        },
+    },
+    # Ownership transfer. Conditional on *both* halves of the pair: owner alone would
+    # let a node that legitimately owned the disk two epochs ago re-take it after a
+    # round trip it never noticed losing. The refused response names the actual owner
+    # and epoch, which is what the loser needs in order to stop.
+    "/v1/dfs/claim": {
+        "cql": (
+            "UPDATE hydra.dfs_vdisks SET owner = ?, epoch = ? WHERE vdisk_id = ? "
+            "IF owner = ? AND epoch = ?"
+        ),
+        "binds": ("owner", "epoch", "vdisk_id", "expected_owner", "expected_epoch"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "owner": {"type": "text", "required": True},
+            "epoch": {"type": "int", "required": True},
+            "expected_owner": {"type": "text", "required": True, "nullable": True},
+            "expected_epoch": {"type": "int", "required": True, "nullable": True},
+        },
+    },
+    # The exactly-once drain. One lightweight transaction per batch -- thousands of
+    # guest writes amortise one Paxos round -- conditioned on the epoch as well as the
+    # counter, so a deposed owner whose batch is already durable on disk cannot commit
+    # it into a map that has moved on. Its egroup bytes become orphans and Purah sweeps
+    # them; the journal records stay undrained and the new owner drains them itself.
+    "/v1/dfs/drain-commit": {
+        "cql": (
+            "UPDATE hydra.dfs_vdisks SET drain_seq = ? WHERE vdisk_id = ? "
+            "IF drain_seq = ? AND epoch = ?"
+        ),
+        "binds": ("drain_seq", "vdisk_id", "expected_drain_seq", "expected_epoch"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "drain_seq": {"type": "int", "required": True},
+            "expected_drain_seq": {"type": "int", "required": True},
+            "expected_epoch": {"type": "int", "required": True},
+        },
+    },
+    "/v1/dfs/egroup-create": {
+        "cql": (
+            "INSERT INTO hydra.dfs_egroups (egroup_id, state, node, path, size, "
+            "seal_hash, vdisk_hint, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "IF NOT EXISTS"
+        ),
+        "binds": ("egroup_id", "state", "node", "path", "size", "seal_hash",
+                  "vdisk_hint", "created_at_ms"),
+        "params": {
+            "egroup_id": {"type": "text", "required": True},
+            "state": {"type": "text", "default": "open"},
+            "node": {"type": "text", "required": True},
+            "path": {"type": "text", "required": True},
+            "size": {"type": "int", "default": 0},
+            "seal_hash": {"type": "text", "default": ""},
+            "vdisk_hint": {"type": "text", "default": ""},
+            "created_at_ms": {"type": "int", "required": True},
+        },
+    },
+    # Sealed means immutable, so the transition is one-way and conditional on the state
+    # it is leaving. open -> sealed, open -> dead, sealed -> dead. Nothing re-opens a
+    # sealed group: that is the property that makes repair a checksum comparison and
+    # snapshots a map copy.
+    "/v1/dfs/egroup-state": {
+        "cql": (
+            "UPDATE hydra.dfs_egroups SET state = ?, seal_hash = ?, size = ? "
+            "WHERE egroup_id = ? IF state = ?"
+        ),
+        "binds": ("state", "seal_hash", "size", "egroup_id", "expected_state"),
+        "params": {
+            "egroup_id": {"type": "text", "required": True},
+            "state": {"type": "text", "required": True},
+            "seal_hash": {"type": "text", "default": ""},
+            "size": {"type": "int", "default": 0},
+            "expected_state": {"type": "text", "required": True},
+        },
+    },
 }
 
 _APPLIED_COLUMN = "[applied]"
