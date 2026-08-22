@@ -95,10 +95,12 @@ verify a sealed egroup against its recorded hash with no locking at all.
 Egroups and journal chunks are ordinary files under an XFS filesystem on a thin LV in
 `vg_aether` — the same volume group and thin pool LINSTOR already draws from (verified on
 the reference node: the pool owns the whole VG). Both substrates therefore coexist on the
-same disks with no repartitioning during the migration years, at the cost of one honest
-caveat: **capacity accounting must sum both consumers of the pool**, and the existing
-free-space readers (the DRS gate, the storage page) must learn that before the first
-byte of DFS data lands.
+same disks with no repartitioning. That overlap is a *transition* state, not an
+architecture: the decision is to **remove Linstor and DRBD**, not to run them beside this
+indefinitely. While both exist, capacity accounting must sum both consumers of the pool and
+the existing free-space readers (the DRS gate, the storage page) must know it. Once Aether's
+last volume is gone the pool has one consumer again and that arithmetic disappears rather
+than becoming permanent complexity.
 
 No LVM-per-egroup, no raw block devices, no custom on-disk format below the egroup file:
 the filesystem gives us allocation, naming and fsync semantics that are boring and

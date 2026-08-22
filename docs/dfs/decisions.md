@@ -8,7 +8,10 @@ silently reversed by whoever implements next.
 writing a storage system; MON/MGR/OSD operational weight; a second cluster to operate
 inside the first), stay on LINSTOR with a widened port range (sufficient below ~1k
 volumes; the shape remains device-per-connection). Decided by the owner with the trade
-stated plainly; the port-range widening stays worthwhile as the interim measure.
+stated plainly. **And decided as a replacement, not an addition**: LINSTOR and DRBD are
+removed once their disks are moved, because the cost being escaped is operating a storage
+layer, and operating two is worse than operating either. The port-range widening survives
+only as an interim measure for whatever runs before the cutover.
 
 **D-2 — Rust for everything on the byte path.** Alternatives: C (the safety burden is
 the whole objection), Go (GC pauses tolerable, but the io_uring/cgo story and the

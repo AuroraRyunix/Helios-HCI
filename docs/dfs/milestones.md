@@ -104,7 +104,7 @@ the test that guards that map will refuse anything else.
   failover, delete — on DFS storage through the normal UI, with Ganon's CI tier green
   throughout.
 
-## 8. Migration from DRBD
+## 8. Removal of DRBD
 
 Per-disk, reversible until the final cutover: create the DFS vdisk, mirror from the DRBD
 device (qemu drive-mirror for live VMs; direct copy for stopped ones), verify by full
@@ -114,8 +114,12 @@ moment, not before.
 
 - **Gate:** round-trip a real VM DRBD→DFS→boot→verify, and the reverse path documented
   and tested — a migration that cannot retreat is a hostage situation.
-- LINSTOR remains for whatever chooses it, indefinitely; the Gluster precedent says the
-  long tail is long.
+- **The milestone does not close while a DRBD resource remains.** Reversibility is a
+  property of each disk's cutover, not an invitation to keep two substrates forever: a
+  storage layer nobody has removed is a storage layer somebody still has to debug, and the
+  GlusterFS long tail is the argument for finishing, not for tolerating another one.
+  Linstor packages, the controller, the satellite and `linstor-db` all come off the nodes
+  here; `provision.py` stops installing `drbd9x-utils` and `kmod-drbd9x`.
 
 The switch already has a name and a config key. `cluster.json` carries `"dfs_engine": "linstor"` on every cluster this provisioner has ever built, and `get_dfs_engine()` is defined in `cluster_new.py`, `mipha.py`, `spark.py` and `vali.py` — four copies, each hardcoded to `return "linstor"`, each called by nothing. It is the vestige of the GlusterFS transition, left behind when that migration finished. This milestone is what it was for: consolidate the four copies into one reader of the existing key, then let it return something else. Worth knowing before someone deletes it as dead code — it is dead, but it is dead in exactly the shape this needs.
 
