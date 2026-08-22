@@ -41,10 +41,68 @@ def get_tasks():
             except Exception:
                 pass
     try:
-        tasks.sort(key=lambda x: x.get("created_at", 0), reverse=True)
+        tasks.sort(key=lambda x: task_epoch(x.get("created_at")), reverse=True)
     except Exception:
         pass
     return tasks
+
+# `created_at` is a CQL `timestamp`, and Daruk serialises it as an ISO-8601 string --
+# "2026-08-21 20:58:49.309Z". This code assumed epoch milliseconds and divided it, so
+# `catcli list` raised
+#
+#   TypeError: unsupported operand type(s) for /: 'str' and 'float'
+#
+# on any row that existed. It was only ever exercised against an empty task table.
+#
+# Both forms are accepted rather than one being declared correct: `log_catalyst_task`
+# writes epoch milliseconds from Python in some paths and lets CQL render a timestamp in
+# others, so a client that handles only one of them is a client that works until it
+# meets the other. valcli's `parse_db_timestamp` reached the same conclusion separately.
+_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+)
+
+
+def task_epoch(value):
+    """Seconds since the epoch, from whatever the row carried. 0 when unreadable.
+
+    0 rather than "now": these values are sorted on, and an unparseable timestamp that
+    reports as the current moment sorts to the top and claims to be the newest task.
+    """
+    import datetime
+
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        # Milliseconds if it is far too large to be seconds. 5e9 seconds is the year
+        # 2128; 5e9 milliseconds is 1970.
+        return value / 1000.0 if value > 5_000_000_000 else float(value)
+    if isinstance(value, str):
+        text = value.strip().rstrip("Z")
+        if text.isdigit():
+            return task_epoch(int(text))
+        for fmt in _TIME_FORMATS:
+            try:
+                return datetime.datetime.strptime(text, fmt).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def task_time_str(value):
+    """The column as printed. Unreadable stays visible rather than becoming `now`."""
+    import datetime
+
+    seconds = task_epoch(value)
+    if not seconds:
+        return "unknown" if value in (None, "") else str(value)[:19]
+    return datetime.datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def cmd_list(args):
     tasks = get_tasks()
@@ -60,11 +118,7 @@ def cmd_list(args):
         act = t.get("action", "")
         status = t.get("status", "")
         progress = f"{t.get('progress', 0)}%"
-        created = t.get("created_at", 0)
-        
-        import datetime
-        dt = datetime.datetime.fromtimestamp(created / 1000.0) if created else datetime.datetime.now()
-        created_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+        created_str = task_time_str(t.get("created_at"))
         
         print(f"{tid:<38} | {svc:<10} | {act:<12} | {status:<10} | {progress:<8} | {created_str}")
 

@@ -607,6 +607,24 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   gained neither, so `podman build` failed with "no such file or directory" on every
   rollout — and the script printed that, continued, restarted spectrum onto the image
   already running, and reported success. A build failure is now fatal.
+* ~~`spark status` reported the storage daemon DOWN on a healthy node.~~ **Fixed
+  (2026-08-22).** It probed TCP 3366 for Sidon -- the LINSTOR *satellite* port, belonging
+  to the thing Sidon replaced. Nothing has listened there since, so the check could only
+  ever fail. Sidon has no client-facing TCP port at all, so the probe is now its control
+  socket, and it sends a ping rather than only connecting: a socket file outlives the
+  process that made it.
+* ~~Eleven native services reported no PID, and could read as FLAPPING.~~ **Fixed
+  (2026-08-22).** spark-daemon called `spark-daemon`, `bifrost`, `dagur`, `mimir`, `vali`,
+  `catalyst`, `hylia`, `gatoway`, `logos`, `mipha` and `agahnim` "containerized" and asked
+  `podman top systemd-<name>` about each, which fails -- they are native systemd units.
+  Empty PIDs are not only cosmetic: a unit with no PID and NRestarts at or above the flap
+  threshold is reported FLAPPING, so a healthy service that had restarted a few times read
+  as crash-looping. The split is now derived from one list of the four real containers.
+* ~~`catcli list` crashed on every row that existed.~~ **Fixed (2026-08-22).**
+  `created_at` is a CQL `timestamp` and Daruk serialises it as an ISO-8601 string; the
+  code divided it by 1000 assuming epoch milliseconds and raised `TypeError`. It had only
+  ever been exercised against an empty task table. Both forms are accepted now, because
+  `log_catalyst_task` genuinely writes both depending on the path.
 * ~~No VM could be started at all.~~ **Fixed (2026-08-22).** spark-daemon's service
   inventory still listed `aether` after the unit was removed, so every node reported
   `Aether: DOWN` forever -- and `vali.select_best_start_host()` skips any host where

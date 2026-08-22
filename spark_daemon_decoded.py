@@ -406,6 +406,11 @@ ZK_DRIFT_CHECK_INTERVAL = 30     # seconds between drift re-assertions
 ZK_SESSION_TIMEOUT_MS = 15000
 FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as FLAPPING
 
+# The only services that run as Podman containers. Everything else is a native systemd
+# unit whose PID comes from `systemctl show -p MainPID`; asking `podman top` about one of
+# those fails and yields no PID at all.
+CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
+
 # Services this node manages when converging toward the desired cluster state, in start
 # order. Stop order is the reverse. ZooKeeper is deliberately absent: it is the store the
 # desired state lives in, so it is started before convergence begins and stopped last.
@@ -727,8 +732,15 @@ def build_node_status():
     if now - globals()['LAST_PIDS_CACHE_TIME'] > 10 or not globals()['SERVICE_PIDS_CACHE']:
         new_cache = {}
         
-        # Native services
-        native_svcs = ["daruk"]
+        # Native services: everything that is not one of the four containers.
+        #
+        # This said `["daruk"]` while the container list below named eleven units that are
+        # native systemd services, so `podman top systemd-vali` and its ten siblings
+        # failed and every one of them reported an empty PID list. That is not only
+        # cosmetic: a unit with no PID and NRestarts at or above the flap threshold is
+        # reported FLAPPING, so a healthy native service that had restarted a few times
+        # read as crash-looping.
+        native_svcs = [s for s in services if s not in CONTAINER_SERVICES]
         cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
         try:
             res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -749,9 +761,7 @@ def build_node_status():
                 new_cache[s_name] = []
                 
         # Containerized services
-        container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
-        if "urbosa" in services:
-            container_svcs.append("urbosa")
+        container_svcs = [s for s in services if s in CONTAINER_SERVICES]
         for s_name in container_svcs:
             pids = []
             if services_active.get(s_name):

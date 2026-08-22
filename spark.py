@@ -9,6 +9,44 @@ def run_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
 
+# The only services that are Podman containers. Everything else is a native systemd
+# unit, so its PID comes from `systemctl show -p MainPID` and `podman top systemd-<name>`
+# would simply fail. Kept as one list because it was written out three times and the
+# copies had already drifted.
+CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
+
+SIDON_CONTROL_SOCKET = "/run/sidon/control.sock"
+
+
+def check_sidon_socket(path=SIDON_CONTROL_SOCKET, timeout=3):
+    """Is Sidon answering?
+
+    Sidon has no client-facing TCP port -- control is this unix socket and replication is
+    9105, which the daemon refuses to bind anywhere but loopback. This used to probe TCP
+    3366, which was the LINSTOR *satellite* port: it belonged to the thing Sidon replaced,
+    nothing has listened on it since, and so the storage daemon read DOWN on every healthy
+    node.
+
+    Connecting is not enough on its own -- a socket file outlives the process that made
+    it -- so this sends a ping and requires an answer.
+    """
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(path)
+        sock.sendall(b'{"op":"ping"}\n')
+        reply = sock.recv(4096)
+        return b'"ok"' in reply or b"'ok'" in reply or b'"node"' in reply
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 def check_tcp_port(port, local_ip=None):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -217,10 +255,10 @@ def show_status_json():
             elif svc == "slate":
                 healthy = check_tcp_port(443, ip_addr)
             elif svc == "sidon":
-                healthy = check_tcp_port(3366, ip_addr)
+                healthy = check_sidon_socket()
  
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
+            if svc not in CONTAINER_SERVICES:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
@@ -335,10 +373,10 @@ def show_status():
             elif svc == "slate":
                 healthy = check_tcp_port(443, ip_addr)
             elif svc == "sidon":
-                healthy = check_tcp_port(3366, ip_addr)
+                healthy = check_sidon_socket()
 
         if is_active and healthy:
-            if svc in ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "logos", "mipha", "daruk", "agahnim"]:
+            if svc not in CONTAINER_SERVICES:
                 _, pid_out, _ = run_local(f"systemctl show -p MainPID --value {svc}")
                 pids = [pid_out.strip()] if (pid_out.strip() and pid_out.strip() != "0") else []
             else:
