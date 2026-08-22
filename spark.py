@@ -120,14 +120,26 @@ def check_urbosa_enabled():
     return False
 
 def get_dfs_engine():
-    return "linstor"
+    """Which storage engine backs VM disks, read from cluster.json.
+
+    Was hardcoded to "linstor" and called by nothing -- a vestige of the GlusterFS
+    transition. spark is a thin CLI, so this reads the file rather than importing the
+    client module: a status listing that cannot run because a helper is missing is worse
+    than one that reports the engine it can see.
+    """
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            value = str(json.load(handle).get("dfs_engine") or "").strip().lower()
+    except Exception:
+        return "linstor"
+    return value if value in ("linstor", "sidon") else "linstor"
 
 def show_status_json():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
-        "aether": "Aether",
+        "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
         "bifrost": "Bifrost",
@@ -204,7 +216,7 @@ def show_status_json():
                 healthy = check_tcp_port(8081, ip_addr)
             elif svc == "slate":
                 healthy = check_tcp_port(443, ip_addr)
-            elif svc == "aether":
+            elif svc == "sidon":
                 healthy = check_tcp_port(3366, ip_addr)
  
         if is_active and healthy:
@@ -231,11 +243,11 @@ def show_status_json():
     print(json.dumps(result))
  
 def show_status():
-    services = ["zookeeper", "hydra-db", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
-        "aether": "Aether",
+        "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
         "bifrost": "Bifrost",
@@ -322,7 +334,7 @@ def show_status():
                 healthy = check_tcp_port(8081, ip_addr)
             elif svc == "slate":
                 healthy = check_tcp_port(443, ip_addr)
-            elif svc == "aether":
+            elif svc == "sidon":
                 healthy = check_tcp_port(3366, ip_addr)
 
         if is_active and healthy:
@@ -342,7 +354,7 @@ def show_status():
             print(f"                    {svc_map[svc]:<16}   {RED}DOWN{RESET}")
 
 def check_any_cluster_service_active():
-    services = ["spectrum", "aether", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "slate"]
+    services = ["spectrum", "sidon", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "slate"]
     for svc in services:
         rc, out, _ = run_local(f"systemctl is-active {svc}")
         if rc == 0 and out.strip() == "active":
@@ -390,7 +402,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "aether", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":

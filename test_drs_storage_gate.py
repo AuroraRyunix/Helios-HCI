@@ -2,17 +2,20 @@
 """Tests for Vali's DRS storage-capacity gate.
 
 The gate refuses a migration when the target cannot hold the VM's disk. It refused
-nothing, on every cluster, for as long as it has existed.
+nothing, on every cluster, for as long as it existed.
 
-Two fallbacks caused it. `get_linstor_free_space()` parsed the *human* storage-pool table
-by scanning cells for one containing "/", which matched `vg_aether/thin_pool_aether` --
-the backing volume group, printed before the capacity columns -- and fell through to a
+Two fallbacks caused it. The free-space reader parsed the *human* storage-pool table by
+scanning cells for one containing "/", which matched `vg_aether/thin_pool_aether` -- the
+backing volume group, printed before the capacity columns -- and fell through to a
 hardcoded 999999 MiB. `get_vm_disk_size()` fell through to 51200. Since the gate only
 refuses when the disk is larger than the free space, a free-space fallback of 999999
 approved every migration.
 
-Both now return `None` for "unknown", and the gate refuses on unknown rather than
-guessing. Measured against the real cluster: the pool has 306951 MiB free, not 999999.
+Both return `None` for "unknown" now, and the gate refuses on unknown rather than
+guessing. That property is what these tests exist to hold, and it survived the storage
+layer being replaced underneath them: the readers ask Sidon instead of a LINSTOR
+controller, and the shape of the answer -- a real number, or None, never a guess -- is
+the same.
 
 Run with:  python -m unittest test_drs_storage_gate
 """
@@ -41,85 +44,58 @@ def load_vali():
 
 vali = load_vali()
 
-# Captured verbatim from `linstor -m --output-version v1 storage-pool list` on a live
-# cluster. The diskless pool really does report INT64_MAX.
-LIVE_POOLS = json.dumps([[
-    {"storage_pool_name": "default-pool", "node_name": "node01",
-     "provider_kind": "LVM_THIN", "free_capacity": 314318732,
-     "total_capacity": 419430400},
-    {"storage_pool_name": "DfltDisklessStorPool", "node_name": "node01",
-     "provider_kind": "DISKLESS", "free_capacity": 9223372036854775807,
-     "total_capacity": 9223372036854775807},
-]])
-
 
 class FreeSpaceTests(unittest.TestCase):
+    """`get_storage_free_space` returns MiB, or None. Never a guess."""
+
     def setUp(self):
-        self._saved = (vali.run_remote_spark, vali.hostname_for_ip)
-        # LINSTOR keys pools by node name; the caller passes an address. cluster.json is
-        # the only place holding both, and there is no cluster.json in a test.
-        vali.hostname_for_ip = lambda ip: {"10.0.0.1": "node01",
-                                           "10.0.0.2": "node02"}.get(ip)
+        self._saved = vali.run_mtls_spark_api
 
     def tearDown(self):
-        vali.run_remote_spark, vali.hostname_for_ip = self._saved
+        vali.run_mtls_spark_api = self._saved
 
-    def _answer(self, rc, stdout):
-        vali.run_remote_spark = lambda ip, cmd: (rc, stdout, "")
+    def _answer(self, rc, body):
+        vali.run_mtls_spark_api = lambda ip, path, payload, method="POST": (rc, body, "")
 
     def test_it_reads_the_real_capacity(self):
-        # 314318732 KiB / 1024 = 306951 MiB. The old parser said 999999.
-        self._answer(0, LIVE_POOLS)
-        self.assertEqual(vali.get_linstor_free_space("10.0.0.1"), 306951)
+        self._answer(0, {"ok": True, "total_bytes": 160982630400,
+                         "available_bytes": 157345660928, "egroup_count": 12})
+        self.assertEqual(vali.get_storage_free_space("10.0.0.1"), 150056)
 
-    def test_the_diskless_pool_is_skipped(self):
-        # INT64_MAX free. Counting it makes a full fabric look empty.
-        self._answer(0, LIVE_POOLS)
-        self.assertLess(vali.get_linstor_free_space("10.0.0.1"), 10 ** 9)
+    def test_a_node_that_does_not_answer_is_unknown(self):
+        self._answer(-1, {})
+        self.assertIsNone(vali.get_storage_free_space("10.0.0.1"))
 
-    def test_an_unreadable_pool_list_is_unknown_not_enormous(self):
-        for rc, out in ((1, ""), (0, ""), (0, "not json"), (0, "[]")):
-            with self.subTest(rc=rc, out=out[:12]):
-                self._answer(rc, out)
-                self.assertIsNone(vali.get_linstor_free_space("10.0.0.1"))
+    def test_an_unparseable_answer_is_unknown_not_enormous(self):
+        # The whole defect in one line: anything other than a number must be None, or the
+        # gate approves migrations onto hosts that cannot hold the disk.
+        for body in ({"ok": True}, {"available_bytes": "lots"}, "not-a-dict", None):
+            with self.subTest(body=body):
+                self._answer(0, body)
+                self.assertIsNone(vali.get_storage_free_space("10.0.0.1"))
 
-    def test_it_reports_the_smallest_backed_pool_on_that_node(self):
-        # A target is only as big as its tightest pool.
-        self._answer(0, json.dumps([[
-            {"storage_pool_name": "a", "node_name": "node01",
-             "provider_kind": "LVM_THIN", "free_capacity": 4194304},
-            {"storage_pool_name": "b", "node_name": "node01",
-             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
-        ]]))
-        self.assertEqual(vali.get_linstor_free_space("10.0.0.1"), 1024)
+    def test_a_full_node_is_zero_free_and_therefore_unknown(self):
+        # Zero available is reported as None rather than 0. Both refuse -- the gate treats
+        # unknown and "no room" identically -- and a node reporting exactly zero is far
+        # more likely to be answering wrongly than to be exactly full.
+        self._answer(0, {"ok": True, "total_bytes": 1024, "available_bytes": 0})
+        self.assertIsNone(vali.get_storage_free_space("10.0.0.1"))
 
-    def test_another_nodes_pools_are_not_counted(self):
-        # `storage-pool list` returns the whole cluster. Taking the minimum across all of
-        # it would refuse a migration to a target with room because some *other* node is
-        # full -- and on a single-node cluster that mistake is invisible.
-        self._answer(0, json.dumps([[
-            {"storage_pool_name": "default-pool", "node_name": "node01",
-             "provider_kind": "LVM_THIN", "free_capacity": 314318732},
-            {"storage_pool_name": "default-pool", "node_name": "node02",
-             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
-        ]]))
-        self.assertEqual(vali.get_linstor_free_space("10.0.0.1"), 306951)
-        self.assertEqual(vali.get_linstor_free_space("10.0.0.2"), 1024)
+    def test_it_asks_the_node_being_measured(self):
+        # The reader this replaced had to filter a cluster-wide listing down to the target
+        # node, because `storage-pool list` returns every node's pools. Getting that wrong
+        # measured the wrong host's free space. Asking the host directly cannot.
+        seen = {}
 
-    def test_a_node_linstor_did_not_report_on_is_unknown(self):
-        # Not "no space" and not "plenty": no rows for a node means LINSTOR did not
-        # answer for it, which is the case that must refuse rather than guess.
-        self._answer(0, json.dumps([[
-            {"storage_pool_name": "default-pool", "node_name": "node02",
-             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
-        ]]))
-        self.assertIsNone(vali.get_linstor_free_space("10.0.0.1"))
+        def capture(ip, path, payload, method="POST"):
+            seen["ip"] = ip
+            seen["op"] = payload.get("op")
+            return 0, {"ok": True, "total_bytes": 100, "available_bytes": 100}, ""
 
-    def test_an_unmappable_address_is_unknown(self):
-        # If the target is not in cluster.json there is no node name to filter on, so
-        # there is no honest answer.
-        self._answer(0, LIVE_POOLS)
-        self.assertIsNone(vali.get_linstor_free_space("10.9.9.9"))
+        vali.run_mtls_spark_api = capture
+        vali.get_storage_free_space("10.0.0.2")
+        self.assertEqual(seen["ip"], "10.0.0.2")
+        self.assertEqual(seen["op"], "capacity")
 
     def test_the_old_fallbacks_are_gone(self):
         source = io.open(os.path.join(HERE, "vali.py"), encoding="utf-8").read()
@@ -128,20 +104,45 @@ class FreeSpaceTests(unittest.TestCase):
         self.assertNotIn("return 51200", source,
                          "the disk-size fallback is still here")
 
-    def test_it_asks_for_machine_readable_output(self):
-        # The human table's column order is what the old parser tripped over.
-        source = io.open(os.path.join(HERE, "vali.py"), encoding="utf-8").read()
-        self.assertIn("--output-version v1", source)
+
+class DiskSizeTests(unittest.TestCase):
+    """`get_vm_disk_size` returns MiB from the map, or None."""
+
+    def setUp(self):
+        self._saved = (vali.get_vm_xml_specs, vali.run_cql_query, vali.sidon_module)
+        vali.get_vm_xml_specs = lambda name: {"disks_list": "20G"}
+        vali.sidon_module = lambda: type("M", (), {
+            "vdisk_id_for": staticmethod(lambda vm, idx: "%s-disk%d" % (vm, idx))})()
+
+    def tearDown(self):
+        vali.get_vm_xml_specs, vali.run_cql_query, vali.sidon_module = self._saved
+
+    def test_it_reads_the_size_from_the_map(self):
+        vali.run_cql_query = lambda cql, *a, **k: (
+            0, json.dumps({"size_bytes": 21474836480}), "")
+        self.assertEqual(vali.get_vm_disk_size("web-01"), 20480)
+
+    def test_a_vdisk_with_no_row_is_unknown(self):
+        vali.run_cql_query = lambda cql, *a, **k: (0, "", "")
+        self.assertIsNone(vali.get_vm_disk_size("web-01"))
+
+    def test_an_unreadable_map_is_unknown(self):
+        vali.run_cql_query = lambda cql, *a, **k: (1, "", "connection refused")
+        self.assertIsNone(vali.get_vm_disk_size("web-01"))
+
+    def test_a_vm_with_no_disks_is_unknown(self):
+        vali.get_vm_xml_specs = lambda name: {"disks_list": ""}
+        vali.run_cql_query = lambda cql, *a, **k: (0, "", "")
+        self.assertIsNone(vali.get_vm_disk_size("web-01"))
 
 
 class GateTests(unittest.TestCase):
-    """Unknown must refuse, not approve."""
+    """Unknown must refuse, not approve.
 
-    def setUp(self):
-        self.saved = (vali.get_vm_disk_size, vali.get_linstor_free_space)
-
-    def tearDown(self):
-        vali.get_vm_disk_size, vali.get_linstor_free_space = self.saved
+    Asserted against the source rather than by running a migration: the gate is a few
+    lines inside a long function that talks to libvirt, Hydra and three daemons, and the
+    property worth guarding -- the guards precede the comparison -- is structural.
+    """
 
     def _gate_source(self):
         source = io.open(os.path.join(HERE, "vali.py"), encoding="utf-8").read()

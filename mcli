@@ -40,30 +40,24 @@ CHECK_ID_TO_FUNC = {
     "zookeeper_status": "database.zookeeper",
     "hydra-db_status": "database.scylladb",
     "daruk_status": "database.daruk",
-    "aether_status": "storage.aether",
+    "sidon_status": "storage.sidon",
     "spectrum_status": "service.spectrum",
     "spark-daemon_status": "service.spark",
     "libvirtd_status": "service.libvirtd",
     "libvirt_responsiveness": "service.libvirtd.responsiveness",
     "scylladb_ring_status": "database.ring",
-    "aether_peers": "storage.peers",
-    "aether_volume": "storage.volume",
-    "aether_storage_pools": "storage.pools",
     "storage_capacity": "storage.capacity",
     "cpu_load": "hardware.cpu",
     "ram_usage": "hardware.ram",
     "disk_space": "hardware.disk",
     "zookeeper_consensus": "database.zookeeper.consensus",
     "scylladb_replication": "database.scylladb.replication",
-    "aether_split_brain": "storage.aether.split_brain",
-    "aether_heal_pending": "storage.aether.heal_pending",
     "mtls_cert_expiration": "security.mtls.certs",
     "ingress_cert_expiration": "security.ingress.certs",
     "certs_seeding_check": "security.certs.seeding",
     "spectrum_api_port": "service.spectrum.port",
     "ntp_sync": "hardware.ntp",
     "hostname_resolution": "service.network.hostname_resolution",
-    "aether_storage_pools_space": "storage.pools.space",
     "storage_mount_options": "storage.volume.mount_options",
     "storage_volume_writable": "storage.volume.writable",
     "spectrum_privilege_check": "service.spectrum.privileges",
@@ -99,11 +93,11 @@ CHECK_ID_TO_FUNC = {
     "mtls_cert_expiry_warning": "security.mtls.expiry_warning",
     "flapping_service_check": "service.systemd.flapping",
     "stale_node_registration": "database.zookeeper.node_registration",
-    "drbd_split_brain_check": "storage.drbd.split_brain",
+    "replica_health": "storage.replica.health",
     "watchdog_daemon_status": "service.spark.watchdog",
     "drs_storage_capacity_check": "service.vali.drs_storage_gate",
     "migration_lock_status": "service.vali.migration_locks",
-    "linstor_latency_check": "storage.linstor.latency"
+    "sidon_latency_check": "storage.sidon.latency"
 }
 
 def get_local_ip():
@@ -186,7 +180,7 @@ def run_node_checks(node, category, local_ip, results_dict):
         # Setup specific list of checks depending on the category being run
         checks_map = {
             "services": [
-                "zookeeper_status", "hydra-db_status", "daruk_status", "aether_status", "spectrum_status",
+                "zookeeper_status", "hydra-db_status", "daruk_status", "sidon_status", "spectrum_status",
                 "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "vali_status",
                 "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "hylia_status", "scylladb_ring_status",
                 "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
@@ -200,11 +194,9 @@ def run_node_checks(node, category, local_ip, results_dict):
                 "drs_storage_capacity_check", "migration_lock_status"
             ],
             "storage": [
-                "aether_peers", "aether_volume", "aether_split_brain",
-                "aether_heal_pending", "aether_storage_pools", "aether_storage_pools_space",
-                "storage_capacity", "storage_mount_options", "storage_volume_writable",
-                "fstab_safety_check", "orphaned_disks_check", "broken_disks_check",
-                "drbd_split_brain_check", "linstor_latency_check"
+                "replica_health", "storage_capacity", "storage_mount_options",
+                "storage_volume_writable", "fstab_safety_check", "orphaned_disks_check",
+                "broken_disks_check", "sidon_latency_check"
             ],
             "hardware": [
                 "cpu_load", "ram_usage", "disk_space", "ntp_sync", "host_virtualization", "firmware_upgrades",
@@ -549,14 +541,9 @@ def show_list():
         ("service.libvirtd.responsiveness", "libvirt_responsiveness", "Verify virtualization hypervisor responds to queries"),
         ("service.network.hostname_resolution", "hostname_resolution", "Verify cluster node hostnames resolve locally"),
         ("database.ring", "scylladb_ring_status", "Verify ScyllaDB Node Clustered topology"),
-        ("storage.peers", "aether_peers", "Verify peer connections inside storage container"),
-        ("storage.volume", "aether_volume", "Check Aether volume state"),
-        ("storage.aether.split_brain", "aether_split_brain", "Check for split-brain files"),
-        ("storage.aether.heal_pending", "aether_heal_pending", "Check count of pending healing files"),
-        ("storage.pools", "aether_storage_pools", "Verify physical storage pools are online on host OS"),
-        ("storage.pools.space", "aether_storage_pools_space", "Check physical storage pool capacity constraints"),
-        ("storage.capacity", "storage_capacity", "Verify space constraints on Aether volume mount"),
-        ("storage.volume.mount_options", "storage_mount_options", "Verify Aether volume is mounted read-write (rw)"),
+        ("storage.replica.health", "replica_health", "Verify every served vdisk can reach its full replica set"),
+        ("storage.capacity", "storage_capacity", "Verify space constraints on the extent store"),
+        ("storage.volume.mount_options", "storage_mount_options", "Verify the extent store is mounted read-write"),
         ("storage_volume_writable", "storage_volume_writable", "Verify storage volume write-read loop functions"),
         ("security.mtls.certs", "mtls_cert_expiration", "Verify Spark mTLS client cert validity & expiration"),
         ("security.ingress.certs", "ingress_cert_expiration", "Verify Ingress TLS/HTTPS server cert validity & expiration"),
@@ -568,10 +555,9 @@ def show_list():
         ("hardware.ntp", "ntp_sync", "Verify chronyd synchronization status and clock offset limit"),
         ("service.spectrum.privileges", "spectrum_privilege_check", "Verify Spectrum container is unprivileged with no host libvirt socket mount"),
         ("storage.fstab.safety", "fstab_safety_check", "Verify /etc/fstab storage mounts use UUIDs and contain safe timeout flags"),
-        ("storage.broken_disks", "broken_disks_check", "Verify Linstor replicas and check for stale temporary uploads in local cache"),
+        ("storage.broken_disks", "broken_disks_check", "Verify vdisks hold their full replica set and check for stale temporary uploads"),
         ("security.auth.seeding", "auth_seeding_check", "Verify ScyllaDB authentication users table is seeded"),
         ("hardware.dns_ntp.sync", "dns_ntp_sync_check", "Verify DNS and NTP configurations are synchronized with cluster database"),
-        ("storage.drbd.split_brain", "drbd_split_brain_check", "Detect DRBD resources that are StandAlone or whose replication has diverged"),
         ("database.scylladb.replication_repair", "replication_factor_vs_repair", "Compare hydra keyspace RF against node count and check replicas were populated by a repair"),
         ("database.scylladb.quorum_safety", "scylladb_quorum_safety", "Verify live ScyllaDB nodes can still form a quorum at the configured RF"),
         ("security.mtls.expiry_warning", "mtls_cert_expiry_warning", "Warn 30 days and fail 7 days before any Spark/mTLS certificate expires"),
@@ -581,7 +567,7 @@ def show_list():
         ("service.spark.watchdog", "watchdog_daemon_status", "Verify spark-daemon's service watchdog thread is running and restarting failed units"),
         ("service.vali.drs_storage_gate", "drs_storage_capacity_check", "Verify the DRS/migration storage capacity gate reads real free space and the pool has headroom"),
         ("service.vali.migration_locks", "migration_lock_status", "Audit VM migration locks against the migrations that are actually running"),
-        ("storage.linstor.latency", "linstor_latency_check", "Measure LINSTOR controller query latency and detect a blocking controller"),
+        ("storage.sidon.latency", "sidon_latency_check", "Measure the storage control socket's response time and detect a blocking daemon"),
     ]
     
     for func, check_id, desc in checks:

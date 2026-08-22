@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """Saga -- backup and restore of the metadata a Helios cluster cannot rebuild.
 
-The DRBD volumes under a VM are replicated and survive a host loss. What does not
-survive is the record of *which* volume is which: `hydra.vms` says a guest exists, how
-much memory it has, which host it runs on, which network it is on, and
-`hydra.vm_nvram` holds its UEFI variables. Lose the keyspace and the cluster still has
-every byte of guest data and no way to say what any of it is.
+The extent groups under a VM are replicated and survive a host loss. What does not
+survive is the record of *which* extent is which: `hydra.dfs_block_map` says where every
+1 MiB of a vdisk lives, `hydra.dfs_vdisks` says who owns it and at what epoch, `hydra.vms`
+says a guest exists and how much memory it has, and `hydra.vm_nvram` holds its UEFI
+variables. Lose the keyspace and the cluster still has every byte of guest data and no way
+to say what any of it is -- an extent group without the map is four megabytes of
+unlabelled bytes.
 
 So this tool backs up the things that are authoritative and cannot be derived:
 
   * the `hydra` keyspace -- via `nodetool snapshot`, the standard Cassandra/Scylla
     mechanism, which hardlinks a consistent per-node set of SSTables;
-  * the LINSTOR controller database -- via `linstor controller backupdb`, which is the
-    only thing that knows a DRBD resource's port, minor, node-id and placement;
   * `/etc/hci` -- `cluster.json` above all, because it names the nodes and holds the
     redundancy factor and the VIP, and because you need it before you can reach Hydra
     at all;
@@ -56,13 +56,11 @@ import urllib.request
 
 DEFAULT_KEYSPACE = "hydra"
 SCYLLA_CONTAINER = "systemd-hydra-db"
-LINSTOR_CONTAINER = "systemd-linstor-controller"
 NODETOOL_WRAPPER = "/usr/local/bin/nodetool"
 
 CLUSTER_JSON = "/etc/hci/cluster.json"
 ETC_HCI = "/etc/hci"
 CERTS_STAGING = "/var/lib/hci/certs_staging"
-LINSTOR_DIR = "/var/lib/linstor"
 
 # Settings live in hydra.cluster_settings beside dns_servers / urbosa_enabled, so the
 # scheduled job needs no new table and no schema migration.
@@ -730,12 +728,11 @@ class Saga:
     """Everything that touches the live cluster, behind one injectable Shell."""
 
     def __init__(self, shell=None, address=None, container=SCYLLA_CONTAINER,
-                 linstor_container=LINSTOR_CONTAINER, etc_hci=ETC_HCI,
+                 etc_hci=ETC_HCI,
                  certs_staging=CERTS_STAGING, cluster_json=CLUSTER_JSON):
         self.shell = shell or Shell()
         self.address = address or local_ip()
         self.container = container
-        self.linstor_container = linstor_container
         # Host paths as constructor arguments rather than module constants read at
         # call time: the backup driver is the part worth testing, and it is only
         # testable if it can be pointed at a directory that is not /etc/hci.
@@ -862,13 +859,6 @@ class Saga:
             "WHERE keyspace_name = '%s';" % keyspace)
         return rows[0].get("replication") if rows else None
 
-    def linstor_controller_here(self):
-        rc, out, _err = self.shell.run(
-            ["podman", "ps", "--format", "{{.Names}}"], timeout=60)
-        if rc != 0:
-            return False
-        return self.linstor_container in out.split()
-
     # -- snapshots ------------------------------------------------------------------
     def take_snapshot(self, keyspace, tag):
         rc, out, err = self.nodetool(["snapshot", "-t", tag, keyspace])
@@ -920,36 +910,6 @@ class Saga:
                 "nothing was found to archive -- refusing to write an empty backup."
                 % (tag, base))
         return members, sorted(tables)
-
-    # -- linstor --------------------------------------------------------------------
-    def backup_linstor_db(self, name, scratch):
-        """A consistent copy of the LINSTOR controller database.
-
-        `linstor controller backupdb` writes into the controller's own
-        /var/lib/linstor -- which on this cluster is the `linstor-db` DRBD volume, i.e.
-        the very volume being protected. So it is moved off immediately and the
-        original removed; leaving them there would grow the HA volume by a copy of
-        itself on every run.
-        """
-        rc, out, err = self.shell.run(
-            ["podman", "exec", self.linstor_container,
-             "linstor", "controller", "backupdb", name], timeout=300)
-        if rc != 0:
-            return None, (err or out).strip()[:300]
-        produced = os.path.join(LINSTOR_DIR, "%s.zip" % name)
-        if not os.path.exists(produced):
-            return None, "linstor reported success but %s is not there" % produced
-        landed = os.path.join(scratch, "linstordb.zip")
-        try:
-            shutil.copy2(produced, landed)
-        except OSError as exc:
-            return None, "could not copy %s: %s" % (produced, exc)
-        finally:
-            try:
-                os.remove(produced)
-            except OSError:
-                pass
-        return landed, None
 
     # -- fan-out --------------------------------------------------------------------
     def run_on_peer(self, ip, command, timeout=1800):
@@ -1050,19 +1010,6 @@ class Saga:
                 notes.extend(ca_notes)
                 ca_captured = bool(ca_members)
 
-            linstor_note = None
-            if self.linstor_controller_here():
-                path, error = self.backup_linstor_db("saga-%s" % round_tag, scratch)
-                if path:
-                    members.append(("linstor/linstordb.zip", path))
-                else:
-                    linstor_note = error
-                    notes.append("LINSTOR controller database NOT captured: %s" % error)
-            else:
-                linstor_note = "the LINSTOR controller does not run on this node"
-                notes.append("LINSTOR controller database not captured here: %s"
-                             % linstor_note)
-
             for name, text in (
                     ("meta/schema.cql", schema_cql),
                     ("meta/schema_migrations.json",
@@ -1088,8 +1035,6 @@ class Saga:
                 "cluster_json": cluster_cfg,
                 "schema_migrations": migrations,
                 "contains_ca": ca_captured,
-                "contains_linstor_db": linstor_note is None,
-                "linstor_note": linstor_note,
                 "target_on_data_filesystem": target_facts["same_filesystem"],
                 "notes": notes,
                 "covers_guest_data": False,
@@ -1407,8 +1352,6 @@ def cmd_list(args):
         flags = []
         if manifest.get("contains_ca"):
             flags.append("CA")
-        if manifest.get("contains_linstor_db"):
-            flags.append("LINSTOR")
         if manifest.get("target_on_data_filesystem"):
             flags.append("LOCAL")
         if entry["partial"]:
@@ -1419,9 +1362,8 @@ def cmd_list(args):
                      ",".join(flags) or "-"])
         tag = manifest.get("round_tag")
         if tag:
-            bucket = rounds.setdefault(tag, {"nodes": set(), "linstor": False})
+            bucket = rounds.setdefault(tag, {"nodes": set()})
             bucket["nodes"].add(entry["node"])
-            bucket["linstor"] = bucket["linstor"] or bool(manifest.get("contains_linstor_db"))
 
     print_table(["When (UTC)", "Cluster", "Node", "Size", "State", "Flags"], rows)
 
@@ -1435,9 +1377,7 @@ def cmd_list(args):
         for tag in sorted(rounds, reverse=True)[:10]:
             bucket = rounds[tag]
             complete = "" if not expected else " of %d" % expected
-            print("  %s  %d%s node(s)%s"
-                  % (tag, len(bucket["nodes"]), complete,
-                     "" if bucket["linstor"] else "  [no LINSTOR controller DB]"))
+            print("  %s  %d%s node(s)" % (tag, len(bucket["nodes"]), complete))
     return 0
 
 
@@ -1463,9 +1403,6 @@ def cmd_verify(args):
               % (manifest.get("created_at"), manifest.get("node"),
                  manifest.get("keyspace"), len(manifest.get("tables") or [])))
         print("  migrations: %s" % ", ".join(sorted(manifest.get("schema_migrations") or {})))
-        if not manifest.get("contains_linstor_db"):
-            print("  LINSTOR controller DB: not in this artefact (%s)"
-                  % manifest.get("linstor_note"))
     if problems:
         print("FAILED:")
         for problem in problems:
@@ -1484,8 +1421,8 @@ def cmd_restore(args):
         os.makedirs(args.extract_only, exist_ok=True)
         extract_archive(path, args.extract_only)
         print("Extracted %s to %s" % (os.path.basename(path), args.extract_only))
-        print("Nothing was written to the cluster. cluster.json, the CA and the "
-              "LINSTOR database are restored by hand -- see docs/backup_restore.md.")
+        print("Nothing was written to the cluster. cluster.json and the CA are "
+              "restored by hand -- see docs/backup_restore.md.")
         return 0
 
     if not args.yes:
@@ -1567,7 +1504,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="saga",
         description="Backup and restore of Helios cluster metadata. Guest data inside "
-                    "DRBD volumes is NOT covered -- see docs/backup_restore.md.")
+                    "vdisks is NOT covered -- see docs/backup_restore.md.")
     sub = parser.add_subparsers(dest="command")
 
     def add_target(p):

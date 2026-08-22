@@ -6,13 +6,13 @@ Four checks, each of which answers a question no other check here answers:
   * `watchdog_daemon_status` -- spark-daemon keeps answering its API whether or not the
     thread that restarts failed services is alive, so `systemctl is-active spark-daemon`
     is green on a host where nothing self-heals.
-  * `linstor_latency_check` -- every other storage check asks the controller a question
+  * `sidon_latency_check` -- every other storage check asks the daemon a question
     and believes the answer. This one times the question.
   * `drs_storage_capacity_check` -- vali's storage gate returns a hard-coded 999999 MiB
     when it cannot parse the pool listing, which is larger than any VM disk, so an
     unparseable listing does not make the gate refuse: it makes the gate approve.
   * `migration_lock_status` -- a migration lock left held refuses every later migration
-    and delete of that VM; a migration running *without* the lock leaves DRBD
+    and delete of that VM; a migration running *without* the lock leaves storage
     dual-primary open with nothing preventing a second one.
 
 Each check is tested three ways, because these are the three ways a health check goes
@@ -71,13 +71,6 @@ def healthy_watchdog_facts(**overrides):
     return facts
 
 
-def healthy_linstor_facts(**overrides):
-    facts = {"controller_ip": "10.0.0.1", "overhead": 0.08, "rc": 0, "elapsed": 0.3,
-             "timed_out": False, "error": "", "offline_nodes": [], "node_count": 3}
-    facts.update(overrides)
-    return facts
-
-
 def healthy_gate_facts(**overrides):
     facts = {
         "local_ip": "10.0.0.1", "node_name": "node-a",
@@ -100,6 +93,11 @@ def healthy_lock_facts(**overrides):
     }
     facts.update(overrides)
     return facts
+
+
+def runner_source():
+    """mcli-runner's text, for the checks asserted structurally rather than by call."""
+    return io.open(os.path.join(HERE, "mcli-runner"), encoding="utf-8").read()
 
 
 class WatchdogTests(unittest.TestCase):
@@ -214,7 +212,7 @@ class WatchdogTests(unittest.TestCase):
         # In maintenance spark-daemon supervises only consensus and storage; reporting
         # the compute services as unrestarted there would fire on every window.
         self.assertEqual(runner.WATCHDOG_MAINTENANCE_SERVICES,
-                         ["zookeeper", "hydra-db", "aether"])
+                         ["zookeeper", "hydra-db", "sidon"])
         for name in ("spectrum", "vali", "catalyst"):
             self.assertNotIn(name, runner.WATCHDOG_MAINTENANCE_SERVICES)
 
@@ -222,196 +220,103 @@ class WatchdogTests(unittest.TestCase):
         # This check is about the watchdog's own behaviour, so a unit the loop does not
         # touch must not appear: reporting zookeeper here would blame the watchdog for
         # something it was never asked to restart.
-        for name in ("zookeeper", "libvirtd", "linstor-controller", "slate", "hylia"):
+        for name in ("zookeeper", "libvirtd", "slate", "hylia"):
             self.assertNotIn(name, runner.WATCHDOG_SERVICES)
         for name in ("hydra-db", "spectrum", "vali", "catalyst", "mipha"):
             self.assertIn(name, runner.WATCHDOG_SERVICES)
 
 
-class LinstorLatencyTests(unittest.TestCase):
-    def test_a_fast_controller_passes(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts())
-        self.assertEqual(status, "PASS", message)
-        self.assertIn("0.30s", message)
+class SidonLatencyTests(unittest.TestCase):
+    """Every other storage check believes the answer; this one times the question.
 
-    def test_a_slow_controller_warns(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            elapsed=runner.LINSTOR_LATENCY_WARN + 1.0))
-        self.assertEqual(status, "WARN", message)
+    Rewritten from a check that timed `linstor node list` against a controller. There is
+    no controller now, and the equivalent -- the local daemon's control socket -- is what
+    every operation on this node goes through, so a slow one stalls attach, detach, drain
+    and migration alike.
+    """
 
-    def test_a_blocking_controller_fails(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            elapsed=runner.LINSTOR_LATENCY_FAIL + 1.0))
-        self.assertEqual(status, "FAIL", message)
-        self.assertIn("linstor-controller", message)
+    def test_the_thresholds_are_ordered_and_bounded(self):
+        self.assertLess(runner.SIDON_LATENCY_WARN, runner.SIDON_LATENCY_FAIL)
+        # The timeout has to exceed the fail threshold, or a call that should be reported
+        # as "slow" is reported as "did not answer", which reads as a dead daemon.
+        self.assertGreater(runner.SIDON_LATENCY_TIMEOUT, runner.SIDON_LATENCY_FAIL)
 
-    def test_a_timeout_fails_rather_than_hanging_the_run(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            rc=-1, timed_out=True, elapsed=60.0))
-        self.assertEqual(status, "FAIL", message)
-        self.assertIn("did not answer", message)
+    def test_the_check_pings_rather_than_doing_work(self):
+        # A ping costs the daemon nothing, so what is measured is the daemon's ability to
+        # answer at all -- not how long some particular operation happens to take.
+        source = runner_source()
+        block = source[source.index('update_current_check(category, "sidon_latency_check")'):]
+        block = block[:block.index('results["sidon_latency_check"]')]
+        self.assertIn("ping", block)
+        self.assertIn("control.sock", block)
+        self.assertIn("SIDON_LATENCY_TIMEOUT", block)
 
-    def test_an_unreachable_controller_fails(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            rc=1, error="Unable to connect to linstor://10.0.0.1"))
-        self.assertEqual(status, "FAIL", message)
-        self.assertIn("10.0.0.1", message)
-
-    def test_an_offline_satellite_warns_even_when_fast(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            offline_nodes=["node-b (OFFLINE)"]))
-        self.assertEqual(status, "WARN", message)
-        self.assertIn("node-b", message)
-
-    def test_an_untimed_query_warns_rather_than_passes(self):
-        status, message = runner.classify_linstor_latency(healthy_linstor_facts(
-            elapsed=None))
-        self.assertEqual(status, "WARN", message)
-
-    def test_offline_satellites_are_parsed_from_the_table(self):
-        table = "\n".join([
-            "+------------------------------------------+",
-            "| Node   | NodeType  | Addresses        | State   |",
-            "|==========================================|",
-            "| node-a | SATELLITE | 10.0.0.1 (PLAIN) | Online  |",
-            "| node-b | SATELLITE | 10.0.0.2 (PLAIN) | OFFLINE |",
-            "+------------------------------------------+",
-        ])
-        captured = {}
-
-        def fake_run_cmd_timed(cmd, timeout):
-            captured["last"] = cmd
-            if "node list" in cmd:
-                return 0, table, "", 0.4, False
-            return 0, "", "", 0.05, False
-
-        original = runner.run_cmd_timed
-        runner.run_cmd_timed = fake_run_cmd_timed
-        try:
-            facts = runner.collect_linstor_latency_facts("10.0.0.1")
-        finally:
-            runner.run_cmd_timed = original
-        self.assertEqual(facts["node_count"], 2)
-        self.assertEqual(facts["offline_nodes"], ["node-b (OFFLINE)"])
+    def test_a_timeout_is_a_failure_not_a_hang(self):
+        # The whole reason this check exists is that a blocked storage control plane
+        # stalls everything queued behind it. Waiting forever to find that out would make
+        # the diagnostic run the next thing stalled.
+        source = runner_source()
+        block = source[source.index('update_current_check(category, "sidon_latency_check")'):]
+        block = block[:block.index('results["sidon_latency_check"]')]
+        self.assertIn('status = "FAIL"', block)
 
 
 class DrsStorageGateTests(unittest.TestCase):
     """The gate's failure mode is approval, not refusal, so silence is not safety."""
 
+    @staticmethod
+    def facts(gate_value=150056, available=157345660928, total=160982630400, **over):
+        base = {"local_ip": "10.0.0.1", "gate_value": gate_value, "gate_error": "",
+                "capacity": {"ok": True, "total_bytes": total,
+                             "available_bytes": available, "egroup_count": 12},
+                "capacity_error": ""}
+        base.update(over)
+        return base
+
     def test_a_working_gate_with_headroom_passes(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts())
+        status, message = runner.classify_drs_storage_gate(self.facts())
         self.assertEqual(status, "PASS", message)
-        self.assertIn("default-pool", message)
 
     def test_the_fail_open_sentinel_is_caught(self):
-        # Reproduced against the live cluster: the pool has 299 GiB free and vali's gate
-        # reports 999999 MiB, which is larger than any VM disk, so it refuses nothing.
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=runner.VALI_FREE_SPACE_FALLBACK_MIB))
+        # The original defect: the gate reported 999999 MiB whenever it could not parse a
+        # listing, which is larger than any VM disk, so it refused nothing.
+        status, message = runner.classify_drs_storage_gate(self.facts(gate_value=999999))
         self.assertEqual(status, "FAIL", message)
-        self.assertIn("failing open", message)
         self.assertIn("999999", message)
 
     def test_any_over_reading_gate_fails_not_just_the_known_sentinel(self):
         # Hard-coding 999999 would go quiet the moment the fallback value changed.
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=4000000))
+        status, message = runner.classify_drs_storage_gate(self.facts(gate_value=4000000))
         self.assertEqual(status, "FAIL", message)
-        self.assertIn("failing open", message)
 
-    def test_a_gate_reading_less_than_the_pool_only_warns(self):
-        # Refusing migrations the host could accept is a nuisance, not a data risk.
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=1024))
+    def test_a_gate_that_cannot_read_free_space_warns_rather_than_passes(self):
+        # None is the correct answer to "I cannot tell", and vali refuses migrations on
+        # it -- safe. But a gate that can never answer is a gate nobody is checking.
+        status, message = runner.classify_drs_storage_gate(self.facts(gate_value=None))
+        self.assertEqual(status, "WARN", message)
+        self.assertIn("None", message)
+
+    def test_an_unreadable_extent_store_warns_rather_than_passes(self):
+        status, message = runner.classify_drs_storage_gate(
+            self.facts(capacity=None, capacity_error="sidon did not answer"))
+        self.assertEqual(status, "WARN", message)
+        self.assertIn("not the same as it having room", message)
+
+    def test_a_gate_that_could_not_be_exercised_warns(self):
+        status, message = runner.classify_drs_storage_gate(
+            self.facts(gate_error="vali is not deployed on this node"))
+        self.assertEqual(status, "WARN", message)
+
+    def test_a_gate_disagreeing_with_the_filesystem_warns(self):
+        # Either it refuses migrations that would fit, or it approves ones that will not.
+        status, message = runner.classify_drs_storage_gate(self.facts(gate_value=10))
         self.assertEqual(status, "WARN", message)
 
     def test_small_drift_is_not_a_disagreement(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=299760 - 100))
-        self.assertEqual(status, "PASS", message)
-
-    def test_an_unreadable_pool_listing_warns_rather_than_passes(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            linstor_error="Unable to connect to linstor://10.0.0.1"))
-        self.assertEqual(status, "WARN", message)
-        self.assertNotEqual(status, "PASS")
-
-    def test_a_missing_vali_warns_rather_than_passes(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=None, gate_error="vali is not deployed on this node"))
-        self.assertEqual(status, "WARN", message)
-
-    def test_pools_without_capacity_numbers_warn(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            pools=[{"name": "default-pool", "node": "node-a", "kind": "LVM_THIN",
-                    "free_kib": None, "total_kib": None}]))
-        self.assertEqual(status, "WARN", message)
-
-    def test_no_pool_at_all_warns(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(pools=[]))
-        self.assertEqual(status, "WARN", message)
-
-    def test_a_nearly_full_thin_pool_fails(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=3072, pools=[{"name": "default-pool", "node": "node-a",
-                                     "kind": "LVM_THIN", "free_kib": 3145728,
-                                     "total_kib": 314413056}]))
-        self.assertEqual(status, "FAIL", message)
-        self.assertIn("freezes", message)
-
-    def test_a_tight_thin_pool_warns(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            gate_value=30720, pools=[{"name": "default-pool", "node": "node-a",
-                                      "kind": "LVM_THIN", "free_kib": 31457280,
-                                      "total_kib": 314413056}]))
-        self.assertEqual(status, "WARN", message)
-
-    def test_over_commitment_warns(self):
-        status, message = runner.classify_drs_storage_gate(healthy_gate_facts(
-            provisioned_kib=629145600))
-        self.assertEqual(status, "WARN", message)
-        self.assertIn("over-committed", message)
-
-    def test_diskless_pools_are_not_counted_as_headroom(self):
-        # A diskless pool reports 2^63-1 free and stores nothing; counting it would show
-        # unlimited headroom on a node whose backing pool is full.
-        rows = [
-            {"storage_pool_name": "DfltDisklessStorPool", "node_name": "node-a",
-             "provider_kind": "DISKLESS", "free_capacity": 9223372036854775807,
-             "total_capacity": 9223372036854775807},
-            {"storage_pool_name": "default-pool", "node_name": "node-a",
-             "provider_kind": "LVM_THIN", "free_capacity": 100,
-             "total_capacity": 314413056},
-            {"storage_pool_name": "default-pool", "node_name": "node-b",
-             "provider_kind": "LVM_THIN", "free_capacity": 314318732,
-             "total_capacity": 314413056},
-        ]
-        original_json = runner._linstor_json
-        original_vali = runner.load_vali_module
-        original_name = runner.linstor_node_name
-        runner._linstor_json = lambda ip, sub: (
-            (rows, "") if "storage-pool" in sub else ([], ""))
-        runner.load_vali_module = lambda: None
-        runner.linstor_node_name = lambda ip: "node-a"
-        try:
-            facts = runner.collect_drs_storage_facts("10.0.0.1", "10.0.0.1")
-        finally:
-            runner._linstor_json = original_json
-            runner.load_vali_module = original_vali
-            runner.linstor_node_name = original_name
-        self.assertEqual([p["name"] for p in facts["pools"]], ["default-pool"])
-        # node-b's pool must not be counted as this host's headroom either.
-        self.assertEqual(facts["pools"][0]["free_kib"], 100)
-
-    def test_an_unknown_node_name_warns_rather_than_guessing(self):
-        original = runner.linstor_node_name
-        runner.linstor_node_name = lambda ip: None
-        try:
-            facts = runner.collect_drs_storage_facts("10.0.0.1", "10.0.0.1")
-        finally:
-            runner.linstor_node_name = original
-        status, message = runner.classify_drs_storage_gate(facts)
-        self.assertEqual(status, "WARN", message)
+        # Free space moves between the two reads. A check that fired on every byte of
+        # drift would fire constantly and be ignored.
+        status, _message = runner.classify_drs_storage_gate(self.facts(gate_value=150000))
+        self.assertEqual(status, "PASS")
 
 
 class MigrationLockTests(unittest.TestCase):
@@ -443,7 +348,7 @@ class MigrationLockTests(unittest.TestCase):
         self.assertNotEqual(status, "FAIL", message)
 
     def test_a_migration_running_without_the_lock_fails(self):
-        # The dangerous one: DRBD dual-primary is open and nothing would refuse a second
+        # The dangerous one: the disk can be claimed and nothing would refuse a second
         # migration of the same disk.
         status, message = runner.classify_migration_locks(healthy_lock_facts(
             migrating_domains=[{"name": "web01", "job_type": "Unbounded",
@@ -627,24 +532,16 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(error, "")
 
     def test_a_gate_that_does_not_answer_warns_rather_than_passes(self):
-        original = runner.load_vali_module
-        original_name = runner.linstor_node_name
-        original_json = runner._linstor_json
-        runner.load_vali_module = lambda: type(
-            "stub", (), {"get_linstor_free_space": staticmethod(lambda ip: None)})
-        runner.linstor_node_name = lambda ip: "node-a"
-        runner._linstor_json = lambda ip, sub: (
-            ([{"storage_pool_name": "default-pool", "node_name": "node-a",
-               "provider_kind": "LVM_THIN", "free_capacity": 314318732,
-               "total_capacity": 314413056}], "") if "storage-pool" in sub else ([], ""))
-        try:
-            facts = runner.collect_drs_storage_facts("10.0.0.1", "10.0.0.1")
-        finally:
-            runner.load_vali_module = original
-            runner.linstor_node_name = original_name
-            runner._linstor_json = original_json
-        self.assertIsNone(facts["gate_value"])
-        self.assertIn("not a number", facts["gate_error"])
+        """vali present but its reader returning None must not read as healthy.
+
+        The gate refuses on None, which is safe -- but a gate that can never answer is a
+        gate nobody is checking, and a PASS here would be the check going quiet about
+        exactly the condition it exists to catch.
+        """
+        facts = {"local_ip": "10.0.0.1", "gate_value": None, "gate_error": "",
+                 "capacity": {"ok": True, "total_bytes": 1 << 40,
+                              "available_bytes": 1 << 39, "egroup_count": 4},
+                 "capacity_error": ""}
         status, message = runner.classify_drs_storage_gate(facts)
         self.assertEqual(status, "WARN", message)
 
@@ -691,7 +588,7 @@ class WiringTests(unittest.TestCase):
         self.assertIsNotNone(mapping)
         self.map = dict(re.findall(r'"([a-z0-9_.-]+)"\s*:\s*"([^"]+)"', mapping.group(1)))
         self.new_checks = ["watchdog_daemon_status", "drs_storage_capacity_check",
-                           "migration_lock_status", "linstor_latency_check"]
+                           "migration_lock_status", "sidon_latency_check"]
 
     def test_each_new_check_has_a_dotted_category(self):
         # A check missing from the map falls back to the invoked category, which puts it

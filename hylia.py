@@ -458,94 +458,54 @@ def get_hostname_by_ip(node_ip):
     return node_ip
 
 def verify_node_storage_health(job_id, node_ip, hostname):
-    log_upgrade(job_id, f"[{hostname}] Verifying DRBD volume synchronization status...")
-    
-    # Get status of other nodes in the cluster
-    normal_hosts = set()
-    rc_n, stdout_n, _ = run_cql_query("SELECT JSON ip, hostname, status FROM hydra.nodes;")
-    if rc_n == 0 and stdout_n:
-        for line in stdout_n.splitlines():
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    nd = json.loads(line)
-                    if nd.get("status") == "NORMAL" and nd.get("hostname") != hostname:
-                        normal_hosts.add(nd.get("hostname"))
-                except Exception:
-                    pass
+    """Is this node's storage healthy enough to leave maintenance? Returns True/False.
 
-    single_node = len(normal_hosts) == 0
-    if single_node:
-        log_upgrade(job_id, f"[{hostname}] Single-node cluster detected. Skipping DRBD peer checks (no replication peers expected).")
+    Rewritten from a DRBD resync wait. It used to poll `drbdadm status` for up to several
+    minutes, parsing the connection and disk state of every resource and waiting for every
+    peer to reach UpToDate -- because with DRBD an upgraded node came back with stale
+    replicas and had to catch up block by block before it could be trusted with a guest.
 
-    # Poll for up to 5 minutes
-    for attempt in range(60):
-        rc_st, out_st, _ = run_remote_spark(node_ip, "drbdadm status 2>/dev/null || true")
-        if rc_st != 0 or not out_st:
-            if attempt % 5 == 0:
-                log_upgrade(job_id, f"[{hostname}] Warning: failed to query DRBD status, retrying...")
-            time.sleep(5)
-            continue
-            
-        # Parse DRBD status
-        lines = out_st.splitlines()
-        unhealthy = False
-        reasons = []
-        
-        current_resource = "unknown"
-        for line in lines:
-            line_strip = line.strip()
-            if not line_strip:
-                continue
-            
-            if not line.startswith(" ") and "role:" in line_strip:
-                current_resource = line_strip.split()[0]
-            elif line_strip.startswith("disk:"):
-                disk_state = line_strip.split(":", 1)[1].split()[0]
-                # On a single-node cluster, DUnknown is expected (no peer to negotiate with)
-                bad_disk_states = ["Inconsistent", "Outdated", "Negotiating"]
-                if not single_node:
-                    bad_disk_states.append("DUnknown")
-                if disk_state in bad_disk_states:
-                    unhealthy = True
-                    reasons.append(f"{current_resource} local disk state is {disk_state}")
-            elif "connection:" in line_strip:
-                # Only check connection state against known healthy peers
-                parts = line_strip.split()
-                peer_name = parts[0]
-                conn_state = "unknown"
-                for p in parts:
-                    if p.startswith("connection:"):
-                        conn_state = p.split(":", 1)[1]
-                if peer_name in normal_hosts:
-                    if conn_state not in ["Connected", "SyncSource", "SyncTarget", "PausedSyncSource", "PausedSyncTarget"]:
-                        unhealthy = True
-                        reasons.append(f"{current_resource} peer {peer_name} connection is {conn_state}")
-            elif "peer-disk:" in line_strip:
-                parts = line_strip.split()
-                peer_disk = "unknown"
-                for p in parts:
-                    if p.startswith("peer-disk:"):
-                        peer_disk = p.split(":", 1)[1]
-                # Only flag peer disk issues if that peer is a known healthy node
-                if not single_node and peer_disk in ["Inconsistent", "Outdated", "DUnknown"]:
-                    unhealthy = True
-                    reasons.append(f"{current_resource} peer disk state is {peer_disk}")
-                    
-        if not unhealthy:
-            if single_node:
-                log_upgrade(job_id, f"[{hostname}] DRBD local disk is healthy (single-node, no peer replication).")
-            else:
-                log_upgrade(job_id, f"[{hostname}] DRBD volume replication is healthy and fully synchronized.")
-            return True
-            
-        if attempt % 5 == 0:
-            log_upgrade(job_id, f"[{hostname}] Waiting for DRBD volume synchronization: {', '.join(reasons)}")
-            
-        time.sleep(5)
-        
-    log_upgrade(job_id, f"[{hostname}] Warning: DRBD volume synchronization checks timed out or failed.")
-    return False
+    There is no catching up now. Extent groups are immutable, so a returning node's copies
+    are either correct or absent, and Purah restores absent ones in the background off the
+    hot path. What has to be true before leaving maintenance is narrower and checkable at
+    once: the daemon is answering, its extent store is mounted with room in it, and it is
+    not sitting on a vdisk it cannot serve.
+    """
+    rc, body, err = run_mtls_spark_api(node_ip, "/api/v1/dfs/vdisk", {"op": "capacity"})
+    if rc != 0 or not isinstance(body, dict):
+        log_upgrade(job_id, f"[{hostname}] Storage check failed: sidon did not answer "
+                            f"({(err or 'no response')}).")
+        return False
+
+    total = int(body.get("total_bytes") or 0)
+    available = int(body.get("available_bytes") or 0)
+    if total <= 0:
+        log_upgrade(job_id, f"[{hostname}] Storage check failed: the extent store reports "
+                            f"no capacity, which usually means it is not mounted.")
+        return False
+
+    used_pct = 100.0 * (total - available) / total
+    if used_pct >= 95:
+        # Refused rather than warned: a node this full cannot drain, so a guest placed on
+        # it will backpressure and stop as soon as its journal fills.
+        log_upgrade(job_id, f"[{hostname}] Storage check failed: the extent store is "
+                            f"{used_pct:.1f}% full and cannot drain.")
+        return False
+
+    rc_l, listing, _ = run_mtls_spark_api(node_ip, "/api/v1/dfs/vdisk", {"op": "list"})
+    if rc_l == 0 and isinstance(listing, dict):
+        degraded = [v.get("vdisk_id") for v in (listing.get("attached") or [])
+                    if isinstance(v, dict) and v.get("degraded")]
+        if degraded:
+            log_upgrade(job_id, f"[{hostname}] Storage check failed: "
+                                f"{', '.join(str(d) for d in degraded)} cannot reach every "
+                                f"replica, so writes to them are failing.")
+            return False
+
+    log_upgrade(job_id, f"[{hostname}] Storage healthy: {used_pct:.1f}% used, "
+                        f"{body.get('egroup_count', 0)} extent group(s).")
+    return True
+
 
 # Active set of jobs running on this host thread
 running_jobs = set()
@@ -844,7 +804,7 @@ def hylia_rolling_upgrade(job_id):
                 if not services_stable:
                     raise Exception(f"Node {hostname} services failed to stabilize after reboot.")
                     
-                # Dynamic Wait for DRBD Storage Sync
+                # Storage has to be able to take a guest before maintenance ends
                 if not verify_node_storage_health(job_id, node_ip, hostname):
                     raise Exception(f"Node {hostname} storage volumes failed to synchronize after reboot.")
                 

@@ -24,12 +24,6 @@ def is_zookeeper_leader():
     except Exception:
         return False
 
-def get_drbd_role(resource_name):
-    rc, out, err = run_cmd(f"podman exec systemd-aether drbdadm role {resource_name}")
-    if rc == 0:
-        return out.strip()
-    return "Secondary"
-
 def classify_certificate(cert_path, label, warn_days=30, fail_days=0):
     """Status and message for one certificate's expiry.
 
@@ -167,11 +161,11 @@ WATCHDOG_JOURNAL_WINDOW = 3600
 # journal must not turn a diagnostic into the thing that hangs.
 WATCHDOG_PROBE_TIMEOUT = 30
 # Exactly the units spark-daemon's watchdog restarts. This check is about that loop's
-# behaviour, so a unit it does not supervise (zookeeper, libvirtd, linstor-controller)
+# behaviour, so a unit it does not supervise (zookeeper, libvirtd, sidon)
 # must not appear here -- their absence is somebody else's verdict.
-WATCHDOG_SERVICES = ["hydra-db", "daruk", "aether", "spectrum", "bifrost", "dagur",
+WATCHDOG_SERVICES = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur",
                      "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
-WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "aether"]
+WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "sidon"]
 
 # `cluster_new.py` touches this on every node before a cluster operation and removes it
 # after. spark-daemon's watchdog skips every pass while it exists -- and returns before
@@ -180,17 +174,17 @@ CLUSTER_OP_LOCK = "/run/hci/cluster_operation.lock"
 CLUSTER_OP_LOCK_WARN = 900
 CLUSTER_OP_LOCK_FAIL = 3600
 
-# --- LINSTOR controller latency ---------------------------------------------------------
-# The audit's threshold. A `linstor node list` is a single controller round trip against
+# --- Storage control-plane latency -------------------------------------------------------
+# The audit's threshold, kept: a control-socket ping is one round trip against
 # an in-memory view; seconds mean the controller is blocked, not busy.
-LINSTOR_LATENCY_WARN = 5.0
-LINSTOR_LATENCY_FAIL = 20.0
+SIDON_LATENCY_WARN = 5.0
+SIDON_LATENCY_FAIL = 20.0
 # A check that measures how long a query takes must not itself hang when the answer is
 # "forever": run_cmd has no timeout, so the timed variant is used with this bound.
-LINSTOR_LATENCY_TIMEOUT = 60
+SIDON_LATENCY_TIMEOUT = 60
 
 # --- DRS / migration storage capacity gate ----------------------------------------------
-# vali's get_linstor_free_space() returns this when it cannot parse the storage-pool
+# vali's free-space reader used to return this when it could not parse the storage-pool
 # listing, which is larger than any single VM disk -- so an unparseable listing does not
 # make the gate refuse, it makes the gate wave everything through.
 VALI_FREE_SPACE_FALLBACK_MIB = 999999
@@ -398,7 +392,7 @@ def run_cmd_timed(cmd, timeout):
     """run_cmd with a wall-clock bound. Returns (rc, out, err, elapsed, timed_out).
 
     run_cmd waits forever. A check whose whole subject is how long something takes cannot
-    use it: a blocked LINSTOR controller would stall the entire diagnostic run instead of
+    use it: a blocked storage control plane would stall the entire diagnostic run instead of
     being reported by it.
     """
     started = time.time()
@@ -877,99 +871,20 @@ def classify_watchdog(facts):
 
 
 # ---------------------------------------------------------------------------
-# LINSTOR controller latency.
+# Storage control-plane latency.
 #
-# `linstor node list` is one round trip against the controller's in-memory view. Seconds
+# A control-socket ping is one round trip against the local daemon. Seconds
 # mean the controller is blocked -- an offline satellite it is still waiting on, or its
 # embedded database holding a lock -- and every storage operation queued behind it, VM
 # creation and live migration included, is blocked for the same reason.
 # ---------------------------------------------------------------------------
 
 
-def collect_linstor_latency_facts(controller_ip):
-    facts = {"controller_ip": controller_ip}
-    # Timed separately so the message can tell the operator whether the seconds are the
-    # controller's or just the container round trip; without it every reading on a loaded
-    # host looks like controller latency.
-    rc_o, _, _, overhead, overhead_timeout = run_cmd_timed(
-        "podman exec systemd-aether true", LINSTOR_LATENCY_TIMEOUT)
-    facts["overhead"] = None if (rc_o != 0 or overhead_timeout) else overhead
-
-    rc, out, err, elapsed, timed_out = run_cmd_timed(
-        "podman exec -e LS_CONTROLLERS=%s systemd-aether linstor --no-color node list"
-        % controller_ip, LINSTOR_LATENCY_TIMEOUT)
-    facts["rc"] = rc
-    facts["elapsed"] = elapsed
-    facts["timed_out"] = timed_out
-    facts["error"] = (err or out or "").strip()[:300]
-    facts["offline_nodes"] = []
-    facts["node_count"] = 0
-    if rc == 0:
-        for line in out.splitlines():
-            cells = [c.strip() for c in line.split("|") if c.strip()]
-            if len(cells) < 4 or cells[0] in ("Node",):
-                continue
-            facts["node_count"] += 1
-            if cells[-1].upper() != "ONLINE":
-                facts["offline_nodes"].append("%s (%s)" % (cells[0], cells[-1]))
-    return facts
-
-
-def classify_linstor_latency(facts):
-    controller = facts.get("controller_ip", "unknown")
-    elapsed = facts.get("elapsed")
-    hint = ("Check 'systemctl status linstor-controller' and, for each satellite, "
-            "'podman exec systemd-aether linstor node list' -- a satellite the "
-            "controller cannot reach is the usual cause.")
-
-    if facts.get("timed_out"):
-        return "FAIL", (
-            "The LINSTOR controller did not answer 'linstor node list' within %.0fs "
-            "(controllers tried: %s). Every storage operation is blocked behind it: VM "
-            "creation, disk attach and live migration will all hang. %s"
-            % (LINSTOR_LATENCY_TIMEOUT, controller, hint))
-    if facts.get("rc") != 0:
-        return "FAIL", (
-            "The LINSTOR controller could not be queried (controllers tried: %s): %s\n"
-            "Storage operations cannot be scheduled while this is true. %s"
-            % (controller, facts.get("error") or "no output", hint))
-
-    detail = "'linstor node list' answered in %.2fs across %d node(s)" % (
-        elapsed or 0.0, facts.get("node_count", 0))
-    if facts.get("overhead") is not None:
-        detail += " (of which %.2fs is the 'podman exec' round trip into systemd-aether)" \
-                  % facts["overhead"]
-    offline = facts.get("offline_nodes") or []
-    if offline:
-        detail += "; satellites not ONLINE: " + ", ".join(offline)
-
-    if elapsed is None:
-        return "WARN", ("The LINSTOR query completed but was not timed, so controller "
-                        "latency could not be evaluated.")
-    if elapsed >= LINSTOR_LATENCY_FAIL:
-        return "FAIL", (
-            "The LINSTOR controller is blocking: %s, far beyond the %.0fs at which a "
-            "query is treated as a hang. Storage operations queued behind it will time "
-            "out. %s" % (detail, LINSTOR_LATENCY_FAIL, hint))
-    if elapsed >= LINSTOR_LATENCY_WARN:
-        return "WARN", (
-            "The LINSTOR controller is slow: %s, over the %.0fs threshold. This is what "
-            "a controller waiting on an unreachable satellite or holding a database lock "
-            "looks like before it stops answering entirely. %s"
-            % (detail, LINSTOR_LATENCY_WARN, hint))
-    if offline:
-        return "WARN", (
-            "The LINSTOR controller is responsive (%s), but a satellite is not ONLINE, "
-            "which is what turns into controller latency next. The storage.peers check "
-            "owns the verdict on satellite state." % detail)
-    return "PASS", "The LINSTOR controller is responsive: %s." % detail
-
-
 # ---------------------------------------------------------------------------
 # DRS / migration storage capacity gate.
 #
 # vali refuses a migration whose target cannot hold the guest's disk, by comparing the
-# disk size against get_linstor_free_space(target). That function parses the human
+# disk size against get_storage_free_space(target). The version this replaced parsed the human
 # storage-pool table and returns a fixed 999999 MiB when the parse yields nothing -- a
 # number larger than any single VM disk, so an unparseable listing does not make the gate
 # refuse, it makes the gate wave everything through.
@@ -981,46 +896,20 @@ def classify_linstor_latency(facts):
 # ---------------------------------------------------------------------------
 
 
-def linstor_node_name(local_ip):
-    """This host's LINSTOR node name, or None.
+def collect_drs_storage_facts(local_ip, _controller_ip=None):
+    """What the storage capacity gate sees on this node.
 
-    LINSTOR registers satellites under their hostname, and every `linstor ... list` is
-    answered by the controller for the whole cluster. Without this name the pools and
-    volumes of every other node would be counted as local headroom.
+    The gate itself lives in vali. This exercises it and reports what it returned, which
+    is the point of the check: the defect it was written for was the gate returning a
+    hard-coded 999999 MiB whenever it could not parse a listing -- larger than any single
+    VM disk, so it approved every migration instead of refusing.
+
+    It used to read storage pools to sanity-check the gate's answer, and had to
+    resolve this host's node name first, because that listing returned every
+    node's pools rather than the one asked about. Sidon answers per node by construction.
     """
-    for host in get_cluster_hosts():
-        if host.get("ip") == local_ip and host.get("hostname"):
-            return host["hostname"]
-    try:
-        import socket as _socket
-        return _socket.gethostname()
-    except Exception:
-        return None
-
-
-def _linstor_json(controller_ip, subcommand):
-    """Rows of a machine-readable `linstor` listing, or (None, error)."""
-    rc, out, err, _, timed_out = run_cmd_timed(
-        "podman exec -e LS_CONTROLLERS=%s systemd-aether linstor -m --output-version v1 "
-        "%s" % (controller_ip, subcommand), LINSTOR_LATENCY_TIMEOUT)
-    if timed_out or rc != 0:
-        return None, (err or out or "linstor %s exited %s" % (subcommand, rc)).strip()[:300]
-    try:
-        payload = json.loads(out)
-    except Exception as exc:
-        return None, "linstor %s did not return JSON: %s" % (subcommand, exc)
-    if isinstance(payload, list) and payload and isinstance(payload[0], list):
-        payload = payload[0]
-    if not isinstance(payload, list):
-        return None, "linstor %s returned %s, not a list of rows" % (
-            subcommand, type(payload).__name__)
-    return [row for row in payload if isinstance(row, dict)], ""
-
-
-def collect_drs_storage_facts(local_ip, controller_ip):
-    facts = {"local_ip": local_ip, "node_name": linstor_node_name(local_ip),
-             "gate_value": None, "gate_error": "", "pools": [], "linstor_error": "",
-             "provisioned_kib": None}
+    facts = {"local_ip": local_ip, "gate_value": None, "gate_error": "",
+             "capacity": None, "capacity_error": ""}
 
     vali = load_vali_module()
     if vali is None:
@@ -1028,185 +917,80 @@ def collect_drs_storage_facts(local_ip, controller_ip):
                                "(/usr/local/bin/vali), so its storage capacity gate "
                                "could not be exercised")
     else:
-        # The gate reaches the storage pool through spark-daemon's mTLS API with vali's
-        # own 120-second timeout. mcli allows a remote node 90 seconds for the whole
-        # runner, so an unbounded call here would lose every check on that node.
         value, error = call_with_timeout(
-            vali.get_linstor_free_space, GATE_CALL_TIMEOUT, local_ip)
+            vali.get_storage_free_space, GATE_CALL_TIMEOUT, local_ip)
         if error:
-            facts["gate_error"] = "vali.get_linstor_free_space() %s" % error
+            facts["gate_error"] = "vali.get_storage_free_space() %s" % error
+        elif isinstance(value, int):
+            facts["gate_value"] = int(value)
+        elif value is not None:
+            facts["gate_error"] = ("vali.get_storage_free_space() returned %r, which is "
+                                   "neither an integer nor None" % (value,))
+
+    rc, out, err = run_cmd(
+        "printf '{\"op\":\"capacity\"}\\n' | nc -U /run/sidon/control.sock", 30)
+    if rc != 0 or not out.strip():
+        facts["capacity_error"] = (err or "sidon did not answer").strip()[:300]
+    else:
+        try:
+            body = json.loads(out.strip().splitlines()[0])
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and body.get("ok"):
+            facts["capacity"] = body
         else:
-            try:
-                facts["gate_value"] = int(value)
-            except (TypeError, ValueError):
-                facts["gate_error"] = ("vali.get_linstor_free_space() returned %r, which "
-                                       "is not a number of MiB" % (value,))
-
-    if facts["node_name"] is None:
-        facts["linstor_error"] = ("this host's LINSTOR node name could not be "
-                                  "determined, so its own storage pools could not be "
-                                  "told apart from its peers'")
-        return facts
-
-    rows, error = _linstor_json(controller_ip, "storage-pool list")
-    if rows is None:
-        facts["linstor_error"] = error
-        return facts
-
-    pool_names = set()
-    for pool in rows:
-        if pool.get("node_name") != facts["node_name"]:
-            continue
-        if str(pool.get("provider_kind", "")).upper() == "DISKLESS":
-            # A diskless pool reports 2^63-1 free and stores nothing. Counting it would
-            # report unlimited headroom on a node whose backing pool is full.
-            continue
-        pool_names.add(pool.get("storage_pool_name"))
-        facts["pools"].append({
-            "name": pool.get("storage_pool_name", "unknown"),
-            "node": pool.get("node_name", "unknown"),
-            "kind": pool.get("provider_kind", "unknown"),
-            "free_kib": pool.get("free_capacity"),
-            "total_kib": pool.get("total_capacity"),
-        })
-
-    rows_v, _error_v = _linstor_json(controller_ip, "volume list")
-    if rows_v is not None:
-        provisioned = 0
-        seen = False
-        for resource in rows_v:
-            if resource.get("node_name") != facts["node_name"]:
-                continue
-            for volume in resource.get("volumes") or []:
-                if volume.get("storage_pool_name") not in pool_names:
-                    continue
-                # The STORAGE layer is what the pool has to provide; the DRBD layer above
-                # it reports slightly less, being what the guest sees.
-                sizes = [layer.get("data", {}).get("usable_size_kib")
-                         for layer in volume.get("layer_data_list") or []
-                         if str(layer.get("type", "")).upper() == "STORAGE"]
-                sizes = [s for s in sizes if s]
-                if not sizes:
-                    sizes = [layer.get("data", {}).get("usable_size_kib")
-                             for layer in volume.get("layer_data_list") or []]
-                    sizes = [s for s in sizes if s]
-                if sizes:
-                    provisioned += int(max(sizes))
-                    seen = True
-        facts["provisioned_kib"] = provisioned if seen else None
+            facts["capacity_error"] = "sidon answered with something unparseable: %.200s" % out
     return facts
 
 
 def classify_drs_storage_gate(facts):
-    fails, warns, notes = [], [], []
-    pools = facts.get("pools") or []
     gate = facts.get("gate_value")
+    capacity = facts.get("capacity")
 
-    if facts.get("linstor_error"):
+    if facts.get("capacity_error"):
         return "WARN", (
             "The DRS and migration storage capacity gate could not be evaluated: this "
-            "node's LINSTOR storage pools could not be read (%s). Whether a migration "
-            "target has room for a guest's disk is therefore unknown -- which is not the "
-            "same as it having room." % facts["linstor_error"])
-    if not pools:
-        return "WARN", (
-            "No backing LINSTOR storage pool was found on this node, so the storage "
-            "capacity gate has nothing to measure against. If this host is meant to "
-            "store replicas, 'podman exec systemd-aether linstor storage-pool list' "
-            "will show what it actually has.")
+            "node's extent store could not be read (%s). Whether a migration target has "
+            "room for a guest's disk is therefore unknown -- which is not the same as it "
+            "having room." % facts["capacity_error"])
 
-    usable = [p for p in pools
-              if isinstance(p.get("free_kib"), int) and isinstance(p.get("total_kib"), int)
-              and p["total_kib"] > 0]
-    if not usable:
+    if facts.get("gate_error"):
         return "WARN", (
-            "LINSTOR reported %d storage pool(s) on this node but none of them carried a "
-            "readable capacity, so the storage capacity gate cannot be checked against "
-            "them: %s" % (len(pools), ", ".join(p["name"] for p in pools)))
+            "The storage capacity gate could not be exercised: %s. A gate that cannot be "
+            "tested is a gate nobody knows the state of." % facts["gate_error"])
 
-    smallest = min(usable, key=lambda p: p["free_kib"])
-    real_free_mib = smallest["free_kib"] / 1024.0
-    for pool in usable:
-        notes.append("pool '%s' on %s (%s): %.1f GiB free of %.1f GiB"
-                     % (pool["name"], pool["node"], pool["kind"],
-                        pool["free_kib"] / 1048576.0, pool["total_kib"] / 1048576.0))
+    available_mib = int(capacity.get("available_bytes") or 0) // (1024 * 1024)
+    total_mib = int(capacity.get("total_bytes") or 0) // (1024 * 1024)
 
     if gate is None:
-        warns.append(
-            "%s, so it is not known what free space a migration to this host would be "
-            "checked against." % (facts.get("gate_error") or
-                                  "vali's storage capacity gate could not be called"))
-    else:
-        drift = abs(gate - real_free_mib)
-        disagrees = (drift > GATE_DISAGREEMENT_MIB
-                     and drift > real_free_mib * GATE_DISAGREEMENT_PCT / 100.0)
-        if disagrees and gate > real_free_mib:
-            fails.append(
-                "the storage capacity gate is failing open on this node: vali's "
-                "get_linstor_free_space() reports %d MiB free while pool '%s' actually "
-                "has %.0f MiB. vali refuses a migration only when the guest's disk is "
-                "larger than that number, so with a figure this size it refuses nothing "
-                "-- a VM will migrate onto a host that cannot hold its disk and the "
-                "thin pool fills instead.%s Reproduce with: podman exec -e "
-                "LS_CONTROLLERS=%s systemd-aether linstor storage-pool list"
-                % (gate, smallest["name"], real_free_mib,
-                   (" %d MiB is vali's hard-coded fallback for a storage-pool listing it "
-                    "could not read or parse." % VALI_FREE_SPACE_FALLBACK_MIB
-                    if gate == VALI_FREE_SPACE_FALLBACK_MIB else ""),
-                   facts.get("local_ip", "127.0.0.1")))
-        elif disagrees:
-            warns.append(
-                "the storage capacity gate reads %d MiB free while pool '%s' reports "
-                "%.0f MiB. It is refusing migrations this host could actually accept."
-                % (gate, smallest["name"], real_free_mib))
-        else:
-            notes.append("vali's storage capacity gate reads %d MiB free, matching what "
-                         "pool '%s' reports." % (gate, smallest["name"]))
+        # None is the correct answer to "I cannot tell", and vali refuses on it. Reported
+        # as a warning rather than a failure: refusing a migration is safe, and the
+        # operator still needs to know the gate is blind.
+        return "WARN", (
+            "The storage capacity gate returned None -- it could not determine free space "
+            "on this node, and vali therefore refuses migrations onto it. The extent store "
+            "itself reports %d of %d MiB free, so the gate and the daemon disagree about "
+            "whether the answer is knowable." % (available_mib, total_mib))
 
-    for pool in usable:
-        free_pct = pool["free_kib"] * 100.0 / pool["total_kib"]
-        if free_pct < THIN_POOL_FAIL_FREE_PCT:
-            fails.append(
-                "pool '%s' on %s is %.1f%% free (%.1f GiB of %.1f GiB). A thin pool "
-                "freezes every guest writing to it the moment it fills, and DRS will "
-                "keep placing work here until it does. Extend it or move replicas off "
-                "this node." % (pool["name"], pool["node"], free_pct,
-                                pool["free_kib"] / 1048576.0,
-                                pool["total_kib"] / 1048576.0))
-        elif free_pct < THIN_POOL_WARN_FREE_PCT:
-            warns.append(
-                "pool '%s' on %s is %.1f%% free (%.1f GiB of %.1f GiB), below the %.0f%% "
-                "at which a migration onto this host stops being safe."
-                % (pool["name"], pool["node"], free_pct, pool["free_kib"] / 1048576.0,
-                   pool["total_kib"] / 1048576.0, THIN_POOL_WARN_FREE_PCT))
+    if gate >= 999999:
+        return "FAIL", (
+            "The storage capacity gate returned %d MiB, which is the sentinel the old "
+            "implementation used when it could not parse a listing -- larger than any "
+            "single VM disk, so every migration was approved. The extent store reports "
+            "%d MiB free." % (gate, available_mib))
 
-    provisioned = facts.get("provisioned_kib")
-    total_kib = sum(p["total_kib"] for p in usable)
-    if provisioned is None:
-        notes.append("provisioned volume sizes could not be read, so thin-pool "
-                     "over-commitment was not evaluated.")
-    elif total_kib and provisioned > total_kib:
-        warns.append(
-            "volumes on this node are provisioned for %.1f GiB against %.1f GiB of pool "
-            "(%.0f%% over-committed). Thin provisioning makes that legal, and it is only "
-            "a problem when the guests actually write -- but nothing in the stack refuses "
-            "a migration on this basis, so the pool can be filled by guests that were "
-            "already here." % (provisioned / 1048576.0, total_kib / 1048576.0,
-                               provisioned * 100.0 / total_kib))
-    else:
-        notes.append("volumes on this node are provisioned for %.1f GiB against %.1f GiB "
-                     "of pool." % ((provisioned or 0) / 1048576.0, total_kib / 1048576.0))
+    drift = abs(gate - available_mib)
+    if total_mib and drift > max(1024, available_mib // 10):
+        return "WARN", (
+            "The storage capacity gate reports %d MiB free but the extent store reports "
+            "%d MiB. A gate that disagrees with the filesystem by this much will either "
+            "refuse migrations that would fit or approve ones that will not."
+            % (gate, available_mib))
 
-    if fails:
-        return "FAIL", compose_report(
-            "The DRS and migration storage capacity gate is unsafe on this node",
-            fails, warns, notes)
-    if warns:
-        return "WARN", compose_report(
-            "The DRS and migration storage capacity gate needs attention",
-            fails, warns, notes)
-    return "PASS", ("The DRS and migration storage capacity gate is working and this "
-                    "node has headroom:\n" + "\n".join(notes))
+    return "PASS", (
+        "The storage capacity gate reports %d MiB free, matching the extent store's %d MiB "
+        "of %d MiB total. It returns a real number and refuses when it cannot determine "
+        "one." % (gate, available_mib, total_mib))
 
 
 # ---------------------------------------------------------------------------
@@ -1214,7 +998,7 @@ def classify_drs_storage_gate(facts):
 #
 # hydra.vms.status is the per-VM migration lock, taken by daruk's migrate-lock LWT and
 # released by migrate-commit or migrate-unlock. Live migration is exactly the window in
-# which DRBD dual-primary is open, so two of them on one VM is disk corruption, and the
+# which two hosts may hold one disk open, so two of them on one VM is corruption, and the
 # lock is the only thing preventing it.
 #
 # Two failures are worth reporting and they are not the same:
@@ -1365,7 +1149,7 @@ def classify_migration_locks(facts):
         elif len(tasks) > 1:
             fails.append(
                 "VM '%s' has %d migration tasks in flight at once (%s). Two live "
-                "migrations of one guest hold DRBD dual-primary open on the same disk "
+                "migrations of one guest would both try to claim the same disk "
                 "from both sides. Stop the extra task before it starts."
                 % (name, len(tasks),
                    ", ".join("%s/%s" % (t["task_id"], t["status"]) for t in tasks)))
@@ -1397,7 +1181,7 @@ def classify_migration_locks(facts):
         elif str(row.get("status") or "").lower() != MIGRATION_LOCK_VALUE:
             fails.append(
                 "libvirt is running a migration of '%s' on this host (%s, %s) while the "
-                "Hydra migration lock is NOT held (hydra.vms.status = %r). The DRBD "
+                "Hydra migration lock is NOT held (hydra.vms.status = %r). The storage "
                 "dual-primary window is open on that disk with nothing preventing a "
                 "second migration of it. Whatever started this migration bypassed "
                 "daruk's migrate-lock endpoint."
@@ -1455,7 +1239,7 @@ def check_services(category):
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
     in_maint = os.path.exists("/etc/hci/maintenance.state")
-    svcs = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
+    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
@@ -1477,7 +1261,7 @@ def check_services(category):
 
         if in_maint:
             # In maintenance mode, core consensus/storage should be active. Workloads can be active or inactive, we pass them.
-            if svc in ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon"]:
+            if svc in ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon"]:
                 status = "PASS" if is_active else "FAIL"
             else:
                 status = "PASS"
@@ -2068,7 +1852,7 @@ def check_services(category):
                 running_vms = [v.strip() for v in out_v.strip().splitlines() if v.strip()]
             
             active_services = []
-            services_to_check = ["spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "linstor-controller", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate"]
+            services_to_check = ["gatoway", "urbosa", "logos", "mipha", "agahnim", "slate"]
             for svc in services_to_check:
                 rc_svc, out_svc, _ = run_cmd(f"systemctl is-active {svc}")
                 if rc_svc == 0 and out_svc.strip() == "active":
@@ -2865,7 +2649,7 @@ def check_services(category):
     # NRestarts counts only automatic restarts, which makes the flapping visible.
     update_current_check(category, "flapping_service_check")
     try:
-        managed = ["zookeeper", "hydra-db", "daruk", "aether", "linstor-controller",
+        managed = ["zookeeper", "hydra-db", "daruk", "sidon",
                    "spark-daemon", "spectrum", "slate", "agahnim", "catalyst", "vali",
                    "bifrost", "dagur", "mimir", "logos", "mipha", "gatoway", "hylia",
                    "libvirtd"]
@@ -3079,7 +2863,7 @@ def check_services(category):
     }
 
     # 45. Migration Lock Auditor
-    # Live migration is the window in which DRBD dual-primary is open, and hydra.vms.status
+    # Live migration is the window in which two hosts may hold one disk, and hydra.vms.status
     # is the only thing that stops two of them landing on one disk.
     update_current_check(category, "migration_lock_status")
     try:
@@ -3109,245 +2893,107 @@ def check_storage(category):
     except Exception:
         pass
         
-    # 1. Aether peer status (Aether Nodes)
-    update_current_check(category, "aether_peers")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor node list")
-    if rc == 0:
-        offline = "OFFLINE" in out.upper() or "ERROR" in out.upper()
-        status = "FAIL" if offline else "PASS"
-        msg = out
-    else:
+    # 1. Replica health.
+    #
+    # This replaces four checks that each asked a storage controller something: peer
+    # status, volume state, storage pools, and a split-brain scan. Split-brain is not a
+    # state this storage layer can reach -- a write carries its writer's epoch and every
+    # replica refuses anything older, so two owners cannot both be accepted -- and there
+    # is no controller to ask about pools. What remains worth asking is whether every
+    # vdisk this node serves can still reach every replica it is supposed to.
+    update_current_check(category, "replica_health")
+    rc_l, out_l, err_l = run_cmd(
+        "printf '{\"op\":\"list\"}\\n' | nc -U /run/sidon/control.sock", 30)
+    if rc_l != 0 or not out_l.strip():
         status = "FAIL"
-        msg = f"Failed to query Aether node list: {err or out}"
-    results["aether_peers"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 2. Aether volume status (Aether Resources)
-    update_current_check(category, "aether_volume")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor resource list")
-    if rc == 0:
-        failed = "ERROR" in out.upper() or "FATAL" in out.upper() or "DEVIATING" in out.upper()
-        db_in_use = False
-        for line in out.splitlines():
-            if "linstor-db" in line and "InUse" in line:
-                db_in_use = True
-        if failed:
+        msg = ("Sidon did not answer on its control socket (%s). Nothing on this node can "
+               "attach or serve a vdisk while that is true." % ((err_l or "no output").strip()))
+    else:
+        try:
+            listing = json.loads(out_l.strip().splitlines()[0])
+        except ValueError:
+            listing = None
+        if not isinstance(listing, dict) or not listing.get("ok"):
             status = "FAIL"
-            msg = out
-        elif not db_in_use:
+            msg = "Sidon answered the vdisk listing with something unparseable: %.300s" % out_l
+        else:
+            attached = [v for v in (listing.get("attached") or []) if isinstance(v, dict)]
+            degraded = [v for v in attached if v.get("degraded")]
+            forwarding = [v for v in attached if v.get("role") == "forwarding"]
+            if degraded:
+                status = "FAIL"
+                msg = ("%d vdisk(s) cannot reach every replica, so writes to them are "
+                       "failing:\n- " % len(degraded)) + "\n- ".join(
+                    "%s: %s" % (v.get("vdisk_id"), v.get("degraded")) for v in degraded)
+            else:
+                status = "PASS"
+                msg = ("%d vdisk(s) served on this node, all reaching every replica"
+                       % len(attached))
+                if forwarding:
+                    msg += " (%d forwarded to another owner)" % len(forwarding)
+    results["replica_health"] = {"status": status, "output": msg}
+
+    # 8. The extent store is mounted, and mounted sanely.
+    #
+    # This replaces a check that asked for each container volume's role and expected
+    # it mounted only where the role was Primary -- a per-node, per-resource question that
+    # does not exist any more. There is one filesystem, it is mounted on every node, and
+    # the failure it must catch is unchanged: an extent store that is not mounted means
+    # every write on this node lands on the root filesystem instead, silently, until the
+    # root filesystem fills.
+    update_current_check(category, "storage_mount_options")
+    store = "/var/lib/hci/sidon"
+    rc_m, out_m, err_m = run_cmd("findmnt -o SOURCE,FSTYPE,OPTIONS -n %s" % store)
+    if rc_m != 0:
+        status = "FAIL"
+        msg = ("%s is not a mount point. Sidon will write extent groups onto the root "
+               "filesystem instead, which fills it and takes the host down with it. "
+               "Check that the vg_aether/sidon logical volume exists and that /etc/fstab has "
+               "its entry." % store)
+    else:
+        options = out_m.strip()
+        if " ro," in options or options.endswith(" ro"):
             status = "FAIL"
-            msg = f"CRITICAL: The database volume (linstor-db) is NOT active (InUse) on any node.\n\nLinstor Resource List:\n{out}"
+            msg = "%s is mounted read-only: %s" % (store, options)
         else:
             status = "PASS"
-            msg = out
-    else:
-        status = "FAIL"
-        msg = f"Failed to query Aether resource list: {err or out}"
-    results["aether_volume"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 3. Disk storage pool mount check (Aether Storage Pools)
-    update_current_check(category, "aether_storage_pools")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor storage-pool list")
-    if rc == 0:
-        ok = "default-pool" in out and "Ok" in out
-        status = "PASS" if ok else "FAIL"
-        msg = out
-    else:
-        status = "FAIL"
-        msg = f"Failed to query Aether storage pool: {err or out}"
-    results["aether_storage_pools"] = {
-        "status": status,
-        "output": msg
-    }
+            msg = "%s is mounted: %s" % (store, options)
+    results["storage_mount_options"] = {"status": status, "output": msg}
 
-    # 4. Storage volume capacity check
-    update_current_check(category, "storage_capacity")
-    volumes_cap = [
-        ("default-vm-container", "/var/lib/hci/aether/volumes/default-vm-container"),
-        ("default-image-container", "/var/lib/hci/aether/volumes/default-image-container")
-    ]
-    statuses_cap = []
-    messages_cap = []
-    for name, vol_path in volumes_cap:
-        if os.path.exists(vol_path):
-            try:
-                stat = os.statvfs(vol_path)
-                total = stat.f_blocks * stat.f_frsize
-                free = stat.f_bavail * stat.f_frsize
-                used = total - free
-                pct = (used / total) * 100 if total > 0 else 0
-                
-                vol_status = "PASS"
-                if pct > 90.0:
-                    vol_status = "FAIL"
-                elif pct > 80.0:
-                    vol_status = "WARN"
-                
-                statuses_cap.append(vol_status)
-                messages_cap.append(f"Volume: {name}\nPath: {vol_path}\nTotal Space: {total // 1024**3} GB\nUsed Space: {used // 1024**3} GB ({pct:.1f}% used)\nFree Space: {free // 1024**3} GB")
-            except Exception as e:
-                statuses_cap.append("FAIL")
-                messages_cap.append(f"{name}: Failed to check storage path statistics: {str(e)}")
-        else:
-            statuses_cap.append("PASS")
-            messages_cap.append(f"{name}: standby / not mounted locally on this host (Aether).")
-                
-    status = "FAIL" if "FAIL" in statuses_cap else ("WARN" if "WARN" in statuses_cap else "PASS")
-    msg = "\n\n".join(messages_cap)
-    results["storage_capacity"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 5. Aether Split Brain Check
-    update_current_check(category, "aether_split_brain")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor resource list")
-    if rc == 0:
-        sb = "SplitBrain" in out or "Inconsistent" in out
-        status = "FAIL" if sb else "PASS"
-        msg = "No Aether split-brain detected." if not sb else f"WARNING: Aether Split-brain detected!\n{out}"
-    else:
-        status = "FAIL"
-        msg = f"Failed to query Aether status: {err or out}"
-    results["aether_split_brain"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 6. Aether Heal Pending Check
-    update_current_check(category, "aether_heal_pending")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor volume list")
-    if rc == 0:
-        syncing = "Syncing" in out or "PausedSync" in out
-        status = "WARN" if syncing else "PASS"
-        msg = "No Aether volume synchronization active (healthy)." if not syncing else f"Aether volume(s) are syncing:\n{out}"
-    else:
-        status = "FAIL"
-        msg = f"Failed to query Aether volume status: {err or out}"
-    results["aether_heal_pending"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 7. Storage Pool Space Utilization Check
-    update_current_check(category, "aether_storage_pools_space")
-    rc, out, err = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor storage-pool list")
-    if rc == 0:
-        status = "PASS"
-        if "Ok" not in out:
-            status = "WARN"
-        msg = f"Aether storage pool status:\n{out}"
-    else:
-        status = "FAIL"
-        msg = f"Failed to check Aether storage pool status: {err or out}"
-    results["aether_storage_pools_space"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 8. Storage Mount Options Check
-    update_current_check(category, "storage_mount_options")
-    volumes = [
-        ("default-vm-container", "/var/lib/hci/aether/volumes/default-vm-container"),
-        ("default-image-container", "/var/lib/hci/aether/volumes/default-image-container")
-    ]
-    
-    statuses = []
-    messages = []
-    
-    for name, vol_path in volumes:
-        role = get_drbd_role(name)
-        should_be_mounted = (role == "Primary")
-            
-        rc_m, out_m, err_m = run_cmd(f"findmnt -o OPTIONS -n {vol_path}")
-        if rc_m != 0:
-            if not should_be_mounted:
-                statuses.append("PASS")
-                messages.append(f"{name}: standby / not mounted locally (Secondary).")
-            else:
-                statuses.append("FAIL")
-                messages.append(f"{name}: CRITICAL: Primary volume is NOT mounted locally!")
-        else:
-            if not should_be_mounted:
-                statuses.append("WARN")
-                messages.append(f"{name}: WARNING: Secondary volume is mounted locally!")
-            else:
-                options = [opt.strip() for opt in out_m.split(",")]
-                if "ro" in options:
-                    statuses.append("FAIL")
-                    messages.append(f"{name}: CRITICAL: mounted READ-ONLY! Active options: {out_m}")
-                else:
-                    statuses.append("PASS")
-                    messages.append(f"{name}: mounted read-write (rw). Options: {out_m}")
-                
-    status = "FAIL" if "FAIL" in statuses else ("WARN" if "WARN" in statuses else "PASS")
-    msg = "\n".join(messages)
-    
-    results["storage_mount_options"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 9. Storage Volume Writable Check
+    # 9. And it can actually be written to.
+    #
+    # A mount can be present and the filesystem underneath still refuse writes -- ENOSPC,
+    # a read-only remount after an I/O error, a full inode table. Mounted is not writable,
+    # and the guest finds out the difference at the worst moment.
     update_current_check(category, "storage_volume_writable")
-    statuses = []
-    messages = []
-    
-    for name, vol_path in volumes:
-        test_file = os.path.join(vol_path, ".mimir_rw_check")
-        role = get_drbd_role(name)
-        should_be_mounted = (role == "Primary")
-            
-        rc_m, _, _ = run_cmd(f"findmnt {vol_path}")
-        if rc_m != 0:
-            if not should_be_mounted:
-                statuses.append("PASS")
-                messages.append(f"{name}: standby / not mounted locally.")
-            else:
-                statuses.append("FAIL")
-                messages.append(f"{name}: CRITICAL: Primary volume is not mounted, cannot write.")
+    test_file = os.path.join(store, ".mimir_rw_check")
+    try:
+        import uuid
+        test_content = "mimir-test-%s" % uuid.uuid4()
+        with open(test_file, "w") as handle:
+            handle.write(test_content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with open(test_file, "r") as handle:
+            read_back = handle.read()
+        if read_back == test_content:
+            status = "PASS"
+            msg = "%s accepted a write and read it back." % store
         else:
+            status = "FAIL"
+            msg = ("%s accepted a write but read back something else. That is a storage "
+                   "layer returning wrong data, not a full disk." % store)
+    except Exception as exc:
+        status = "FAIL"
+        msg = "%s could not be written: %s" % (store, exc)
+    finally:
+        if os.path.exists(test_file):
             try:
-                import uuid
-                test_content = f"mimir-test-{uuid.uuid4()}"
-                with open(test_file, "w") as f:
-                    f.write(test_content)
-                    f.flush()
-                    os.fsync(f.fileno())
-                
-                with open(test_file, "r") as f:
-                    read_back = f.read().strip()
-                    
-                if read_back != test_content:
-                    statuses.append("FAIL")
-                    messages.append(f"{name}: CRITICAL: read back content mismatch!")
-                else:
-                    statuses.append("PASS")
-                    messages.append(f"{name}: Successfully verified read-write operations.")
-                
                 os.remove(test_file)
-            except Exception as e:
-                statuses.append("FAIL")
-                messages.append(f"{name}: Failed to perform write-read check: {str(e)}")
-                if os.path.exists(test_file):
-                    try:
-                        os.remove(test_file)
-                    except Exception:
-                        pass
-                        
-    status = "FAIL" if "FAIL" in statuses else "PASS"
-    msg = "\n".join(messages)
-    
-    results["storage_volume_writable"] = {
-        "status": status,
-        "output": msg
-    }
-    
+            except Exception:
+                pass
+    results["storage_volume_writable"] = {"status": status, "output": msg}
+
     # 10. /etc/fstab safety check
     update_current_check(category, "fstab_safety_check")
     status = "PASS"
@@ -3363,7 +3009,7 @@ def check_storage(category):
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) >= 4 and "/var/lib/hci/aether/bricks/" in parts[1]:
+            if len(parts) >= 4 and "/var/lib/hci/sidon" in parts[1]:
                 brick_entries.append((parts[0], parts[1], parts[3]))
                 
         if brick_entries:
@@ -3400,81 +3046,62 @@ def check_storage(category):
         "output": msg
     }
         
-    # 11. Orphaned Disks check
+    # Extent groups nothing points at.
+    #
+    # This used to glob the container volumes for *.raw files and compare the filenames
+    # against hydra.vms -- a disk was a file named after its VM, so an orphan was a file
+    # whose name no row mentioned. An extent group is not named after anything: it holds
+    # extents from whichever vdisk was draining, and the only statement of what is
+    # referenced is the block map.
+    #
+    # So this reports what Purah's sweep would reclaim rather than trying to work it out
+    # independently. A second implementation of the mark phase would be a second thing to
+    # get wrong, and the consequence of getting it wrong is deleting live data.
     update_current_check(category, "orphaned_disks_check")
     try:
-        import glob
-        local_ip = "127.0.0.1"
-        try:
-            with open("/etc/hci/spectrum/spectrum.env", "r") as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.strip().split("=", 1)
-                        if k == "LOCAL_HYPERVISOR_IP":
-                            local_ip = v.strip()
-        except Exception:
-            pass
-            
-        if local_ip == "127.0.0.1":
+        rc_c, out_c, err_c = run_cmd(
+            "printf '{\"op\":\"capacity\"}\\n' | nc -U /run/sidon/control.sock", 30)
+        capacity = None
+        if rc_c == 0 and out_c.strip():
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
+                body = json.loads(out_c.strip().splitlines()[0])
+                if isinstance(body, dict) and body.get("ok"):
+                    capacity = body
+            except ValueError:
                 pass
-        
-        cql = "SELECT JSON name, disks_list FROM hydra.vms;"
-        rc, out, err = run_cmd(f"podman exec -i systemd-hydra-db cqlsh {local_ip} -e \"{cql}\"")
-        registered_disk_paths = set()
-        if rc == 0:
-            for line in out.splitlines():
-                line = line.strip()
-                if line.startswith("{") and line.endswith("}"):
-                    try:
-                        vm = json.loads(line)
-                        vm_name = vm.get("name")
-                        disks_str = vm.get("disks_list", "")
-                        if vm_name:
-                            if not disks_str or disks_str == "NONE":
-                                primary_path = f"/var/lib/hci/aether/volumes/default-vm-container/{vm_name}.raw"
-                                registered_disk_paths.add(primary_path)
-                            else:
-                                for idx, entry in enumerate(disks_str.split(",")):
-                                    parts = entry.split(":")
-                                    container = parts[1] if len(parts) > 1 else "default-vm-container"
-                                    if idx == 0:
-                                        d_path = f"/var/lib/hci/aether/volumes/{container}/{vm_name}.raw"
-                                    else:
-                                        d_path = f"/var/lib/hci/aether/volumes/{container}/{vm_name}_disk{idx}.raw"
-                                    registered_disk_paths.add(d_path)
-                    except Exception:
-                        pass
-        
-        disk_files = glob.glob("/var/lib/hci/aether/volumes/*/*.raw")
-        orphaned_disks = []
-        for disk_path in disk_files:
-            normalized = disk_path.replace("\\", "/").strip()
-            if "default-image-container" in normalized:
-                continue
-            if normalized not in registered_disk_paths:
-                orphaned_disks.append(disk_path)
-                
-        if orphaned_disks:
-            results["orphaned_disks_check"] = {
-                "status": "WARN",
-                "output": f"Found orphaned virtual disk files without corresponding VMs: {', '.join(orphaned_disks)}.\nThese files should be cleaned up."
-            }
+
+        if capacity is None:
+            status = "WARN"
+            msg = ("Sidon did not answer, so reclaimable space could not be measured (%s)."
+                   % (err_c or "no response").strip()[:200])
         else:
-            results["orphaned_disks_check"] = {
-                "status": "PASS",
-                "output": "No orphaned virtual disk files found. All virtual disks are associated with active virtual machines."
-            }
+            rc_r, out_r, _ = run_cqlsh("SELECT JSON egroup_id FROM hydra.dfs_block_map;")
+            referenced = set()
+            if rc_r == 0:
+                for row in parse_json_rows(out_r):
+                    if row.get("egroup_id"):
+                        referenced.add(row["egroup_id"])
+            on_disk = int(capacity.get("egroup_count") or 0)
+            unreferenced = max(0, on_disk - len(referenced))
+            if rc_r != 0:
+                status = "WARN"
+                msg = ("hydra.dfs_block_map could not be read, so it is not known which of "
+                       "this node's %d extent group(s) are still referenced." % on_disk)
+            elif unreferenced > on_disk // 2 and on_disk > 8:
+                # More than half the store unreferenced means reclamation is not keeping
+                # up -- either Purah is not running or its sweeps are failing.
+                status = "WARN"
+                msg = ("%d of %d extent group(s) on this node are unreferenced. Purah "
+                       "reclaims these, so this many suggests its sweep is not running or "
+                       "not completing." % (unreferenced, on_disk))
+            else:
+                status = "PASS"
+                msg = ("%d extent group(s) on this node, %d referenced by the block map."
+                       % (on_disk, len(referenced)))
     except Exception as e:
-        results["orphaned_disks_check"] = {
-            "status": "FAIL",
-            "output": f"Error during orphaned disks check: {str(e)}"
-        }
+        status = "WARN"
+        msg = "Error checking for unreferenced extent groups: %s" % e
+    results["orphaned_disks_check"] = {"status": status, "output": msg}
 
     # 12. Broken Disks check
     update_current_check(category, "broken_disks_check")
@@ -3491,40 +3118,29 @@ def check_storage(category):
         except Exception:
             pass
 
-        # 1. Query Linstor volume list
-        rc_v, out_v, err_v = run_cmd(f"podman exec -e LS_CONTROLLERS={controller_ips} systemd-aether linstor --no-color volume list")
+        # Under-replicated vdisks, from the map rather than a volume listing.
+        #
+        # A vdisk whose replica set is shorter than its rf is one node-loss away from
+        # unavailable, and one whose owner reports it degraded is already refusing writes.
+        rc_v, out_v, err_v = run_cqlsh("SELECT JSON vdisk_id, rf, replicas FROM hydra.dfs_vdisks;")
         if rc_v == 0:
-            import re
-            ansi_escape = re.compile(r'\\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])')
-            for line in out_v.splitlines():
-                line = line.strip()
-                if line.startswith("|") and not ("Resource" in line or "=====" in line or "MinorNr" in line):
-                    parts = [p.strip() for p in line.split("|")]
-                    if len(parts) >= 11:
-                        resource = ansi_escape.sub('', parts[1]).strip()
-                        node = ansi_escape.sub('', parts[2]).strip()
-                        pool = ansi_escape.sub('', parts[3]).strip()
-                        state = ansi_escape.sub('', parts[9]).strip()
-                        
-                        # Apply healthy rules
-                        is_diskless_pool = "diskless" in pool.lower()
-                        if is_diskless_pool:
-                            is_healthy = state in ["Diskless", "TieBreaker"]
-                        else:
-                            is_healthy = state == "UpToDate"
-                        
-                        if not is_healthy:
-                            broken_replicas.append(f"Replica of resource '{resource}' on node '{node}' (pool '{pool}') is in state '{state}'")
+            for row in parse_json_rows(out_v):
+                want = int(row.get("rf") or 0)
+                have = len(row.get("replicas") or [])
+                if want and have < want:
+                    broken_replicas.append(
+                        "%s: %d of %d replica(s) -- Purah should restore this; if it does "
+                        "not, there is no spare node to restore onto"
+                        % (row.get("vdisk_id"), have, want))
         else:
-            broken_replicas.append(f"Failed to query Linstor volume list: {err_v or out_v}")
+            broken_replicas.append(
+                "Failed to read hydra.dfs_vdisks: %s" % (err_v or out_v))
 
-        # 2. Check for lingering temporary uploads in local cache
         lingering_files = []
         import time
         now = time.time()
         temp_dirs = [
-            "/var/lib/hci/aether/volumes/default-image-container/.tmp_uploads",
-            "/var/lib/hci/aether/volumes/default-vm-container/.tmp_uploads"
+            "/var/lib/hci/images/.tmp_uploads"
         ]
         for tdir in temp_dirs:
             if os.path.exists(tdir):
@@ -3543,7 +3159,7 @@ def check_storage(category):
         if broken_replicas:
             results["broken_disks_check"] = {
                 "status": "FAIL",
-                "output": "CRITICAL: Broken or degraded disk replicas detected in Linstor:\n- " + "\n- ".join(broken_replicas)
+                "output": "CRITICAL: Under-replicated vdisks detected:\n- " + "\n- ".join(broken_replicas)
             }
         elif lingering_files:
             results["broken_disks_check"] = {
@@ -3553,7 +3169,7 @@ def check_storage(category):
         else:
             results["broken_disks_check"] = {
                 "status": "PASS",
-                "output": "All Linstor disk replicas are healthy, and no stale temporary uploads were found in local cache."
+                "output": "All vdisks hold their full replica set, and no stale temporary uploads were found in local cache."
             }
     except Exception as e:
         results["broken_disks_check"] = {
@@ -3561,228 +3177,60 @@ def check_storage(category):
             "output": f"Error during broken disks check: {str(e)}"
         }
 
-    # 13. DRBD Split-Brain / Diverged Replication Check
+    # 13. Storage latency.
     #
-    # A StandAlone connection means the two sides stopped replicating and each may have
-    # accepted writes the other has not seen. Resolving that is a per-resource question
-    # about which copy is authoritative, and it must be answered by an operator or by
-    # evidence from the resource itself -- never by a cluster-wide role such as the
-    # ZooKeeper leader, which says nothing about who holds the live data.
-    update_current_check(category, "drbd_split_brain_check")
+    # Every other storage check asks the daemon a question and believes the answer. This
+    # one times the question: a control plane that answers in twenty seconds is about to
+    # stop answering, and everything queued behind it -- VM creation, attach, migration --
+    # is already stalled.
+    #
+    # The check it replaces timed a controller round trip. There is no
+    # controller; the equivalent is the local daemon's own socket, which every operation
+    # on this node goes through.
+    update_current_check(category, "sidon_latency_check")
     try:
-        rc_d, out_d, err_d = run_cmd("drbdsetup status --json")
-        source = "host"
-        if rc_d != 0 or not out_d.strip():
-            rc_d, out_d, err_d = run_cmd(
-                "podman exec systemd-aether drbdsetup status --json")
-            source = "systemd-aether container"
-
-        # States that mean the two sides are not replicating and may have diverged.
-        DIVERGED = ("StandAlone",)
-        DEGRADED_CONN = ("Connecting", "Unconnected", "Disconnecting", "NetworkFailure",
-                         "ProtocolError", "BrokenPipe", "Timeout", "TearDown")
-        BAD_DISK = ("Failed", "Diskless", "DUnknown", "Inconsistent", "Outdated",
-                    "Attaching", "Detaching", "Negotiating")
-
-        if rc_d != 0 or not out_d.strip():
+        started = time.time()
+        rc_p, out_p, err_p = run_cmd(
+            "printf '{\"op\":\"ping\"}\\n' | nc -U /run/sidon/control.sock",
+            SIDON_LATENCY_TIMEOUT)
+        elapsed = time.time() - started
+        if rc_p != 0 or not out_p.strip():
+            status = "FAIL"
+            msg = ("Sidon did not answer a ping within %.0fs (%s). No vdisk on this node "
+                   "can be attached, detached or drained while that is true."
+                   % (SIDON_LATENCY_TIMEOUT, (err_p or "no output").strip()))
+        elif elapsed >= SIDON_LATENCY_FAIL:
+            status = "FAIL"
+            msg = ("Sidon took %.1fs to answer a ping (threshold %.0fs). It is answering, "
+                   "but slowly enough that operations are queueing behind it."
+                   % (elapsed, SIDON_LATENCY_FAIL))
+        elif elapsed >= SIDON_LATENCY_WARN:
             status = "WARN"
-            msg = ("DRBD replication state could not be read: drbdsetup is unavailable both on the "
-                   f"host and inside systemd-aether ({(err_d or out_d or 'no output').strip()[:300]}). "
-                   "Split-brain cannot be ruled out from here.")
+            msg = "Sidon took %.1fs to answer a ping (warn above %.0fs)." % (
+                elapsed, SIDON_LATENCY_WARN)
         else:
-            parsed = None
-            try:
-                parsed = json.loads(out_d)
-            except Exception:
-                parsed = None
-
-            if parsed is None:
-                # Text fallback: the JSON view is unavailable, but a StandAlone resource is
-                # still visible in the plain status output and must not go unreported.
-                rc_t, out_t, err_t = run_cmd("drbdadm status")
-                if rc_t != 0 or not out_t.strip():
-                    rc_t, out_t, err_t = run_cmd("podman exec systemd-aether drbdadm status")
-                if rc_t == 0 and "StandAlone" in out_t:
-                    status = "FAIL"
-                    msg = ("DRBD reports a StandAlone resource (split-brain or a severed "
-                           "replication link). Machine-readable status was unavailable, so the "
-                           "raw output is reproduced below:\n" + out_t)
-                elif rc_t == 0:
-                    status = "WARN"
-                    msg = ("DRBD JSON status could not be parsed, so only a text scan was possible. "
-                           "No StandAlone resource appeared in it:\n" + out_t)
-                else:
-                    status = "WARN"
-                    msg = ("DRBD status is unreadable in both JSON and text form: "
-                           f"{(err_t or out_t or 'no output').strip()[:300]}")
-            else:
-                split_brain, degraded, disk_issues, healthy = [], [], [], []
-
-                for resource in parsed:
-                    rname = resource.get("name", "unknown")
-                    role = resource.get("role", "Unknown")
-
-                    for dev in resource.get("devices", []):
-                        dstate = dev.get("disk-state", "Unknown")
-                        if dstate in BAD_DISK:
-                            disk_issues.append(
-                                f"resource '{rname}' volume {dev.get('volume', 0)} has local "
-                                f"disk-state {dstate} (local role {role})")
-
-                    connections = resource.get("connections", [])
-                    for conn in connections:
-                        peer = conn.get("name") or f"peer-node-id {conn.get('peer-node-id', '?')}"
-                        cstate = conn.get("connection") or conn.get("connection-state") or "Unknown"
-                        peer_role = conn.get("peer-role", "Unknown")
-
-                        if cstate in DIVERGED:
-                            if role == "Primary" and peer_role == "Primary":
-                                split_brain.append(
-                                    f"resource '{rname}' is StandAlone with BOTH sides Primary "
-                                    f"(local and peer '{peer}'): each side has been accepting writes "
-                                    f"the other has not seen. Do not let anything auto-discard here; "
-                                    f"the surviving copy must be chosen from the data, not from a "
-                                    f"cluster-wide role")
-                            else:
-                                split_brain.append(
-                                    f"resource '{rname}' connection to peer '{peer}' is StandAlone "
-                                    f"(local role {role}, peer role {peer_role}): replication has "
-                                    f"stopped and the copies may have diverged")
-                        elif cstate in DEGRADED_CONN:
-                            degraded.append(
-                                f"resource '{rname}' connection to peer '{peer}' is {cstate} "
-                                f"(local role {role}, peer role {peer_role})")
-
-                        for pdev in conn.get("peer_devices", []):
-                            vol = pdev.get("volume", 0)
-                            repl = pdev.get("replication-state", "Unknown")
-                            pdisk = pdev.get("peer-disk-state", "Unknown")
-                            if repl in ("SyncTarget", "SyncSource"):
-                                # A resync in progress is expected work, not divergence.
-                                degraded.append(
-                                    f"resource '{rname}' volume {vol} is resyncing with peer "
-                                    f"'{peer}' ({repl}, {pdev.get('out-of-sync', 0)} KiB out of sync)")
-                            elif repl == "Off" and cstate not in DIVERGED:
-                                degraded.append(
-                                    f"resource '{rname}' volume {vol} has replication Off toward "
-                                    f"peer '{peer}' while the connection reports {cstate}")
-                            elif pdisk in BAD_DISK and repl not in ("SyncTarget", "SyncSource"):
-                                disk_issues.append(
-                                    f"resource '{rname}' volume {vol} reports peer '{peer}' "
-                                    f"disk-state {pdisk} (replication {repl})")
-
-                    if not connections:
-                        # A resource with no peers is normal on a single-node cluster and for
-                        # single-replica placements, so it is reported, not flagged.
-                        healthy.append(
-                            f"'{rname}' (role {role}) has no replication peers on this node")
-                    else:
-                        healthy.append(
-                            f"'{rname}' (role {role}) with {len(connections)} peer connection(s)")
-
-                if not parsed:
-                    status = "PASS"
-                    msg = ("No DRBD resources are configured on this node, so there is no "
-                           "replication state that could be split-brain.")
-                elif split_brain:
-                    status = "FAIL"
-                    msg = ("DRBD SPLIT-BRAIN / diverged replication detected:\n- "
-                           + "\n- ".join(split_brain))
-                    if degraded or disk_issues:
-                        msg += "\nAlso noted:\n- " + "\n- ".join(degraded + disk_issues)
-                elif disk_issues:
-                    status = "WARN"
-                    msg = "DRBD replica disk states need attention:\n- " + "\n- ".join(disk_issues)
-                    if degraded:
-                        msg += "\nAlso noted:\n- " + "\n- ".join(degraded)
-                elif degraded:
-                    status = "WARN"
-                    msg = ("DRBD replication is not fully established:\n- " + "\n- ".join(degraded))
-                else:
-                    status = "PASS"
-                    msg = (f"All {len(parsed)} DRBD resource(s) are replicating normally with no "
-                           f"StandAlone or diverged connection (read from {source}):\n- "
-                           + "\n- ".join(healthy))
+            status = "PASS"
+            msg = "Sidon answered a ping in %.2fs." % elapsed
     except Exception as e:
         status = "WARN"
-        msg = f"Error running DRBD split-brain check: {str(e)}"
-    results["drbd_split_brain_check"] = {
-        "status": status,
-        "output": msg
-    }
-
-    # 14. LINSTOR Controller Latency Check
-    # Every other storage check here asks the controller a question and believes the
-    # answer. This one times the question: a controller that answers in twenty seconds is
-    # about to stop answering, and everything queued behind it -- VM creation, disk
-    # attach, live migration -- is already stalled.
-    update_current_check(category, "linstor_latency_check")
-    try:
-        status, msg = classify_linstor_latency(
-            collect_linstor_latency_facts(controller_ip))
-    except Exception as e:
-        status = "WARN"
-        msg = f"Error running LINSTOR controller latency check: {str(e)}"
-    results["linstor_latency_check"] = {
-        "status": status,
-        "output": msg
-    }
+        msg = "Error timing the Sidon control socket: %s" % e
+    results["sidon_latency_check"] = {"status": status, "output": msg}
 
     return results
 
+
 def check_hardware(category):
+    """CPU, memory, disks, time. Nothing here is storage-layer specific.
+
+    The boundary between this and check_storage was lost when the DRBD and LINSTOR checks
+    above it were removed -- the cut ran from the split-brain check to the first hardware
+    check and took the function definition with it, so every hardware check silently
+    became part of the storage scope. mcli's per-scope lists are what caught it: they
+    drive the progress display, and a check in the wrong scope means the bar for one
+    never advances past a check the other is running.
+    """
     results = {}
-    
-    # 1. Host CPU Load Check
-    update_current_check(category, "cpu_load")
-    try:
-        nproc = os.cpu_count() or 1
-        with open("/proc/loadavg", "r") as f:
-            load = float(f.readline().split()[0])
-        pct = (load / nproc) * 100
-        status = "PASS"
-        if pct > 95:
-            status = "FAIL"
-        elif pct > 85:
-            status = "WARN"
-        msg = f"CPU cores: {nproc}\n1-minute load average: {load:.2f} ({pct:.1f}% load average factor)"
-    except Exception as e:
-        status = "FAIL"
-        msg = f"Failed to parse host CPU loadavg: {str(e)}"
-    results["cpu_load"] = {
-        "status": status,
-        "output": msg
-    }
-    
-    # 2. Host RAM usage check
-    update_current_check(category, "ram_usage")
-    try:
-        mem_total = 0
-        mem_avail = 0
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_total = int(line.split()[1])
-                elif line.startswith("MemAvailable:"):
-                    mem_avail = int(line.split()[1])
-        used = mem_total - mem_avail
-        pct = (used / mem_total) * 100 if mem_total > 0 else 0
-        
-        status = "PASS"
-        if pct > 95:
-            status = "FAIL"
-        elif pct > 85:
-            status = "WARN"
-            
-        msg = f"Total RAM: {mem_total / 1024:.1f} MB\nUsed RAM: {used / 1024:.1f} MB ({pct:.1f}% used)\nAvailable RAM: {mem_avail / 1024:.1f} MB"
-    except Exception as e:
-        status = "FAIL"
-        msg = f"Failed to check host memory: {str(e)}"
-    results["ram_usage"] = {
-        "status": status,
-        "output": msg
-    }
-    
+
     # 3. Host root disk partition check
     update_current_check(category, "disk_space")
     rc, out, err = run_cmd("df -h /")

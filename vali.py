@@ -756,39 +756,42 @@ def drs_thread_loop():
         time.sleep(30)
 
 def get_vm_disk_size(vm_name):
+    """The VM's primary disk size in MiB, or None if it cannot be determined.
+
+    None means "could not determine" and the caller must refuse on it -- a guessed size
+    that happens to fit lets a migration proceed onto a target that cannot hold the disk.
+
+    This used to parse `linstor volume-definition list` output looking for a cell
+    containing "gib". The map holds the number directly.
+    """
     vm_data = get_vm_xml_specs(vm_name)
-    if vm_data and vm_data.get("disks_list"):
-        res_name = vm_data["disks_list"].split(",")[0]
-        ips = []
+    if not vm_data or not vm_data.get("disks_list"):
+        return None
+    module = sidon_module()
+    if module is None:
+        return None
+    vdisk_id = module.vdisk_id_for(vm_name, 0)
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON size_bytes FROM hydra.dfs_vdisks WHERE vdisk_id = '%s';" % vdisk_id)
+    if rc != 0:
+        return None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
         try:
-            if os.path.exists("/etc/hci/cluster.json"):
-                with open("/etc/hci/cluster.json", "r") as f:
-                    ips = [h["ip"] for h in json.load(f).get("hosts", [])]
-        except Exception:
-            pass
-        if not ips:
-            ips = ["127.0.0.1"]
-        controllers_str = ",".join(ips)
-        cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume-definition list --resource-definition {res_name}"
-        rc, stdout, _ = run_remote_spark(LOCAL_IP, cmd)
-        if rc == 0 and stdout:
-            for line in stdout.splitlines():
-                parts = line.split("|")
-                for p in parts:
-                    if "gib" in p.lower():
-                        try:
-                            val = float(p.strip().split()[0])
-                            return int(val * 1024)
-                        except:
-                            pass
-    # Unknown, not "50 GiB". A guessed size that happens to fit lets a migration proceed
-    # onto a target that cannot hold the disk.
+            size = int(json.loads(line).get("size_bytes") or 0)
+        except (ValueError, TypeError):
+            continue
+        if size > 0:
+            return size // (1024 * 1024)
     return None
+
 
 def hostname_for_ip(ip):
     """The cluster hostname of a node, or None.
 
-    LINSTOR keys everything by node name while this code passes addresses around, so the
+    The map keys everything by node name while this code passes addresses around, so the
     two have to be reconciled somewhere. `cluster.json` is the only place that holds both.
     """
     try:
@@ -801,68 +804,31 @@ def hostname_for_ip(ip):
     return None
 
 
-def get_linstor_free_space(target_ip):
-    """Free MiB in the target node's smallest backed storage pool, or None if unknown.
+def get_storage_free_space(target_ip):
+    """Free MiB in the target node's extent store, or None if unknown.
 
-    None means "could not determine", and the caller must refuse on it. This used to
-    return a hard-coded 999999 MiB when the listing could not be parsed -- larger than any
-    single VM disk, so the capacity gate approved everything instead of refusing.
+    None means "could not determine", and the caller must refuse on it. An earlier version
+    of this returned a hard-coded 999999 MiB when the listing could not be parsed -- larger
+    than any single VM disk, so the capacity gate approved everything instead of refusing.
+    That is the failure this signature exists to prevent, and it is why there is no
+    fallback here either.
+
+    Sidon answers with bytes from statvfs on the filesystem holding the extents, which is
+    the number that decides whether a drain can complete. The previous implementation
+    parsed `linstor storage-pool list` and had to filter the rows down to the target node,
+    because that listing returns every node's pools rather than the one asked about.
     """
-    ips = []
+    rc, body, _err = run_mtls_spark_api(
+        target_ip, "/api/v1/dfs/vdisk", {"op": "capacity"})
+    if rc != 0 or not isinstance(body, dict):
+        return None
     try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                ips = [h["ip"] for h in json.load(f).get("hosts", [])]
-    except Exception:
-        pass
-    if not ips:
-        ips = ["127.0.0.1"]
-    controllers_str = ",".join(ips)
-    # --machine-readable. The human table was parsed by scanning cells for one containing
-    # "/", which hit "vg_aether/thin_pool_aether" -- the backing volume group, printed
-    # before the capacity columns -- and fell through to the fallback on every real
-    # cluster. Since the gate only refuses when the disk is *larger* than this number, a
-    # fallback of 999999 MiB meant it refused nothing, ever.
-    cmd = (f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether "
-           f"linstor -m --output-version v1 storage-pool list")
-    rc, stdout, _ = run_remote_spark(target_ip, cmd)
-    if rc != 0 or not stdout:
+        available = int(body.get("available_bytes") or 0)
+    except (TypeError, ValueError):
         return None
-
-    try:
-        payload = json.loads(stdout)
-    except Exception:
+    if available <= 0:
         return None
-
-    # `storage-pool list` returns every node's pools, not the target's. Taking the
-    # minimum across all of them would refuse a migration to a target with room because
-    # some *other* node is full -- and on a one-node cluster the bug is invisible.
-    target_node = hostname_for_ip(target_ip)
-    if not target_node:
-        return None
-
-    # Capacities are KiB. Diskless pools report INT64_MAX, which is not free space and
-    # makes a full fabric look empty, so they are skipped. The smallest backed pool is
-    # the answer: a target is only as large as its tightest pool.
-    best = None
-    matched = False
-    for entry in _iter_storage_pools(payload):
-        if entry.get("node_name") != target_node:
-            continue
-        matched = True
-        if entry.get("provider_kind") in ("DISKLESS", "diskless"):
-            continue
-        free_kib = entry.get("free_capacity")
-        if not isinstance(free_kib, int) or free_kib < 0 or free_kib > (1 << 60):
-            continue
-        free_mib = free_kib // 1024
-        best = free_mib if best is None else min(best, free_mib)
-
-    # A node with no rows at all is not a node with no space -- it is a node LINSTOR did
-    # not report on, which is exactly the case that must refuse rather than guess.
-    if not matched:
-        return None
-    return best
+    return available // (1024 * 1024)
 
 
 def _iter_storage_pools(payload):
@@ -981,12 +947,13 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         for idx, entry in enumerate(disks_list.split(",")):
             parts = entry.split(":")
             bus = parts[2] if len(parts) > 2 else "virtio"
-            d_path = f"/dev/drbd/by-res/{name}-disk{idx}/0"
+            d_path = sidon_module().nbd_socket(sidon_module().vdisk_id_for(name, idx))
             disk_paths_with_bus.append((d_path, bus))
     elif disks_list == "NONE":
         disk_paths_with_bus = []
     else:
-        disk_paths_with_bus = [(f"/dev/drbd/by-res/{name}-disk0/0", "virtio")]
+        disk_paths_with_bus = [
+            (sidon_module().nbd_socket(sidon_module().vdisk_id_for(name, 0)), "virtio")]
 
     sidon = sidon_module() if using_sidon() else None
 
@@ -1038,7 +1005,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
                     slug = re.sub(r'-+', '-', slug)
                     slug = slug.strip('-')
                     slug = slug[:28]
-                    iso_path = f"/dev/drbd/by-res/img-{slug}/0"
+                    iso_path = sidon_module().nbd_socket(f"img-{slug}")
                     
                 disk_devices_xml += f"""
     <disk type='block' device='cdrom'>
@@ -1264,7 +1231,6 @@ def select_best_start_host(memory_needed):
 
     hosts = get_cluster_hosts()
     
-    # Scheduling is cluster-wide on Linstor
 
     best_host = None
     min_used_mem = float('inf')
@@ -1340,36 +1306,6 @@ def get_node_ip(host_or_ip):
     return host_or_ip
 
 
-def get_linstor_pending_sync():
-    hosts = []
-    try:
-        import os, json
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-    except Exception:
-        pass
-    
-    ips = [h["ip"] for h in hosts] if hosts else ["127.0.0.1"]
-    controllers_str = ",".join(ips)
-    cmd = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume list"
-    
-    # Try querying from any online node in the cluster
-    candidate_ips = ["127.0.0.1"] + ips
-    rc = -1
-    stdout = ""
-    for ip in candidate_ips:
-        rc, stdout, stderr = run_remote_spark(ip, cmd)
-        if rc == 0:
-            break
-            
-    if rc != 0:
-        return -1
-    if "Syncing" in stdout or "PausedSync" in stdout or "Inconsistent" in stdout:
-        return 1
-    return 0
-
 def release_failed_claim(vm_name, host_ip):
     """Give back a placement claimed for a start that then failed.
 
@@ -1434,7 +1370,7 @@ def process_queue_task(task):
             # Two callers racing on the same VM -- a manual start against a DRS placement,
             # or a start issued while a stale host_ip was still in the row -- both reached
             # that point and both wrote, so two qemu processes ended up on the same raw
-            # DRBD device. Claiming first means one of them is turned away here.
+            # vdisk. Claiming first means one of them is turned away here.
             # Passed through as read, not coerced to "": a row whose host_ip was never
             # written holds null, and `IF host_ip = ''` does not match null. Coercing here
             # would refuse every start of such a VM as "owned by another host".
@@ -1463,14 +1399,14 @@ def process_queue_task(task):
             restore_cmd = get_nvram_restore_cmd(vm_name)
             q_vm = shlex.quote(vm_name)
 
-            # Promote the DRBD devices on the destination host as a separate CHECKED step before the
+            # Claim the vdisks on the destination host as a separate CHECKED step before the
             # VM is defined or started. A promotion failure means the peer still holds Primary (the
             # VM is probably still running there behind a stale host_ip row), and booting anyway
             # would put two qemu processes on the same raw device.
             promoted = []
             if disks_list and disks_list != "NONE":
                 disk_count = len(disks_list.split(","))
-                if using_sidon():
+                if True:
                     # The Sidon equivalent of promotion, and a stronger one. Attaching wins
                     # the ownership compare-and-swap in Hydra and fences every journal
                     # replica at the new epoch, so a previous owner that is wedged, lying,
@@ -1493,20 +1429,6 @@ def process_queue_task(task):
                                 detail = body_a.get("error") or ""
                             return False, f"Refusing to start {vm_name}: Sidon would not hand {vdisk_id} to {selected_host} ({detail or err_a}). Another host may still own the disk."
                         promoted.append(vdisk_id)
-                else:
-                    for idx, entry in enumerate(disks_list.split(",")):
-                        res_name = f"{vm_name}-disk{idx}"
-                        q_res = shlex.quote(res_name)
-                        rc_d, stdout_d, stderr_d = run_remote_spark(selected_host, f"drbdadm primary {q_res}")
-                        if rc_d != 0:
-                            # Release the resources we already promoted so this host does not sit on them
-                            for done in promoted:
-                                run_remote_spark(selected_host, f"drbdadm secondary {shlex.quote(done)} || true")
-                            release_failed_claim(vm_name, selected_host)
-                            return False, f"Refusing to start {vm_name}: DRBD resource {res_name} could not be promoted to Primary on {selected_host} ({(stderr_d or stdout_d).strip()}). The peer node may still hold Primary for this resource (the VM may still be running there)."
-                        promoted.append(res_name)
-                        run_remote_spark(selected_host, f"drbdadm resize {q_res} || true")
-
             cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
             if rc != 0:
@@ -1626,18 +1548,18 @@ def process_queue_task(task):
                 return False, (f"Refusing to migrate {vm_name}: its disk size could not be "
                                f"determined, so there is no way to tell whether "
                                f"{target_host} can hold it.")
-            target_free = get_linstor_free_space(target_ip)
+            target_free = get_storage_free_space(target_ip)
             if target_free is None:
                 return False, (f"Refusing to migrate {vm_name}: the free storage on "
                                f"{target_host} could not be read, so the capacity check "
                                f"cannot be made.")
             if target_free < disk_size:
-                return False, f"Target host {target_host} has insufficient free Linstor storage pool space ({target_free} MiB available, needs {disk_size} MiB)."
+                return False, f"Target host {target_host} has insufficient free extent-store space ({target_free} MiB available, needs {disk_size} MiB)."
 
             # Take the migration lock. The condition and the write are one Paxos round, so
             # there is no window between them: previously the code read `status`, decided
             # nobody was migrating, and set it in a separate statement, which two callers
-            # could both pass. Live migration is exactly the window in which DRBD
+            # could both pass. Live migration is exactly the window in which storage
             # dual-primary is open, so two of them on one VM is disk corruption.
             print(f"Taking the migration lock for VM '{vm_name}'...")
             ok, applied, current, err = run_lwt("/v1/vm/migrate-lock", {"name": vm_name})
@@ -1831,7 +1753,7 @@ def process_queue_task(task):
 
                 # Write state file and stop all cluster services on the target host (except spark-daemon)
                 run_remote_spark(target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
-                stop_cmd = "sleep 2 && systemctl stop spectrum catalyst bifrost dagur mimir vali aether linstor-controller hydra-db gatoway urbosa logos mipha daruk agahnim slate"
+                stop_cmd = "sleep 2 && systemctl stop spectrum catalyst bifrost dagur mimir vali sidon hydra-db gatoway urbosa logos mipha daruk agahnim slate"
 
                 # Update task progress to 100 before running the stop command, so the task status is marked completed in ScyllaDB
                 call_catalyst_api("/api/v1/tasks/update", {
@@ -1869,7 +1791,7 @@ def process_queue_task(task):
             }, method="POST")
             
             print(f"[Maintenance Catalyst Task] Starting services on host {hostname}...")
-            start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway urbosa logos mipha daruk agahnim slate"
+            start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway urbosa logos mipha daruk agahnim slate"
             run_remote_spark(target_ip, start_cmd)
             
             # Update task progress
@@ -1889,69 +1811,16 @@ def process_queue_task(task):
             
 
 
-            # Linstor Satellite auto-heal triggered automatically via DRBD reconnection
-            print(f"[Maintenance Catalyst Task] Linstor Satellite auto-heal triggered automatically via DRBD reconnection on host {hostname}.")
-            
-            # Create child Catalyst task for sync
-            import uuid
-            child_task_id = str(uuid.uuid4())
-            now_ms = int(time.time() * 1000)
-            child_payload = json.dumps({"hostname": hostname, "parent_task_id": task_id})
-            cql_child = f"""
-            INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-            VALUES ({child_task_id}, 'aether', 'sync', 'processing', '{child_payload.replace("'", "''")}', 10, {now_ms}, {now_ms});
-            """
-            run_cql_query(cql_child)
-            
-            # Poll sync status
-            synced = False
-            # Poll up to 60 iterations (3 minutes)
-            for iteration in range(60):
-                child_progress = min(95, 10 + iteration * 5)
-                # Map child progress (10%-95%) to parent task progress (40%-90%)
-                parent_progress = int(40 + (child_progress / 100.0) * 50)
-                
-                cql_up_child = f"UPDATE hydra.catalyst_tasks SET progress = {child_progress}, updated_at = {int(time.time()*1000)} WHERE task_id = {child_task_id};"
-                run_cql_query(cql_up_child)
-                
-                call_catalyst_api("/api/v1/tasks/update", {
-                    "task_id": task_id,
-                    "status": "processing",
-                    "progress": parent_progress
-                }, method="POST")
-                
-                pending = get_linstor_pending_sync()
-                print(f"[Maintenance Catalyst Task] Linstor sync status - pending status: {pending}")
-                if pending == 0:
-                    synced = True
-                    print(f"[Maintenance Catalyst Task] Linstor DRBD volumes fully synced on host {hostname}!")
-                    break
-                    
-                time.sleep(3)
-                
-            now_ms_end = int(time.time() * 1000)
+            # Nothing to wait for. This used to announce a satellite auto-heal, create a
+            # child Catalyst task and poll get_linstor_pending_sync() every three seconds
+            # until DRBD had finished copying. Extent groups are immutable and Purah
+            # re-replicates them in the background, so a returning node is usable the
+            # moment it is up.
+            synced = True
             if synced:
-                # Set child task to completed
-                cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'completed', progress = 100, updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
-                run_cql_query(cql_child_end)
-                
-                # Set node status to NORMAL
-                cql_normal = f"UPDATE hydra.nodes SET status = 'NORMAL' WHERE hostname = '{hostname}';"
-                run_cql_query(cql_normal)
-                print(f"[Maintenance Catalyst Task] Host {hostname} rejoin and sync completed successfully.")
-
-                # The host is back in the ring and back in service, so the cluster
-                # maintenance lock is finally free. It is released here rather than when
-                # `leave` was requested: until the storage has resynced this host is not
-                # a replica anyone should be counting on, and letting a second host start
-                # draining in that window is the case the lock exists to stop.
-                #
-                # The token from the acquisition is long gone -- `leave` can arrive hours
-                # later, and after a leader change this is not even the same process --
-                # so the row is read and released on the token it carries.
                 release_maintenance_lock_for_host(hostname)
             else:
-                err_msg = "DRBD volume sync timed out or failed to complete self-heal."
+                err_msg = "the host did not finish rejoining."
                 cql_child_end = f"UPDATE hydra.catalyst_tasks SET status = 'failed', progress = 100, error_msg = '{err_msg}', updated_at = {now_ms_end} WHERE task_id = {child_task_id};"
                 run_cql_query(cql_child_end)
                 # The lock stays held. The host did not finish rejoining, so the cluster

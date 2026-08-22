@@ -655,15 +655,21 @@ class BackupTest(TempTree):
             self.quiet_backup(instance, round_tag=self.ROUND)
         self.assertIn("cluster.json", str(caught.exception))
 
-    def test_the_linstor_database_is_noted_when_it_is_not_captured(self):
-        """The controller runs on one node. An artefact from any other node has no
-        LINSTOR database in it, and has to say so rather than look complete."""
+    def test_the_manifest_no_longer_claims_a_controller_database(self):
+        """There is no second database to capture.
+
+        LINSTOR kept its own, on exactly one node, so an artefact from any other node was
+        incomplete and had to say so. Sidon has none: the map lives in the keyspace this
+        already snapshots, so a per-node artefact is complete on every node -- and a
+        manifest still advertising the old field would have a restore looking for a member
+        that no artefact will ever contain.
+        """
         shell = FakeShell()
         instance = self.build_saga(shell)
         self.plant_snapshot(saga.SNAPSHOT_PREFIX + self.ROUND)
         manifest, _out = self.quiet_backup(instance, round_tag=self.ROUND)
-        self.assertFalse(manifest["contains_linstor_db"])
-        self.assertIn("controller", manifest["linstor_note"])
+        self.assertNotIn("contains_linstor_db", manifest)
+        self.assertNotIn("linstor_note", manifest)
 
 
 class TargetTest(TempTree):
