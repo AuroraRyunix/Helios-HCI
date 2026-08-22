@@ -577,6 +577,54 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   asserts `*_B64`/mapping coverage in both directions, upgrade-package vs LCM-inventory parity, that
   every embedded `*_script` literal compiles, and that no embedded source carries CRLF. That last
   assertion failed on its first run and caught 17 files that had drifted back to CRLF.
+  **Extended 2026-08-22** with the fifth and sixth hand-maintained inventories in this
+  path: the Spectrum image's build context against the Dockerfile's own `COPY` lines, and
+  the Rust crates the rollout builds against the `Cargo.toml` files in the tree. Both
+  found live breakage — see the two entries below.
+* ~~Nothing checked that a name a component reads is bound anywhere.~~ **Resolved
+  (2026-08-22)**: `test_unbound_names.py`. Removing a feature means cutting a region out
+  of a file, and a region has two ends, so a cut sized to the feature routinely takes a
+  definition that outlived it. None of that is visible at import — Python resolves a
+  global when the line runs — so the file parses, imports, deploys, starts, serves every
+  request that does not touch the missing name, and raises `NameError` on the one that
+  does. It found six: `spark_daemon_decoded.py` had lost the allowlists behind four
+  endpoints and the assignment feeding `host/capabilities`' own return value; `mipha.py`
+  had lost `LOCAL_IP`, which `spark_endpoint` reads, so every mTLS call it made would
+  have raised on the first fence; and `valcli.py` called three functions that exist in no
+  module.
+
+  The checker is deliberately over-permissive: a conditional assignment counts as a
+  binding. It cannot prove a name is *always* bound; it proves a name is bound **nowhere**,
+  which is what this class of edit actually produces.
+* ~~The rollout could not ship the storage daemon.~~ **Resolved (2026-08-22)**: only
+  `agahnim` was built on the node, so `sidon` could be changed in the repository and reach
+  a running cluster by no route except reprovisioning — the one component where that is
+  the least acceptable answer. All three crates now go, with every `.rs` under `src/`
+  rather than a named list, and a `sidon` that fails to build stops that node's update
+  instead of leaving the old one running behind a rollout that reported success.
+* ~~The Spectrum image had silently stopped being rebuilt.~~ **Resolved (2026-08-22)**:
+  its Dockerfile gained `COPY lanayru.py` and `COPY helios_sidon.py`; the upload list
+  gained neither, so `podman build` failed with "no such file or directory" on every
+  rollout — and the script printed that, continued, restarted spectrum onto the image
+  already running, and reported success. A build failure is now fatal.
+* ~~The Phoenix console was deployed by hand.~~ **Resolved (2026-08-22)**:
+  `deploy_updates.py` tars its build context, builds the image, installs the Quadlet from
+  `spectrum_phx/quadlet/` rather than a duplicated string, and restarts the unit.
+  `SECRET_KEY_BASE` is read from whichever node already has one and reused, because it
+  must be identical cluster-wide — with per-node secrets, Slate moving a request to a
+  different backend logs the operator out — and regenerating it on each rollout would do
+  that to every live session.
+* **The signed upgrade package still cannot carry a binary or an image.**
+  `create_upgrade_zip.py` ships files to fixed paths, and `hylia` applies them by copying;
+  neither can build a crate or a container. So `sidon`, `ganon`, `agahnim` and the Phoenix
+  console reach a cluster only through `deploy_updates.py`, which is a developer pushing
+  from a checkout rather than an operator applying a signed release. That is a design
+  question about what a signed release contains — sources plus a build step, with the
+  reproducibility problem that implies, or binaries, with the "who signed this artefact"
+  problem that implies — and not a missing entry in a list.
+* **`provision.py` does not know about the Phoenix console.** A fresh cluster gets the
+  Python one and gains this one on its first `deploy_updates.py` run. Wiring it needs the
+  cluster-wide `SECRET_KEY_BASE` generated at cluster-create time.
 * ~~`podman build` cannot be run from a clean checkout.~~ **Resolved (2026-08-20)**: the Dockerfile
   copies `spectrum_server.py` and renames it on the way in, so the build works from the tree as checked
   out. The rename indirection is gone rather than worked around -- it had four touchpoints
@@ -641,6 +689,18 @@ as data* by DRBD and refused with EIO by Sidon.
   from one machine: the instances share a clock and a page cache. Real hosts are what
   settle clock skew, genuine partitions, and the kernel-death injector — which needs
   `kernel.sysrq` widened on a node somebody is willing to lose.
+* **A cluster-wide replica check before a rolling reboot.** `hylia` verifies the node it
+  is about to take down — daemon answering, store mounted with room, no degraded vdisk —
+  and nothing verifies the *cluster*. Rebooting the node holding the last reachable
+  replica of a vdisk still makes it unavailable. It needs more than one node to write or
+  to test.
+* **Leftover LINSTOR logical volumes on upgraded nodes.** The DRBD teardown unmounts,
+  downs the resources, unloads the module and removes the packages, and deliberately does
+  not touch the backing volumes: removing one is a decision about data, not about
+  packages. On the test node that leaves `img-test`, `linstor-db`, `scratchtest` and
+  `test-disk0` in `vg_aether/thin_pool_aether`, thin, holding tens of megabytes between
+  them and sharing the pool with `sidon`. Worth a documented `lvremove` step somebody
+  performs on purpose, not an automatic one.
 * **Snapshots and clones.** The schema and the immutability rules are already in place; a
   snapshot is a map copy against a frozen parent. Nothing creates one yet. This is also
   what closes saga's honest caveat about guest data.

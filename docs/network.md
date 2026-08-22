@@ -16,9 +16,9 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Spectrum Web UI** | `8443` | TCP (HTTPS) | Public / Management | Prism Web Console interface and REST API gateway. |
 | **Catalyst Manager** | `9091` | TCP (HTTP) | Localhost | Task Manager API. Mapped locally for scheduling and submission. |
 | **Vali Placement** | `9095` | TCP (HTTP) | Localhost | Acropolis VM placement, live migration, and DRS controls. |
-| **Linstor Controller** | `3370` | TCP | Localhost & Cluster | Linstor Controller REST API and orchestration port. |
-| **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
-| **DRBD Replication** | `7700`-`7890` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
+| ~~Linstor Controller~~ | ~~`3370`~~ | — | — | **Closed.** Removed with the storage engine. |
+| ~~Linstor Satellite~~ | ~~`3376`~~ | — | — | **Closed.** |
+| ~~DRBD Replication~~ | ~~`7700`-`7890`~~ | — | — | **Closed**, and the range was itself the problem: 191 ports, one per DRBD resource, was the cluster-wide ceiling on replicated volumes. |
 | **VXLAN Overlay** (Urbosa) | `4789` | **UDP** | Cluster Mesh | Tenant overlay segment traffic between hosts. Point-to-multipoint, no multicast required. |
 | **Sidon** (storage replication) | `9105` | TCP | Cluster Mesh | Journal appends, extent-group transfer, epoch fencing and forwarded guest I/O between per-node data-path daemons. One connection per node **pair**, independent of VM count — which was the whole complaint about DRBD's per-device model. **mTLS is not implemented yet, so the daemon refuses to bind this port to anything but loopback**; multi-node replication needs that work finished first. See [sidon.md](./sidon.md). |
 | **Sidon** (control) | — | unix socket | Local only | `/run/sidon/control.sock`, reached from spark-daemon. Cluster-facing storage control therefore arrives over the existing mTLS mesh on `9099` and is translated locally, so the storage tier adds no authenticated surface of its own. |
@@ -52,15 +52,14 @@ flowchart TB
         Spark1["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK1["ZooKeeper (Consensus)<br>Port 2181"]
         DB1["ScyllaDB (Metadata)<br>Port 9042"]
-        AetherCtrl1["Linstor Controller<br>Port 3370"]
-        AetherSat1["Linstor Satellite<br>Port 3376"]
+        Sidon1["Sidon (Storage Data Path)<br>unix sockets + Port 9105"]
     end
 
     subgraph Host2 [hci-node02]
         Spark2["Spark Daemon (mTLS API)<br>Port 9099"]
         ZK2["ZooKeeper (Consensus)<br>Port 2181"]
         DB2["ScyllaDB (Metadata)<br>Port 9042"]
-        AetherSat2["Linstor Satellite<br>Port 3376"]
+        Sidon2["Sidon (Storage Data Path)<br>unix sockets + Port 9105"]
     end
 
     %% Internal service orchestration and query flows on Host1
@@ -79,9 +78,9 @@ flowchart TB
     %% Inter-node replication and consensus (Cluster Mesh)
     DB1 <===>|"ScyllaDB Gossip & Replication (Port 7000)"| DB2
     ZK1 <===>|"Consensus Election & Sync (Ports 2888/3888)"| ZK2
-    AetherSat1 <===>|"Linstor/DRBD Control & Sync (Ports 3376, 7788+)"| AetherSat2
-    AetherCtrl1 -.->|"Orchestrate Satellites (Port 3376)"| AetherSat1
-    AetherCtrl1 -.->|"Orchestrate Satellites (Port 3376)"| AetherSat2
+    Sidon1 <===>|"Journal + extent replication, epoch fencing (Port 9105)<br>one connection per node pair"| Sidon2
+    Spark1 -.->|"Control socket /run/sidon/control.sock"| Sidon1
+    Sidon1 -.->|"Block map + ownership CAS (Port 9042)"| DB1
 
     %% Remote orchestration and fallbacks
     Spark1 -.->|"Orchestrate remote node (Port 9099)"| Spark2
@@ -96,7 +95,7 @@ flowchart TB
 ### A. Localhost Bindings (No External Access)
 To ensure isolation and security, internal daemon API ports are bound exclusively to the loopback interface (`127.0.0.1`):
 * **Vali (`9095`) & Catalyst (`9091`)**: These services are not exposed externally. Access from Spectrum is routed locally through the `spark-daemon` mTLS wrapper to prevent unauthenticated commands.
-* **Storage Mounts**: Hypervisor VMs access storage containers directly via block-level DRBD device mapping (e.g. `/dev/drbd/by-res/...`), bypassing network-attached filesystem shares entirely for localized guests.
+* **Storage**: guests reach their disks over a per-vdisk unix socket under `/var/lib/hci/sidon/nbd/`, group-owned by `qemu`. There is no block device, no kernel client and no network filesystem in the path — qemu speaks NBD to the Sidon on its own host, and that daemon decides whether the bytes are local, on a replica, or forwarded to whichever node owns the vdisk.
 
 ### B. Mutual TLS Mesh (Port `9099`)
 * All node-to-node remote command execution is performed through the **Spark Daemon** over port `9099`.
@@ -110,5 +109,5 @@ To ensure isolation and security, internal daemon API ports are bound exclusivel
 ### D. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7700`-`7890`)
 * **Gossip Database Layer**: ScyllaDB nodes talk to each other directly on port `7000` to share cluster metadata, tables partition maps, and telemetry stats.
 * **Consensus Sync Layer**: ZooKeeper nodes use ports `2888` and `3888` to elect Odin leaders and synchronize locks.
-* **Software-Defined Storage**: Linstor Satellites and Controller communicate over ports `3370` and `3376` for cluster resource provisioning, and DRBD volumes replicate synchronously across the physical disks using TCP ports `7700` to `7890`.
+* **Software-Defined Storage**: one port, `9105`, carrying journal appends, extent-group transfer, epoch fencing and forwarded guest I/O — one connection per node **pair**, independent of how many disks the cluster has. There is no controller to reach and no per-volume port to allocate, which is what the three entries struck out above were.
 
