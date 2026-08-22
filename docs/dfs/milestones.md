@@ -106,6 +106,8 @@ moment, not before.
 - LINSTOR remains for whatever chooses it, indefinitely; the Gluster precedent says the
   long tail is long.
 
+The switch already has a name and a config key. `cluster.json` carries `"dfs_engine": "linstor"` on every cluster this provisioner has ever built, and `get_dfs_engine()` is defined in `cluster_new.py`, `mipha.py`, `spark.py` and `vali.py` — four copies, each hardcoded to `return "linstor"`, each called by nothing. It is the vestige of the GlusterFS transition, left behind when that migration finished. This milestone is what it was for: consolidate the four copies into one reader of the existing key, then let it return something else. Worth knowing before someone deletes it as dead code — it is dead, but it is dead in exactly the shape this needs.
+
 ## 9. Performance — deliberately last
 
 vhost-user-blk beside NBD, drain tuning, read-ahead, locality policy. Every earlier
