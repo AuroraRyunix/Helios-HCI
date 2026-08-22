@@ -285,7 +285,20 @@ class EndpointTableTests(LwtTestCase):
     def test_parameter_types_are_ones_the_coercer_understands(self):
         for path, op in daruk.LWT_OPS.items():
             for name, spec in op["params"].items():
-                self.assertIn(spec["type"], ("text", "int", "bool"), f"{path}.{name}")
+                self.assertIn(spec["type"], ("text", "int", "bool", "list"),
+                              f"{path}.{name}")
+
+    def test_a_list_parameter_rejects_anything_that_is_not_a_list_of_strings(self):
+        # The replica set binds to a CQL list<text>, and it decides which hosts an append
+        # must reach. A list carrying a number or a dict binds without complaint and lands
+        # in the column as something no reader can resolve to a host -- so the elements are
+        # checked, not just the container.
+        spec = {"type": "list"}
+        self.assertEqual(daruk._coerce("/p", "replicas", spec, ["a", "b"]), ["a", "b"])
+        for bad in ("not-a-list", 3, {"a": 1}, ["a", 2], [None]):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError):
+                    daruk._coerce("/p", "replicas", spec, bad)
 
     def test_the_migration_lock_value_is_not_a_caller_parameter(self):
         # If a caller could choose the lock value, two callers could each "hold" a
