@@ -86,7 +86,7 @@ impl Backend for LocalVdisk {
         self.0.lock().expect("vdisk mutex poisoned").size
     }
     fn read_only(&self) -> bool {
-        self.0.lock().expect("vdisk mutex poisoned").class == "immutable"
+        self.0.lock().expect("vdisk mutex poisoned").class == crate::meta::CLASS_IMMUTABLE
     }
     fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
         self.0.lock().expect("vdisk mutex poisoned").read(offset, len)

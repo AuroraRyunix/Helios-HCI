@@ -10,6 +10,7 @@ nothing until now compared them to each other:
     create_upgrade_zip.py   components_map         component -> {source, target path}
     check_updates.py        components_paths       component -> target path (LCM)
     deploy_updates.py       SPECTRUM_BUILD_FILES   the console image's build context
+    deploy_updates.py       put_text_file(...)     what a rollout actually uploads
 
 Drift between any two of them is silent. `sync_provision.py` covering 21 of 24
 constants meant three daemons kept shipping the copy embedded at whatever commit
@@ -46,6 +47,22 @@ DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
 # `COPY <source> <destination>` in the Spectrum Dockerfile. Only the source matters
 # here: it names a file that has to be in the build context.
 DOCKERFILE_COPY_RE = re.compile(r"^COPY\s+(\S+)\s+\S+\s*$", re.MULTILINE)
+
+# Every "/usr/local/bin/..." literal in deploy_updates.py. Crude on purpose: the question
+# is whether the path appears at all, and a path that appears only in a comment is still
+# a path somebody has to keep in step.
+INSTALL_PATH_RE = re.compile(r'"(/usr/local/bin/[A-Za-z0-9_.-]+)"')
+
+# Components whose target path in components_map is not somewhere the rollout copies to,
+# because they live in the console container image instead. `spectrum_server` is staged
+# into the build context and installed by the Dockerfile; `Dockerfile` is the build
+# context itself. Both are still in components_map because the *signed package* installs
+# them that way -- the two paths genuinely differ, and that is worth an exception with a
+# reason rather than a silently missing entry.
+IMAGE_ONLY_TARGETS = {
+    "/usr/local/bin/spectrum_server",
+    "/usr/local/bin/Dockerfile",
+}
 
 # Files whose embedded string literals are dispatched to nodes and executed as
 # Python. `handle_cluster_create` sends these to every host and JSON-parses the
@@ -90,6 +107,45 @@ def embedded_script_literals(path):
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id.endswith("_script"):
                 yield target.id, node.lineno, node.value.value
+
+
+class TestRolloutCoverage(unittest.TestCase):
+    """`deploy_updates.py` vs `create_upgrade_zip.py`'s components_map.
+
+    These are the two ways code reaches a node and nothing compared them. The rollout
+    uploaded 27 of the 31 components the package installs, and the gap was invisible:
+    `helios_sidon.py` is imported at runtime by vali, mipha, hylia, valcli and the
+    console, and it reached nodes only through `provision.py`'s embedded copy. So a
+    rollout could change every caller of that module and leave the module itself at
+    whatever version the node was originally built with -- which is the worst version of
+    this bug, because the two halves drift apart while every deployment reports success.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.packaged = {
+            info["target"] for info in
+            literal_assignment(CREATE_UPGRADE_ZIP, "components_map").values()
+        }
+        cls.uploaded = set(INSTALL_PATH_RE.findall(read_text(DEPLOY_UPDATES)))
+
+    def test_the_rollout_uploads_everything_the_package_installs(self):
+        missing = sorted(self.packaged - self.uploaded - IMAGE_ONLY_TARGETS)
+        self.assertEqual(
+            missing,
+            [],
+            "create_upgrade_zip.py installs these to a node but deploy_updates.py never "
+            f"uploads them, so a rollout leaves them at whatever version provisioning "
+            f"put there: {missing}",
+        )
+
+    def test_the_image_only_exceptions_are_really_in_the_package(self):
+        """An exception for a component that is no longer packaged is an exception
+        nobody will notice has stopped meaning anything."""
+        stale = sorted(IMAGE_ONLY_TARGETS - self.packaged)
+        self.assertEqual(
+            stale, [],
+            f"IMAGE_ONLY_TARGETS excuses components_map entries that no longer exist: {stale}")
 
 
 class TestSpectrumBuildContext(unittest.TestCase):

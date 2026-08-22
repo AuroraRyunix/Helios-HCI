@@ -756,6 +756,18 @@ def deploy_to_node(ip):
             # The ordered schema, imported by the daemons at startup.
             print(f"[{ip}] Uploading helios_schema to /usr/local/bin/helios_schema.py...")
             put_text_file(sftp, local_helios_schema, "/usr/local/bin/helios_schema.py")
+
+            # The storage client, imported at runtime by vali, mipha, hylia, valcli and
+            # the console. It reached nodes only through provision.py's embedded copy
+            # until now, so a rollout could change every daemon that calls it and leave
+            # the module they call at whatever version the node was built with.
+            print(f"[{ip}] Uploading helios_sidon to /usr/local/bin/helios_sidon.py...")
+            put_text_file(sftp, "helios_sidon.py", "/usr/local/bin/helios_sidon.py")
+
+            # Imported by spectrum_server at runtime, so it needs to be on the host as
+            # well as inside the console image.
+            print(f"[{ip}] Uploading lanayru to /usr/local/bin/lanayru.py...")
+            put_text_file(sftp, "lanayru.py", "/usr/local/bin/lanayru.py")
             ssh.exec_command("chmod +x /usr/local/bin/impa")
             
             # 2a. Copy Bifrost CLI

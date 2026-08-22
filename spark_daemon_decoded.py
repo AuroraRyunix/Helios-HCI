@@ -3281,7 +3281,7 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     # migration capacity gate read unknown and refused every migration, and the console
     # rendered a cluster with no storage in it.
     DFS_VDISK_OPS = ("create", "attach", "detach", "delete", "status", "flush",
-                     "seal", "resize")
+                     "seal", "resize", "snapshot", "clone")
     DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
                     "purah-sweep", "purah-scrub", "purah-heal")
     DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS

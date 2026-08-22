@@ -23,9 +23,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
-use crate::meta::{cql_str, json_params, now_ms, Daruk};
+use crate::meta::{
+    block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_FORMING, CLASS_IMMUTABLE,
+    CLASS_RW, MAP_BATCH,
+};
 use crate::nbd::{self, Export, LocalVdisk};
 use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
+use crate::extent::vdisk_hash;
+use crate::vdisk::field_u64;
 use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
@@ -216,6 +221,8 @@ impl Daemon {
             "status" => self.op_status(req),
             "flush" => self.op_flush(req),
             "seal" => self.op_seal(req),
+            "snapshot" => self.op_snapshot(req),
+            "clone" => self.op_clone(req),
             "resize" => self.op_resize(req),
             "capacity" => self.op_capacity(),
             "peers" => self.op_peers(),
@@ -233,8 +240,8 @@ impl Daemon {
             return Err(Error::refused("size_bytes must be greater than zero".to_string()));
         }
         let container = req.get("container").and_then(Value::as_str).unwrap_or("default");
-        let class = req.get("class").and_then(Value::as_str).unwrap_or("rw");
-        if class != "rw" && class != "immutable" {
+        let class = req.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
+        if class != CLASS_RW && class != CLASS_IMMUTABLE {
             return Err(Error::refused(format!(
                 "class '{class}' is neither 'rw' nor 'immutable'"
             )));
@@ -320,6 +327,17 @@ impl Daemon {
         let row = rows
             .first()
             .ok_or_else(|| Error::refused(format!("vdisk {id} does not exist")))?;
+        // A vdisk still being built out of a parent's map is not servable, and the class
+        // says so. Attaching one would present a disk whose extents are half copied --
+        // which reads as zeroes where the copy has not reached, and is indistinguishable
+        // from a disk that was legitimately never written.
+        if row.get("class").and_then(Value::as_str) == Some(CLASS_FORMING) {
+            return Err(Error::refused(format!(
+                "vdisk {id} is still being formed from its parent and cannot be attached. \
+                 If no snapshot or clone is in progress, this one did not finish and the \
+                 vdisk should be deleted."
+            )));
+        }
         let cur_owner = row.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
         let cur_epoch = row.get("epoch").and_then(Value::as_i64).unwrap_or(0);
         let new_epoch = cur_epoch + 1;
@@ -342,11 +360,11 @@ impl Daemon {
                 ))
             })?;
             let size = row.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
-            let class = row.get("class").and_then(Value::as_str).unwrap_or("rw");
+            let class = row.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
             let backend = Arc::new(Forwarder {
                 vdisk: id.clone(),
                 size,
-                read_only: class == "immutable",
+                read_only: class == CLASS_IMMUTABLE,
                 owner: Arc::clone(owner_client),
             });
             let socket = self.serve_socket(&id, backend)?;
@@ -594,8 +612,8 @@ impl Daemon {
         let vdisk = self.owned_vdisk(&id)?;
         {
             let mut v = vdisk.lock().expect("vdisk mutex poisoned");
-            if v.class == "immutable" {
-                return Ok(json!({"vdisk_id": id, "class": "immutable", "already_sealed": true}));
+            if v.class == CLASS_IMMUTABLE {
+                return Ok(json!({"vdisk_id": id, "class": CLASS_IMMUTABLE, "already_sealed": true}));
             }
             v.close()?;
         }
@@ -603,7 +621,7 @@ impl Daemon {
             "/v1/dfs/vdisk-seal",
             json_params(vec![
                 ("vdisk_id", json!(id)),
-                ("expected_class", json!("rw")),
+                ("expected_class", json!(CLASS_RW)),
             ]),
         )?;
         if !cas.applied {
@@ -613,7 +631,183 @@ impl Daemon {
             )));
         }
         self.op_detach(req)?;
-        Ok(json!({"vdisk_id": id, "class": "immutable", "sealed": true}))
+        Ok(json!({"vdisk_id": id, "class": CLASS_IMMUTABLE, "sealed": true}))
+    }
+
+    /// Point-in-time copy of a vdisk, as an immutable child.
+    ///
+    /// The whole operation is a map copy. Sealed extent groups are immutable, so parent
+    /// and snapshot can share every one of them and neither can disturb the other: a
+    /// write to the parent is redirect-on-write, appending somewhere new and repointing
+    /// only the parent's own map. Nothing copies a byte of data, so this is O(extents in
+    /// the map) rather than O(bytes on disk), and a snapshot of a terabyte costs the same
+    /// as a snapshot of a gigabyte.
+    ///
+    /// Nothing here touches reference counts, because there are none. Purah marks from
+    /// `dfs_block_map` in its entirety, so a group referenced by the snapshot's rows is
+    /// live whether or not the snapshot is attached, and whether or not the parent still
+    /// exists. That is the property that makes snapshots nearly free here and it is worth
+    /// naming: the decision not to keep refcounts is what paid for this.
+    fn op_snapshot(&self, req: &Value) -> Result<Value> {
+        self.derive_child(req, CLASS_IMMUTABLE)
+    }
+
+    /// Writable copy of a vdisk.
+    ///
+    /// Identical to a snapshot except for the class the child ends up in. Safe for the
+    /// same reason: both sides redirect their writes into new extents and neither ever
+    /// writes into a shared sealed group. This is what clone-from-image is -- an image is
+    /// already immutable, so a fleet of VMs cloned from one template shares its extents
+    /// until each writes, and deduplication would be buying back something never spent.
+    fn op_clone(&self, req: &Value) -> Result<Value> {
+        self.derive_child(req, CLASS_RW)
+    }
+
+    fn derive_child(&self, req: &Value, class: &str) -> Result<Value> {
+        let parent_id = str_field(req, "vdisk_id")?;
+        let child_id = str_field(req, "child_id")?;
+        if child_id == parent_id {
+            return Err(Error::refused(
+                "a vdisk cannot be its own snapshot".to_string(),
+            ));
+        }
+        let daruk = self.daruk();
+
+        let rows = daruk.query(&format!(
+            "SELECT class, size_bytes, container, extent_bytes, egroup_bytes, replicas, rf \
+             FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+            cql_str(&parent_id)
+        ))?;
+        let parent = rows
+            .first()
+            .ok_or_else(|| Error::refused(format!("vdisk {parent_id} does not exist")))?;
+        let parent_class = parent.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
+
+        // A writable parent has a journal, and a journal is data the map does not know
+        // about yet. Draining it is what makes the copied map a complete answer -- and
+        // only the owner can drain, so a writable parent has to be attached here.
+        //
+        // An immutable parent needs none of this: it has no journal, its map is final,
+        // and any node may copy it. That is the clone-from-image case, and it is the
+        // common one.
+        match parent_class {
+            CLASS_IMMUTABLE => {}
+            CLASS_RW => {
+                let vdisk = self.owned_vdisk(&parent_id).map_err(|_| {
+                    Error::refused(format!(
+                        "vdisk {parent_id} is writable, so it has to be drained before it can \
+                         be copied, and only the node that owns it can do that. Attach it \
+                         here first, or seal it."
+                    ))
+                })?;
+                let mut v = vdisk.lock().expect("vdisk mutex poisoned");
+                if v.needs_drain() {
+                    v.drain()?;
+                }
+            }
+            other => {
+                return Err(Error::refused(format!(
+                    "vdisk {parent_id} has class '{other}' and cannot be copied"
+                )))
+            }
+        }
+
+        let size = parent.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0);
+        let container = parent.get("container").and_then(Value::as_str).unwrap_or("default");
+        let extent_bytes = parent.get("extent_bytes").and_then(Value::as_i64).unwrap_or(1 << 20);
+        let egroup_bytes = parent.get("egroup_bytes").and_then(Value::as_i64).unwrap_or(4 << 20);
+        let rf = parent.get("rf").and_then(Value::as_i64).unwrap_or(1).max(1);
+        let replicas: Vec<String> = parent
+            .get("replicas")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_else(|| vec![self.cfg.node.clone()]);
+
+        // The child row goes in first, as CLASS_FORMING, and the map follows.
+        //
+        // Neither order is free of a crash window, so the question is which leftover a
+        // later reader can name. Map-rows-first leaves a block map with no vdisk to
+        // explain it, which is the one state Purah cannot tell from a bug. Row-first at
+        // the final class would leave an attachable disk whose extents are half copied.
+        // A row in a class nothing will attach is neither: it says exactly what it is.
+        let cas = daruk.cas(
+            "/v1/dfs/vdisk-create",
+            json_params(vec![
+                ("vdisk_id", json!(child_id)),
+                ("container", json!(container)),
+                ("size_bytes", json!(size)),
+                ("class", json!(CLASS_FORMING)),
+                ("owner", json!("")),
+                ("epoch", json!(0)),
+                ("drain_seq", json!(0)),
+                ("extent_bytes", json!(extent_bytes)),
+                ("egroup_bytes", json!(egroup_bytes)),
+                ("created_at_ms", json!(now_ms())),
+                ("replicas", json!(replicas)),
+                ("rf", json!(rf)),
+                ("parent_vdisk", json!(parent_id)),
+            ]),
+        )?;
+        if !cas.applied {
+            return Err(Error::refused(format!("vdisk {child_id} already exists")));
+        }
+
+        let map_rows = daruk.query(&format!(
+            "SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash FROM hydra.dfs_block_map \
+             WHERE vdisk_id = {}",
+            cql_str(&parent_id)
+        ))?;
+        let mut copied: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(map_rows.len());
+        for row in map_rows {
+            let idx = field_u64(&row, "extent_index")?;
+            let egroup_id = row
+                .get("egroup_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::meta("block map row without egroup_id".to_string()))?
+                .to_string();
+            let offset = field_u64(&row, "egroup_offset")? as u32;
+            let length = field_u64(&row, "length")? as u32;
+            // Carried through, never recomputed. These extents keep the identity the
+            // parent wrote them under; rewriting them to say "the child wrote this"
+            // would be a lie, and copying them so it were true would make a snapshot a
+            // data copy, which is the entire thing it is not.
+            let vh = row
+                .get("vdisk_hash")
+                .and_then(Value::as_i64)
+                .map(|v| v as u64)
+                .unwrap_or_else(|| vdisk_hash(&parent_id));
+            copied.push((idx, egroup_id, offset, length, vh));
+        }
+        let extents = copied.len();
+        for batch in block_map_batches(&child_id, 0, &copied, MAP_BATCH) {
+            daruk.query(&batch)?;
+        }
+
+        // Only now is it a disk. Conditional on the class this call put there, so two
+        // concurrent snapshots into the same name cannot both believe they finished.
+        let done = daruk.cas(
+            "/v1/dfs/vdisk-class",
+            json_params(vec![
+                ("vdisk_id", json!(child_id)),
+                ("class", json!(class)),
+                ("expected_class", json!(CLASS_FORMING)),
+            ]),
+        )?;
+        if !done.applied {
+            return Err(Error::refused(format!(
+                "vdisk {child_id} was built but its class could not be set: it is {}",
+                done.current_str("class")
+            )));
+        }
+
+        Ok(json!({
+            "vdisk_id": child_id,
+            "parent_vdisk": parent_id,
+            "class": class,
+            "size_bytes": size,
+            "extents": extents,
+            "bytes_copied": 0,
+        }))
     }
 
     /// Grow a vdisk. Refuses to shrink, always.
@@ -626,7 +820,7 @@ impl Daemon {
         let new_size = u64_field(req, "size_bytes")?;
         let vdisk = self.owned_vdisk(&id)?;
         let mut v = vdisk.lock().expect("vdisk mutex poisoned");
-        if v.class == "immutable" {
+        if v.class == CLASS_IMMUTABLE {
             return Err(Error::refused(format!("vdisk {id} is immutable and cannot be resized")));
         }
         if new_size == v.size {

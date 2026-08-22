@@ -155,6 +155,32 @@ def delete_vdisk(vdisk_id, **kw):
     return call("delete", vdisk_id=vdisk_id, **kw)
 
 
+def snapshot(vdisk_id, child_id, **kw):
+    """A point-in-time immutable copy. `child_id` is the new vdisk.
+
+    Nothing is copied but the block map. Sealed extent groups are immutable, so parent
+    and snapshot share every one of them, and a later write to the parent is redirected
+    into new extents rather than over shared ones. The cost is proportional to the
+    number of extents in the map, not to the bytes on disk, so a snapshot of a terabyte
+    costs what a snapshot of a gigabyte costs.
+
+    A writable parent must be attached on the node this call reaches: it has to be
+    drained first, and only its owner can drain it. An immutable parent needs neither,
+    which is why cloning an image works from anywhere.
+    """
+    return call("snapshot", vdisk_id=vdisk_id, child_id=child_id, **kw)
+
+
+def clone(vdisk_id, child_id, **kw):
+    """A writable copy. A snapshot but for the class it ends in.
+
+    This is what clone-from-image is. The template is already immutable, so every VM
+    cloned from it shares its extents until each writes its own -- which is the win
+    deduplication is usually bought for, had without buying it.
+    """
+    return call("clone", vdisk_id=vdisk_id, child_id=child_id, **kw)
+
+
 def seal(vdisk_id, **kw):
     """Freeze a vdisk to the immutable class, permanently.
 
@@ -214,6 +240,7 @@ NBD_OPT_GO = 7
 NBD_REP_ACK = 1
 NBD_REP_INFO = 3
 NBD_INFO_EXPORT = 0
+NBD_CMD_READ = 0
 NBD_CMD_WRITE = 1
 NBD_CMD_FLUSH = 3
 NBD_CMD_DISC = 2
@@ -279,7 +306,7 @@ class NbdWriter(object):
             raise SidonError("nbd server never reported the export size", "io")
         return size
 
-    def _request(self, cmd, offset, length, data=None):
+    def _request(self, cmd, offset, length, data=None, want_data=False):
         import struct
         self.handle += 1
         self.sock.sendall(struct.pack(">IHHQQI", NBD_REQUEST_MAGIC, 0, cmd,
@@ -296,6 +323,9 @@ class NbdWriter(object):
             raise SidonError("nbd reply handle %d does not match request %d" % (handle, self.handle), "io")
         if errno:
             raise SidonError("nbd server returned errno %d at offset %d" % (errno, offset), "io")
+        if want_data:
+            return self._recv(length)
+        return None
 
     def write_stream(self, stream, total, progress=None):
         """Copy `total` bytes from `stream` into the vdisk. Returns bytes written."""
@@ -315,6 +345,36 @@ class NbdWriter(object):
             if progress:
                 progress(written)
         return written
+
+    def read(self, offset, length):
+        """Read `length` bytes at `offset`.
+
+        Here because verifying storage means reading it back. A writer that cannot read
+        can confirm that a write was accepted and never that the right bytes are there,
+        and "the server said OK" is the weakest possible evidence about a data path.
+        """
+        if length > NBD_CHUNK:
+            out = []
+            done = 0
+            while done < length:
+                want = min(NBD_CHUNK, length - done)
+                out.append(self._request(NBD_CMD_READ, offset + done, want, want_data=True))
+                done += want
+            return b"".join(out)
+        return self._request(NBD_CMD_READ, offset, length, want_data=True)
+
+    def write_at(self, offset, data):
+        """Write `data` at `offset`. `write_stream` is the bulk path; this is the small one."""
+        if offset + len(data) > self.size:
+            raise SidonError(
+                "write of %d bytes at %d runs past the end of a %d byte vdisk"
+                % (len(data), offset, self.size), "refused")
+        done = 0
+        while done < len(data):
+            chunk = data[done:done + NBD_CHUNK]
+            self._request(NBD_CMD_WRITE, offset + done, len(chunk), chunk)
+            done += len(chunk)
+        return done
 
     def flush(self):
         self._request(NBD_CMD_FLUSH, 0, 0)

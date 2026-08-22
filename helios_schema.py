@@ -226,6 +226,28 @@ MIGRATIONS = [
             "CREATE TABLE IF NOT EXISTS hydra.dfs_egroup_replicas ( egroup_id text, node text, path text, state text, PRIMARY KEY ((egroup_id), node) );",
         ],
     },
+    {
+        "id": "0007-dfs-snapshots",
+        "statements": [
+            # The identity an extent's footer was stamped with when it was written.
+            #
+            # A footer carries the vdisk hash and the extent index, so a correct checksum
+            # proves the bytes are undamaged and the identity proves they are the *right*
+            # bytes. Reads verified that against the reading vdisk's own hash, which is
+            # the same thing right up until extents are legitimately shared -- and a
+            # snapshot shares every one of them. The first snapshot taken returned EIO on
+            # every read, which is the guard doing its job on a case that had not existed
+            # when it was written.
+            #
+            # Stored per row because one vdisk's map can hold both: a clone inherits its
+            # parent's extents and stamps its own on whatever it rewrites.
+            #
+            # No backfill. A row without this column was written by the vdisk that owns
+            # it, so the reader falls back to its own hash, which is the right answer for
+            # every row that predates snapshots.
+            "ALTER TABLE hydra.dfs_block_map ADD vdisk_hash bigint;",
+        ],
+    },
 ]
 
 

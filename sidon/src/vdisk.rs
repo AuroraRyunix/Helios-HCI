@@ -21,7 +21,10 @@ use serde_json::{json, Value};
 use crate::err::{Error, Result};
 use crate::extent::{vdisk_hash, EgroupStore, OpenEgroup};
 use crate::journal::{Journal, FLAG_COMMIT};
-use crate::meta::{block_map_batches, cql_str, json_params, now_ms, Daruk};
+use crate::meta::{
+    block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_IMMUTABLE, CLASS_RW,
+    MAP_BATCH as MAP_ROWS_PER_BATCH,
+};
 use crate::overlay::Overlay;
 use crate::peer::{self, PeerClient, Request};
 
@@ -31,13 +34,24 @@ pub const MAX_RECORD: usize = 1 << 20;
 
 /// Rows per CQL batch when a drain commits its map. Large enough that a big drain is a
 /// handful of round trips, small enough to stay clear of Scylla's batch size warnings.
-const MAP_ROWS_PER_BATCH: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct ExtentLoc {
     pub egroup_id: String,
     pub offset: u32,
     pub length: u32,
+    /// The vdisk identity stamped into this extent's footer when it was written.
+    ///
+    /// Usually this vdisk's own, and for a snapshot or a clone it is the parent's: shared
+    /// extents are written once, under whichever vdisk wrote them, and copying the map
+    /// does not and must not rewrite them.
+    ///
+    /// Recorded per row rather than derived from the reader, because the footer check is
+    /// "are these the bytes that were written here", and once extents are legitimately
+    /// shared the reader's own identity is the wrong thing to compare against. Checking
+    /// it against the reader is what made the first snapshot return EIO on every read --
+    /// the guard firing correctly on a case that had not existed before.
+    pub vdisk_hash: u64,
 }
 
 pub struct Vdisk {
@@ -108,7 +122,7 @@ impl Vdisk {
         let class = row
             .get("class")
             .and_then(Value::as_str)
-            .unwrap_or("rw")
+            .unwrap_or(CLASS_RW)
             .to_string();
         let drain_seq = field_u64(row, "drain_seq").unwrap_or(0);
 
@@ -161,7 +175,7 @@ impl Vdisk {
 
     fn load_map(&mut self) -> Result<()> {
         let rows = self.daruk.query(&format!(
-            "SELECT extent_index, egroup_id, egroup_offset, length FROM hydra.dfs_block_map \
+            "SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash FROM hydra.dfs_block_map \
              WHERE vdisk_id = {}",
             cql_str(&self.id)
         ))?;
@@ -174,7 +188,16 @@ impl Vdisk {
                 .to_string();
             let offset = field_u64(&row, "egroup_offset")? as u32;
             let length = field_u64(&row, "length")? as u32;
-            self.map.insert(idx, ExtentLoc { egroup_id, offset, length });
+            // Absent on rows written before the column existed. Those extents were
+            // written by the vdisk that owns the row, so its own hash is the right
+            // answer and the migration needs no backfill.
+            // i64 on the wire; the round trip through two's complement is exact.
+            let vh = row
+                .get("vdisk_hash")
+                .and_then(Value::as_i64)
+                .map(|v| v as u64)
+                .unwrap_or(self.vh);
+            self.map.insert(idx, ExtentLoc { egroup_id, offset, length, vdisk_hash: vh });
         }
         Ok(())
     }
@@ -245,7 +268,7 @@ impl Vdisk {
             };
             let extent = match self
                 .store
-                .read_extent(&loc.egroup_id, loc.offset, loc.length, self.vh, idx)
+                .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, idx)
             {
                 Ok(bytes) => bytes,
                 Err(local) => {
@@ -298,7 +321,7 @@ impl Vdisk {
     /// Append a guest write to the journal and acknowledge it. The only durability call
     /// on this path is the journal's own `sync_data`.
     pub fn write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        if self.class == "immutable" {
+        if self.class == CLASS_IMMUTABLE {
             return Err(Error::refused(format!(
                 "vdisk {} is an immutable image and cannot be written",
                 self.id
@@ -549,7 +572,7 @@ impl Vdisk {
             // Verified exactly as a local read is. A replica is not more trustworthy for
             // being remote, and accepting its bytes unchecked would turn one damaged copy
             // into a silently propagated one.
-            if crate::extent::verify_footer(data, footer, self.vh, idx).is_ok() {
+            if crate::extent::verify_footer(data, footer, loc.vdisk_hash, idx).is_ok() {
                 return Some(data.to_vec());
             }
             eprintln!(
@@ -798,7 +821,7 @@ impl Vdisk {
         let mut indices: Vec<u64> = touched.into_iter().collect();
         indices.sort_unstable();
 
-        let mut new_rows: Vec<(u64, String, u32, u32)> = Vec::with_capacity(indices.len());
+        let mut new_rows: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(indices.len());
         let mut new_locs: Vec<(u64, ExtentLoc)> = Vec::with_capacity(indices.len());
         let mut sealed: Vec<String> = Vec::new();
 
@@ -815,7 +838,7 @@ impl Vdisk {
             if let Some(loc) = self.map.get(&idx).cloned() {
                 let cur = self
                     .store
-                    .read_extent(&loc.egroup_id, loc.offset, loc.length, self.vh, idx)?;
+                    .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, idx)?;
                 let n = cur.len().min(ext_len);
                 buf[..n].copy_from_slice(&cur[..n]);
             }
@@ -844,8 +867,16 @@ impl Vdisk {
             // survives a node loss, and draining it would *reduce* its durability. Data
             // that becomes less safe by being tidied up is not a tidy-up.
             self.replicate_extent(&eg_id, offset as u64, &framed)?;
-            new_rows.push((idx, eg_id.clone(), offset, ext_len as u32));
-            new_locs.push((idx, ExtentLoc { egroup_id: eg_id, offset, length: ext_len as u32 }));
+            new_rows.push((idx, eg_id.clone(), offset, ext_len as u32, self.vh));
+            new_locs.push((idx, ExtentLoc {
+                egroup_id: eg_id,
+                offset,
+                length: ext_len as u32,
+                // Written here, so stamped with this vdisk's identity. A clone
+                // that overwrites a shared extent lands here and takes its own,
+                // which is why the hash belongs to the row and not to the vdisk.
+                vdisk_hash: self.vh,
+            }));
 
             let full = self
                 .open_eg
@@ -1005,7 +1036,7 @@ impl Vdisk {
     }
 }
 
-fn field_u64(row: &Value, name: &str) -> Result<u64> {
+pub(crate) fn field_u64(row: &Value, name: &str) -> Result<u64> {
     match row.get(name) {
         Some(Value::Number(n)) if n.is_i64() => Ok(n.as_i64().unwrap_or(0).max(0) as u64),
         Some(Value::Number(n)) if n.is_u64() => Ok(n.as_u64().unwrap_or(0)),

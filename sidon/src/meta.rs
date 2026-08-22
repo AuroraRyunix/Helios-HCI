@@ -182,25 +182,53 @@ pub fn cql_str(s: &str) -> String {
 /// partitions, and every row in this batch is in the *same* partition (one vdisk), where
 /// unlogged batches are already atomic. Paying the batch-log write would be paying for a
 /// guarantee we already have.
+/// The three values `dfs_vdisks.class` may hold.
+///
+/// Constants rather than literals because the difference between them is whether a disk
+/// can be written, and a typo in a string comparison fails open: `class == "immutabel"`
+/// is false, and a golden image every VM is cloned from becomes writable.
+///
+/// `forming` is the state a snapshot or clone passes through while its map is being
+/// copied from its parent. Nothing attaches it, so a copy interrupted halfway leaves a
+/// row that says what it is rather than a disk that reads as half zeroes.
+pub const CLASS_RW: &str = "rw";
+pub const CLASS_IMMUTABLE: &str = "immutable";
+pub const CLASS_FORMING: &str = "forming";
+
+/// Rows per `BEGIN UNLOGGED BATCH`. Large enough that a big map is not thousands of round
+/// trips, small enough that one statement stays under Scylla's batch warning threshold.
+pub const MAP_BATCH: usize = 100;
+
+/// Rows are `(extent_index, egroup_id, egroup_offset, length, vdisk_hash)`.
+///
+/// `vdisk_hash` is per row and not per call, because one vdisk's map can legitimately
+/// mix identities: a clone inherits its parent's extents and stamps its own on anything
+/// it rewrites, so the two live side by side in the same map.
+///
+/// The hash is stored as a signed integer, because CQL has no unsigned type and a
+/// bigint that silently wrapped would compare unequal on the way back out and turn every
+/// read of a high-hashed vdisk into a misdirected-read error.
 pub fn block_map_batches(
     vdisk_id: &str,
     epoch: u64,
-    rows: &[(u64, String, u32, u32)],
+    rows: &[(u64, String, u32, u32, u64)],
     per_batch: usize,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for chunk in rows.chunks(per_batch.max(1)) {
         let mut sql = String::from("BEGIN UNLOGGED BATCH ");
-        for (extent_index, egroup_id, egroup_offset, length) in chunk {
+        for (extent_index, egroup_id, egroup_offset, length, vdisk_hash) in chunk {
             sql.push_str(&format!(
                 "INSERT INTO hydra.dfs_block_map (vdisk_id, extent_index, egroup_id, \
-                 egroup_offset, length, epoch) VALUES ({}, {}, {}, {}, {}, {}); ",
+                 egroup_offset, length, epoch, vdisk_hash) \
+                 VALUES ({}, {}, {}, {}, {}, {}, {}); ",
                 cql_str(vdisk_id),
                 extent_index,
                 cql_str(egroup_id),
                 egroup_offset,
                 length,
-                epoch
+                epoch,
+                *vdisk_hash as i64
             ));
         }
         sql.push_str("APPLY BATCH;");
@@ -242,9 +270,11 @@ mod tests {
     #[test]
     fn batches_chunk_and_close() {
         let rows = vec![
-            (0u64, "eg-a".to_string(), 0u32, 1024u32),
-            (1, "eg-a".to_string(), 1024, 1024),
-            (2, "eg-b".to_string(), 0, 1024),
+            (0u64, "eg-a".to_string(), 0u32, 1024u32, 0x1111_2222_3333_4444u64),
+            (1, "eg-a".to_string(), 1024, 1024, 0x1111_2222_3333_4444),
+            // A different identity in the same map: what a clone looks like once it has
+            // rewritten one of the extents it inherited.
+            (2, "eg-b".to_string(), 0, 1024, 0xAAAA_BBBB_CCCC_DDDD),
         ];
         let batches = block_map_batches("vd-1", 7, &rows, 2);
         assert_eq!(batches.len(), 2);
@@ -252,9 +282,26 @@ mod tests {
             assert!(b.starts_with("BEGIN UNLOGGED BATCH "));
             assert!(b.ends_with("APPLY BATCH;"));
             assert!(b.contains("epoch"));
+            assert!(b.contains("vdisk_hash"));
         }
         assert_eq!(batches[0].matches("INSERT INTO").count(), 2);
         assert_eq!(batches[1].matches("INSERT INTO").count(), 1);
+        // Written as a signed integer, and the top-bit case is the one that matters:
+        // an unsigned rendering would come back as a different number entirely.
+        assert!(batches[1].contains(&(0xAAAA_BBBB_CCCC_DDDDu64 as i64).to_string()));
+    }
+
+    #[test]
+    fn a_high_hash_survives_the_round_trip_through_cql() {
+        // The check the footer performs is an equality test, so a hash that does not
+        // come back bit-identical turns every read of that vdisk into "misdirected
+        // read". Signed is the only integer CQL has; this pins the conversion.
+        for h in [0u64, 1, i64::MAX as u64, 1u64 << 63, u64::MAX] {
+            let rows = vec![(0u64, "eg".to_string(), 0u32, 4u32, h)];
+            let sql = block_map_batches("vd", 0, &rows, 1).remove(0);
+            assert!(sql.contains(&(h as i64).to_string()), "{h:#x} missing from {sql}");
+            assert_eq!((h as i64) as u64, h);
+        }
     }
 
     #[test]

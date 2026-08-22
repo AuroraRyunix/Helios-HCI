@@ -394,12 +394,13 @@ LWT_OPS = {
     "/v1/dfs/vdisk-create": {
         "cql": (
             "INSERT INTO hydra.dfs_vdisks (vdisk_id, container, size_bytes, class, owner, "
-            "epoch, drain_seq, extent_bytes, egroup_bytes, created_at_ms, replicas, rf) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+            "epoch, drain_seq, extent_bytes, egroup_bytes, created_at_ms, replicas, rf, "
+            "parent_vdisk) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
         ),
         "binds": ("vdisk_id", "container", "size_bytes", "class", "owner", "epoch",
                   "drain_seq", "extent_bytes", "egroup_bytes", "created_at_ms",
-                  "replicas", "rf"),
+                  "replicas", "rf", "parent_vdisk"),
         "params": {
             "vdisk_id": {"type": "text", "required": True},
             "container": {"type": "text", "default": "default"},
@@ -415,6 +416,11 @@ LWT_OPS = {
             # because an append has to reach named hosts and a takeover has to fence them.
             "replicas": {"type": "list", "required": True},
             "rf": {"type": "int", "default": 1},
+            # Set on a snapshot or a clone, empty on an ordinary create. Recorded rather
+            # than derived because nothing else remembers where a child came from: the
+            # extents are shared, so there is no way to tell afterwards which vdisk was
+            # copied from which.
+            "parent_vdisk": {"type": "text", "default": ""},
         },
     },
     # Ownership transfer. Conditional on *both* halves of the pair: owner alone would
@@ -512,6 +518,21 @@ LWT_OPS = {
     # it is also what made the corruption the fencing work spent weeks defending against.
     # An immutable vdisk cannot express the hazard: writes are refused by class, so any
     # number of hosts may serve reads from it and none of them can write.
+    # The class transition a snapshot or clone finishes with.
+    #
+    # Conditional on the class the caller put there, which is what stops two concurrent
+    # copies into the same name from both believing they finished: the second one's
+    # create already lost the IF NOT EXISTS, and this makes sure it cannot then promote
+    # a row the first one is still filling in.
+    "/v1/dfs/vdisk-class": {
+        "cql": "UPDATE hydra.dfs_vdisks SET class = ? WHERE vdisk_id = ? IF class = ?",
+        "binds": ("class", "vdisk_id", "expected_class"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "class": {"type": "text", "required": True},
+            "expected_class": {"type": "text", "required": True},
+        },
+    },
     "/v1/dfs/vdisk-seal": {
         "cql": "UPDATE hydra.dfs_vdisks SET class = ? WHERE vdisk_id = ? IF class = ?",
         "binds": ("sealed_class", "vdisk_id", "expected_class"),
@@ -723,9 +744,26 @@ class CQLProxyHandler(BaseHTTPRequestHandler):
                     from cassandra.query import SimpleStatement
                     statement = SimpleStatement(post_data, consistency_level=ConsistencyLevel.ONE)
                     rows = session.execute(statement)
+                # Column names come from the result set, never from the namedtuple the
+                # driver built.
+                #
+                # `namedtuple` refuses field names that are Python keywords and, with
+                # rename=True as the driver uses, replaces them positionally: the `class`
+                # column of `hydra.dfs_vdisks` arrived as `field_2_`. Every reader asking
+                # for "class" got nothing and used its default, so a sealed image loaded
+                # as class `rw` -- and `Vdisk::write`'s immutability check, the thing that
+                # replaced DRBD's dual-primary for templates, could never fire. An
+                # attached image accepted writes.
+                #
+                # `class` is not special. `from`, `is`, `in`, `for`, `if`, `not`, `and`,
+                # `or`, `None`, `True` and the rest are all legal CQL identifiers and all
+                # renamed the same way, silently, at whatever position they happen to sit.
+                names = list(getattr(rows, "column_names", None) or [])
                 result = []
                 for row in rows:
-                    if hasattr(row, '_asdict'):
+                    if names and len(names) == len(row):
+                        result.append(dict(zip(names, row)))
+                    elif hasattr(row, '_asdict'):
                         result.append(row._asdict())
                     elif hasattr(row, '_fields'):
                         result.append(dict(zip(row._fields, row)))
