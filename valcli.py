@@ -344,38 +344,76 @@ def cmd_storage_list():
             r.get("path", "N/A"),
             ftt_val
         ])
-    print("=== Aether Storage Containers ===")
+    print("=== Storage Containers ===")
     print_table(headers, rows)
     print()
-    
 
-
-    # Standardized on Linstor/DRBD storage engine
-    controllers_str = "127.0.0.1"
+    # Per-node extent store. This replaces two LINSTOR listings -- `node list` and
+    # `volume list` -- printed as the controller rendered them. There is no controller,
+    # and each node answers for itself, so the table is built here from what each one
+    # says rather than from one host's view of everyone.
+    hosts = []
     try:
         if os.path.exists("/etc/hci/cluster.json"):
             with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-                if hosts:
-                    controllers_str = ",".join([h["ip"] for h in hosts])
+                hosts = json.load(f).get("hosts", [])
     except Exception:
         pass
+    if not hosts:
+        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
 
-    print("=== Aether Linstor Node Status ===")
-    res_nodes = subprocess.run(f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res_nodes.returncode != 0:
-        print("Warning: Could not query Aether volume list (systemd-aether not active or storage daemon offline).")
-        return
-    print(res_nodes.stdout.decode("utf-8", errors="ignore").strip())
+    print("=== Extent Store ===")
+    store_rows = []
+    for host in hosts:
+        ip = host.get("ip")
+        if not ip:
+            continue
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "capacity"})
+        if rc != 0 or not isinstance(body, dict):
+            store_rows.append([host.get("hostname") or ip, "unreachable",
+                               "-", "-", "-",
+                               (str(err) or "no response")[:40]])
+            continue
+        gib = 1024 ** 3
+        total = int(body.get("total_bytes") or 0)
+        avail = int(body.get("available_bytes") or 0)
+        store_rows.append([
+            body.get("node") or host.get("hostname") or ip,
+            "online",
+            "%.1f GiB" % (total / gib),
+            "%.1f GiB" % ((total - avail) / gib),
+            str(body.get("egroup_count", 0)),
+            "%.2f GiB" % (int(body.get("journal_bytes") or 0) / gib),
+        ])
+    print_table(["Node", "State", "Total", "Used", "Extent groups", "Journal"], store_rows)
     print()
-    
-    print("=== Aether Linstor Volume Status ===")
-    res_vols = subprocess.run(f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume list", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res_vols.returncode != 0:
-        print("Warning: Could not query Aether volume list (systemd-aether not active or storage daemon offline).")
+
+    print("=== Vdisks ===")
+    rc_v, out_v, err_v = run_cql_query(
+        "SELECT JSON vdisk_id, owner, epoch, rf, replicas, size_bytes FROM hydra.dfs_vdisks;")
+    if rc_v != 0:
+        print("Warning: hydra.dfs_vdisks could not be read (%s)." % (err_v or out_v))
         return
-    print(res_vols.stdout.decode("utf-8", errors="ignore").strip())
+    vdisk_rows = []
+    for line in (out_v or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        want = int(row.get("rf") or 0)
+        have = len(row.get("replicas") or [])
+        vdisk_rows.append([
+            row.get("vdisk_id", "?"),
+            row.get("owner") or "unattached",
+            str(row.get("epoch", "-")),
+            "%d/%d%s" % (have, want, "" if have >= want else "  DEGRADED"),
+            "%.1f GiB" % (int(row.get("size_bytes") or 0) / (1024 ** 3)),
+        ])
+    print_table(["Vdisk", "Owner", "Epoch", "Replicas", "Size"], sorted(vdisk_rows))
+
 
 def cmd_db_print():
     if len(sys.argv) < 3:
@@ -471,167 +509,108 @@ def cmd_storage_benchmark(container_name):
 
     import uuid
     bench_id = str(uuid.uuid4())[:8]
-    res_name = f"bench-temp-{bench_id}"
-    local_hostname = socket.gethostname()
-    
-    print(f"Creating temporary DRBD volume '{res_name}' in storage pool '{container_name}'...")
-    
-    # 1. Create resource definition
-    cmd_def = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition create {res_name}"
-    rc = subprocess.run(cmd_def, shell=True).returncode
-    if rc != 0:
-        print("Error: Failed to create temporary resource definition in Linstor.")
-        sys.exit(1)
-        
-    # 2. Create volume definition (100MB)
-    cmd_vol = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor volume-definition create {res_name} 100M"
-    rc = subprocess.run(cmd_vol, shell=True).returncode
-    if rc != 0:
-        print("Error: Failed to create temporary volume definition in Linstor.")
-        # Cleanup definition
-        subprocess.run(f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {res_name}", shell=True)
-        sys.exit(1)
-        
-    # 3. Create resource on local host
-    cmd_res = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource create {local_hostname} {res_name} --storage-pool {container_name}"
-    rc = subprocess.run(cmd_res, shell=True).returncode
-    if rc != 0:
-        print(f"Error: Failed to deploy temporary resource on {local_hostname}. Pool '{container_name}' might not exist.")
-        # Cleanup
-        subprocess.run(f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {res_name}", shell=True)
-        sys.exit(1)
-        
-    # 4. Wait for DRBD block device to appear
-    dev_path = f"/dev/drbd/by-res/{res_name}/0"
-    print(f"Waiting for block device {dev_path} to appear...")
-    device_ready = False
-    for _ in range(15):
-        if os.path.exists(dev_path):
-            device_ready = True
-            break
-        time.sleep(1)
-        
-    if not device_ready:
-        print(f"Error: Temporary block device {dev_path} failed to appear within 15 seconds.")
-        # Cleanup
-        subprocess.run(f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {res_name}", shell=True)
-        sys.exit(1)
-        
-    # 5. Perform the benchmark
-    print(f"Benchmarking storage pool '{container_name}' via raw block device {dev_path}...")
-    file_size_mb = 100
-    chunk_size = 1024 * 1024  # 1 MB
-    data = b"0" * chunk_size
-    
+    vdisk_id = "bench-temp-%s" % bench_id
+
+    # A throwaway vdisk, benchmarked through the same NBD path a guest uses.
+    #
+    # The version this replaces created a LINSTOR resource definition, a volume
+    # definition and a resource, waited for a DRBD device to appear, ran fio against it,
+    # then demoted and deleted -- five controller round trips and a device-node poll, each
+    # with its own cleanup path. What it measured also included DRBD's replication, which
+    # is the right thing to measure but was indistinguishable from the local disk's
+    # contribution.
+    print("Creating temporary vdisk '%s' (100 MiB)..." % vdisk_id)
+    rc_c, body_c, err_c = run_mtls_spark_api(
+        "127.0.0.1", "/api/v1/dfs/vdisk",
+        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": 100 * 1024 * 1024})
+    if rc_c != 0:
+        detail = body_c.get("error") if isinstance(body_c, dict) else err_c
+        print("Error: could not create the benchmark vdisk: %s" % detail)
+        return
+
+    socket_path = None
     try:
-        # Write test
-        print(f"[1/3] Writing {file_size_mb} MB of data...")
-        start_write = time.time()
-        with open(dev_path, "wb") as f:
-            for _ in range(file_size_mb):
-                f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        end_write = time.time()
-        write_time = end_write - start_write
-        write_speed = file_size_mb / write_time if write_time > 0 else 0
-        print(f"      Write Speed: {write_speed:.2f} MB/s (took {write_time:.2f}s)")
-        
-        # Read test
-        print(f"[2/3] Reading {file_size_mb} MB of data...")
-        start_read = time.time()
-        with open(dev_path, "rb") as f:
-            while f.read(chunk_size):
-                pass
-        end_read = time.time()
-        read_time = end_read - start_read
-        read_speed = file_size_mb / read_time if read_time > 0 else 0
-        print(f"      Read Speed:  {read_speed:.2f} MB/s (took {read_time:.2f}s)")
-        
+        rc_a, body_a, err_a = run_mtls_spark_api(
+            "127.0.0.1", "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vdisk_id})
+        if rc_a != 0 or not isinstance(body_a, dict):
+            detail = body_a.get("error") if isinstance(body_a, dict) else err_a
+            print("Error: could not attach the benchmark vdisk: %s" % detail)
+            return
+        socket_path = body_a.get("socket")
+        nbd_url = "nbd+unix:///%s?socket=%s" % (vdisk_id, socket_path)
+
+        print("[1/2] Sequential write...")
+        subprocess.run(
+            ["qemu-io", "-f", "raw", "-c", "write -P 0xAB 0 64M", nbd_url], check=False)
+        print("[2/2] Sequential read...")
+        subprocess.run(
+            ["qemu-io", "-f", "raw", "-c", "read -P 0xAB 0 64M", nbd_url], check=False)
     except Exception as ex:
-        print(f"Error during benchmark: {ex}")
+        print("Error during benchmark: %s" % ex)
     finally:
-        print("[3/3] Cleaning up temporary Linstor/DRBD resource...")
-        # Demote to secondary just in case
-        subprocess.run(f"drbdadm secondary {res_name} || true", shell=True)
-        # Delete resource definition
-        cmd_del = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {res_name}"
-        subprocess.run(cmd_del, shell=True)
-        
+        print("Cleaning up the temporary vdisk...")
+        # Detach before delete: a vdisk still being served is refused, which is the guard
+        # against removing storage from under something that has not let go of it.
+        run_mtls_spark_api("127.0.0.1", "/api/v1/dfs/vdisk",
+                           {"op": "detach", "vdisk_id": vdisk_id})
+        run_mtls_spark_api("127.0.0.1", "/api/v1/dfs/vdisk",
+                           {"op": "delete", "vdisk_id": vdisk_id})
+
     print("Benchmark completed.")
 
 def cmd_storage_cleanup_orphaned():
-    import glob
-    import re
-    
-    print("Fetching active virtual machines from database...")
-    active_vms = set()
-    rc, stdout, stderr = run_cql_query("SELECT JSON name FROM hydra.vms;")
-    if rc != 0:
-        print(f"Error querying active VMs: {stderr or stdout}")
-        sys.exit(1)
-        
-    if stdout:
-        for line in stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    row = json.loads(line)
-                    if "name" in row and row["name"]:
-                        active_vms.add(row["name"])
-                except Exception:
-                    pass
-                    
-    print(f"Found {len(active_vms)} active VM(s) in the cluster.")
-    
-    raw_files = glob.glob("/var/lib/hci/aether/volumes/*/*.raw")
-    vars_files = glob.glob("/var/lib/hci/aether/volumes/*/*_vars.fd")
-    
-    orphaned_files = []
-    for file_path in raw_files + vars_files:
-        normalized = file_path.replace("\\", "/")
-        if "default-image-container" in normalized:
+    """Report reclaimable space, and ask Purah to reclaim it.
+
+    This used to glob the container volumes for *.raw and *_vars.fd files and match the
+    filenames against hydra.vms -- a disk was a file named after its VM, so an orphan was
+    a file no row mentioned. An extent group is not named after anything: it holds extents
+    from whichever vdisk was draining, and the only statement of what is referenced is the
+    block map.
+
+    So this asks Purah rather than working it out. A second implementation of the mark
+    phase would be a second thing to get wrong, and the consequence of getting it wrong is
+    deleting live data. The two-scan rule means one invocation may report candidates and
+    reclaim nothing; that is the rule working, not a failure.
+    """
+    hosts = []
+    try:
+        if os.path.exists("/etc/hci/cluster.json"):
+            with open("/etc/hci/cluster.json", "r") as f:
+                hosts = json.load(f).get("hosts", [])
+    except Exception:
+        pass
+    if not hosts:
+        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
+
+    rows = []
+    for host in hosts:
+        ip = host.get("ip")
+        if not ip:
             continue
-            
-        filename = os.path.basename(normalized)
-        if filename.endswith(".raw"):
-            base = filename[:-4]
-            # Match <vm_name>_disk<idx>
-            match = re.match(r"^(.*)_disk\d+$", base)
-            if match:
-                vm_name = match.group(1)
-            else:
-                vm_name = base
-        elif filename.endswith("_vars.fd"):
-            vm_name = filename[:-8]
-        else:
+        rc, body, err = run_mtls_spark_api(
+            ip, "/api/v1/dfs/vdisk", {"op": "purah-sweep"})
+        if rc != 0 or not isinstance(body, dict):
+            detail = body.get("error") if isinstance(body, dict) else err
+            rows.append([host.get("hostname") or ip, "-", "-", "-",
+                         (str(detail) or "no response")[:40]])
             continue
-            
-        if vm_name not in active_vms:
-            orphaned_files.append(normalized)
-            
-    if not orphaned_files:
-        print("No orphaned virtual disk or NVRAM files found.")
-        return
-        
-    print(f"Found {len(orphaned_files)} orphaned file(s) to clean up:")
-    for file_path in orphaned_files:
-        print(f"  - {file_path}")
-        
-    # Perform deletion
-    deleted_count = 0
-    for file_path in orphaned_files:
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-                print(f"Successfully deleted: {file_path}")
-                deleted_count += 1
-            else:
-                print(f"File not found (already deleted): {file_path}")
-        except Exception as e:
-            print(f"Error deleting {file_path}: {e}")
-            
-    print(f"Orphaned storage cleanup complete. Deleted {deleted_count} file(s).")
+        reclaimed = body.get("reclaimed") or []
+        rows.append([
+            host.get("hostname") or ip,
+            str(body.get("egroups_known", 0)),
+            str(body.get("egroups_referenced", 0)),
+            "%d (%.1f MiB)" % (len(reclaimed),
+                               int(body.get("bytes_reclaimed") or 0) / (1024 * 1024)),
+            "%d awaiting a second scan" % body.get("skipped_awaiting_grace", 0),
+        ])
+
+    print_table(["Node", "Extent groups", "Referenced", "Reclaimed", "Notes"], rows)
+    print()
+    print("An extent group is reclaimed only after two consecutive scans have found it "
+          "unreferenced. One run reporting candidates and reclaiming nothing is that rule "
+          "working: a drain makes bytes durable before the map points at them, so a single "
+          "scan landing in that window sees a group that is milliseconds from being live.")
+
 
 def format_size(bytes_val):
     if bytes_val is None:
@@ -660,181 +639,137 @@ def cmd_image_list():
                 except Exception:
                     pass
 
-    # 2. Query Linstor volume definitions
-    controllers_str = "127.0.0.1"
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-                if hosts:
-                    controllers_str = ",".join([h["ip"] for h in hosts])
-    except Exception:
-        pass
+    # 2. Which images actually have storage behind them.
+    #
+    # An image is a sealed, immutable vdisk. The listing this replaces asked LINSTOR for
+    # volume definitions and matched the ones named img-*, which is the same question
+    # asked of a system that no longer exists.
+    backing = {}
+    rc_v, out_v, _err_v = run_cql_query(
+        "SELECT JSON vdisk_id, class, size_bytes FROM hydra.dfs_vdisks;")
+    if rc_v == 0:
+        for line in (out_v or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            vdisk_id = row.get("vdisk_id") or ""
+            if vdisk_id.startswith("img-"):
+                backing[vdisk_id] = row
 
-    cmd_vols = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor -m volume-definition list"
-    p = subprocess.run(cmd_vols, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    lin_vols = []
-    if p.returncode == 0 and p.stdout:
-        try:
-            raw_vols = json.loads(p.stdout.decode("utf-8", errors="ignore"))
-            if raw_vols and isinstance(raw_vols[0], list):
-                lin_vols = [item for sublist in raw_vols for item in sublist]
-            else:
-                lin_vols = raw_vols
-        except Exception:
-            pass
-
-    # Filter Linstor resources starting with img-
-    lin_img_vols = {v["name"]: v for v in lin_vols if v["name"].startswith("img-")}
-
-    # Merge and label
     records = {}
-
-    # Process ScyllaDB images
-    for db_img in db_images:
-        name = db_img.get("name")
-        if not name:
-            continue
-        path = db_img.get("path", "")
-        size_bytes = db_img.get("size_bytes")
-        img_type = db_img.get("type", "N/A")
-        
-        # Extract resource name from path
-        lin_res = None
-        if path.startswith("/dev/drbd/by-res/"):
-            parts = path.split("/")
-            if len(parts) >= 5:
-                lin_res = parts[4]
-                
-        has_lin = False
-        lin_size = None
-        if lin_res and lin_res in lin_img_vols:
-            has_lin = True
-            vdef = lin_img_vols[lin_res]
-            if vdef.get("volume_definitions"):
-                lin_size = vdef["volume_definitions"][0].get("size_kib", 0) * 1024
-                
-        size_disp = "N/A"
-        if size_bytes and size_bytes != 'None' and size_bytes != 'null':
-            size_disp = format_size(size_bytes)
-        elif lin_size is not None:
-            size_disp = format_size(lin_size)
-            
+    for image in db_images:
+        name = image.get("name") or image.get("filename") or "?"
+        vdisk_id = "img-%s" % slugify_image_name(name)
+        row = backing.pop(vdisk_id, None)
+        if row is None:
+            status = "Missing storage"
+        elif row.get("class") != "immutable":
+            # An immutable class is the whole guarantee: a sealed image cannot be written
+            # by anything, which is what replaced DRBD's dual-primary for templates. One
+            # still 'rw' was written and never sealed, and would let a guest scribble on
+            # the template every other guest is cloned from.
+            status = "Not sealed"
+        else:
+            status = "Active"
         records[name] = {
             "name": name,
-            "type": img_type,
-            "size": size_disp,
+            "type": image.get("type") or "unknown",
+            "size": format_size(image.get("size_bytes")),
             "scylla": "Yes",
-            "linstor": "Yes" if has_lin else "No",
-            "status": "Active" if has_lin else "Missing Storage"
+            "vdisk": "Yes" if row else "No",
+            "status": status,
         }
 
-    # Process remaining Linstor image volumes (orphaned)
-    for lin_name, vdef in lin_img_vols.items():
-        referenced = False
-        for db_img in db_images:
-            path = db_img.get("path", "")
-            if f"/by-res/{lin_name}/" in path or path.endswith(f"/{lin_name}"):
-                referenced = True
-                break
-        if not referenced:
-            size_kib = 0
-            if vdef.get("volume_definitions"):
-                size_kib = vdef["volume_definitions"][0].get("size_kib", 0)
-            size_disp = format_size(size_kib * 1024)
-            img_type = "iso" if "iso" in lin_name.lower() else "disk"
-            
-            records[lin_name] = {
-                "name": lin_name,
-                "type": img_type,
-                "size": size_disp,
-                "scylla": "No",
-                "linstor": "Yes",
-                "status": "Orphaned"
-            }
+    # Anything left is a vdisk named like an image with no catalogue row behind it.
+    for vdisk_id, row in backing.items():
+        name = vdisk_id[4:]
+        records[name] = {
+            "name": name,
+            "type": "unknown",
+            "size": format_size(row.get("size_bytes")),
+            "scylla": "No",
+            "vdisk": "Yes",
+            "status": "Orphaned",
+        }
 
-    headers = ["Image Name", "Type", "Size", "ScyllaDB Registered", "Linstor Resource", "Status"]
+    headers = ["Image Name", "Type", "Size", "ScyllaDB Registered", "Vdisk", "Status"]
     rows = []
     for name, r in sorted(records.items()):
-        rows.append([
-            r["name"],
-            r["type"],
-            r["size"],
-            r["scylla"],
-            r["linstor"],
-            r["status"]
-        ])
-
+        rows.append([r["name"], r["type"], r["size"], r["scylla"], r["vdisk"], r["status"]])
     print_table(headers, rows)
 
 def cmd_image_delete(image_name):
-    # 1. Resolve Linstor resource name
+    # 1. Resolve the vdisk behind the image.
+    #
+    # The recorded path is the NBD socket, so the id is derivable from the name -- but the
+    # row is read anyway, because an image whose row says something else is an image the
+    # catalogue and the storage layer disagree about, and deleting the derived one would
+    # leave the recorded one allocated and unreachable.
     cql = f"SELECT JSON name, path FROM hydra.valhalla_images WHERE name = '{image_name}';"
     rc, stdout, err = run_cql_query(cql)
-    res_name = None
     in_db = False
+    recorded_path = None
     if rc == 0 and stdout:
         for line in stdout.splitlines():
             line = line.strip()
             if line.startswith("{") and line.endswith("}"):
                 try:
                     row = json.loads(line)
-                    path = row.get("path", "")
-                    in_db = True
-                    if path.startswith("/dev/drbd/by-res/"):
-                        parts = path.split("/")
-                        if len(parts) >= 5:
-                            res_name = parts[4]
                 except Exception:
-                    pass
+                    continue
+                if row.get("name"):
+                    in_db = True
+                    recorded_path = row.get("path")
 
-    if not res_name:
-        if image_name.startswith("img-"):
-            res_name = image_name
-        else:
-            res_name = f"img-{image_name}"
+    vdisk_id = None
+    if recorded_path and recorded_path.startswith("/var/lib/hci/sidon/nbd/"):
+        vdisk_id = os.path.basename(recorded_path)
+        if vdisk_id.endswith(".sock"):
+            vdisk_id = vdisk_id[:-5]
+    if not vdisk_id:
+        vdisk_id = image_name if image_name.startswith("img-") else "img-%s" % slugify_image_name(image_name)
 
-    print(f"Target Linstor resource: '{res_name}'")
-    
-    # 2. Get all hosts to run drbdadm secondary on them
-    hosts = []
+    print(f"Target vdisk: '{vdisk_id}'")
+
+    # 2. Detach, then delete.
+    #
+    # Detach first on every node: an image is attached read-only wherever a guest is using
+    # it, and Sidon refuses to delete one it is still serving. That refusal is the guard
+    # against removing a template out from under running VMs, so it is worked with rather
+    # than forced. This used to run `drbdadm secondary` on every host for the same reason,
+    # and had to, because nothing else would have stopped it.
+    hosts_list = []
     try:
         if os.path.exists("/etc/hci/cluster.json"):
             with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = [h["ip"] for h in cdata.get("hosts", [])]
+                hosts_list = json.load(f).get("hosts", [])
     except Exception:
         pass
-    if not hosts:
-        hosts = ["127.0.0.1"]
+    if not hosts_list:
+        hosts_list = [{"ip": "127.0.0.1"}]
 
-    # Demote on all hosts
-    for ip in hosts:
-        print(f"Demoting DRBD resource '{res_name}' to secondary on {ip}...")
-        rc_sec, stdout_sec, stderr_sec = run_remote_spark(ip, f"drbdadm secondary {res_name}")
-        if rc_sec != 0 and "Device or resource busy" in (stderr_sec or stdout_sec):
-            print(f"Warning/Error on {ip}: {stderr_sec or stdout_sec}")
+    for host in hosts_list:
+        ip = host.get("ip")
+        if not ip:
+            continue
+        run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id})
 
-    # 3. Delete in Linstor
-    controllers_str = "127.0.0.1"
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts_list = cdata.get("hosts", [])
-                if hosts_list:
-                    controllers_str = ",".join([h["ip"] for h in hosts_list])
-    except Exception:
-        pass
-
-    print(f"Deleting resource definition '{res_name}' in Linstor...")
-    cmd_del = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {res_name}"
-    rc_del = subprocess.run(cmd_del, shell=True).returncode
+    # 3. Delete it. The extents themselves are left for Purah: an image may be the parent
+    # of a snapshot chain, and deleting shared data because one referrer went away is the
+    # bug reference counting exists to cause.
+    print(f"Deleting vdisk '{vdisk_id}'...")
+    rc_del, body_del, err_del = run_mtls_spark_api(
+        hosts_list[0].get("ip", "127.0.0.1"), "/api/v1/dfs/vdisk",
+        {"op": "delete", "vdisk_id": vdisk_id})
     if rc_del != 0:
-        print("Warning: Failed to delete Linstor resource definition. It may not exist or is in use.")
+        detail = body_del.get("error") if isinstance(body_del, dict) else err_del
+        print(f"Warning: could not delete the vdisk: {detail}")
     else:
-        print("Successfully deleted Linstor resource definition.")
+        print("Successfully deleted the vdisk. Its extents will be reclaimed by Purah.")
 
     # 4. Delete from ScyllaDB
     if in_db:
@@ -848,116 +783,72 @@ def cmd_image_delete(image_name):
         print("Image was not registered in ScyllaDB. No metadata deletion needed.")
 
 def cmd_disk_list():
-    # 1. Query ScyllaDB VMs
-    cql = "SELECT JSON name, disk_path, disks_list FROM hydra.vms;"
-    rc, stdout, err = run_cql_query(cql)
-    disk_to_vm = {}
+    """Every vdisk, who owns it, and whether it is holding its replicas.
+
+    The version this replaces cross-referenced two LINSTOR listings against hydra.vms and
+    filtered out the names it knew were not VM disks -- img-*, linstor-db, bench-*. The
+    map holds all of it in one table, and there is no controller database to exclude.
+    """
+    attachments = {}
+    rc, stdout, _err = run_cql_query("SELECT JSON name, disks_list FROM hydra.vms;")
     if rc == 0 and stdout:
         for line in stdout.splitlines():
             line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    row = json.loads(line)
-                    vm_name = row.get("name")
-                    disks_list = row.get("disks_list", "")
-                    
-                    if disks_list and disks_list != "NONE" and disks_list != "None" and disks_list != 'null':
-                        disks_payload = disks_list.split(",")
-                        for idx, entry in enumerate(disks_payload):
-                            disk_res_name = f"{vm_name}-disk{idx}"
-                            disk_to_vm[disk_res_name] = vm_name
-                except Exception:
-                    pass
+            if not line.startswith("{"):
+                continue
+            try:
+                vm = json.loads(line)
+            except Exception:
+                continue
+            vm_name = vm.get("name")
+            disks = vm.get("disks_list") or ""
+            if not vm_name:
+                continue
+            count = len([d for d in disks.split(",") if d.strip()]) if disks and disks != "NONE" else 1
+            for idx in range(count):
+                attachments["%s-disk%d" % (vm_name, idx)] = vm_name
 
-    # 2. Query Linstor volume definitions
-    controllers_str = "127.0.0.1"
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-                if hosts:
-                    controllers_str = ",".join([h["ip"] for h in hosts])
-    except Exception:
-        pass
+    rc_v, out_v, err_v = run_cql_query(
+        "SELECT JSON vdisk_id, owner, size_bytes, class, rf, replicas FROM hydra.dfs_vdisks;")
+    if rc_v != 0:
+        print("Error: hydra.dfs_vdisks could not be read: %s" % (err_v or out_v))
+        return
 
-    cmd_vdef = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor -m volume-definition list"
-    p = subprocess.run(cmd_vdef, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    lin_vdefs = []
-    if p.returncode == 0 and p.stdout:
-        try:
-            raw_vdefs = json.loads(p.stdout.decode("utf-8", errors="ignore"))
-            if raw_vdefs and isinstance(raw_vdefs[0], list):
-                lin_vdefs = [item for sublist in raw_vdefs for item in sublist]
-            else:
-                lin_vdefs = raw_vdefs
-        except Exception:
-            pass
-
-    # We query volume list to get storage pool
-    cmd_vols = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor -m volume list"
-    p = subprocess.run(cmd_vols, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    lin_vols = []
-    if p.returncode == 0 and p.stdout:
-        try:
-            raw_vols = json.loads(p.stdout.decode("utf-8", errors="ignore"))
-            if raw_vols and isinstance(raw_vols[0], list):
-                lin_vols = [item for sublist in raw_vols for item in sublist]
-            else:
-                lin_vols = raw_vols
-        except Exception:
-            pass
-
-    # Extract storage pool names for each resource
-    res_pools = {}
-    for vol in lin_vols:
-        rname = vol.get("name")
-        if not rname:
-            continue
-        for v in vol.get("volumes", []):
-            pool = v.get("storage_pool_name")
-            if pool and pool != "DfltDisklessStorPool":
-                res_pools[rname] = pool
-                break
-
-    # Process Linstor disks (non-image, non-system, non-bench)
     disks = []
-    for vd in lin_vdefs:
-        rname = vd.get("name")
-        if not rname:
+    for line in (out_v or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
             continue
-        if rname.startswith("img-") or rname == "linstor-db" or rname.startswith("bench-temp-"):
+        try:
+            row = json.loads(line)
+        except Exception:
             continue
-            
-        size_kib = 0
-        if vd.get("volume_definitions"):
-            size_kib = vd["volume_definitions"][0].get("size_kib", 0)
-        size_disp = format_size(size_kib * 1024)
-        
-        attached_vm = disk_to_vm.get(rname, "Unattached")
-        pool = res_pools.get(rname, "N/A")
-        status = "Active" if attached_vm != "Unattached" else "Orphaned"
-        
+        vdisk_id = row.get("vdisk_id") or "?"
+        if vdisk_id.startswith("img-") or vdisk_id.startswith("bench-temp-"):
+            continue
+        want = int(row.get("rf") or 0)
+        have = len(row.get("replicas") or [])
+        if row.get("class") == "immutable":
+            status = "Sealed"
+        elif want and have < want:
+            status = "Degraded (%d/%d replicas)" % (have, want)
+        elif not row.get("owner"):
+            status = "Unattached"
+        else:
+            status = "Active"
         disks.append({
-            "name": rname,
-            "size": size_disp,
-            "pool": pool,
-            "attached": attached_vm,
-            "status": status
+            "name": vdisk_id,
+            "size": format_size(row.get("size_bytes")),
+            "owner": row.get("owner") or "-",
+            "attached": attachments.get(vdisk_id, "-"),
+            "status": status,
         })
 
-    headers = ["Disk Name", "Size", "Storage Pool", "Attached To VM", "Status"]
-    rows = []
-    for d in sorted(disks, key=lambda x: x["name"]):
-        rows.append([
-            d["name"],
-            d["size"],
-            d["pool"],
-            d["attached"],
-            d["status"]
-        ])
-
+    headers = ["Vdisk", "Size", "Owner", "Attached To VM", "Status"]
+    rows = [[d["name"], d["size"], d["owner"], d["attached"], d["status"]]
+            for d in sorted(disks, key=lambda x: x["name"])]
     print_table(headers, rows)
+
 
 def cmd_disk_delete(disk_name):
     # 1. Query ScyllaDB VMs to check attachments
@@ -1001,31 +892,29 @@ def cmd_disk_delete(disk_name):
     if not hosts:
         hosts = ["127.0.0.1"]
 
-    for ip in hosts:
-        print(f"Demoting DRBD resource '{disk_name}' to secondary on {ip}...")
-        rc_sec, stdout_sec, stderr_sec = run_remote_spark(ip, f"drbdadm secondary {disk_name}")
-        if rc_sec != 0 and "Device or resource busy" in (stderr_sec or stdout_sec):
-            print(f"Warning/Error on {ip}: {stderr_sec or stdout_sec}")
+    # Detach on every node, then delete.
+    #
+    # This used to run `drbdadm secondary` on every host before deleting the resource
+    # definition, because nothing else would stop a host holding the device open. Sidon
+    # refuses to delete a vdisk it is still serving, so the detach is worked with rather
+    # than forced -- and a refusal here means something still has the disk, which is
+    # exactly what should stop a delete.
+    for host in hosts_list:
+        ip = host.get("ip")
+        if not ip:
+            continue
+        run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": disk_name})
 
-    # 4. Delete from Linstor
-    controllers_str = "127.0.0.1"
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts_list = cdata.get("hosts", [])
-                if hosts_list:
-                    controllers_str = ",".join([h["ip"] for h in hosts_list])
-    except Exception:
-        pass
-
-    print(f"Deleting resource definition '{disk_name}' in Linstor...")
-    cmd_del = f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor resource-definition delete {disk_name}"
-    rc_del = subprocess.run(cmd_del, shell=True).returncode
+    print(f"Deleting vdisk '{disk_name}'...")
+    rc_del, body_del, err_del = run_mtls_spark_api(
+        hosts_list[0].get("ip", "127.0.0.1"), "/api/v1/dfs/vdisk",
+        {"op": "delete", "vdisk_id": disk_name})
     if rc_del != 0:
-        print("Warning: Failed to delete Linstor resource definition. It may not exist or is in use.")
-    else:
-        print("Successfully deleted Linstor resource definition.")
+        detail = body_del.get("error") if isinstance(body_del, dict) else err_del
+        print(f"Error: could not delete the vdisk: {detail}")
+        return
+    print("Successfully deleted the vdisk. Its extents will be reclaimed by Purah.")
+
 
 def run_node_checks(ip, hostname, local_ip, results_dict):
     cmd = "/usr/local/bin/mcli-runner --category all"
@@ -1885,10 +1774,10 @@ def print_usage():
     print("        --force-stop                 Forcefully stop/suspend VMs that fail migration")
     print("  valcli host.maintenance.leave <h>  Take host (or '--all') out of maintenance mode")
     print("  valcli cluster.vip.set <vip>       Configure cluster-wide Virtual IP (VIP)")
-    print("  valcli storage.list                List all Aether storage containers")
+    print("  valcli storage.list                List storage containers, per-node extent stores and vdisks")
     print("  valcli storage.benchmark <name>    Run safe read/write performance benchmark")
     print("  valcli storage.cleanup_orphaned    Delete orphaned virtual disk and NVRAM files")
-    print("  valcli image.list                  List all ScyllaDB registered and Linstor images")
+    print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
     print("  valcli disk.delete <name>          Delete virtual disk (fails if disk is attached to a VM)")
@@ -1898,7 +1787,7 @@ def print_usage():
     print("  valcli scheduler.trigger <name>    Manually trigger execution of a Dagur job")
     print("  valcli system.cleanup              Prune execution history tables older than 3 days")
     print("  valcli backup.target [<dir>]       Show or set where metadata backups are written")
-    print("  valcli backup.run                  Back up the hydra keyspace, LINSTOR DB and /etc/hci")
+    print("  valcli backup.run                  Back up the hydra keyspace and /etc/hci")
     print("      Options:")
     print("        --all-nodes                  Also run on every peer, in parallel")
     print("        --include-ca                 Also capture the cluster CA and node private keys")
@@ -1911,8 +1800,8 @@ def print_usage():
     print("        --extract-only <dir>         Unpack the artefact without touching the cluster")
     print("        --force                      Proceed despite a schema-version mismatch")
     print("  valcli backup.prune                Apply the retention policy now (--dry-run to preview)")
-    print("      Note: backups cover cluster METADATA only. Guest data inside DRBD")
-    print("      volumes is not backed up by any of this -- see docs/backup_restore.md.")
+    print("      Note: backups cover cluster METADATA only. Guest data inside")
+    print("      vdisks is not backed up by any of this -- see docs/backup_restore.md.")
     print("  valcli db.print <table_name>       Print ScyllaDB table contents as ASCII table")
     print("      Options:")
     print("        --columns c1,c2              Specify a comma-separated list of columns to print")
