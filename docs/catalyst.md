@@ -20,6 +20,48 @@ Catalyst is the task orchestrator, coordinator, and execution scheduler for the 
 
 ---
 
+## Claiming a Scheduler Tick
+
+The scheduler thread reads `last_run_epoch`, decides a job is due, and writes the current
+time back. That read-modify-write used to be blind, so it submitted the job **once per
+scheduler that reached the row** — two Dagur runs of the same backup, the same scrub, the
+same compaction, against the same volumes at the same moment.
+
+Two schedulers is not a hypothetical. `is_zookeeper_leader()` probes ZooKeeper's four-letter
+`stat` and, when the leader does not answer on port 9091, falls back to *"lowest node with
+9091 open"*. A ZooKeeper that is slow, restarting or partitioned gives that answer to two
+nodes at once, and both then believe they are the only scheduler.
+
+`claim_scheduled_run()` takes the tick through Daruk's
+[`POST /v1/schedule/claim-job`](./daruk.md#claiming-a-scheduler-tick), whose
+`IF last_run_epoch = ?` makes the claim and the clock one Paxos round:
+
+```
+read hydra.dagur_schedules  →  job is due  →  claim the tick  →  submit to Dagur
+                                                    │
+                                                    └─ refused: another Catalyst
+                                                       already has it. Skip.
+```
+
+Three behaviours the loop depends on:
+
+* **The claim comes before the work.** Nothing is written to `hydra.catalyst_tasks` and
+  nothing is queued until the tick is ours.
+* **An unanswerable claim skips the tick.** If Daruk cannot be reached the job does *not*
+  run: a skipped tick runs on the next pass ten seconds later, and a tick run twice cannot
+  be taken back.
+* **The expected clock is the value that was read, nulls included.** `last_run_epoch` is
+  null — not `0` — for a schedule inserted without one, and `IF last_run_epoch = 0` does not
+  match a null. (Reading it as `0` also used to raise `TypeError` inside the loop's
+  `try`, which cost every *other* schedule that pass, silently.)
+
+> [!NOTE]
+> Spectrum runs its own copy of this loop over the same table, and Mimir runs the same shape
+> over `hydra.mimir_schedules`. Both still write the clock blind and can race a Catalyst
+> that is claiming correctly. `POST /v1/schedule/claim-check` exists for the Mimir side.
+
+---
+
 ## API Endpoints Reference
 
 Catalyst binds strictly to `127.0.0.1` and is accessed internally by Prism/Spectrum:

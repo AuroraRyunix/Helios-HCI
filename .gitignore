@@ -20,3 +20,12 @@ spark_daemon_decoded.py.bak
 
 # Rust build artifacts
 agahnim/target/
+
+# Phoenix rewrite of Spectrum (spectrum_phx)
+/spectrum_phx/_build/
+/spectrum_phx/deps/
+/spectrum_phx/.elixir_ls/
+/spectrum_phx/priv/static/assets/
+/spectrum_phx/priv/static/cache_manifest.json
+/spectrum_phx/erl_crash.dump
+/spectrum_phx/*.ez

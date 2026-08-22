@@ -20,11 +20,32 @@ try:
 except Exception:
     pass
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    local = globals().get("LOCAL_IP")
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command):
     """Executes a command on local/remote node via spark-daemon mTLS API."""
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
@@ -42,7 +63,8 @@ def run_mtls_api(ip, path, payload, method="POST"):
     def execute_request(target_ip):
         context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
         context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-        context.check_hostname = False
+        target_ip, verify_identity = spark_endpoint(target_ip)
+        context.check_hostname = verify_identity
         url = f"https://{target_ip}:9099{path}"
         data = None
         if payload is not None and method != "GET":
@@ -1123,9 +1145,14 @@ def cmd_health_check():
 def run_spectrum_api(path, method="GET", payload=None):
     import ssl
     import urllib.request
-    ctx = ssl.create_default_context()
+    # Pinned to the console certificate rather than CERT_NONE. Loopback, so the exposure
+    # was small, but "verify nothing" and "verify the local console" are different things.
+    # check_hostname stays off because that certificate is CN=Spectrum and provisioning
+    # installs the same one on every node, so there is no per-node name to match --
+    # pinning the certificate is the identity check.
+    ctx = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spectrum/certs/server.crt")
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
     
     url = f"https://127.0.0.1:8443{path}"
     data = None
@@ -1282,16 +1309,30 @@ def get_zookeeper_leader_ip():
     candidates.sort()
     return candidates[0]
 
+def catalyst_client_context():
+    """Client certificate for Catalyst, which now requires mutual TLS.
+
+    It dispatches VM lifecycle work and used to accept it from anything that could open
+    a socket to port 9091, checking neither a credential nor a source address.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                         cafile="/etc/hci/spark/certs/ca.crt")
+    context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                            keyfile="/etc/hci/spark/certs/node.key")
+    return context
+
+
 def wait_for_catalyst_task(task_id):
     leader_ip = get_zookeeper_leader_ip()
-    url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
     print(f"Waiting for Catalyst task {task_id} to finish...")
     
     last_progress = -1
     while True:
         try:
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=35) as response:
+            with urllib.request.urlopen(
+                    req, context=catalyst_client_context(), timeout=35) as response:
                 if response.status == 200:
                     res = json.loads(response.read().decode("utf-8"))
                     status = res.get("status")
@@ -1311,7 +1352,7 @@ def wait_for_catalyst_task(task_id):
                 elif response.status == 204:
                     # Long polling timeout, update leader IP and keep waiting
                     leader_ip = get_zookeeper_leader_ip()
-                    url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+                    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
                     continue
                 else:
                     print(f"Unexpected response status from Catalyst: {response.status}")
@@ -1324,7 +1365,7 @@ def wait_for_catalyst_task(task_id):
             # Maybe leader is switching/rebooting, try to find new leader IP
             time.sleep(2)
             leader_ip = get_zookeeper_leader_ip()
-            url = f"http://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+            url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
 
 def cmd_host_maintenance_enter(hostname, force_stop=False):
     if hostname == "--all":
@@ -1775,6 +1816,57 @@ def cmd_vm_edit():
         print(f"Error updating VM: {data}")
         sys.exit(1)
 
+SAGA_BIN = "/usr/local/bin/saga"
+
+
+def run_saga(args):
+    """Hand a subcommand to Saga, the metadata backup tool, and exit with its code.
+
+    A pass-through rather than a reimplementation. Saga has to work on a host whose
+    metadata layer is the broken thing -- that is the whole point of a restore -- so it
+    talks to cqlsh and nodetool directly and does not go through Daruk or Spectrum the
+    way the rest of this CLI does. Wrapping it here keeps `valcli` the one place an
+    operator looks without duplicating any of that.
+
+    Output is not captured: a backup prints progress for as long as it runs, and
+    swallowing it until the end would make a slow run look like a hung one.
+    """
+    if not os.path.exists(SAGA_BIN):
+        print(f"Error: {SAGA_BIN} is not installed on this node.")
+        print("Backups run on the node that holds the data; deploy saga and retry.")
+        sys.exit(1)
+    try:
+        result = subprocess.run([SAGA_BIN] + list(args))
+    except KeyboardInterrupt:
+        sys.exit(130)
+    sys.exit(result.returncode)
+
+
+def cmd_backup_run():
+    """valcli backup.run [--all-nodes] [--include-ca] [--allow-same-filesystem] ..."""
+    run_saga(["backup"] + sys.argv[2:])
+
+
+def cmd_backup_list():
+    run_saga(["list"] + sys.argv[2:])
+
+
+def cmd_backup_verify():
+    run_saga(["verify"] + sys.argv[2:])
+
+
+def cmd_backup_restore():
+    run_saga(["restore"] + sys.argv[2:])
+
+
+def cmd_backup_prune():
+    run_saga(["prune"] + sys.argv[2:])
+
+
+def cmd_backup_target():
+    run_saga(["target"] + sys.argv[2:])
+
+
 def print_usage():
     print("Valkyrie CLI (valcli) v1.2.0 - Helios HCI command-line manager\n")
     print("Usage:")
@@ -1805,6 +1897,22 @@ def print_usage():
     print("  valcli scheduler.history           List past executions of Dagur jobs")
     print("  valcli scheduler.trigger <name>    Manually trigger execution of a Dagur job")
     print("  valcli system.cleanup              Prune execution history tables older than 3 days")
+    print("  valcli backup.target [<dir>]       Show or set where metadata backups are written")
+    print("  valcli backup.run                  Back up the hydra keyspace, LINSTOR DB and /etc/hci")
+    print("      Options:")
+    print("        --all-nodes                  Also run on every peer, in parallel")
+    print("        --include-ca                 Also capture the cluster CA and node private keys")
+    print("        --allow-same-filesystem      Accept a target on the database's own disk")
+    print("  valcli backup.list                 List artefacts at the backup target")
+    print("  valcli backup.verify [<file>]      Check an artefact against its manifest (default: latest)")
+    print("  valcli backup.restore [<file>]     Load an artefact back into this cluster")
+    print("      Options:")
+    print("        --tables a,b                 Restore only these tables")
+    print("        --extract-only <dir>         Unpack the artefact without touching the cluster")
+    print("        --force                      Proceed despite a schema-version mismatch")
+    print("  valcli backup.prune                Apply the retention policy now (--dry-run to preview)")
+    print("      Note: backups cover cluster METADATA only. Guest data inside DRBD")
+    print("      volumes is not backed up by any of this -- see docs/backup_restore.md.")
     print("  valcli db.print <table_name>       Print ScyllaDB table contents as ASCII table")
     print("      Options:")
     print("        --columns c1,c2              Specify a comma-separated list of columns to print")
@@ -1922,6 +2030,18 @@ def main():
         cmd_scheduler_history()
     elif cmd == "system.cleanup":
         cmd_system_cleanup()
+    elif cmd == "backup.run":
+        cmd_backup_run()
+    elif cmd == "backup.list":
+        cmd_backup_list()
+    elif cmd == "backup.verify":
+        cmd_backup_verify()
+    elif cmd == "backup.restore":
+        cmd_backup_restore()
+    elif cmd == "backup.prune":
+        cmd_backup_prune()
+    elif cmd == "backup.target":
+        cmd_backup_target()
     elif cmd == "scheduler.trigger":
         if len(sys.argv) < 3:
             print("Error: Job name is required.")

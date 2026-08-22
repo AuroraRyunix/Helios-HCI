@@ -1,0 +1,48 @@
+# Third-party Python packages for the Helios-HCI control plane.
+#
+# Target runtime: the EL10.2 (Rocky Linux 10.2) host image, Python 3.12.
+#
+# This list is deliberately short. Every other root script is standard library on
+# purpose -- helios_zk.py is a hand-written ZooKeeper wire-protocol client rather
+# than a kazoo dependency for exactly that reason -- so the list below was derived
+# by walking the imports of every root script (including the extensionless CLIs
+# allssh, catcli, mcli, mcli-runner and nodetool), not by convention. Only two
+# non-stdlib imports exist in the whole Python tree:
+#
+#   paramiko          provision.py, deploy_updates.py   SSH/SFTP to cluster nodes
+#   cassandra-driver  daruk.py                          imported as `cassandra`
+#
+# There are no test-only dependencies: test_hylia.py and test_deployment_manifest.py
+# use unittest and the standard library only, which is why there is no
+# requirements-dev.txt.
+#
+# Install on a node with:
+#     python3 -m pip install --only-binary :all: -r requirements.txt
+
+
+# --- paramiko -----------------------------------------------------------------
+# Pure-Python wheel, requires_python >=3.9.
+#
+# 5.0.0 removes SHA-1: RSA keys are no longer signed or verified with SHA-1, and
+# the diffie-hellman-group{,14,-exchange}-sha1 key exchanges are gone. That is
+# correct for this fleet -- EL10.2's OpenSSH negotiates rsa-sha2-256/512 and
+# modern kex, and provision.py's RSAKey.generate(2048) / SSHClient /
+# AutoAddPolicy / RejectPolicy / BadHostKeyException usage is unaffected (checked
+# against an installed 5.0.0). GSSAPI support was also removed in 5.0.0; nothing
+# here uses it. If a node ever has to be reached over an SSH implementation that
+# only offers SHA-1, drop back to paramiko==4.0.0 rather than loosening this pin.
+paramiko==5.0.0
+
+# --- cassandra-driver ---------------------------------------------------------
+# daruk.py's `from cassandra.cluster import Cluster` at module scope, against
+# ScyllaDB (Hydra). requires_python >=3.10.
+#
+# MUST be installed from a wheel. The driver selects its event loop at import
+# time, and on Python 3.12+ the asyncore fallback is gone (asyncore was removed
+# from the stdlib), so with no libev C extension `import cassandra.cluster` raises
+#   DependencyException: Unable to load a default connection class
+# and daruk dies at start, taking the CQL proxy every daemon's run_cql_query()
+# depends on with it. The manylinux_2_28 cp312 wheel bundles both
+# libevwrapper.*.so and libev.so.4 and is fine; an sdist build on a host without
+# libev-devel is not. Hence --only-binary above.
+cassandra-driver==3.30.1

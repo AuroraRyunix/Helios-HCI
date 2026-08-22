@@ -19,6 +19,21 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Linstor Controller** | `3370` | TCP | Localhost & Cluster | Linstor Controller REST API and orchestration port. |
 | **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
 | **DRBD Replication** | `7700`-`7890` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
+| **VXLAN Overlay** (Urbosa) | `4789` | **UDP** | Cluster Mesh | Tenant overlay segment traffic between hosts. Point-to-multipoint, no multicast required. |
+| **Sidon** (DFS data path) | `9105` | TCP (mTLS) | Cluster Mesh | *Reserved, not yet listening.* Extent replication, journal appends and forwarded guest I/O between per-node data-path daemons. One connection per node **pair**, independent of VM count — see [dfs/architecture.md](./dfs/architecture.md). |
+
+---
+
+## 1a. Software-Defined Overlay Address Ranges
+
+Urbosa's logical networking consumes two address ranges that are invisible to the physical fabric but must not be reused by tenants or by the management network.
+
+| Range | Purpose | Allocated by |
+| :--- | :--- | :--- |
+| `100.64.0.0/16` | Tier-1 to Tier-0 transit links, one `/30` per T1 router (16384 available). T0 takes `.1`, T1 takes `.2`. | `hydra.urbosa_transit_pool`, claimed with a lightweight transaction keyed on the slot number. Never derived — two routers hashing to one `/30` is silent misrouting between tenants. |
+| Tenant segment CIDRs | Guest subnets on overlay segments, routed inside the T1 namespace. | Operator, per segment, in `hydra.urbosa_segments`. |
+
+`100.64.0.0/10` is the shared-address space of RFC 6598, chosen because it is neither publicly routable nor likely to collide with a tenant's RFC 1918 addressing. Only the first `/16` of it is used.
 
 ---
 
@@ -85,7 +100,12 @@ To ensure isolation and security, internal daemon API ports are bound exclusivel
 * All node-to-node remote command execution is performed through the **Spark Daemon** over port `9099`.
 * The daemon requires valid mTLS certificates (`node.crt` and `client.crt` signed by the cluster CA) for every connection, replacing the need for inter-node root SSH keys.
 
-### C. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7700`-`7890`)
+### C. Overlay Data Plane (UDP `4789`)
+* Tenant traffic on an Urbosa overlay segment is encapsulated in VXLAN and sent host-to-host over UDP port `4789`. It carries no cluster control traffic and needs no multicast: each host holds a static flood list naming every peer, so the fabric only has to carry unicast UDP between node addresses.
+* Broadcast, unknown-unicast and multicast frames are therefore replicated once per peer by the sending host. See [Head-End Replication](./urbosa.md#5-head-end-replication) for why that is the intended design here and what would replace it at larger scale.
+* The MTU of the bridges and tunnels is driven from the `dns_mtu` cluster setting; the physical fabric must carry that plus 50 bytes of VXLAN overhead.
+
+### D. Cluster Data Mesh (Ports `7000`, `2888`, `3888`, `3376`, `7700`-`7890`)
 * **Gossip Database Layer**: ScyllaDB nodes talk to each other directly on port `7000` to share cluster metadata, tables partition maps, and telemetry stats.
 * **Consensus Sync Layer**: ZooKeeper nodes use ports `2888` and `3888` to elect Odin leaders and synchronize locks.
 * **Software-Defined Storage**: Linstor Satellites and Controller communicate over ports `3370` and `3376` for cluster resource provisioning, and DRBD volumes replicate synchronously across the physical disks using TCP ports `7700` to `7890`.

@@ -48,6 +48,8 @@ Every 5 seconds, the `gatoway` daemon on each host performs the following steps:
 3. **Prune Deleted Networks**:
    - Compares active VLAN bridges on the host (`br-vlan-*`) with those in ScyllaDB.
    - If a bridge exists on the host but its network has been deleted from ScyllaDB, it tears down the bridge and the physical sub-interface automatically to release kernel resources.
+   - **A bridge that still has anything enslaved beyond its own VLAN uplink is refused, not deleted.** Those extra interfaces are guest taps, and removing the bridge would pull the NIC out from under a running VM. The refusal is logged once, naming the interfaces to detach.
+   - **A failed or unparseable read of `hydra.gatoway_networks` skips both reconciliation and pruning.** Treating "the query failed" as "no networks configured" would delete every `br-vlan-*` bridge on the host at once. Urbosa's overlay reclaimer follows the same two rules for the same reasons — see [Resource Reclamation](./urbosa.md#e-resource-reclamation).
 
 ---
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import json
 import time
 import socket
@@ -24,11 +25,32 @@ try:
 except Exception:
     pass
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -39,7 +61,74 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
+class ConditionalStatementError(RuntimeError):
+    """A compare-and-swap was handed to the query path, which cannot report one."""
+
+
+def _cql_outside_string_literals(cql_query):
+    """The statement with every single-quoted literal blanked out.
+
+    This daemon writes the *stdout of arbitrary jobs* into hydra.dagur_runs, so a CQL
+    literal here can hold anything a backup script or a health check printed. Searching
+    the raw statement for the keyword would refuse a run record because the job happened
+    to print "check if the volume is mounted". A doubled quote ('') is an escaped quote
+    inside a literal, not the end of one.
+    """
+    out = []
+    index = 0
+    length = len(cql_query)
+    while index < length:
+        char = cql_query[index]
+        if char != "'":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if cql_query[index] == "'":
+                if index + 1 < length and cql_query[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        out.append("''")
+    return "".join(out)
+
+
+# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
+# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
+# caller needs.
+_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
+
+
+def is_conditional_cql(cql_query):
+    """True when the statement is a lightweight transaction rather than a plain write."""
+    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
+
+
 def run_cql_query(cql_query, *args, **kwargs):
+    """Run a statement whose only interesting outcome is "did it execute".
+
+    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
+    *rejected* lightweight transaction as its row of values joined by spaces --
+
+        False 10.10.102.41
+
+    -- and returns rc=0, which is indistinguishable from a successful write, so every
+    caller that used this function for a compare-and-swap was treating lost races as wins.
+    The refusal is here rather than in a review comment because the bug comes back the
+    moment somebody appends "IF ..." to an existing call and the tests still pass.
+
+    Conditional writes belong on one of Daruk's typed /v1/... endpoints. Dagur has none:
+    it takes work from Catalyst, which claims each scheduler tick with
+    /v1/schedule/claim-job before this daemon ever hears about the job.
+    """
+    if is_conditional_cql(cql_query):
+        raise ConditionalStatementError(
+            "a conditional statement cannot be run through run_cql_query(): its result "
+            "cannot say whether the condition held. Use a Daruk /v1/... endpoint. "
+            f"Statement: {' '.join(cql_query.split())[:200]}")
     import urllib.request
     import json
     try:
@@ -144,15 +233,28 @@ def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
 def call_catalyst_api(path, payload=None, method="GET"):
+    """Call the local Catalyst API over mutual TLS.
+
+    Catalyst dispatches cluster work and now requires a certificate this cluster's CA
+    signed. Loopback is reached by this node's own address because that is what its
+    certificate names -- see spark_endpoint() for the same reasoning applied to
+    spark-daemon.
+    """
     import urllib.request
     import json
-    url = f"http://127.0.0.1:9091{path}"
+    address, verify_identity = spark_endpoint("127.0.0.1")
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                         cafile="/etc/hci/spark/certs/ca.crt")
+    context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                            keyfile="/etc/hci/spark/certs/node.key")
+    context.check_hostname = verify_identity
+    url = f"https://{address}:9091{path}"
     data = None
     if payload is not None and method != "GET":
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=35) as response:
+        with urllib.request.urlopen(req, context=context, timeout=35) as response:
             if response.status == 204:
                 return 204, None
             res = json.loads(response.read().decode("utf-8"))

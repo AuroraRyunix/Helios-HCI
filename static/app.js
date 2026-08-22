@@ -5753,7 +5753,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'aether_storage_pools', 'aether_storage_pools_space', 'aether_volume', 'aether_peers', 
             'aether_heal_pending', 'aether_split_brain', 'storage_capacity', 
             'storage_mount_options', 'storage_volume_writable', 'fstab_safety_check',
-            'orphaned_disks_check'
+            'orphaned_disks_check', 'linstor_latency_check'
         ];
         const hardwareChecks = [
             'cpu_load', 'disk_space', 'ram_usage', 'host_virtualization', 

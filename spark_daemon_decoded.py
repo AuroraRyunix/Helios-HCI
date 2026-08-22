@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__build__ = "1.2.2"
+__build__ = "1.2.3"
 import sys
 import os
 import ssl
@@ -10,6 +10,12 @@ import urllib.request
 import threading
 import time
 import base64
+import re
+import stat
+import glob
+import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 socket.setdefaulttimeout(45.0)
@@ -33,11 +39,68 @@ def get_service_build_number(target_path):
         pass
     return "Unknown"
 
+_SPARK_LOCAL_IP = None
+
+def spark_local_ip():
+    """This node's address as its own certificate names it.
+
+    spectrum.env is what provision.py wrote; the UDP-connect trick is the fallback the
+    rest of this file already uses. Only a non-loopback answer is cached, because the
+    daemon starts before the network is necessarily up and a cached 127.0.0.1 would
+    never recover.
+    """
+    global _SPARK_LOCAL_IP
+    if _SPARK_LOCAL_IP:
+        return _SPARK_LOCAL_IP
+    resolved = "127.0.0.1"
+    try:
+        with open("/etc/hci/spectrum/spectrum.env", "r") as f:
+            for line in f:
+                if line.startswith("LOCAL_HYPERVISOR_IP="):
+                    value = line.strip().split("=", 1)[1].strip()
+                    if value:
+                        resolved = value
+    except Exception:
+        pass
+    if resolved == "127.0.0.1":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("10.255.255.255", 1))
+            resolved = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+    if resolved not in ("127.0.0.1", "::1", "localhost"):
+        _SPARK_LOCAL_IP = resolved
+    return resolved
+
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        local = spark_local_ip()
+        if local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -81,10 +144,11 @@ class UdevHelper:
 
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -220,10 +284,11 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     ca_cert = "/etc/hci/spark/certs/ca.crt"
     node_cert = "/etc/hci/spark/certs/node.crt"
     node_key = "/etc/hci/spark/certs/node.key"
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_cert)
     context.load_cert_chain(certfile=node_cert, keyfile=node_key)
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -318,6 +383,1699 @@ def settings_sync_loop():
             print(f"[SPARK] settings_sync_loop error: {e}")
         time.sleep(60)
 
+# ---------------------------------------------------------------------------
+# ZooKeeper-backed cluster state (Odin/Zeus).
+#
+# Each node holds an *ephemeral* znode under ZK_NODES_PATH describing itself. Because
+# the znode's lifetime is bound to the ZooKeeper session, a node that dies has its entry
+# removed by the ensemble rather than by anyone polling for it -- liveness stops being a
+# sample and becomes a fact. `cluster status` then reads this tree instead of fanning
+# out mTLS calls to every host on every invocation.
+#
+# Desired cluster state lives at ZK_CLUSTER_STATE; each node's reconcile loop converges
+# its local services toward it, so `cluster start` sets an intent rather than driving
+# each node imperatively.
+ZK_ROOT = "/helios"
+ZK_NODES_PATH = ZK_ROOT + "/nodes"
+# Desired cluster state. This is the path cluster_new.py and spectrum already write via
+# zkCli.sh ("started"/"stopped"), so the reconcile loop reads the existing source of
+# truth rather than introducing a competing one.
+ZK_CLUSTER_STATE = "/cluster_state"
+ZK_PUBLISH_INTERVAL = 5          # seconds between state refreshes
+ZK_DRIFT_CHECK_INTERVAL = 30     # seconds between drift re-assertions
+ZK_SESSION_TIMEOUT_MS = 15000
+FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as FLAPPING
+
+# Services this node manages when converging toward the desired cluster state, in start
+# order. Stop order is the reverse. ZooKeeper is deliberately absent: it is the store the
+# desired state lives in, so it is started before convergence begins and stopped last.
+MANAGED_SERVICE_ORDER = ["hydra-db", "daruk", "aether", "linstor-controller", "spectrum",
+                         "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
+                         "mimir", "logos", "mipha", "gatoway", "urbosa", "hylia"]
+
+
+def _load_helios_zk():
+    """Import the helios_zk module from wherever it was deployed."""
+    try:
+        import helios_zk
+        return helios_zk
+    except ImportError:
+        pass
+    import importlib.util
+    import importlib.machinery
+    for candidate in ("/usr/local/bin/helios_zk.py", "/usr/local/bin/helios_zk"):
+        if os.path.exists(candidate):
+            loader = importlib.machinery.SourceFileLoader("helios_zk", candidate)
+            spec = importlib.util.spec_from_loader("helios_zk", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise ImportError("helios_zk module not found")
+
+
+def get_zk_hosts():
+    """Cluster ZooKeeper endpoints, local first so a healthy node prefers itself."""
+    hosts = []
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            hosts = [h["ip"] for h in json.load(f).get("hosts", []) if h.get("ip")]
+    except Exception:
+        pass
+    return ["127.0.0.1"] + [h for h in hosts if h != "127.0.0.1"]
+
+
+def zk_publisher_loop():
+    """Maintain this node's ephemeral znode, reconnecting whenever the session drops."""
+    try:
+        zkmod = _load_helios_zk()
+    except ImportError as exc:
+        print(f"[ZK] helios_zk unavailable ({exc}); node state will not be published.", flush=True)
+        return
+
+    client = None
+    node_path = None
+    while True:
+        try:
+            if client is None:
+                client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
+                client.ensure_path(ZK_NODES_PATH)
+                print(f"[ZK] Publisher connected to {client.connected_host}.", flush=True)
+                node_path = None
+
+            status = build_node_status()
+            status["ts"] = int(time.time())
+            status["build"] = globals().get("__build__", "unknown")
+            if node_path is None:
+                node_path = ZK_NODES_PATH + "/" + str(status.get("ip") or "unknown")
+            client.upsert_ephemeral(node_path, json.dumps(status).encode("utf-8"))
+        except Exception as exc:
+            print(f"[ZK] Publisher error ({exc}); reconnecting.", flush=True)
+            try:
+                if client:
+                    client.close()
+            except Exception:
+                pass
+            client = None
+            node_path = None
+        time.sleep(ZK_PUBLISH_INTERVAL)
+
+
+def read_desired_cluster_state(client):
+    """Return the desired cluster state ('started'/'stopped'), or None if unreadable.
+
+    None is meaningfully different from 'stopped': it means we could not determine
+    intent, and the correct response is to change nothing. Treating "unknown" as
+    "stopped" is what deadlocked the old autostart path -- ZooKeeper down meant the
+    state could not be read, which was read as 'stopped', which stopped ZooKeeper.
+    """
+    try:
+        raw = client.get(ZK_CLUSTER_STATE)
+        if raw is None:
+            return None
+        value = raw.decode("utf-8", "replace").strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def converge_to_desired_state(desired, full=False):
+    """Bring local services into line with the desired cluster state.
+
+    `full=True` (the desired state just changed) walks the whole set in dependency order.
+    Otherwise this is a periodic drift check: it only touches units that are not already
+    in the intended state, so the common case costs one `systemctl is-active` batch and
+    issues no commands at all.
+
+    The drift check exists because acting only on state *changes* leaves a hole: a service
+    that dies later, while the desired state is unchanged, is left to systemd's
+    Restart=always -- and a unit that exhausts its restart limit stays down until someone
+    rewrites the desired state.
+    """
+    running = desired.startswith("start")
+    order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
+    action = "start" if running else "stop"
+
+    if full:
+        print(f"[ZK] Converging local services toward '{desired}'.", flush=True)
+        targets = order
+    else:
+        # Batch one query for all managed units and act only on the mismatches.
+        res = subprocess.run("systemctl is-active " + " ".join(order),
+                             shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        states = res.stdout.decode().splitlines()
+        targets = []
+        for idx, svc in enumerate(order):
+            state = states[idx].strip() if idx < len(states) else ""
+            is_active = state == "active"
+            # "activating" is in-flight, not drift; leave it alone rather than restarting
+            # a unit that is already on its way to the right state.
+            if state == "activating":
+                continue
+            if running and not is_active:
+                targets.append(svc)
+            elif not running and is_active:
+                targets.append(svc)
+        if not targets:
+            return
+        print(f"[ZK] Drift detected against '{desired}': {', '.join(targets)}", flush=True)
+
+    for svc in targets:
+        subprocess.run(f"systemctl {action} {svc}", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def zk_reconcile_loop():
+    """Converge local services toward the desired cluster state published in ZooKeeper.
+
+    This is what makes `cluster start` a declaration rather than an imperative drive: the
+    CLI records intent once, and every node moves itself toward it and republishes what
+    it actually achieved.
+    """
+    try:
+        zkmod = _load_helios_zk()
+    except ImportError:
+        return
+
+    client = None
+    applied = None
+    last_drift_check = 0.0
+    while True:
+        try:
+            if client is None:
+                client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
+                print("[ZK] Reconcile loop connected.", flush=True)
+            # Read inline rather than through a helper that swallows errors: a dead
+            # socket must propagate to the handler below so the client is rebuilt.
+            # Swallowing it returns None forever, which looks like "no desired state"
+            # and silently wedges the loop against a socket that will never recover.
+            try:
+                raw = client.get(ZK_CLUSTER_STATE)
+                desired = raw.decode("utf-8", "replace").strip() or None
+            except zkmod.ZKNoNode:
+                desired = None      # state genuinely unset; nothing to converge toward
+            if desired:
+                if os.path.exists("/etc/hci/maintenance.state"):
+                    if desired != applied:
+                        print(f"[ZK] Desired state '{desired}' ignored: host is in maintenance.", flush=True)
+                        applied = desired
+                else:
+                    changed = desired != applied
+                    now = time.time()
+                    due = (now - last_drift_check) >= ZK_DRIFT_CHECK_INTERVAL
+                    if changed or due:
+                        last_drift_check = now
+                        converge_to_desired_state(desired, full=changed)
+                        applied = desired
+        except Exception as exc:
+            print(f"[ZK] Reconcile error ({exc}); reconnecting.", flush=True)
+            try:
+                if client:
+                    client.close()
+            except Exception:
+                pass
+            client = None
+        time.sleep(ZK_PUBLISH_INTERVAL)
+
+
+def build_node_status():
+    """Collect this node's service and liveness state.
+
+    Module-level so the /api/v1/node/status handler and the ZooKeeper publisher
+    share one implementation. spark.py and this daemon previously derived service
+    state separately and could disagree about the same host.
+    """
+    import json
+    import subprocess
+    import socket
+    import os
+    
+    ip_addr = "127.0.0.1"
+    hostname = socket.gethostname()
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            hosts = cdata.get("hosts", [])
+            for h in hosts:
+                if h.get("hostname") == hostname:
+                    ip_addr = h.get("ip")
+                    break
+            if ip_addr == "127.0.0.1" and hosts:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    local_ip = s.getsockname()[0]
+                    s.close()
+                    for h in hosts:
+                        if h.get("ip") == local_ip:
+                            ip_addr = local_ip
+                            hostname = h.get("hostname")
+                            break
+                except Exception:
+                    pass
+    except Exception:
+        pass
+        
+    is_leader = False
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.1)
+        s.connect(("127.0.0.1", 2181))
+        s.sendall(b"stat")
+        resp = s.recv(1024).decode('utf-8', errors='ignore')
+        s.close()
+        is_leader = "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
+    except Exception:
+        pass
+        
+    maint_status = "NORMAL"
+    if os.path.exists("/etc/hci/maintenance.state"):
+        maint_status = "IN_MAINTENANCE"
+        
+    global NODE_DISKS_CACHE
+    if 'NODE_DISKS_CACHE' not in globals():
+        globals()['NODE_DISKS_CACHE'] = None
+        
+    disks_count = globals()['NODE_DISKS_CACHE']
+    if disks_count is None:
+        try:
+            res_d = subprocess.run("lsblk -d -n -o TYPE", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_d.returncode == 0:
+                disks_count = sum(1 for line in res_d.stdout.decode().splitlines() if line.strip() == "disk")
+                globals()['NODE_DISKS_CACHE'] = disks_count
+            else:
+                disks_count = 1
+        except Exception:
+            disks_count = 1
+
+    global SERVICE_PIDS_CACHE, LAST_PIDS_CACHE_TIME
+    if 'SERVICE_PIDS_CACHE' not in globals():
+        globals()['SERVICE_PIDS_CACHE'] = {}
+    if 'LAST_PIDS_CACHE_TIME' not in globals():
+        globals()['LAST_PIDS_CACHE_TIME'] = 0
+
+    services = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    svc_map = {
+        "zookeeper": "ZooKeeper",
+        "hydra-db": "HydraDB",
+        "daruk": "Daruk",
+        "aether": "Aether",
+        "spark-daemon": "Spark",
+        "spectrum": "Spectrum",
+        "bifrost": "Bifrost",
+        "dagur": "Dagur",
+        "mimir": "Mimir",
+        "vali": "Vali",
+        "catalyst": "Catalyst",
+        "hylia": "Hylia",
+        "gatoway": "Gatoway",
+        "logos": "Logos",
+        "mipha": "Mipha",
+        "agahnim": "Agahnim",
+        "slate": "Slate"
+    }
+    if check_urbosa_enabled():
+        services.append("urbosa")
+        svc_map["urbosa"] = "Urbosa"
+    
+    result = {
+        "ip": ip_addr,
+        "hostname": hostname,
+        "zk_leader": is_leader,
+        "maintenance_status": maint_status,
+        "disks": disks_count,
+        "services": {}
+    }
+    
+    cmd = f"systemctl is-active {' '.join(services)}"
+    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = res.stdout.decode().splitlines()
+    
+    services_active = {}
+    for idx, svc in enumerate(services):
+        is_active = False
+        if idx < len(lines):
+            is_active = (lines[idx].strip() == "active")
+        services_active[svc] = is_active
+
+    # Refresh PIDs cache if 10 seconds elapsed
+    now = time.time()
+    if now - globals()['LAST_PIDS_CACHE_TIME'] > 10 or not globals()['SERVICE_PIDS_CACHE']:
+        new_cache = {}
+        
+        # Native services
+        native_svcs = ["daruk"]
+        cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
+        try:
+            res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res_nat.returncode == 0:
+                nat_lines = [l.strip() for l in res_nat.stdout.decode().splitlines() if l.strip()]
+                for s_idx, s_name in enumerate(native_svcs):
+                    pids = []
+                    if s_idx < len(nat_lines):
+                        val = nat_lines[s_idx]
+                        if val and val != "0":
+                            pids = [int(val)]
+                    new_cache[s_name] = pids
+            else:
+                for s_name in native_svcs:
+                    new_cache[s_name] = []
+        except Exception:
+            for s_name in native_svcs:
+                new_cache[s_name] = []
+                
+        # Containerized services
+        container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
+        if "urbosa" in services:
+            container_svcs.append("urbosa")
+        for s_name in container_svcs:
+            pids = []
+            if services_active.get(s_name):
+                try:
+                    res_cont = subprocess.run(f"podman top systemd-{s_name} hpid", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    if res_cont.returncode == 0:
+                        cont_lines = res_cont.stdout.decode().strip().splitlines()
+                        if len(cont_lines) > 1:
+                            for line in cont_lines[1:]:
+                                val = line.strip()
+                                if val and val != "?":
+                                    try:
+                                        pids.append(int(val))
+                                    except ValueError:
+                                        pids.append(val)
+                except Exception:
+                    pass
+            new_cache[s_name] = pids
+            
+        globals()['SERVICE_PIDS_CACHE'] = new_cache
+        globals()['LAST_PIDS_CACHE_TIME'] = now
+
+    pids_cache = globals()['SERVICE_PIDS_CACHE']
+    
+    # Restart counters, so a crash-looping service is not reported as healthy.
+    # `systemctl is-active` returns "active" during each restart window of a unit with
+    # Restart=always, so a unit that has failed 30 times in a row samples as UP roughly
+    # as often as not. NRestarts makes the flapping visible instead of invisible.
+    restarts = {}
+    try:
+        res_nr = subprocess.run(
+            "systemctl show -p NRestarts --value " + " ".join(services),
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        nr_lines = res_nr.stdout.decode().splitlines()
+        for idx, svc in enumerate(services):
+            if idx < len(nr_lines):
+                try:
+                    restarts[svc] = int(nr_lines[idx].strip() or 0)
+                except ValueError:
+                    restarts[svc] = 0
+    except Exception:
+        pass
+
+    for svc in services:
+        n_restarts = restarts.get(svc, 0)
+        if services_active[svc]:
+            svc_pids = pids_cache.get(svc, [])
+            # Active with no main PID and a restart history is a unit caught mid-respawn,
+            # not a healthy one. Report it as FLAPPING so the operator sees the truth.
+            flapping = n_restarts >= FLAP_RESTART_THRESHOLD and not svc_pids
+            result["services"][svc_map[svc]] = {
+                "status": "FLAPPING" if flapping else "UP",
+                "pids": svc_pids,
+                "restarts": n_restarts
+            }
+        else:
+            result["services"][svc_map[svc]] = {
+                "status": "DOWN",
+                "pids": [],
+                "restarts": n_restarts
+            }
+
+    return result
+
+# ---------------------------------------------------------------------------
+# Typed API (docs/spark_api.md)
+#
+# These endpoints exist so callers stop handing this daemon shell strings. No
+# caller value is ever interpolated into a command: parameters are validated at
+# the boundary and then passed as individual argv elements with shell=False, so
+# nothing a caller sends can change the shape of a command. Parsing lives in
+# module-level functions so it stays testable without an HTTP server.
+# ---------------------------------------------------------------------------
+
+# A name is a value, never a fragment. \Z rather than $ on purpose: $ also matches
+# just before a trailing newline, so "vm1\n" would pass and then be handed to virsh.
+NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
+
+# Paths must resolve under one of these roots. /dev/drbd/by-res/<res>/<vol> is a
+# symlink to the minor device, so realpath legitimately lands on /dev/drbdNNNN --
+# that one target is accepted as well, but only when the path as written was
+# already under /dev/drbd/. Everything else (traversal, a symlink out of the
+# aether tree) is rejected by the realpath check.
+ALLOWED_PATH_ROOTS = ("/dev/drbd/", "/var/lib/hci/aether/")
+DRBD_MINOR_RE = re.compile(r"\A/dev/drbd[0-9]+\Z")
+
+ALLOWED_OWNERS = ("root:qemu", "root:root")
+ALLOWED_MODES = ("0600", "0640", "0644", "0660", "0664", "0666", "0700", "0750", "0755", "0770")
+
+AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
+VIRSH = ["virsh", "-c", "qemu:///system"]
+HYDRA_DB_CONTAINER = "systemd-hydra-db"
+VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
+DRBD_ROLES = ("primary", "secondary")
+
+# -- Linstor ---------------------------------------------------------------
+# The client lives in the aether container, which runs on every node, and finds
+# whichever node currently holds the controller through LS_CONTROLLERS. Calling it
+# there rather than in systemd-linstor-controller is what makes these endpoints work
+# from any host instead of only the leader.
+LINSTOR_CONTAINER = "systemd-aether"
+CLUSTER_JSON = "/etc/hci/cluster.json"
+
+# Cluster creation makes exactly one pool:
+#   linstor storage-pool create lvmthin <node> default-pool vg_aether/thin_pool_aether
+# and Spectrum refuses dynamic container creation on this storage engine. A pool is
+# therefore an allowlisted value like an owner or a mode, never caller text; adding a
+# second pool to the product means adding its name here.
+ALLOWED_STORAGE_POOLS = ("default-pool",)
+DEFAULT_STORAGE_POOL = "default-pool"
+
+# 1 GiB .. 64 TiB. The floor rejects a zero-sized volume-definition; the ceiling is a
+# sanity bound on the number, not a capacity check -- Linstor still refuses what the
+# pool cannot actually back.
+MIN_VOLUME_GIB = 1
+MAX_VOLUME_GIB = 65536
+KIB_PER_GIB = 1024 * 1024
+
+# LINSTOR aligns volume sizes to 4 KiB, one DRBD block. Requests are aligned to match
+# before they are sent, so a resource's stored size equals what was asked for and an
+# idempotent retry compares equal instead of looking like a size conflict.
+VOLUME_ALIGN_KIB = 4
+
+# Automatic split-brain resolution, applied to every VM disk at create time.
+#
+# --allow-two-primaries is deliberately absent. Setting it here let one VM be started
+# on two hosts at once, and two qemu processes writing one raw DRBD device corrupts
+# it. Live migration needs dual-primary only for the hand-over window and enables it
+# around that call itself.
+DRBD_SPLIT_BRAIN_OPTIONS = [
+    "--after-sb-0pri", "discard-zero-changes",
+    "--after-sb-1pri", "discard-secondary",
+    "--after-sb-2pri", "disconnect",
+]
+
+# LINSTOR's ApiCallRc carries its severity in the top two bits: error is both set,
+# warning is the high bit alone, info the next one. Used only as a second opinion --
+# the client's exit status is the primary signal, so a wrong guess about this mask
+# cannot turn a successful call into a failure on its own.
+LINSTOR_MASK_ERROR = 0xC000000000000000
+
+# A resource that is already there is not a failure for an idempotent create; a
+# resource that is already gone is not a failure for a delete. Kept to the phrasings
+# LINSTOR actually uses: a loose marker here would read a real failure as a success and
+# return 200 for a disk that does not exist, which is the bug this whole endpoint is
+# meant to remove.
+LINSTOR_EXISTS_MARKERS = ("already exists", "already registered")
+LINSTOR_ABSENT_MARKERS = ("not found", "does not exist")
+
+IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
+
+DNSMASQ_LEASE_FILES = ("/var/lib/dnsmasq/dnsmasq.leases", "/var/lib/misc/dnsmasq.leases")
+LIBVIRT_LEASE_GLOB = "/var/lib/libvirt/dnsmasq/*.leases"
+SECURE_BOOT_EFIVAR = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+
+def run_argv(argv, timeout=45):
+    """Run a command as an argv list with shell=False.
+
+    Every typed endpoint goes through here. subprocess.run() with a list never
+    involves a shell, so a value in argv is always exactly one argument no matter
+    what characters it contains.
+    """
+    try:
+        res = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except FileNotFoundError:
+        return 127, "", "%s: command not found" % argv[0]
+    except subprocess.TimeoutExpired:
+        return -1, "", "%s: timed out after %ss" % (argv[0], timeout)
+    except OSError as exc:
+        return -1, "", str(exc)
+    return (res.returncode,
+            res.stdout.decode("utf-8", errors="ignore"),
+            res.stderr.decode("utf-8", errors="ignore"))
+
+
+_SIDON_MODULE = None
+
+
+def load_sidon_module():
+    """Import helios_sidon from wherever provisioning put it.
+
+    Same shape as the other cross-module imports here: the file ships to
+    /usr/local/bin, which is not on sys.path, and it also sits beside this daemon in a
+    source checkout. Cached because the alternative is re-reading the file on every
+    vdisk operation.
+    """
+    global _SIDON_MODULE
+    if _SIDON_MODULE is not None:
+        return _SIDON_MODULE
+    try:
+        import helios_sidon as module
+        _SIDON_MODULE = module
+        return module
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sidon.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "helios_sidon.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_sidon", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SIDON_MODULE = module
+        return module
+    raise ImportError("helios_sidon.py was not found")
+
+
+def valid_name(value):
+    """True when value is a name safe to pass as a single argument."""
+    return isinstance(value, str) and NAME_RE.match(value) is not None
+
+
+def validate_path(value):
+    """Resolve and allowlist a caller-supplied path.
+
+    Returns (realpath, None) or (None, error_message). Rejects rather than
+    sanitizes: nothing is stripped or rewritten to make a path acceptable.
+    """
+    if not isinstance(value, str) or not value:
+        return None, "path must be a non-empty string"
+    if "\x00" in value:
+        return None, "path must not contain a null byte"
+    if not value.startswith("/"):
+        return None, "path must be absolute"
+
+    literal = os.path.normpath(value)
+    real = os.path.realpath(value)
+
+    def under_root(candidate):
+        for root in ALLOWED_PATH_ROOTS:
+            if candidate.startswith(root) and len(candidate) > len(root):
+                return True
+        return False
+
+    if not under_root(literal):
+        return None, "path must be under " + " or ".join(ALLOWED_PATH_ROOTS)
+    if not under_root(real):
+        # A /dev/drbd/by-res/... symlink resolves to the bare minor device.
+        if not (literal.startswith("/dev/drbd/") and DRBD_MINOR_RE.match(real)):
+            return None, "path resolves outside " + " or ".join(ALLOWED_PATH_ROOTS)
+    return real, None
+
+
+def validate_owner(value):
+    """Owner comes from a fixed allowlist, never from caller text."""
+    if value in ALLOWED_OWNERS:
+        return value, None
+    return None, "owner must be one of " + ", ".join(ALLOWED_OWNERS)
+
+
+def validate_mode(value):
+    """Mode is an octal string from a fixed allowlist."""
+    if value in ALLOWED_MODES:
+        return value, None
+    return None, "mode must be one of " + ", ".join(ALLOWED_MODES)
+
+
+def validate_storage_pool(value):
+    """Storage pool comes from a fixed allowlist, never from caller text."""
+    if value is None:
+        return DEFAULT_STORAGE_POOL, None
+    if value in ALLOWED_STORAGE_POOLS:
+        return value, None
+    return None, "storage_pool must be one of " + ", ".join(ALLOWED_STORAGE_POOLS)
+
+
+def validate_volume_gib(value):
+    """Volume size is an integer number of GiB inside sane bounds.
+
+    A bool is rejected explicitly: `isinstance(True, int)` is True in Python, and
+    `True` would otherwise be accepted and formatted as a 1 GiB volume.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None, "size_gib must be an integer number of GiB"
+    if value < MIN_VOLUME_GIB or value > MAX_VOLUME_GIB:
+        return None, "size_gib must be between %d and %d" % (MIN_VOLUME_GIB, MAX_VOLUME_GIB)
+    return value, None
+
+
+def validate_volume_size_kib(payload):
+    """Resolve a volume size to KiB from either `size_gib` or `size_kib`.
+
+    VM disks are whole GiB and say so. Images are not: an ISO is whatever size it is,
+    and rounding one up to the next GiB would both waste the difference on every node
+    and make the size-mismatch guard compare a rounded figure against the real one.
+
+    Exactly one of the two keys is accepted. Supplying both is an error rather than a
+    precedence rule, because a caller that sends a size in two units has a bug and
+    silently honouring one of them hides it.
+
+    The result is rounded up to a multiple of `VOLUME_ALIGN_KIB`. LINSTOR aligns volumes
+    to 4 KiB itself, so an unaligned request comes back as a slightly larger volume than
+    was asked for -- and the next idempotent create of the same resource would then
+    compare its own unaligned request against the aligned reality and reject the retry as
+    a size mismatch. Aligning here makes the request equal to what LINSTOR will store.
+    """
+    raw_kib = payload.get("size_kib")
+    raw_gib = payload.get("size_gib")
+
+    if raw_kib is not None and raw_gib is not None:
+        return None, "Send either size_gib or size_kib, not both"
+
+    if raw_kib is None:
+        size_gib, error = validate_volume_gib(raw_gib)
+        if error:
+            return None, error
+        return size_gib * KIB_PER_GIB, None
+
+    if isinstance(raw_kib, bool) or not isinstance(raw_kib, int):
+        return None, "size_kib must be an integer number of KiB"
+    if raw_kib < 1:
+        return None, "size_kib must be greater than zero"
+    if raw_kib > MAX_VOLUME_GIB * KIB_PER_GIB:
+        return None, "size_kib must not exceed %d" % (MAX_VOLUME_GIB * KIB_PER_GIB)
+
+    # Rounding up comes after the bounds and before anything else uses the figure. An
+    # image smaller than one DRBD block is rounded up to one rather than rejected: the
+    # floor is a property of the volume, not of what may be stored in it.
+    remainder = raw_kib % VOLUME_ALIGN_KIB
+    if remainder:
+        raw_kib += VOLUME_ALIGN_KIB - remainder
+    return raw_kib, None
+
+
+def validate_flag(value, name):
+    """A JSON boolean, or absent. Anything else is a caller bug worth reporting.
+
+    Deliberately strict: `allow_two_primaries` is the option that let one VM run on two
+    hosts and corrupt its own disk, so a truthy string must not be able to turn it on.
+    """
+    if value is None:
+        return False, None
+    if isinstance(value, bool):
+        return value, None
+    return None, "%s must be true or false" % name
+
+
+def validate_node_names(value):
+    """Node names for a placement: a list of names, or the cluster's own nodes.
+
+    Omitting `nodes` places on every node in the cluster document, which is what the
+    Python tier's create path did. An explicit empty list is an error rather than a
+    silent no-op: a resource definition with no resources backs no disk.
+    """
+    if value is None:
+        nodes = cluster_node_names()
+        if not nodes:
+            return None, "No nodes are configured on this host and none were supplied"
+        return nodes, None
+
+    if not isinstance(value, list):
+        return None, "nodes must be a list of node names"
+    if not value:
+        return None, "nodes must not be empty"
+    if len(value) > 32:
+        return None, "nodes must contain at most 32 names"
+
+    nodes = []
+    for name in value:
+        if not valid_name(name):
+            return None, "Invalid node name"
+        if name not in nodes:
+            nodes.append(name)
+    return nodes, None
+
+
+def virsh_status_for(stderr):
+    """404 when libvirt says the domain does not exist, 500 otherwise."""
+    lowered = (stderr or "").lower()
+    if "not found" in lowered or "no domain" in lowered:
+        return 404
+    return 500
+
+
+def parse_virsh_domiflist(text):
+    """Parse `virsh domiflist` into [{"mac","type","source","model"}].
+
+    Columns are Interface, Type, Source, Model, MAC. The MAC is taken from the
+    last column so an unexpected extra column cannot shift it.
+    """
+    interfaces = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if set(line) <= set("- "):          # the ---- separator row
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if parts[0].lower() == "interface" and parts[-1].lower() == "mac":
+            continue                        # header row
+        def cell(value):
+            return "" if value == "-" else value
+        interfaces.append({
+            "mac": cell(parts[-1]),
+            "type": cell(parts[1]),
+            "source": cell(parts[2]),
+            "model": cell(parts[3]),
+        })
+    return interfaces
+
+
+def parse_virsh_dominfo(text):
+    """Parse `virsh dominfo` into {"state","vcpus","memory_kib","autostart"}."""
+    fields = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+
+    vcpus = None
+    try:
+        vcpus = int(fields.get("cpu(s)", "").strip())
+    except (TypeError, ValueError):
+        vcpus = None
+
+    memory_kib = None
+    mem_raw = fields.get("max memory", "")
+    if mem_raw:
+        try:
+            memory_kib = int(mem_raw.split()[0])
+        except (IndexError, ValueError):
+            memory_kib = None
+
+    return {
+        "state": fields.get("state", ""),
+        "vcpus": vcpus,
+        "memory_kib": memory_kib,
+        "autostart": fields.get("autostart", "").lower() == "enable",
+    }
+
+
+def parse_domain_graphics(xml_text):
+    """Pull the first vnc/spice <graphics> element out of a domain XML.
+
+    Returns {"graphics","port","listen"} or None when the domain has no console.
+    port is -1 for an autoport device that has not been allocated yet, which is a
+    fact the caller needs rather than an error.
+    """
+    root = ET.fromstring(xml_text)
+    for graphics in root.findall("./devices/graphics"):
+        gtype = graphics.get("type")
+        if gtype not in ("vnc", "spice"):
+            continue
+        try:
+            port = int(graphics.get("port", "-1"))
+        except (TypeError, ValueError):
+            port = -1
+        listen = graphics.get("listen") or ""
+        if not listen:
+            listen_el = graphics.find("./listen")
+            if listen_el is not None:
+                listen = listen_el.get("address") or ""
+        return {"graphics": gtype, "port": port, "listen": listen}
+    return None
+
+
+def parse_domain_name(xml_text):
+    """The <name> of a domain XML document, or None."""
+    root = ET.fromstring(xml_text)
+    name_el = root.find("./name")
+    if name_el is None or name_el.text is None:
+        return None
+    return name_el.text.strip()
+
+
+def virsh_domain_state(name):
+    """Current libvirt state of a domain, or None when it cannot be read."""
+    rc, stdout, _ = run_argv(VIRSH + ["domstate", name], timeout=20)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return lines[0] if lines else None
+
+
+_NODETOOL_STATUS = {"U": "Up", "D": "Down", "?": "Unknown"}
+_NODETOOL_STATE = {"N": "Normal", "L": "Leaving", "J": "Joining", "M": "Moving", "?": "Unknown"}
+_LOAD_UNITS = ("bytes", "B", "KB", "MB", "GB", "TB", "PB",
+               "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def parse_nodetool_status(text):
+    """Parse `nodetool status` into [{"address","status","state","load","tokens"}].
+
+    Data rows begin with a two-character status/state code (UN, DN, UJ, ...);
+    every header and banner line fails that test and is skipped.
+    """
+    nodes = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split()
+        code = parts[0]
+        if len(code) != 2:
+            continue
+        if code[0] not in _NODETOOL_STATUS or code[1] not in _NODETOOL_STATE:
+            continue
+        if len(parts) < 3:
+            continue
+
+        address = parts[1]
+        rest = parts[2:]
+        load = rest[0] if rest else ""
+        consumed = 1 if rest else 0
+        if len(rest) >= 2 and rest[1] in _LOAD_UNITS:
+            load = rest[0] + " " + rest[1]
+            consumed = 2
+
+        tokens = None
+        if len(rest) > consumed:
+            try:
+                tokens = int(rest[consumed])
+            except ValueError:
+                tokens = None
+
+        nodes.append({
+            "address": address,
+            "status": _NODETOOL_STATUS[code[0]],
+            "state": _NODETOOL_STATE[code[1]],
+            "load": load,
+            "tokens": tokens,
+        })
+    return nodes
+
+
+def parse_meminfo(text):
+    """Derive {"total_mb","used_mb","free_mb","available_mb"} from /proc/meminfo.
+
+    Same arithmetic free(1) does (used = total - free - buffers - cache), read
+    from the file free(1) itself reads, so there is no subprocess and no exposure
+    to procps output-format drift between releases.
+    """
+    values = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        parts = value.split()
+        if not parts:
+            continue
+        try:
+            values[key.strip()] = int(parts[0])
+        except ValueError:
+            continue
+
+    total = values.get("MemTotal", 0)
+    free = values.get("MemFree", 0)
+    available = values.get("MemAvailable", free)
+    buffers = values.get("Buffers", 0)
+    cached = values.get("Cached", 0) + values.get("SReclaimable", 0)
+    used = total - free - buffers - cached
+    if used < 0:
+        used = 0
+    return {
+        "total_mb": total // 1024,
+        "used_mb": used // 1024,
+        "free_mb": free // 1024,
+        "available_mb": available // 1024,
+    }
+
+
+def parse_dnsmasq_leases(text):
+    """Parse a dnsmasq lease file into [{"mac","ip","hostname","expires"}].
+
+    Line format: <expiry-epoch> <mac> <ip> <hostname> <client-id>.
+    """
+    leases = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            expires = int(parts[0])
+        except ValueError:
+            continue
+        hostname = parts[3]
+        if hostname == "*":
+            hostname = ""
+        leases.append({
+            "mac": parts[1],
+            "ip": parts[2],
+            "hostname": hostname,
+            "expires": expires,
+        })
+    return leases
+
+
+def parse_ip_route_json(text):
+    """(interface, gateway) of the default route from `ip -j route`."""
+    try:
+        routes = json.loads(text)
+    except Exception:
+        return None, None
+    if not isinstance(routes, list):
+        return None, None
+    for route in routes:
+        if isinstance(route, dict) and route.get("dst") == "default":
+            return route.get("dev"), route.get("gateway")
+    return None, None
+
+
+def parse_proc_net_route(text):
+    """(interface, gateway) of the default route from /proc/net/route.
+
+    Fallback for an iproute2 without JSON support. The gateway column is a
+    little-endian hex word.
+    """
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if parts[1] != "00000000":
+            continue
+        try:
+            raw = int(parts[2], 16)
+        except ValueError:
+            continue
+        gateway = ".".join(str((raw >> (8 * i)) & 0xFF) for i in range(4))
+        return parts[0], gateway
+    return None, None
+
+
+def parse_ip_addr_json(text):
+    """Addresses from `ip -j addr` as a flat list of dicts."""
+    addresses = []
+    try:
+        links = json.loads(text)
+    except Exception:
+        return addresses
+    if not isinstance(links, list):
+        return addresses
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        ifname = link.get("ifname")
+        for addr in link.get("addr_info") or []:
+            if not isinstance(addr, dict):
+                continue
+            addresses.append({
+                "interface": ifname,
+                "family": addr.get("family"),
+                "address": addr.get("local"),
+                "prefixlen": addr.get("prefixlen"),
+                "scope": addr.get("scope"),
+            })
+    return addresses
+
+
+def _unescape_mount_field(field):
+    """/proc/self/mounts escapes space, tab, newline and backslash as \\OOO."""
+    out = []
+    i = 0
+    while i < len(field):
+        char = field[i]
+        if char == "\\" and i + 3 < len(field) and field[i + 1:i + 4].isdigit():
+            try:
+                out.append(chr(int(field[i + 1:i + 4], 8)))
+                i += 4
+                continue
+            except ValueError:
+                pass
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def parse_proc_mounts(text):
+    """The set of mount points in a /proc/self/mounts document."""
+    points = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            points.add(_unescape_mount_field(parts[1]))
+    return points
+
+
+def path_is_mounted(path):
+    """True when path is a mount point.
+
+    Checks the mount table first, then falls back to the st_dev comparison
+    mountpoint(1) uses, so a bind mount inside the same table is still caught.
+    """
+    try:
+        with open("/proc/self/mounts", "r") as handle:
+            if path in parse_proc_mounts(handle.read()):
+                return True
+    except Exception:
+        pass
+    try:
+        here = os.stat(path)
+        parent = os.stat(os.path.join(path, ".."))
+        return here.st_dev != parent.st_dev
+    except OSError:
+        return False
+
+
+def device_size_bytes(path, st_result):
+    """Size of a block device or a regular file, without shelling out."""
+    if stat.S_ISBLK(st_result.st_mode):
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            return 0
+        try:
+            return os.lseek(fd, 0, os.SEEK_END)
+        except OSError:
+            return 0
+        finally:
+            os.close(fd)
+    return st_result.st_size
+
+
+def drbd_local_role(resource):
+    """Local role of a DRBD resource, or None when it cannot be read.
+
+    DRBD 8 prints "Primary/Secondary", DRBD 9 prints just the local role.
+    """
+    rc, stdout, _ = run_argv(["drbdadm", "role", resource], timeout=20)
+    if rc != 0:
+        return None
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    role = lines[0]
+    if "/" in role:
+        role = role.split("/", 1)[0]
+    return role or None
+
+
+def drbd_peer_roles(resource):
+    """Peer roles of a DRBD resource from drbdsetup, [] when unknown.
+
+    This is what makes "the peer already holds Primary" visible to the caller
+    instead of surfacing as a generic promotion failure.
+    """
+    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json", resource], timeout=20)
+    if rc != 0:
+        return []
+    try:
+        data = json.loads(stdout)
+    except Exception:
+        return []
+    roles = []
+    if isinstance(data, list):
+        for resource_entry in data:
+            if not isinstance(resource_entry, dict):
+                continue
+            for connection in resource_entry.get("connections") or []:
+                if isinstance(connection, dict) and connection.get("peer-role"):
+                    roles.append(connection["peer-role"])
+    return roles
+
+
+# ---------------------------------------------------------------------------
+# Fencing
+#
+# Mipha fences a host before it restarts that host's VMs somewhere else. The fence it
+# used to send was a shell string --
+#
+#     systemctl stop libvirtd virtqemud || true; pkill -9 qemu || true
+#
+# -- whose every clause ends in `|| true`, so it exits 0 whatever happened, and whose
+# exit status was the only thing the caller checked. "The daemon accepted the request"
+# was being read as "no guest is running any more", and the two are not the same on a
+# host wedged enough to need fencing in the first place.
+#
+# This endpoint does the same work and then answers with the state it can actually
+# observe afterwards: guest processes still alive, DRBD resources still Primary, devices
+# still open. Mipha treats `fenced: false` and an unanswered request identically -- both
+# mean the host is not proven safe to fail over.
+#
+# The marker file is written before anything is demoted. Mipha's storage loop re-promotes
+# linstor-db and the container resources within two seconds on whichever node holds
+# ZooKeeper leadership, so a fence that demotes first would be undone before it finished.
+# ---------------------------------------------------------------------------
+
+FENCE_MARKER_PATH = "/run/hci/mipha-self-fence.json"
+
+# Mount points Mipha's storage loop puts on top of DRBD devices. A resource cannot be
+# demoted while a filesystem sits on it, and the list is fixed rather than derived so a
+# fence never unmounts something it did not put there.
+FENCE_MOUNTS = ("/var/lib/linstor",
+                "/var/lib/hci/aether/volumes/default-vm-container",
+                "/var/lib/hci/aether/volumes/default-image-container")
+
+
+def qemu_process_ids():
+    """PIDs of the guest processes running on this host, read from /proc.
+
+    Not pkill: pkill's exit status reports whether its pattern matched anything, which
+    says nothing about what is left running once it has finished.
+    """
+    found = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry, "r") as handle:
+                if handle.read().strip().startswith("qemu"):
+                    found.append(int(entry))
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def drbd_local_resources():
+    """[(name, role, [open volume numbers])] per loaded resource; None if unreadable.
+
+    None is deliberately distinct from []: "this host has no DRBD resources" and "this
+    host's DRBD state could not be read" must not produce the same fence verdict.
+    """
+    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json"], timeout=30)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(stdout.strip() or "[]")
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    resources = []
+    for entry in data:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        opened = [str(device.get("volume", 0))
+                  for device in (entry.get("devices") or [])
+                  if isinstance(device, dict) and device.get("open")]
+        resources.append((entry["name"], str(entry.get("role", "")), opened))
+    return resources
+
+
+def write_fence_marker(reason, report):
+    """Record that this host is fenced, where its own Mipha will see it.
+
+    On tmpfs on purpose: a reboot ends the fence, because a rebooted host is not running
+    the guests any more.
+    """
+    try:
+        os.makedirs(os.path.dirname(FENCE_MARKER_PATH), exist_ok=True)
+        with open(FENCE_MARKER_PATH, "w") as handle:
+            json.dump({"reason": reason, "at": time.time(), "report": report}, handle)
+        return True
+    except OSError:
+        return False
+
+
+def fence_this_host():
+    """Stop every guest, release every DRBD device, and report what is *still* held.
+
+    The return value is evidence, not a receipt. `fenced` is true only when nothing is
+    left: no guest process, no Primary resource, no open device. A DRBD state that could
+    not be read is `fenced: false` -- an unreadable answer is not a good one.
+    """
+    report = {"fenced": False, "libvirt_active": False, "qemu_pids": [],
+              "primary_resources": [], "open_devices": [], "actions": [], "detail": ""}
+
+    write_fence_marker("fenced through the Spark API", {})
+
+    # 1. Ask libvirt to stop its domains first. A destroy releases the DRBD device
+    #    through the normal path and leaves libvirt's own state consistent; the SIGKILL
+    #    below is the fallback for when libvirt is part of what has failed.
+    rc, stdout, _ = run_argv(VIRSH + ["list", "--name", "--state-running"], timeout=30)
+    if rc == 0:
+        for name in [line.strip() for line in stdout.splitlines() if line.strip()]:
+            rc_d, out_d, err_d = run_argv(VIRSH + ["destroy", name], timeout=60)
+            report["actions"].append("destroy %s: %s" % (
+                name, "ok" if rc_d == 0 else (err_d or out_d).strip()[:120]))
+    else:
+        report["actions"].append(
+            "virsh could not list running domains; killing guest processes directly")
+
+    # 2. Stop libvirt so nothing restarts a domain behind the fence.
+    for unit in ("libvirtd", "virtqemud", "libvirtd.socket", "virtqemud.socket"):
+        run_argv(["systemctl", "stop", unit], timeout=60)
+    _rc_a, out_a, _err_a = run_argv(["systemctl", "is-active", "libvirtd"], timeout=15)
+    report["libvirt_active"] = out_a.strip() == "active"
+
+    # 3. SIGKILL whatever survived, then look again rather than assuming.
+    for _attempt in range(3):
+        pids = qemu_process_ids()
+        if not pids:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        time.sleep(2)
+    report["qemu_pids"] = qemu_process_ids()
+
+    # 4. Drop the filesystems this host's storage loop mounted on DRBD devices; a
+    #    resource cannot go Secondary underneath a mount.
+    if run_argv(["mountpoint", "-q", FENCE_MOUNTS[0]], timeout=15)[0] == 0:
+        run_argv(["systemctl", "stop", "linstor-controller"], timeout=60)
+    for mount in FENCE_MOUNTS:
+        if run_argv(["mountpoint", "-q", mount], timeout=15)[0] != 0:
+            continue
+        rc_u, out_u, err_u = run_argv(["umount", "-l", mount], timeout=60)
+        report["actions"].append("umount %s: %s" % (
+            mount, "ok" if rc_u == 0 else (err_u or out_u).strip()[:120]))
+
+    # 5. Give up Primary on everything. Checked, and never --force: a demotion that is
+    #    refused is exactly the information the caller needs, and forcing it past a
+    #    process that still holds the device would not make that process stop writing.
+    resources = drbd_local_resources()
+    if resources is None:
+        report["detail"] = ("guest processes were stopped, but drbdsetup did not answer, "
+                            "so it cannot be shown that this host released its disks")
+        return report
+    for name, role, _opened in resources:
+        if role.lower() != "primary":
+            continue
+        rc_s, out_s, err_s = run_argv(["drbdadm", "secondary", name], timeout=60)
+        report["actions"].append("secondary %s: %s" % (
+            name, "ok" if rc_s == 0 else (err_s or out_s).strip()[:120]))
+
+    after = drbd_local_resources()
+    if after is None:
+        report["detail"] = ("demotions were issued, but drbdsetup did not answer "
+                            "afterwards, so the result could not be read back")
+        return report
+    report["primary_resources"] = [name for name, role, _o in after
+                                   if role.lower() == "primary"]
+    report["open_devices"] = ["%s/%s" % (name, volume)
+                              for name, _role, opened in after for volume in opened]
+
+    report["fenced"] = (not report["qemu_pids"]
+                        and not report["primary_resources"]
+                        and not report["open_devices"])
+    if report["fenced"]:
+        report["detail"] = ("no guest process, no Primary DRBD resource and no open DRBD "
+                            "device remain on this host")
+    else:
+        parts = []
+        if report["qemu_pids"]:
+            parts.append("guest processes still running: %s" % report["qemu_pids"])
+        if report["primary_resources"]:
+            parts.append("still Primary on %s" % ", ".join(report["primary_resources"]))
+        if report["open_devices"]:
+            parts.append("devices still open: %s" % ", ".join(report["open_devices"]))
+        report["detail"] = "the fence did not take -- " + "; ".join(parts)
+
+    write_fence_marker("fenced through the Spark API",
+                       {"fenced": report["fenced"], "detail": report["detail"]})
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Linstor
+#
+# Same rules as the rest of the typed API: every element of every command is a
+# literal or an already-validated value, run_argv() calls subprocess.run() with a
+# list and shell=False, and what comes back is parsed into this daemon's own shape
+# rather than handed to the caller as stdout.
+# ---------------------------------------------------------------------------
+
+
+def cluster_hosts():
+    """[{"hostname","ip"}] from the on-host cluster document; [] when unreadable.
+
+    Values that could not be a node name or an address are dropped rather than
+    repaired, so a damaged cluster.json cannot contribute an argument to a command.
+    """
+    try:
+        with open(CLUSTER_JSON, "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    if not isinstance(hosts, list):
+        return []
+
+    parsed = []
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        hostname = host.get("hostname")
+        address = host.get("ip")
+        parsed.append({
+            "hostname": hostname if valid_name(hostname) else None,
+            "ip": address if isinstance(address, str) and IPV4_RE.match(address) else None,
+        })
+    return parsed
+
+
+def cluster_node_names():
+    """Every node name in the cluster document, in configured order."""
+    return [host["hostname"] for host in cluster_hosts() if host["hostname"]]
+
+
+def cluster_node_ips():
+    """Every node address in the cluster document, in configured order."""
+    return [host["ip"] for host in cluster_hosts() if host["ip"]]
+
+
+def linstor_argv(args):
+    """argv for one linstor client call inside the aether container.
+
+    LS_CONTROLLERS is one argv element built from the cluster document, so the client
+    reaches whichever node currently runs the controller. `-m` asks for the
+    machine-readable document; every remaining element is a fixed literal or a value
+    that has already passed validation at the boundary.
+    """
+    controllers = ",".join(cluster_node_ips()) or "127.0.0.1"
+    return (["podman", "exec", "-e", "LS_CONTROLLERS=" + controllers,
+             LINSTOR_CONTAINER, "linstor", "-m"] + list(args))
+
+
+def _linstor_entries(node):
+    """Yield the dicts in a machine-readable document, list nesting flattened.
+
+    Some client versions wrap the document in an extra list ([[{...}]]), so this
+    descends through lists but not through dict values -- a nested object inside a
+    resource is data, not another top-level entry.
+    """
+    if isinstance(node, list):
+        for item in node:
+            for found in _linstor_entries(item):
+                yield found
+    elif isinstance(node, dict):
+        yield node
+
+
+def parse_linstor_api_call_rc(text):
+    """[{"ret_code","message","details"}] from a linstor client response document."""
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    messages = []
+    for entry in _linstor_entries(data):
+        if "ret_code" not in entry and "message" not in entry:
+            continue
+        ret_code = entry.get("ret_code")
+        if not isinstance(ret_code, int):
+            ret_code = 0
+        messages.append({
+            "ret_code": ret_code,
+            "message": str(entry.get("message") or ""),
+            "details": str(entry.get("details") or ""),
+            # "already exists" lands in `cause` rather than `message` for some of the
+            # client's responses, and that string is what the idempotency check reads.
+            "cause": str(entry.get("cause") or ""),
+        })
+    return messages
+
+
+# The client renamed its keys between output versions. Both spellings are read here so
+# that no caller ever has to know which version a given cluster's client speaks.
+_RD_LIST_KEYS = ("resource_definitions", "rsc_dfns")
+_RD_NAME_KEYS = ("name", "rsc_name")
+_VD_LIST_KEYS = ("volume_definitions", "vlm_dfns")
+_VD_NUMBER_KEYS = ("volume_number", "vlm_nr")
+_VD_SIZE_KEYS = ("size_kib", "vlm_size")
+_RSC_LIST_KEYS = ("resources",)
+_RSC_NAME_KEYS = ("name", "rsc_name")
+_RSC_NODE_KEYS = ("node_name", "node")
+
+
+def _first_key(entry, keys):
+    for key in keys:
+        if key in entry:
+            return entry[key]
+    return None
+
+
+def parse_linstor_resource_definitions(text):
+    """[{"name","volumes":[{"number","size_kib"}]}] from `resource-definition list`.
+
+    An unrecognised document yields [] rather than a guess: a caller that gets an
+    empty list and then fails to create is recoverable, one that gets a wrong size is
+    not.
+    """
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    definitions = []
+    for entry in _linstor_entries(data):
+        listed = _first_key(entry, _RD_LIST_KEYS)
+        if not isinstance(listed, list):
+            # Piraeus 1.31's client emits the definitions bare -- [[{"name": ...}]] --
+            # with no wrapper key at all, so an entry that already looks like a
+            # definition is one. Verified against the deployed client; without this the
+            # list endpoint reported an empty cluster while resources existed.
+            if _first_key(entry, _RD_NAME_KEYS):
+                listed = [entry]
+            else:
+                continue
+        for definition in listed:
+            if not isinstance(definition, dict):
+                continue
+            name = _first_key(definition, _RD_NAME_KEYS)
+            if not isinstance(name, str) or not name:
+                continue
+            volumes = []
+            for volume in _first_key(definition, _VD_LIST_KEYS) or []:
+                if not isinstance(volume, dict):
+                    continue
+                number = _first_key(volume, _VD_NUMBER_KEYS)
+                size_kib = _first_key(volume, _VD_SIZE_KEYS)
+                volumes.append({
+                    "number": number if isinstance(number, int) else 0,
+                    "size_kib": size_kib if isinstance(size_kib, int) else None,
+                })
+            definitions.append({"name": name, "volumes": volumes})
+    return definitions
+
+
+def parse_linstor_resources(text):
+    """[{"name","node"}] from `resource list`: which nodes actually back a resource."""
+    try:
+        data = json.loads(text.strip() or "[]")
+    except ValueError:
+        return []
+
+    placements = []
+    for entry in _linstor_entries(data):
+        listed = _first_key(entry, _RSC_LIST_KEYS)
+        if not isinstance(listed, list):
+            continue
+        for resource in listed:
+            if not isinstance(resource, dict):
+                continue
+            name = _first_key(resource, _RSC_NAME_KEYS)
+            node = _first_key(resource, _RSC_NODE_KEYS)
+            if not isinstance(name, str) or not name:
+                continue
+            placements.append({
+                "name": name,
+                "node": node if isinstance(node, str) else "",
+            })
+    return placements
+
+
+def linstor_says(detail, markers):
+    """True when the client's own message contains one of `markers`."""
+    lowered = (detail or "").lower()
+    return any(marker in lowered for marker in markers)
+
+
+def linstor_call(args, timeout=120):
+    """Run one linstor client command. Returns (ok, stdout, detail).
+
+    `ok` is False when the client exited non-zero or reported an error-masked
+    ApiCallRc. The exit status is the primary signal and the mask is a second opinion,
+    so a wrong assumption about the mask cannot by itself turn a successful call into
+    a failure. `detail` is the client's own message text -- it drives the idempotency
+    checks and the error string, and is never returned as the body of a success.
+    """
+    rc, stdout, stderr = run_argv(linstor_argv(args), timeout=timeout)
+    messages = parse_linstor_api_call_rc(stdout)
+
+    parts = []
+    for message in messages:
+        for field in ("message", "details", "cause"):
+            if message[field]:
+                parts.append(message[field])
+    if stderr.strip():
+        parts.append(stderr.strip())
+    detail = " ".join(parts)
+
+    reported_error = any(
+        (message["ret_code"] & LINSTOR_MASK_ERROR) == LINSTOR_MASK_ERROR
+        for message in messages
+    )
+    ok = rc == 0 and not reported_error
+    if not ok and not detail:
+        detail = stdout.strip() or ("linstor %s failed with exit code %s" % (args[0], rc))
+    return ok, stdout, detail
+
+
+def linstor_resource_path(resource):
+    """Where a resource's volume 0 appears on every node backing it."""
+    return "/dev/drbd/by-res/%s/0" % resource
+
+
+def linstor_inventory():
+    """(resources, error): what Linstor holds, in this daemon's shape.
+
+    Each entry is {"name","size_kib","size_gib","nodes","device_path"}. Placement comes
+    from a second call because `resource-definition list` describes the definition, not
+    where it is materialised; a failure there degrades `nodes` to [] rather than failing
+    the read, since the definitions are the part a caller cannot do without.
+    """
+    # volume-definition list, not resource-definition list: on the deployed client the
+    # latter omits volume_definitions entirely, so existing sizes came back as null and
+    # the size-mismatch guard below could never fire -- letting a new VM silently adopt
+    # a deleted VM's disk at a different size.
+    ok, stdout, detail = linstor_call(["volume-definition", "list"], timeout=60)
+    if not ok:
+        return None, detail or "linstor resource-definition list failed"
+
+    placements = {}
+    ok_resources, resources_stdout, _ = linstor_call(["resource", "list"], timeout=60)
+    if ok_resources:
+        for placement in parse_linstor_resources(resources_stdout):
+            nodes = placements.setdefault(placement["name"], [])
+            if placement["node"] and placement["node"] not in nodes:
+                nodes.append(placement["node"])
+
+    inventory = []
+    for definition in parse_linstor_resource_definitions(stdout):
+        volume = None
+        for candidate in definition["volumes"]:
+            if candidate["number"] == 0:
+                volume = candidate
+                break
+        size_kib = volume["size_kib"] if volume else None
+        inventory.append({
+            "name": definition["name"],
+            "size_kib": size_kib,
+            "size_gib": (size_kib // KIB_PER_GIB) if isinstance(size_kib, int) else None,
+            "nodes": placements.get(definition["name"], []),
+            "device_path": linstor_resource_path(definition["name"]),
+        })
+    return inventory, None
+
+
+def read_dhcp_leases():
+    """Every dnsmasq lease this host knows about, deduplicated by (mac, ip)."""
+    files = list(DNSMASQ_LEASE_FILES)
+    try:
+        files.extend(sorted(glob.glob(LIBVIRT_LEASE_GLOB)))
+    except Exception:
+        pass
+
+    leases = []
+    seen = set()
+    for lease_file in files:
+        try:
+            with open(lease_file, "r", errors="ignore") as handle:
+                content = handle.read()
+        except OSError:
+            continue
+        for lease in parse_dnsmasq_leases(content):
+            key = (lease["mac"], lease["ip"])
+            if key in seen:
+                continue
+            seen.add(key)
+            leases.append(lease)
+    return leases
+
+
+def read_host_capabilities():
+    """{"kvm","drbd_module","secure_boot"} read straight from the kernel."""
+    kvm = os.path.exists("/dev/kvm")
+
+    drbd_module = os.path.exists("/proc/drbd")
+    if not drbd_module:
+        try:
+            with open("/proc/modules", "r") as handle:
+                for line in handle:
+                    if line.split(" ", 1)[0] == "drbd":
+                        drbd_module = True
+                        break
+        except OSError:
+            pass
+
+    secure_boot = False
+    try:
+        with open(SECURE_BOOT_EFIVAR, "rb") as handle:
+            data = handle.read()
+        # 4-byte EFI attribute prefix followed by the one-byte value.
+        if data:
+            secure_boot = data[-1] == 1
+    except OSError:
+        secure_boot = False
+
+    return {"kvm": kvm, "drbd_module": drbd_module, "secure_boot": secure_boot}
+
+
+DB_REPAIR_LOCK = threading.Lock()
+DB_REPAIR_THREAD = None
+
+
+def _run_db_repair(argv):
+    print("[REPAIR] Starting %s. This can take a long time on a large keyspace." % " ".join(argv))
+    rc, stdout, stderr = run_argv(argv, timeout=86400)
+    if rc == 0:
+        print("[REPAIR] Completed successfully.")
+    else:
+        print("[REPAIR] Failed with exit code %s: %s" % (rc, (stderr or stdout).strip()))
+
+
+def start_db_repair(keyspace, primary_range):
+    """Start a nodetool repair in the background.
+
+    Returns True when a repair was started, False when one is already running. A
+    repair outlives any reasonable HTTP timeout, so it never runs inline.
+    """
+    global DB_REPAIR_THREAD
+    argv = ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "repair"]
+    if primary_range:
+        argv.append("-pr")
+    argv.append(keyspace)
+
+    with DB_REPAIR_LOCK:
+        if DB_REPAIR_THREAD is not None and DB_REPAIR_THREAD.is_alive():
+            return False
+        thread = threading.Thread(target=_run_db_repair, args=(argv,), daemon=True)
+        DB_REPAIR_THREAD = thread
+        thread.start()
+        return True
+
+
+def schedule_host_reboot(delay=2):
+    """Reboot after the HTTP response has been written."""
+    def worker():
+        time.sleep(delay)
+        rc, _, stderr = run_argv(["systemctl", "reboot"], timeout=60)
+        if rc != 0:
+            print("[REBOOT] systemctl reboot failed: %s" % stderr.strip())
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
 class SparkDaemonHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -352,11 +2110,19 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         
-        url = f"http://127.0.0.1:9095{path}"
+        # Vali requires mutual TLS. Loopback is reached by this node's own address,
+        # because that is what its certificate names -- see spark_endpoint().
+        address, verify_identity = spark_endpoint("127.0.0.1")
+        vali_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
+                                              cafile="/etc/hci/spark/certs/ca.crt")
+        vali_ctx.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
+                                 keyfile="/etc/hci/spark/certs/node.key")
+        vali_ctx.check_hostname = verify_identity
+        url = f"https://{address}:9095{path}"
         req = urllib.request.Request(url, data=post_data, method=method)
         req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=120) as response:
+            with urllib.request.urlopen(req, context=vali_ctx, timeout=120) as response:
                 res_bytes = response.read()
                 self.send_response(response.status)
                 self.send_header("Content-Type", "application/json")
@@ -397,8 +2163,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     print(f"[Spark Daemon] Local Vali is offline. Multi-node cluster detected. Attempting to delegate leave maintenance request to remote spark daemons: {other_ips}")
                     context_remote = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
                     context_remote.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-                    context_remote.check_hostname = False
-                    
+                    # Every address here comes from cluster.json, so each one is the IP its
+                    # own node certificate is issued for and verification stays on.
+                    context_remote.check_hostname = True
+
                     forward_success = False
                     for remote_ip in other_ips:
                         url = f"https://{remote_ip}:9099/api/v1/host/maintenance"
@@ -465,7 +2233,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/v1/urbosa/tunnels/status":
             self.handle_urbosa_tunnels_status()
             return
-        
+
+        if self.route_typed_get(parsed):
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -499,6 +2270,9 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/v1/cluster/sync-settings":
             self.handle_sync_settings()
+            return
+
+        if self.route_typed_post(urllib.parse.urlparse(self.path)):
             return
 
         self.send_response(404)
@@ -668,186 +2442,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         self.send_json_response(200, response)
 
     def handle_node_status(self):
-        import json
-        import subprocess
-        import socket
-        import os
-        
-        ip_addr = "127.0.0.1"
-        hostname = socket.gethostname()
-        try:
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = cdata.get("hosts", [])
-                for h in hosts:
-                    if h.get("hostname") == hostname:
-                        ip_addr = h.get("ip")
-                        break
-                if ip_addr == "127.0.0.1" and hosts:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    try:
-                        s.connect(("8.8.8.8", 80))
-                        local_ip = s.getsockname()[0]
-                        s.close()
-                        for h in hosts:
-                            if h.get("ip") == local_ip:
-                                ip_addr = local_ip
-                                hostname = h.get("hostname")
-                                break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-            
-        is_leader = False
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            s.connect(("127.0.0.1", 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            is_leader = "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
-        except Exception:
-            pass
-            
-        maint_status = "NORMAL"
-        if os.path.exists("/etc/hci/maintenance.state"):
-            maint_status = "IN_MAINTENANCE"
-            
-        global NODE_DISKS_CACHE
-        if 'NODE_DISKS_CACHE' not in globals():
-            globals()['NODE_DISKS_CACHE'] = None
-            
-        disks_count = globals()['NODE_DISKS_CACHE']
-        if disks_count is None:
-            try:
-                res_d = subprocess.run("lsblk -d -n -o TYPE", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res_d.returncode == 0:
-                    disks_count = sum(1 for line in res_d.stdout.decode().splitlines() if line.strip() == "disk")
-                    globals()['NODE_DISKS_CACHE'] = disks_count
-                else:
-                    disks_count = 1
-            except Exception:
-                disks_count = 1
-
-        global SERVICE_PIDS_CACHE, LAST_PIDS_CACHE_TIME
-        if 'SERVICE_PIDS_CACHE' not in globals():
-            globals()['SERVICE_PIDS_CACHE'] = {}
-        if 'LAST_PIDS_CACHE_TIME' not in globals():
-            globals()['LAST_PIDS_CACHE_TIME'] = 0
-
-        services = ["zookeeper", "hydra-db", "daruk", "aether", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
-        svc_map = {
-            "zookeeper": "ZooKeeper",
-            "hydra-db": "HydraDB",
-            "daruk": "Daruk",
-            "aether": "Aether",
-            "spark-daemon": "Spark",
-            "spectrum": "Spectrum",
-            "bifrost": "Bifrost",
-            "dagur": "Dagur",
-            "mimir": "Mimir",
-            "vali": "Vali",
-            "catalyst": "Catalyst",
-            "hylia": "Hylia",
-            "gatoway": "Gatoway",
-            "logos": "Logos",
-            "mipha": "Mipha",
-            "agahnim": "Agahnim",
-            "slate": "Slate"
-        }
-        if check_urbosa_enabled():
-            services.append("urbosa")
-            svc_map["urbosa"] = "Urbosa"
-        
-        result = {
-            "ip": ip_addr,
-            "hostname": hostname,
-            "zk_leader": is_leader,
-            "maintenance_status": maint_status,
-            "disks": disks_count,
-            "services": {}
-        }
-        
-        cmd = f"systemctl is-active {' '.join(services)}"
-        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        lines = res.stdout.decode().splitlines()
-        
-        services_active = {}
-        for idx, svc in enumerate(services):
-            is_active = False
-            if idx < len(lines):
-                is_active = (lines[idx].strip() == "active")
-            services_active[svc] = is_active
-
-        # Refresh PIDs cache if 10 seconds elapsed
-        now = time.time()
-        if now - globals()['LAST_PIDS_CACHE_TIME'] > 10 or not globals()['SERVICE_PIDS_CACHE']:
-            new_cache = {}
-            
-            # Native services
-            native_svcs = ["daruk"]
-            cmd_native = f"systemctl show -p MainPID --value {' '.join(native_svcs)}"
-            try:
-                res_nat = subprocess.run(cmd_native, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res_nat.returncode == 0:
-                    nat_lines = [l.strip() for l in res_nat.stdout.decode().splitlines() if l.strip()]
-                    for s_idx, s_name in enumerate(native_svcs):
-                        pids = []
-                        if s_idx < len(nat_lines):
-                            val = nat_lines[s_idx]
-                            if val and val != "0":
-                                pids = [int(val)]
-                        new_cache[s_name] = pids
-                else:
-                    for s_name in native_svcs:
-                        new_cache[s_name] = []
-            except Exception:
-                for s_name in native_svcs:
-                    new_cache[s_name] = []
-                    
-            # Containerized services
-            container_svcs = ["spark-daemon", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "zookeeper", "hydra-db", "aether", "spectrum", "slate"]
-            if "urbosa" in services:
-                container_svcs.append("urbosa")
-            for s_name in container_svcs:
-                pids = []
-                if services_active.get(s_name):
-                    try:
-                        res_cont = subprocess.run(f"podman top systemd-{s_name} hpid", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        if res_cont.returncode == 0:
-                            cont_lines = res_cont.stdout.decode().strip().splitlines()
-                            if len(cont_lines) > 1:
-                                for line in cont_lines[1:]:
-                                    val = line.strip()
-                                    if val and val != "?":
-                                        try:
-                                            pids.append(int(val))
-                                        except ValueError:
-                                            pids.append(val)
-                    except Exception:
-                        pass
-                new_cache[s_name] = pids
-                
-            globals()['SERVICE_PIDS_CACHE'] = new_cache
-            globals()['LAST_PIDS_CACHE_TIME'] = now
-
-        pids_cache = globals()['SERVICE_PIDS_CACHE']
-        
-        for svc in services:
-            if services_active[svc]:
-                result["services"][svc_map[svc]] = {
-                    "status": "UP",
-                    "pids": pids_cache.get(svc, [])
-                }
-            else:
-                result["services"][svc_map[svc]] = {
-                    "status": "DOWN",
-                    "pids": []
-                }
-                
-        self.send_json_response(200, result)
+        self.send_json_response(200, build_node_status())
 
     def handle_binary_version(self, parsed):
         import urllib.parse
@@ -1020,7 +2615,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
  
             # Start linstor-controller
-            run_checked_cmd(hosts[0], "systemctl start linstor-controller")
+            # run_checked_cmd is defined in cluster_new.py, not here -- calling it raised
+            # NameError and broke this path. run_parallel_checked has identical semantics
+            # (checked remote exec, raises on failure) and takes a list.
+            run_parallel_checked([hosts[0]], "systemctl start linstor-controller")
             for ip in hosts[1:]:
                 run_remote_spark(ip, "systemctl stop linstor-controller")
             # Wait for Linstor controller
@@ -1138,7 +2736,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             
             # Start storage engine (linstor-controller and satellite/aether on all)
             run_parallel_checked(servers, "systemctl start aether")
-            run_checked_cmd(servers[0], "systemctl start linstor-controller")
+            run_parallel_checked([servers[0]], "systemctl start linstor-controller")
             for ip in servers[1:]:
                 run_remote_spark(ip, "systemctl stop linstor-controller")
             # Wait for Linstor controller API to start listening on port 3370 on the leader server
@@ -1194,14 +2792,16 @@ for line in res_lsblk.stdout.decode().splitlines():
         try: size_bytes = int(parts[1])
         except ValueError: continue
         dev_path = "/dev/" + name
+        # A claimed disk is wiped, so skip any disk with ANY non-empty mountpoint anywhere in
+        # its tree (system path, /srv, /data, swap, ...) -- an in-use disk is never a candidate.
         res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        is_sys = False
+        is_in_use = False
         for m in res_m.stdout.decode().splitlines():
             m = m.strip()
-            if m in ["/", "/boot", "/boot/efi", "/var", "/usr", "/home"] or "swap" in m.lower():
-            is_sys = True
-            break
-        if is_sys: continue
+            if (m and m != "-") or "swap" in m.lower():
+                is_in_use = True
+                break
+        if is_in_use: continue
         res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if "part" in res_p.stdout.decode().splitlines(): continue
         if size_bytes >= 100 * 10**9:
@@ -1500,17 +3100,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         if not hosts:
             hosts = ["127.0.0.1"]
 
-        # 0.5. Dynamically read configured storage disks
-        disk_devices = ["/dev/sdb"]
-        try:
-            with open("/etc/hci/aether/storage-pools.json", "r") as f:
-                spdata = json.load(f)
-                for disk in spdata.get("local_disks", []):
-                    dev = disk.get("device")
-                    if dev and dev not in disk_devices:
-                        disk_devices.append(dev)
-        except Exception:
-            pass
+        # 0.5. Storage disks are NOT resolved here. Each host discovers its own devices at wipe
+        # time (see the wipe plan script below): reading this node's storage-pools.json and
+        # broadcasting those device names would wipe the wrong disk on any host whose storage
+        # sits elsewhere (e.g. /dev/nvme0n1).
 
         # 1. Stop and Delete Storage Volumes/Resources (Standardized on Linstor/DRBD)
         pass
@@ -1539,14 +3132,164 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             "done"
         )
         run_parallel(hosts, drbd_down_cmd)
-        # Wipe LVM thin pool and disk signatures dynamically on all configured disk devices
-        # Ensure LVM wiping is performed on the remote hosts
-        for dev in disk_devices:
-            lvm_wipe_cmd = f"lvchange -an -f /dev/vg_aether/* || true; lvremove -y -f vg_aether || true; vgremove -y -f vg_aether || true; rm -rf /dev/vg_aether || true; dmsetup ls | grep vg_aether | awk '{{print $1}}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done; pvremove -y -f {dev} || true; wipefs -a -f {dev} || true"
-            try:
-                run_parallel(hosts, lvm_wipe_cmd)
-            except Exception:
-                pass
+        # Wipe the LVM thin pool and VG (device independent) on every host first, so the storage
+        # disks are left as bare unmounted devices before the signature wipe discovers them.
+        lvm_wipe_cmd = "lvchange -an -f /dev/vg_aether/* || true; lvremove -y -f vg_aether || true; vgremove -y -f vg_aether || true; rm -rf /dev/vg_aether || true; dmsetup ls | grep vg_aether | awk '{print $1}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done"
+        try:
+            run_parallel(hosts, lvm_wipe_cmd)
+        except Exception:
+            pass
+
+        # Discover and zero the physical storage disks this cluster actually claimed. Every host
+        # resolves its own devices (storage-pools.json, vg_aether/orphaned PVs, scan of raw
+        # unmounted disks >= 100GB); there is NO hardcoded device fallback, so a host that
+        # matches nothing is a clean no-op instead of wiping a guessed device name.
+        wipe_devices_script = """
+import subprocess, json, sys, os
+devs = []
+reasons = {}
+skipped = []
+
+def add_dev(dev, reason):
+    if dev and dev not in devs:
+        devs.append(dev)
+        reasons[dev] = reason
+
+def mountpoints_of(dev):
+    mounts = []
+    res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for m in res_m.stdout.decode().splitlines():
+        m = m.strip()
+        if m and m != "-" and m not in mounts:
+            mounts.append(m)
+    return mounts
+
+def size_of(dev):
+    res_sz = subprocess.run("blockdev --getsize64 " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res_sz.returncode == 0:
+        try: return int(res_sz.stdout.decode().strip())
+        except ValueError: return -1
+    return -1
+
+def signatures_of(dev):
+    sigs = []
+    res_w = subprocess.run("wipefs " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for line in res_w.stdout.decode().splitlines()[1:]:
+        cols = line.split()
+        if len(cols) >= 3 and cols[2] not in sigs:
+            sigs.append(cols[2])
+    return sigs
+
+# 0. Disks this node recorded as its own Aether storage pool members (authoritative)
+try:
+    with open("/etc/hci/aether/storage-pools.json", "r") as f:
+        spdata = json.load(f)
+    for disk in spdata.get("local_disks", []):
+        add_dev(disk.get("device"), "configured in storage-pools.json")
+except Exception:
+    pass
+
+# 1. Find PVs of vg_aether or orphaned PVs
+res_pvs = subprocess.run("pvs --noheadings -o pv_name,vg_name", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if res_pvs.returncode == 0:
+    for line in res_pvs.stdout.decode().splitlines():
+        parts = line.split()
+        if len(parts) >= 1:
+            pv = parts[0].strip()
+            vg = parts[1].strip() if len(parts) >= 2 else ""
+            if vg in ["vg_aether", ""]:
+                add_dev(pv, "LVM PV (vg=" + (vg if vg else "orphaned") + ")")
+
+# 2. Scan for candidate disks >= 100GB (unmounted, no partitions)
+res_lsblk = subprocess.run("lsblk -b -d -n -o NAME,SIZE,TYPE,ROTA", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if res_lsblk.returncode == 0:
+    for line in res_lsblk.stdout.decode().splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == "disk":
+            name = parts[0]
+            try: size_bytes = int(parts[1])
+            except ValueError: continue
+            dev_path = "/dev/" + name
+            if dev_path in devs: continue
+            # Skip any disk carrying ANY non-empty mountpoint anywhere in its tree, not just
+            # recognised system paths: a disk mounted at /srv or /data is in use, not a candidate.
+            skip_reason = ""
+            for m in mountpoints_of(dev_path):
+                if "swap" in m.lower():
+                    skip_reason = "active swap (" + m + ")"
+                else:
+                    skip_reason = "mounted at " + m
+                break
+            if not skip_reason:
+                res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if "part" in res_p.stdout.decode().splitlines():
+                    skip_reason = "disk has partitions"
+            if not skip_reason and size_bytes < 100 * 10**9:
+                skip_reason = "smaller than 100GB (" + ("%.1f" % (size_bytes / 10.0**9)) + " GB)"
+            if skip_reason:
+                skipped.append((dev_path, skip_reason))
+                continue
+            add_dev(dev_path, "unpartitioned unmounted disk >= 100GB")
+
+# 3. Final veto: never touch a device that is missing or still has anything mounted on it,
+#    whichever source proposed it.
+vetted = []
+for dev in devs:
+    if not os.path.exists(dev):
+        skipped.append((dev, "device not present on this host"))
+        continue
+    mounts = mountpoints_of(dev)
+    swap_mounts = [m for m in mounts if "swap" in m.lower()]
+    if swap_mounts:
+        skipped.append((dev, "active swap (" + ",".join(swap_mounts) + ") -- refusing to wipe"))
+        continue
+    if mounts:
+        skipped.append((dev, "still mounted at " + ",".join(mounts) + " -- refusing to wipe"))
+        continue
+    vetted.append(dev)
+devs = vetted
+
+# 4. Print the exact wipe set (and every rejection) before destroying anything
+print("=== cluster destroy: disk wipe plan for this host ===")
+for dev, why in skipped:
+    print("  SKIP  " + dev + " -- " + why)
+if not devs:
+    print("  No qualifying devices found. Nothing will be wiped on this host.")
+    print("=== end of wipe plan (no-op) ===")
+    sys.exit(0)
+for dev in devs:
+    size_bytes = size_of(dev)
+    size_str = ("%.1f GB" % (size_bytes / 10.0**9)) if size_bytes > 0 else "unknown"
+    sigs = signatures_of(dev)
+    mounts = mountpoints_of(dev)
+    print("  WIPE  " + dev + " -- size=" + size_str + " signatures=" + (",".join(sigs) if sigs else "none") + " mountpoints=" + (",".join(mounts) if mounts else "none") + " reason=" + reasons.get(dev, "unknown"))
+print("=== wiping " + str(len(devs)) + " device(s): " + ", ".join(devs) + " ===")
+
+for dev in devs:
+    subprocess.run("pvremove -y -f " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.path.exists("/etc/lvm/devices/system.devices"):
+        dev_name = dev.split("/")[-1]
+        subprocess.run("sed -i '/" + dev_name + "/d' /etc/lvm/devices/system.devices", shell=True)
+    subprocess.run("wipefs -a -f " + dev, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    size_bytes = size_of(dev)
+    if size_bytes > 0:
+        seek_val = (size_bytes // 1048576) - 1024
+        if seek_val > 0:
+            subprocess.run("dd if=/dev/zero of=" + dev + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:
+        print("Failed to determine size of " + dev + "; skipped zeroing end of device")
+    print("Wiped " + dev)
+"""
+        wipe_devices_b64 = base64.b64encode(wipe_devices_script.strip().encode()).decode()
+        cmd_wipe_devices = f"python3 -c \"import base64; exec(base64.b64decode('{wipe_devices_b64}').decode())\""
+        wipe_results = run_parallel(hosts, cmd_wipe_devices)
+        for wip, (rc_pv, out_pv, err_pv) in wipe_results.items():
+            if out_pv.strip():
+                print(f"[{wip}] Wipe log:\n{out_pv}")
+            if rc_pv != 0:
+                print(f"[{wip}] [WARNING] Wipe execution failed: {err_pv}")
+
         wipe_script = """
 import subprocess
 import os
@@ -1609,6 +3352,923 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             
         self.send_json_response(200, {"message": "Cluster destroyed successfully."})
 
+    # ------------------------------------------------------------------
+    # Typed API (docs/spark_api.md)
+    # ------------------------------------------------------------------
+
+    def read_json_payload(self):
+        """Read the request body as a JSON object. Returns (payload, error)."""
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+        except (TypeError, ValueError):
+            return None, "Invalid Content-Length header"
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return {}, None
+        try:
+            payload = json.loads(raw.decode('utf-8'))
+        except Exception:
+            return None, "Invalid JSON body"
+        if not isinstance(payload, dict):
+            return None, "JSON body must be an object"
+        return payload, None
+
+    def reject(self, message, status=400):
+        """Every rejection has the same shape: {"error": "..."}."""
+        self.send_json_response(status, {"error": message})
+
+    def query_param(self, parsed, key):
+        values = urllib.parse.parse_qs(parsed.query).get(key, [])
+        return values[0] if values else None
+
+    def route_typed_get(self, parsed):
+        """Dispatch the typed read endpoints. True when the request was handled."""
+        path = parsed.path
+
+        if path == "/api/v1/storage/drbd/status":
+            self.handle_storage_drbd_status(parsed)
+            return True
+        if path == "/api/v1/storage/device":
+            self.handle_storage_device(parsed)
+            return True
+        if path == "/api/v1/storage/container/mounted":
+            self.handle_storage_container_mounted(parsed)
+            return True
+        if path == "/api/v1/storage/drbd/options":
+            self.handle_storage_drbd_options(parsed)
+            return True
+        if path == "/api/v1/storage/linstor/resources":
+            self.handle_storage_linstor_resources(parsed)
+            return True
+        if path == "/api/v1/host/network":
+            self.handle_host_network()
+            return True
+        if path == "/api/v1/host/memory":
+            self.handle_host_memory()
+            return True
+        if path == "/api/v1/host/disks":
+            self.handle_host_disks()
+            return True
+        if path == "/api/v1/host/capabilities":
+            self.handle_host_capabilities()
+            return True
+        if path == "/api/v1/host/dhcp-leases":
+            self.handle_host_dhcp_leases()
+            return True
+        if path == "/api/v1/db/ring":
+            self.handle_db_ring()
+            return True
+
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"]:
+            action = segments[4]
+            if action not in ("interfaces", "console", "info"):
+                return False
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            if action == "interfaces":
+                self.handle_vm_interfaces(name)
+            elif action == "console":
+                self.handle_vm_console(name)
+            else:
+                self.handle_vm_info(name)
+            return True
+
+        return False
+
+    def route_typed_post(self, parsed):
+        """Dispatch the typed write endpoints. True when the request was handled."""
+        path = parsed.path
+        if path == "/api/v1/vm/define":
+            self.handle_vm_define()
+            return True
+        if path == "/api/v1/vm/undefine":
+            self.handle_vm_undefine()
+            return True
+        if path == "/api/v1/storage/drbd/role":
+            self.handle_storage_drbd_role()
+            return True
+        if path == "/api/v1/storage/device/prepare":
+            self.handle_storage_device_prepare()
+            return True
+        if path == "/api/v1/storage/device/write":
+            self.handle_storage_device_write(parsed)
+            return True
+        if path == "/api/v1/storage/device/flush":
+            self.handle_storage_device_flush()
+            return True
+        if path == "/api/v1/storage/container/ensure":
+            self.handle_storage_container_ensure()
+            return True
+        if path == "/api/v1/dfs/vdisk":
+            self.handle_dfs_vdisk()
+            return True
+        if path == "/api/v1/storage/linstor/resource":
+            self.handle_storage_linstor_resource()
+            return True
+        if path == "/api/v1/storage/linstor/resource/delete":
+            self.handle_storage_linstor_resource_delete()
+            return True
+        if path == "/api/v1/host/reboot":
+            self.handle_host_reboot()
+            return True
+        if path == "/api/v1/host/fence":
+            self.handle_host_fence()
+            return True
+        if path == "/api/v1/db/repair":
+            self.handle_db_repair()
+            return True
+
+        segments = [segment for segment in path.split("/") if segment]
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "power":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_power(name)
+            return True
+
+        return False
+
+    # -- VM ------------------------------------------------------------
+
+    def handle_vm_interfaces(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["domiflist", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh domiflist failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, {"interfaces": parse_virsh_domiflist(stdout)})
+
+    def handle_vm_console(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["dumpxml", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh dumpxml failed",
+                        virsh_status_for(stderr))
+            return
+        try:
+            graphics = parse_domain_graphics(stdout)
+        except ET.ParseError as exc:
+            self.reject("Could not parse domain XML: %s" % exc, 500)
+            return
+        if graphics is None:
+            self.reject("Domain %s has no vnc or spice console" % name, 404)
+            return
+        self.send_json_response(200, graphics)
+
+    def handle_vm_info(self, name):
+        rc, stdout, stderr = run_argv(VIRSH + ["dominfo", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh dominfo failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, parse_virsh_dominfo(stdout))
+
+    def handle_vm_define(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid VM name")
+            return
+
+        xml_b64 = payload.get("xml_b64")
+        if not isinstance(xml_b64, str) or not xml_b64.strip():
+            self.reject("Missing xml_b64")
+            return
+        try:
+            xml_bytes = base64.b64decode("".join(xml_b64.split()), validate=True)
+        except Exception:
+            self.reject("xml_b64 is not valid base64")
+            return
+        try:
+            xml_text = xml_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self.reject("xml_b64 must decode to UTF-8 domain XML")
+            return
+        try:
+            xml_name = parse_domain_name(xml_text)
+        except ET.ParseError as exc:
+            self.reject("Domain XML is not well formed: %s" % exc)
+            return
+        if xml_name != name:
+            self.reject("Domain XML declares name '%s', which does not match '%s'"
+                        % (xml_name, name))
+            return
+
+        # The XML reaches virsh as a file path, never as a shell argument, so no
+        # part of the document can be read as command syntax.
+        fd, temp_path = tempfile.mkstemp(prefix="spark-domain-", suffix=".xml")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(xml_bytes)
+            rc, stdout, stderr = run_argv(VIRSH + ["define", temp_path], timeout=60)
+        except OSError as exc:
+            self.reject("Could not stage domain XML: %s" % exc, 500)
+            return
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh define failed", 500)
+            return
+        self.send_json_response(200, {"defined": True})
+
+    def handle_vm_undefine(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid VM name")
+            return
+        keep_nvram = payload.get("keep_nvram", False)
+        if not isinstance(keep_nvram, bool):
+            self.reject("keep_nvram must be a boolean")
+            return
+
+        argv = VIRSH + ["undefine", name, "--keep-nvram" if keep_nvram else "--nvram"]
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh undefine failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, {"undefined": True})
+
+    def handle_vm_power(self, name):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        action = payload.get("action")
+        if action not in VM_POWER_ACTIONS:
+            self.reject("action must be one of " + ", ".join(VM_POWER_ACTIONS))
+            return
+
+        rc, stdout, stderr = run_argv(VIRSH + [action, name], timeout=120)
+        state = virsh_domain_state(name)
+        if rc != 0:
+            message = (stderr or stdout).strip() or ("virsh %s failed" % action)
+            if virsh_status_for(stderr) == 404:
+                self.reject(message, 404)
+                return
+            # The domain exists but did not take the transition. Report the state
+            # it is actually in alongside the failure.
+            self.send_json_response(409, {"state": state or "", "error": message})
+            return
+        self.send_json_response(200, {"state": state or ""})
+
+    # -- Storage -------------------------------------------------------
+
+    def handle_storage_drbd_status(self, parsed):
+        resource = self.query_param(parsed, "resource")
+        argv = ["drbdsetup", "status", "--json"]
+        if resource is not None:
+            if not valid_name(resource):
+                self.reject("Invalid resource name")
+                return
+            argv.append(resource)
+
+        rc, stdout, stderr = run_argv(argv, timeout=30)
+        if rc != 0:
+            # A named resource that drbdsetup does not know is a 404, not a
+            # server fault: DRBD resources exist only on the nodes that back them.
+            self.reject((stderr or stdout).strip() or "drbdsetup status failed",
+                        404 if resource is not None else 500)
+            return
+        try:
+            status = json.loads(stdout.strip() or "[]")
+        except Exception:
+            self.reject("Could not parse drbdsetup status output", 500)
+            return
+        self.send_json_response(200, status)
+
+    def handle_storage_drbd_role(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        role = payload.get("role")
+        if not isinstance(role, str) or role.lower() not in DRBD_ROLES:
+            self.reject("role must be one of " + ", ".join(DRBD_ROLES))
+            return
+        role = role.lower()
+        force = payload.get("force", False)
+        if not isinstance(force, bool):
+            self.reject("force must be a boolean")
+            return
+
+        argv = ["drbdadm", role]
+        if force and role == "primary":
+            argv.append("--force")
+        argv.append(resource)
+
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        resulting = drbd_local_role(resource)
+        if resulting is None and rc == 0:
+            # drbdadm confirmed the transition; only the read-back was unavailable.
+            resulting = role.capitalize()
+
+        if resulting is not None and resulting.lower() == role:
+            self.send_json_response(200, {"role": resulting})
+            return
+
+        message = (stderr or stdout).strip() or ("Could not read the role of " + resource)
+        if any(peer.lower() == "primary" for peer in drbd_peer_roles(resource)):
+            message = "Peer already holds Primary for %s. %s" % (resource, message)
+        self.send_json_response(409, {"role": resulting or "Unknown", "error": message})
+
+    def handle_storage_drbd_options(self, parsed):
+        """The *configured* resource options, which `drbdsetup status` does not carry.
+
+        This exists for fencing. A device's `quorum` flag in the status document reads
+        true both when quorum is held and when quorum is switched off altogether, so a
+        caller that only had the status could not tell "we hold the majority" from "this
+        cluster has no quorum at all" -- and those have opposite consequences for whether
+        a partitioned peer has stopped writing.
+        """
+        resource = self.query_param(parsed, "resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        rc, stdout, stderr = run_argv(["drbdsetup", "show", "--json", resource], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "drbdsetup show failed", 404)
+            return
+        try:
+            shown = json.loads(stdout.strip() or "[]")
+        except Exception:
+            self.reject("Could not parse drbdsetup show output", 500)
+            return
+        for entry in shown if isinstance(shown, list) else []:
+            if isinstance(entry, dict) and entry.get("resource") == resource:
+                options = entry.get("options")
+                self.send_json_response(200, {
+                    "resource": resource,
+                    "options": options if isinstance(options, dict) else {}})
+                return
+        self.reject("drbdsetup show returned no options for " + resource, 404)
+
+    def handle_storage_device(self, parsed):
+        raw_path = self.query_param(parsed, "path")
+        if raw_path is None:
+            self.reject("Missing path parameter")
+            return
+        real, error = validate_path(raw_path)
+        if error:
+            self.reject(error)
+            return
+
+        try:
+            st_result = os.stat(real)
+        except FileNotFoundError:
+            self.send_json_response(200, {"exists": False, "is_block": False, "size_bytes": 0})
+            return
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+
+        self.send_json_response(200, {
+            "exists": True,
+            "is_block": stat.S_ISBLK(st_result.st_mode),
+            "size_bytes": device_size_bytes(real, st_result),
+        })
+
+    def handle_storage_device_prepare(self):
+        import pwd
+        import grp
+
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        real, error = validate_path(payload.get("path"))
+        if error:
+            self.reject(error)
+            return
+        owner, error = validate_owner(payload.get("owner"))
+        if error:
+            self.reject(error)
+            return
+        mode, error = validate_mode(payload.get("mode"))
+        if error:
+            self.reject(error)
+            return
+
+        user_name, _, group_name = owner.partition(":")
+        try:
+            uid = pwd.getpwnam(user_name).pw_uid
+            gid = grp.getgrnam(group_name).gr_gid
+        except KeyError:
+            self.reject("Owner '%s' does not exist on this host" % owner, 500)
+            return
+
+        try:
+            os.chown(real, uid, gid)
+            os.chmod(real, int(mode, 8))
+        except FileNotFoundError:
+            self.reject("No such path: " + real, 404)
+            return
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+        self.send_json_response(200, {"prepared": True})
+
+    def handle_storage_device_write(self, parsed):
+        """Stream the request body directly onto a block device.
+
+        The web tier must not touch storage at all -- not the device, and not a staging
+        file on a mounted volume. It receives the upload and proxies the bytes here; this
+        daemon owns the data path, the same way Stargate does on Nutanix rather than
+        Prism. Spectrum's container consequently needs no /dev and no storage mount.
+
+        The device is taken from the query string and validated against the allowlist; the
+        payload is the raw body, so nothing the caller sends can influence a command.
+        """
+        params = urllib.parse.parse_qs(parsed.query or "")
+        device = (params.get("device") or [None])[0]
+
+        ok, err = validate_path(device)
+        if not ok:
+            self.send_json_response(400, {"error": err})
+            return
+        if not str(device).startswith("/dev/drbd/"):
+            self.send_json_response(400, {"error": "device must be under /dev/drbd/"})
+            return
+        if not os.path.exists(device):
+            self.send_json_response(404, {"error": "device does not exist: " + str(device)})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            self.send_json_response(400, {"error": "Content-Length required and must be > 0"})
+            return
+
+        written = 0
+        try:
+            with open(device, "r+b") as dst:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(4 * 1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except Exception as exc:
+            self.send_json_response(500, {"error": "write failed: " + str(exc)})
+            return
+
+        if written != length:
+            # A short write means the client disconnected mid-upload. Say so rather than
+            # reporting success, which previously let a truncated image be registered.
+            self.send_json_response(400, {
+                "error": "short write: %d of %d bytes" % (written, length),
+                "written": written})
+            return
+
+        self.send_json_response(200, {"written": written})
+
+    def handle_storage_device_flush(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        real, error = validate_path(payload.get("path"))
+        if error:
+            self.reject(error)
+            return
+        if not os.path.exists(real):
+            self.reject("No such path: " + real, 404)
+            return
+
+        rc, stdout, stderr = run_argv(["blockdev", "--flushbufs", real], timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "blockdev --flushbufs failed", 500)
+            return
+        self.send_json_response(200, {"flushed": True})
+
+    def handle_storage_container_mounted(self, parsed):
+        raw_path = self.query_param(parsed, "path")
+        if raw_path is None:
+            self.reject("Missing path parameter")
+            return
+        real, error = validate_path(raw_path)
+        if error:
+            self.reject(error)
+            return
+        self.send_json_response(200, {"mounted": path_is_mounted(real)})
+
+    def handle_storage_container_ensure(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid container name")
+            return
+
+        path = os.path.join(AETHER_VOLUMES_ROOT, name)
+        existed = os.path.isdir(path)
+        try:
+            os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+        self.send_json_response(200, {"path": path, "created": not existed})
+
+    # -- Storage: Sidon (the extent-based DFS) --------------------------
+
+    # Sidon listens on a unix socket, not a port, so it is reachable only from code
+    # running natively on this host. Spectrum runs in a container and asks here instead,
+    # over the mutual TLS this daemon already terminates. That is the whole reason this
+    # endpoint exists: one authenticated surface for the cluster rather than a second
+    # certificate, a second port and a second thing to rotate, per storage tier.
+    DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping")
+
+    def handle_dfs_vdisk(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        op = payload.get("op")
+        if op not in self.DFS_OPS:
+            # An allow-list rather than a pass-through. Forwarding whatever arrives would
+            # make this endpoint exactly as powerful as the control socket it fronts,
+            # which defeats the point of fronting it.
+            self.reject("Unsupported DFS operation: %r" % (op,))
+            return
+
+        vdisk_id = payload.get("vdisk_id")
+        if op not in ("list", "ping") and not valid_name(vdisk_id):
+            self.reject("Invalid vdisk id")
+            return
+
+        try:
+            sidon = load_sidon_module()
+        except Exception as exc:
+            self.reject("helios_sidon is unavailable: %s" % exc, 500)
+            return
+
+        params = {k: v for k, v in payload.items() if k != "op"}
+        try:
+            result = sidon.call(op, **params)
+        except sidon.SidonError as exc:
+            # `kind` decides the status code, so a caller can tell a lost race from an
+            # outage without parsing prose: 409 means the answer will not change on a
+            # retry, 503 means it might.
+            status = 409 if exc.kind == "refused" else 503
+            self.send_json_response(status, {"error": str(exc), "kind": exc.kind})
+            return
+        except Exception as exc:
+            self.reject("sidon call failed: %s" % exc, 500)
+            return
+        self.send_json_response(200, result)
+
+    # -- Storage: Linstor ----------------------------------------------
+
+    def handle_storage_linstor_resources(self, parsed):
+        """Everything Linstor holds, or one resource when `?resource=` is given."""
+        resource = self.query_param(parsed, "resource")
+        if resource is not None and not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+
+        inventory, error = linstor_inventory()
+        if inventory is None:
+            self.reject(error, 500)
+            return
+
+        if resource is None:
+            self.send_json_response(200, {"resources": inventory})
+            return
+
+        for entry in inventory:
+            if entry["name"] == resource:
+                self.send_json_response(200, {"resources": [entry]})
+                return
+        self.reject("No such Linstor resource: " + resource, 404)
+
+    def handle_storage_linstor_resource(self):
+        """Create replicated storage: resource definition, volume definition, placement,
+        DRBD options.
+
+        Backs both of the things the cluster stores this way, which differ in exactly two
+        respects. A VM disk is sized in whole GiB (`size_gib`) and is single-primary. A
+        golden image is sized in KiB (`size_kib`), because an ISO is whatever size it is,
+        and needs `allow_two_primaries` so guests on several hosts can attach it
+        read-only at once. Everything else -- idempotency, the size guard, the rollback --
+        is the same for both, so they share this endpoint rather than a copy of it.
+
+        One idempotent operation rather than four endpoints. The four commands are
+        meaningless apart -- a resource definition with no volume definition backs
+        nothing, and a volume definition with no resources exists on no node -- so
+        exposing them separately would just move the sequencing bug into every caller.
+
+        Idempotent in the sense that matters for a retry: each step tolerates the
+        object already being there, and the response says whether this call was the one
+        that created it. A resource that already exists at a *different* size is a 409
+        rather than a silent reuse, because that is how a VM ends up attached to a
+        disk left behind by an earlier VM of the same name.
+
+        Partial work is cleaned up here, not left for the caller: if placement or the
+        DRBD options fail after this call created the resource definition, the
+        definition is deleted again. A definition that already existed is never
+        deleted -- it may be backing a live VM.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+        requested_kib, error = validate_volume_size_kib(payload)
+        if error:
+            self.reject(error)
+            return
+        storage_pool, error = validate_storage_pool(payload.get("storage_pool"))
+        if error:
+            self.reject(error)
+            return
+        nodes, error = validate_node_names(payload.get("nodes"))
+        if error:
+            self.reject(error)
+            return
+        allow_two_primaries, error = validate_flag(
+            payload.get("allow_two_primaries"), "allow_two_primaries")
+        if error:
+            self.reject(error)
+            return
+
+        # Read before write: the controller has to be reachable for this to work at
+        # all, and knowing whether the resource is already there is what makes the
+        # difference between a safe retry and adopting someone else's disk.
+        inventory, error = linstor_inventory()
+        if inventory is None:
+            self.reject(error, 500)
+            return
+
+        existing = None
+        for entry in inventory:
+            if entry["name"] == resource:
+                existing = entry
+                break
+
+        if existing is not None and existing["size_kib"] not in (None, requested_kib):
+            self.send_json_response(409, {
+                "resource": resource,
+                "size_kib": existing["size_kib"],
+                "size_gib": existing["size_gib"],
+                "error": ("Linstor resource %s already exists at %s KiB, not the %d KiB "
+                          "requested" % (resource, existing["size_kib"], requested_kib)),
+            })
+            return
+
+        created = False
+        if existing is None:
+            ok, _stdout, detail = linstor_call(["resource-definition", "create", resource])
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                self.reject("Could not create resource definition %s: %s" % (resource, detail),
+                            500)
+                return
+            created = ok
+
+        def undo(reason):
+            """Delete only what this call created, then report the original failure."""
+            if created:
+                undone, _out, undo_detail = linstor_call(
+                    ["resource-definition", "delete", resource], timeout=180)
+                if not undone:
+                    print("[LINSTOR] Rollback of %s failed: %s" % (resource, undo_detail))
+                    reason += (" (rollback of %s also failed: %s)" % (resource, undo_detail))
+            self.reject(reason, 500)
+
+        # --vlmnr 0 rather than letting the client pick the next free number. Without it a
+        # retry against a resource that already has volume 0 does not fail as "already
+        # exists" -- it quietly adds a *second* volume, and the VM ends up with a disk it
+        # never asked for. The size check above is what decides whether volume 0 is
+        # already the one that was asked for.
+        if existing is None or existing["size_kib"] != requested_kib:
+            ok, _stdout, detail = linstor_call(
+                ["volume-definition", "create", "--vlmnr", "0", resource,
+                 "%dKiB" % requested_kib])
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                undo("Could not create volume definition %s: %s" % (resource, detail))
+                return
+
+        for node in nodes:
+            ok, _stdout, detail = linstor_call(
+                ["resource", "create", node, resource, "--storage-pool", storage_pool],
+                timeout=180)
+            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
+                undo("Could not place %s on %s: %s" % (resource, node, detail))
+                return
+
+        # Automatic split-brain resolution, and -- only when the caller asked for it --
+        # dual-primary. See DRBD_SPLIT_BRAIN_OPTIONS for why that is not the default:
+        # dual-primary on a read-write VM disk is what let one VM run on two hosts and
+        # corrupt it. A golden image is the case it is correct for, because guests on
+        # several hosts attach it read-only at the same time and each host must hold
+        # Primary to do so. It is written exactly once, by the upload that creates it,
+        # while the uploading node is the only Primary.
+        drbd_options = list(DRBD_SPLIT_BRAIN_OPTIONS)
+        if allow_two_primaries:
+            drbd_options = ["--allow-two-primaries", "yes"] + drbd_options
+        ok, _stdout, detail = linstor_call(
+            ["resource-definition", "drbd-options"] + drbd_options + [resource])
+        if not ok:
+            undo("Could not set DRBD options on %s: %s" % (resource, detail))
+            return
+
+        self.send_json_response(200, {
+            "resource": resource,
+            "created": created,
+            "size_gib": requested_kib // KIB_PER_GIB,
+            "size_kib": requested_kib,
+            "storage_pool": storage_pool,
+            "nodes": nodes,
+            "allow_two_primaries": allow_two_primaries,
+            "device_path": linstor_resource_path(resource),
+        })
+
+    def handle_storage_linstor_resource_delete(self):
+        """Remove a resource definition, and with it its volumes on every node.
+
+        `deleted` is false when there was nothing to delete. That is a success, not a
+        404: the caller of a rollback wants the resource gone, and a delete that races
+        another delete must not turn a completed rollback into an error.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        resource = payload.get("resource")
+        if not valid_name(resource):
+            self.reject("Invalid resource name")
+            return
+
+        ok, _stdout, detail = linstor_call(
+            ["resource-definition", "delete", resource], timeout=180)
+        if ok:
+            self.send_json_response(200, {"resource": resource, "deleted": True})
+            return
+        if linstor_says(detail, LINSTOR_ABSENT_MARKERS):
+            self.send_json_response(200, {"resource": resource, "deleted": False})
+            return
+
+        # The resource is there and did not go away -- in use by a running VM, or a
+        # node holding it is unreachable. 409 with the state key, as elsewhere in this
+        # API, so the caller learns what actually happened rather than "500".
+        self.send_json_response(409, {
+            "resource": resource,
+            "deleted": False,
+            "error": detail or ("Could not delete resource definition " + resource),
+        })
+
+    # -- Host ----------------------------------------------------------
+
+    def handle_host_network(self):
+        interface = None
+        gateway = None
+        rc, stdout, _ = run_argv(["ip", "-j", "route"], timeout=20)
+        if rc == 0:
+            interface, gateway = parse_ip_route_json(stdout)
+        if interface is None:
+            try:
+                with open("/proc/net/route", "r") as handle:
+                    interface, gateway = parse_proc_net_route(handle.read())
+            except OSError:
+                pass
+
+        addresses = []
+        rc_addr, stdout_addr, _ = run_argv(["ip", "-j", "addr"], timeout=20)
+        if rc_addr == 0:
+            addresses = parse_ip_addr_json(stdout_addr)
+
+        self.send_json_response(200, {
+            "default_interface": interface,
+            "default_gateway": gateway,
+            "addresses": addresses,
+        })
+
+    def handle_host_memory(self):
+        try:
+            with open("/proc/meminfo", "r") as handle:
+                content = handle.read()
+        except OSError as exc:
+            self.reject("Could not read /proc/meminfo: %s" % exc, 500)
+            return
+        self.send_json_response(200, parse_meminfo(content))
+
+    def handle_host_disks(self):
+        columns = "NAME,PATH,SIZE,TYPE,MOUNTPOINT,FSTYPE,ROTA,MODEL,SERIAL"
+        rc, stdout, stderr = run_argv(["lsblk", "-J", "-b", "-o", columns], timeout=30)
+        if rc != 0:
+            # An older lsblk without one of those columns still answers the plain form.
+            rc, stdout, stderr = run_argv(["lsblk", "-J", "-b"], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "lsblk failed", 500)
+            return
+        try:
+            disks = json.loads(stdout.strip() or "{}")
+        except Exception:
+            self.reject("Could not parse lsblk output", 500)
+            return
+        self.send_json_response(200, disks)
+
+    def handle_host_capabilities(self):
+        self.send_json_response(200, read_host_capabilities())
+
+    def handle_host_dhcp_leases(self):
+        self.send_json_response(200, {"leases": read_dhcp_leases()})
+
+    def handle_host_reboot(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        if payload.get("confirm") is not True:
+            self.reject('Reboot requires {"confirm": true}')
+            return
+        schedule_host_reboot()
+        self.send_json_response(200, {"rebooting": True})
+
+    def handle_host_fence(self):
+        """Fence this host and answer with the state that can be observed afterwards.
+
+        409 rather than 200 when the fence did not take, per the typed API's rule that a
+        409 means "the operation did not take" and carries the state key that says so.
+        The body is the same either way, because the body *is* the evidence: a caller
+        that cannot read it must treat the request as failed.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        if payload.get("confirm") is not True:
+            self.reject('Fencing this host requires {"confirm": true}')
+            return
+        report = fence_this_host()
+        self.send_json_response(200 if report.get("fenced") else 409, report)
+
+    # -- Database ------------------------------------------------------
+
+    def handle_db_ring(self):
+        rc, stdout, stderr = run_argv(
+            ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "status"], timeout=60)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "nodetool status failed", 500)
+            return
+        self.send_json_response(200, {"nodes": parse_nodetool_status(stdout)})
+
+    def handle_db_repair(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        keyspace = payload.get("keyspace", "hydra")
+        if not valid_name(keyspace):
+            self.reject("Invalid keyspace name")
+            return
+        primary_range = payload.get("primary_range", True)
+        if not isinstance(primary_range, bool):
+            self.reject("primary_range must be a boolean")
+            return
+
+        if not start_db_repair(keyspace, primary_range):
+            self.reject("A repair is already running on this node", 409)
+            return
+        self.send_json_response(200, {"started": True})
+
 class SecureHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, ssl_context):
         super().__init__(server_address, RequestHandlerClass)
@@ -1624,6 +4284,12 @@ def check_cluster_and_autostart():
     print("[AUTOSTART] Cleaning up all local libvirt virtual machines to ensure clean compute startup...")
     subprocess.run("for vm in $(virsh list --all --name); do virsh destroy $vm || true; virsh undefine $vm --nvram || true; done", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
+    # ZooKeeper is infrastructure, not a workload: it holds the desired cluster state,
+    # so it must be running before that state can be read. Start it unconditionally and
+    # never stop it as part of "the cluster is stopped".
+    subprocess.run("systemctl start zookeeper", shell=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     if os.path.exists("/run/hci/cluster_operation.lock"):
         print("[AUTOSTART] Cluster operation is in progress. Bypassing autostart checks.")
         return
@@ -1632,7 +4298,7 @@ def check_cluster_and_autostart():
     # Check if cluster configuration exists
     if not os.path.exists("/etc/hci/cluster.json"):
         print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return
@@ -1713,7 +4379,7 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
@@ -1864,7 +4530,18 @@ def main():
 
     t_nvram = threading.Thread(target=nvram_watcher_loop, daemon=True)
     t_nvram.start()
-    
+
+    # Publish this node's state into ZooKeeper as an ephemeral znode, and converge local
+    # services toward the desired cluster state recorded there. Both loops tolerate
+    # ZooKeeper being absent (they retry), so the daemon still serves its mTLS API on a
+    # host where ZooKeeper has not started yet -- which is what the direct-probe fallback
+    # in `cluster status` relies on.
+    t_zk_pub = threading.Thread(target=zk_publisher_loop, daemon=True)
+    t_zk_pub.start()
+
+    t_zk_rec = threading.Thread(target=zk_reconcile_loop, daemon=True)
+    t_zk_rec.start()
+
     server_address = ('', PORT)
     httpd = SecureHTTPServer(server_address, SparkDaemonHandler, context)
     print(f"Spark Daemon listening on port {PORT} with mTLS...")

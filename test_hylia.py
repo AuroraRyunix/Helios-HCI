@@ -9,6 +9,13 @@ import hylia
 
 class TestHyliaLCM(unittest.TestCase):
     def setUp(self):
+        # These fixtures are unsigned, and hylia now refuses an unsigned package before
+        # it reads a single digest -- correctly, since the manifest is what carries them.
+        # The override keeps these tests about what they were written to test. The
+        # refusal itself is covered by test_unsigned_package_is_refused below.
+        self._prior_override = os.environ.get("HELIOS_ALLOW_UNSIGNED_UPDATES")
+        os.environ["HELIOS_ALLOW_UNSIGNED_UPDATES"] = "i-accept-unsigned-updates"
+
         self.test_dir = "/tmp/yggdrasil_test_env"
         self.extract_dir = "/tmp/yggdrasil_test_extract"
         os.makedirs(self.test_dir, exist_ok=True)
@@ -57,12 +64,37 @@ class TestHyliaLCM(unittest.TestCase):
             z.write(self.manifest_path, "manifest.json")
 
     def tearDown(self):
+        if self._prior_override is None:
+            os.environ.pop("HELIOS_ALLOW_UNSIGNED_UPDATES", None)
+        else:
+            os.environ["HELIOS_ALLOW_UNSIGNED_UPDATES"] = self._prior_override
         for path in [self.test_dir, self.extract_dir]:
             if os.path.exists(path):
                 try:
                     shutil.rmtree(path)
                 except Exception:
                     pass
+
+    def test_unsigned_package_is_refused_without_the_override(self):
+        """The manual upload path never passes through check-updates.
+
+        A package handed straight to the console is only anchored by this check, so an
+        unsigned one has to be refused here or it is not refused anywhere.
+        """
+        os.environ.pop("HELIOS_ALLOW_UNSIGNED_UPDATES", None)
+        with self.assertRaises(Exception) as ctx:
+            hylia.validate_and_extract_zip(self.zip_path, self.extract_dir)
+        message = str(ctx.exception)
+        self.assertIn("Refusing this update package", message)
+        self.assertIn("unsigned", message)
+
+    def test_a_truthy_value_does_not_enable_the_override(self):
+        # "1"/"true"/"yes" must not work: the override is meant to be typed deliberately.
+        for value in ("1", "true", "yes", "TRUE"):
+            os.environ["HELIOS_ALLOW_UNSIGNED_UPDATES"] = value
+            with self.assertRaises(Exception, msg=value) as ctx:
+                hylia.validate_and_extract_zip(self.zip_path, self.extract_dir)
+            self.assertIn("Refusing this update package", str(ctx.exception))
 
     def test_valid_package_verification(self):
         # Verify valid package extracts and validates correctly

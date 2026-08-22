@@ -6,6 +6,58 @@ import time
 import socket
 import subprocess
 
+# Slate/Traefik client-facing ingress. This is the port clients actually reach
+# through the VIP (README section 8), so it is what gates VIP ownership.
+INGRESS_PORT = 443
+# Spectrum WebUI/API. Slate proxies to https://127.0.0.1:8443, so a node with
+# 443 up but 8443 down still returns 502 for every client request.
+SPECTRUM_PORT = 8443
+ZK_CLIENT_PORT = 2181
+
+# Probes against other nodes cross the network. 0.2s turned a brief latency
+# spike into an apparent consensus loss and flapped the VIP every 2s loop.
+REMOTE_PROBE_TIMEOUT = 1.0
+# Loopback probes never leave the host, so they stay fast.
+LOCAL_PROBE_TIMEOUT = 0.5
+
+def probe_tcp(host, port, timeout):
+    """Returns True if a TCP connect to host:port succeeds within timeout."""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+def get_iface_addresses(iface):
+    """Returns the exact addresses configured on iface, one entry per address.
+
+    Used instead of a substring search over 'ip addr show': VIP 10.10.102.13 is
+    a substring of the unrelated address 10.10.102.130.
+    """
+    addrs = []
+    try:
+        res = subprocess.run(f"ip -json addr show dev {iface}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode == 0:
+            out = res.stdout.decode('utf-8').strip()
+            if out:
+                for entry in json.loads(out):
+                    for addr in entry.get("addr_info", []):
+                        local_ip = addr.get("local")
+                        if local_ip:
+                            addrs.append(local_ip)
+    except Exception as e:
+        sys.stderr.write(f"Error reading addresses on {iface}: {e}\n")
+    return addrs
+
 def get_local_net_info(hosts):
     try:
         res = subprocess.run("ip -json addr show", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -35,8 +87,8 @@ def get_zookeeper_leader_ip():
     for ip in ips:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 2181))
+            s.settimeout(REMOTE_PROBE_TIMEOUT)
+            s.connect((ip, ZK_CLIENT_PORT))
             s.sendall(b"stat")
             resp = s.recv(1024).decode('utf-8', errors='ignore')
             s.close()
@@ -45,44 +97,65 @@ def get_zookeeper_leader_ip():
                 break
         except Exception:
             pass
-            
-    # Check if leader is active on port 8443 (Spectrum)
+
+    # Check the leader is actually serving clients on the Slate ingress port.
+    # 8443 (Spectrum) was the wrong signal here: clients reach 443, not 8443.
     leader_active = False
     if leader_ip:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((leader_ip, 8443))
-            s.close()
-            leader_active = True
-        except Exception:
-            leader_active = False
-            
+        leader_active = probe_tcp(leader_ip, INGRESS_PORT, REMOTE_PROBE_TIMEOUT)
+
     if leader_active:
         return leader_ip
-        
+
+    # No leader in a multi-node cluster means consensus is lost. Binding the VIP on the
+    # strength of a local guess is how both sides of a partition end up advertising it.
     if not leader_ip and len(ips) > 1:
         sys.stdout.write("ZooKeeper consensus lost or unreachable in multi-node cluster. Refusing split-brain candidate fallback.\n")
         sys.stdout.flush()
         return None
-        
-    # If leader is inactive, find active candidates with port 8443 open
+
+    # Single node: there is no peer to conflict with, so this node may hold the VIP as
+    # long as it is actually serving the ingress port.
+    if not leader_ip:
+        local = ips[0] if ips else "127.0.0.1"
+        return local if probe_tcp(local, INGRESS_PORT, REMOTE_PROBE_TIMEOUT) else None
+
+    # A leader exists but is not serving. Deliberately do NOT pick a replacement by sort
+    # order: that is a second, independent election which can disagree with the
+    # ensemble's, and in a partition each side would choose the lowest candidate it can
+    # see -- so both could bind the VIP and produce an address conflict.
+    #
+    # Releasing is the safe outcome: the WebUI is briefly unreachable, which is visible
+    # and recoverable, rather than duplicated, which is neither.
+    sys.stdout.write(
+        "ZooKeeper leader " + str(leader_ip) + " is not serving the ingress port. "
+        "Refusing to elect a replacement independently; releasing the VIP.\n")
+    sys.stdout.flush()
+    return None
+
+    # If leader is inactive, find active candidates serving the ingress port
     candidates = []
     for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 8443))
-            s.close()
+        if probe_tcp(ip, INGRESS_PORT, REMOTE_PROBE_TIMEOUT):
             candidates.append(ip)
-        except Exception:
-            pass
-            
+
     if not candidates:
         return leader_ip if leader_ip else "127.0.0.1"
-        
-    candidates.sort()
-    return candidates[0]
+
+    # Deliberately do NOT fall back to "lowest reachable candidate" here.
+    #
+    # Reaching this point means ZooKeeper named a leader but that leader is not serving.
+    # Picking a different node by sort order is a second, independent election that can
+    # disagree with the ensemble's -- and in a partition each side would pick the lowest
+    # candidate *it* can see, so both could bind the VIP and produce an address conflict.
+    #
+    # Releasing the VIP is the safe outcome: the WebUI is briefly unreachable, which is
+    # visible and recoverable, rather than duplicated, which is neither.
+    sys.stdout.write(
+        "ZooKeeper leader is not serving on the ingress port. Refusing to elect a "
+        "replacement independently; releasing the VIP until consensus resolves.\n")
+    sys.stdout.flush()
+    return None
 
 def is_zookeeper_leader(local_ip=None):
     if not local_ip:
@@ -106,13 +179,9 @@ def is_zookeeper_leader(local_ip=None):
     return get_zookeeper_leader_ip() == local_ip
 
 def is_vip_bound(iface, vip):
-    try:
-        res = subprocess.run(f"ip addr show dev {iface}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode == 0:
-            return vip in res.stdout.decode('utf-8')
-    except Exception:
-        pass
-    return False
+    # Exact element match against the parsed address list, not a substring
+    # search over the raw 'ip addr show' text.
+    return vip in get_iface_addresses(iface)
 
 import signal
 
@@ -129,9 +198,10 @@ def signal_handler(signum, frame):
     
     if current_vip and current_iface:
         try:
-            # Check if bound and delete it
-            res = subprocess.run(f"ip addr show dev {current_iface}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode == 0 and current_vip in res.stdout.decode('utf-8'):
+            # Check if bound (exact match) and delete it. current_prefixlen must
+            # be the prefix the VIP was actually added with, or 'ip addr del'
+            # silently fails to match and the VIP stays bound on a dying node.
+            if current_vip in get_iface_addresses(current_iface):
                 sys.stdout.write(f"Releasing VIP {current_vip} from {current_iface} on shutdown...\n")
                 sys.stdout.flush()
                 cmd_del = f"ip addr del {current_vip}/{current_prefixlen} dev {current_iface} label {current_iface}:vip"
@@ -141,18 +211,45 @@ def signal_handler(signum, frame):
             sys.stderr.flush()
     sys.exit(0)
 
+def is_local_ingress_listening():
+    """Local Slate/Traefik ingress on 443 - the port clients actually connect to."""
+    return probe_tcp("127.0.0.1", INGRESS_PORT, LOCAL_PROBE_TIMEOUT)
+
 def is_local_spectrum_listening():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(("127.0.0.1", 8443))
-        s.close()
-        return True
-    except Exception:
-        return False
+    """Local Spectrum WebUI/API on 8443 - the only backend Slate proxies to."""
+    return probe_tcp("127.0.0.1", SPECTRUM_PORT, LOCAL_PROBE_TIMEOUT)
+
+last_health_msg = None
+
+def is_local_stack_healthy():
+    """VIP health guard.
+
+    443 is the hard gate: it is the client-facing port, and holding the VIP with
+    Traefik down blackholes every client. 8443 is checked as a secondary signal
+    because slate_config/dynamic.yml points Slate at https://127.0.0.1:8443 only
+    - a node with 443 up and 8443 down answers every request with a 502, which
+    is no better for clients than a blackhole. Each is reported separately so an
+    operator can tell which layer failed, but only on transition: this runs
+    every 2s and would otherwise flood the journal while degraded.
+    """
+    global last_health_msg
+    msg = None
+    if not is_local_ingress_listening():
+        msg = f"Local health guard: Slate ingress on 127.0.0.1:{INGRESS_PORT} is not listening."
+    elif not is_local_spectrum_listening():
+        msg = f"Local health guard: Slate is up but its backend Spectrum on 127.0.0.1:{SPECTRUM_PORT} is not listening."
+
+    if msg != last_health_msg:
+        if msg:
+            print(msg)
+        elif last_health_msg is not None:
+            print("Local health guard: Slate ingress and Spectrum backend are healthy again.")
+        last_health_msg = msg
+
+    return msg is None
 
 def main():
-    global current_vip, current_iface, running
+    global current_vip, current_iface, current_prefixlen, running
     print("Bifrost VIP Manager daemon started.")
     
     signal.signal(signal.SIGTERM, signal_handler)
@@ -191,9 +288,9 @@ def main():
             leader = is_zookeeper_leader(local_ip)
             bound = is_vip_bound(iface, vip)
             
-            if leader and is_local_spectrum_listening():
+            if leader and is_local_stack_healthy():
                 if not bound:
-                    print(f"I am the ZooKeeper leader and Spectrum is active. Binding VIP {vip} to {iface}...")
+                    print(f"I am the ZooKeeper leader and the local Slate ingress is active. Binding VIP {vip} to {iface}...")
                     cmd_add = f"ip addr add {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_add, shell=True)
                     # Broadcast Gratuitous ARP
@@ -202,7 +299,7 @@ def main():
                     subprocess.run(cmd_arp, shell=True)
             else:
                 if bound:
-                    print(f"Releasing VIP {vip} from {iface} (not leader or local Spectrum is inactive)...")
+                    print(f"Releasing VIP {vip} from {iface} (not leader or local ingress is inactive)...")
                     cmd_del = f"ip addr del {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_del, shell=True)
                     

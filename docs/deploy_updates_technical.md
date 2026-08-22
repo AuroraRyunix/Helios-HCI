@@ -13,6 +13,10 @@ mindmap
     Certificate Sync
       Ensures shared SSL cert on Node 1 (via OpenSSL)
       Replicates server.crt/key across other nodes
+    Release Key Pinning
+      Reads the release public key (HELIOS_RELEASE_PUBKEY)
+      Refuses to distribute anything containing a PRIVATE KEY
+      Writes /etc/hci/keys/release_ed25519.pub on every node
     SSH/SFTP File Transfer
       paramiko.SSHClient & paramiko.AutoAddPolicy
       replaces Windows CRLF (\r\n) with Unix LF (\n)
@@ -33,10 +37,23 @@ mindmap
 - Connects to **Node 1** via SSH. If `/etc/hci/spectrum/certs/server.crt` is missing, generates a self-signed key using `openssl req`.
 - Copies these credentials into memory to write them on all remaining cluster nodes.
 
+### Release Public Key Pinning
+- Resolves the release public key from `HELIOS_RELEASE_PUBKEY`, then `./release_ed25519.pub`,
+  then `~/.helios/release_ed25519.pub`.
+- Writes it to `/etc/hci/keys/release_ed25519.pub` (mode `0644`, directory `0755`) on every
+  node. `provision.py` pins this when a node is built; a node built before update signing
+  existed has no key at all, and `check-updates` fails closed without one.
+- Refuses to run if the file contains `PRIVATE KEY`. Pointing this at the signing key
+  instead of its public half would copy the one secret the whole scheme depends on onto
+  every node in the fleet.
+- If no key is found locally, the rollout continues and prints how to supply one; nodes
+  keep whatever `provision.py` pinned.
+- See [update_signing.md](./update_signing.md).
+
 ### Deployment Loop (`main()`)
 Iterates over node IPs:
 1. Opens Paramiko SSH and SFTP clients.
-2. Copies all 20+ core python binaries, CLI scripts (`spark`, `cluster`, `valcli`, `mcli`, `catcli`, `nodetool`), and configuration models directly to `/usr/local/bin/`.
+2. Copies all 20+ core python binaries, CLI scripts (`spark`, `cluster`, `valcli`, `mcli`, `catcli`, `nodetool`), shared modules (`helios_zk.py`, `helios_sig.py`), and configuration models directly to `/usr/local/bin/`.
 3. Ensures clean execution permissions (`chmod 755`).
 4. Writes systemd unit configuration files (`/etc/systemd/system/*.service`).
 5. If not running in `--fast` mode:

@@ -1,0 +1,45 @@
+# Build context for `podman build spectrum_phx/`.
+#
+# The two entries that actually matter are _build/ and deps/: this repo is
+# checked out on Windows, so _build/ holds esbuild-win32-x64 and
+# tailwind-windows-x64.exe and deps/ holds artifacts compiled by a different
+# Elixir/OTP than the image uses. Shipping either into the build context does
+# not just bloat it, it produces an image that cannot build its assets.
+
+# Elixir build artifacts and fetched dependencies -- rebuilt inside the image.
+_build/
+deps/
+cover/
+doc/
+.fetch
+*.ez
+*.tar
+erl_crash.dump
+
+# Generated assets. `mix assets.deploy` regenerates these in the build stage,
+# and a stale cache_manifest.json makes Plug.Static serve digests that no longer
+# exist.
+priv/static/assets/
+priv/static/cache_manifest.json
+assets/node_modules/
+
+# Not needed to build a prod release.
+test/
+.formatter.exs
+.elixir_ls/
+.lexical/
+tmp/
+
+# Version control and editor state.
+.git/
+.gitignore
+.dockerignore
+.github/
+.vscode/
+.idea/
+
+# Deployment inputs consumed outside the image build.
+Dockerfile
+quadlet/
+README.md
+AGENTS.md

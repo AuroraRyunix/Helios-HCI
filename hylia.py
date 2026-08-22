@@ -13,16 +13,38 @@ import uuid
 import threading
 import zipfile
 import hashlib
+import re
 
 def run_command_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command, timeout=45):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command, "timeout": timeout}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -38,10 +60,11 @@ def run_remote_spark(ip, command, timeout=45):
             time.sleep(2)
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099{path}"
     data = None
     if payload is not None and method != "GET":
@@ -150,6 +173,112 @@ def log_upgrade(job_id, line):
     cql = f"INSERT INTO hydra.hylia_logs (job_id, timestamp, log_line) VALUES ({job_id}, {timestamp}, '{escaped_line}');"
     run_cql_query(cql)
 
+# manifest.json is the one file in an update package that nothing hashes, so every
+# value it carries is untrusted input that eventually reaches a root shell on every
+# node. Components may only be installed below these directory prefixes, using a
+# restricted character set that cannot escape a shell word.
+ALLOWED_TARGET_PREFIXES = ("/usr/local/bin/",)
+_SAFE_PATH_RE = re.compile(r'^[A-Za-z0-9._/-]+$')
+_SAFE_FILENAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+_SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+
+def validate_target_path(target_path, comp_name):
+    """Reject any manifest target_path that is not a plain absolute file path under
+    an allowlisted install directory. Returns the validated path."""
+    if not target_path or not isinstance(target_path, str):
+        raise Exception(f"Component '{comp_name}' declares no target_path in the manifest.")
+    if not target_path.startswith("/"):
+        raise Exception(f"Component '{comp_name}' target_path '{target_path}' is not an absolute path.")
+    if not _SAFE_PATH_RE.match(target_path):
+        raise Exception(f"Component '{comp_name}' target_path '{target_path}' contains illegal characters.")
+    if target_path.endswith("/"):
+        raise Exception(f"Component '{comp_name}' target_path '{target_path}' is a directory, not a file.")
+    if ".." in target_path.split("/"):
+        raise Exception(f"Component '{comp_name}' target_path '{target_path}' contains a '..' segment.")
+    if not any(target_path.startswith(prefix) for prefix in ALLOWED_TARGET_PREFIXES):
+        allowed = ", ".join(ALLOWED_TARGET_PREFIXES)
+        raise Exception(f"Component '{comp_name}' target_path '{target_path}' is outside the permitted install directories ({allowed}).")
+    return target_path
+
+def validate_component_filename(comp_file, comp_name):
+    """Manifest 'file' entries must be bare filenames living inside the extract
+    directory; anything with a path separator could escape it."""
+    if not comp_file or not isinstance(comp_file, str):
+        raise Exception(f"Component '{comp_name}' declares no file in the manifest.")
+    if comp_file in (".", "..") or not _SAFE_FILENAME_RE.match(comp_file):
+        raise Exception(f"Component '{comp_name}' file '{comp_file}' is not a plain filename.")
+    return comp_file
+
+def validate_declared_hash(declared_hash, comp_name, comp_file):
+    """A component entry without a well-formed digest cannot be verified at all."""
+    if not isinstance(declared_hash, str) or not _SHA256_RE.match(declared_hash):
+        raise Exception(f"Checksum verification failed for '{comp_file}' (component '{comp_name}'): declared sha256 '{declared_hash}' is not a 64-character hex digest.")
+    return declared_hash.lower()
+
+def validate_manifest_component(comp_name, comp_info):
+    """Structurally validate one manifest component entry.
+    Returns (comp_file, declared_hash, target_path)."""
+    if not isinstance(comp_info, dict):
+        raise Exception(f"Manifest entry for component '{comp_name}' is not an object.")
+    comp_file = validate_component_filename(comp_info.get("file"), comp_name)
+    declared_hash = validate_declared_hash(comp_info.get("sha256"), comp_name, comp_file)
+    target_path = validate_target_path(comp_info.get("target_path") or f"/usr/local/bin/{comp_name}", comp_name)
+    return comp_file, declared_hash, target_path
+
+def hash_file(file_path):
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f_bin:
+        while chunk := f_bin.read(8192):
+            sha256.update(chunk)
+    return sha256.hexdigest()
+
+def _load_signing_module():
+    """Import helios_sig from wherever this process happens to be running.
+
+    On a host, hylia sits in /usr/local/bin next to it. Inside the Spectrum container it
+    runs from /app, where the module is copied by the Dockerfile. Neither location is
+    importable by name from the other, so both are tried.
+    """
+    try:
+        import helios_sig
+        return helios_sig
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sig.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_sig.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_sig", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise Exception(
+        "Cannot verify this update package: helios_sig.py was not found. Refusing to "
+        "install an unverified package. Reinstall the LCM components, or see "
+        "docs/update_signing.md.")
+
+
+def _verify_package_signature(extract_dir):
+    """Refuse a package whose manifest was not signed by the pinned release key.
+
+    An unsigned package is refused unless the operator has explicitly set the transition
+    variable; a *badly* signed one is refused in every case, because a bad signature is
+    evidence of tampering rather than of an old release process.
+    """
+    helios_sig = _load_signing_module()
+    try:
+        helios_sig.verify_package_manifest(extract_dir)
+    except helios_sig.SignatureMissing as exc:
+        if not helios_sig.unsigned_updates_permitted():
+            raise Exception(
+                "Refusing this update package. %s %s"
+                % (exc, helios_sig.unsigned_override_hint()))
+        print("[Hylia] UNVERIFIED PACKAGE: %s Installing anyway because the unsigned "
+              "override is set. Nothing in this package has been shown to come from the "
+              "Helios release key." % exc)
+
+
 def validate_and_extract_zip(zip_path, extract_dir):
     if os.path.exists(extract_dir):
         import shutil
@@ -158,36 +287,48 @@ def validate_and_extract_zip(zip_path, extract_dir):
         except Exception:
             pass
     os.makedirs(extract_dir, exist_ok=True)
-    
+
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_dir)
-        
+
+    # Before the manifest is trusted for anything. Every component digest lives in the
+    # manifest, so one signature over it transitively covers every file and every install
+    # path in the package -- but only if it is checked before those digests are read.
+    #
+    # This is the anchor for the manual upload path in particular. `check-updates`
+    # verifies what the update server advertises, and a package handed straight to the
+    # console never passed through it.
+    _verify_package_signature(extract_dir)
+
     manifest_path = os.path.join(extract_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise Exception("manifest.json not found in update package.")
-        
+
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-        
-    components = manifest.get("components", {})
+
+    if not isinstance(manifest, dict):
+        raise Exception("manifest.json is malformed: expected a JSON object.")
+
+    components = manifest.get("components")
+    if not isinstance(components, dict) or not components:
+        raise Exception("manifest.json is malformed: 'components' is missing or is not a non-empty object.")
+
     for comp_name, comp_info in components.items():
-        comp_file = comp_info.get("file")
-        declared_hash = comp_info.get("sha256")
-        
+        comp_file, declared_hash, _ = validate_manifest_component(comp_name, comp_info)
+
         file_path = os.path.join(extract_dir, comp_file)
         if not os.path.exists(file_path):
             raise Exception(f"Declared file '{comp_file}' for component '{comp_name}' is missing.")
-            
-        sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f_bin:
-            while chunk := f_bin.read(8192):
-                sha256.update(chunk)
-        actual_hash = sha256.hexdigest()
-        
+
+        actual_hash = hash_file(file_path)
+
         if actual_hash != declared_hash:
             raise Exception(f"Checksum verification failed for '{comp_file}'. Declared: {declared_hash}, Actual: {actual_hash}")
-            
-    changelog_file = manifest.get("changelog", "changelog.md")
+
+    # The changelog name is manifest-controlled too; keep it inside the package.
+    changelog_file = manifest.get("changelog") or "changelog.md"
+    validate_component_filename(changelog_file, "changelog")
     changelog_path = os.path.join(extract_dir, changelog_file)
     changelog_content = ""
     if os.path.exists(changelog_path):
@@ -209,6 +350,112 @@ def get_service_build_number(target_path):
     except Exception:
         pass
     return "Unknown"
+
+def get_remote_sha256(node_ip, remote_path):
+    rc, out, _ = run_remote_spark(node_ip, f"sha256sum '{remote_path}'")
+    if rc != 0 or not out or not out.strip():
+        return None
+    return out.strip().split()[0].lower()
+
+def deploy_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir):
+    """Install one component on a node via a staged, verified, atomic swap.
+
+    The live file is never removed up front: the payload is streamed to a staging
+    path, decoded, checksum-verified against the manifest and only then renamed
+    over the target. The previous file is kept as a backup until the new one is
+    confirmed in place, so an interrupted transfer can never leave a node without
+    (for example) spark-daemon, which is the channel used to push a fix.
+    """
+    comp_file, declared_hash, target_path = validate_manifest_component(comp_name, comp_info)
+
+    local_file_path = os.path.join(extract_dir, comp_file)
+    if not os.path.exists(local_file_path):
+        raise Exception(f"Staged file '{local_file_path}' for component '{comp_name}' is missing. The extracted update package is gone; re-upload the package and restart the job.")
+
+    with open(local_file_path, "rb") as f_bin:
+        file_bytes = f_bin.read()
+
+    # Re-verify the staged copy against the manifest before it leaves this node:
+    # extraction happened at upload time and /tmp is writable by anyone.
+    local_hash = hashlib.sha256(file_bytes).hexdigest()
+    if local_hash != declared_hash:
+        raise Exception(f"Staged copy of '{comp_file}' no longer matches the manifest checksum (declared {declared_hash}, actual {local_hash}). Refusing to deploy component '{comp_name}'.")
+
+    # CRLF is normalised here rather than with a remote 'sed -i' so that the digest
+    # verified on the node covers exactly the bytes that were transmitted. For a
+    # package built with LF endings this is a no-op and expected_hash == declared_hash.
+    payload = file_bytes.replace(b"\r\n", b"\n")
+    expected_hash = hashlib.sha256(payload).hexdigest()
+    b64_data = base64.b64encode(payload).decode("utf-8")
+
+    remote_dir = os.path.dirname(target_path)
+    staged_b64 = f"{target_path}.hylia_b64"
+    staged_new = f"{target_path}.hylia_new"
+    backup_path = f"{target_path}.hylia_bak"
+    cleanup_cmd = f"rm -f '{staged_b64}' '{staged_new}'"
+    # 'cp -p' preserves the original mode into the backup, so restoring is a plain move.
+    restore_cmd = f"if [ -e '{backup_path}' ]; then mv -f '{backup_path}' '{target_path}'; fi; {cleanup_cmd}"
+
+    log_upgrade(job_id, f"[{hostname}] Transferring component '{comp_name}' to {target_path}...")
+
+    # Clear stale staging files from any previously interrupted transfer, otherwise
+    # the appends below would concatenate onto them and produce corrupt base64.
+    # The live target is deliberately left untouched.
+    rc_p, _, err_p = run_remote_spark(node_ip, f"mkdir -p '{remote_dir}' && {cleanup_cmd}")
+    if rc_p != 0:
+        raise Exception(f"Failed to prepare staging area for '{comp_name}' on {hostname}: {err_p}")
+
+    chunk_size = 64000
+    for c_idx in range(0, len(b64_data), chunk_size):
+        sub_chunk = b64_data[c_idx:c_idx+chunk_size]
+        rc_w, _, err_w = run_remote_spark(node_ip, f"echo '{sub_chunk}' >> '{staged_b64}'")
+        if rc_w != 0:
+            run_remote_spark(node_ip, cleanup_cmd)
+            raise Exception(f"Failed to write file chunk for '{comp_name}' to {hostname}: {err_w}")
+
+    rc_d, _, err_d = run_remote_spark(node_ip, f"base64 -d < '{staged_b64}' > '{staged_new}' && rm -f '{staged_b64}'")
+    if rc_d != 0:
+        run_remote_spark(node_ip, cleanup_cmd)
+        raise Exception(f"Failed to decode transferred component '{comp_name}' on {hostname}: {err_d}")
+
+    staged_hash = get_remote_sha256(node_ip, staged_new)
+    if staged_hash != expected_hash:
+        run_remote_spark(node_ip, cleanup_cmd)
+        raise Exception(f"Checksum verification failed for '{comp_name}' on {hostname} after transfer (expected {expected_hash}, got {staged_hash}). Existing file left untouched.")
+
+    # Back up the running file, then swap the verified copy in with a rename, which
+    # is atomic because staging and target share a directory.
+    swap_cmd = (
+        f"rm -f '{backup_path}' && "
+        f"if [ -e '{target_path}' ]; then cp -p '{target_path}' '{backup_path}'; fi && "
+        f"chmod +x '{staged_new}' && mv -f '{staged_new}' '{target_path}'"
+    )
+    rc_s, _, err_s = run_remote_spark(node_ip, swap_cmd)
+    if rc_s != 0:
+        run_remote_spark(node_ip, restore_cmd)
+        raise Exception(f"Failed to activate component '{comp_name}' on {hostname}: {err_s}. Previous version restored.")
+
+    # Confirm the live path really is the new file before discarding the backup.
+    live_hash = get_remote_sha256(node_ip, target_path)
+    if live_hash != expected_hash:
+        run_remote_spark(node_ip, restore_cmd)
+        raise Exception(f"Post-install verification failed for '{comp_name}' on {hostname} (expected {expected_hash}, got {live_hash}). Previous version restored.")
+
+    run_remote_spark(node_ip, f"rm -f '{backup_path}'; {cleanup_cmd}")
+    log_upgrade(job_id, f"[{hostname}] Component '{comp_name}' installed and verified ({expected_hash[:12]}...).")
+    return True
+
+def get_hostname_by_ip(node_ip):
+    rc_h, stdout_h, _ = run_cql_query(f"SELECT JSON hostname FROM hydra.nodes WHERE ip = '{node_ip}' ALLOW FILTERING;")
+    if rc_h == 0 and stdout_h:
+        try:
+            for line in stdout_h.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    return json.loads(line).get("hostname") or node_ip
+        except Exception:
+            pass
+    return node_ip
 
 def verify_node_storage_health(job_id, node_ip, hostname):
     log_upgrade(job_id, f"[{hostname}] Verifying DRBD volume synchronization status...")
@@ -478,39 +725,24 @@ def hylia_rolling_upgrade(job_id):
                 log_upgrade(job_id, f"[{hostname}] Deploying verified components...")
                 extract_dir = "/tmp/helios_update"
                 
+                # Validate every manifest entry before touching the node, so a bad
+                # package is rejected outright instead of half-deployed.
                 for comp_name, comp_info in components.items():
-                    comp_file = comp_info.get("file")
-                    target_path = comp_info.get("target_path", f"/usr/local/bin/{comp_name}")
-                    
-                    local_file_path = os.path.join(extract_dir, comp_file)
-                    if os.path.exists(local_file_path):
-                        log_upgrade(job_id, f"[{hostname}] Transferring component '{comp_name}' to {target_path}...")
-                        with open(local_file_path, "rb") as f_bin:
-                            b64_data = base64.b64encode(f_bin.read()).decode("utf-8")
-                            
-                        remote_dir = os.path.dirname(target_path)
-                        run_remote_spark(node_ip, f"mkdir -p {remote_dir} && rm -f {target_path}")
-                        
-                        chunk_size = 64000
-                        for c_idx in range(0, len(b64_data), chunk_size):
-                            sub_chunk = b64_data[c_idx:c_idx+chunk_size]
-                            write_cmd = f"echo '{sub_chunk}' >> {target_path}.tmp"
-                            rc_w, _, err_w = run_remote_spark(node_ip, write_cmd)
-                            if rc_w != 0:
-                                raise Exception(f"Failed to write file chunk to remote node: {err_w}")
-                                
-                        decode_cmd = f"cat {target_path}.tmp | base64 -d > {target_path} && rm -f {target_path}.tmp && sed -i 's/\\r$//' {target_path} && chmod +x {target_path} || true"
-                        rc_d, _, err_d = run_remote_spark(node_ip, decode_cmd)
-                        if rc_d != 0:
-                            raise Exception(f"Failed to decode base64 file remotely: {err_d}")
-                            
+                    validate_manifest_component(comp_name, comp_info)
+
+                for comp_name, comp_info in components.items():
+                    deploy_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir)
+
                 if "spectrum" in components:
                     log_upgrade(job_id, f"[{hostname}] Rebuilding Spectrum container on host...")
                     build_cmd = (
                         "rm -rf /tmp/spectrum_build && mkdir -p /tmp/spectrum_build/static && "
-                        "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/server.py && "
+                        "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/spectrum_server.py && "
                         "cp /usr/local/bin/hylia /tmp/spectrum_build/hylia.py && "
                         "cp /usr/local/bin/Dockerfile /tmp/spectrum_build/Dockerfile && "
+                        # lanayru is imported by spectrum_server at runtime; tolerate its
+                        # absence on nodes provisioned before it shipped.
+                        "if [ -f /usr/local/bin/lanayru.py ]; then cp /usr/local/bin/lanayru.py /tmp/spectrum_build/lanayru.py; fi && "
                         "cp -r /usr/local/bin/static/* /tmp/spectrum_build/static/ && "
                         "podman build -t localhost/spectrum:latest /tmp/spectrum_build && "
                         "systemctl stop spectrum && podman rm -f systemd-spectrum && systemctl start spectrum"
@@ -526,9 +758,15 @@ def hylia_rolling_upgrade(job_id):
                     log_upgrade(job_id, f"[{hostname}] Running pre-flight storage synchronization checks on remaining cluster nodes...")
                     preflight_ok = True
                     for other_node in target_nodes:
-                        o_ip = other_node["ip"]
-                        o_host = other_node["hostname"]
-                        if o_ip != node_ip:
+                        # target_nodes is a list of IP strings (see hydra.hylia_jobs);
+                        # tolerate the dict form in case a job row predates that.
+                        if isinstance(other_node, dict):
+                            o_ip = other_node.get("ip")
+                            o_host = other_node.get("hostname") or o_ip
+                        else:
+                            o_ip = other_node
+                            o_host = get_hostname_by_ip(o_ip)
+                        if o_ip and o_ip != node_ip:
                             log_upgrade(job_id, f"[{hostname}] Checking storage replica sync status on {o_host}...")
                             if not verify_node_storage_health(job_id, o_ip, o_host):
                                 log_upgrade(job_id, f"[{hostname}] ERROR: Storage replica on node {o_host} is degraded or unsynchronized. Cannot reboot safely.")

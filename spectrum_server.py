@@ -1,19 +1,25 @@
 __build__ = "1.2.2"
 import os
+import re
 import uuid
 import sys
 import json
 import ssl
+import shlex
 import socket
+import ipaddress
 import subprocess
 import urllib.request
 import urllib.parse
+import urllib.error
 import time
+import traceback
 import random
 import threading
 import hashlib
 import secrets
 import base64
+import http.client
 import http.cookies
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
@@ -92,7 +98,14 @@ def is_authenticated(handler):
     if not session_token:
         print(f"[AUTH DEBUG] Path: {handler.path} | No session token found", flush=True)
         return False
-        
+
+    # Reject anything that is not a token this server could have issued, before
+    # it is ever interpolated into a CQL statement. This is pre-authentication,
+    # attacker-controlled input taken from a header, query string or cookie.
+    if not is_valid_session_token(session_token):
+        print(f"[AUTH DEBUG] Path: {handler.path} | Malformed session token rejected", flush=True)
+        return False
+
     # Check session cache first
     now = time.time()
     if session_token in SESSION_CACHE:
@@ -119,6 +132,11 @@ def is_authenticated(handler):
         print(f"[AUTH DEBUG] Path: {handler.path} | Exception in auth: {e}", flush=True)
     return False
 
+# Hosts that upgrade packages may be downloaded from. The official update
+# service is always allowed; an operator running an internal mirror can add
+# hosts with a comma-separated UPDATE_MIRROR_HOSTS entry in spectrum.env.
+UPDATE_HOST_ALLOWLIST = {"updates-helios.zerotwo.cloud"}
+
 # Load local environment settings if available
 try:
     with open("/etc/hci/spectrum/spectrum.env", "r") as f:
@@ -127,6 +145,11 @@ try:
                 k, v = line.strip().split("=", 1)
                 if k == "LOCAL_HYPERVISOR_IP":
                     LOCAL_IP = v
+                elif k == "UPDATE_MIRROR_HOSTS":
+                    for mirror_host in v.split(","):
+                        mirror_host = mirror_host.strip().lower()
+                        if mirror_host:
+                            UPDATE_HOST_ALLOWLIST.add(mirror_host)
 except Exception:
     pass
 
@@ -246,11 +269,32 @@ def log_catalyst_task(service, action, status, progress, payload_dict, error_msg
 
 
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    local = globals().get("LOCAL_IP")
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command, timeout=45):
     """Executes a command on the local or remote node via its spark-daemon mTLS API."""
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command, "timeout": timeout}).encode("utf-8")
@@ -322,10 +366,119 @@ def slugify_image_name(filename):
     slug = slug.strip('-')
     return slug[:28]
 
+# --------------------------------------------------------------------------
+# Input validation at the API boundary
+#
+# VM names are interpolated straight into root shell commands (linstor and
+# virsh, executed via spark-daemon's /api/v1/execute with shell=True) and into
+# CQL statements. Unlike image names, which slugify_image_name() rewrites, a VM
+# name is a user-visible identity: silently mangling it would leave operators
+# looking at a VM that is not the one they asked for. So names are validated
+# and rejected instead.
+# --------------------------------------------------------------------------
+_VM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+VM_NAME_ERROR = (
+    "Invalid VM name. A name must be 1-63 characters, start with a letter or "
+    "digit, and contain only letters, digits, '.', '-' and '_'."
+)
+
+def is_valid_vm_name(name):
+    """True only for VM names that are safe to interpolate into shell/CQL."""
+    if not isinstance(name, str):
+        return False
+    return _VM_NAME_RE.match(name) is not None
+
+# Session tokens are minted by secrets.token_hex(32) in the login handler, i.e.
+# exactly 64 lowercase hex characters. Anything else is rejected before it can
+# reach a query: run_cql_query() falls back to piping raw text into cqlsh when
+# Daruk is unreachable, and cqlsh does execute ';'-separated statements, so an
+# unvalidated pre-auth token is stacked-CQL during any Daruk outage.
+_SESSION_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+
+def is_valid_session_token(token):
+    """True only for tokens matching the format this server generates."""
+    if not isinstance(token, str):
+        return False
+    return _SESSION_TOKEN_RE.match(token) is not None
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+def validate_update_download_url(download_url):
+    """Restrict upgrade downloads to https on an allowlisted host.
+
+    urlopen() otherwise accepts file://, http:// and any host the caller names,
+    which is an arbitrary-read and SSRF primitive on a root-privileged service.
+    """
+    if not isinstance(download_url, str) or not download_url.strip():
+        return False, "Missing download_url in payload"
+    try:
+        parsed = urllib.parse.urlparse(download_url.strip())
+    except Exception:
+        return False, "Malformed download_url"
+    if parsed.scheme.lower() != "https":
+        return False, f"download_url must use https (got '{parsed.scheme or 'none'}')"
+    if parsed.username or parsed.password:
+        return False, "download_url must not contain embedded credentials"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False, "download_url has no host"
+    if host not in UPDATE_HOST_ALLOWLIST:
+        allowed = ", ".join(sorted(UPDATE_HOST_ALLOWLIST))
+        return False, (
+            f"download_url host '{host}' is not an allowed update source "
+            f"(allowed: {allowed}). Add an internal mirror with "
+            f"UPDATE_MIRROR_HOSTS in /etc/hci/spectrum/spectrum.env."
+        )
+    return True, ""
+
+def get_vm_disk_res_names(vm_name):
+    """Linstor resource-definition names backing a VM's disks."""
+    disks_list = ""
+    try:
+        rc, stdout, _ = run_cql_query(
+            f"SELECT JSON disks_list FROM hydra.vms WHERE name = '{vm_name}';"
+        )
+        if rc == 0:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        disks_list = json.loads(line).get("disks_list") or ""
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    num_disks = 1
+    if disks_list and disks_list.strip().upper() != "NONE":
+        parsed_disks = [d for d in disks_list.split(",") if d.strip()]
+        if parsed_disks:
+            num_disks = len(parsed_disks)
+    return [f"{vm_name}-disk{idx}" for idx in range(num_disks)]
+
+def set_vm_disks_two_primaries(vm_name, enabled):
+    """Toggle DRBD dual-primary on every disk of a VM.
+
+    Dual-primary is only legitimate for the live-migration hand-over window,
+    when source and target qemu both hold the device open. Outside that window
+    it means two qemu processes can write one raw device, which corrupts it, so
+    it is enabled immediately before a migration and disabled immediately after
+    rather than being set permanently at VM creation time.
+    """
+    value = "yes" if enabled else "no"
+    failures = []
+    for res_name in get_vm_disk_res_names(vm_name):
+        rc, out, err = run_linstor_cmd(
+            f"resource-definition drbd-options --allow-two-primaries {value} {res_name}"
+        )
+        if rc != 0:
+            failures.append(f"{res_name}: {(err or out or '').strip()}")
+    return failures
+
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099{path}"
     data = None
@@ -336,8 +489,41 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         with urllib.request.urlopen(req, context=context, timeout=120) as response:
             res = json.loads(response.read().decode("utf-8"))
             return 0, res, ""
+    except urllib.error.HTTPError as e:
+        # The typed endpoints report failure as {"error": "..."} with a 4xx/5xx
+        # status, which urllib raises. Without reading the body here the caller
+        # only ever sees "HTTP Error 500", and every migrated call site loses the
+        # message that the raw execute path used to hand back in stderr.
+        detail = ""
+        try:
+            body = json.loads(e.read().decode("utf-8", errors="replace"))
+            if isinstance(body, dict):
+                detail = str(body.get("error", "")).strip()
+                return -1, body, detail or str(e)
+        except Exception:
+            pass
+        return -1, {"error": detail or str(e)}, detail or str(e)
     except Exception as e:
         return -1, {}, str(e)
+
+def demote_drbd_secondary(res_name):
+    """Demote a DRBD resource to Secondary, reporting a demotion that did not take.
+
+    Failure here is not fatal -- the caller is either finishing or already
+    unwinding -- but it used to be invisible, because the shell form ran with
+    `|| true` and its result was discarded. The typed endpoint returns the
+    resulting role, so a node left holding Primary is at least logged.
+    """
+    rc, res, err = run_mtls_spark_api(
+        "127.0.0.1",
+        "/api/v1/storage/drbd/role",
+        {"resource": res_name, "role": "secondary", "force": False})
+    if rc != 0 or str(res.get("role", "")).strip().lower() != "secondary":
+        print(f"[VALHALLA] DRBD resource {res_name} was not demoted to Secondary "
+              f"(role is '{str(res.get('role', '')).strip() or 'unknown'}'): "
+              f"{(res.get('error') or err or '').strip()}", flush=True)
+        return False
+    return True
 
 def run_cql_query(cql_query, *args, **kwargs):
     import urllib.request
@@ -383,6 +569,73 @@ def run_cql_query(cql_query, *args, **kwargs):
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 
+DARUK_URL = "http://127.0.0.1:9043"
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure: Daruk unreachable, a malformed request, a
+    database error. A compare-and-swap that was *refused* is `(True, False, {...}, "")`
+    and belongs to the caller, not to an error handler -- it means someone else holds what
+    was being claimed, and `current` says what they hold. run_cql_query() cannot express
+    that distinction at all: it flattens rows into space-joined strings and returns rc=0
+    either way, so an ownership write that lost its race reads as one that won.
+
+    There is deliberately no cqlsh fallback. That fallback exists so services keep working
+    while Daruk is down, but it can only run statement text and cannot report whether a
+    condition held; an ownership write that cannot be made conditional must not be made.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
+
+def reconcile_local_vm(name, host_ip, live_state):
+    """Write back what libvirt says about a VM this node believes it owns.
+
+    `host_ip` is the placement the reconciler read, and every write is conditional on it
+    still being there. The unconditional version of this loop was a way to lose a running
+    VM: a guest that had just been migrated away still had a local libvirt trace, the
+    reconciler saw "not running here", and cleared host_ip on a row that now pointed at
+    the new owner. The VM was then unplaced as far as Hydra was concerned and the next
+    start booted a second copy of it against the same DRBD device.
+
+    Returns True when the write landed. A refusal is not an error -- it means this node is
+    no longer the host of record and has nothing to say about the VM.
+    """
+    if live_state == "Stopped":
+        ok, applied, current, err = run_lwt("/v1/vm/release", {
+            "name": name, "expected_host_ip": host_ip,
+        })
+    else:
+        ok, applied, current, err = run_lwt("/v1/vm/set-state", {
+            "name": name, "state": live_state, "expected_host_ip": host_ip,
+        })
+    if not ok:
+        print(f"[Reconcile] VM '{name}': could not update its record ({err}).")
+        return False
+    if not applied:
+        print(f"[Reconcile] VM '{name}' is no longer placed here (Hydra now says {current.get('host_ip')!r}); leaving its record alone.")
+        return False
+    return True
+
+
 def get_actual_replication_factor():
     try:
         import urllib.request
@@ -403,7 +656,57 @@ def get_actual_replication_factor():
                     return str(rep["replication_factor"])
     except Exception as e:
         print(f"Error fetching actual replication factor: {e}")
-    return "3"
+    # Deliberately not "3": returning a plausible-looking RF when the query failed makes
+    # a broken cluster report full fault tolerance. "unknown" is the honest answer and is
+    # visibly wrong in the UI, which is the point.
+    return "unknown"
+
+def run_nodetool_repair(reason=""):
+    """Run a full repair so an RF increase actually replicates.
+
+    ALTER KEYSPACE only changes the replication *strategy*: Scylla accepts it instantly
+    and system_schema reports the new factor, but existing data is not copied to the new
+    replicas until a repair runs. Without this the cluster reports RF=3 while a partition
+    still lives on a single node, and losing that node loses the data -- fault tolerance
+    that exists only on paper. Repair is idempotent and safe to re-run.
+    """
+    label = f" ({reason})" if reason else ""
+    print(f"[REPAIR] Starting nodetool repair{label}. This can take a while on a large keyspace.")
+    rc, res, err = run_mtls_spark_api(
+        LOCAL_IP, "/api/v1/db/repair", {"keyspace": "hydra", "primary_range": True})
+    if rc == 0 and "error" not in res and res.get("started"):
+        # The typed endpoint starts the repair and returns immediately, so this
+        # reports "started", not "finished". Completion is no longer observable
+        # from here; the repair continues on the node after this returns.
+        print(f"[REPAIR] Started successfully{label}. It runs asynchronously on the node.")
+        return True
+    print(f"[REPAIR] FAILED to start{label}: {(res.get('error') or err or '').strip()[:400]}")
+    print("[REPAIR] Replicas may be under-populated. Re-run: "
+          "podman exec systemd-hydra-db nodetool repair -pr hydra")
+    return False
+
+
+def alter_keyspace_rf(desired_rf, reason=""):
+    """Change the keyspace replication factor, then repair if it increased."""
+    before = get_actual_replication_factor()
+    alter = ("ALTER KEYSPACE hydra WITH replication = "
+             "{'class': 'SimpleStrategy', 'replication_factor': %d};" % desired_rf)
+    rc, _, err = run_cql_query(alter)
+    if rc != 0:
+        print(f"[REPAIR] ALTER KEYSPACE to RF={desired_rf} failed: {err}")
+        return False
+    try:
+        increased = int(before) < int(desired_rf)
+    except (TypeError, ValueError):
+        increased = True   # unknown previous RF: repair rather than assume it was enough
+    if increased:
+        import threading
+        # Repair can run for a long time; do not block startup or an API request on it.
+        threading.Thread(target=run_nodetool_repair,
+                         args=(reason or f"RF {before} -> {desired_rf}",),
+                         daemon=True).start()
+    return True
+
 
 def get_container_node_ip(container_name):
     """Finds which node in the cluster has the specified storage container mounted. Returns '127.0.0.1' as fallback."""
@@ -427,8 +730,12 @@ def get_container_node_ip(container_name):
                 if rc_m == 0:
                     return nip
             else:
-                rc_m, _, _ = run_remote_spark(nip, f"mountpoint -q {container_path}")
-                if rc_m == 0:
+                rc_m, res_m, _ = run_mtls_spark_api(
+                    nip,
+                    "/api/v1/storage/container/mounted?path=" + urllib.parse.quote(container_path, safe=""),
+                    None,
+                    method="GET")
+                if rc_m == 0 and res_m.get("mounted"):
                     return nip
     except Exception:
         pass
@@ -451,15 +758,30 @@ def submit_catalyst_cql_task(job_name, cql_query):
     try:
         leader_ip = get_catalyst_target_ip()
         req = urllib.request.Request(
-            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+            f"https://{leader_ip}:9091/api/v1/tasks/submit",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
+        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res.get("task_id"), None
     except Exception as e:
         return None, str(e)
+
+def catalyst_ssl_context():
+    """Client context for calls to Catalyst, which now requires mutual TLS.
+
+    Catalyst dispatches cluster work -- VM start, stop, migrate -- and used to accept it
+    from anything that could open a socket to port 9091, checking neither a credential
+    nor a source address. It now requires a certificate signed by this cluster's CA, so
+    every caller has to present one.
+
+    The same client material every other inter-node call in this file uses. Inside the
+    Spectrum container these are bind-mounted read-only from the host.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    return context
 
 def validate_password_complexity(password):
     """Validates a password against the active cluster security policy."""
@@ -522,6 +844,593 @@ def get_cluster_nodes():
         return hosts
 
     return _CACHED_CLUSTER_JSON_HOSTS
+
+# --------------------------------------------------------------------------
+# Bounded reads
+#
+# Two of this console's polling endpoints answered every request with a full table scan.
+# Both tables they scan have a time-ordered clustering key, so "the newest N rows of one
+# partition" is a read the storage engine answers directly: it walks N rows on one
+# replica set instead of every row on all of them.
+#
+# The scans were not only expensive. `SELECT ... LIMIT 100` with no WHERE returns the
+# first 100 rows the coordinator reaches in *token* order, which is not the most recent
+# 100 of anything -- one busy job's partition could fill the whole answer while another
+# job's runs never appeared at all.
+# --------------------------------------------------------------------------
+
+# metrics.html slices each host's series to its last 40 points before drawing it, so
+# every sample past that was read out of Hydra and thrown away -- once per open browser
+# tab, every 30 seconds. At logos.py's 30s cadence, 40 samples is the 20 minutes of
+# history the charts actually show.
+METRICS_SAMPLES_PER_NODE = 40
+
+# dagur_runs rows read per job. The page merges every job's recent history into one
+# table and sorts it in the browser, so this is a per-partition depth, not a page size;
+# DAGUR_RUNS_MAX caps what the merge sends.
+DAGUR_RUNS_PER_JOB = 10
+DAGUR_RUNS_MAX = 100
+
+# Job names are the partition key of hydra.dagur_runs and go back into CQL as a string
+# literal. They are written by this file's own seeding and by dagur.py, but nothing
+# validates them on the way in, and run_cql_query() falls back to piping statement text
+# into cqlsh when Daruk is down -- where a ';' in a "job name" is a second statement.
+_DAGUR_JOB_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+def is_ip_literal(value):
+    """True only for a value that is literally an IP address.
+
+    Node addresses come out of /etc/hci/cluster.json and hydra.nodes and go straight back
+    into CQL as a partition key. Same reasoning as _DAGUR_JOB_NAME_RE above: not user
+    input, but not checked on the way in either.
+    """
+    try:
+        ipaddress.ip_address(str(value).strip())
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_json_rows(stdout):
+    """Rows of a `SELECT JSON` result, as dicts."""
+    rows = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                pass
+    return rows
+
+
+def read_node_metrics(limit=METRICS_SAMPLES_PER_NODE):
+    """The newest `limit` telemetry samples for each node, one partition at a time.
+
+    hydra.logos_metrics is PRIMARY KEY (node_ip, timestamp) with CLUSTERING ORDER BY
+    (timestamp DESC) and a 24h TTL, and logos.py writes one row per node every 30
+    seconds -- about 2,880 live rows per node, 8,600 on a three-node cluster.
+
+    /api/cluster/metrics used to read all of them with `SELECT JSON * FROM
+    hydra.logos_metrics`: no WHERE, no LIMIT, on every poll of every open tab, to draw
+    120 points. Reading each node's partition with a LIMIT is answered by the clustering
+    order without a scan.
+
+    Nodes come from the cluster configuration, so a node that has been removed from the
+    cluster stops appearing here even while its rows live out their TTL. That is the
+    intended behaviour: the charts are of the cluster, not of the table.
+
+    Returns (rows, unread_ips). `unread_ips` names nodes whose partition could not be
+    read at all, which is a different thing from a node that reported nothing and must
+    not be drawn as one.
+    """
+    rows = []
+    unread = []
+    for node in get_cluster_nodes():
+        ip = (node or {}).get("ip")
+        if not ip or not is_ip_literal(ip):
+            continue
+        ip = str(ip).strip()
+        cql = ("SELECT JSON node_ip, timestamp, cpu_pct, mem_pct, mem_total_kb, "
+               "cpu_cores, disk_iops, disk_bandwidth_kbps, net_rx_kbps, net_tx_kbps "
+               f"FROM hydra.logos_metrics WHERE node_ip = '{ip}' LIMIT {int(limit)};")
+        rc, stdout, _ = run_cql_query(cql)
+        if rc != 0:
+            unread.append(ip)
+            continue
+        rows.extend(parse_json_rows(stdout))
+    return rows, unread
+
+
+def cql_timestamp_ms(value):
+    """A CQL timestamp as epoch milliseconds, or 0.0 when it cannot be read.
+
+    `SELECT JSON` renders a `timestamp` column as "2026-08-18 20:58:32.922Z", not as a
+    number. Sorting those values as they arrive sorts strings, which happens to be
+    correct for one format and silently is not for another -- and comparing a string to
+    an int raises. Every merge across partitions in this file goes through here.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    import datetime
+    cleaned = text.replace("Z", "").split("+")[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(cleaned, fmt).timestamp() * 1000.0
+        except ValueError:
+            continue
+    return 0.0
+
+
+def read_dagur_runs(per_job=DAGUR_RUNS_PER_JOB, cap=DAGUR_RUNS_MAX):
+    """The most recent runs of every scheduled job, newest first.
+
+    hydra.dagur_runs is PRIMARY KEY (job_name, start_time) clustered start_time DESC, so
+    a job's recent history is a single-partition read. The old `SELECT JSON * FROM
+    hydra.dagur_runs LIMIT 100` had no WHERE: a full scan, and its 100 rows were whatever
+    the coordinator reached first rather than the 100 latest.
+
+    Job names come from hydra.dagur_schedules -- one row per job, a handful of rows. A
+    run whose schedule has since been deleted is no longer listed; the only alternative
+    is the scan this replaces, and an orphaned job's history is not what the page is for.
+
+    Returns (runs, ok). `ok` is False when the schedule list itself could not be read, so
+    an empty history and an unreadable database are distinguishable.
+    """
+    rc, stdout, _ = run_cql_query("SELECT JSON job_name FROM hydra.dagur_schedules;")
+    if rc != 0:
+        return [], False
+
+    runs = []
+    for row in parse_json_rows(stdout):
+        job = (row.get("job_name") or "").strip()
+        if not _DAGUR_JOB_NAME_RE.match(job):
+            continue
+        cql = ("SELECT JSON job_name, start_time, run_id, end_time, status, exit_code, "
+               "output FROM hydra.dagur_runs "
+               f"WHERE job_name = '{job}' LIMIT {int(per_job)};")
+        rc_r, stdout_r, _ = run_cql_query(cql)
+        if rc_r != 0:
+            continue
+        runs.extend(parse_json_rows(stdout_r))
+
+    # Each partition already came back newest-first; this orders the merge across jobs.
+    runs.sort(key=lambda run: cql_timestamp_ms(run.get("start_time")), reverse=True)
+    return runs[:int(cap)], True
+
+
+# --------------------------------------------------------------------------
+# The Valhalla image catalogue
+#
+# Two defects lived here. `GET /api/images` scanned a directory and INSERTed catalogue
+# rows for whatever it found, so loading a page wrote to the database. And
+# /api/images/delete deleted the catalogue row first, fired an unchecked
+# `resource-definition delete` and an unchecked fan-out `rm -f {path}` -- with the path
+# interpolated straight into a root shell -- and answered 200 whatever happened. A failed
+# LINSTOR delete therefore left a DRBD resource holding storage on every node that
+# nothing in the UI could ever see again, and the operator was told it had worked.
+# --------------------------------------------------------------------------
+
+# Where upload stages image files, and the only prefix under which this file will run an
+# `rm`. Note the trailing slash: without it, "/var/lib/hci/aether/volumes-evil/x" is a
+# prefix match.
+IMAGE_CONTAINER_ROOT = "/var/lib/hci/aether/volumes/"
+
+# A DRBD device is not a file. Removing one means deleting the LINSTOR resource, which
+# tears the device down on every node; `rm` on /dev/drbd/by-res/<res>/0 deletes a udev
+# symlink and leaves the resource -- and the storage it holds -- allocated.
+DRBD_DEVICE_PREFIX = "/dev/drbd/"
+
+
+def image_backing_kind(path):
+    """How an image's backing store must be removed: 'drbd', 'file', or None.
+
+    None means the row points somewhere this file will not delete from, and the delete is
+    refused and reported rather than attempted. Quoting the path is not the guard on its
+    own -- `rm -f` on a correctly quoted "/etc" is still `rm -f /etc`. What makes it safe
+    is that the path has to be one of the two shapes an image can legitimately have.
+    """
+    if not isinstance(path, str):
+        return None
+    path = path.strip()
+    if not path or "\x00" in path or ".." in path:
+        return None
+    if path.startswith(DRBD_DEVICE_PREFIX) and len(path) > len(DRBD_DEVICE_PREFIX):
+        return "drbd"
+    if path.startswith(IMAGE_CONTAINER_ROOT) and len(path) > len(IMAGE_CONTAINER_ROOT):
+        return "file"
+    return None
+
+
+# LINSTOR is being asked to delete something that is already gone. That is the state the
+# call was trying to reach, so it is not a failure -- but every other non-zero exit is,
+# and must not be swallowed the way the old code swallowed all of them.
+#
+# "no domain" is libvirt's wording, kept here because the VM delete path below applies
+# the same reasoning to virsh: a domain that is already undefined is the outcome asked
+# for. spark-daemon maps both wordings to 404 in virsh_status_for().
+_ALREADY_GONE_RE = re.compile(
+    r"not found|does not exist|unknown resource|no such|no domain", re.IGNORECASE)
+
+
+def remove_image_backing(name, path):
+    """Remove an image's backing store, checked. Returns (ok, detail).
+
+    `ok` False means the storage is still allocated, and the caller must leave the
+    catalogue row alone so the image stays visible and the delete can be retried.
+    `detail` carries the daemon's own message.
+    """
+    kind = image_backing_kind(path)
+
+    if kind is None:
+        if not path:
+            # A row with no path at all: written by the directory scan that /api/images
+            # used to perform, which never recorded one. There is nothing to remove, and
+            # saying so beats inventing a path to delete.
+            return True, "no backing store recorded"
+        return False, (f"Refusing to delete image '{name}': its recorded path {path!r} is "
+                       f"neither a DRBD device under {DRBD_DEVICE_PREFIX} nor a file under "
+                       f"{IMAGE_CONTAINER_ROOT}.")
+
+    if kind == "drbd":
+        res_name = f"img-{slugify_image_name(name)}"
+        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
+        if rc == 0:
+            return True, f"LINSTOR resource {res_name} deleted"
+        message = ((stderr or "") + " " + (stdout or "")).strip()
+        if _ALREADY_GONE_RE.search(message):
+            return True, f"LINSTOR resource {res_name} was already gone"
+        return False, (f"LINSTOR refused to delete resource {res_name}: "
+                       f"{message[:400] or 'no output'}")
+
+    # A staged image file exists on every node, so it has to be removed on every node.
+    # A node that does not answer is reported: a copy left behind is what the next upload
+    # of the same name collides with.
+    nodes = []
+    rc_n, stdout_n, _ = run_cql_query("SELECT JSON ip FROM hydra.nodes;")
+    if rc_n == 0:
+        nodes = [row.get("ip") for row in parse_json_rows(stdout_n) if row.get("ip")]
+    if not nodes:
+        nodes = [LOCAL_IP or "127.0.0.1"]
+
+    command = "rm -f -- " + shlex.quote(path)
+    failures = []
+    for ip in nodes:
+        try:
+            rc_rm, stdout_rm, stderr_rm = run_remote_spark(ip, command, timeout=30)
+        except Exception as e:
+            failures.append(f"{ip}: {e}")
+            continue
+        if rc_rm != 0:
+            detail = ((stderr_rm or "") + " " + (stdout_rm or "")).strip()
+            failures.append(f"{ip}: {detail[:200] or 'removal failed'}")
+    if failures:
+        return False, f"Could not remove {path} on: " + "; ".join(failures)
+    return True, f"{path} removed on {len(nodes)} node(s)"
+
+
+def delete_catalogue_image(name):
+    """Delete an image: its backing store first, checked, then its catalogue row.
+
+    Returns (status_code, body). The order is the fix. The old code deleted the row
+    first, which is the one ordering where a failure downstream is unrecoverable from the
+    UI: the storage is still allocated and the only handle on it -- the row naming its
+    path -- has already been thrown away. Backing store first means a failure leaves the
+    image exactly where it was, still listed, still deletable.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return 400, {"error": "An image name is required."}
+    name = name.strip()
+
+    rc, stdout, stderr = run_cql_query(
+        "SELECT JSON name, path FROM hydra.valhalla_images "
+        f"WHERE name = '{name.replace(chr(39), chr(39) * 2)}';")
+    if rc != 0:
+        return 503, {"error": f"The image catalogue could not be read: {stderr or 'unknown error'}"}
+    rows = parse_json_rows(stdout)
+    if not rows:
+        # Not a silent success. The row this was asked to delete does not exist, and
+        # answering 200 would tell the operator a delete happened that did not.
+        return 404, {"error": f"No image named '{name}' is in the catalogue."}
+    path = rows[0].get("path") or ""
+
+    ok, detail = remove_image_backing(name, path)
+    if not ok:
+        return 500, {
+            "error": detail,
+            "image": name,
+            "catalogue_row": "kept",
+            "message": (f"Image '{name}' was NOT deleted. Its backing store is still "
+                        f"allocated, so the catalogue row has been left in place."),
+        }
+
+    rc_d, _, stderr_d = run_cql_query(
+        f"DELETE FROM hydra.valhalla_images WHERE name = '{name.replace(chr(39), chr(39) * 2)}';")
+    if rc_d != 0:
+        # The backing store is gone and the row is not. The image is unusable and the row
+        # has to be cleaned up by hand, which is worth saying plainly rather than
+        # answering 200 and leaving a catalogue entry pointing at nothing.
+        return 500, {
+            "error": (f"Image '{name}' backing store was removed ({detail}), but its "
+                      f"catalogue row could not be deleted: {stderr_d or 'unknown error'}. "
+                      f"The row now points at storage that no longer exists; remove it with "
+                      f"DELETE FROM hydra.valhalla_images WHERE name = '{name}'."),
+            "image": name,
+            "catalogue_row": "orphaned",
+        }
+
+    return 200, {"message": f"Image '{name}' successfully deleted.", "detail": detail}
+
+
+# --------------------------------------------------------------------------
+# VM delete
+#
+# The old sequence read host_ip, destroyed the domain on that host, and then deleted the
+# row unconditionally. A VM that migrated between the read and the destroy was destroyed
+# nowhere -- the destroy went to the host it had left -- and its row disappeared anyway,
+# leaving a guest running on a host that nothing in the cluster still associates with it.
+# It cannot be found in the UI, it is not counted against the host's capacity, and it
+# holds its DRBD device open against the next thing that claims the name.
+#
+# The fix is to stop the VM from moving and to prove it has not moved, using Daruk's
+# typed compare-and-swap endpoints (docs/daruk.md):
+#
+#   1. Read the row, so "no such VM" is decided before any conditional write. This
+#      matters: `UPDATE ... IF status != ?` *applies* against a row that does not exist
+#      and creates a partial one, so calling migrate-lock on an unknown name would invent
+#      a VM rather than report one missing.
+#   2. Take the migration lock. A refusal means a live migration is in flight, and
+#      deleting a VM mid-hand-over is the worst possible moment. Holding it also
+#      serialises two concurrent deletes of the same VM.
+#   3. Re-read the placement under the lock, then pin it with `/v1/vm/set-state`, whose
+#      condition is `IF host_ip = ?`. A refusal means something moved the VM between the
+#      read and the write -- migration is not the only writer; the reconciler releases a
+#      placement too -- and the delete stops there with the row intact.
+#   4. Only then destroy, undefine, and delete storage, all checked.
+#
+# What is still missing is a conditional *delete*: Daruk has no /v1/vm/delete, so the
+# final `DELETE FROM hydra.vms` is unconditional. It runs while this caller holds the
+# migration lock and has just proved the placement, which closes the window the defect
+# was about, but a `DELETE ... IF host_ip = ?` would close it outright.
+# --------------------------------------------------------------------------
+
+# The state written on the row while the delete runs, so an operator refreshing the page
+# sees why the VM stopped answering rather than watching it flicker.
+VM_DELETING_STATE = "Deleting"
+
+
+def _read_vm_row(name):
+    """(row, ok) for one VM. `ok` False means the read failed, not that it is missing."""
+    rc, stdout, stderr = run_cql_query(
+        "SELECT JSON name, host_ip, state, status, disks_list, disk_path "
+        f"FROM hydra.vms WHERE name = '{name}';")
+    if rc != 0:
+        return None, False
+    rows = parse_json_rows(stdout)
+    return (rows[0] if rows else None), True
+
+
+def _destroy_vm_on_host(name, host_ip):
+    """Stop and undefine the guest on the host of record. Returns (ok, detail).
+
+    A destroy that fails for any reason other than "there is no such domain here" leaves
+    a guest running, and deleting the row on top of that produces exactly the orphan this
+    whole path exists to avoid. So it is checked, and only "already gone" passes.
+    """
+    quoted = urllib.parse.quote(name, safe="")
+    rc, res, err = run_mtls_spark_api(host_ip, f"/api/v1/vm/{quoted}/power", {"action": "destroy"})
+    message = str((res or {}).get("error") or err or "")
+    if rc != 0 and not _ALREADY_GONE_RE.search(message) and "not running" not in message.lower():
+        return False, f"{host_ip} refused to destroy the guest: {message[:300] or 'no output'}"
+
+    rc_u, res_u, err_u = run_mtls_spark_api(host_ip, "/api/v1/vm/undefine",
+                                            {"name": name, "keep_nvram": True})
+    message_u = str((res_u or {}).get("error") or err_u or "")
+    if rc_u != 0 and not _ALREADY_GONE_RE.search(message_u):
+        return False, f"{host_ip} refused to undefine the guest: {message_u[:300] or 'no output'}"
+    return True, f"guest destroyed and undefined on {host_ip}"
+
+
+_SIDON = None
+
+
+def sidon_module():
+    """helios_sidon, loaded from wherever the image put it. None if unavailable."""
+    global _SIDON
+    if _SIDON is not None:
+        return _SIDON or None
+    try:
+        import helios_sidon
+        _SIDON = helios_sidon
+        return _SIDON
+    except ImportError:
+        _SIDON = False
+        return None
+
+
+def using_sidon():
+    module = sidon_module()
+    return bool(module and module.using_sidon())
+
+
+def sidon_call(op, host_ip="127.0.0.1", **params):
+    """Ask spark to run a Sidon operation on `host_ip`.
+
+    Spectrum is a container; Sidon's control socket is on the host. Rather than mounting
+    /run into this container, the call goes over the mTLS mesh spark already terminates,
+    so a storage tier adds no second credential. Returns (ok, body_or_error_string).
+    """
+    payload = dict(params)
+    payload["op"] = op
+    rc, body, err = run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", payload)
+    if rc != 0:
+        detail = ""
+        if isinstance(body, dict):
+            detail = body.get("error") or ""
+        return False, detail or err or "spark did not answer the DFS endpoint"
+    return True, body
+
+
+def _delete_vm_disks(name, disks_list):
+    """Delete the VM's LINSTOR resources, checked. Returns (ok, detail).
+
+    Unchecked, this is the images defect again in another table: the row goes, the
+    resources stay, and the storage they hold is no longer reachable from anything the
+    UI shows. A resource that is already gone is the state being asked for, not an error.
+    """
+    count = len(disks_list.split(",")) if disks_list else 1
+    failures = []
+
+    if using_sidon():
+        module = sidon_module()
+        for idx in range(count):
+            vdisk_id = module.vdisk_id_for(name, idx)
+            # Detach first: delete refuses an attached vdisk rather than pulling storage
+            # out from under a running qemu. A vdisk that is not attached here is the
+            # state being asked for, so that refusal is not a failure.
+            sidon_call("detach", vdisk_id=vdisk_id)
+            ok, body = sidon_call("delete", vdisk_id=vdisk_id)
+            if not ok and "does not exist" not in str(body):
+                failures.append(f"{vdisk_id}: {str(body)[:200]}")
+        if failures:
+            return False, "Sidon refused to delete " + "; ".join(failures)
+        return True, f"{count} vdisk(s) deleted"
+
+    for idx in range(count):
+        res_name = f"{name}-disk{idx}"
+        rc, stdout, stderr = run_linstor_cmd(f"resource-definition delete {res_name}")
+        if rc == 0:
+            continue
+        message = ((stderr or "") + " " + (stdout or "")).strip()
+        if _ALREADY_GONE_RE.search(message):
+            continue
+        failures.append(f"{res_name}: {message[:200] or 'no output'}")
+    if failures:
+        return False, "LINSTOR refused to delete " + "; ".join(failures)
+    return True, f"{count} disk resource(s) deleted"
+
+
+def delete_vm(name):
+    """Delete a VM and everything backing it. Returns (status_code, body).
+
+    See the block comment above for the ordering and why each step is conditional.
+    """
+    if not is_valid_vm_name(name):
+        return 400, {"error": VM_NAME_ERROR}
+
+    row, ok = _read_vm_row(name)
+    if not ok:
+        return 503, {"error": "hydra.vms could not be read, so it is not known where this VM is placed."}
+    if row is None:
+        return 404, {"error": f"No VM named '{name}' is registered."}
+
+    task_id, created_at = log_catalyst_task("vm", "delete", "processing", 10, {"vm_name": name})
+
+    def fail(status, message):
+        log_catalyst_task("vm", "delete", "failed", 100, {"vm_name": name},
+                          error_msg=message, task_id=task_id, created_at=created_at)
+        return status, {"error": message, "vm": name, "record": "kept"}
+
+    lock_ok, locked, current, lock_err = run_lwt("/v1/vm/migrate-lock", {"name": name})
+    if not lock_ok:
+        return fail(503, f"Refusing to delete '{name}': the migration lock could not be taken "
+                         f"({lock_err}). Without it a migration could move the guest out from "
+                         f"under the delete.")
+    if not locked:
+        return fail(409, f"Refusing to delete '{name}': it is migrating "
+                         f"(status = {current.get('status')!r}). Retry once the migration settles.")
+
+    unlock_after = True
+    try:
+        # Re-read under the lock: a migration may have committed between the first read
+        # and the lock, and this is the placement the destroy has to go to.
+        row, ok = _read_vm_row(name)
+        if not ok:
+            return fail(503, f"Refusing to delete '{name}': hydra.vms became unreadable "
+                             f"after the migration lock was taken.")
+        if row is None:
+            # Something else deleted it while we waited. The lock we hold is on a row that
+            # no longer exists; leaving it set would resurrect a stub, so drop it.
+            return fail(404, f"No VM named '{name}' is registered.")
+
+        host_ip = row.get("host_ip") or ""
+        previous_state = row.get("state") or "Stopped"
+        disks_list = row.get("disks_list") or ""
+
+        # The compare-and-swap. `/v1/vm/set-state` writes `state` conditional on
+        # `IF host_ip = ?`, so it is a placement check and a status marker in one round.
+        # A refusal is not an error -- it means the VM is somewhere else now, and this
+        # delete has been operating on a stale reading of where its guest lives.
+        ok_cas, applied, current, cas_err = run_lwt("/v1/vm/set-state", {
+            "name": name, "state": VM_DELETING_STATE, "expected_host_ip": host_ip,
+        })
+        if not ok_cas:
+            return fail(503, f"Refusing to delete '{name}': its placement could not be "
+                             f"confirmed ({cas_err}).")
+        if not applied:
+            return fail(409, f"Refusing to delete '{name}': it has moved to "
+                             f"{current.get('host_ip')!r} since this delete started. Nothing has "
+                             f"been destroyed and the VM's record is unchanged; retry the delete.")
+
+        def restore_state():
+            """Put `state` back after an aborted delete, still conditional on placement."""
+            run_lwt("/v1/vm/set-state", {
+                "name": name, "state": previous_state, "expected_host_ip": host_ip,
+            })
+
+        if host_ip:
+            destroyed, detail = _destroy_vm_on_host(name, host_ip)
+            if not destroyed:
+                restore_state()
+                return fail(500, f"'{name}' was not deleted: {detail}. The guest may still be "
+                                 f"running, so its record has been left in place.")
+        else:
+            # Hydra places this VM nowhere. There is no host to destroy it on, and
+            # guessing one would destroy a guest of the same name belonging to nobody.
+            detail = "no host of record; nothing to destroy"
+
+        disks_ok, disk_detail = _delete_vm_disks(name, disks_list)
+        if not disks_ok:
+            restore_state()
+            return fail(500, f"'{name}' was not deleted: {disk_detail}. Its storage is still "
+                             f"allocated, so its record has been left in place.")
+
+        nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
+        run_remote_spark(host_ip or LOCAL_IP, "rm -f -- " + shlex.quote(nvram_path))
+        run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
+
+        rc_del, _, stderr_del = run_cql_query(f"DELETE FROM hydra.vms WHERE name = '{name}';")
+        if rc_del != 0:
+            return fail(500, f"'{name}' was destroyed and its storage deleted, but its record "
+                             f"could not be removed: {stderr_del or 'unknown error'}. The row now "
+                             f"describes a VM that no longer exists.")
+
+        # The row is gone, and the migration lock lived in one of its columns.
+        unlock_after = False
+
+        EVENT_LOGS.append({"desc": f"VM '{name}' successfully deleted.", "time": "Just now"})
+        log_catalyst_task("vm", "delete", "completed", 100, {"vm_name": name},
+                          task_id=task_id, created_at=created_at)
+        invalidate_status_cache()
+        return 200, {"message": f"VM {name} deleted successfully.",
+                     "detail": f"{detail}; {disk_detail}"}
+    except Exception as e:
+        return fail(500, f"'{name}' could not be deleted: {e}")
+    finally:
+        if unlock_after:
+            # Conditional on the lock still being this delete's to release, so a late
+            # unlock cannot clear a migration that started afterwards.
+            run_lwt("/v1/vm/migrate-unlock", {"name": name})
+
 
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader by querying stat on port 2181."""
@@ -666,13 +1575,12 @@ def get_consolidated_dhcp_leases():
         for n in nodes:
             n_ip = n.get("ip")
             if n_ip:
-                rc_l, out_l, _ = run_remote_spark(n_ip, "cat /var/lib/dnsmasq/dnsmasq.leases 2>/dev/null || cat /var/lib/misc/dnsmasq.leases 2>/dev/null")
-                if rc_l == 0 and out_l:
-                    for line in out_l.splitlines():
-                        parts = line.strip().split()
-                        if len(parts) >= 3:
-                            mac = parts[1].lower().strip()
-                            lease_ip = parts[2].strip()
+                rc_l, res_l, _ = run_mtls_spark_api(n_ip, "/api/v1/host/dhcp-leases", None, method="GET")
+                if rc_l == 0 and "error" not in res_l:
+                    for lease in res_l.get("leases", []):
+                        mac = str(lease.get("mac", "")).strip().lower()
+                        lease_ip = str(lease.get("ip", "")).strip()
+                        if mac and lease_ip:
                             dhcp_leases[mac] = lease_ip
     except Exception as e:
         print(f"Error fetching DHCP leases: {e}")
@@ -681,16 +1589,17 @@ def get_consolidated_dhcp_leases():
 def resolve_vm_ip(host_ip, vm_name, vm_status, dhcp_leases):
     if vm_status == "running" and host_ip:
         try:
-            rc_mac, out_mac, _ = run_remote_spark(host_ip, f"virsh -c qemu:///system domiflist {vm_name}")
+            rc_mac, res_mac, _ = run_mtls_spark_api(
+                host_ip,
+                "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/interfaces",
+                None,
+                method="GET")
             macs = []
-            if rc_mac == 0 and out_mac:
-                for line in out_mac.splitlines():
-                    if ":" in line:
-                        parts = line.split()
-                        if len(parts) >= 5:
-                            mac = parts[4].strip().lower()
-                            if len(mac) == 17:
-                                macs.append(mac)
+            if rc_mac == 0 and "error" not in res_mac:
+                for iface in res_mac.get("interfaces", []):
+                    mac = str(iface.get("mac", "")).strip().lower()
+                    if mac:
+                        macs.append(mac)
             for mac in macs:
                 if mac in dhcp_leases:
                     return dhcp_leases[mac]
@@ -786,6 +1695,32 @@ def get_cluster_metrics(nodes_info):
         "used_mem_gb": used_mem_gb
     }
 
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin; inside the Spectrum container it is copied to
+    /app. Neither location is importable by name from the other.
+    """
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "helios_schema.py")):
+        if not os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
+
 def init_db():
     """Attempts to initialize the ScyllaDB keyspace and table on startup."""
     print("Connecting to ScyllaDB and creating keyspace/table if not exists...")
@@ -793,68 +1728,6 @@ def init_db():
     node_count = len(nodes) if nodes else 1
     desired_rf = min(3, node_count)
     create_keyspace = f"CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {desired_rf}}};"
-    create_table = """
-    CREATE TABLE IF NOT EXISTS hydra.vms (
-        name text PRIMARY KEY,
-        vcpu int,
-        memory int,
-        disk_path text,
-        disk_size int,
-        state text,
-        host_ip text,
-        disks_list text,
-        firmware text,
-        iso text,
-        boot_device text,
-        network_id text,
-        cpu_model text,
-        audio_enabled boolean
-    );
-    """
-    create_containers_table = """
-    CREATE TABLE IF NOT EXISTS hydra.storage_containers (
-        name text PRIMARY KEY,
-        tier text,
-        quota_bytes bigint,
-        path text,
-        ftt int
-    );
-    """
-    create_mimir_results = """
-    CREATE TABLE IF NOT EXISTS hydra.mimir_results (
-        category text,
-        check_name text,
-        node_ip text,
-        status text,
-        output text,
-        execution_id uuid,
-        timestamp timestamp,
-        PRIMARY KEY (category, check_name, node_ip)
-    );
-    """
-    create_dagur_schedules = """
-    CREATE TABLE IF NOT EXISTS hydra.dagur_schedules (
-        job_name text PRIMARY KEY,
-        task_type text,
-        cron_expression text,
-        interval_seconds int,
-        enabled boolean,
-        last_run_epoch bigint,
-        command text
-    );
-    """
-    create_dagur_runs = """
-    CREATE TABLE IF NOT EXISTS hydra.dagur_runs (
-        job_name text,
-        start_time timestamp,
-        run_id uuid,
-        end_time timestamp,
-        status text,
-        exit_code int,
-        output text,
-        PRIMARY KEY (job_name, start_time)
-    ) WITH CLUSTERING ORDER BY (start_time DESC);
-    """
     
     # Detect tier from local storage-pools.json
     detected_tier = "HDD"
@@ -886,16 +1759,24 @@ def init_db():
     """
     insert_db_compaction = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('db_compaction', 'db_compaction', '0 */12 * * *', 43200, true, 0, 'nodetool compact || true') IF NOT EXISTS;
+    VALUES ('db_compaction', 'db_compaction', '0 */12 * * *', 43200, false, 0, 'nodetool compact || true') IF NOT EXISTS;
     """
     insert_storage_auto_heal = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('storage_auto_heal', 'storage_auto_heal', '0 1 * * *', 86400, true, 0, '/usr/local/bin/hci-auto-heal') IF NOT EXISTS;
+    VALUES ('storage_auto_heal', 'storage_auto_heal', '0 1 * * *', 86400, true, 0, '/usr/local/bin/mipha --auto-heal') IF NOT EXISTS;
     """
     insert_system_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('system_history_cleanup', 'system_cleanup', '0 0 * * *', 86400, true, 0, '/usr/local/bin/valcli system.cleanup') IF NOT EXISTS;
     """
+    # Enabled on a fresh cluster even though no backup target is configured yet, so it
+    # fails nightly with a message naming the fix. A cluster with no backups should say so
+    # once a day; a disabled schedule is silent, which is what "no backup/DR" looked like.
+    insert_metadata_backup = """
+    INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
+    VALUES ('metadata_backup', 'backup', '30 1 * * *', 86400, true, 0, '/usr/local/bin/saga backup --all-nodes') IF NOT EXISTS;
+    """
+
     insert_orphaned_disks_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('orphaned_disks_cleanup', 'storage_cleanup', '0 2 * * *', 86400, true, 0, '/usr/local/bin/valcli storage.cleanup_orphaned') IF NOT EXISTS;
@@ -904,141 +1785,17 @@ def init_db():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('helios_update_check', 'update_check', '0 */4 * * *', 14400, true, 0, 'python3 /usr/local/bin/check-updates') IF NOT EXISTS;
     """
-    create_lcm_update_state = """
-    CREATE TABLE IF NOT EXISTS hydra.lcm_update_state (
-        key text PRIMARY KEY,
-        latest_version text,
-        release_date text,
-        download_url text,
-        sha256 text,
-        size bigint,
-        changelog text,
-        current_version text,
-        update_available boolean,
-        last_checked timestamp,
-        error_msg text
-    );
-    """
     
     # Define valhalla_images table
-    create_valhalla_images = """
-    CREATE TABLE IF NOT EXISTS hydra.valhalla_images (
-        name text PRIMARY KEY,
-        filename text,
-        size_bytes bigint,
-        type text,
-        path text,
-        created_at timestamp
-    );
-    """
 
-    create_users_table = """
-    CREATE TABLE IF NOT EXISTS hydra.users (
-        username text PRIMARY KEY,
-        password_hash text
-    );
-    """
 
-    create_sessions_table = """
-    CREATE TABLE IF NOT EXISTS hydra.sessions (
-        session_token text PRIMARY KEY,
-        username text,
-        created_at timestamp
-    );
-    """
 
-    create_console_sessions_table = """
-    CREATE TABLE IF NOT EXISTS hydra.console_sessions (
-        console_token text PRIMARY KEY,
-        host_ip text,
-        port int,
-        expires_at int
-    );
-    """
 
-    create_cluster_settings_table = """
-    CREATE TABLE IF NOT EXISTS hydra.cluster_settings (
-        key text PRIMARY KEY,
-        value text
-    );
-    """
-    create_mimir_schedules = """
-    CREATE TABLE IF NOT EXISTS hydra.mimir_schedules (
-        schedule_name text PRIMARY KEY,
-        category text,
-        enabled boolean,
-        last_run_epoch bigint
-    );
-    """
     insert_mimir_default = """
     INSERT INTO hydra.mimir_schedules (schedule_name, category, enabled, last_run_epoch)
     VALUES ('hourly_checks', 'all', true, 0) IF NOT EXISTS;
     """
 
-    create_gatoway_networks = """
-    CREATE TABLE IF NOT EXISTS hydra.gatoway_networks (
-        net_id uuid PRIMARY KEY,
-        name text,
-        type text,
-        vlan_id int
-    );
-    """
-    create_urbosa_t0_routers = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t0_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        uplink_interface text,
-        uplink_ip text,
-        gateway_ip text,
-        nat_rules text
-    );
-    """
-    create_urbosa_t1_routers = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_t1_routers (
-        router_id uuid PRIMARY KEY,
-        name text,
-        t0_link_id uuid,
-        dhcp_enabled boolean
-    );
-    """
-    create_urbosa_segments = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_segments (
-        segment_id uuid PRIMARY KEY,
-        name text,
-        vni int,
-        t1_link_id uuid,
-        subnet_cidr text,
-        gateway_ip text,
-        dhcp_enabled boolean,
-        dhcp_start text,
-        dhcp_end text
-    );
-    """
-    create_urbosa_firewall_rules = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_firewall_rules (
-        rule_id uuid PRIMARY KEY,
-        description text,
-        source_ip text,
-        dest_ip text,
-        protocol text,
-        port int,
-        action text,
-        priority int
-    );
-    """
-    create_urbosa_tunnel_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.urbosa_tunnel_metrics (
-        node_ip text,
-        interface_name text,
-        timestamp timestamp,
-        rx_kbps float,
-        tx_kbps float,
-        rx_packets float,
-        tx_packets float,
-        PRIMARY KEY ((node_ip, interface_name), timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
     insert_default_network = """
     INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id)
     VALUES (7a68e0d6-11f8-4e89-9430-b3b44b8bc438, 'Physical-Direct', 'direct', null) IF NOT EXISTS;
@@ -1046,94 +1803,35 @@ def init_db():
 
     insert_default_image_container = "SELECT now() FROM system.local;"
 
-    create_logos_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.logos_metrics (
-        node_ip text,
-        timestamp timestamp,
-        cpu_pct float,
-        mem_pct float,
-        mem_total_kb bigint,
-        cpu_cores int,
-        disk_iops float,
-        disk_bandwidth_kbps float,
-        net_rx_kbps float,
-        net_tx_kbps float,
-        PRIMARY KEY (node_ip, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
-    create_vm_nvram = """
-    CREATE TABLE IF NOT EXISTS hydra.vm_nvram (
-        vm_name text PRIMARY KEY,
-        nvram_data text
-    );
-    """
-    create_console_metrics = """
-    CREATE TABLE IF NOT EXISTS hydra.console_metrics (
-        vm_name text,
-        timestamp timestamp,
-        avg_fps float,
-        low_fps float,
-        latency float,
-        PRIMARY KEY (vm_name, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp DESC)
-      AND default_time_to_live = 86400;
-    """
-    create_yggdrasil_jobs = """
-    CREATE TABLE IF NOT EXISTS hydra.hylia_jobs (
-        job_id uuid PRIMARY KEY,
-        state text,
-        target_nodes list<text>,
-        current_node text,
-        build_number text,
-        manifest_json text,
-        changelog_md text
-    );
-    """
-    create_yggdrasil_logs = """
-    CREATE TABLE IF NOT EXISTS hydra.hylia_logs (
-        job_id uuid,
-        timestamp timestamp,
-        log_line text,
-        PRIMARY KEY (job_id, timestamp)
-    ) WITH CLUSTERING ORDER BY (timestamp ASC);
-    """
 
     # Retry loop since ScyllaDB may take a moment to bootstrap on boot
     for i in range(15):
         rc, out, err = run_cql_query(create_keyspace)
         if rc == 0:
             print("Keyspace 'hydra' checked/created successfully.")
-            rc2, out2, err2 = run_cql_query(create_table)
-            rc3, out3, err3 = run_cql_query(create_containers_table)
-            rc4, out4, err4 = run_cql_query(create_mimir_results)
-            rc5, out5, err5 = run_cql_query(create_dagur_schedules)
-            rc6, out6, err6 = run_cql_query(create_dagur_runs)
-            rc7, out7, err7 = run_cql_query(create_valhalla_images)
-            rc8, out8, err8 = run_cql_query(create_users_table)
-            rc9, out9, err9 = run_cql_query(create_sessions_table)
-            rc_cs, out_cs, err_cs = run_cql_query(create_console_sessions_table)
-            rc10, out10, err10 = run_cql_query(create_cluster_settings_table)
-            rc11, out11, err11 = run_cql_query(create_mimir_schedules)
-            rc12, out12, err12 = run_cql_query(create_gatoway_networks)
-            rc13, out13, err13 = run_cql_query(create_logos_metrics)
-            # Migrate existing logos_metrics table to add mem_total_kb and cpu_cores if missing
-            run_cql_query("ALTER TABLE hydra.logos_metrics ADD mem_total_kb bigint;")
-            run_cql_query("ALTER TABLE hydra.logos_metrics ADD cpu_cores int;")
-            rc14, out14, err14 = run_cql_query(create_urbosa_t0_routers)
-            rc15, out15, err15 = run_cql_query(create_urbosa_t1_routers)
-            rc16, out16, err16 = run_cql_query(create_urbosa_segments)
-            rc17, out17, err17 = run_cql_query(create_urbosa_firewall_rules)
-            rc18, out18, err18 = run_cql_query(create_urbosa_tunnel_metrics)
-            rc_nv, out_nv, err_nv = run_cql_query(create_vm_nvram)
-            rc_cm, out_cm, err_cm = run_cql_query(create_console_metrics)
-            rc_yj, out_yj, err_yj = run_cql_query(create_yggdrasil_jobs)
-            rc_yl, out_yl, err_yl = run_cql_query(create_yggdrasil_logs)
-            rc_lus, out_lus, err_lus = run_cql_query(create_lcm_update_state)
-            if (rc2 == 0 and rc3 == 0 and rc4 == 0 and rc5 == 0 and rc6 == 0 and 
-                rc7 == 0 and rc8 == 0 and rc9 == 0 and rc_cs == 0 and rc10 == 0 and rc11 == 0 and rc12 == 0 and rc13 == 0 and
-                rc14 == 0 and rc15 == 0 and rc16 == 0 and rc17 == 0 and rc18 == 0 and rc_nv == 0 and rc_cm == 0 and
-                rc_yj == 0 and rc_yl == 0 and rc_lus == 0):
+            # The tables are no longer defined here. helios_schema holds one ordered,
+            # recorded list applied behind a cluster lock, so two daemon versions cannot
+            # race to define the same table differently -- the loser's
+            # CREATE TABLE IF NOT EXISTS is a silent no-op and it never finds out.
+            #
+            # Twenty-three tables lived here, six of them also declared by vali.py or
+            # check_updates.py. They agreed, but nothing made them agree.
+            try:
+                applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+                if applied:
+                    print(f"Applied schema migrations: {', '.join(applied)}")
+                schema_ok = True
+                # Columns added after logos_metrics shipped. Not migrations:
+                # Scylla errors when the column exists, so these are idempotent
+                # only because that error is swallowed here.
+                run_cql_query("ALTER TABLE hydra.logos_metrics ADD mem_total_kb bigint;")
+                run_cql_query("ALTER TABLE hydra.logos_metrics ADD cpu_cores int;")
+            except Exception as schema_error:
+                # ScyllaDB may still be bootstrapping. The surrounding loop retries; a
+                # failure here must not be mistaken for a schema that applied.
+                print(f"Schema not applied yet: {schema_error}")
+                schema_ok = False
+            if schema_ok:
                 print("Tables checked/created successfully.")
                 run_cql_query(insert_default)
                 run_cql_query(insert_default_image_container)
@@ -1141,16 +1839,36 @@ def init_db():
                 run_cql_query(insert_diagnostics)
                 run_cql_query(insert_storage_scrub)
                 run_cql_query("UPDATE hydra.dagur_schedules SET command = 'drbdadm status || true' WHERE job_name = 'storage_scrub';")
+                run_cql_query(insert_storage_auto_heal)
+                # Migrate clusters provisioned before this job pointed at a real command.
+                # The INSERT above is IF NOT EXISTS, so it cannot repair an existing row --
+                # and /usr/local/bin/hci-auto-heal never existed in the first place.
+                run_cql_query(
+                    "UPDATE hydra.dagur_schedules SET command = '/usr/local/bin/mipha --auto-heal' "
+                    "WHERE job_name = 'storage_auto_heal' IF command = '/usr/local/bin/hci-auto-heal';")
                 run_cql_query(insert_db_compaction)
+                # Scheduled major compaction is an anti-pattern on size-tiered compaction:
+                # it rewrites everything into one enormous SSTable that then never compacts
+                # again, and it does heavy IO on a host that is also serving VM disks.
+                # Scylla's own guidance is not to schedule it. Disabled rather than deleted
+                # so an operator can see it and re-enable deliberately if they mean to.
+                run_cql_query(
+                    "UPDATE hydra.dagur_schedules SET enabled = false "
+                    "WHERE job_name = 'db_compaction' IF enabled = true;")
                 run_cql_query(insert_mimir_default)
                 run_cql_query(insert_system_cleanup)
                 run_cql_query(insert_orphaned_disks_cleanup)
+                run_cql_query(insert_metadata_backup)
                 run_cql_query(insert_helios_update_check)
                 run_cql_query(insert_default_network)
                 # Attempt to alter vms table to add network_id
                 run_cql_query("ALTER TABLE hydra.vms ADD network_id text;")
                 run_cql_query("ALTER TABLE hydra.vms ADD cpu_model text;")
                 run_cql_query("ALTER TABLE hydra.vms ADD audio_enabled boolean;")
+                # 'status' holds the transient lifecycle lock (e.g. 'migrating') that vali.py
+                # sets around live migration. It is distinct from 'state' (Running/Stopped).
+                # Without this column the UPDATE fails and vali's migration guard never engages.
+                run_cql_query("ALTER TABLE hydra.vms ADD status text;")
                 
                 # Seeding default user 'helios' if users table is empty
                 rc_users, out_users, err_users = run_cql_query("SELECT username FROM hydra.users;")
@@ -1183,8 +1901,7 @@ def init_db():
                         if rf_lines:
                             configured_rf = int(rf_lines[0])
                     desired_rf = min(configured_rf, len(get_cluster_nodes()) if get_cluster_nodes() else 1)
-                    alter_keyspace = f"ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {desired_rf}}};"
-                    run_cql_query(alter_keyspace)
+                    alter_keyspace_rf(desired_rf, reason="startup reconcile")
                 except Exception as e:
                     print(f"Error altering keyspace replication on startup: {e}")
                     
@@ -1315,19 +2032,21 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
     letters = string.ascii_lowercase
     disk_devices_xml = ""
 
-    # Reconstruct disk paths
-    disk_paths = []
-    if disks_list:
-        disks_payload = disks_list.split(",")
-        for idx, entry in enumerate(disks_payload):
-            d_path = f"/dev/drbd/by-res/{name}-disk{idx}/0"
-            disk_paths.append(d_path)
-    else:
-        disk_paths = [f"/dev/drbd/by-res/{name}-disk0/0"]
+    disk_count = len(disks_list.split(",")) if disks_list else 1
 
-    for idx, d_path in enumerate(disk_paths):
-        dev_letter = letters[idx % 26]
-        disk_devices_xml += f"""
+    if using_sidon():
+        # A network disk over a unix socket: qemu speaks NBD to the local Sidon and never
+        # touches a block device, so there is no /dev node to promote, demote or leak,
+        # and no kernel client in the path.
+        module = sidon_module()
+        for idx in range(disk_count):
+            disk_devices_xml += module.disk_xml(
+                module.vdisk_id_for(name, idx), letters[idx % 26], vcpu)
+    else:
+        disk_paths = [f"/dev/drbd/by-res/{name}-disk{idx}/0" for idx in range(disk_count)]
+        for idx, d_path in enumerate(disk_paths):
+            dev_letter = letters[idx % 26]
+            disk_devices_xml += f"""
     <disk type='block' device='disk'>
       <driver name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'/>
       <source dev='{d_path}'/>
@@ -1343,7 +2062,8 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
                 # Query DB or fallback to slugified name
                 iso_path = None
                 try:
-                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec}';")
+                    spec_esc = spec.replace("'", "''")
+                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec_esc}';")
                     if rc_img == 0 and stdout_img:
                         for line in stdout_img.splitlines():
                             if "/dev/" in line:
@@ -1364,8 +2084,8 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
 
     has_kvm = False
     try:
-        rc, _, _ = run_remote_spark("127.0.0.1", "test -e /dev/kvm")
-        has_kvm = (rc == 0)
+        rc, res_caps, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/capabilities", None, method="GET")
+        has_kvm = (rc == 0 and bool(res_caps.get("kvm")))
     except Exception:
         pass
 
@@ -1910,19 +2630,22 @@ def get_network_details(net_id):
 
 def hotplug_vm_nic(host_ip, vm_name, old_net_id, new_net_id):
     # 1. Get current MAC address using domiflist
-    rc, stdout, _ = run_remote_spark(host_ip, f"virsh -c qemu:///system domiflist {vm_name}")
-    if rc != 0 or not stdout:
+    rc, res_if, _ = run_mtls_spark_api(
+        host_ip,
+        "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/interfaces",
+        None,
+        method="GET")
+    if rc != 0 or "error" in res_if:
         return False, "Failed to query active interfaces on guest VM."
         
     mac = None
     iface_type = "bridge"
-    for line in stdout.splitlines():
-        if "virtio" in line or "vnet" in line or "macvtap" in line or "direct" in line:
-            parts = line.split()
-            if len(parts) >= 5:
-                iface_type = parts[1]
-                mac = parts[4]
-                break
+    for iface in res_if.get("interfaces", []):
+        candidate = str(iface.get("mac", "")).strip()
+        if candidate:
+            iface_type = str(iface.get("type", "")).strip() or "bridge"
+            mac = candidate
+            break
                 
     if not mac:
         return False, "Could not locate active interface MAC address."
@@ -1939,13 +2662,9 @@ def hotplug_vm_nic(host_ip, vm_name, old_net_id, new_net_id):
     # Dynamically detect default route interface on the host for direct/flat network
     uplink_dev = "ens192"
     try:
-        rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route get 8.8.8.8 | grep -oP 'dev \\K\\S+'")
-        if rc_dev == 0 and stdout_dev.strip():
-            uplink_dev = stdout_dev.strip()
-        else:
-            rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route | grep default | awk '{print $5}'")
-            if rc_dev == 0 and stdout_dev.strip():
-                uplink_dev = stdout_dev.strip().splitlines()[0]
+        rc_dev, res_dev, _ = run_mtls_spark_api(host_ip, "/api/v1/host/network", None, method="GET")
+        if rc_dev == 0 and str(res_dev.get("default_interface", "")).strip():
+            uplink_dev = str(res_dev["default_interface"]).strip()
     except Exception:
         pass
         
@@ -2061,7 +2780,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         # If there is a recorded error_msg, return it in the error field
                         error_msg = state_row.get("error_msg", "")
                         self.send_json(200, {
-                            "current_version": state_row.get("current_version", "1.2.0-b4081"),
+                            # Not a plausible-looking build number. check-updates writes
+                            # "unknown" here when it could not read hylia, and inventing a
+                            # version to stand in for one that could not be read is how
+                            # this pair of files came to report an update forever.
+                            "current_version": state_row.get("current_version") or "unknown",
                             "latest_version": state_row.get("latest_version", ""),
                             "update_available": state_row.get("update_available", False),
                             "release_date": state_row.get("release_date", ""),
@@ -2077,15 +2800,19 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 else:
                     # No cached update state found yet!
                     # Return that a check is needed or is in progress
-                    current_version = "1.2.0-b4081"
+                    current_version = "unknown"
                     try:
                         sys.path.append("/usr/local/bin")
                         sys.path.append(".")
                         import hylia
+                        # A hylia that imports but carries no __build__ predates build
+                        # tags, which is a real answer. A hylia that will not import at
+                        # all is not, and must not be given one.
                         current_version = getattr(hylia, "__build__", "1.2.0-b4081")
                     except Exception:
                         pass
-                        
+
+
                     self.send_json(200, {
                         "current_version": current_version,
                         "update_available": False,
@@ -2364,20 +3091,18 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
-                            run_remote_spark("127.0.0.1", f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                            run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
-                            cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                            run_cql_query(cql_update)
-                            vm["state"] = "Stopped"
-                            vm["host_ip"] = ""
-                            host_ip = ""
+                            if reconcile_local_vm(name, host_ip, "Stopped"):
+                                vm["state"] = "Stopped"
+                                vm["host_ip"] = ""
+                                host_ip = ""
                     elif vm.get("state") != live_state:
-                        cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                        run_cql_query(cql_update)
-                        vm["state"] = live_state
-                
+                        if reconcile_local_vm(name, host_ip, live_state):
+                            vm["state"] = live_state
+
                 vm_status = vm.get("state", "Stopped").lower()
-                
+
                 # Resolve host IP to hostname for the frontend UI
                 vm_node_display = host_ip
                 for n in get_cluster_nodes():
@@ -2475,14 +3200,17 @@ class SpectrumHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/lanayru/checks":
             # Real DB check checking consensus via nodetool
-            rc_db, stdout_db, _ = run_remote_spark(LOCAL_IP, "podman exec systemd-hydra-db nodetool status || true")
+            rc_db, res_ring, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/db/ring", None, method="GET")
             db_status = "error"
             db_msg = "ScyllaDB cluster offline or unreachable."
-            if rc_db == 0 and stdout_db:
-                # Count UN nodes
+            if rc_db == 0 and "error" not in res_ring and res_ring.get("nodes"):
+                # Count nodes that are Up and Normal -- nodetool's "UN" pair,
+                # now reported as separate status/state fields.
                 un_nodes = 0
-                for line in stdout_db.splitlines():
-                    if line.strip().startswith("UN"):
+                for ring_node in res_ring.get("nodes", []):
+                    ring_status = str(ring_node.get("status", "")).strip().upper()
+                    ring_state = str(ring_node.get("state", "")).strip().upper()
+                    if ring_status.startswith("U") and ring_state.startswith("N"):
                         un_nodes += 1
                 expected_nodes = len(get_cluster_nodes()) if get_cluster_nodes() else 3
                 if un_nodes >= expected_nodes:
@@ -2506,21 +3234,18 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     storage_msg = "Linstor pools online but thin provisioning not found."
             
             # Node memory check using LOCAL_IP
-            rc_mem, stdout_mem, _ = run_remote_spark(LOCAL_IP, "free -m")
+            rc_mem, res_mem, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/host/memory", None, method="GET")
             compute_status = "warning"
             compute_msg = "Host compute resources warning or unverified."
-            if rc_mem == 0 and stdout_mem:
+            if rc_mem == 0 and "error" not in res_mem:
                 try:
-                    lines = stdout_mem.splitlines()
-                    for line in lines:
-                        if line.startswith("Mem:"):
-                            free_mem = int(line.split()[3])
-                            if free_mem >= 2048:
-                                compute_status = "ready"
-                                compute_msg = f"Host RAM capacity check passed ({free_mem}MB free on node)"
-                            else:
-                                compute_status = "warning"
-                                compute_msg = f"Host RAM capacity warning: only {free_mem}MB free on node"
+                    free_mem = int(float(res_mem.get("free_mb", 0)))
+                    if free_mem >= 2048:
+                        compute_status = "ready"
+                        compute_msg = f"Host RAM capacity check passed ({free_mem}MB free on node)"
+                    else:
+                        compute_status = "warning"
+                        compute_msg = f"Host RAM capacity warning: only {free_mem}MB free on node"
                 except:
                     pass
             
@@ -2723,19 +3448,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             default_gateway = None
             suggested_ip = None
             
-            rc_route, out_route, _ = run_remote_spark("127.0.0.1", "ip route show | grep default")
-            if rc_route == 0 and out_route:
-                parts = out_route.strip().split()
-                try:
-                    via_idx = parts.index("via")
-                    default_gateway = parts[via_idx + 1]
-                except ValueError:
-                    pass
-                try:
-                    dev_idx = parts.index("dev")
-                    default_interface = parts[dev_idx + 1]
-                except ValueError:
-                    pass
+            rc_route, res_route, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/network", None, method="GET")
+            if rc_route == 0 and "error" not in res_route:
+                default_gateway = str(res_route.get("default_gateway", "")).strip() or None
+                default_interface = str(res_route.get("default_interface", "")).strip() or None
             
             if default_interface:
                 rc_ip, out_ip, _ = run_remote_spark("127.0.0.1", f"ip addr show {default_interface} | grep 'inet '")
@@ -2903,20 +3619,18 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
-                            run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                            run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
-                            cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                            run_cql_query(cql_update)
-                            vm["state"] = "Stopped"
-                            vm["host_ip"] = ""
-                            host_ip = ""
+                            if reconcile_local_vm(name, host_ip, "Stopped"):
+                                vm["state"] = "Stopped"
+                                vm["host_ip"] = ""
+                                host_ip = ""
                     elif vm.get("state") != live_state:
-                        cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                        run_cql_query(cql_update)
-                        vm["state"] = live_state
-                
+                        if reconcile_local_vm(name, host_ip, live_state):
+                            vm["state"] = live_state
+
                 vm_status = vm.get("state", "Stopped").lower()
-                
+
                 # Resolve host IP to hostname for the frontend UI
                 vm_node_display = host_ip
                 for n in get_cluster_nodes():
@@ -3115,18 +3829,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/cluster/metrics":
-            cql = "SELECT JSON * FROM hydra.logos_metrics;"
-            rc, stdout, stderr = run_cql_query(cql)
-            metrics = []
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            metrics.append(json.loads(line))
-                        except Exception:
-                            pass
-            
+            # One bounded read per node instead of a scan of the whole table. See
+            # read_node_metrics() for why the old form cost a full cluster scan per
+            # open tab per poll.
+            metrics, metrics_unavailable = read_node_metrics()
+
             logs = []
             
             # 1. mimir_results
@@ -3153,30 +3860,24 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         except:
                             pass
             
-            # 2. dagur_runs
-            cql_dagur = "SELECT JSON * FROM hydra.dagur_runs LIMIT 50;"
-            rc_d, stdout_d, _ = run_cql_query(cql_dagur)
-            if rc_d == 0:
-                for line in stdout_d.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            item = json.loads(line)
-                            ts = item.get("start_time", "")
-                            job = item.get("job_name", "")
-                            status = item.get("status", "")
-                            exit_code = item.get("exit_code", 0)
-                            out = item.get("output", "")
-                            msg = f"Dagur Job '{job}' finished with status '{status}' (Exit: {exit_code}). Output: {out}"
-                            logs.append({
-                                "timestamp": ts,
-                                "source": "Dagur",
-                                "level": "INFO" if status == "SUCCESS" else "ERROR",
-                                "message": msg
-                            })
-                        except:
-                            pass
-                            
+            # 2. dagur_runs -- per job and bounded. `LIMIT 50` with no WHERE was a scan
+            # returning whichever 50 rows the coordinator reached first, so the "recent
+            # activity" feed was not showing recent activity.
+            dagur_runs, _dagur_ok = read_dagur_runs(per_job=5, cap=50)
+            for item in dagur_runs:
+                ts = item.get("start_time", "")
+                job = item.get("job_name", "")
+                status = item.get("status", "")
+                exit_code = item.get("exit_code", 0)
+                out = item.get("output", "")
+                msg = f"Dagur Job '{job}' finished with status '{status}' (Exit: {exit_code}). Output: {out}"
+                logs.append({
+                    "timestamp": ts,
+                    "source": "Dagur",
+                    "level": "INFO" if status == "SUCCESS" else "ERROR",
+                    "message": msg
+                })
+
             # 3. catalyst_tasks
             cql_catalyst = "SELECT JSON * FROM hydra.catalyst_tasks;"
             rc_c, stdout_c, _ = run_cql_query(cql_catalyst)
@@ -3250,7 +3951,12 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             logs.sort(key=get_ts_epoch, reverse=True)
             logs = logs[:200]
 
-            self.send_json(200, {"metrics": metrics, "logs": logs, "console_metrics": console_metrics_list})
+            # `metrics_unavailable` names nodes whose telemetry partition could not be
+            # read. A node that is absent from `metrics` because it was never asked is
+            # not a node that reported nothing, and the two must not look alike.
+            self.send_json(200, {"metrics": metrics, "logs": logs,
+                                 "console_metrics": console_metrics_list,
+                                 "metrics_unavailable": metrics_unavailable})
             return
 
         elif path == "/api/cluster/nodes/hardware":
@@ -3279,38 +3985,28 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             model = line.split(":", 1)[1].strip()
                     cpu_data = {"cores": cores, "model": model}
                 
-                rc_ram, out_ram, err_ram = run_remote_spark(node_ip, "free -b")
+                rc_ram, res_ram, err_ram = run_mtls_spark_api(node_ip, "/api/v1/host/memory", None, method="GET")
                 ram_data = {"total": 0, "used": 0, "free": 0}
-                if rc_ram == 0:
-                    lines = out_ram.splitlines()
-                    for line in lines:
-                        if line.strip().startswith("Mem:"):
-                            parts = line.split()
-                            if len(parts) >= 4:
-                                try:
-                                    ram_data = {
-                                        "total": int(parts[1]),
-                                        "used": int(parts[2]),
-                                        "free": int(parts[3])
-                                    }
-                                except:
-                                    pass
+                if rc_ram == 0 and "error" not in res_ram:
+                    try:
+                        # The endpoint reports MiB; this view renders bytes.
+                        ram_data = {
+                            "total": int(float(res_ram.get("total_mb", 0)) * 1024 * 1024),
+                            "used": int(float(res_ram.get("used_mb", 0)) * 1024 * 1024),
+                            "free": int(float(res_ram.get("free_mb", 0)) * 1024 * 1024)
+                        }
+                    except:
+                        pass
                 
-                rc_disk, out_disk, err_disk = run_remote_spark(node_ip, "lsblk -o NAME,SIZE,TYPE,MOUNTPOINT -J")
+                rc_disk, res_disk, err_disk = run_mtls_spark_api(node_ip, "/api/v1/host/disks", None, method="GET")
                 disks_data = []
-                if rc_disk == 0:
-                    try:
-                        disks_data = json.loads(out_disk).get("blockdevices", [])
-                    except:
-                        pass
+                if rc_disk == 0 and isinstance(res_disk, dict):
+                    disks_data = res_disk.get("blockdevices", []) or []
                 
-                rc_net, out_net, err_net = run_remote_spark(node_ip, "ip -j addr show")
+                rc_net, res_net, err_net = run_mtls_spark_api(node_ip, "/api/v1/host/network", None, method="GET")
                 network_data = []
-                if rc_net == 0:
-                    try:
-                        network_data = json.loads(out_net)
-                    except:
-                        pass
+                if rc_net == 0 and isinstance(res_net, dict):
+                    network_data = res_net.get("addresses", []) or []
                 
                 status = "online" if rc_cpu == 0 else "offline"
                 
@@ -3373,17 +4069,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/dagur/runs":
-            db_runs = []
-            cql = "SELECT JSON * FROM hydra.dagur_runs LIMIT 100;"
-            rc, stdout, stderr = run_cql_query(cql)
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            db_runs.append(json.loads(line))
-                        except Exception:
-                            pass
+            # Per job and bounded. The old `LIMIT 100` had no WHERE, so it scanned the
+            # table and returned the first 100 rows in token order -- never "the 100 most
+            # recent runs", which is what the page claims to show.
+            db_runs, runs_ok = read_dagur_runs()
+            if not runs_ok:
+                self.send_json(503, {"error": "The Dagur job list could not be read, so no "
+                                              "execution history can be shown."})
+                return
             self.send_json(200, {"runs": db_runs})
             return
 
@@ -3437,42 +4130,27 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif path == "/api/images":
-            db_images = []
-            cql = "SELECT JSON * FROM hydra.valhalla_images;"
+            # A pure read. This endpoint used to scan
+            # /var/lib/hci/aether/volumes/default-image-container and INSERT a catalogue
+            # row for every image-looking file it found, so opening the Images page wrote
+            # to the database -- from every tab, on every refresh.
+            #
+            # The rows it wrote were also guesses. Upload puts an image on a replicated
+            # DRBD device (/dev/drbd/by-res/img-<slug>/0), not in that directory, so the
+            # only files the scan ever caught were ones nobody registered; it recorded
+            # them with a `path` no LINSTOR resource backs, and only as this node sees
+            # them. Reconciling the catalogue against the filesystem is a cluster-wide
+            # job, and belongs in hydra.dagur_schedules where it can run once and be
+            # retried, not in a GET.
+            cql = "SELECT JSON name, filename, size_bytes, type, path, created_at FROM hydra.valhalla_images;"
             rc, stdout, stderr = run_cql_query(cql)
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            db_images.append(json.loads(line))
-                        except Exception:
-                            pass
-            # Scan filesystem for files not in database
-            target_dir = "/var/lib/hci/aether/volumes/default-image-container"
-            if os.path.exists(target_dir):
-                try:
-                    existing_names = {img.get("name") for img in db_images if img.get("name")}
-                    for f in os.listdir(target_dir):
-                        if f.lower().endswith((".iso", ".img", ".qcow2")) and f not in existing_names:
-                            fpath = os.path.join(target_dir, f)
-                            st = os.stat(fpath)
-                            size_bytes = st.st_size
-                            created_at = int(st.st_mtime * 1000)
-                            image_meta = {
-                                "name": f,
-                                "filename": f,
-                                "size_bytes": size_bytes,
-                                "type": "iso" if f.lower().endswith(".iso") else "template",
-                                "path": fpath,
-                                "created_at": created_at
-                            }
-                            cql_ins = f"INSERT INTO hydra.valhalla_images JSON '{json.dumps(image_meta)}';"
-                            run_cql_query(cql_ins)
-                            db_images.append(image_meta)
-                except Exception as e:
-                    print(f"[API] Error scanning image directory: {e}")
-            self.send_json(200, {"images": db_images})
+            if rc != 0:
+                # An unreadable catalogue is not an empty catalogue, and answering 200
+                # with [] would draw "no images registered" over a database outage.
+                self.send_json(503, {"error": f"The image catalogue could not be read: "
+                                              f"{stderr or 'unknown error'}"})
+                return
+            self.send_json(200, {"images": parse_json_rows(stdout)})
             return
 
         elif path == "/api/storage/disks":
@@ -3514,6 +4192,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             if not vm_name:
                 self.send_json(400, {"error": "Missing VM name"})
                 return
+            if not is_valid_vm_name(vm_name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
+                return
 
             db_vm = None
             cql = f"SELECT JSON * FROM hydra.vms WHERE name = '{vm_name}';"
@@ -3536,31 +4217,26 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 host_ip = LOCAL_IP
 
             vnc_port = None
-            if console_type == "spice":
-                cmd = f"virsh -c qemu:///system domdisplay {vm_name} --type spice"
-            else:
-                cmd = f"virsh -c qemu:///system vncdisplay {vm_name}"
+            console_ip = "127.0.0.1"
+            if host_ip and host_ip != LOCAL_IP and host_ip != "127.0.0.1":
+                console_ip = host_ip
 
-            if host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "":
-                rc, stdout, stderr = run_remote_spark("127.0.0.1", cmd)
-            else:
-                rc, stdout, stderr = run_remote_spark(host_ip, cmd)
-
-            if rc == 0:
-                display = stdout.strip()
-                if console_type == "spice":
-                    if ":" in display:
-                        try:
-                            vnc_port = int(display.split(":")[-1])
-                        except ValueError:
-                            pass
-                else:
-                    if ":" in display:
-                        try:
-                            display_num = int(display.split(":")[-1])
-                            vnc_port = 5900 + display_num
-                        except ValueError:
-                            pass
+            rc, res_con, _ = run_mtls_spark_api(
+                console_ip,
+                "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
+                None,
+                method="GET")
+            # The endpoint reports the graphics device the domain actually has,
+            # and the listening port directly -- no display-number arithmetic.
+            # Asking virsh for a spice display on a VNC-only domain used to fail,
+            # so a mismatch stays a failure here rather than handing the client a
+            # console of the protocol it did not ask for.
+            if (rc == 0 and "error" not in res_con
+                    and str(res_con.get("graphics", "")).strip().lower() == console_type):
+                try:
+                    vnc_port = int(res_con.get("port"))
+                except (TypeError, ValueError):
+                    pass
 
             if vnc_port is None:
                 self.send_json(500, {"error": "Could not resolve VM console port"})
@@ -3628,6 +4304,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     if not vm_name:
                         self.connection.close()
                         return
+                    # The name below reaches both CQL and a virsh shell command.
+                    # The 101 response is already sent, so drop the connection
+                    # rather than trying to send a JSON error.
+                    if not is_valid_vm_name(vm_name):
+                        print(f"[WS Proxy] Rejecting malformed VM name in console request", flush=True)
+                        self.connection.close()
+                        return
 
                     db_vm = None
                     cql = f"SELECT JSON * FROM hydra.vms WHERE name = '{vm_name}';"
@@ -3650,31 +4333,24 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     if not host_ip:
                         host_ip = LOCAL_IP
 
-                    if console_type == "spice":
-                        cmd = f"virsh -c qemu:///system domdisplay {vm_name} --type spice"
-                    else:
-                        cmd = f"virsh -c qemu:///system vncdisplay {vm_name}"
+                    console_ip = "127.0.0.1"
+                    if host_ip and host_ip != LOCAL_IP and host_ip != "127.0.0.1":
+                        console_ip = host_ip
 
-                    if host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "":
-                        rc, stdout, stderr = run_remote_spark("127.0.0.1", cmd)
-                    else:
-                        rc, stdout, stderr = run_remote_spark(host_ip, cmd)
-
-                    if rc == 0:
-                        display = stdout.strip()
-                        if console_type == "spice":
-                            if ":" in display:
-                                try:
-                                    vnc_port = int(display.split(":")[-1])
-                                except ValueError:
-                                    pass
-                        else:
-                            if ":" in display:
-                                try:
-                                    display_num = int(display.split(":")[-1])
-                                    vnc_port = 5900 + display_num
-                                except ValueError:
-                                    pass
+                    rc, res_con, _ = run_mtls_spark_api(
+                        console_ip,
+                        "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
+                        None,
+                        method="GET")
+                    # Same contract as the HTTP handler above: structured
+                    # graphics type and port, and a protocol mismatch is a
+                    # failure rather than a silent downgrade.
+                    if (rc == 0 and "error" not in res_con
+                            and str(res_con.get("graphics", "")).strip().lower() == console_type):
+                        try:
+                            vnc_port = int(res_con.get("port"))
+                        except (TypeError, ValueError):
+                            pass
 
                 if not vm_name:
                     vm_name = "Session (via token)"
@@ -3764,6 +4440,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 vm_name = query_params.get("name", [None])[0]
                 if not vm_name:
                     self.send_json(400, {"error": "Missing VM name"})
+                    return
+                if not is_valid_vm_name(vm_name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
                     return
 
                 db_vm = None
@@ -3957,7 +4636,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             session_token = cookie["session_id"].value
                     except Exception:
                         pass
-            if session_token:
+            # Same boundary as is_authenticated(): never build a query from a
+            # token that does not match the format this server issues.
+            if session_token and is_valid_session_token(session_token):
+                SESSION_CACHE.pop(session_token, None)
                 delete_cql = f"DELETE FROM hydra.sessions WHERE session_token = '{session_token}';"
                 run_cql_query(delete_cql)
             self.send_response(200)
@@ -4089,11 +4771,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     self.send_json(200, {"task_id": res.get("task_id"), "status": "pending"})
             except Exception as e:
@@ -4104,13 +4786,54 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 content = self.rfile.read(content_length)
                 payload = json.loads(content.decode('utf-8'))
-                download_url = payload.get("download_url")
-                expected_sha256 = payload.get("sha256")
-                
-                if not download_url:
-                    self.send_json(400, {"error": "Missing download_url in payload"})
+
+                # The URL and digest come from the row check-updates wrote, not from the
+                # request. They are the values that were covered by the release
+                # signature; taking them from the caller lets anyone who can reach this
+                # API point the installer at a package of their choosing and supply a
+                # matching digest, which is the whole signature check bypassed. The
+                # request body is now only a trigger.
+                rc_state, out_state, _err_state = run_cql_query(
+                    "SELECT JSON download_url, sha256 FROM hydra.lcm_update_state "
+                    "WHERE key = 'latest';")
+                signed = {}
+                if rc_state == 0:
+                    for line in (out_state or "").splitlines():
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                signed = json.loads(line)
+                            except ValueError:
+                                signed = {}
+                            break
+                download_url = signed.get("download_url")
+                expected_sha256 = signed.get("sha256")
+                if not download_url or not expected_sha256:
+                    self.send_json(409, {
+                        "error": "No verified update is recorded. Run an update check "
+                                 "first; downloads use the URL and digest that check "
+                                 "verified, not values supplied here."
+                    })
                     return
-                
+
+                # Only https, only an allowlisted update host. Without this the
+                # caller picks any URL urlopen understands, including file://.
+                url_ok, url_err = validate_update_download_url(download_url)
+                if not url_ok:
+                    self.send_json(400, {"error": url_err})
+                    return
+                download_url = download_url.strip()
+
+                # The package hash is mandatory. It used to be optional, so a
+                # request that simply omitted "sha256" had its download handed
+                # to the installer completely unverified.
+                if not isinstance(expected_sha256, str) or not _SHA256_HEX_RE.match(expected_sha256.strip()):
+                    self.send_json(400, {
+                        "error": "A valid sha256 digest (64 hex characters) is required to download an update package."
+                    })
+                    return
+                expected_sha256 = expected_sha256.strip()
+
                 zip_path = "/tmp/helios_update.zip"
                 extract_dir = "/tmp/helios_update"
                 
@@ -4127,15 +4850,21 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 sha256_verifier = hashlib.sha256()
                 
                 with urllib.request.urlopen(req, timeout=60) as response:
+                    # urlopen follows redirects, so re-check where we actually
+                    # landed before trusting a byte of the response.
+                    final_ok, final_err = validate_update_download_url(response.geturl())
+                    if not final_ok:
+                        self.send_json(400, {"error": f"Update download redirected to a disallowed location. {final_err}"})
+                        return
                     with open(zip_path, "wb") as f_out:
                         while chunk := response.read(65536):
                             f_out.write(chunk)
                             sha256_verifier.update(chunk)
-                            
+
                 actual_sha256 = sha256_verifier.hexdigest()
-                
-                # 2. Check hash
-                if expected_sha256 and actual_sha256.lower() != expected_sha256.lower():
+
+                # 2. Check hash (always -- expected_sha256 is validated above)
+                if actual_sha256.lower() != expected_sha256.lower():
                     self.send_json(400, {
                         "error": f"Downloaded package hash mismatch. Expected: {expected_sha256}, Got: {actual_sha256}"
                     })
@@ -4606,8 +5335,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         user_rf = int(data["replication_factor"])
                         node_count = len(get_cluster_nodes()) if get_cluster_nodes() else 1
                         capped_rf = min(user_rf, node_count)
-                        alter_cql = f"ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {capped_rf}}};"
-                        run_cql_query(alter_cql)
+                        alter_keyspace_rf(capped_rf, reason="operator changed replication_factor")
                     except Exception as e:
                         print(f"Error altering keyspace replication: {e}")
 
@@ -4714,11 +5442,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     try:
                         leader_ip = get_catalyst_target_ip()
                         req = urllib.request.Request(
-                            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                            f"https://{leader_ip}:9091/api/v1/tasks/submit",
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA BOOTSTRAP] Task submitted successfully: {res}")
@@ -4737,11 +5465,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     try:
                         leader_ip = get_catalyst_target_ip()
                         req = urllib.request.Request(
-                            f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                            f"https://{leader_ip}:9091/api/v1/tasks/submit",
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA CLEANUP] Task submitted successfully: {res}")
@@ -4912,49 +5640,126 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 for h in hosts:
                     run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                     
-                # Configure DRBD options (allow two primaries, auto-resync policies)
+                # Configure DRBD options (auto-resync policies).
+                # Dual-primary is intentionally kept for image resources only:
+                # the golden image is attached to guests as a read-only cdrom
+                # (see generate_vm_xml), so VMs on several hosts open it at the
+                # same time and each host must hold Primary to do so. It is
+                # written exactly once, here, while this node is the only
+                # Primary. VM disks are read-write and must NOT get this.
                 run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
                 run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                 
                 # Wait up to 10 seconds for the block device to appear locally
                 found = False
                 for _ in range(20):
-                    rc_chk, _, _ = run_remote_spark("127.0.0.1", f"test -b {block_dev_path}")
-                    if rc_chk == 0:
+                    rc_chk, res_chk, _ = run_mtls_spark_api(
+                        "127.0.0.1",
+                        "/api/v1/storage/device?path=" + urllib.parse.quote(block_dev_path, safe=""),
+                        None,
+                        method="GET")
+                    if rc_chk == 0 and res_chk.get("is_block"):
                         found = True
                         break
                     time.sleep(0.5)
                 if not found:
                     raise Exception(f"DRBD block device {block_dev_path} did not appear on local host.")
                 
-                # Promote to Primary locally on host to write the data
-                run_remote_spark("127.0.0.1", f"drbdadm primary {res_name}")
+                # Promote to Primary locally on host to write the data.
+                # The typed endpoint returns the role the resource actually ends
+                # up in. A promotion that did not take -- typically because the
+                # peer still holds Primary -- must abort the upload: writing the
+                # block device from a Secondary is exactly the split-brain the
+                # role check exists to prevent, and the old fire-and-forget call
+                # could not see it.
+                rc_pri, res_pri, err_pri = run_mtls_spark_api(
+                    "127.0.0.1",
+                    "/api/v1/storage/drbd/role",
+                    {"resource": res_name, "role": "primary", "force": False})
+                role_now = str(res_pri.get("role", "")).strip().lower() if rc_pri == 0 else ""
+                if role_now != "primary":
+                    raise Exception(
+                        f"Failed to promote DRBD resource {res_name} to Primary "
+                        f"(role is '{role_now or 'unknown'}'; the peer may still hold Primary): "
+                        f"{(res_pri.get('error') or err_pri or '').strip()}")
                 
-                # Stream the upload in chunks of 1MB directly to the block device
-                chunk_size = 1024 * 1024
-                bytes_remaining = content_length
-                last_progress = 0
-                
-                with open(block_dev_path, "wb") as f:
-                    while bytes_remaining > 0:
-                        chunk_to_read = min(chunk_size, bytes_remaining)
-                        chunk = self.rfile.read(chunk_to_read)
+                # Stream the upload through Spark rather than writing the device here.
+                #
+                # The web tier must not touch the data path. Its container mounts no /dev,
+                # so opening a DRBD device failed with ENOENT and image upload never
+                # worked in this deployment -- but mounting /dev would be the wrong fix.
+                # Spark owns host storage, the way Stargate rather than Prism owns it on
+                # Nutanix, so the bytes are proxied to it and it performs the write.
+                # http.client rather than urllib: urllib does not reliably stream a
+                # file-like body, and the framing it produced was rejected mid-transfer.
+                ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+                ctx.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+                _relay_ip, _relay_verify = spark_endpoint(LOCAL_IP)
+                ctx.check_hostname = _relay_verify
+
+                progress_state = {"sent": 0, "reported": 0}
+
+                class _UploadRelay:
+                    """Feeds the client's upload straight through without buffering it."""
+
+                    def __init__(self, stream, total):
+                        self.stream = stream
+                        self.remaining = total
+
+                    def read(self, size=-1):
+                        if self.remaining <= 0:
+                            return b""
+                        want = self.remaining if size is None or size < 0 else min(size, self.remaining)
+                        chunk = self.stream.read(want)
                         if not chunk:
-                            break
-                        f.write(chunk)
-                        bytes_remaining -= len(chunk)
-                        
-                        # Update task progress every 5%
-                        progress = int(((content_length - bytes_remaining) / content_length) * 100) if content_length > 0 else 100
-                        if progress - last_progress >= 5:
-                            log_catalyst_task("valhalla", "upload_image", "processing", progress, {"filename": filename, "size_bytes": content_length}, task_id=task_id, created_at=created_at_ms)
-                            last_progress = progress
-                
-                # Adjust block device permissions
-                run_remote_spark("127.0.0.1", f"chmod 666 {block_dev_path}")
-                
-                # Demote back to Secondary
-                run_remote_spark("127.0.0.1", f"drbdadm secondary {res_name}")
+                            return b""
+                        self.remaining -= len(chunk)
+                        progress_state["sent"] += len(chunk)
+                        pct = int((progress_state["sent"] / content_length) * 100) if content_length else 100
+                        if pct - progress_state["reported"] >= 5:
+                            progress_state["reported"] = pct
+                            log_catalyst_task("valhalla", "upload_image", "processing", pct,
+                                              {"filename": filename, "size_bytes": content_length},
+                                              task_id=task_id, created_at=created_at_ms)
+                        return chunk
+
+                conn = http.client.HTTPSConnection(LOCAL_IP, 9099, context=ctx, timeout=3600)
+                try:
+                    conn.request(
+                        "POST",
+                        "/api/v1/storage/device/write?device=" + urllib.parse.quote(block_dev_path, safe=""),
+                        body=_UploadRelay(self.rfile, content_length),
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Content-Length": str(content_length),
+                        },
+                    )
+                    write_resp = conn.getresponse()
+                    write_body = write_resp.read().decode("utf-8", "replace")
+                    if write_resp.status != 200:
+                        raise Exception("Spark refused the image write: " + write_body[:300])
+                    write_result = json.loads(write_body)
+                finally:
+                    conn.close()
+
+                written = write_result.get("written", 0)
+                if written != content_length:
+                    raise Exception(
+                        "Image upload was truncated: Spark wrote %d of %d bytes."
+                        % (written, content_length))
+
+                # Adjust block device permissions. 0660 root:qemu, not 0666:
+                # qemu/libvirt is the only consumer that needs the device, and
+                # world-writable let any local user or mapped container corrupt
+                # the golden image every VM is cloned from.
+                run_mtls_spark_api(
+                    "127.0.0.1",
+                    "/api/v1/storage/device/prepare",
+                    {"path": block_dev_path, "owner": "root:qemu", "mode": "0660"})
+
+                # Flush kernel buffers for the device, then demote to Secondary
+                run_mtls_spark_api("127.0.0.1", "/api/v1/storage/device/flush", {"path": block_dev_path})
+                demote_drbd_secondary(res_name)
                 
                 created_at = int(datetime.datetime.now().timestamp() * 1000)
                 image_meta = {
@@ -4965,7 +5770,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "path": block_dev_path,
                     "created_at": created_at
                 }
-                cql = f"INSERT INTO hydra.valhalla_images JSON '{json.dumps(image_meta)}';"
+                # json.dumps escapes double quotes and backslashes but NOT single quotes,
+                # so a filename containing ' would break out of the CQL string literal.
+                image_meta_json = json.dumps(image_meta).replace("'", "''")
+                cql = f"INSERT INTO hydra.valhalla_images JSON '{image_meta_json}';"
                 run_cql_query(cql)
                 
                 # Complete catalyst task
@@ -4974,7 +5782,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"message": "Image uploaded successfully", "image": image_meta, "task_id": task_id})
             except Exception as e:
                 # Ensure we attempt to demote back to secondary on failure
-                run_remote_spark("127.0.0.1", f"drbdadm secondary {res_name} || true")
+                demote_drbd_secondary(res_name)
                 # Cleanup Linstor definition on failure
                 run_linstor_cmd(f"resource-definition delete {res_name}")
                 log_catalyst_task("valhalla", "upload_image", "failed", 100, {"filename": filename, "size_bytes": content_length}, error_msg=str(e), task_id=task_id, created_at=created_at_ms)
@@ -4991,6 +5799,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 latency = float(payload["latency"])
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(vm_name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             import datetime
@@ -5105,6 +5917,12 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
 
+            # Validate before anything is created or written: this name is
+            # interpolated into root linstor/virsh shell commands and into CQL.
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
+                return
+
             task_id, created_at = log_catalyst_task("vm", "create", "processing", 10, {"vm_name": name})
 
             disks_parsed = []
@@ -5132,7 +5950,41 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 
                 res_name = f"{name}-disk{idx}"
                 d_path = f"/dev/drbd/by-res/{res_name}/0"
-                
+
+                if using_sidon():
+                    module = sidon_module()
+                    vdisk_id = module.vdisk_id_for(name, idx)
+                    d_path = module.nbd_socket(vdisk_id)
+                    try:
+                        ok, body = sidon_call(
+                            "create", vdisk_id=vdisk_id,
+                            size_bytes=int(primary_size) * 1024 * 1024 * 1024)
+                        if not ok and "already exists" not in str(body):
+                            raise Exception(f"Sidon could not create vdisk {vdisk_id}: {body}")
+                        # Attached here rather than at boot: the socket has to exist
+                        # before libvirt starts the domain, and attaching is what claims
+                        # ownership and fixes the epoch every write of this disk carries.
+                        ok, body = sidon_call("attach", vdisk_id=vdisk_id)
+                        if not ok:
+                            raise Exception(f"Sidon could not attach vdisk {vdisk_id}: {body}")
+                    except Exception as e:
+                        # Same unwind as the LINSTOR path below: a half-created VM leaves
+                        # storage nothing in the UI can reach, which is the defect the
+                        # checked deleter exists to stop being recreated here.
+                        for created in created_disks:
+                            stale = os.path.basename(created).rsplit(".sock", 1)[0]
+                            sidon_call("detach", vdisk_id=stale)
+                            sidon_call("delete", vdisk_id=stale)
+                        log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name},
+                                          error_msg=str(e), task_id=task_id, created_at=created_at)
+                        self.send_json(500, {"error": f"Failed to allocate storage disk {idx}: {str(e)}"})
+                        return
+                    if idx == 0:
+                        primary_disk_size_gb = primary_size
+                    disk_paths.append(d_path)
+                    created_disks.append(d_path)
+                    continue
+
                 try:
                     # 1. Create resource definition
                     rc, out, err = run_linstor_cmd(f"resource-definition create {res_name}")
@@ -5156,8 +6008,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     for h in hosts:
                         run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                         
-                    # 4. Set DRBD options (allow two primaries, split-brain policies)
-                    run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
+                    # 4. Set DRBD options (split-brain policies).
+                    # Dual-primary is deliberately NOT set here. Two nodes
+                    # holding Primary on a read-write VM disk means two qemu
+                    # processes can write one raw device, which corrupts it.
+                    # Live migration needs it only for the hand-over window, so
+                    # /api/vms/migrate enables it around that call and turns it
+                    # back off afterwards.
                     run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                     
                     if idx == 0:
@@ -5181,24 +6038,39 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 network_id = "7a68e0d6-11f8-4e89-9430-b3b44b8bc438"
             cpu_model = payload.get("cpu_model", "")
             audio_enabled = bool(payload.get("audio_enabled", False))
+            # The typed endpoint rejects a null where a string is due, and every one of
+            # these fields reaches it straight from the request body, where an explicit
+            # null is what a form with a cleared field sends.
             vm_meta = {
                 "name": name,
                 "vcpu": vcpu,
                 "memory": memory,
-                "disk_path": disk_paths[0] if disk_paths else "",
+                "disk_path": (disk_paths[0] if disk_paths else "") or "",
                 "disk_size": primary_disk_size_gb if disk_paths else 0,
                 "state": "Stopped",
                 "host_ip": "",
                 "disks_list": ",".join(disks_payload) if disks_payload else "NONE",
-                "firmware": firmware,
-                "iso": iso,
-                "boot_device": boot_device,
+                "firmware": firmware or "uefi",
+                "iso": iso or "",
+                "boot_device": boot_device or "",
                 "network_id": network_id,
-                "cpu_model": cpu_model,
+                "cpu_model": cpu_model or "",
                 "audio_enabled": audio_enabled
             }
-            cql = f"INSERT INTO hydra.vms JSON '{json.dumps(vm_meta)}';"
-            run_cql_query(cql)
+            # INSERT is an upsert in CQL, so this used to overwrite whatever row already
+            # carried the name -- including a live VM's, whose host_ip it reset to "". The
+            # VM kept running while Hydra recorded it as unplaced, and the next start put
+            # a second copy of it on another host against the same disks. The insert is
+            # now conditional, and a name that is already taken is refused.
+            ok, applied, current, err = run_lwt("/v1/vm/create", vm_meta)
+            if not ok:
+                log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name}, error_msg=err, task_id=task_id, created_at=created_at)
+                self.send_json(500, {"error": f"Failed to register VM {name}: {err}"})
+                return
+            if not applied:
+                log_catalyst_task("vm", "create", "failed", 100, {"vm_name": name}, error_msg="VM already exists", task_id=task_id, created_at=created_at)
+                self.send_json(409, {"error": f"A VM named '{name}' already exists (currently placed on {current.get('host_ip') or 'no host'}). Its record was left untouched."})
+                return
 
             # 4. Append event log
             EVENT_LOGS.append({
@@ -5223,46 +6095,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
-                
-            cql_select = f"SELECT JSON path FROM hydra.valhalla_images WHERE name = '{name}';"
-            rc, stdout, stderr = run_cql_query(cql_select)
-            path_to_delete = None
-            if rc == 0:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            path_to_delete = json.loads(line).get("path")
-                        except Exception:
-                            pass
-            
-            cql_delete = f"DELETE FROM hydra.valhalla_images WHERE name = '{name}';"
-            run_cql_query(cql_delete)
-            
-            res_name = f"img-{slugify_image_name(name)}"
-            run_linstor_cmd(f"resource-definition delete {res_name}")
-            
-            if path_to_delete:
-                if not path_to_delete.startswith("/dev/drbd/"):
-                    nodes = []
-                    rc_n, stdout_n, _ = run_cql_query("SELECT JSON ip FROM hydra.nodes;")
-                    if rc_n == 0 and stdout_n:
-                        for line in stdout_n.splitlines():
-                            line = line.strip()
-                            if line.startswith("{") and line.endswith("}"):
-                                try:
-                                    nodes.append(json.loads(line).get("ip"))
-                                except:
-                                    pass
-                    if not nodes:
-                        nodes = ["127.0.0.1"]
-                    for other_ip in nodes:
-                        try:
-                            run_remote_spark(other_ip, f"rm -f {path_to_delete}")
-                        except Exception as e:
-                            print(f"Error removing image file from {other_ip}: {e}")
-                    
-            self.send_json(200, {"message": f"Image '{name}' successfully deleted."})
+
+            # Backing store first and checked, then the row. See delete_catalogue_image().
+            status, body = delete_catalogue_image(name)
+            self.send_json(status, body)
             return
 
         elif self.path == "/api/vms/cdrom":
@@ -5272,6 +6108,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 iso = payload.get("iso", "")
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             task_id, created_at = log_catalyst_task("vm", "cdrom", "processing", 10, {"vm_name": name, "iso": iso})
@@ -5360,10 +6200,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
                 action = payload["action"]  # "start", "stop", "reset", "reboot", "shutdown"
-                
+
+                if not is_valid_vm_name(name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
+                    return
+
                 # Map actions
                 mapped_action = "on" if action == "start" else "off" if action == "stop" else action
-                
+
                 rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/power", {"name": name, "action": mapped_action})
                 if rc == 0 and "error" not in res:
                     new_state = "Running" if mapped_action in ["on", "reset", "reboot", "shutdown"] else "Stopped"
@@ -5393,8 +6237,44 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
                 target_host = payload["target_host"]
-                
-                rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
+
+                if not is_valid_vm_name(name):
+                    self.send_json(400, {"error": VM_NAME_ERROR})
+                    return
+
+                # Live migration is the one case where source and target qemu
+                # legitimately hold the same disk open at once, so DRBD
+                # dual-primary is enabled for exactly this window and turned
+                # back off as soon as the call returns. VM disks are no longer
+                # created with it permanently set.
+                enable_failures = set_vm_disks_two_primaries(name, True)
+                if enable_failures:
+                    self.send_json(500, {
+                        "error": "Failed to enable DRBD dual-primary for the migration window: "
+                                 + "; ".join(enable_failures)
+                    })
+                    return
+
+                two_primaries_still_on = False
+                rc, res, err = -1, {}, ""
+                try:
+                    rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/vm/migrate", {"name": name, "target_host": target_host})
+                finally:
+                    # rc == -1 with an empty result means the mTLS call itself
+                    # failed or timed out; the migration may still be running on
+                    # the hypervisor, and revoking dual-primary underneath it
+                    # would break it. Leave it on in that case and say so.
+                    if rc == -1 and not res:
+                        two_primaries_still_on = True
+                        print(f"[MIGRATE] No definitive result for VM '{name}'; leaving DRBD dual-primary enabled. "
+                              f"Disable it manually once the migration settles.", flush=True)
+                    else:
+                        disable_failures = set_vm_disks_two_primaries(name, False)
+                        if disable_failures:
+                            two_primaries_still_on = True
+                            print(f"[MIGRATE] Failed to disable DRBD dual-primary for VM '{name}': "
+                                  f"{'; '.join(disable_failures)}", flush=True)
+
                 if rc == 0 and "error" not in res:
                     EVENT_LOGS.append({
                         "desc": f"VM '{name}' migration to node '{target_host}' initiated.",
@@ -5402,10 +6282,21 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     })
                     invalidate_status_cache()
 
+                    if two_primaries_still_on:
+                        res = dict(res)
+                        res["warning"] = ("DRBD dual-primary could not be disabled after migration. "
+                                          "Clear it manually before the VM is started elsewhere.")
                     self.send_json(200, res)
                 else:
                     err_msg = res.get("error", err)
-                    self.send_json(500, {"error": f"Failed to migrate VM: {err_msg}"})
+                    error_body = {"error": f"Failed to migrate VM: {err_msg}"}
+                    if two_primaries_still_on:
+                        error_body["warning"] = (
+                            "DRBD dual-primary is still enabled on this VM's disks because the migration "
+                            "result was indeterminate. If the migration is not still running, clear it with: "
+                            "linstor resource-definition drbd-options --allow-two-primaries no <vm>-disk<N>."
+                        )
+                    self.send_json(500, error_body)
                 return
             except Exception as e:
                 self.send_json(500, {"error": str(e)})
@@ -5438,6 +6329,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 name = payload["name"]
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
+                return
+
+            if not is_valid_vm_name(name):
+                self.send_json(400, {"error": VM_NAME_ERROR})
                 return
 
             task_id, created_at = log_catalyst_task("vm", "update", "processing", 10, {"vm_name": name})
@@ -5552,7 +6447,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     # Ensure all target containers directories exist
                     for d_info in new_parsed:
                         t_ip = get_container_node_ip(d_info['container'])
-                        run_remote_spark(t_ip, f"mkdir -p /var/lib/hci/aether/volumes/{d_info['container']}")
+                        run_mtls_spark_api(t_ip, "/api/v1/storage/container/ensure", {"name": d_info['container']})
 
                     import string
                     letters = string.ascii_lowercase
@@ -5623,7 +6518,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             for h in hosts:
                                 run_linstor_cmd(f"resource create {h['hostname']} {res_name} --storage-pool default-pool")
                                 
-                            run_linstor_cmd(f"resource-definition drbd-options --allow-two-primaries yes {res_name}")
+                            # No dual-primary here either: a disk added to a VM
+                            # is read-write and gets the same treatment as one
+                            # created by /api/vms/create.
                             run_linstor_cmd(f"resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect {res_name}")
                             
                             # Attach disk live to the running VM
@@ -5731,7 +6628,6 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             return
 
         elif self.path == "/api/vms/delete":
-            task_id, created_at = None, None
             try:
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
@@ -5739,61 +6635,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            task_id, created_at = log_catalyst_task("vm", "delete", "processing", 10, {"vm_name": name})
-            try:
-                # Find VM details in ScyllaDB
-                cql = f"SELECT JSON host_ip, disks_list, disk_path FROM hydra.vms WHERE name = '{name}';"
-                rc, stdout, stderr = run_cql_query(cql)
-                host_ip = ""
-                disks_list = ""
-                disk_path = ""
-                if rc == 0:
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                vm_meta = json.loads(line)
-                                host_ip = vm_meta.get("host_ip", "")
-                                disks_list = vm_meta.get("disks_list", "")
-                                disk_path = vm_meta.get("disk_path", "")
-                            except Exception:
-                                pass
-
-                # 1. Stop and undefine VM if it is active on a host
-                if host_ip:
-                    run_remote_spark(host_ip, f"virsh -c qemu:///system destroy {name} || true")
-                    run_remote_spark(host_ip, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
-
-                # 2. Delete Linstor resources and NVRAM files
-                num_disks = len(disks_list.split(",")) if disks_list else 1
-                for idx in range(num_disks):
-                    res_name = f"{name}-disk{idx}"
-                    run_linstor_cmd(f"resource-definition delete {res_name}")
-                # Delete UEFI nvram vars file and DB entry
-                nvram_file_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
-                if host_ip:
-                    run_remote_spark(host_ip, f"rm -f {nvram_file_path}")
-                else:
-                    run_remote_spark(LOCAL_IP, f"rm -f {nvram_file_path}")
-                run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
-
-                # 4. Remove metadata record from ScyllaDB
-                cql = f"DELETE FROM hydra.vms WHERE name = '{name}';"
-                run_cql_query(cql)
-
-                # 5. Append delete event log
-                EVENT_LOGS.append({
-                    "desc": f"VM '{name}' successfully deleted.",
-                    "time": "Just now"
-                })
-
-                log_catalyst_task("vm", "delete", "completed", 100, {"vm_name": name}, task_id=task_id, created_at=created_at)
-                invalidate_status_cache()
-
-                self.send_json(200, {"message": f"VM {name} deleted successfully."})
-            except Exception as e:
-                log_catalyst_task("vm", "delete", "failed", 100, {"vm_name": name}, error_msg=str(e), task_id=task_id, created_at=created_at)
-                self.send_json(500, {"error": str(e)})
+            # The destroy goes to the host that still holds the placement, proved with a
+            # compare-and-swap, and the row only goes once there is nothing left running.
+            # See delete_vm() for the ordering.
+            status, body = delete_vm(name)
+            self.send_json(status, body)
             return
 
         elif self.path == "/api/storage/containers/create":
@@ -6488,11 +7334,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -6533,11 +7379,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -6601,11 +7447,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 leader_ip = get_catalyst_target_ip()
                 req = urllib.request.Request(
-                    f"http://{leader_ip}:9091/api/v1/tasks/submit",
+                    f"https://{leader_ip}:9091/api/v1/tasks/submit",
                     data=json.dumps(submit_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -6754,10 +7600,20 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             req.add_header("Authorization", auth)
                         req.add_header("Content-Type", "application/json")
                         
-                        # Bypass SSL verification for internal communication
-                        ctx = ssl.create_default_context()
+                        # Verified against the console certificate, which provisioning
+                        # generates once and installs on every node -- so this proves the
+                        # peer is a console in *this* cluster. It previously used
+                        # CERT_NONE while forwarding the caller's Cookie and
+                        # Authorization headers, so anything that could answer on
+                        # :8443 collected a live session and a reboot request.
+                        #
+                        # check_hostname stays off: the certificate is CN=Spectrum and is
+                        # deliberately the same on every node, so there is no per-node
+                        # name to match. Pinning the certificate is the identity check.
+                        ctx = ssl.create_default_context(
+                            ssl.Purpose.SERVER_AUTH,
+                            cafile="/etc/hci/spectrum/certs/server.crt")
                         ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
                         
                         with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
                             resp_data = response.read()
@@ -6849,7 +7705,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     # 2. Reboot the host
                     print(f"[REBOOT TASK] Rebooting host {target_hostname}...")
                     log_catalyst_task("host", "reboot", "processing", 50, {"hostname": target_hostname}, task_id=task_id, created_at=created_at)
-                    run_remote_spark(target_ip, "reboot || true")
+                    run_mtls_spark_api(target_ip, "/api/v1/host/reboot", {"confirm": True})
                     
                     # 4. Wait for host to go offline
                     time.sleep(10)
@@ -7021,13 +7877,11 @@ def db_reconcile_loop():
                                 live_state = libvirt_vms.get(name, "Stopped")
                                 if live_state == "Stopped":
                                     if name in libvirt_vms:
-                                        run_remote_spark("127.0.0.1", f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                                        run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                                     if db_state != "Stopped" or host_ip != "":
-                                        cql_update = f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';"
-                                        run_cql_query(cql_update)
+                                        reconcile_local_vm(name, host_ip, "Stopped")
                                 elif db_state != live_state:
-                                    cql_update = f"UPDATE hydra.vms SET state = '{live_state}' WHERE name = '{name}';"
-                                    run_cql_query(cql_update)
+                                    reconcile_local_vm(name, host_ip, live_state)
                             else:
                                 # This VM is assigned to another node in the database.
                                 # If it exists locally (defined or running), we must clean it up to prevent split-brain.
@@ -7036,8 +7890,11 @@ def db_reconcile_loop():
                                     live_state = libvirt_vms[name]
                                     print(f"[Reconcile] VM '{name}' is running/defined locally (state: {live_state}) but database assigns it to remote host {host_ip or 'None'}. Cleaning up locally to prevent split-brain...")
                                     if live_state == "Running":
-                                        run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system destroy {name} || true")
-                                    run_remote_spark(LOCAL_IP, f"virsh -c qemu:///system undefine {name} --keep-nvram || true")
+                                        run_mtls_spark_api(
+                                            LOCAL_IP,
+                                            "/api/v1/vm/" + urllib.parse.quote(name, safe="") + "/power",
+                                            {"action": "destroy"})
+                                    run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         except Exception:
                             pass
         except Exception:
@@ -7111,45 +7968,6 @@ def get_catalyst_target_ip():
         return "127.0.0.1"
     return leader_ip
 
-def mimir_scheduler_loop():
-    # Wait for ScyllaDB and ZooKeeper to bootstrap on startup
-    time.sleep(30)
-    while True:
-        try:
-            if is_zookeeper_leader():
-                # Read schedules
-                cql = "SELECT JSON * FROM hydra.mimir_schedules;"
-                rc, stdout, stderr = run_cql_query(cql)
-                if rc == 0:
-                    schedules = []
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                schedules.append(json.loads(line))
-                            except Exception:
-                                pass
-                    
-                    now = int(time.time())
-                    for s in schedules:
-                        if s.get("enabled", False):
-                            name = s.get("schedule_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = 3600 if name == "hourly_checks" else 86400
-                            
-                            if now - last_run >= interval:
-                                print(f"[Mimir Scheduler] Triggering check: {name}...")
-                                # Update last_run_epoch first to prevent multiple runs
-                                cql_update = f"UPDATE hydra.mimir_schedules SET last_run_epoch = {now} WHERE schedule_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
-                                category = s.get("category", "all")
-                                run_cmd = f"/usr/local/bin/mcli health_checks run_all" if category == "all" else f"/usr/local/bin/mcli health_checks {category}"
-                                import threading
-                                threading.Thread(target=run_remote_spark, args=("127.0.0.1", run_cmd), daemon=True).start()
-        except Exception:
-            pass
-        time.sleep(60)
 
 def insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, output):
     clean_output = output.replace("'", "''").replace("\\", "\\\\")
@@ -7188,42 +8006,6 @@ def execute_dagur_job_thread(job_name, command):
         "time": "Just now"
     })
 
-def dagur_scheduler_loop():
-    # Wait for ScyllaDB and ZooKeeper to bootstrap on startup
-    time.sleep(30)
-    while True:
-        try:
-            if is_zookeeper_leader():
-                cql = "SELECT JSON * FROM hydra.dagur_schedules;"
-                rc, stdout, stderr = run_cql_query(cql)
-                if rc == 0:
-                    schedules = []
-                    for line in stdout.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                schedules.append(json.loads(line))
-                            except Exception:
-                                pass
-                    
-                    now = int(time.time())
-                    for s in schedules:
-                        if s.get("enabled", False):
-                            name = s.get("job_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = s.get("interval_seconds", 3600)
-                            command = s.get("command", "")
-                            
-                            if now - last_run >= interval:
-                                print(f"[Dagur Scheduler] Triggering job: {name}...")
-                                cql_update = f"UPDATE hydra.dagur_schedules SET last_run_epoch = {now} WHERE job_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
-                                t = threading.Thread(target=execute_dagur_job_thread, args=(name, command), daemon=True)
-                                t.start()
-        except Exception:
-            pass
-        time.sleep(10)
 
 def internal_token_verifier_loop():
     import socket
@@ -7278,27 +8060,62 @@ def internal_token_verifier_loop():
             except Exception:
                 pass
 
+def supervise(name, target, restart_delay=5.0, max_restart_delay=300.0):
+    """Run a background loop under a supervisor that restarts it if it dies.
+
+    Every long-running loop here was a bare daemon thread. A daemon thread that raises
+    prints a traceback to a log nobody tails and then simply stops existing -- the
+    process keeps serving, so nothing looks wrong, and the feature that thread provided
+    is silently gone until someone notices months later that reconciliation stopped or
+    metrics stopped being collected. That is the failure mode this exists for: not a
+    crash, but a quiet partial death.
+
+    Backoff is exponential and capped. A loop that fails instantly and forever -- an
+    unreachable database at boot, say -- must not become a restart storm that buries the
+    log and burns a core; but it must also keep trying, because the condition that broke
+    it is usually temporary.
+
+    The supervisor thread is itself a daemon, so the process still exits promptly.
+    """
+    def runner():
+        delay = restart_delay
+        while True:
+            started = time.time()
+            try:
+                target()
+                # A loop that returns has decided to stop. Respect that rather than
+                # spinning it back up.
+                print(f"[supervise] {name} returned; not restarting.")
+                return
+            except Exception as exc:
+                ran_for = time.time() - started
+                traceback.print_exc()
+                # Reset the backoff if it managed a decent run: a loop that dies after an
+                # hour is a different problem from one that cannot start at all.
+                if ran_for > max_restart_delay:
+                    delay = restart_delay
+                print(f"[supervise] {name} died after {ran_for:.0f}s ({exc!r}); "
+                      f"restarting in {delay:.0f}s.")
+                time.sleep(delay)
+                delay = min(delay * 2, max_restart_delay)
+
+    thread = threading.Thread(target=runner, name=f"supervise-{name}", daemon=True)
+    thread.start()
+    return thread
+
+
 def main():
-    # Start background VM state reconciliation thread
-    t = threading.Thread(target=db_reconcile_loop, daemon=True)
-    t.start()
+    # Background loops, each under a supervisor. See supervise() for why: a bare daemon
+    # thread that raises leaves the process healthy and the feature dead.
+    supervise("db_reconcile", db_reconcile_loop)
+    supervise("metrics_and_cluster_monitor", metrics_and_cluster_monitor_loop)
+    supervise("internal_token_verifier", internal_token_verifier_loop)
 
-    # Start background Mimir health checks scheduler thread
-    # t2 = threading.Thread(target=mimir_scheduler_loop, daemon=True)
-    # t2.start()
+    # The Mimir and Dagur scheduler loops are deliberately not started here. Catalyst
+    # owns both schedules and now claims each tick with a compare-and-swap; running a
+    # second scheduler over the same rows from the console would race it, and before the
+    # claim existed it double-submitted jobs outright.
 
-    # Start background Dagur central task runner scheduler thread
-    # t3 = threading.Thread(target=dagur_scheduler_loop, daemon=True)
-    # t3.start()
-    
-    # Start background metrics and cluster monitor loop thread
-    t4 = threading.Thread(target=metrics_and_cluster_monitor_loop, daemon=True)
-    t4.start()
-
-    # Start background internal console token verifier socket server
-    t5 = threading.Thread(target=internal_token_verifier_loop, daemon=True)
-    t5.start()
-    
     # 1. Initialize self-signed SSL certificates for web traffic
     cert_file, key_file = init_ssl()
     

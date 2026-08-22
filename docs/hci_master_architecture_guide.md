@@ -652,7 +652,13 @@ CREATE TABLE IF NOT EXISTS hydra.vali_tasks (
 To keep the Spectrum container boundaries secure, Spectrum is not allowed to communicate directly with Vali. Instead, all actions are routed as follows:
 1. Spectrum calls the local `spark-daemon` on `127.0.0.1:9099` via mTLS.
 2. The local `spark-daemon` forwards the request locally to `vali` on `127.0.0.1:9095`.
-3. Vali queues the task in `hydra.vali_tasks` and polls the database for task completion, returning a synchronous response once processed.
+3. Vali executes the task and returns a synchronous response.
+
+> **`hydra.vali_tasks` is not the queue.** It is created and never written to. The
+> real dispatch queue is Catalyst's in-process `queue.Queue`, which is worth knowing
+> for a different reason: it does not survive a Catalyst restart, so a task accepted
+> and not yet run is lost rather than resumed. `valcli` still cleans `vali_tasks` and
+> `mcli` still checks it exists, which is why the table is kept rather than dropped.
 
 ```
 [ Spectrum Container ] 

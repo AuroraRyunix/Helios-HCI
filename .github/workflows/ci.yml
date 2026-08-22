@@ -1,0 +1,116 @@
+name: CI
+
+# The repo previously had no CI at all, and several defects reached the tree that a
+# compile or an import check would have caught: an IndentationError inside an embedded
+# script that broke cluster creation for months, a function called but never defined,
+# and a CRLF working tree that shipped carriage returns in every shebang, so no script
+# on any node could exec.
+#
+# Every job here is chosen to catch a failure that has actually happened.
+
+on:
+  push:
+    branches: [ main, "**" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  python:
+    name: Python (daemons, CLIs, deployment manifest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Byte-compile every root module
+        # provision.py alone is ~1.4MB of embedded base64; a syntax error here reaches
+        # every node at provisioning time.
+        run: python -m compileall -q $(git ls-files '*.py') mcli mcli-runner catcli nodetool allssh
+
+      # Discovery, not an enumerated list. The list silently lost coverage every time
+      # a test file was added and nobody remembered to name it here -- two suites were
+      # missing when this was changed. A test in test_deployment_manifest.py asserts
+      # this step never goes back to naming files.
+      - name: Unit tests
+        run: python -m unittest discover -p 'test_*.py' -v
+
+  elixir:
+    name: Elixir (spectrum_phx)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spectrum_phx
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: erlef/setup-beam@v1
+        with:
+          # Pinned to the versions the release image builds with
+          # (hexpm/elixir:1.17.3-erlang-27.1.2-alpine). A newer local toolchain has
+          # already masked one incompatibility: a regex modifier that compiled on 1.20
+          # but crashed the release at boot on 1.17.
+          elixir-version: "1.17.3"
+          otp-version: "27.1.2"
+
+      - name: Cache deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            spectrum_phx/deps
+            spectrum_phx/_build
+          key: mix-${{ runner.os }}-${{ hashFiles('spectrum_phx/mix.lock') }}
+          restore-keys: mix-${{ runner.os }}-
+
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors
+      - run: mix test
+
+      - name: Check formatting
+        run: mix format --check-formatted
+
+      - name: Audit dependencies for advisories
+        # decimal 2.4.1 shipped here with an unauthenticated DoS advisory.
+        run: mix hex.audit
+
+  rust:
+    name: Rust (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [agahnim, sidon, ganon]
+    defaults:
+      run:
+        working-directory: ${{ matrix.crate }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - run: cargo check --all-targets
+      # sidon and ganon carry the storage correctness suites -- journal replay after a
+      # torn write, overlay segment disjointness, checksum and misdirect detection, and
+      # the ack journal's legal-history rule. They gate every data-path change, so they
+      # run here rather than only on a node. agahnim has no tests to run yet, and
+      # `cargo test` on a crate without them is a pass that means nothing.
+      - name: Unit tests
+        if: matrix.crate != 'agahnim'
+        run: cargo test --all-targets
+
+  container:
+    name: Spectrum (Phoenix) image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the release image
+        # mix release does not evaluate runtime.exs, so only an actual image build catches
+        # boot-time configuration errors.
+        run: docker build -t spectrum-phx:ci spectrum_phx

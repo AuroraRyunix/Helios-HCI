@@ -97,7 +97,8 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 *   **Location:** `mipha.py` (lines 52–68)
 *   **The Issue:** When a DRBD resource enters `StandAlone` (due to split-brain data divergence), Mipha's auto-resolution check only triggers connection resets with `--discard-my-data` if the local node role is `Secondary`.
 *   **Impact:** If a network partition occurs while VMs are active on both nodes, both nodes will have promoted their local resources to `Primary`. Since both nodes report `role == "Primary"`, neither will match the resolution condition (`role != "Primary"`), leaving the DRBD volumes permanently stuck in `StandAlone` and replication suspended until manual operator intervention.
-*   **Recommendation:** Enhance `resolve_drbd_standalone` to check if a split-brain is active, determine which node has the latest writes (or let ZooKeeper designate the leader's storage as correct), force-demote the other node to `Secondary`, and run the connection reset.
+*   **Recommendation:** Enhance `resolve_drbd_standalone` to check if a split-brain is active, determine which node has the latest writes, force-demote the other node to `Secondary`, and run the connection reset.
+*   **Status (2026-08-17): RESOLVED — but note the correction below.** The parenthetical in the original recommendation ("or let ZooKeeper designate the leader's storage as correct") was implemented and **was itself a data-loss bug**, so it has been struck from the recommendation above. ZooKeeper leadership is a single cluster-wide property; "which node holds the authoritative copy" is a per-resource question. A node running a VM and holding `Primary` on that VM's disk would discard its own live writes purely because a different node happened to be the ZK leader, resyncing from a stale copy while qemu was still writing. `resolve_drbd_standalone` now decides per resource from DRBD role and device holders, and never discards on a resource whose device is in use — see [mipha_technical.md](./mipha_technical.md) for the full policy. Do not reintroduce a cluster-wide tiebreaker here.
 
 ### B. Blocking Sequential Linstor Command Hangs
 *   **Location:** `spectrum_server.py` (lines 265–287)
@@ -229,31 +230,44 @@ This document outlines critical issues, edge cases, and design bottlenecks ident
 
 ## 13. Proposed Mimir/Mcli Diagnostic Health Checks
 
-To proactively detect and surface the architectural gaps identified in this audit, Mimir's health checking system (`mcli-runner` / `mcli`) should be extended with the following diagnostic checks:
+To proactively detect and surface the architectural gaps identified in this audit, Mimir's health checking system (`mcli-runner` / `mcli`) should be extended with the following diagnostic checks.
+
+**Status: all but one are implemented.** Every check below carries a dotted entry in `mcli`'s `CHECK_ID_TO_FUNC`, which decides the partition of `hydra.mimir_results` its result lands in; a check missing from that map is written to the *invoked* scope's partition and then removed again by the legacy-partition cleanup in the same run. See [mimir.md](./mimir.md) for what each one reports and [mimir_technical.md](./mimir_technical.md) for how it decides.
 
 ### A. Core services checks (Category: `services`)
-1.  **ZooKeeper Ensemble Scale Check (`zookeeper_ring_scale`)**:
+1.  **ZooKeeper Ensemble Scale Check (`zookeeper_ring_scale`)** — *implemented*, `database.zookeeper.ring_scale`:
     *   **Logic**: Query the ZooKeeper server list configuration. If the number of voting nodes exceeds 5 or 7, trigger a warning recommending that secondary nodes be configured as ZK Observers.
-2.  **ScyllaDB 2-Node Quorum Check (`scylladb_quorum_safety`)**:
+2.  **ScyllaDB 2-Node Quorum Check (`scylladb_quorum_safety`)** — *implemented*, `database.scylladb.quorum_safety`:
     *   **Logic**: Query host counts and keyspace replication factor. If the cluster has exactly 2 nodes and SimpleStrategy replication is RF=2, verify database consistency level. If `QUORUM` is enforced, flag a critical warning indicating zero tolerance for node failure.
-3.  **mTLS Certificate Expiration Alert (`mtls_cert_expiry_warning`)**:
+3.  **mTLS Certificate Expiration Alert (`mtls_cert_expiry_warning`)** — *implemented*, `security.mtls.expiry_warning`:
     *   **Logic**: Parse CA, node, and client certificates (`/etc/hci/spark/certs/node.crt`) and compute the remaining lifetime. Flag a warning if the remaining lifetime is less than 30 days.
-4.  **Fencing SSH Keys & Out-of-Band Setup Check (`fencing_access_check`)**:
-    *   **Logic**: Verify that the dedicated fencing SSH key pair (`id_rsa_fencing`) exists on the host, that `/root/.ssh/authorized_keys` restricts execution to `/usr/local/bin/fence_node`, and that registered IPMI IP addresses are pingable.
-5.  **Service Watchdog Active Check (`watchdog_daemon_status`)**:
-    *   **Logic**: Query the status of Spark's background watchdog thread. Flag a failure if the watchdog loop has crashed or is not executing health probes.
+4.  **Fencing SSH Keys & Out-of-Band Setup Check (`fencing_access_check`)** — **not implemented, deliberately**:
+    *   **Logic as proposed**: Verify that the dedicated fencing SSH key pair (`id_rsa_fencing`) exists on the host, that `/root/.ssh/authorized_keys` restricts execution to `/usr/local/bin/fence_node`, and that registered IPMI IP addresses are pingable.
+    *   **Why it was not built**: none of the three artifacts it inspects exists, and none of them is what the fencing work now underway uses. There is no `id_rsa_fencing` and no `fence_node` executable anywhere in the product, and no `authorized_keys` restriction to pin. Fencing is being built in `mipha.py` around a different mechanism entirely — a `/etc/hci/fencing.json` holding BMC entries, driven through `ipmitool` as one rung of a `self` / `spark` / `bmc` / `storage-quorum` ladder, with its own preflight report. A check written to the proposal above would inspect files that will never exist on any node, FAIL permanently, and be read as noise within a week — after which the checks beside it start being read as noise too.
+    *   **Blocked on**: the fencing work in sections 2A and 12 landing. Once `/etc/hci/fencing.json` is committed, a `fencing_access_check` becomes worth writing, and the version to write then verifies the path that actually exists end to end — that `ipmitool` is installed, that each host has a BMC entry with a readable `password_file` at mode 600, and that each configured BMC answers a `chassis power status` — rather than re-deriving mipha's own preflight from the outside. Writing it against a config shape that is still in flight would only produce a check that has to be rewritten with it.
+5.  **Service Watchdog Active Check (`watchdog_daemon_status`)** — *implemented*, `service.spark.watchdog`:
+    *   **Logic as proposed**: Query the status of Spark's background watchdog thread. Flag a failure if the watchdog loop has crashed or is not executing health probes.
+    *   **Logic as built**: there is no status to query — the loop publishes no heartbeat, no state file and no endpoint, and spark-daemon keeps answering its mTLS API whether or not the thread is alive. The check therefore infers the loop from three things it cannot fake: its preconditions (the thread returns permanently, without retrying, if `/etc/hci/cluster.json` is missing or `/run/hci/cluster_operation.lock` is held when it starts), its own startup announcement in the journal *where the journal still covers the daemon's startup*, and its effect (a unit it supervises that has been down for more than three of its 30-second passes while ZooKeeper reports the cluster started). The middle one is treated as inconclusive after log rotation rather than as proof of absence.
+    *   The effect test is the only way to catch a loop that is wedged rather than dead: its `systemctl start` and `podman` calls carry no timeout, so one hung call stops the thread forever without raising anything.
 
 ### B. Storage engine checks (Category: `storage`)
-1.  **DRBD Split-Brain Dual-Primary Check (`drbd_split_brain_check`)**:
-    *   **Logic**: Parse `drbdsetup status --json`. If any replication volumes are in `StandAlone` state while their roles are both `Primary`, trigger a critical failure alarm.
-2.  **Linstor Controller Query Latency Check (`linstor_latency_check`)**:
-    *   **Logic**: Execute a lightweight Linstor CLI query (e.g., `linstor node list`) and measure the execution time. If it exceeds 5 seconds, flag a latency warning indicating a possible database blocking hang or offline node.
+1.  **DRBD Split-Brain Dual-Primary Check (`drbd_split_brain_check`)** — *implemented*, `storage.drbd.split_brain`:
+    *   **Logic**: Parse `drbdsetup status --json`. If any replication volumes are in `StandAlone` state while their roles are both `Primary`, trigger a critical failure alarm. As built it reports every `StandAlone` connection, not only the dual-Primary case: replication that has stopped may have diverged whichever roles the two sides hold.
+2.  **Linstor Controller Query Latency Check (`linstor_latency_check`)** — *implemented*, `storage.linstor.latency`:
+    *   **Logic**: Execute a lightweight Linstor CLI query (e.g., `linstor node list`) and measure the execution time. If it exceeds 5 seconds, flag a latency warning indicating a possible database blocking hang or offline node. FAIL above 20 seconds or on no answer within 60. The `podman exec` round trip into `systemd-aether` is timed separately and subtracted in the message, so container overhead on a loaded host does not read as controller latency.
 
 ### C. Scheduler & DRS checks (Category: `drs`)
-1.  **DRS Storage Capacity Gate Check (`drs_storage_capacity_check`)**:
-    *   **Logic**: Verify that Vali's DRS balancer checks Linstor thin pool storage capacity before initiating migrations, alerting if DRS is running without storage capacity validation.
-2.  **Concurrent Migration Lock Auditor (`migration_lock_status`)**:
-    *   **Logic**: Audit the ScyllaDB active VM tables to ensure that no live migrations are running concurrently without corresponding locks, flagging collisions.
+
+`mcli`'s category argument is an *invocation scope* — `services`, `storage`, `hardware` — and both web consoles group results by hardcoded per-scope check-name lists derived from it. Adding a fourth scope for two checks would require matching changes in `spectrum_server.py` and `spectrum_phx`. Both checks are therefore run by the `services` scope and stored under dotted `service.vali.*` categories, which is what actually decides their partition.
+
+1.  **DRS Storage Capacity Gate Check (`drs_storage_capacity_check`)** — *implemented*, `service.vali.drs_storage_gate`:
+    *   **Logic as proposed**: Verify that Vali's DRS balancer checks Linstor thin pool storage capacity before initiating migrations, alerting if DRS is running without storage capacity validation.
+    *   **Logic as built**: the gate now exists (`vali.py`, in the migrate task handler), so the proposal as written asks a question about source code whose answer is a fixed "yes". The runtime question is whether the gate can *answer*, and on the reference cluster it cannot: `get_linstor_free_space()` parses the human storage-pool table looking for a field containing `/`, finds `vg_aether/thin_pool_aether` before it reaches the capacity columns, and falls through to a hard-coded `999999` MiB. That is larger than any single VM disk, so an unparseable listing does not make the gate refuse — it makes the gate approve everything.
+    *   The check calls `vali.get_linstor_free_space()` itself, by importing the deployed `vali`, and compares its answer against the free capacity `linstor -m storage-pool list` reports for this node's backing pools. A private copy of vali's parser would keep reporting the gate broken after it was fixed, and would keep reporting it healthy if it broke in a new way. It then checks the pool has real headroom and reports thin-pool over-commitment.
+    *   **Still open in `vali.py`** (not in this change's scope): `get_linstor_free_space()` and `get_vm_disk_size()` both fail open — one returns `999999` MiB free, the other `51200` MiB needed — so a failure to read either side lets the migration through. Both should return "unknown" and make the gate refuse.
+2.  **Concurrent Migration Lock Auditor (`migration_lock_status`)** — *implemented*, `service.vali.migration_locks`:
+    *   **Logic**: Audit `hydra.vms.status` — the per-VM migration lock taken by daruk's `migrate-lock` LWT — against the migrations that are actually running. A lock held with no migration task in flight is orphaned and refuses every later migration *and* every delete of that VM until it is cleared; the message names the `migrate-unlock` call that clears it. A live migration running on this host while the lock is *not* held is the dangerous direction, and it is only visible by asking libvirt (`virsh domjobinfo`) what it is doing rather than asking the database.
+    *   `hydra.catalyst_tasks` is scanned only when a VM claims a migration or libvirt reports one. It is a full partition scan of a table with a 30-day retention, and running one hourly on every node to confirm that nothing is migrating is the unbounded read this codebase has removed elsewhere.
 
 ---
 

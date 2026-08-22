@@ -72,7 +72,44 @@ Safely quiesce active virtual machines, unmount the filesystems, and put the ser
 cluster stop
 ```
 
-### E. Cluster Destruction (`cluster destroy`)
+### E. Ring Inspection (`cluster ring`)
+Print the ScyllaDB (Hydra) ring beside the cluster's own membership. The two are separate
+records and drift apart silently — a node marked `DOWN` in `hydra.nodes` is still a ring
+member holding replicas, and a ring member with no `hydra.nodes` row is a node the cluster
+has forgotten but `QUORUM` has not.
+```bash
+cluster ring
+```
+Shows the keyspace replication factor, what `QUORUM` therefore requires, each member's
+up/normal state and host ID, and which side of the two memberships each host is on.
+
+### F. Node Decommission (`cluster decommission`)
+Preflight and plan the permanent removal of a node from the ring. Prints the ordered
+sequence and refuses when the destructive step would be unsafe. It never runs
+`nodetool decommission` or `nodetool removenode` itself — those stream data, run
+unbounded, and cannot be undone.
+```bash
+# Check and print the sequence
+cluster decommission --node 10.10.102.223
+
+# Bookkeeping only, after the node is genuinely out of the ring:
+# rewrites cluster.json on the survivors and deletes the hydra.nodes row
+cluster decommission --node 10.10.102.223 --finalize
+```
+
+### G. Node Rejoin (`cluster rejoin`)
+Preflight and plan bringing a node back. Checks that a previously decommissioned node has
+had its ScyllaDB data wiped — rejoining with it resurrects rows deleted while the node was
+away — and restores its cluster metadata.
+```bash
+cluster rejoin --node 10.10.102.223
+cluster rejoin --node 10.10.102.223 --finalize
+```
+
+Both sequences, and the quorum gate that governs maintenance mode, are documented in
+[ring_lifecycle.md](./ring_lifecycle.md).
+
+### H. Cluster Destruction (`cluster destroy`)
 Wipe all databases, clear claimed disks, remove configuration parameters, and reset the hypervisor hosts to factory default.
 ```bash
 # WARNING: Wipes all VM disks, metadata tables, and system configurations permanently
@@ -93,6 +130,15 @@ cluster destroy
 * **Host Crash Detection**: The active Mipha leader polls all cluster nodes every 10 seconds using both network pings (ICMP) and the Spark mTLS API (`9099`). If a host is unreachable on both paths for 3 consecutive polls (30 seconds), it is marked as `DOWN` in ScyllaDB.
 * **Automatic Failover & Restart**: Mipha queries ScyllaDB for all virtual machines registered to the failed node, resets their database state, and submits automatic start tasks to the Catalyst task queue.
 * **Optimal Scheduling**: The **Vali** scheduler picks up the tasks and immediately schedules the VMs to boot on the healthiest remaining hosts based on available RAM and DRS rules, restoring VM availability automatically.
+
+### C. Maintenance Mode and Quorum
+Entering maintenance mode stops the host's `hydra-db` along with everything else, so it is
+refused when the remaining ScyllaDB replicas could not form a quorum without it — derived
+from the keyspace's actual replication factor and the actual ring, not assumed. Only one
+host may transition at a time, enforced by a single-row lock in `hydra.cluster_locks` with
+a holder token and a TTL rather than by a scan of node rows. A single-node cluster can
+never enter maintenance mode; `cluster stop` is the operation for quiescing one. See
+[ring_lifecycle.md](./ring_lifecycle.md).
 
 ---
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import sys
 import os
+import re
 import json
 import time
 import socket
+import urllib.error
 import urllib.request
 import ssl
 import threading
@@ -26,11 +28,32 @@ try:
 except Exception:
     pass
 
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and nothing else, so a
+    connection can only be tied to the node answering it when it is addressed by that
+    same IP. Verification used to be off everywhere, which meant any certificate the
+    cluster CA ever signed -- every node's own included -- satisfied a connection to any
+    other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing the call, since a loopback connection
+    cannot be answered by another node in the first place.
+    """
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP, True
+        return ip, False
+    return ip, True
+
 def run_remote_spark(ip, command):
+    ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
-    
+    context.check_hostname = verify_identity
+
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -41,7 +64,89 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
+DARUK_URL = "http://127.0.0.1:9043"
+
+
+class ConditionalStatementError(RuntimeError):
+    """A compare-and-swap was handed to the query path, which cannot report one."""
+
+
+def _cql_outside_string_literals(cql_query):
+    """The statement with every single-quoted literal blanked out.
+
+    Job output, task error messages and operator-supplied commands all end up inside CQL
+    literals here, and any of them can contain the word "if". Searching the raw text for
+    the keyword would refuse an ordinary INSERT because a job Dagur ran happened to print
+    "check if the volume is mounted". A doubled quote ('') is an escaped quote inside a
+    literal, not the end of one.
+    """
+    out = []
+    index = 0
+    length = len(cql_query)
+    while index < length:
+        char = cql_query[index]
+        if char != "'":
+            out.append(char)
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if cql_query[index] == "'":
+                if index + 1 < length and cql_query[index + 1] == "'":
+                    index += 2
+                    continue
+                index += 1
+                break
+            index += 1
+        out.append("''")
+    return "".join(out)
+
+
+# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
+# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
+# caller needs.
+_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
+
+
+def is_conditional_cql(cql_query):
+    """True when the statement is a lightweight transaction rather than a plain write."""
+    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
+
+
 def run_cql_query(cql_query, *args, **kwargs):
+    """Run a statement whose only interesting outcome is "did it execute".
+
+    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
+    *rejected* lightweight transaction as its row of values joined by spaces --
+
+        False 10.10.102.41
+
+    -- and returns rc=0, which is indistinguishable from a successful write, so every
+    caller that used this function for a compare-and-swap was treating lost races as wins.
+    The refusal is here rather than in a review comment because the bug comes back the
+    moment somebody appends "IF ..." to an existing call and the tests still pass.
+
+    Conditional writes belong on one of Daruk's typed /v1/... endpoints; see run_lwt().
+    """
+    if is_conditional_cql(cql_query):
+        raise ConditionalStatementError(
+            "a conditional statement cannot be run through run_cql_query(): its result "
+            "cannot say whether the condition held. Use a Daruk /v1/... endpoint via "
+            "run_lwt(), or run_conditional_cql_query() if the caller reads the [applied] "
+            f"verdict itself. Statement: {' '.join(cql_query.split())[:200]}")
+    return run_conditional_cql_query(cql_query)
+
+
+def run_conditional_cql_query(cql_query, *args, **kwargs):
+    """run_cql_query without the conditional-statement guard.
+
+    The only legitimate caller is one that reads the `[applied]` verdict out of stdout
+    itself. helios_schema does: its schema lock is taken with IF NOT EXISTS and released
+    with IF holder = ?, and it parses the verdict positionally through `lwt_applied()`,
+    including Daruk's space-joined shape. That lock cannot move to a typed endpoint
+    because it runs *before* the schema exists -- Daruk would need an operation table
+    entry for a table nothing has created yet.
+    """
     import urllib.request
     import json
     try:
@@ -84,6 +189,42 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+
+
+def run_lwt(endpoint, params, timeout=15):
+    """Call one of Daruk's typed compare-and-swap endpoints.
+
+    Returns `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure: Daruk unreachable, a malformed request, a
+    database error. A compare-and-swap that was *refused* is `(True, False, {...}, "")` --
+    a lost race, not a failure. `current` carries the values that beat it, so the caller
+    can say which scheduler already claimed the tick rather than "the update failed".
+
+    There is deliberately no cqlsh fallback. That fallback keeps services working while
+    Daruk is down, but it can only run statement text and cannot report whether a
+    condition held; a claim that cannot be made conditional must not be made at all --
+    running the job twice is worse than not running it this tick.
+    """
+    try:
+        req = urllib.request.Request(
+            f"{DARUK_URL}{endpoint}",
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", f"HTTP {e.code}")
+        except Exception:
+            return False, False, {}, f"HTTP {e.code}"
+    except Exception as e:
+        return False, False, {}, f"Daruk is not answering on {DARUK_URL}: {e}"
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
+
+
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
     ips = []
@@ -146,21 +287,51 @@ def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
 # Initialize Database Schema
-def init_db_schema():
-    tasks_table = """
-    CREATE TABLE IF NOT EXISTS hydra.catalyst_tasks (
-        task_id uuid PRIMARY KEY,
-        service text,
-        action text,
-        status text,
-        payload text,
-        progress int,
-        error_msg text,
-        created_at timestamp,
-        updated_at timestamp
-    );
+def load_schema_module():
+    """Import the ordered cluster schema, wherever this process is running from.
+
+    On a host it sits in /usr/local/bin beside this file; inside the Spectrum container
+    it is copied to /app. Neither location is importable by name from the other.
     """
-    run_cql_query(tasks_table)
+    try:
+        import helios_schema
+        return helios_schema
+    except ImportError:
+        pass
+    import importlib.util
+    import os as _os
+    for candidate in ("/usr/local/bin/helios_schema.py",
+                      _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                    "helios_schema.py")):
+        if not _os.path.exists(candidate):
+            continue
+        spec = importlib.util.spec_from_file_location("helios_schema", candidate)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError(
+        "helios_schema.py was not found. The cluster schema cannot be applied without "
+        "it; reinstall the Helios components.")
+
+
+def init_db_schema():
+    """Apply the cluster schema, which is shared and no longer this daemon's to define.
+
+    hydra.catalyst_tasks used to be created here. It now lives in helios_schema with
+    every other table, so two daemon versions cannot race to define it differently --
+    the loser's CREATE TABLE IF NOT EXISTS is a silent no-op and it never finds out.
+
+    Every daemon calls this. Applying happens behind a cluster lock, so concurrent
+    starts are safe and no daemon depends on another having run first.
+
+    The unguarded executor is handed over deliberately: the schema lock is an
+    IF NOT EXISTS insert and a conditional delete, and helios_schema reads the [applied]
+    verdict itself. It is the one caller allowed to run a conditional statement through
+    the text path.
+    """
+    applied = load_schema_module().ensure_schema(run_conditional_cql_query, node_id=LOCAL_IP)
+    if applied:
+        print(f"[Catalyst] Applied schema migrations: {', '.join(applied)}")
 
 # In-Memory Event Queues & Completion Sync
 queues = {
@@ -179,6 +350,39 @@ def submit_task_to_memory(service, task_data):
         task_id = task_data["task_id"]
         with lock:
             task_events[task_id] = threading.Event()
+
+def claim_scheduled_run(job_name, expected_last_run, now):
+    """Take this tick of `job_name`, or report that somebody else already has it.
+
+    The scheduler's clock is its lock. Reading `last_run_epoch`, deciding the job is due
+    and writing the time back is a read-modify-write, and blind it submits the job once
+    per scheduler that reaches the row -- two Dagur runs of the same backup, the same
+    scrub, the same compaction, against the same volumes at the same moment.
+
+    Two schedulers is not a hypothetical: is_zookeeper_leader() probes ZooKeeper's
+    four-letter `stat` and, when the leader does not answer on 9091, falls back to "lowest
+    node with 9091 open". A ZooKeeper that is slow, restarting or partitioned hands that
+    answer to two nodes at once, and both then believe they are the only scheduler.
+
+    Conditioning the clock write on the value that was read makes the claim and the clock
+    one Paxos round, so exactly one caller proceeds. Returning False on a Daruk failure is
+    the safe direction: a tick that is skipped runs on the next pass ten seconds later,
+    and a tick that is run twice cannot be taken back.
+    """
+    ok, applied, current, error = run_lwt("/v1/schedule/claim-job", {
+        "job_name": job_name,
+        "last_run_epoch": now,
+        "expected_last_run_epoch": expected_last_run,
+    })
+    if not ok:
+        print(f"[Scheduler] Could not claim '{job_name}': {error}. Skipping this tick.")
+        return False
+    if not applied:
+        print(f"[Scheduler] Job '{job_name}' was already claimed for this interval "
+              f"(last_run_epoch is now {current.get('last_run_epoch')}). Skipping.")
+        return False
+    return True
+
 
 # Scheduler Thread: reads hydra.dagur_schedules and submits execution tasks to Dagur
 def scheduler_thread_loop():
@@ -203,19 +407,30 @@ def scheduler_thread_loop():
                     for s in schedules:
                         if s.get("enabled", False):
                             name = s.get("job_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = s.get("interval_seconds", 3600)
+                            # The value as the row holds it, nulls included, because that
+                            # is what the compare-and-swap has to condition on. `.get(k, 0)`
+                            # returns None for a column that exists and is null, so the
+                            # arithmetic below needs its own coercion -- and used to raise
+                            # TypeError on such a row, which the loop's except swallowed
+                            # and which cost every *other* schedule that pass.
+                            last_run_recorded = s.get("last_run_epoch")
+                            last_run = last_run_recorded if isinstance(last_run_recorded, int) else 0
+                            interval = s.get("interval_seconds") or 3600
                             command = s.get("command", "")
-                            
+
                             if name in local_last_run and now - local_last_run[name] < interval:
                                 continue
-                                
+
                             if now - last_run >= interval:
+                                # Claim the tick before doing anything with it. A refused
+                                # claim means another scheduler got there first and is
+                                # already submitting this job.
+                                if not claim_scheduled_run(name, last_run_recorded, now):
+                                    continue
+
                                 print(f"[Scheduler] Triggering Dagur job: {name}...")
                                 local_last_run[name] = now
-                                cql_update = f"UPDATE hydra.dagur_schedules SET last_run_epoch = {now} WHERE job_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
+
                                 task_id = str(uuid.uuid4())
                                 now_ms = int(time.time() * 1000)
                                 payload = json.dumps({"job_name": name, "command": command})
@@ -238,7 +453,23 @@ def scheduler_thread_loop():
 class CatalystAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass # Prevent console clutter
-        
+
+    def setup(self):
+        """Complete the TLS handshake in the worker thread.
+
+        Same shape as spark-daemon's handler. Doing it here rather than by wrapping the
+        listening socket means one slow or hostile client cannot stall every other
+        connection during its handshake.
+        """
+        self.connection = self.server.ssl_context.wrap_socket(self.request, server_side=True)
+        if self.timeout is not None:
+            self.connection.settimeout(self.timeout)
+        if self.disable_nagle_algorithm:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        self.rfile = self.connection.makefile("rb", self.rbufsize)
+        self.wfile = self.connection.makefile("wb", self.wbufsize)
+
+
     def send_json(self, status, data):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -443,9 +674,34 @@ def main():
     t = threading.Thread(target=scheduler_thread_loop, daemon=True)
     t.start()
     
+    # Mutual TLS, against the same cluster CA every other inter-node call uses.
+    #
+    # This API dispatched cluster work -- VM start, stop, migrate -- to anything that
+    # could open a socket to port 9091. It bound 0.0.0.0 under Network=host and checked
+    # neither a credential nor a source address, so on any network the cluster could
+    # reach, it was an unauthenticated remote-control interface for every guest.
+    #
+    # CERT_REQUIRED is what closes it: a caller must present a certificate this cluster's
+    # CA signed, which means a node, and the handshake fails before a request line is
+    # ever parsed.
+    ca_cert = "/etc/hci/spark/certs/ca.crt"
+    node_cert = "/etc/hci/spark/certs/node.crt"
+    node_key = "/etc/hci/spark/certs/node.key"
+    for path in (ca_cert, node_cert, node_key):
+        if not os.path.exists(path):
+            print(f"[ERROR] Catalyst cannot start without {path}. The API would otherwise "
+                  f"listen without authentication.")
+            sys.exit(1)
+
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile=node_cert, keyfile=node_key)
+    ssl_context.load_verify_locations(cafile=ca_cert)
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+
     server_address = ("0.0.0.0", 9091)
     httpd = ThreadingHTTPServer(server_address, CatalystAPIHandler)
-    print("Catalyst API listening on port 9091")
+    httpd.ssl_context = ssl_context
+    print("Catalyst API listening on port 9091 (mutual TLS)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

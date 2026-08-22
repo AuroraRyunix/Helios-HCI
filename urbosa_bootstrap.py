@@ -67,10 +67,31 @@ def run_cql_query(cql_query, *args, **kwargs):
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = p.communicate()
         return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
+def spark_endpoint(ip):
+    """Return (address, verify_identity) for an mTLS call to a spark-daemon.
+
+    Node certificates carry `subjectAltName = IP:<node ip>`, so a connection can only be
+    tied to the node answering it when it is addressed by that same IP. Verification used
+    to be off here, which meant any certificate the cluster CA ever signed -- every node's
+    own included -- satisfied a connection to any other node.
+
+    Loopback is in no node's SAN. spark-daemon binds 0.0.0.0:9099, so this node's own
+    address reaches the same listener and does verify; where that address is unknown the
+    identity check is dropped rather than failing a call that cannot leave the machine.
+    """
+    local = globals().get("LOCAL_IP")
+    if ip in ("127.0.0.1", "::1", "localhost"):
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local, True
+        return ip, False
+    return ip, True
+
+
 def run_remote_spark(ip, command):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = False
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
     
     url = f"https://{ip}:9099/api/v1/execute"
     data = json.dumps({"command": command}).encode("utf-8")
@@ -107,28 +128,43 @@ def main():
                     except Exception:
                         pass
         
-        # Build iptables cleanup commands
-        iptables_cleanup = []
+        # Build iptables cleanup commands.
+        #
+        # urbosa.py manages its rules inside a dedicated URBOSA-FWD chain that it
+        # flushes and rebuilds each pass, with a single jump installed from FORWARD.
+        # Tearing that down is therefore chain-scoped and does not depend on
+        # reconstructing each rule's exact spec from the database -- which also means
+        # cleanup no longer silently misses rules whose DB rows were already deleted.
+        #
+        # The legacy per-rule deletes against FORWARD are kept as a second step so a
+        # host provisioned before the chain existed is still cleaned up on downgrade.
+        iptables_cleanup = [
+            "while iptables -C FORWARD -j URBOSA-FWD 2>/dev/null; do "
+            "  iptables -D FORWARD -j URBOSA-FWD || break; "
+            "done",
+            "iptables -F URBOSA-FWD 2>/dev/null || true",
+            "iptables -X URBOSA-FWD 2>/dev/null || true",
+        ]
         for rule in fw_rules:
             src = rule.get("source_ip", "ANY")
             dst = rule.get("dest_ip", "ANY")
             proto = rule.get("protocol", "ANY")
             port = rule.get("port", 0)
             act = rule.get("action", "ALLOW")
-            
+
             rule_action = "-j ACCEPT" if act == "ALLOW" else "-j DROP"
             rule_proto = "" if proto == "ANY" else f"-p {proto.lower()}"
             rule_port = "" if (port == 0 or proto == "ANY") else f"--dport {port}"
             rule_src = "" if src == "ANY" else f"-s {src}"
             rule_dst = "" if dst == "ANY" else f"-d {dst}"
-            
+
             iptables_cleanup.append(
                 f"while iptables -C FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action} 2>/dev/null; do "
                 f"  iptables -D FORWARD {rule_src} {rule_dst} {rule_proto} {rule_port} {rule_action} || break; "
                 f"done"
             )
-        
-        iptables_cmd_str = " && ".join(iptables_cleanup) if iptables_cleanup else "true"
+
+        iptables_cmd_str = " ; ".join(iptables_cleanup) if iptables_cleanup else "true"
         
         # 2. Iterate hosts to clean up namespaces, processes, links, and firewall rules
         for ip in hosts:
@@ -142,8 +178,13 @@ def main():
                 "    ip netns del \"$ns\" || true; "
                 "  fi; "
                 "done && "
+                # Every link family Urbosa creates in the ROOT namespace. The
+                # halves that live inside namespaces go with the namespaces
+                # above; these do not, and deleting only br-ov-* and vxlan-*
+                # left the veths and macvlans behind on every teardown.
                 "for link in $(ip -o link show | awk -F': ' '{print $2}' | cut -d'@' -f1); do "
-                "  if [[ \"$link\" =~ ^br-ov- || \"$link\" =~ ^vxlan- ]]; then "
+                "  if [[ \"$link\" =~ ^br-ov- || \"$link\" =~ ^vxlan- || \"$link\" =~ ^veth-ov- "
+                "     || \"$link\" =~ ^mv-t0- || \"$link\" =~ ^t0-[0-9a-f]{8}$ || \"$link\" =~ ^t1-[0-9a-f]{8}$ ]]; then "
                 "    ip link del \"$link\" || true; "
                 "  fi; "
                 "done && "
@@ -160,6 +201,11 @@ def main():
         run_cql_query("TRUNCATE hydra.urbosa_t1_routers;")
         run_cql_query("TRUNCATE hydra.urbosa_segments;")
         run_cql_query("TRUNCATE hydra.urbosa_firewall_rules;")
+        # Transit /30 reservations. Leaving these behind would hand the next
+        # generation of routers a pool that is fully allocated to routers that no
+        # longer exist. Not fatal - urbosa reclaims orphaned reservations on its
+        # own - but a teardown should not need a follow-up.
+        run_cql_query("TRUNCATE hydra.urbosa_transit_pool;")
         print("Urbosa cleanup completed successfully.")
         return
 

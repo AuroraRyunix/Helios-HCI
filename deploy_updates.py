@@ -10,6 +10,43 @@ def put_text_file(sftp, local_path, remote_path):
     with sftp.open(remote_path, "wb") as f_remote:
         f_remote.write(content.encode("utf-8"))
 
+# Blindly accepting unknown host keys (paramiko.AutoAddPolicy) means every rollout
+# re-trusts whatever currently answers on the node IP -- and what this script pushes
+# is root-executed code, so a MITM here owns the whole cluster. Verify against
+# known_hosts by default; set HELIOS_SSH_TRUST_NEW_HOSTS=1 only for first contact on
+# a trusted provisioning network (provision.py seeds /root/.ssh/known_hosts).
+trust_new_hosts = os.environ.get("HELIOS_SSH_TRUST_NEW_HOSTS", "").strip().lower() in ("1", "true", "yes")
+
+def new_ssh_client():
+    client = paramiko.SSHClient()
+    try:
+        client.load_system_host_keys()
+    except Exception:
+        pass
+    user_known_hosts = os.path.expanduser("~/.ssh/known_hosts")
+    if os.path.exists(user_known_hosts):
+        try:
+            client.load_host_keys(user_known_hosts)
+        except Exception as e:
+            print(f"Warning: could not read {user_known_hosts}: {e}")
+    if trust_new_hosts:
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    else:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    return client
+
+def explain_host_key_failure(ip, err):
+    if isinstance(err, paramiko.BadHostKeyException):
+        print(f"[{ip}] HOST KEY MISMATCH -- the key presented does not match known_hosts.")
+        print(f"[{ip}] Refusing to push root-executed code. Investigate before retrying.")
+        return True
+    if isinstance(err, paramiko.SSHException) and "not found in known_hosts" in str(err):
+        print(f"[{ip}] Host key is not in known_hosts, so it cannot be verified.")
+        print(f"[{ip}] Add it with: ssh-keyscan -H {ip} >> ~/.ssh/known_hosts")
+        print(f"[{ip}] Or, for first contact on a trusted network, re-run with HELIOS_SSH_TRUST_NEW_HOSTS=1")
+        return True
+    return False
+
 nodes_env = os.environ.get("HELIOS_NODES")
 if nodes_env:
     nodes = [ip.strip() for ip in nodes_env.split(",") if ip.strip()]
@@ -39,8 +76,7 @@ shared_cert = None
 shared_key = None
 
 print("=== Ensuring a single shared SSL certificate exists on Node 1 ===")
-ssh_cert = paramiko.SSHClient()
-ssh_cert.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+ssh_cert = new_ssh_client()
 try:
     key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
     if os.path.exists(key_path):
@@ -69,13 +105,19 @@ try:
     sftp_cert.close()
     print("=== Shared SSL certificate loaded successfully ===")
 except Exception as e:
-    print(f"Error ensuring shared SSL certificate: {e}")
+    if not explain_host_key_failure(nodes[0], e):
+        print(f"Error ensuring shared SSL certificate: {e}")
 finally:
     ssh_cert.close()
 
 local_spark = "spark.py"
 local_cluster = "cluster_new.py"
 local_daemon = "spark_daemon_decoded.py"
+local_helios_zk = "helios_zk.py"
+local_helios_sig = "helios_sig.py"
+local_impa = "impa.py"
+local_helios_schema = "helios_schema.py"
+local_saga = "saga.py"
 local_bifrost = "bifrost.py"
 local_valcli = "valcli.py"
 local_mcli = "mcli"
@@ -96,23 +138,87 @@ local_yggdrasil = "hylia.py"
 local_check_updates = "check_updates.py"
 local_nodetool = "nodetool"
 
+# The release public key check-updates verifies signed releases against. provision.py
+# pins it when a node is built; a node built before update signing existed has none at
+# all, and without one every update check fails closed. A rollout can therefore seed
+# it, over the same host-key-verified session that writes root-executed code into
+# /usr/local/bin -- and only ever the public half.
+RELEASE_PUBKEY_REMOTE_PATH = "/etc/hci/keys/release_ed25519.pub"
+
+release_pubkey_path = os.environ.get("HELIOS_RELEASE_PUBKEY", "").strip()
+if not release_pubkey_path:
+    for candidate in ("release_ed25519.pub", os.path.expanduser("~/.helios/release_ed25519.pub")):
+        if os.path.exists(candidate):
+            release_pubkey_path = candidate
+            break
+
+release_pubkey_pem = None
+if release_pubkey_path and os.path.exists(release_pubkey_path):
+    with open(release_pubkey_path, "r", encoding="utf-8", errors="ignore") as f_relkey:
+        release_pubkey_pem = f_relkey.read().replace("\r\n", "\n")
+    # Pointing this at the signing key instead of its public half would copy the one
+    # secret the whole scheme depends on onto every node in the fleet.
+    if "PRIVATE KEY" in release_pubkey_pem:
+        print(f"Error: {release_pubkey_path} contains a PRIVATE key. Only the public half may be")
+        print("       distributed; the signing key never leaves the release workstation.")
+        sys.exit(1)
+    if "BEGIN PUBLIC KEY" not in release_pubkey_pem:
+        print(f"Error: {release_pubkey_path} is not a PEM public key.")
+        sys.exit(1)
+    print(f"=== Release public key {release_pubkey_path} will be pinned at {RELEASE_PUBKEY_REMOTE_PATH} ===")
+else:
+    print("=== No release public key found locally; nodes keep whatever provision.py pinned ===")
+    print("    Update checks fail closed on a node with no pinned key. Set HELIOS_RELEASE_PUBKEY")
+    print("    to the public half of the release signing key to pin it during this rollout.")
+
 local_dir = "."
 local_server = os.path.join(local_dir, "spectrum_server.py")
 local_dockerfile = os.path.join(local_dir, "Dockerfile")
 local_static_dir = os.path.join(local_dir, "static")
 
+# Third-party image references, and the registry override that makes an air-gapped or
+# mirrored site possible. Kept in step with provision.py's IMAGES catalogue -- these
+# quadlet bodies are a second copy of the ones there, and a rolling update that wrote a
+# different image than provisioning did would silently downgrade a service.
+IMAGES = {
+    "aether": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
+    "linstor-controller": "quay.io/piraeusdatastore/piraeus-server:v1.31.0",
+    "slate": "docker.io/library/traefik:v2.10",
+}
+
+REGISTRY = (os.environ.get("HELIOS_REGISTRY") or "").strip()
+
+
+def resolve_image(name):
+    """The image reference for a component, with any registry override applied.
+
+    Replaces the registry host and keeps the repository path, which is what a mirror or
+    pull-through cache expects. Same rule as provision.py's resolver.
+    """
+    reference = IMAGES[name]
+    if not REGISTRY:
+        return reference
+    head, _, rest = reference.partition("/")
+    if "." in head or ":" in head or head == "localhost":
+        return REGISTRY.rstrip("/") + "/" + rest
+    return REGISTRY.rstrip("/") + "/" + reference
+
+
 logos_service_content = """[Unit]
 Description=Logos Distributed Metrics Service
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/proc:/host/proc:ro
-Volume=/sys:/host/sys:ro
-Exec=/usr/local/bin/logos
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/logos
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -121,14 +227,18 @@ WantedBy=multi-user.target
 gatoway_service_content = """[Unit]
 Description=Gatoway L2 Network Sync Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/gatoway
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gatoway
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -137,14 +247,18 @@ WantedBy=multi-user.target
 urbosa_service_content = """[Unit]
 Description=Urbosa SDN Logical Router and Overlay Orchestrator
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/urbosa
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/urbosa
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
@@ -153,112 +267,134 @@ WantedBy=multi-user.target
 mipha_service_content = """[Unit]
 Description=Mipha HA Cluster Monitor Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/dev:/dev:shared
-Volume=/var/run:/var/run:shared
-Volume=/run/systemd/system:/run/systemd/system:ro
-Exec=/usr/local/bin/mipha
-AddCapability=CAP_SYS_ADMIN
-AddCapability=CAP_SYS_RAWIO
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mipha
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 yggdrasil_service_content = """[Unit]
-Description=Hylia HA Life Cycle Management Daemon
+Description=Hylia Rolling Upgrade and Life Cycle Manager
 After=zookeeper.service
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
-Volume=/:/host:rw
-Exec=/usr/local/bin/hylia
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hylia
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 dagur_service_content = """[Unit]
-Description=Dagur Task Scheduler Daemon
+Description=Dagur HA Task Scheduler Service
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/dagur
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dagur
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 mimir_service_content = """[Unit]
-Description=Mimir Health Checker Daemon
+Description=Mimir Health Check and Diagnostics Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/mimir
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mimir
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 vali_service_content = """[Unit]
-Description=Vali VM Placement and DRS Daemon
+Description=Vali Audit Log and Compliance Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
-Exec=/usr/local/bin/vali
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vali
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 catalyst_service_content = """[Unit]
-Description=Catalyst Task Management Service
+Description=Catalyst API Gateway Daemon
 After=zookeeper.service
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/catalyst
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/catalyst
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
 
 [Install]
 WantedBy=multi-user.target
 """
 
 bifrost_service_content = """[Unit]
-Description=Bifrost Floating VIP Manager Daemon
+Description=Bifrost VM Lifecycle Management Service
 After=zookeeper.service
+ConditionPathExists=/etc/hci/cluster.json
+ConditionPathExists=!/etc/hci/maintenance.state
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:ro
-Exec=/usr/local/bin/bifrost
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bifrost
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=512M
+MemoryHigh=400M
 
 [Install]
 WantedBy=multi-user.target
@@ -268,21 +404,15 @@ daemon_service_content = """[Unit]
 Description=Spark Host Management Daemon
 After=network.target
 
-[Container]
-Image=localhost/helios-base:latest
-Network=host
-Volume=/usr/local/bin:/usr/local/bin:ro
-Volume=/etc/hci:/etc/hci:rw
-Volume=/etc/containers/systemd:/etc/containers/systemd:rw
-Volume=/var/run/libvirt/libvirt-sock:/var/run/libvirt/libvirt-sock:Z
-Volume=/dev:/dev:shared
-Volume=/run/systemd/system:/run/systemd/system:ro
-Volume=/var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket:Z
-Volume=/root/.certs:/root/.certs:ro
-Exec=/usr/local/bin/spark-daemon
-AddCapability=CAP_SYS_ADMIN
-AddCapability=CAP_SYS_RAWIO
-AddCapability=CAP_NET_ADMIN
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spark-daemon
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=200
+MemoryMax=512M
+MemoryHigh=400M
 
 [Install]
 WantedBy=multi-user.target
@@ -318,7 +448,7 @@ ExecStartPre=-/usr/bin/bash -c "printf '[Unit]\\\\nAfter=lvm2-monitor.service ne
 ExecStartPre=-/usr/bin/systemctl daemon-reload
 
 [Container]
-Image=quay.io/piraeusdatastore/piraeus-server:v1.31.0
+Image=""" + resolve_image("aether") + """
 Network=host
 Volume=/dev:/dev
 Volume=/lib/modules:/lib/modules:ro
@@ -344,7 +474,7 @@ MemoryMax=1G
 MemoryHigh=900M
 
 [Container]
-Image=quay.io/piraeusdatastore/piraeus-server:v1.31.0
+Image=""" + resolve_image("linstor-controller") + """
 Network=host
 Volume=/var/lib/linstor:/var/lib/linstor:z
 Volume=/etc/linstor:/etc/linstor:z
@@ -388,7 +518,7 @@ MemoryMax=512M
 MemoryHigh=400M
 
 [Container]
-Image=docker.io/library/traefik:v2.10
+Image=""" + resolve_image("slate") + """
 Network=host
 Volume=/etc/hci/slate:/etc/traefik:z
 Volume=/etc/hci/spectrum/certs:/etc/hci/spectrum/certs:ro,z
@@ -398,9 +528,8 @@ User=root
 
 def deploy_to_node(ip):
         print(f"================ Deploying to {ip} ================")
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        
+        ssh = new_ssh_client()
+
         try:
             key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
             if os.path.exists(key_path):
@@ -426,6 +555,29 @@ def deploy_to_node(ip):
             # 2. Copy Spark Daemon
             print(f"[{ip}] Uploading spark-daemon to /usr/local/bin/spark-daemon...")
             put_text_file(sftp, local_daemon, "/usr/local/bin/spark-daemon")
+
+            # Shared ZooKeeper client, imported by spark-daemon and the cluster CLI.
+            print(f"[{ip}] Uploading helios_zk to /usr/local/bin/helios_zk.py...")
+            put_text_file(sftp, local_helios_zk, "/usr/local/bin/helios_zk.py")
+
+            # Update signature verification, imported by check-updates.
+            print(f"[{ip}] Uploading helios_sig to /usr/local/bin/helios_sig.py...")
+            put_text_file(sftp, local_helios_sig, "/usr/local/bin/helios_sig.py")
+
+            # Certificate lifecycle tool. Reaches peers over SSH, not mTLS, so it still
+            # works once the certificates it exists to renew have expired.
+            print(f"[{ip}] Uploading impa to /usr/local/bin/impa...")
+            put_text_file(sftp, local_impa, "/usr/local/bin/impa")
+
+            # Metadata backup and restore. The keyspace is the only statement of
+            # which DRBD volume belongs to which VM.
+            print(f"[{ip}] Uploading saga to /usr/local/bin/saga...")
+            put_text_file(sftp, local_saga, "/usr/local/bin/saga")
+
+            # The ordered schema, imported by the daemons at startup.
+            print(f"[{ip}] Uploading helios_schema to /usr/local/bin/helios_schema.py...")
+            put_text_file(sftp, local_helios_schema, "/usr/local/bin/helios_schema.py")
+            ssh.exec_command("chmod +x /usr/local/bin/impa")
             
             # 2a. Copy Bifrost CLI
             print(f"[{ip}] Uploading bifrost to /usr/local/bin/bifrost...")
@@ -433,13 +585,13 @@ def deploy_to_node(ip):
             
             # 2b. Write bifrost.container Quadlet
             print(f"[{ip}] Writing bifrost.container Quadlet...")
-            f_bif = sftp.open("/etc/containers/systemd/bifrost.container", "w")
+            f_bif = sftp.open("/etc/systemd/system/bifrost.service", "w")
             f_bif.write(bifrost_service_content)
             f_bif.close()
             
             # 2ba. Write spark-daemon.container Quadlet
             print(f"[{ip}] Writing spark-daemon.container Quadlet...")
-            f_sd = sftp.open("/etc/containers/systemd/spark-daemon.container", "w")
+            f_sd = sftp.open("/etc/systemd/system/spark-daemon.service", "w")
             f_sd.write(daemon_service_content)
             f_sd.close()
     
@@ -468,12 +620,12 @@ def deploy_to_node(ip):
             
             # 2g. Write Dagur and Mimir Quadlets
             print(f"[{ip}] Writing dagur.container Quadlet...")
-            f_dag = sftp.open("/etc/containers/systemd/dagur.container", "w")
+            f_dag = sftp.open("/etc/systemd/system/dagur.service", "w")
             f_dag.write(dagur_service_content)
             f_dag.close()
             
             print(f"[{ip}] Writing mimir.container Quadlet...")
-            f_mim = sftp.open("/etc/containers/systemd/mimir.container", "w")
+            f_mim = sftp.open("/etc/systemd/system/mimir.service", "w")
             f_mim.write(mimir_service_content)
             f_mim.close()
             
@@ -483,7 +635,7 @@ def deploy_to_node(ip):
             
             # 2i. Write vali Quadlet
             print(f"[{ip}] Writing vali.container Quadlet...")
-            f_val = sftp.open("/etc/containers/systemd/vali.container", "w")
+            f_val = sftp.open("/etc/systemd/system/vali.service", "w")
             f_val.write(vali_service_content)
             f_val.close()
     
@@ -493,7 +645,7 @@ def deploy_to_node(ip):
             
             # 2ic. Write gatoway Quadlet
             print(f"[{ip}] Writing gatoway.container Quadlet...")
-            f_gate = sftp.open("/etc/containers/systemd/gatoway.container", "w")
+            f_gate = sftp.open("/etc/systemd/system/gatoway.service", "w")
             f_gate.write(gatoway_service_content)
             f_gate.close()
     
@@ -503,7 +655,7 @@ def deploy_to_node(ip):
             
             # 2icb. Write urbosa Quadlet
             print(f"[{ip}] Writing urbosa.container Quadlet...")
-            f_urb = sftp.open("/etc/containers/systemd/urbosa.container", "w")
+            f_urb = sftp.open("/etc/systemd/system/urbosa.service", "w")
             f_urb.write(urbosa_service_content)
             f_urb.close()
     
@@ -513,7 +665,7 @@ def deploy_to_node(ip):
             
             # 2ie. Write logos Quadlet
             print(f"[{ip}] Writing logos.container Quadlet...")
-            f_log = sftp.open("/etc/containers/systemd/logos.container", "w")
+            f_log = sftp.open("/etc/systemd/system/logos.service", "w")
             f_log.write(logos_service_content)
             f_log.close()
     
@@ -523,7 +675,7 @@ def deploy_to_node(ip):
             
             # 2ig. Write mipha Quadlet
             print(f"[{ip}] Writing mipha.container Quadlet...")
-            f_miph = sftp.open("/etc/containers/systemd/mipha.container", "w")
+            f_miph = sftp.open("/etc/systemd/system/mipha.service", "w")
             f_miph.write(mipha_service_content)
             f_miph.close()
  
@@ -534,10 +686,21 @@ def deploy_to_node(ip):
             # Copy check-updates script
             print(f"[{ip}] Uploading check-updates script to /usr/local/bin/check-updates...")
             put_text_file(sftp, local_check_updates, "/usr/local/bin/check-updates")
-            
+
+            # Pin the release public key. World-readable on purpose: it is public, and
+            # the Spectrum container reads it through the same read-only /etc/hci mount.
+            if release_pubkey_pem:
+                print(f"[{ip}] Pinning release public key at {RELEASE_PUBKEY_REMOTE_PATH}...")
+                stdin_key, stdout_key, stderr_key = ssh.exec_command("mkdir -p /etc/hci/keys && chmod 755 /etc/hci/keys")
+                stdout_key.channel.recv_exit_status()
+                f_relkey_remote = sftp.open(RELEASE_PUBKEY_REMOTE_PATH, "w")
+                f_relkey_remote.write(release_pubkey_pem)
+                f_relkey_remote.close()
+                ssh.exec_command(f"chmod 644 {RELEASE_PUBKEY_REMOTE_PATH}")
+
             # Write hylia Quadlet
             print(f"[{ip}] Writing hylia.container Quadlet...")
-            f_ygg = sftp.open("/etc/containers/systemd/hylia.container", "w")
+            f_ygg = sftp.open("/etc/systemd/system/hylia.service", "w")
             f_ygg.write(yggdrasil_service_content)
             f_ygg.close()
     
@@ -559,7 +722,7 @@ def deploy_to_node(ip):
             
             # 2k. Write catalyst Quadlet
             print(f"[{ip}] Writing catalyst.container Quadlet...")
-            f_cat = sftp.open("/etc/containers/systemd/catalyst.container", "w")
+            f_cat = sftp.open("/etc/systemd/system/catalyst.service", "w")
             f_cat.write(catalyst_service_content)
             f_cat.close()
             
@@ -628,10 +791,17 @@ def deploy_to_node(ip):
                 put_text_file(sftp, local_dockerfile, "/tmp/spectrum_build/Dockerfile")
                 
                 print(f"[{ip}] Uploading server.py for Spectrum build...")
-                put_text_file(sftp, local_server, "/tmp/spectrum_build/server.py")
+                put_text_file(sftp, local_server, "/tmp/spectrum_build/spectrum_server.py")
                 
                 print(f"[{ip}] Uploading hylia.py for Spectrum build...")
                 put_text_file(sftp, local_yggdrasil, "/tmp/spectrum_build/hylia.py")
+
+                # Staged for the image alongside hylia: the console extracts update
+                # packages in-container, so whatever verifies a manifest has to exist
+                # there too. Requires a matching COPY line in the Dockerfile.
+                print(f"[{ip}] Uploading helios_sig.py for Spectrum build...")
+                put_text_file(sftp, local_helios_sig, "/tmp/spectrum_build/helios_sig.py")
+                put_text_file(sftp, local_helios_schema, "/tmp/spectrum_build/helios_schema.py")
                 
                 # 3c. Upload all static assets for Spectrum build (recursively)
                 print(f"[{ip}] Uploading static assets for Spectrum build...")
@@ -700,7 +870,7 @@ def deploy_to_node(ip):
             ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
             
             # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
-            ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
+            ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/spectrum_server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
             
             # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
             print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")
@@ -794,23 +964,29 @@ def deploy_to_node(ip):
                     print(f"[{ip}] Error compiling Agahnim: {stderr.read().decode()}")
                 
             # Deploy/update systemd service unit
-            agahnim_svc_cmd = """cat << 'EOF' > /etc/containers/systemd/agahnim.container
-    [Unit]
-    Description=Agahnim Console Proxy Daemon
-    After=network.target
-    
-    [Container]
-    Image=localhost/helios-base:latest
-    Network=host
-    Volume=/usr/local/bin:/usr/local/bin:ro
-    Exec=/usr/local/bin/agahnim 8081
-    
-    [Install]
-    WantedBy=multi-user.target
-    EOF
-    """
-            stdin, stdout, stderr = ssh.exec_command(agahnim_svc_cmd)
-            stdout.channel.recv_exit_status()
+            # Agahnim is a compiled Rust binary, so it is a native systemd unit -- not a
+            # container. The previous heredoc here also never terminated: its EOF marker was
+            # indented, which `<< 'EOF'` (unquoted delimiter position) does not match.
+            f_agah = sftp.open("/etc/systemd/system/agahnim.service", "w")
+            f_agah.write("""[Unit]
+Description=Agahnim Console Proxy Daemon
+After=network.target
+ConditionPathExists=/etc/hci/cluster.json
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agahnim 8081
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=100
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+""")
+            f_agah.close()
                 
             if not fast_mode:
                 # 10. Rebuild the spectrum container image locally
@@ -843,7 +1019,9 @@ def deploy_to_node(ip):
                 "systemctl is-active mimir && systemctl restart mimir || true",
                 "systemctl is-active vali && systemctl restart vali || true",
                 "systemctl daemon-reload && systemctl enable agahnim && systemctl restart agahnim || true",
-                "systemctl daemon-reload && systemctl enable slate && systemctl restart slate || true",
+                # slate is a genuine Quadlet; generated units cannot be enabled (their [Install]
+                # section is what the generator acts on), so reload and restart only.
+                "systemctl daemon-reload && systemctl restart slate || true",
                 "systemctl enable gatoway && systemctl restart gatoway || true",
                 "systemctl enable urbosa && systemctl restart urbosa || true",
                 "systemctl enable logos && systemctl restart logos || true",
@@ -861,7 +1039,8 @@ def deploy_to_node(ip):
             print(f"[{ip}] Deployment and storage recovery successful.\n")
             
         except Exception as e:
-            print(f"[{ip}] Failed to deploy: {e}\n")
+            if not explain_host_key_failure(ip, e):
+                print(f"[{ip}] Failed to deploy: {e}\n")
         finally:
             ssh.close()
 

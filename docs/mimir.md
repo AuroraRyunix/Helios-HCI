@@ -9,6 +9,7 @@ Mimir is the background cluster health diagnostics and checking service for the 
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/mimir`) managed by systemd (`mimir.service`).
 - **Consensus Execution**: Mimir queries ZooKeeper status and only triggers checks on the node elected as the ZooKeeper leader to prevent concurrent execution.
 - **Autostart Constraint**: Mimir is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
+- **Certificate Survey (every node, every 15 minutes)**: the one check that is deliberately *not* behind the leader election above. Each node classifies every certificate under `/etc/hci/spark/certs` and `/root/.certs` and upserts the result into `hydra.mimir_results` as `mtls_cert_expiration` / `security.mtls.certs`, so the console shows a continuously refreshed answer rather than whatever the last leader-triggered fan-out left behind. The certificates are per-node, and the day they lapse is the day the leader-only fan-out stops being able to reach any node at all. `PASS` above 30 days, `WARN` inside 30, `FAIL` inside 7 or already expired; an expiry date that cannot be parsed is `WARN`, never `PASS`. See [mtls_lifecycle.md](./mtls_lifecycle.md) for the renewal path this check exists to prompt.
 
 ## Database Schema
 Mimir relies on the following ScyllaDB tables in the `hydra` keyspace:
@@ -41,6 +42,41 @@ The triggered execution calls `mcli` tool which performs node check evaluations 
     * **Private Key Permissions**: Verifies private key file permissions are secure (restricted to owner only, i.e. `600` or `400`).
     * **Modulus Verification**: Checks that each private key matches its corresponding certificate by validating that their RSA/EC modulus matches using `openssl x509 -modulus` and `openssl pkey -modulus`.
     * **Signature Trust**: Verifies client and node certificates are properly signed by their respective CAs using `openssl verify`.
+
+- **Spark Service Watchdog (`watchdog_daemon_status`)**:
+  - **Category**: `services` (stored under `service.spark.watchdog`)
+  - **Description**: Verifies that spark-daemon's background watchdog thread — the only thing on a host that restarts a cluster service after it fails — is actually running. `systemctl is-active spark-daemon` does not answer this: the daemon keeps serving its mTLS API whether or not that thread is alive, which is exactly the "host is up, host is not working" case this check exists for.
+  - **How it decides**, since the loop publishes no heartbeat:
+    * **Preconditions**: the autostart thread returns *permanently*, without retrying, if `/etc/hci/cluster.json` is missing or `/run/hci/cluster_operation.lock` is held when spark-daemon starts. A lock older than the daemon is therefore a `FAIL` that needs `systemctl restart spark-daemon`, not just a lock release. A lock taken *after* startup is the watchdog pausing by design; held over 15 minutes it warns, over an hour it fails as stale.
+    * **Its own announcement**: `[WATCHDOG] Starting service health watchdog` in the journal for the current `InvocationID`. Only conclusive where the journal still holds an `[AUTOSTART]` line from the same window — after log rotation, absence of the line proves nothing and is reported as such.
+    * **Its effect**: a unit the loop supervises that has been inactive for more than three of its 30-second passes, while ZooKeeper reports the cluster `started`. This is the only way to see a loop that is wedged rather than dead — its `systemctl start` and `podman` calls carry no timeout, so one hung call stops the thread forever without raising.
+  - A stopped cluster, a maintenance window and a unit down for a few seconds are all `PASS`: the watchdog restarting nothing is correct in each.
+
+- **DRS/Migration Storage Capacity Gate (`drs_storage_capacity_check`)**:
+  - **Category**: `services` (stored under `service.vali.drs_storage_gate`)
+  - **Description**: Vali refuses a migration whose target cannot hold the guest's disk by comparing the disk size against `get_linstor_free_space(target)`. This check verifies the gate can actually answer, by calling vali's own function and comparing its result with the free capacity `linstor -m storage-pool list` reports for this node's backing pools. It imports the deployed `vali` rather than re-implementing the parser, so it follows a fix instead of rotting into a false alarm.
+  - **Fails** when the gate reads materially *more* free space than the pool has — its failure mode is approval, not refusal, so a gate that cannot parse the listing waves every migration through. Also fails when a thin pool drops below 5% free, and warns below 15% or when provisioned volumes exceed the pool's total size.
+  - Diskless pools are excluded: they report 2^63-1 bytes free and store nothing, so counting them would show unlimited headroom on a full node.
+
+- **Migration Lock Auditor (`migration_lock_status`)**:
+  - **Category**: `services` (stored under `service.vali.migration_locks`)
+  - **Description**: `hydra.vms.status` is the per-VM migration lock, taken by daruk's `/v1/vm/migrate-lock` LWT and released by `migrate-commit` or `migrate-unlock`. Live migration is the window in which DRBD dual-primary is open, so the lock is the only thing standing between two concurrent migrations and a corrupted disk.
+  - **Reports**: a lock held with no migration task in flight (orphaned — it refuses every later migration *and* every delete of that VM until cleared, and the output names the `migrate-unlock` call that clears it); two migration tasks in flight for one VM; a migration that has been running past vali's own 10-minute timeout; and, from `virsh domjobinfo`, a live migration running on this host while the lock is **not** held, which is the direction that corrupts data.
+  - `hydra.catalyst_tasks` is only scanned when a VM claims a migration or libvirt reports one — it is a full partition scan of a table with 30-day retention, and it should not run hourly on every node just to confirm nothing is happening.
+  - libvirt is asked through `virsh`, not through `systemctl is-active libvirtd`: a modular or socket-activated host leaves that unit `inactive` while `virsh` works perfectly, and gating on it would report "no migration can be running here" on a host that is migrating right now.
+
+- **LINSTOR Controller Latency (`linstor_latency_check`)**:
+  - **Category**: `storage` (stored under `storage.linstor.latency`)
+  - **Description**: Every other storage check asks the LINSTOR controller a question and believes the answer. This one times the question. `linstor node list` is a single round trip against an in-memory view, so seconds mean the controller is blocked — waiting on an unreachable satellite, or holding a lock in its embedded database — and every storage operation queued behind it (VM creation, disk attach, live migration) is blocked for the same reason.
+  - `WARN` above 5s, `FAIL` above 20s or if there is no answer within 60s. The check itself is bounded so a hung controller cannot stall the diagnostic run. The `podman exec` round trip into `systemd-aether` is measured separately and named in the output, so container overhead is not mistaken for controller latency.
+
+- **Stuck Catalyst Tasks (`stuck_tasks_check`)**:
+  - **Category**: `services` (stored under `service.catalyst.stuck_tasks`)
+  - **Description**: Flags tasks in `hydra.catalyst_tasks` that have been `pending` or `processing` for over 10 minutes, naming each one and how long it has been in flight.
+  - This check previously answered `PASS` on every cluster it ran on. `created_at` is a CQL `timestamp`, which `SELECT JSON` renders as `'2026-08-21 20:58:49.309Z'`; `int()` on that raises, the surrounding `except` swallowed it, and every in-flight task was skipped. On the reference cluster it went green while three Dagur tasks had been pending for over an hour. A task whose age cannot be read is now `WARN`, not silently treated as fresh.
+
+> [!IMPORTANT]
+> Every check must have an entry in `mcli`'s `CHECK_ID_TO_FUNC`, and its category must contain a dot. `hydra.mimir_results` is partitioned by `category`: a check missing from the map is stored under the *invoked* scope instead, which both duplicates it across scopes and puts it in the partition the legacy cleanup deletes at the end of the same run. An undotted category would be deleted for the same reason. `test_mimir_results.py` asserts both.
 
 ---
 

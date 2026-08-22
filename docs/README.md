@@ -13,7 +13,10 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [deployment.md](./deployment.md) | The Podman Quadlet deployment model, the update-rollout paths, ingress. |
 | [setup-guide.md](./setup-guide.md) | Local dev prerequisites, what runs standalone vs. what needs a real cluster. |
 | [hci_master_architecture_guide.md](./hci_master_architecture_guide.md) | The deepest existing architecture reference (1500+ lines). |
+| [spark_api.md](./spark_api.md) | The typed per-domain Spark API that replaces raw shell execution: the contract, the design rules, and the migration metric. |
+| [cluster_state.md](./cluster_state.md) | How desired cluster state and per-node actual state are held in ZooKeeper, the ephemeral-znode liveness model, and the direct-probe fallback. |
 | [network.md](./network.md) | Full network scope/port allocation reference. |
+| [backup_restore.md](./backup_restore.md) | What the cluster cannot rebuild, how `saga` captures it, the restore sequence, retention — and, explicitly, what is *not* backed up (guest data is not). |
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |
 | [add_ons_design.md](./add_ons_design.md) | Forward-looking design blueprint for four scale-out add-ons (Helios Portal, Helios Files, Helios Horizon, Scale-Out Urbosa) — none implemented yet. |
@@ -37,17 +40,19 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Mipha (`mipha.py`) | [mipha.md](./mipha.md) | [mipha_technical.md](./mipha_technical.md) |
 | Spark (`spark.py` / `spark_daemon_decoded.py`) | [spark.md](./spark.md) | [spark_technical.md](./spark_technical.md) |
 | Spectrum (`spectrum_server.py`) | [spectrum.md](./spectrum.md) | [spectrum_technical.md](./spectrum_technical.md) |
+| Spectrum (Phoenix) (`spectrum_phx/`) | [spectrum_phx.md](./spectrum_phx.md) | [../spectrum_phx/README.md](../spectrum_phx/README.md) (toolchain, build, local dev) |
 | Urbosa (`urbosa.py`) | [urbosa.md](./urbosa.md) | [urbosa_technical.md](./urbosa_technical.md) |
 | Urbosa Bootstrap (`urbosa_bootstrap.py`) | — | [urbosa_bootstrap_technical.md](./urbosa_bootstrap_technical.md) |
 | Vali (`vali.py`) | [vali.md](./vali.md) | [vali_technical.md](./vali_technical.md) |
 | Valcli (`valcli.py`) | — | [valcli_technical.md](./valcli_technical.md) |
+| Saga (`saga.py`) | [backup_restore.md](./backup_restore.md) | — (the narrative doc covers the internals too) |
 | Provision (`provision.py`) | — | [provision_technical.md](./provision_technical.md) |
 | Sync Provision (`sync_provision.py`) | — | [sync_provision_technical.md](./sync_provision_technical.md) |
 | Check Updates (`check_updates.py`) | — | [check_updates_technical.md](./check_updates_technical.md) |
 | Create Upgrade Zip (`create_upgrade_zip.py`) | — | [create_upgrade_zip_technical.md](./create_upgrade_zip_technical.md) |
 | Deploy Updates (`deploy_updates.py`) | — | [deploy_updates_technical.md](./deploy_updates_technical.md) |
+| Update Signing (`helios_sig.py`) | [update_signing.md](./update_signing.md) | — |
 | Push to GitHub (`push_to_github.py`) | — | [push_to_github_technical.md](./push_to_github_technical.md) |
-| Replace Run CQL (`replace_run_cql.py`) | — | [replace_run_cql_technical.md](./replace_run_cql_technical.md) |
 | Test Hylia (`test_hylia.py`) | — | [test_hylia_technical.md](./test_hylia_technical.md) |
 | Valkyrie (host OS) | [valkyrie.md](./valkyrie.md) | — (no daemon code; it's the physical hypervisor host itself) |
 | Odin (consensus concept) | [odin.md](./odin.md) | — |
@@ -56,6 +61,24 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Aether (Linstor/DRBD) | [aether.md](./aether.md) | — |
 | Slate (Traefik) | [slate.md](./slate.md) | — |
 | Agahnim (Rust console proxy) | [agahnim.md](./agahnim.md) | — |
+
+## DFS design (Sidon, Purah, Ganon)
+
+Design documents for the extent-based replacement of Linstor/DRBD. **None of this is implemented** — `sidon`, `purah` and `ganon` are names with specifications behind them and no code yet. The build order is in `milestones.md`; the first thing built is the harness.
+
+| Document | Covers |
+| :-- | :-- |
+| [dfs/README.md](./dfs/README.md) | Index, component names, the one-paragraph version. |
+| [dfs/architecture.md](./dfs/architecture.md) | Why DRBD's shape cannot get there; the extent model; what is deliberately out. |
+| [dfs/invariants.md](./dfs/invariants.md) | The contract (I-1..I-8) everything else exists to satisfy. |
+| [dfs/data-path.md](./dfs/data-path.md) | Journal, drain, extent store, checksums, mark-sweep GC. |
+| [dfs/ownership.md](./dfs/ownership.md) | Leases, epochs, the fencing proof, live migration by forwarding. |
+| [dfs/metadata.md](./dfs/metadata.md) | Schema sketch, Daruk endpoints, exactly-once drain, load arithmetic. |
+| [dfs/ganon.md](./dfs/ganon.md) | The fault-injection harness — built first, calibrated against DRBD. |
+| [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
+| [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
+
+Status: **designed, not building** — implementation begins with the harness, not the filesystem.
 
 ## Audit / Backlog
 

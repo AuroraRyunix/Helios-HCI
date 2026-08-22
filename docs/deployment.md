@@ -6,20 +6,33 @@ Helios-HCI is deployed as a **self-hosted, on-premises cluster** — there is no
 
 ## 1. Podman Quadlets
 
-Almost every Helios daemon runs as a **Podman Quadlet** — a `.container` unit file under `/etc/containers/systemd/` that `podman-system-generator` turns into a regular `systemd` unit (`systemd-<name>.service`) at boot. `provision.py` is what writes these files (grep it for `node.write_file("/etc/containers/systemd/...")` to see the exact unit content it generates). The Quadlet-managed services, verified against `provision.py`'s unit-writing code, are:
+Helios splits deployment deliberately between two mechanisms.
+
+**Third-party services run as Podman Quadlets** — a `.container` unit file under `/etc/containers/systemd/` that `podman-system-generator` turns into a regular `systemd` unit (`systemd-<name>.service`) at boot. `provision.py` writes these (grep for `node.write_file("/etc/containers/systemd/...")`). They are:
+
+```
+zookeeper, hydra-db, aether, linstor-controller, spectrum, slate
+```
+
+These are genuine third-party services with real dependency trees — ZooKeeper, ScyllaDB, Linstor, Traefik — plus the Spectrum image built from the repo `Dockerfile`.
+
+**The Helios daemons themselves run as native `systemd` units** in `/etc/systemd/system/`:
 
 ```
 spark-daemon, bifrost, dagur, mimir, vali, gatoway, urbosa, logos, mipha,
-catalyst, hylia, zookeeper, hydra-db, aether, spectrum, slate, linstor-controller
+catalyst, hylia, daruk, agahnim
 ```
 
-(`urbosa` is only deployed if SDN overlay is enabled for the cluster.)
+They are stdlib-only Python (or, for `agahnim`, a compiled Rust binary), and their job is to *configure the host*: `urbosa` creates network namespaces, `gatoway` builds VLAN bridges, `bifrost` moves IP addresses, `mipha` drives `drbdadm`. Containerising an agent whose purpose is to reconfigure the host it runs on requires handing it `Network=host`, `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `/dev` and the systemd runtime — at which point the boundary isolates nothing while adding an image to build, version and fail to pull. Resource governance is unaffected either way: containers take their limits from cgroups v2, the same mechanism `MemoryMax=`/`CPUWeight=` use in a `.service`.
 
-Every Quadlet-managed Python daemon runs the same local image, `localhost/helios-base:latest`, with `Network=host` and a read-only bind-mount of `/usr/local/bin` (where `provision.py` wrote the actual `.py`/CLI files) so the container executes the script directly off the host filesystem rather than baking it into the image. Individual units add whatever extra mounts/capabilities they need — e.g. `vali.container` mounts `/var/run/libvirt/libvirt-sock`, `gatoway.container` adds `CAP_NET_ADMIN`, `hylia.container` bind-mounts the whole host (`/:/host:rw`) and the systemd D-Bus socket so it can drive host reboots/service management during rolling upgrades.
+> [!NOTE]
+> An earlier commit migrated these eleven daemons to Quadlets pointing at `Image=localhost/helios-base:latest`. **No commit ever built or pulled that image**, so none of them could start; the migration also silently dropped `ConditionPathExists=!/etc/hci/maintenance.state` from nine units and most cgroup limits, and never updated `spark.py`, which still reads `systemctl show -p MainPID` for exactly these services. It has been reverted. Do not reintroduce it without first creating the image and updating `spark.py`.
 
-**Two services are intentionally *not* Quadlets** — they run as plain native `systemd` units instead:
-* **`agahnim`** (`/etc/systemd/system/agahnim.service`) — the Rust console-proxy binary is `cargo build --release`'d directly on the node during provisioning and installed to `/usr/local/bin/agahnim`; the unit just execs it.
-* **`daruk`** (`/etc/systemd/system/daruk.service`) — the ScyllaDB CQL proxy runs natively and `podman exec`s *into* the `systemd-hydra-db` container to reach `cqlsh`/the ScyllaDB Python driver, rather than running as its own container.
+Two notes on the native units:
+* **`agahnim`** — the Rust console-proxy binary is `cargo build --release`'d on the node during provisioning and installed to `/usr/local/bin/agahnim`; the unit just execs it.
+* **`daruk`** — the ScyllaDB CQL proxy runs natively and `podman exec`s *into* the `systemd-hydra-db` container to reach the ScyllaDB Python driver. Its unit refreshes the in-volume copy of `daruk.py` on every start, because LCM upgrades only replace `/usr/local/bin/daruk.py` while the service executes the copy inside the database volume.
+
+Cluster lifecycle is not driven unit-by-unit from the CLI: desired state is recorded in ZooKeeper and each node converges toward it — see [cluster_state.md](./cluster_state.md).
 
 The Spectrum WebUI container image itself (`spectrum:latest` / `localhost/spectrum:latest`) is the one component actually built from a `Dockerfile` with `podman build` — see [docs/AGENTS.md](./AGENTS.md) §7 for the `server.py` copy-rename step this depends on.
 
