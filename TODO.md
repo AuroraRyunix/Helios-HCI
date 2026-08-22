@@ -659,9 +659,17 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   **Still open, and different in kind: the console's container image.** It pulls base
   images from a public registry at build time, so putting it in a signed package means
   either vendoring those bases or admitting the build is not hermetic.
-* **`provision.py` does not know about the Phoenix console.** A fresh cluster gets the
-  Python one and gains this one on its first `deploy_updates.py` run. Wiring it needs the
-  cluster-wide `SECRET_KEY_BASE` generated at cluster-create time.
+* ~~`provision.py` does not know about the Phoenix console.~~ **Half done (2026-08-22).**
+  Provisioning now decides the one thing only it can: `SECRET_KEY_BASE`, generated once
+  per cluster and written identically to every node. It has to be the same everywhere --
+  a session cookie signed on one node must verify on the others, or Slate routing to a
+  different backend logs the operator out -- and rotating it later invalidates every live
+  session, so cluster creation is the only moment to choose it.
+
+  Provisioning deliberately does **not** install the unit or build the image. The Quadlet
+  carries `ConditionPathExists` on that env file, so it stays cleanly inactive until the
+  first `deploy_updates.py` run builds the image; installing a unit whose `Pull=never`
+  image does not exist yet would give a fresh cluster a start-failure loop instead.
 * ~~`podman build` cannot be run from a clean checkout.~~ **Resolved (2026-08-20)**: the Dockerfile
   copies `spectrum_server.py` and renames it on the way in, so the build works from the tree as checked
   out. The rename indirection is gone rather than worked around -- it had four touchpoints

@@ -40,6 +40,20 @@ DEFAULT_USERNAME = "root"
 DEFAULT_PASSWORD = ""
 DHCP_IPS = []
 HOSTS = []
+
+# SECRET_KEY_BASE for the Phoenix console, decided once for the whole cluster.
+#
+# It has to be identical on every node: a session cookie signed on one node must verify
+# on the others, or Slate moving a request to a different backend logs the operator out.
+# Cluster creation is the only moment that can decide it -- a per-node value generated at
+# deploy time would be a different value per node, and rotating it later invalidates every
+# live session.
+#
+# Written even though provisioning does not start the console. The Quadlet carries
+# `ConditionPathExists` on this file, so the unit stays cleanly inactive until
+# deploy_updates.py builds the image and installs it; what provisioning contributes is the
+# one decision that cannot be made later without consequences.
+PHX_SECRET = ""
 VIP = ""
 PREFIX = ""
 GATEWAY = ""
@@ -429,6 +443,18 @@ def wait_for_ssh(ip, timeout=120):
             time.sleep(2)
     return False
 
+def generate_phx_secret():
+    """48 random bytes, base64, no padding characters that would need quoting.
+
+    `secrets` rather than `random`: this signs session cookies, and a predictable value
+    means forgeable sessions on the console that administers the cluster.
+    """
+    import base64
+    import secrets
+
+    return base64.b64encode(secrets.token_bytes(48)).decode("ascii").rstrip("=")
+
+
 def main():
     print("==========================================================")
     print("              Aura HCI Cluster Provisioner                ")
@@ -454,7 +480,7 @@ def main():
         for _name in sorted(IMAGES):
             print(f"  {_name}: {resolve_image(_name)}")
 
-    global DEFAULT_PASSWORD, DHCP_IPS, HOSTS, VIP, PREFIX, GATEWAY
+    global DEFAULT_PASSWORD, DHCP_IPS, HOSTS, VIP, PREFIX, GATEWAY, PHX_SECRET
     
     DEFAULT_PASSWORD = os.environ.get("HELIOS_PASSWORD")
     if not DEFAULT_PASSWORD:
@@ -483,6 +509,9 @@ def main():
             HOSTS = [ip.strip() for ip in hosts_input.split(",") if ip.strip()]
         except (IOError, NameError):
             HOSTS = []
+
+    # Decided here, where HOSTS is settled and before any node is touched.
+    PHX_SECRET = generate_phx_secret()
 
     vip_env = os.environ.get("HELIOS_VIP")
     if vip_env:
@@ -1219,6 +1248,18 @@ WantedBy=multi-user.target
 
             spectrum_env = f"SPECTRUM_HOST={node.ip}\nSPECTRUM_PORT=8000\nSPECTRUM_LOG_LEVEL=info\n"
             node.write_file("/etc/hci/spectrum/spectrum.env", spectrum_env)
+
+            # The Phoenix console's environment. Same secret on every node, this node's
+            # own address as PHX_HOST, and every node as an accepted origin because Slate
+            # can route a request to any of them.
+            if PHX_SECRET:
+                phx_env = (
+                    f"SECRET_KEY_BASE={PHX_SECRET}\n"
+                    f"PHX_HOST={node.ip}\n"
+                    f"PHX_EXTRA_ORIGINS={','.join(HOSTS)}\n"
+                )
+                node.write_file("/etc/hci/spectrum/spectrum-phx.env", phx_env)
+                node.execute("chmod 600 /etc/hci/spectrum/spectrum-phx.env")
 
             hydra_env = f"HYDRA_DB_SEEDS={seed_ips}\nHYDRA_DB_LISTEN={node.ip}\n"
             node.write_file("/etc/hci/hydra/cassandra.env", hydra_env)
