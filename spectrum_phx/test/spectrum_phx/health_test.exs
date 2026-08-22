@@ -61,6 +61,19 @@ defmodule SpectrumPhx.HealthTest do
       assert Health.category_for("spectrum_privilege_check") == :services
     end
 
+    test "groups the checks that mcli gained after these lists were first copied" do
+      # Added to mcli's checks_map after this module was written, so each was :other here
+      # -- and `hylia_status` had never reached either console at all: mcli-runner builds
+      # the name as results[f"{svc}_status"], it had no CHECK_ID_TO_FUNC entry, and every
+      # run wrote it to the invoked scope's partition for the legacy cleanup to delete
+      # seconds later.
+      assert Health.category_for("watchdog_daemon_status") == :services
+      assert Health.category_for("drs_storage_capacity_check") == :services
+      assert Health.category_for("migration_lock_status") == :services
+      assert Health.category_for("hylia_status") == :services
+      assert Health.category_for("linstor_latency_check") == :storage
+    end
+
     test "a check in neither list is grouped as other rather than silently as a service" do
       assert Health.category_for("some_new_check") == :other
 

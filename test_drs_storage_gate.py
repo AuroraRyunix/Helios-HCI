@@ -55,10 +55,14 @@ LIVE_POOLS = json.dumps([[
 
 class FreeSpaceTests(unittest.TestCase):
     def setUp(self):
-        self._saved = vali.run_remote_spark
+        self._saved = (vali.run_remote_spark, vali.hostname_for_ip)
+        # LINSTOR keys pools by node name; the caller passes an address. cluster.json is
+        # the only place holding both, and there is no cluster.json in a test.
+        vali.hostname_for_ip = lambda ip: {"10.0.0.1": "node01",
+                                           "10.0.0.2": "node02"}.get(ip)
 
     def tearDown(self):
-        vali.run_remote_spark = self._saved
+        vali.run_remote_spark, vali.hostname_for_ip = self._saved
 
     def _answer(self, rc, stdout):
         vali.run_remote_spark = lambda ip, cmd: (rc, stdout, "")
@@ -79,13 +83,43 @@ class FreeSpaceTests(unittest.TestCase):
                 self._answer(rc, out)
                 self.assertIsNone(vali.get_linstor_free_space("10.0.0.1"))
 
-    def test_it_reports_the_smallest_backed_pool(self):
+    def test_it_reports_the_smallest_backed_pool_on_that_node(self):
         # A target is only as big as its tightest pool.
         self._answer(0, json.dumps([[
-            {"storage_pool_name": "a", "provider_kind": "LVM_THIN", "free_capacity": 4194304},
-            {"storage_pool_name": "b", "provider_kind": "LVM_THIN", "free_capacity": 1048576},
+            {"storage_pool_name": "a", "node_name": "node01",
+             "provider_kind": "LVM_THIN", "free_capacity": 4194304},
+            {"storage_pool_name": "b", "node_name": "node01",
+             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
         ]]))
         self.assertEqual(vali.get_linstor_free_space("10.0.0.1"), 1024)
+
+    def test_another_nodes_pools_are_not_counted(self):
+        # `storage-pool list` returns the whole cluster. Taking the minimum across all of
+        # it would refuse a migration to a target with room because some *other* node is
+        # full -- and on a single-node cluster that mistake is invisible.
+        self._answer(0, json.dumps([[
+            {"storage_pool_name": "default-pool", "node_name": "node01",
+             "provider_kind": "LVM_THIN", "free_capacity": 314318732},
+            {"storage_pool_name": "default-pool", "node_name": "node02",
+             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
+        ]]))
+        self.assertEqual(vali.get_linstor_free_space("10.0.0.1"), 306951)
+        self.assertEqual(vali.get_linstor_free_space("10.0.0.2"), 1024)
+
+    def test_a_node_linstor_did_not_report_on_is_unknown(self):
+        # Not "no space" and not "plenty": no rows for a node means LINSTOR did not
+        # answer for it, which is the case that must refuse rather than guess.
+        self._answer(0, json.dumps([[
+            {"storage_pool_name": "default-pool", "node_name": "node02",
+             "provider_kind": "LVM_THIN", "free_capacity": 1048576},
+        ]]))
+        self.assertIsNone(vali.get_linstor_free_space("10.0.0.1"))
+
+    def test_an_unmappable_address_is_unknown(self):
+        # If the target is not in cluster.json there is no node name to filter on, so
+        # there is no honest answer.
+        self._answer(0, LIVE_POOLS)
+        self.assertIsNone(vali.get_linstor_free_space("10.9.9.9"))
 
     def test_the_old_fallbacks_are_gone(self):
         source = io.open(os.path.join(HERE, "vali.py"), encoding="utf-8").read()

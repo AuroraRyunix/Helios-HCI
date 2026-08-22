@@ -76,14 +76,15 @@ defmodule SpectrumPhx.Health do
     zookeeper_status hydra-db_status daruk_status aether_status spectrum_status
     spark-daemon_status libvirtd_status catalyst_status bifrost_status dagur_status
     mimir_status vali_status gatoway_status urbosa_status logos_status mipha_status
-    agahnim_status slate_status scylladb_ring_status zookeeper_consensus
+    agahnim_status slate_status hylia_status scylladb_ring_status zookeeper_consensus
     scylladb_replication spectrum_api_port mtls_cert_expiration ingress_cert_expiration
     certs_seeding_check slate_config_status libvirt_responsiveness hostname_resolution
     spectrum_privilege_check auth_seeding_check vip_binding_status maintenance_mode_check
     vali_leader_status scylladb_tasks_schema security_config_audit virsh_power_off_check
     stuck_tasks_check urbosa_compliance ssh_known_hosts_seeding zookeeper_ring_scale
     scylladb_quorum_safety replication_factor_vs_repair mtls_cert_expiry_warning
-    flapping_service_check stale_node_registration
+    flapping_service_check stale_node_registration watchdog_daemon_status
+    drs_storage_capacity_check migration_lock_status
   )
 
   @storage_checks ~w(
@@ -91,6 +92,7 @@ defmodule SpectrumPhx.Health do
     aether_storage_pools aether_storage_pools_space storage_capacity
     storage_mount_options storage_volume_writable fstab_safety_check
     orphaned_disks_check broken_disks_check drbd_split_brain_check
+    linstor_latency_check
   )
 
   @hardware_checks ~w(

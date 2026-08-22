@@ -751,7 +751,29 @@ def get_vm_disk_size(vm_name):
     # onto a target that cannot hold the disk.
     return None
 
+def hostname_for_ip(ip):
+    """The cluster hostname of a node, or None.
+
+    LINSTOR keys everything by node name while this code passes addresses around, so the
+    two have to be reconciled somewhere. `cluster.json` is the only place that holds both.
+    """
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            for host in json.load(f).get("hosts", []):
+                if host.get("ip") == ip:
+                    return host.get("hostname")
+    except Exception:
+        pass
+    return None
+
+
 def get_linstor_free_space(target_ip):
+    """Free MiB in the target node's smallest backed storage pool, or None if unknown.
+
+    None means "could not determine", and the caller must refuse on it. This used to
+    return a hard-coded 999999 MiB when the listing could not be parsed -- larger than any
+    single VM disk, so the capacity gate approved everything instead of refusing.
+    """
     ips = []
     try:
         if os.path.exists("/etc/hci/cluster.json"):
@@ -773,14 +795,27 @@ def get_linstor_free_space(target_ip):
     if rc != 0 or not stdout:
         return None
 
-    # LINSTOR reports capacities in KiB. Diskless pools report INT64_MAX, which averaged
-    # or summed into a total makes a full fabric look empty, so they are skipped.
-    best = None
     try:
         payload = json.loads(stdout)
     except Exception:
         return None
+
+    # `storage-pool list` returns every node's pools, not the target's. Taking the
+    # minimum across all of them would refuse a migration to a target with room because
+    # some *other* node is full -- and on a one-node cluster the bug is invisible.
+    target_node = hostname_for_ip(target_ip)
+    if not target_node:
+        return None
+
+    # Capacities are KiB. Diskless pools report INT64_MAX, which is not free space and
+    # makes a full fabric look empty, so they are skipped. The smallest backed pool is
+    # the answer: a target is only as large as its tightest pool.
+    best = None
+    matched = False
     for entry in _iter_storage_pools(payload):
+        if entry.get("node_name") != target_node:
+            continue
+        matched = True
         if entry.get("provider_kind") in ("DISKLESS", "diskless"):
             continue
         free_kib = entry.get("free_capacity")
@@ -788,6 +823,11 @@ def get_linstor_free_space(target_ip):
             continue
         free_mib = free_kib // 1024
         best = free_mib if best is None else min(best, free_mib)
+
+    # A node with no rows at all is not a node with no space -- it is a node LINSTOR did
+    # not report on, which is exactly the case that must refuse rather than guess.
+    if not matched:
+        return None
     return best
 
 
