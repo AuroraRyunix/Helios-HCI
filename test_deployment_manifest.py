@@ -31,6 +31,7 @@ Run with:  python -m unittest test_deployment_manifest
 """
 
 import ast
+import base64
 import os
 import re
 import unittest
@@ -72,6 +73,21 @@ EMBEDDED_SCRIPT_SOURCES = ("spark_daemon_decoded.py", "cluster_new.py")
 # The same pattern sync_provision.py uses to detect its own drift, so this test
 # sees exactly the set of constants that tool sees.
 B64_CONSTANT_RE = re.compile(r"^([A-Z_]+_B64)\s*=", re.MULTILINE)
+
+# The constant *and* its payload, so the embedded bytes can be compared with the file
+# they were encoded from.
+B64_VALUE_RE = r'^%s\s*=\s*"([^"]*)"'
+
+
+def embedded_payload(provision_source, const):
+    """The decoded bytes of one `*_B64` constant, or None if it is not a plain literal."""
+    match = re.search(B64_VALUE_RE % re.escape(const), provision_source, re.MULTILINE)
+    if not match:
+        return None
+    try:
+        return base64.b64decode(match.group(1))
+    except Exception:
+        return None
 
 
 def read_text(path):
@@ -283,6 +299,48 @@ class TestProvisionEmbedding(unittest.TestCase):
             [],
             "sync_provision.py's mapping references these constants, which "
             f"provision.py does not declare: {stale}",
+        )
+
+    def test_every_embedded_payload_is_the_current_source(self):
+        """Mapped is not the same as current, and this is the gap that matters.
+
+        `sync_provision.py` re-encodes each source file into `provision.py`. Nothing runs
+        it automatically, so editing a daemon and committing leaves provisioning shipping
+        the copy embedded whenever it was last synced -- while `deploy_updates.py`, which
+        reads the files directly, ships the new one. The two deployment paths then install
+        different code, and only the path nobody uses day to day is wrong.
+
+        That happened: eleven of thirty-one constants were stale after a session's work,
+        including `spark_daemon_decoded.py` (whose stale copy could not start a VM),
+        `daruk.py` (whose stale copy made every sealed image writable) and
+        `helios_schema.py` (missing the migration snapshots need). Every fix existed in
+        the tree and none of it would have reached a freshly provisioned cluster.
+
+        Run `python sync_provision.py` to fix a failure here.
+        """
+        provision_source = read_text(PROVISION)
+        stale = []
+        for const, src in sorted(self.mapping.items()):
+            path = os.path.join(REPO_ROOT, src)
+            if not os.path.exists(path):
+                continue
+            embedded = embedded_payload(provision_source, const)
+            if embedded is None:
+                continue
+            with open(path, "rb") as handle:
+                # sync_provision.py normalises line endings on the way in, so a CRLF
+                # checkout must not read as a difference.
+                current = handle.read().replace(b"\r\n", b"\n")
+            if embedded != current:
+                stale.append(
+                    "%s (%s): embedded %d bytes, source is %d"
+                    % (const, src, len(embedded), len(current)))
+        self.assertEqual(
+            stale,
+            [],
+            "provision.py embeds copies that are not the current sources, so a freshly "
+            "provisioned cluster would get different code from one updated by "
+            "deploy_updates.py. Run `python sync_provision.py`:\n  " + "\n  ".join(stale),
         )
 
     def test_every_mapped_source_file_exists(self):
