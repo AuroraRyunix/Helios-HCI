@@ -29,8 +29,42 @@ try:
 except Exception:
     pass
 
+_SIDON = None
+
+
+def sidon_module():
+    """helios_sidon, or None. Loaded from /usr/local/bin, which is not on sys.path."""
+    global _SIDON
+    if _SIDON is not None:
+        return _SIDON or None
+    try:
+        import helios_sidon
+        _SIDON = helios_sidon
+        return _SIDON
+    except ImportError:
+        pass
+    import importlib.util
+    for candidate in ("/usr/local/bin/helios_sidon.py",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_sidon.py")):
+        if os.path.exists(candidate):
+            spec = importlib.util.spec_from_file_location("helios_sidon", candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _SIDON = module
+            return module
+    _SIDON = False
+    return None
+
+
 def get_dfs_engine():
-    return "linstor"
+    """Which storage engine backs VM disks. Was hardcoded to "linstor" and called by
+    nothing; it is now the switch that decides how a VM's disks are made ready to boot."""
+    module = sidon_module()
+    return module.dfs_engine() if module else "linstor"
+
+
+def using_sidon():
+    return get_dfs_engine() == "sidon"
 
 def get_default_container():
     return "default-pool"
@@ -954,9 +988,18 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     else:
         disk_paths_with_bus = [(f"/dev/drbd/by-res/{name}-disk0/0", "virtio")]
 
+    sidon = sidon_module() if using_sidon() else None
+
     for idx, (d_path, bus) in enumerate(disk_paths_with_bus):
         dev_prefix = "vd" if bus == "virtio" else "sd"
         dev_letter = letters[idx % 26]
+        if sidon is not None:
+            # A network disk on a unix socket. qemu talks NBD to the local Sidon and never
+            # opens a block device, so there is no /dev node to promote, demote or leak --
+            # which is also why the start path attaches instead of running drbdadm.
+            disk_devices_xml += sidon.disk_xml(
+                sidon.vdisk_id_for(name, idx), dev_letter, vcpu)
+            continue
         if bus == "virtio":
             driver_opts = f"name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'"
         else:
@@ -1426,18 +1469,43 @@ def process_queue_task(task):
             # would put two qemu processes on the same raw device.
             promoted = []
             if disks_list and disks_list != "NONE":
-                for idx, entry in enumerate(disks_list.split(",")):
-                    res_name = f"{vm_name}-disk{idx}"
-                    q_res = shlex.quote(res_name)
-                    rc_d, stdout_d, stderr_d = run_remote_spark(selected_host, f"drbdadm primary {q_res}")
-                    if rc_d != 0:
-                        # Release the resources we already promoted so this host does not sit on them
-                        for done in promoted:
-                            run_remote_spark(selected_host, f"drbdadm secondary {shlex.quote(done)} || true")
-                        release_failed_claim(vm_name, selected_host)
-                        return False, f"Refusing to start {vm_name}: DRBD resource {res_name} could not be promoted to Primary on {selected_host} ({(stderr_d or stdout_d).strip()}). The peer node may still hold Primary for this resource (the VM may still be running there)."
-                    promoted.append(res_name)
-                    run_remote_spark(selected_host, f"drbdadm resize {q_res} || true")
+                disk_count = len(disks_list.split(","))
+                if using_sidon():
+                    # The Sidon equivalent of promotion, and a stronger one. Attaching wins
+                    # the ownership compare-and-swap in Hydra and fences every journal
+                    # replica at the new epoch, so a previous owner that is wedged, lying,
+                    # or unreachable cannot complete another write -- where drbdadm primary
+                    # can only *infer* that the peer stopped, and only where quorum is
+                    # armed. A refused claim names the host that actually holds the disk.
+                    module = sidon_module()
+                    for idx in range(disk_count):
+                        vdisk_id = module.vdisk_id_for(vm_name, idx)
+                        rc_a, body_a, err_a = run_mtls_spark_api(
+                            selected_host, "/api/v1/dfs/vdisk",
+                            {"op": "attach", "vdisk_id": vdisk_id})
+                        if rc_a != 0:
+                            for done in promoted:
+                                run_mtls_spark_api(selected_host, "/api/v1/dfs/vdisk",
+                                                   {"op": "detach", "vdisk_id": done})
+                            release_failed_claim(vm_name, selected_host)
+                            detail = ""
+                            if isinstance(body_a, dict):
+                                detail = body_a.get("error") or ""
+                            return False, f"Refusing to start {vm_name}: Sidon would not hand {vdisk_id} to {selected_host} ({detail or err_a}). Another host may still own the disk."
+                        promoted.append(vdisk_id)
+                else:
+                    for idx, entry in enumerate(disks_list.split(",")):
+                        res_name = f"{vm_name}-disk{idx}"
+                        q_res = shlex.quote(res_name)
+                        rc_d, stdout_d, stderr_d = run_remote_spark(selected_host, f"drbdadm primary {q_res}")
+                        if rc_d != 0:
+                            # Release the resources we already promoted so this host does not sit on them
+                            for done in promoted:
+                                run_remote_spark(selected_host, f"drbdadm secondary {shlex.quote(done)} || true")
+                            release_failed_claim(vm_name, selected_host)
+                            return False, f"Refusing to start {vm_name}: DRBD resource {res_name} could not be promoted to Primary on {selected_host} ({(stderr_d or stdout_d).strip()}). The peer node may still hold Primary for this resource (the VM may still be running there)."
+                        promoted.append(res_name)
+                        run_remote_spark(selected_host, f"drbdadm resize {q_res} || true")
 
             cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
