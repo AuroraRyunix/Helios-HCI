@@ -10,7 +10,7 @@
 //! won the compare-and-swap in Hydra, and the epoch it won is the epoch every journal
 //! record it writes will carry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use crate::err::{Error, Result};
 use crate::meta::{cql_str, json_params, now_ms, Daruk};
 use crate::nbd::{self, Export};
+use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
 pub struct DaemonConfig {
@@ -34,6 +35,8 @@ pub struct DaemonConfig {
     pub node: String,
     pub high_water: u64,
     pub daruk_timeout: Duration,
+    pub purah_interval: Duration,
+    pub purah_grace: Duration,
 }
 
 struct Attached {
@@ -45,6 +48,7 @@ struct Attached {
 pub struct Daemon {
     cfg: DaemonConfig,
     attached: Mutex<HashMap<String, Attached>>,
+    purah_state: Mutex<Purah>,
 }
 
 impl Daemon {
@@ -55,7 +59,22 @@ impl Daemon {
         if let Some(parent) = cfg.control_socket.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Ok(Arc::new(Daemon { cfg, attached: Mutex::new(HashMap::new()) }))
+        let store = crate::extent::EgroupStore::new(&cfg.root.join("egroups"), 0)?;
+        let purah = Purah::new(
+            Daruk::new(&cfg.daruk_addr, cfg.daruk_timeout),
+            store,
+            &cfg.node,
+            // Zero means zero. The safe default lives in main.rs where the environment is
+            // read; silently substituting it here would make an explicit
+            // SIDON_PURAH_GRACE=0 do something other than what it says, which is worse
+            // than letting an operator who asked for no grace have none.
+            cfg.purah_grace,
+        );
+        Ok(Arc::new(Daemon {
+            cfg,
+            attached: Mutex::new(HashMap::new()),
+            purah_state: Mutex::new(purah),
+        }))
     }
 
     fn daruk(&self) -> Daruk {
@@ -82,6 +101,7 @@ impl Daemon {
             ))
         })?;
         std::fs::set_permissions(&self.cfg.control_socket, std::fs::Permissions::from_mode(0o600))?;
+        self.start_purah();
         println!("sidon: control socket ready");
 
         for conn in listener.incoming() {
@@ -155,6 +175,8 @@ impl Daemon {
             "list" => self.op_list(),
             "status" => self.op_status(req),
             "flush" => self.op_flush(req),
+            "purah-sweep" => self.op_purah_sweep(),
+            "purah-scrub" => self.op_purah_scrub(),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
         }
     }
@@ -343,7 +365,7 @@ impl Daemon {
         let daruk = self.daruk();
         // Map rows first, then the vdisk row. The reverse order would leave orphaned map
         // rows pointing into egroups with no vdisk to explain them, which is exactly the
-        // state the curator cannot distinguish from a bug.
+        // state Purah cannot distinguish from a bug.
         daruk.query(&format!(
             "DELETE FROM hydra.dfs_block_map WHERE vdisk_id = {}",
             cql_str(&id)
@@ -354,10 +376,10 @@ impl Daemon {
         ))?;
         let journal = self.cfg.root.join("journal").join(format!("{id}.jrn"));
         let _ = std::fs::remove_file(&journal);
-        // Extent groups are left for the curator: they may be shared with snapshots, and
+        // Extent groups are left for Purah: they may be shared with snapshots, and
         // deleting shared data because one referrer went away is the bug refcounts exist
         // to cause. Mark-sweep reclaims them when nothing points at them.
-        Ok(json!({"vdisk_id": id, "deleted": true, "egroups": "left for the curator"}))
+        Ok(json!({"vdisk_id": id, "deleted": true, "egroups": "left for purah"}))
     }
 
     fn op_list(&self) -> Result<Value> {
@@ -417,6 +439,69 @@ fn group_id(name: &str) -> Option<u32> {
         }
     }
     None
+}
+
+impl Daemon {
+    /// Extent groups every attached vdisk is using, gathered under their locks.
+    fn held_egroups(&self) -> HashSet<String> {
+        let map = self.attached.lock().expect("attached mutex poisoned");
+        let mut held = HashSet::new();
+        for a in map.values() {
+            let v = a.vdisk.lock().expect("vdisk mutex poisoned");
+            held.extend(v.held_egroups());
+        }
+        held
+    }
+
+    fn op_purah_sweep(&self) -> Result<Value> {
+        // The curator state -- which groups have been seen unreferenced, and since when --
+        // lives across sweeps, so it is held by the daemon rather than rebuilt per call.
+        // Two consecutive observations is the rule; a fresh Purah each time would reset
+        // that and could reclaim on first sight.
+        let held = self.held_egroups();
+        let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
+        let report = purah.sweep(&held, now_ms())?;
+        Ok(report.to_json())
+    }
+
+    fn op_purah_scrub(&self) -> Result<Value> {
+        let purah = self.purah_state.lock().expect("purah mutex poisoned");
+        Ok(purah.scrub()?.to_json())
+    }
+
+    /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.
+    pub fn start_purah(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        let interval = me.cfg.purah_interval;
+        if interval.is_zero() {
+            println!("sidon: purah is disabled (interval 0)");
+            return;
+        }
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            match me.op_purah_sweep() {
+                Ok(r) => {
+                    let reclaimed = r.get("reclaimed").and_then(Value::as_array)
+                        .map(|a| a.len()).unwrap_or(0);
+                    if reclaimed > 0 {
+                        println!("purah: reclaimed {reclaimed} extent group(s), {} bytes",
+                                 r.get("bytes_reclaimed").and_then(Value::as_u64).unwrap_or(0));
+                    }
+                }
+                // Hydra being unreachable is not a reason to stop curating forever; the
+                // next tick tries again. Reclamation is allowed to be late.
+                Err(e) => eprintln!("purah: sweep failed: {e}"),
+            }
+            match me.op_purah_scrub() {
+                Ok(r) => {
+                    if r.get("clean").and_then(Value::as_bool) != Some(true) {
+                        eprintln!("purah: SCRUB FOUND DAMAGE: {r}");
+                    }
+                }
+                Err(e) => eprintln!("purah: scrub failed: {e}"),
+            }
+        });
+    }
 }
 
 fn str_field(req: &Value, name: &str) -> Result<String> {

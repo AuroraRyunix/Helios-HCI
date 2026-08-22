@@ -6,14 +6,14 @@
 //!
 //! 1. **A write is acknowledged when its journal record is durable, and not before.**
 //! 2. **Extent bytes are durable before any map row points at them.** A crash between
-//!    the two leaves orphaned bytes, which the curator sweeps. The reverse ordering
+//!    the two leaves orphaned bytes, which Purah sweeps. The reverse ordering
 //!    leaves a map pointing at bytes that do not exist, which is data loss.
 //! 3. **The journal is not truncated until the map commit has been applied.** A crash
 //!    between the two replays records that are already drained, which is idempotent.
 //! 4. **Nothing on the guest's write path talks to Hydra.**
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -514,6 +514,21 @@ impl Vdisk {
         self.drain()
     }
 
+    /// Every extent group this vdisk is using right now: everything its map points at,
+    /// plus the open group the next drain will append to.
+    ///
+    /// The sweep needs this because Hydra can be a moment behind the owner: a drain that
+    /// has just repointed an extent leaves the previous group unreferenced in a stale
+    /// read while this vdisk still has the new one only in memory.
+    pub fn held_egroups(&self) -> HashSet<String> {
+        let mut held: HashSet<String> =
+            self.map.values().map(|l| l.egroup_id.clone()).collect();
+        if let Some(eg) = &self.open_eg {
+            held.insert(eg.id.clone());
+        }
+        held
+    }
+
     pub fn stats(&self) -> Value {
         json!({
             "vdisk_id": self.id,
@@ -539,9 +554,4 @@ fn field_u64(row: &Value, name: &str) -> Result<u64> {
             .map_err(|_| Error::meta(format!("column '{name}' is not a number: {s:?}"))),
         _ => Err(Error::meta(format!("row is missing numeric column '{name}'"))),
     }
-}
-
-/// Where a vdisk's files live, for callers that need to clean up after a delete.
-pub fn vdisk_paths(root: &Path, id: &str) -> (PathBuf, PathBuf) {
-    (root.join("journal").join(format!("{id}.jrn")), root.join("egroups"))
 }

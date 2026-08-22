@@ -20,6 +20,7 @@ mod journal;
 mod meta;
 mod nbd;
 mod overlay;
+mod purah;
 mod vdisk;
 
 use std::path::PathBuf;
@@ -61,6 +62,12 @@ fn main() {
         // never waits on one, small enough that replay after a crash is seconds.
         high_water: env_bytes("SIDON_HIGH_WATER", 64 << 20),
         daruk_timeout: Duration::from_secs(env_bytes("SIDON_DARUK_TIMEOUT", 15)),
+        // Purah runs every 5 minutes and will not reclaim anything it has not seen
+        // unreferenced for 10 -- and never on first sight, whatever the grace, because
+        // the two-scan rule is separate from it. Generous on purpose: reclaiming late
+        // costs disk, reclaiming early costs data, and those are not comparable.
+        purah_interval: Duration::from_secs(env_bytes("SIDON_PURAH_INTERVAL", 300)),
+        purah_grace: Duration::from_secs(env_bytes("SIDON_PURAH_GRACE", 600)),
     };
 
     println!(

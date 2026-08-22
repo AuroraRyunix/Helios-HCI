@@ -36,6 +36,11 @@ pub const FLAG_COMMIT: u32 = 1;
 
 pub struct Record {
     pub seq: u64,
+    /// The epoch its writer held. Replay does not consult it -- a record in this node's
+    /// own journal was written by this node -- but it is what a replica checks before
+    /// accepting an append, so the format carries it from the start rather than needing a
+    /// migration when replication lands.
+    #[allow(dead_code)]
     pub epoch: u64,
     pub offset: u64,
     pub flags: u32,
@@ -64,10 +69,6 @@ impl Journal {
 
     pub fn len(&self) -> u64 {
         self.len
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     pub fn next_seq(&self) -> u64 {

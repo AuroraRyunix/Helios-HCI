@@ -8,7 +8,7 @@
 //!
 //! Overwrites therefore never happen in place. A rewritten extent is appended somewhere
 //! new and the map is repointed -- redirect-on-write -- and the bytes it used to occupy
-//! become garbage for the curator to sweep. That trade is deliberate: garbage collection
+//! become garbage for Purah to sweep. That trade is deliberate: garbage collection
 //! is a performance problem, and replica divergence is a correctness problem.
 
 use std::fs::{File, OpenOptions};
@@ -103,10 +103,6 @@ impl EgroupStore {
 
     pub fn path_for(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.eg"))
-    }
-
-    pub fn egroup_bytes(&self) -> u64 {
-        self.egroup_bytes
     }
 
     pub fn create(&self, id: &str) -> Result<OpenEgroup> {

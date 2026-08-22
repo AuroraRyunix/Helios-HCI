@@ -349,7 +349,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 ## 9. Documentation
 
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
-* [docs/dfs/](./docs/dfs/README.md) - The extent-based DFS (Sidon) replacing per-device DRBD replication for VM disks: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, and the ADR list. Sidon and Ganon are built and running on a single node; replication, ownership transfer and the curator are not.
+* [docs/dfs/](./docs/dfs/README.md) - The extent-based DFS (Sidon) replacing per-device DRBD replication for VM disks: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, and the ADR list. Sidon and Ganon are built and running on a single node; replication, ownership transfer and Purah are not.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.
