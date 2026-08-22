@@ -2,13 +2,14 @@
 """Regression tests for the deployment manifest.
 
 Every assertion here corresponds to a defect this repository has actually shipped.
-The deployment story is spread across four independent, hand-maintained lists, and
+The deployment story is spread across five independent, hand-maintained lists, and
 nothing until now compared them to each other:
 
-    sync_provision.py       mapping          var name  -> source file to embed
-    provision.py            *_B64            the embedded payloads themselves
-    create_upgrade_zip.py   components_map   component -> {source file, target path}
-    check_updates.py        components_paths component -> target path (LCM inventory)
+    sync_provision.py       mapping                source file to embed, by var name
+    provision.py            *_B64                  the embedded payloads themselves
+    create_upgrade_zip.py   components_map         component -> {source, target path}
+    check_updates.py        components_paths       component -> target path (LCM)
+    deploy_updates.py       SPECTRUM_BUILD_FILES   the console image's build context
 
 Drift between any two of them is silent. `sync_provision.py` covering 21 of 24
 constants meant three daemons kept shipping the copy embedded at whatever commit
@@ -39,6 +40,12 @@ PROVISION = os.path.join(REPO_ROOT, "provision.py")
 SYNC_PROVISION = os.path.join(REPO_ROOT, "sync_provision.py")
 CREATE_UPGRADE_ZIP = os.path.join(REPO_ROOT, "create_upgrade_zip.py")
 CHECK_UPDATES = os.path.join(REPO_ROOT, "check_updates.py")
+DEPLOY_UPDATES = os.path.join(REPO_ROOT, "deploy_updates.py")
+DOCKERFILE = os.path.join(REPO_ROOT, "Dockerfile")
+
+# `COPY <source> <destination>` in the Spectrum Dockerfile. Only the source matters
+# here: it names a file that has to be in the build context.
+DOCKERFILE_COPY_RE = re.compile(r"^COPY\s+(\S+)\s+\S+\s*$", re.MULTILINE)
 
 # Files whose embedded string literals are dispatched to nodes and executed as
 # Python. `handle_cluster_create` sends these to every host and JSON-parses the
@@ -83,6 +90,110 @@ def embedded_script_literals(path):
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id.endswith("_script"):
                 yield target.id, node.lineno, node.value.value
+
+
+class TestSpectrumBuildContext(unittest.TestCase):
+    """The Dockerfile's COPY lines vs what deploy_updates.py stages for the build.
+
+    This drifted twice, and both times silently. The Dockerfile gained
+    `COPY lanayru.py` and later `COPY helios_sidon.py`; deploy_updates.py staged
+    neither, so `podman build` failed with "no such file or directory" on every
+    rollout -- and the script printed the error, continued, restarted spectrum onto
+    the image that was already running, and reported the deployment successful. The
+    console silently stopped being upgraded while nothing said so.
+
+    The build failure is fatal now. This keeps it from happening in the first place.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.build_files = literal_assignment(DEPLOY_UPDATES, "SPECTRUM_BUILD_FILES")
+        cls.staged = {staged for _source, staged in cls.build_files}
+        copied = DOCKERFILE_COPY_RE.findall(read_text(DOCKERFILE))
+        # `static/` is a directory, walked separately rather than listed.
+        cls.copied = {name for name in copied if not name.endswith("/")}
+
+    def test_every_file_the_dockerfile_copies_is_staged(self):
+        missing = sorted(self.copied - self.staged)
+        self.assertEqual(
+            missing,
+            [],
+            "Dockerfile COPYs these into the Spectrum image but deploy_updates.py's "
+            f"SPECTRUM_BUILD_FILES does not stage them, so podman build fails: {missing}",
+        )
+
+    def test_nothing_is_staged_that_the_image_does_not_want(self):
+        """The reverse is not a build failure, but it is worth being told about: a
+        file in the context that no COPY names is either a forgotten COPY line or a
+        stale entry."""
+        extra = sorted(self.staged - self.copied)
+        self.assertEqual(
+            extra,
+            [],
+            "deploy_updates.py stages these into the Spectrum build context but the "
+            f"Dockerfile COPYs none of them: {extra}",
+        )
+
+    def test_every_staged_source_exists(self):
+        missing = sorted(
+            source for source, _staged in self.build_files
+            if not os.path.exists(os.path.join(REPO_ROOT, source))
+        )
+        self.assertEqual(
+            missing,
+            [],
+            f"SPECTRUM_BUILD_FILES names sources that do not exist: {missing}",
+        )
+
+
+class TestRustCrates(unittest.TestCase):
+    """Every Rust service the tree builds is one an upgrade can actually ship.
+
+    `sidon` was reachable only through provision.py, which meant the storage daemon
+    could be changed in the repository and never reach a running cluster except by
+    reprovisioning the node -- the one component where that is the least acceptable
+    answer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.crates = literal_assignment(DEPLOY_UPDATES, "RUST_CRATES")
+
+    def test_every_crate_in_the_tree_is_deployed(self):
+        in_tree = {
+            name for name in os.listdir(REPO_ROOT)
+            if os.path.isfile(os.path.join(REPO_ROOT, name, "Cargo.toml"))
+        }
+        listed = {crate for crate, _binary in self.crates}
+        missing = sorted(in_tree - listed)
+        self.assertEqual(
+            missing,
+            [],
+            "these crates have a Cargo.toml in the repository but deploy_updates.py's "
+            f"RUST_CRATES does not build them, so no rollout can ship them: {missing}",
+        )
+
+    def test_every_deployed_crate_exists(self):
+        missing = sorted(
+            crate for crate, _binary in self.crates
+            if not os.path.isfile(os.path.join(REPO_ROOT, crate, "Cargo.toml"))
+        )
+        self.assertEqual(
+            missing, [], f"RUST_CRATES names crates that are not in the tree: {missing}"
+        )
+
+    def test_each_crate_declares_the_binary_it_is_deployed_as(self):
+        """The install step copies target/release/<binary>. A crate whose Cargo.toml
+        produces a differently-named artefact would build cleanly and then fail to
+        install, at the end of a rollout rather than the start."""
+        for crate, binary in self.crates:
+            manifest = read_text(os.path.join(REPO_ROOT, crate, "Cargo.toml"))
+            self.assertIn(
+                'name = "%s"' % binary,
+                manifest,
+                f"deploy_updates.py installs {crate} as '{binary}', but "
+                f"{crate}/Cargo.toml does not declare that name",
+            )
 
 
 class TestProvisionEmbedding(unittest.TestCase):

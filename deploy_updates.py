@@ -10,6 +10,56 @@ def put_text_file(sftp, local_path, remote_path):
     with sftp.open(remote_path, "wb") as f_remote:
         f_remote.write(content.encode("utf-8"))
 
+
+# The Rust services, by crate directory and the binary each produces. They are built on
+# the node rather than shipped as binaries: the cluster is one architecture and one
+# distribution, and a cross-built binary in an update package is a thing nobody can
+# reproduce from the repository.
+#
+# `sidon` was reachable only through provision.py until this list existed, which meant a
+# cluster could be upgraded but its storage daemon could not -- the one component where
+# "reprovision the node to get the fix" is the least acceptable answer.
+RUST_CRATES = (
+    ("agahnim", "agahnim"),
+    ("sidon", "sidon"),
+    ("ganon", "ganon"),
+)
+
+
+def mkdir_p(sftp, path):
+    """sftp has no mkdir -p, and an existing directory raises."""
+    built = ""
+    for part in path.split("/"):
+        if not part:
+            continue
+        built += "/" + part
+        try:
+            sftp.mkdir(built)
+        except IOError:
+            pass
+
+
+def upload_crate(sftp, ssh, local_root, crate):
+    """Stage one crate's sources under /tmp/<crate>_build. Returns the build directory.
+
+    Every .rs file under src/ is sent, not a named list. sidon has twelve modules and
+    ganon four, and a list here would go stale the first time one is added -- silently,
+    because a missing module is a compile error on the node long after this script has
+    reported success.
+    """
+    build_dir = "/tmp/%s_build" % crate
+    ssh.exec_command("rm -rf %s" % build_dir)
+    mkdir_p(sftp, build_dir + "/src")
+
+    local_crate = os.path.join(local_root, crate)
+    put_text_file(sftp, os.path.join(local_crate, "Cargo.toml"), build_dir + "/Cargo.toml")
+
+    local_src = os.path.join(local_crate, "src")
+    for name in sorted(os.listdir(local_src)):
+        if name.endswith(".rs"):
+            put_text_file(sftp, os.path.join(local_src, name), build_dir + "/src/" + name)
+    return build_dir
+
 # Blindly accepting unknown host keys (paramiko.AutoAddPolicy) means every rollout
 # re-trusts whatever currently answers on the node IP -- and what this script pushes
 # is root-executed code, so a MITM here owns the whole cluster. Verify against
@@ -34,6 +84,41 @@ def new_ssh_client():
     else:
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
     return client
+
+
+def live_sftp(ssh, sftp):
+    """Return a usable SFTP channel, reopening it if the one we hold has been closed.
+
+    A rollout opens one SFTP channel at the start and then spends minutes running remote
+    commands -- three cargo builds and a podman image build. The SFTP channel is idle
+    through all of it, and it does not reliably survive: the next write comes back
+    "Socket is closed" from paramiko's own Channel, which is the server having closed the
+    channel out from under a connection that is otherwise perfectly healthy.
+
+    Keepalives on the transport do not help, because the transport was never the thing
+    that died. Probing and reopening does, and it is the honest shape anyway: a channel
+    opened ten minutes ago is not something to assume is still there.
+    """
+    try:
+        sftp.stat("/")
+        return sftp
+    except Exception:
+        return ssh.open_sftp()
+
+
+def keep_alive(ssh):
+    """Send SSH keepalives so a long remote build does not cost us the connection.
+
+    A rollout opens one SFTP channel and then runs commands that take minutes -- three
+    cargo builds and a podman image build. With nothing on the wire in between, the
+    connection is idle for the whole of it, and the next SFTP call comes back "Socket is
+    closed" from a channel that was reaped while we waited on a command.
+
+    Thirty seconds is well inside any sensible ClientAliveInterval and costs one packet.
+    """
+    transport = ssh.get_transport()
+    if transport is not None:
+        transport.set_keepalive(30)
 
 def explain_host_key_failure(ip, err):
     if isinstance(err, paramiko.BadHostKeyException):
@@ -83,6 +168,7 @@ try:
         ssh_cert.connect(nodes[0], username=username, key_filename=key_path, timeout=15)
     else:
         ssh_cert.connect(nodes[0], username=username, password=password, timeout=15)
+    keep_alive(ssh_cert)
     cmd_check = "test -f /etc/hci/spectrum/certs/server.crt && test -f /etc/hci/spectrum/certs/server.key"
     stdin_chk, stdout_chk, stderr_chk = ssh_cert.exec_command(cmd_check)
     if stdout_chk.channel.recv_exit_status() != 0:
@@ -114,6 +200,24 @@ local_spark = "spark.py"
 local_cluster = "cluster_new.py"
 local_daemon = "spark_daemon_decoded.py"
 local_helios_zk = "helios_zk.py"
+# Every file the Spectrum image's Dockerfile COPYs, as (repo path, name in the build
+# context). `static/` is walked separately because it is a directory.
+#
+# This is an inventory rather than a run of put_text_file calls because it drifted:
+# the Dockerfile gained `COPY lanayru.py` and `COPY helios_sidon.py` and this list did
+# not, so `podman build` failed on every rollout with "no such file or directory" -- and
+# the failure was printed, stepped over, and followed by "Deployment successful", with
+# spectrum restarted onto the image it was already running. The console had silently
+# stopped being upgraded. test_deployment_manifest.py now keeps the two in agreement.
+SPECTRUM_BUILD_FILES = (
+    ("spectrum_server.py", "spectrum_server.py"),
+    ("hylia.py", "hylia.py"),
+    ("helios_sig.py", "helios_sig.py"),
+    ("helios_schema.py", "helios_schema.py"),
+    ("lanayru.py", "lanayru.py"),
+    ("helios_sidon.py", "helios_sidon.py"),
+)
+
 local_helios_sig = "helios_sig.py"
 local_impa = "impa.py"
 local_helios_schema = "helios_schema.py"
@@ -485,6 +589,8 @@ def deploy_to_node(ip):
             else:
                 ssh.connect(ip, username=username, password=password, timeout=15)
             
+            keep_alive(ssh)
+
             if not fast_mode:
                 # 1. Clean and recreate build directory for Spectrum
                 print(f"[{ip}] Preparing build directories on remote host...")
@@ -733,22 +839,16 @@ def deploy_to_node(ip):
                 ssh.exec_command("podman load -i /tmp/traefik.tar && rm -f /tmp/traefik.tar")
             
             if not fast_mode:
-                # 3b. Upload Dockerfile and server.py for Spectrum build
+                # 3b. Stage the Spectrum build context: the Dockerfile and every file it
+                # COPYs. `spectrum_server.py` becomes `server.py` inside the image, but
+                # it is staged under its own name -- the rename is the Dockerfile's job.
                 print(f"[{ip}] Uploading Dockerfile for Spectrum build...")
                 put_text_file(sftp, local_dockerfile, "/tmp/spectrum_build/Dockerfile")
-                
-                print(f"[{ip}] Uploading server.py for Spectrum build...")
-                put_text_file(sftp, local_server, "/tmp/spectrum_build/spectrum_server.py")
-                
-                print(f"[{ip}] Uploading hylia.py for Spectrum build...")
-                put_text_file(sftp, local_yggdrasil, "/tmp/spectrum_build/hylia.py")
 
-                # Staged for the image alongside hylia: the console extracts update
-                # packages in-container, so whatever verifies a manifest has to exist
-                # there too. Requires a matching COPY line in the Dockerfile.
-                print(f"[{ip}] Uploading helios_sig.py for Spectrum build...")
-                put_text_file(sftp, local_helios_sig, "/tmp/spectrum_build/helios_sig.py")
-                put_text_file(sftp, local_helios_schema, "/tmp/spectrum_build/helios_schema.py")
+                print(f"[{ip}] Uploading {len(SPECTRUM_BUILD_FILES)} sources for Spectrum build...")
+                for source, staged in SPECTRUM_BUILD_FILES:
+                    put_text_file(sftp, os.path.join(local_dir, source),
+                                  "/tmp/spectrum_build/" + staged)
                 
                 # 3c. Upload all static assets for Spectrum build (recursively)
                 print(f"[{ip}] Uploading static assets for Spectrum build...")
@@ -773,20 +873,11 @@ def deploy_to_node(ip):
                         
                         put_text_file(sftp, local_filepath, remote_filepath)
                 
-                # Upload Agahnim proxy source files
-                print(f"[{ip}] Uploading Agahnim proxy source...")
-                ssh.exec_command("rm -rf /tmp/agahnim_build && mkdir -p /tmp/agahnim_build/src")
-                local_agahnim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agahnim")
-                try:
-                    sftp.mkdir("/tmp/agahnim_build")
-                except IOError:
-                    pass
-                try:
-                    sftp.mkdir("/tmp/agahnim_build/src")
-                except IOError:
-                    pass
-                put_text_file(sftp, os.path.join(local_agahnim_dir, "Cargo.toml"), "/tmp/agahnim_build/Cargo.toml")
-                put_text_file(sftp, os.path.join(local_agahnim_dir, "src", "main.rs"), "/tmp/agahnim_build/src/main.rs")
+                # Upload every Rust crate's sources.
+                local_root = os.path.dirname(os.path.abspath(__file__))
+                for crate, _binary in RUST_CRATES:
+                    print(f"[{ip}] Uploading {crate} source...")
+                    upload_crate(sftp, ssh, local_root, crate)
             
             # Write shared SSL certificates to ensure uniform certs across all Traefik (Slate) instances
             if shared_cert and shared_key:
@@ -873,23 +964,39 @@ def deploy_to_node(ip):
                 if exit_code != 0:
                     print(f"[{ip}] Error compiling WASM: {stderr.read().decode()}")
                     
-                # Compile Agahnim Console Proxy (Rust)
-                print(f"[{ip}] Compiling Agahnim console proxy...")
-                cmd_agahnim = (
-                    "cd /tmp/agahnim_build && cargo build --release && "
-                    "cp /tmp/agahnim_build/target/release/agahnim /usr/local/bin/agahnim && "
-                    "chmod +x /usr/local/bin/agahnim && "
-                    "rm -rf /tmp/agahnim_build"
-                )
-                stdin, stdout, stderr = ssh.exec_command(cmd_agahnim)
-                exit_code = stdout.channel.recv_exit_status()
-                if exit_code != 0:
-                    print(f"[{ip}] Error compiling Agahnim: {stderr.read().decode()}")
+                # Compile the Rust services.
+                #
+                # sidon is installed but not restarted here. Restarting the storage daemon
+                # detaches every vdisk on the node, so it belongs in the maintenance
+                # window the rolling upgrade already opens -- hylia drains the host first
+                # and puts the new binary into service with the reboot. Copying it in
+                # early is safe because systemd runs the inode it already opened.
+                for crate, binary in RUST_CRATES:
+                    print(f"[{ip}] Compiling {crate}...")
+                    cmd_build = (
+                        "cd /tmp/{c}_build && cargo build --release && "
+                        "install -m 0755 /tmp/{c}_build/target/release/{b} /usr/local/bin/{b} && "
+                        "rm -rf /tmp/{c}_build"
+                    ).format(c=crate, b=binary)
+                    stdin, stdout, stderr = ssh.exec_command(cmd_build)
+                    exit_code = stdout.channel.recv_exit_status()
+                    if exit_code != 0:
+                        detail = stderr.read().decode()
+                        print(f"[{ip}] Error compiling {crate}: {detail}")
+                        if crate == "sidon":
+                            # Every other component can limp. A node whose storage daemon
+                            # did not build has the old one still running and a rollout
+                            # that reported success, which is how a cluster ends up
+                            # running two versions of the thing that owns the data path.
+                            raise RuntimeError(
+                                "sidon failed to build on %s; refusing to continue this "
+                                "node's update: %s" % (ip, detail.strip()[:400]))
                 
             # Deploy/update systemd service unit
             # Agahnim is a compiled Rust binary, so it is a native systemd unit -- not a
             # container. The previous heredoc here also never terminated: its EOF marker was
             # indented, which `<< 'EOF'` (unquoted delimiter position) does not match.
+            sftp = live_sftp(ssh, sftp)
             f_agah = sftp.open("/etc/systemd/system/agahnim.service", "w")
             f_agah.write("""[Unit]
 Description=Agahnim Console Proxy Daemon
@@ -917,7 +1024,14 @@ WantedBy=multi-user.target
                 stdin, stdout, stderr = ssh.exec_command("podman build -t localhost/spectrum:latest /tmp/spectrum_build")
                 exit_code = stdout.channel.recv_exit_status()
                 if exit_code != 0:
-                    print(f"[{ip}] Error building spectrum container: {stderr.read().decode()}")
+                    # Fatal, because the next step restarts spectrum -- onto the image
+                    # that is already there. Reporting the build error and then reporting
+                    # the deployment successful is how a console goes months without
+                    # being upgraded while every rollout says it worked.
+                    raise RuntimeError(
+                        "the spectrum image failed to build on %s, so restarting it "
+                        "would only reinstate the running one: %s"
+                        % (ip, stderr.read().decode().strip()[:600]))
                 
             # 11. Restart systemd-spectrum service
             print(f"[{ip}] Restarting spectrum service...")
@@ -963,7 +1077,13 @@ WantedBy=multi-user.target
             
         except Exception as e:
             if not explain_host_key_failure(ip, e):
-                print(f"[{ip}] Failed to deploy: {e}\n")
+                # With the traceback. A rollout has forty-odd steps and "Socket is
+                # closed" names none of them, which turns a one-line failure into a
+                # bisect of the script.
+                import traceback
+                print(f"[{ip}] Failed to deploy: {e}")
+                traceback.print_exc()
+                print()
         finally:
             ssh.close()
 

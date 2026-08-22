@@ -738,8 +738,7 @@ impl Daemon {
                         "size_bytes": v.size,
                         "degraded": v.degraded,
                         "class": v.class,
-                        "replicas": v.replicas.iter()
-                            .map(|r| r.node.clone()).collect::<Vec<_>>(),
+                        "replicas": v.map_replicas(),
                         "role": "owner",
                     }));
                 }

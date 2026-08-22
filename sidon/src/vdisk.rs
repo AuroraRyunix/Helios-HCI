@@ -994,7 +994,12 @@ impl Vdisk {
             "journal_bytes": self.journal.len(),
             "overlay_segments": self.overlay.len(),
             "mapped_extents": self.map.len(),
-            "replicas": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
+            // The set as the map records it, this node included -- not `self.replicas`,
+            // which is the peers this node dials and is therefore one short. Reporting
+            // the dialled list under this name is how a reader counting replicas against
+            // the redundancy factor concludes every vdisk is one copy down.
+            "replicas": self.map_replicas.clone(),
+            "peers": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
             "degraded": self.degraded,
         })
     }

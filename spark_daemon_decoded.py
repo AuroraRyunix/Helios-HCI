@@ -3271,8 +3271,20 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     # over the mutual TLS this daemon already terminates. That is the whole reason this
     # endpoint exists: one authenticated surface for the cluster rather than a second
     # certificate, a second port and a second thing to rotate, per storage tier.
-    DFS_OPS = ("create", "attach", "detach", "delete", "status", "list", "flush", "ping",
-               "seal", "resize", "capacity", "peers", "purah-sweep", "purah-scrub", "purah-heal")
+    # Operations that name a vdisk, and operations that are about the node.
+    #
+    # Split rather than listing the exceptions, because listing exceptions is how this
+    # broke: the guard read "everything except list and ping needs a vdisk_id", so
+    # capacity, peers and all three purah jobs -- which take no vdisk and never did --
+    # were refused with "Invalid vdisk id". Every caller of capacity went through this
+    # endpoint, so hylia's storage guard refused every node's maintenance exit, vali's
+    # migration capacity gate read unknown and refused every migration, and the console
+    # rendered a cluster with no storage in it.
+    DFS_VDISK_OPS = ("create", "attach", "detach", "delete", "status", "flush",
+                     "seal", "resize")
+    DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
+                    "purah-sweep", "purah-scrub", "purah-heal")
+    DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS
 
     def handle_dfs_vdisk(self):
         payload, error = self.read_json_payload()
@@ -3288,8 +3300,7 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject("Unsupported DFS operation: %r" % (op,))
             return
 
-        vdisk_id = payload.get("vdisk_id")
-        if op not in ("list", "ping") and not valid_name(vdisk_id):
+        if op in self.DFS_VDISK_OPS and not valid_name(payload.get("vdisk_id")):
             self.reject("Invalid vdisk id")
             return
 

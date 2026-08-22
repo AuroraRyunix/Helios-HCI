@@ -4,7 +4,9 @@ import json
 import ssl
 import socket
 import subprocess
+import re
 import urllib.request
+import urllib.error
 import time
 import os
 import threading
@@ -99,6 +101,60 @@ def run_mtls_api(ip, path, payload, method="POST"):
                 if rc_alt == 0 and "error" not in res_alt:
                     return rc_alt, res_alt, err_alt
     return rc, res, err
+
+def slugify_image_name(filename):
+    """The vdisk id an image is stored under, from its filename.
+
+    Character-for-character what `slugify_image_name` in spectrum_server.py produces.
+    The two must agree: a delete that computes a different slug removes nothing, or --
+    worse -- something else. Duplicated rather than imported because valcli is a
+    stdlib-only script installed on its own, with no import path back to the console.
+    """
+    base = filename
+    for extension in (".iso", ".qcow2", ".img"):
+        if filename.lower().endswith(extension):
+            base = filename[:-len(extension)]
+            break
+
+    slug = re.sub(r"[^a-z0-9_-]", "-", base.lower())
+    slug = re.sub(r"-+", "-", slug)
+    return slug.strip("-")[:28]
+
+
+def run_mtls_spark_api(ip, path, payload, method="POST"):
+    """One mTLS call to one node's spark-daemon. No failover, deliberately.
+
+    `run_mtls_api` above retries a failed loopback call on another node, which is right
+    for reading cluster state and wrong for everything under /api/v1/dfs/. A vdisk has
+    exactly one owner, so "attach on this node" retried elsewhere is not the same request
+    -- it is a different and incorrect one. The name matches vali.py and mipha.py, which
+    is the semantics these call sites were written against.
+    """
+    ip, verify_identity = spark_endpoint(ip)
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = verify_identity
+
+    url = f"https://{ip}:9099{path}"
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+            return 0, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as e:
+        # The daemon answers a refused storage operation with 409 and a body naming the
+        # host that holds the disk. Swallowing that as a transport error would turn the
+        # one useful message in the exchange into "call failed".
+        try:
+            return 0, json.loads(e.read().decode("utf-8")), ""
+        except Exception:
+            return -1, {}, str(e)
+    except Exception as e:
+        return -1, {}, str(e)
+
 
 def run_cql_query(cql_query, *args, **kwargs):
     import urllib.request
@@ -899,16 +955,12 @@ def cmd_disk_delete(disk_name):
     # refuses to delete a vdisk it is still serving, so the detach is worked with rather
     # than forced -- and a refusal here means something still has the disk, which is
     # exactly what should stop a delete.
-    for host in hosts_list:
-        ip = host.get("ip")
-        if not ip:
-            continue
+    for ip in hosts:
         run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": disk_name})
 
     print(f"Deleting vdisk '{disk_name}'...")
     rc_del, body_del, err_del = run_mtls_spark_api(
-        hosts_list[0].get("ip", "127.0.0.1"), "/api/v1/dfs/vdisk",
-        {"op": "delete", "vdisk_id": disk_name})
+        hosts[0], "/api/v1/dfs/vdisk", {"op": "delete", "vdisk_id": disk_name})
     if rc_del != 0:
         detail = body_del.get("error") if isinstance(body_del, dict) else err_del
         print(f"Error: could not delete the vdisk: {detail}")

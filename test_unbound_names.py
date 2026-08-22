@@ -41,7 +41,8 @@ COMPONENTS = [
     "impa.py", "saga.py", "lanayru.py", "spectrum_server.py", "cluster_new.py",
     "provision.py", "deploy_updates.py", "check_updates.py", "create_upgrade_zip.py",
     "sync_provision.py", "helios_schema.py", "helios_sidon.py", "helios_sig.py",
-    "helios_zk.py", "mimir.py", "mcli", "mcli-runner", "valcli",
+    "helios_zk.py", "mimir.py", "mcli", "mcli-runner", "valcli.py", "nodetool",
+    "catcli", "urbosa.py", "urbosa_bootstrap.py",
 ]
 
 BUILTIN_NAMES = frozenset(dir(builtins)) | {
@@ -163,12 +164,19 @@ def unbound_names(path):
 
 class UnboundNameTests(unittest.TestCase):
     def test_no_component_reads_a_name_nothing_binds(self):
+        # A name in COMPONENTS that is not a file is a typo, and a typo here silently
+        # switches a component off. `valcli` was listed instead of `valcli.py`, so ten
+        # calls to a function that exists in no module went unnoticed until the command
+        # was run on a node.
+        absent = [c for c in COMPONENTS if not os.path.exists(os.path.join(HERE, c))]
+        self.assertEqual(
+            absent, [],
+            "COMPONENTS names files that are not in the repository, so they are not "
+            "being checked at all: %s" % absent)
+
         broken = {}
         for component in COMPONENTS:
-            path = os.path.join(HERE, component)
-            if not os.path.exists(path):
-                continue
-            findings = unbound_names(path)
+            findings = unbound_names(os.path.join(HERE, component))
             if findings:
                 broken[component] = findings
 

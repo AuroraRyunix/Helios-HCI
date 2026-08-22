@@ -34,7 +34,7 @@ defmodule SpectrumPhx.StorageTest do
       "epoch" => Keyword.get(opts, :epoch, 3),
       "size_bytes" => Keyword.get(opts, :size, 10_737_418_240),
       "degraded" => Keyword.get(opts, :degraded, false),
-      "class" => Keyword.get(opts, :class, "mutable"),
+      "class" => Keyword.get(opts, :class, "rw"),
       "replicas" => Keyword.get(opts, :replicas, ["hci-01", "hci-02"])
     }
   end

@@ -115,18 +115,8 @@ impl EgroupStore {
         Ok(OpenEgroup { id: id.to_string(), file, size: 0 })
     }
 
-    /// Append one extent plus its footer. Returns the offset the extent starts at.
-    pub fn append(
-        &self,
-        eg: &mut OpenEgroup,
-        data: &[u8],
-        vdisk_hash: u64,
-        extent_index: u64,
-    ) -> Result<u32> {
-        self.append_framed(eg, data, vdisk_hash, extent_index).map(|(off, _)| off)
-    }
-
-    /// Append, and hand back the exact bytes written.
+    /// Append one extent plus its footer, handing back the offset and the exact bytes
+    /// written.
     ///
     /// The caller ships those bytes to the replicas rather than re-framing there, so every
     /// copy is byte-identical and repair stays a checksum comparison instead of a
@@ -240,7 +230,7 @@ mod tests {
         let mut eg = store.create("eg-test-1").unwrap();
         let vh = vdisk_hash("vd-1");
         let data = vec![0x5Au8; 4096];
-        let off = store.append(&mut eg, &data, vh, 3).unwrap();
+        let (off, _) = store.append_framed(&mut eg, &data, vh, 3).unwrap();
         store.sync(&mut eg).unwrap();
         let back = store.read_extent("eg-test-1", off, 4096, vh, 3).unwrap();
         assert_eq!(back, data);
@@ -253,7 +243,7 @@ mod tests {
         let store = EgroupStore::new(&dir, 1 << 20).unwrap();
         let mut eg = store.create("eg-c").unwrap();
         let vh = vdisk_hash("vd-1");
-        let off = store.append(&mut eg, &vec![7u8; 512], vh, 0).unwrap();
+        let (off, _) = store.append_framed(&mut eg, &vec![7u8; 512], vh, 0).unwrap();
         store.sync(&mut eg).unwrap();
         drop(eg);
 
@@ -275,7 +265,7 @@ mod tests {
         let store = EgroupStore::new(&dir, 1 << 20).unwrap();
         let mut eg = store.create("eg-m").unwrap();
         let vh = vdisk_hash("vd-1");
-        let off = store.append(&mut eg, &vec![1u8; 256], vh, 42).unwrap();
+        let (off, _) = store.append_framed(&mut eg, &vec![1u8; 256], vh, 42).unwrap();
         store.sync(&mut eg).unwrap();
 
         // Same bytes, same checksum, wrong extent: this is the failure a CRC alone

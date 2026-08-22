@@ -31,7 +31,7 @@ defmodule SpectrumPhx.UploadStubs do
 
     def seal(ip, vdisk) do
       report({:seal, ip, vdisk})
-      answer(:seal, {:ok, %{"class" => "immutable"}})
+      answer(:seal, {:ok, %{"class" => "immutable", "sealed" => true}})
     end
 
     def delete(ip, vdisk) do
