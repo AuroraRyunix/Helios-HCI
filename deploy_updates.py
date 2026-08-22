@@ -86,6 +86,42 @@ def new_ssh_client():
     return client
 
 
+DRBD_TEARDOWN = """# Tear down what is left of DRBD on a node upgraded from a DRBD cluster.
+#
+# Removing the Quadlets stops the satellite and the controller; it does nothing about
+# the kernel side. Four resources stayed up with the module at refcount 5, /dev/drbd*
+# nodes still present, and /var/lib/linstor still mounted on one of them, days after
+# every trace of LINSTOR had been removed from the tree.
+#
+# Deliberately not forced at any step. `drbdadm down` refuses a resource something
+# still has open, and that refusal is the guard against tearing storage out from under
+# a process still using it -- so a failure here leaves the module loaded and the
+# packages installed, which is the safe direction. Nothing that follows depends on it.
+#
+# The backing logical volumes are left alone. They are thin and hold tens of megabytes
+# between them, and removing a volume is a decision about data rather than about
+# packages.
+umount /var/lib/linstor 2>/dev/null
+sed -i '\\|/var/lib/linstor|d' /etc/fstab 2>/dev/null
+command -v drbdadm >/dev/null 2>&1 && drbdadm down all 2>/dev/null
+# A few seconds, because the module does not drop to refcount 0 the instant the last
+# resource is downed -- the first pass over a live node downed four resources, failed
+# to unload, and left the packages installed and a warning printed for a node that was
+# in fact finished. `modprobe -r` rather than rmmod: it takes the dependent transport
+# module with it, which rmmod will not.
+for _attempt in 1 2 3 4 5; do
+    lsmod | grep -q '^drbd ' || break
+    modprobe -r drbd 2>/dev/null && break
+    sleep 2
+done
+if ! lsmod | grep -q '^drbd '; then
+    rpm -q kmod-drbd9x >/dev/null 2>&1 && dnf remove -y kmod-drbd9x 2>/dev/null
+    rpm -q drbd9x-utils >/dev/null 2>&1 && dnf remove -y drbd9x-utils 2>/dev/null
+fi
+rm -rf /etc/drbd.d /etc/drbd.conf /var/lib/linstor 2>/dev/null
+true"""
+
+
 def live_sftp(ssh, sftp):
     """Return a usable SFTP channel, reopening it if the one we hold has been closed.
 
@@ -790,16 +826,42 @@ def deploy_to_node(ip):
             f_proxy.write(daruk_service_content)
             f_proxy.close()
             
-            # The satellite and controller Quadlets are removed rather than written.
-            # A node upgraded from a DRBD cluster still carries both, and a leftover
-            # .container generates a unit that starts a satellite against a controller
-            # which no longer exists.
+            # The satellite and controller Quadlets are removed rather than written,
+            # and the containers they generated are stopped.
+            #
+            # Removing the .container file alone was not enough, and the gap was
+            # invisible: the generated unit is gone at the next daemon-reload, but a
+            # container that is already running keeps running until the host reboots.
+            # A node upgraded from a DRBD cluster therefore kept a LINSTOR satellite and
+            # controller alive for days after every trace of LINSTOR had been removed
+            # from the tree, holding ports and answering queries that nothing asked any
+            # more -- while `podman ps` showed a storage stack the cluster no longer has.
             for stale in ("aether", "linstor-controller"):
                 try:
                     sftp.remove(f"/etc/containers/systemd/{stale}.container")
                     print(f"[{ip}] Removed stale {stale}.container Quadlet.")
                 except IOError:
                     pass
+
+            # `|| true` throughout: on a cluster that never had DRBD none of this exists,
+            # and a rollout must not fail because it had nothing to clean up.
+            _, stdout_stale, _ = ssh.exec_command(
+                "systemctl stop aether linstor-controller 2>/dev/null; "
+                "podman rm -f systemd-aether systemd-linstor-controller 2>/dev/null; "
+                "systemctl reset-failed aether linstor-controller 2>/dev/null; true")
+            stdout_stale.channel.recv_exit_status()
+
+            print(f"[{ip}] Tearing down any leftover DRBD...")
+            _, stdout_drbd, _ = ssh.exec_command(DRBD_TEARDOWN)
+            stdout_drbd.channel.recv_exit_status()
+            _, stdout_check, _ = ssh.exec_command("lsmod | grep -c '^drbd ' || true")
+            stdout_check.channel.recv_exit_status()
+            if stdout_check.read().decode().strip() not in ("0", ""):
+                # Not fatal. Something still has a DRBD device open, which is a reason
+                # to leave it alone rather than a reason to stop the rollout -- but it
+                # is the only place anyone would find out.
+                print(f"[{ip}] NOTE: the DRBD module is still loaded, so something is "
+                      f"still holding a device. Run `drbdsetup status` to see what.")
 
             # 3a. Update spectrum.container Quadlet
             print(f"[{ip}] Writing updated spectrum.container Quadlet...")

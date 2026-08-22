@@ -70,6 +70,42 @@ IMAGES = {
 REGISTRY = ""
 
 
+
+DRBD_TEARDOWN = """# Tear down what is left of DRBD on a node upgraded from a DRBD cluster.
+#
+# Removing the Quadlets stops the satellite and the controller; it does nothing about
+# the kernel side. Four resources stayed up with the module at refcount 5, /dev/drbd*
+# nodes still present, and /var/lib/linstor still mounted on one of them, days after
+# every trace of LINSTOR had been removed from the tree.
+#
+# Deliberately not forced at any step. `drbdadm down` refuses a resource something
+# still has open, and that refusal is the guard against tearing storage out from under
+# a process still using it -- so a failure here leaves the module loaded and the
+# packages installed, which is the safe direction. Nothing that follows depends on it.
+#
+# The backing logical volumes are left alone. They are thin and hold tens of megabytes
+# between them, and removing a volume is a decision about data rather than about
+# packages.
+umount /var/lib/linstor 2>/dev/null
+sed -i '\\|/var/lib/linstor|d' /etc/fstab 2>/dev/null
+command -v drbdadm >/dev/null 2>&1 && drbdadm down all 2>/dev/null
+# A few seconds, because the module does not drop to refcount 0 the instant the last
+# resource is downed -- the first pass over a live node downed four resources, failed
+# to unload, and left the packages installed and a warning printed for a node that was
+# in fact finished. `modprobe -r` rather than rmmod: it takes the dependent transport
+# module with it, which rmmod will not.
+for _attempt in 1 2 3 4 5; do
+    lsmod | grep -q '^drbd ' || break
+    modprobe -r drbd 2>/dev/null && break
+    sleep 2
+done
+if ! lsmod | grep -q '^drbd '; then
+    rpm -q kmod-drbd9x >/dev/null 2>&1 && dnf remove -y kmod-drbd9x 2>/dev/null
+    rpm -q drbd9x-utils >/dev/null 2>&1 && dnf remove -y drbd9x-utils 2>/dev/null
+fi
+rm -rf /etc/drbd.d /etc/drbd.conf /var/lib/linstor 2>/dev/null
+true"""
+
 def resolve_image(name):
     """The image reference for a component, with any registry override applied.
 
@@ -1340,6 +1376,21 @@ WantedBy=multi-user.target
                               "aether", "linstor-controller"]
             node.execute("rm -f " + " ".join(f"/etc/containers/systemd/{q}.container" for q in stale_quadlets))
             node.execute("systemctl daemon-reload")
+            # Unlinking the Quadlet does not stop a container that is already running --
+            # the generated unit is gone at the next reload, and the container survives
+            # until the host reboots. A node upgraded from a DRBD cluster therefore kept
+            # a LINSTOR satellite and controller alive for days after every trace of
+            # LINSTOR had been removed from the tree.
+            node.execute(
+                "systemctl stop aether linstor-controller 2>/dev/null; "
+                "podman rm -f systemd-aether systemd-linstor-controller 2>/dev/null; "
+                "systemctl reset-failed aether linstor-controller 2>/dev/null; true")
+            # And the kernel side, which the Quadlets never touched: resources still
+            # up, /dev/drbd* still present, /var/lib/linstor still mounted, the module
+            # still loaded and the packages still installed. Not forced at any step --
+            # `drbdadm down` refusing a resource something has open is the guard, not
+            # an obstacle.
+            node.execute(DRBD_TEARDOWN)
         except Exception as e:
             print(f"[{node.ip}] Quadlet deployment failed: {e}")
             node.close()

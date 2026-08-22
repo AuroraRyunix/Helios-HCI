@@ -834,24 +834,6 @@ def get_storage_free_space(target_ip):
     return available // (1024 * 1024)
 
 
-def _iter_storage_pools(payload):
-    """Yield storage-pool dicts from whatever shape the client emits.
-
-    Piraeus wraps them inconsistently between versions -- sometimes a bare list of lists,
-    sometimes a dict under a key. Reading only one shape is how the resource list came
-    back empty while resources existed.
-    """
-    stack = [payload]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            if "free_capacity" in item or "storage_pool_name" in item:
-                yield item
-                continue
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-
 def get_vm_xml_specs(name):
     cql = f"SELECT JSON * FROM hydra.vms WHERE name = '{name}';"
     rc, stdout, _ = run_cql_query(cql)
@@ -1560,10 +1542,12 @@ def process_queue_task(task):
                 return False, f"Target host {target_host} has insufficient free extent-store space ({target_free} MiB available, needs {disk_size} MiB)."
 
             # Take the migration lock. The condition and the write are one Paxos round, so
-            # there is no window between them: previously the code read `status`, decided
-            # nobody was migrating, and set it in a separate statement, which two callers
-            # could both pass. Live migration is exactly the window in which storage
-            # dual-primary is open, so two of them on one VM is disk corruption.
+            # there is no window between them: previously the code read `status`,
+            # decided nobody was migrating, and set it in a separate statement, which two
+            # callers could both pass. What that used to risk was disk corruption, since
+            # live migration was the window in which DRBD dual-primary was open. What it
+            # risks now is two migrations racing each other's ownership CAS and leaving
+            # the VM defined on a host that does not own its disk.
             print(f"Taking the migration lock for VM '{vm_name}'...")
             ok, applied, current, err = run_lwt("/v1/vm/migrate-lock", {"name": vm_name})
             if not ok:

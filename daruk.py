@@ -165,7 +165,10 @@ LWT_OPS = {
     # Placement. `expected_host_ip` is the value the caller read before it decided to
     # start the VM; the swap only lands if the row still holds it. Without the condition
     # two nodes write their own IP a millisecond apart, both believe they own the VM, and
-    # both open the same DRBD device -- the dual-primary corruption this exists to stop.
+    # both try to boot it. The storage layer would now refuse the second one -- a vdisk
+    # has one owner per epoch -- so this is no longer the last line against a corrupted
+    # disk. It is still the first: a refusal here is a clean error, and a refusal at the
+    # storage layer is a half-started VM to clean up.
     "/v1/vm/claim": {
         "cql": "UPDATE hydra.vms SET host_ip = ?, state = ? WHERE name = ? IF host_ip = ?",
         "binds": ("host_ip", "state", "name", "expected_host_ip"),
