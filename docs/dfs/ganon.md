@@ -65,13 +65,15 @@ easy case and real clusters do not fail cleanly:
 |---|---|---|
 | Process kill | `kill -9` on the daemon / qemu | crash mid-anything |
 | Process **stall** | `SIGSTOP … SIGCONT` | the wedged-but-alive host, the fencing work's hardest case; a stalled owner resuming with stale state is the sharpest I-4 attack there is |
-| Kernel death | `echo c > /proc/sysrq-trigger` | host loss with no goodbye (on an expendable node) |
+| Kernel death | `echo c > /proc/sysrq-trigger` | host loss with no goodbye (on an expendable node) — **requires `kernel.sysrq` to permit it**; the reference node ships `16` (sync only), so the injector must widen it deliberately on the target, which doubles as a guard against ever pointing this at the last node |
 | Partition | nftables drop, **including asymmetric** (A sees B, B drops A) and partial (data port only, Hydra still reachable — and the reverse) | every split-brain precondition; the asymmetric cases are where lease-based designs die |
-| Disk misbehaviour | `dm-flakey` (fails after N s), `dm-dust` (bad sectors), `dm-delay` (slow disk ≠ dead disk) | dying disks, and the grey zone where a disk answers slowly enough to stall but not to fail |
+| Disk misbehaviour | `dm-flakey` (fails after N s; also `error_reads`, `corrupt_bio_byte`, `random_read_corrupt`) and `dm-delay` (slow disk ≠ dead disk) | dying disks, and the grey zone where a disk answers slowly enough to stall but not to fail. **`dm-dust` is not built in the RHEL 10 kernel** — verified, not assumed — so bad-sector emulation comes from `dm-flakey`'s read-error and corruption modes instead of a second target. No capability is lost; the granularity is coarser. |
 | Power-loss proxy | `dm-flakey` with `drop_writes` across a remount | the lying-fsync window, to the extent software can forge it (invariants.md is explicit that a physical power-cut rig eventually supersedes this) |
 | On-disk corruption | flip bytes in a replica file / DRBD backing LV directly | bitrot; the scrub-and-read-repair attack (I-5) |
 | Clock skew | `date -s` jumps on one node | every "the lease hasn't expired by *my* clock" argument |
 | Space exhaustion | fill the backing filesystem | ENOSPC mid-drain, the error path nobody tests |
+
+Verified present on the reference node: `dm-flakey`, `dm-delay`, `nbd`, `libnbd`, nftables 1.1.5, qemu 10.1.0 (`/usr/libexec/qemu-kvm`), kernel 6.12, rustc/cargo 1.92 with working crates.io access. The two gaps are in the rows above and neither blocks milestone 1.
 
 ## 5. Scenario × invariant
 
