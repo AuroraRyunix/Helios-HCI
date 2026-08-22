@@ -125,7 +125,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
         </div>
         <p class="-mt-3 text-xs text-zinc-500">
           Comma separated sizes in GiB or TiB, optionally <code>size:container</code>.
-          Each becomes one DRBD resource.
+          Each becomes one vdisk.
         </p>
 
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">

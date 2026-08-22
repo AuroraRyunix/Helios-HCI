@@ -7,8 +7,8 @@ defmodule SpectrumPhx.Vms.Vm do
 
   ## Why the name is *rejected* rather than sanitised
 
-  A VM name reaches a root shell on the hypervisor (Vali builds `drbdadm`, `virsh` and
-  `linstor` command lines from it and hands them to spark-daemon's `/api/v1/execute`,
+  A VM name reaches a root shell on the hypervisor (Vali builds `virsh` command lines
+  from it and hands them to spark-daemon's `/api/v1/execute`,
   which runs them with a shell as root) and it reaches CQL. It is also the operator-visible
   identity of the VM: silently rewriting `web 01` into `web-01`, the way image names are
   slugified, would leave an operator looking at a VM that is not the one they asked for,
@@ -82,7 +82,7 @@ defmodule SpectrumPhx.Vms.Vm do
   @min_vcpu 1
   @max_vcpu 512
 
-  # Sizes are ultimately handed to `linstor volume-definition create <res> <n>GiB`, and
+  # Sizes are ultimately handed to a vdisk create as a byte count, and
   # Vali only knows how to convert G and T suffixes. Accepting "512M" here would produce a
   # crash three services away rather than a field error here, so M is rejected up front.
   @disk_size_regex ~r/\A(\d+)\s*(G|GB|GIB|T|TB|TIB)?\z/i
@@ -229,8 +229,8 @@ defmodule SpectrumPhx.Vms.Vm do
   The VM's disks, parsed out of the `disks_list` column.
 
   Entries are `"<size>"` or `"<size>:<container>"`, comma separated; the literal
-  `"NONE"` means the VM has no disks. Each disk N of VM `foo` is the DRBD resource
-  `foo-diskN` at `/dev/drbd/by-res/foo-diskN/0`.
+  `"NONE"` means the VM has no disks. Each disk N of VM `foo` is the vdisk `foo-diskN`,
+  served to qemu over the unix socket `/var/lib/hci/sidon/nbd/foo-diskN.sock`.
   """
   @spec disks(t()) :: [map()]
   def disks(%__MODULE__{disks_list: list, name: name}) do
@@ -252,7 +252,7 @@ defmodule SpectrumPhx.Vms.Vm do
         size_gib: size_gib_or_nil(size),
         container: container,
         resource: resource,
-        path: "/dev/drbd/by-res/#{resource}/0"
+        path: "/var/lib/hci/sidon/nbd/#{resource}.sock"
       }
     end)
   end
@@ -369,7 +369,7 @@ defmodule SpectrumPhx.Vms.Vm do
     end
   end
 
-  # The container name is appended to a Linstor storage-pool argument, so it gets the
+  # The container name is appended to a storage argument, so it gets the
   # same treatment as a VM name rather than being passed through.
   defp validate_container(nil), do: :ok
 

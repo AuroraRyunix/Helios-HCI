@@ -189,7 +189,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           <:col :let={disk} label="#">{disk.index}</:col>
           <:col :let={disk} label="Size">{disk.size}</:col>
           <:col :let={disk} label="Container">{blank(disk.container, "default")}</:col>
-          <:col :let={disk} label="DRBD resource">
+          <:col :let={disk} label="Vdisk">
             <span class="font-mono text-xs">{disk.resource}</span>
           </:col>
           <:col :let={disk} label="Path">

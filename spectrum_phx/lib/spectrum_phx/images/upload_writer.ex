@@ -3,20 +3,19 @@ defmodule SpectrumPhx.Images.UploadWriter do
   Streams an uploaded image onto cluster storage without ever staging it here.
 
   A `Phoenix.LiveView.UploadWriter` that pushes each chunk the browser sends onto an
-  already-open request to spark-daemon, which owns the block device. The default writer
-  spools to a temporary file; for an install ISO that is gibibytes of the web tier's disk,
-  and it puts this tier back on the data path that `SpectrumPhx.Images` exists to keep it
-  off. See `SpectrumPhx.Images.upload_note/0`.
+  already-open request to spark-daemon, which is native to the host and owns storage. The
+  default writer spools to a temporary file; for an install ISO that is gibibytes of the
+  web tier's disk, and it puts this tier back on the data path that `SpectrumPhx.Images`
+  exists to keep it off. See `SpectrumPhx.Images.upload_note/0`.
 
   ## Where the work happens
 
-  `init/1` does no network work at all. The DRBD preparation runs on the *first chunk*,
+  `init/1` does no network work at all. Preparing the vdisk runs on the *first chunk*,
   because `init/1` is called inside the upload channel's `join` and the browser joins with
   the socket's default ten-second timeout -- then *rejoins* if it expires, which would run
-  the whole preparation a second time and leak the first attempt's connection. Waiting for
-  a DRBD device to appear can use most of that budget on its own. `write_chunk/2` is
-  bounded by `:chunk_timeout`, which the LiveView sets, so the slow work sits under a
-  limit this code controls.
+  the whole preparation a second time and leak the first attempt's connection.
+  `write_chunk/2` is bounded by `:chunk_timeout`, which the LiveView sets, so the work
+  sits under a limit this code controls rather than one the browser picked.
 
   ## Backpressure
 
@@ -28,7 +27,7 @@ defmodule SpectrumPhx.Images.UploadWriter do
 
   Every exit runs the rollback. `close/2` is called with `:done` when all chunks arrived,
   `:cancel` when the operator navigated away or the socket died, and `{:error, reason}`
-  when a chunk failed -- and a half-built DRBD resource holds storage on every node that
+  when a chunk failed -- and a half-built vdisk holds storage on every replica that
   nothing reclaims, so all three paths converge on `SpectrumPhx.Images.rollback_upload/1`
   unless the upload actually completed and was registered.
 
@@ -73,8 +72,8 @@ defmodule SpectrumPhx.Images.UploadWriter do
       name: state.name,
       size_bytes: state.size_bytes,
       written: state.written,
-      device: state.allocation && state.allocation.device,
-      resource: state.allocation && state.allocation.resource,
+      socket: state.allocation && state.allocation.socket,
+      vdisk: state.allocation && state.allocation.vdisk,
       result: state.result
     }
   end
@@ -113,10 +112,10 @@ defmodule SpectrumPhx.Images.UploadWriter do
       {:ok, %{state | stage: :done, written: written, result: {:ok, image}}}
     else
       {:error, reason} ->
-        # Connection first, allocation second. The daemon holds the device open for as
-        # long as the request is alive, so a delete issued before the socket closes is
-        # refused with "resource is still in use" and the resource leaks -- which is the
-        # exact failure this rollback exists to prevent.
+        # Connection first, allocation second. The daemon holds the vdisk attached for
+        # as long as the request is alive, so a delete issued before the socket closes is
+        # refused and the vdisk leaks -- which is the exact failure this rollback exists
+        # to prevent.
         transport().close(state.handle)
         Images.rollback_upload(state.allocation)
         # {:error, _} from close/2 fails the entry, which is right: an image that was not
@@ -128,8 +127,8 @@ defmodule SpectrumPhx.Images.UploadWriter do
   # Cancelled, or closed before a single chunk arrived. Nothing was allocated unless the
   # first chunk got as far as preparing, and rollback is safe either way.
   def close(%{stage: stage} = state, reason) when stage in [:pending, :streaming] do
-    # Connection first: the daemon releases the device when the request ends, and the
-    # LINSTOR delete cannot succeed until it has.
+    # Connection first: the daemon releases the vdisk when the request ends, and the
+    # delete cannot succeed until it has.
     if state.handle, do: transport().close(state.handle)
 
     if state.allocation do
@@ -182,10 +181,10 @@ defmodule SpectrumPhx.Images.UploadWriter do
   defp error_of(_state), do: {:transport, "The upload was already aborted."}
 
   defp register_attrs(state) do
-    %{name: state.name, size_bytes: state.size_bytes, device: state.allocation.device}
+    %{name: state.name, size_bytes: state.size_bytes, socket: state.allocation.socket}
   end
 
-  # The volume was defined for the size the browser declared, and the daemon rejects a
+  # The vdisk was created at the size the browser declared, and the daemon rejects a
   # body that does not match its Content-Length. Catching it here names the actual problem
   # rather than surfacing a truncated-body transport error.
   defp declared_size_reached(%{written: written, size_bytes: size}) when written == size, do: :ok
@@ -235,7 +234,7 @@ defmodule SpectrumPhx.Images.UploadWriter do
              Mint.HTTP.request(
                conn,
                "POST",
-               Spark.device_write_path(allocation.device),
+               Spark.vdisk_write_path(allocation.vdisk),
                headers,
                :stream
              ) do

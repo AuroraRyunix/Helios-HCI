@@ -6,58 +6,59 @@ defmodule SpectrumPhx.StorageTest do
 
   alias SpectrumPhx.Storage
 
-  @two_nodes ["10.10.0.11", "10.10.0.12"]
+  @a "10.10.0.11"
+  @b "10.10.0.12"
+  @two_nodes [@a, @b]
 
   # -- fixtures ------------------------------------------------------------------------
 
-  defp resource(name, opts \\ []) do
+  # Sidon's `capacity` document. Bytes, from statfs on the extent store's own filesystem.
+  defp capacity(node, opts \\ []) do
     %{
-      "name" => name,
-      "node-id" => 0,
-      "role" => Keyword.get(opts, :role, "Secondary"),
-      "suspended" => Keyword.get(opts, :suspended, false),
-      "devices" => [
-        %{
-          "volume" => 0,
-          "minor" => 1000,
-          "disk-state" => Keyword.get(opts, :disk_state, "UpToDate"),
-          "client" => Keyword.get(opts, :client, false),
-          "quorum" => Keyword.get(opts, :quorum, true),
-          # drbdsetup reports KiB: 10 GiB.
-          "size" => 10_485_760
-        }
-      ],
-      "connections" => Keyword.get(opts, :connections, [connection()])
+      "node" => node,
+      "path" => "/var/lib/hci/sidon/egroups",
+      "total_bytes" => Keyword.get(opts, :total, 107_374_182_400),
+      "available_bytes" => Keyword.get(opts, :available, 53_687_091_200),
+      "egroup_bytes" => Keyword.get(opts, :egroup_bytes, 50_331_648),
+      "egroup_count" => Keyword.get(opts, :egroup_count, 12),
+      "journal_bytes" => Keyword.get(opts, :journal_bytes, 4_194_304)
     }
   end
 
-  defp connection(opts \\ []) do
+  # One entry of Sidon's `list` document.
+  defp owned(id, opts \\ []) do
     %{
-      "peer-node-id" => 1,
-      "name" => Keyword.get(opts, :peer, "hci-02"),
-      "connection" => Keyword.get(opts, :state, "Connected"),
-      "peer-role" => Keyword.get(opts, :peer_role, "Secondary"),
-      "peer_devices" => [
-        %{
-          "volume" => 0,
-          "replication" => Keyword.get(opts, :replication, "Established"),
-          "peer-disk-state" => Keyword.get(opts, :peer_disk_state, "UpToDate"),
-          "peer-client" => false
-        }
-      ]
+      "vdisk_id" => id,
+      "socket" => "/var/lib/hci/sidon/nbd/#{id}.sock",
+      "role" => "owner",
+      "epoch" => Keyword.get(opts, :epoch, 3),
+      "size_bytes" => Keyword.get(opts, :size, 10_737_418_240),
+      "degraded" => Keyword.get(opts, :degraded, false),
+      "class" => Keyword.get(opts, :class, "mutable"),
+      "replicas" => Keyword.get(opts, :replicas, ["hci-01", "hci-02"])
     }
   end
 
-  defp pool(name, node, opts \\ []) do
+  defp forwarding(id, to) do
     %{
-      "storage_pool_name" => name,
-      "node_name" => node,
-      "provider_kind" => Keyword.get(opts, :provider, "LVM_THIN"),
-      # LINSTOR reports KiB: 50 GiB free of 100 GiB.
-      "free_capacity" => Keyword.get(opts, :free, 52_428_800),
-      "total_capacity" => Keyword.get(opts, :total, 104_857_600),
-      "props" => %{"StorDriver/StorPoolName" => "vg0/thinpool"},
-      "reports" => Keyword.get(opts, :reports, [])
+      "vdisk_id" => id,
+      "socket" => "/var/lib/hci/sidon/nbd/#{id}.sock",
+      "role" => "forwarding",
+      "forwarding_to" => to
+    }
+  end
+
+  defp attached(entries), do: {:ok, %{"attached" => entries}}
+
+  defp peers(node, entries) do
+    {:ok, %{"node" => node, "peers" => entries}}
+  end
+
+  defp peer(node, opts \\ []) do
+    %{
+      "node" => node,
+      "reachable" => Keyword.get(opts, :reachable, true),
+      "detail" => Keyword.get(opts, :detail, "")
     }
   end
 
@@ -78,8 +79,8 @@ defmodule SpectrumPhx.StorageTest do
               "path" => "/dev/sda1",
               "size" => 1_073_741_824,
               "type" => "part",
-              "mountpoint" => "/boot",
-              "fstype" => "ext4",
+              "mountpoints" => ["/boot"],
+              "fstype" => "xfs",
               "rota" => false
             }
           ]
@@ -88,538 +89,410 @@ defmodule SpectrumPhx.StorageTest do
     }
   end
 
-  # Two nodes, both answering, one healthy two-way-replicated resource.
-  defp healthy(overrides \\ %{}) do
-    Map.merge(
-      %{
-        node_ips: @two_nodes,
-        redundancy_factor: 1,
-        pools: {:ok, [pool("default-pool", "hci-01"), pool("default-pool", "hci-02")]},
-        drbd: %{
-          "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-          "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-        },
-        disks: %{"10.10.0.11" => {:ok, lsblk()}, "10.10.0.12" => {:ok, lsblk()}}
+  # A cluster where both nodes answer everything and nothing is wrong.
+  defp healthy(opts \\ []) do
+    vdisks = Keyword.get(opts, :vdisks, [owned("vm1-disk0")])
+
+    %{
+      node_ips: @two_nodes,
+      redundancy_factor: Keyword.get(opts, :rf, 1),
+      capacity: %{@a => {:ok, capacity("hci-01")}, @b => {:ok, capacity("hci-02")}},
+      vdisks: %{@a => attached(vdisks), @b => attached([])},
+      peers: %{
+        @a => peers("hci-01", [peer("hci-02")]),
+        @b => peers("hci-02", [peer("hci-01")])
       },
-      overrides
-    )
+      disks: %{@a => {:ok, lsblk()}, @b => {:ok, lsblk()}}
+    }
   end
 
-  defp snapshot(static), do: Storage.snapshot(static: static)
+  defp snap(static), do: Storage.snapshot(static: static)
 
-  defp resource_named(snapshot, name) do
-    Enum.find(snapshot.resources.entries, &(&1.name == name))
+  defp vdisk(snapshot, id) do
+    Enum.find(snapshot.vdisks.entries, &(&1.id == id))
   end
 
-  # -- DRBD health ---------------------------------------------------------------------
-
-  describe "DRBD resource health" do
-    test "a fully replicated UpToDate resource is healthy" do
-      snapshot = snapshot(healthy())
-      resource = resource_named(snapshot, "vm-web-01-disk0")
-
-      assert resource.health == :ok
-      assert resource.issues == []
-      assert resource.replicas == 2
-      assert resource.expected_replicas == 2
-      assert resource.under_replicated? == false
-      assert resource.size_bytes == 10_485_760 * 1024
-      assert snapshot.summary.resources_ok == 1
-      refute snapshot.summary.attention?
-    end
-
-    test "an Inconsistent local device is degraded, not healthy" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", disk_state: "Inconsistent")]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "Inconsistent"))
-    end
-
-    test "a StandAlone connection is degraded" do
-      standalone = [connection(state: "StandAlone")]
-
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: standalone)]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "StandAlone"))
-    end
-
-    test "an Outdated peer disk is degraded even though the local copy is fine" do
-      outdated = [connection(peer_disk_state: "Outdated")]
-
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: outdated)]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "Outdated"))
-    end
-
-    test "a resync in progress is degraded rather than healthy" do
-      # Replication "SyncTarget" means this copy is still being filled. Reporting it as
-      # replicated is exactly the claim the fabric cannot back up yet.
-      syncing = [connection(replication: "SyncTarget")]
-
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: syncing)]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "SyncTarget"))
-    end
-
-    test "a lost quorum is degraded" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", quorum: false)]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "quorum"))
-    end
-
-    test "suspended I/O is degraded" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", suspended: true)]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "suspended"))
-    end
-  end
-
-  describe "under-replication" do
-    test "a resource present on one of two nodes is flagged" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: [])]},
-            "10.10.0.12" => {:ok, []}
-          }
-        })
-
-      snapshot = snapshot(static)
-      resource = resource_named(snapshot, "vm-web-01-disk0")
-
-      assert resource.replicas == 1
-      assert resource.expected_replicas == 2
-      assert resource.under_replicated? == true
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "1 of 2 replicas"))
-      assert snapshot.summary.resources_under_replicated == 1
-      assert snapshot.summary.attention?
-    end
-
-    test "a diskless placement is an access point, not a replica" do
-      diskless = resource("vm-web-01-disk0", client: true, disk_state: "Diskless")
-
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-            "10.10.0.12" => {:ok, [diskless]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.replicas == 1
-      assert resource.under_replicated? == true
-    end
-
-    test "a single-node cluster expects one copy and is not under-replicated" do
-      static = %{
-        node_ips: ["10.10.0.11"],
-        redundancy_factor: 0,
-        pools: {:ok, [pool("default-pool", "hci-01")]},
-        drbd: %{"10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: [])]}},
-        disks: %{"10.10.0.11" => {:ok, lsblk()}}
-      }
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.expected_replicas == 1
-      assert resource.under_replicated? == false
-      assert resource.health == :ok
-    end
-
-    test "the redundancy factor cannot demand more copies than there are nodes" do
-      # A two-node cluster configured with FTT 2 would otherwise flag every resource on a
-      # deployment that is doing exactly what it was built to do.
-      static = healthy(%{redundancy_factor: 5})
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.expected_replicas == 2
-      assert resource.under_replicated? == false
-    end
-  end
-
-  describe "dual primary" do
-    test "two Primaries on a VM disk is reported" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", role: "Primary")]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0", role: "Primary")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.health == :degraded
-      assert Enum.any?(resource.issues, &(&1 =~ "dual-primary"))
-      assert length(resource.primaries) == 2
-    end
-
-    test "two Primaries on an image resource is expected and not flagged" do
-      # Image resources carry --allow-two-primaries on purpose: the golden image is
-      # attached read-only to guests on several hosts at once.
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("img-ubuntu-24-04", role: "Primary")]},
-            "10.10.0.12" => {:ok, [resource("img-ubuntu-24-04", role: "Primary")]}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("img-ubuntu-24-04")
-
-      assert resource.health == :ok
-      assert resource.issues == []
-    end
-  end
-
-  describe "unreachable nodes" do
-    test "a node that did not answer makes an otherwise-clean resource unknown" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-            "10.10.0.12" => {:error, :econnrefused}
-          }
-        })
-
-      snapshot = snapshot(static)
-      resource = resource_named(snapshot, "vm-web-01-disk0")
-
-      assert snapshot.resources.state == :partial
-      assert resource.health == :unknown
-      # Not `false`: the unread node might hold the missing replica, and might not.
-      assert resource.under_replicated? == nil
-      assert snapshot.summary.resources_under_replicated == 0
-      assert snapshot.summary.attention?
-    end
-
-    test "a peer DRBD names does not become a phantom under-replication warning" do
-      # 10.10.0.12 did not answer, but 10.10.0.11's DRBD reports a Connected, UpToDate
-      # peer. The copy is evidently there; what is missing is our ability to confirm it.
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-            "10.10.0.12" => {:error, :econnrefused}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.replicas == 1
-      assert resource.evidenced_replicas == 2
-      refute Enum.any?(resource.issues, &(&1 =~ "replicas"))
-      # Still not healthy: peer-reported state is second-hand.
-      assert resource.health == :unknown
-    end
-
-    test "a shortfall no peer accounts for is still reported while nodes are unread" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: [])]},
-            "10.10.0.12" => {:error, :econnrefused}
-          }
-        })
-
-      resource = static |> snapshot() |> resource_named("vm-web-01-disk0")
-
-      assert resource.evidenced_replicas == 1
-      assert Enum.any?(resource.issues, &(&1 =~ "only 1 of 2 replicas could be seen"))
-      assert resource.health == :degraded
-      assert resource.under_replicated? == nil
-    end
-
-    test "the unreachable node is named rather than dropped" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-            "10.10.0.12" => {:error, :econnrefused}
-          }
-        })
-
-      snapshot = snapshot(static)
-
-      assert [%{ip: "10.10.0.12", error: error}] = snapshot.resources.unreachable
-      assert error =~ "econnrefused"
-    end
-
-    test "no node answering is unavailable, not an empty resource list" do
-      static =
-        healthy(%{
-          drbd: %{
-            "10.10.0.11" => {:error, :timeout},
-            "10.10.0.12" => {:error, :timeout}
-          }
-        })
-
-      snapshot = snapshot(static)
-
-      assert snapshot.resources.state == :unavailable
-      assert snapshot.resources.entries == []
-      assert length(snapshot.resources.unreachable) == 2
-      assert snapshot.summary.attention?
-    end
-
-    test "every node answering with nothing is an honest empty fabric" do
-      static = healthy(%{drbd: %{"10.10.0.11" => {:ok, []}, "10.10.0.12" => {:ok, []}}})
-      snapshot = snapshot(static)
-
-      assert snapshot.resources.state == :ok
-      assert snapshot.resources.entries == []
-      refute snapshot.summary.attention?
-    end
-  end
-
-  # -- pools ---------------------------------------------------------------------------
-
-  describe "storage pools" do
-    test "capacities are read as KiB and converted to bytes" do
-      snapshot = snapshot(healthy())
-      [first | _rest] = snapshot.pools.entries
-
-      assert first.total_bytes == 104_857_600 * 1024
-      assert first.free_bytes == 52_428_800 * 1024
-      assert first.used_bytes == 52_428_800 * 1024
-      assert_in_delta first.used_percent, 50.0, 0.001
-      assert first.state == :ok
-      assert first.backing == "vg0/thinpool"
-    end
-
-    test "a diskless pool's sentinel capacity is dropped, not averaged in" do
-      # LINSTOR reports INT64_MAX for a diskless pool. Counting it would make a full
-      # fabric report itself as very nearly empty.
-      diskless =
-        pool("DfltDisklessStorPool", "hci-01",
-          provider: "DISKLESS",
-          free: 9_223_372_036_854_775_807,
-          total: 9_223_372_036_854_775_807
-        )
-
-      static = healthy(%{pools: {:ok, [pool("default-pool", "hci-01"), diskless]}})
-      snapshot = snapshot(static)
-
-      assert Enum.any?(snapshot.pools.entries, &(&1.state == :diskless))
-      assert snapshot.capacity.raw_total_bytes == 104_857_600 * 1024
-    end
-
-    test "a pool LINSTOR reports an error for is an error, not an ok pool" do
-      broken =
-        pool("default-pool", "hci-02",
-          reports: [%{"message" => "Device /dev/sdb is not accessible"}]
-        )
-
-      static = healthy(%{pools: {:ok, [broken]}})
-      snapshot = snapshot(static)
-
-      assert [%{state: :error, messages: [message]}] = snapshot.pools.entries
-      assert message =~ "not accessible"
-      assert snapshot.summary.pools_error == 1
-      assert snapshot.summary.attention?
-    end
-
-    test "a pool with no reported capacity is unknown, not a healthy empty pool" do
-      static = healthy(%{pools: {:ok, [pool("default-pool", "hci-01", total: nil, free: nil)]}})
-      snapshot = snapshot(static)
-
-      assert [%{state: :unknown, used_percent: nil, total_bytes: nil}] = snapshot.pools.entries
-      assert snapshot.summary.attention?
-    end
-
-    test "an unreadable LINSTOR controller is unavailable, not zero pools" do
-      static = healthy(%{pools: {:error, "connection refused"}})
-      snapshot = snapshot(static)
-
-      assert snapshot.pools.state == :unavailable
-      assert snapshot.pools.entries == []
-      assert snapshot.pools.error == "connection refused"
-      refute snapshot.capacity.known?
-      assert snapshot.capacity.raw_total_bytes == nil
-      assert snapshot.summary.attention?
-    end
-
-    test "usable capacity accounts for the copies the cluster keeps" do
-      snapshot = snapshot(healthy())
-
-      # Two pools of 100 GiB each, replicated twice.
-      assert snapshot.capacity.raw_total_bytes == 2 * 104_857_600 * 1024
-      assert snapshot.capacity.usable_total_bytes == 104_857_600 * 1024
-      assert snapshot.capacity.usable_used_bytes == 52_428_800 * 1024
-    end
-
-    test "LINSTOR's outer list wrapper is unwrapped" do
-      # `linstor --machine-readable` wraps rows in an extra list on some versions.
-      static = healthy(%{pools: {:ok, [[pool("default-pool", "hci-01")]]}})
-      snapshot = snapshot(static)
-
-      assert [%{name: "default-pool"}] = snapshot.pools.entries
-    end
-  end
-
-  describe "pools_command/1" do
-    test "renders only values that parse as addresses" do
-      command = Storage.pools_command(["10.10.0.11", "10.10.0.12"])
-
-      assert command =~ "LS_CONTROLLERS=10.10.0.11,10.10.0.12"
-      assert command =~ "--machine-readable storage-pool list"
-    end
-
-    test "drops anything that is not an address rather than passing it to a shell" do
-      command = Storage.pools_command(["10.10.0.11", "; rm -rf /", "$(id)"])
-
-      assert command =~ "LS_CONTROLLERS=10.10.0.11 "
-      refute command =~ "rm -rf"
-      refute command =~ "$("
-    end
-
-    test "falls back to the loopback rather than emitting an empty variable" do
-      assert Storage.pools_command([]) =~ "LS_CONTROLLERS=127.0.0.1"
-    end
-  end
-
-  # -- disks ---------------------------------------------------------------------------
-
-  describe "disk inventory" do
-    test "the lsblk tree is flattened with its nesting preserved" do
-      snapshot = snapshot(healthy())
-      [node | _rest] = snapshot.disks
-
-      assert node.state == :ok
-      assert [disk, partition] = node.devices
-      assert disk.name == "sda"
-      assert disk.depth == 0
-      assert disk.size_bytes == 512_110_190_592
-      assert disk.rotational? == false
-      assert partition.name == "sda1"
-      assert partition.depth == 1
-      assert partition.mountpoint == "/boot"
-    end
-
-    test "a node that did not answer is listed as unreadable, not as having no disks" do
-      static =
-        healthy(%{disks: %{"10.10.0.11" => {:ok, lsblk()}, "10.10.0.12" => {:error, :nxdomain}}})
-
-      snapshot = snapshot(static)
-
-      assert [_ok, unreadable] = snapshot.disks
-      assert unreadable.state == :unavailable
-      assert unreadable.devices == []
-      assert unreadable.error =~ "nxdomain"
-      assert snapshot.summary.nodes_unreadable == 1
-    end
-
-    test "the newer lsblk mountpoints list is read as well" do
-      document = %{
-        "blockdevices" => [
-          %{"name" => "nvme0n1", "size" => 100, "type" => "disk", "mountpoints" => [nil, "/data"]}
-        ]
-      }
-
-      static = healthy(%{disks: %{"10.10.0.11" => {:ok, document}}, node_ips: ["10.10.0.11"]})
-      snapshot = snapshot(static)
-
-      assert [%{devices: [%{mountpoint: "/data"}]}] = snapshot.disks
-    end
+  defp store(snapshot, ip) do
+    Enum.find(snapshot.stores.entries, &(&1.ip == ip))
   end
 
   # -- no cluster ------------------------------------------------------------------------
 
   describe "no cluster" do
     test "an unconfigured host reports nothing rather than an empty healthy fabric" do
-      snapshot =
-        snapshot(%{
-          node_ips: [],
-          redundancy_factor: 0,
-          pools: {:error, :no_cluster_configured},
-          drbd: %{},
-          disks: %{}
-        })
+      snapshot = snap(%{node_ips: []})
 
       refute snapshot.configured?
-      assert snapshot.pools.state == :unavailable
-      assert snapshot.resources.state == :unavailable
+      assert snapshot.stores.state == :unavailable
+      assert snapshot.vdisks.state == :unavailable
       assert snapshot.disks == []
       refute snapshot.capacity.known?
+      # The distinction the whole module exists for: "nothing was read" is not "nothing
+      # is wrong".
+      assert snapshot.summary.attention?
+    end
+  end
+
+  # -- extent stores ---------------------------------------------------------------------
+
+  describe "extent stores" do
+    test "capacity is read as bytes and used is derived from what is left" do
+      snapshot = snap(healthy())
+      store = store(snapshot, @a)
+
+      assert store.total_bytes == 107_374_182_400
+      assert store.available_bytes == 53_687_091_200
+      assert store.used_bytes == 53_687_091_200
+      assert_in_delta store.used_percent, 50.0, 0.01
+      assert store.state == :ok
+      assert store.messages == []
+    end
+
+    test "a store reporting no capacity is unknown, not an empty one at 0% used" do
+      static = put_in(healthy().capacity[@a], {:ok, capacity("hci-01", total: 0, available: 0)})
+      snapshot = snap(static)
+
+      store = store(snapshot, @a)
+      assert store.state == :unknown
+      assert store.used_percent == nil
+      assert [message] = store.messages
+      assert message =~ "not mounted"
       assert snapshot.summary.attention?
     end
 
-    test "the live path on a host with no cluster.json reads nothing and says so" do
-      # No static payload at all, so this is the real sourcing code. `Cluster.Config`
-      # finds no hosts on a development machine, so there is nobody to call and the fan-out
-      # never happens -- the page must not hang, and must not come back looking healthy.
+    test "a store that cannot drain is an error, not a warning" do
+      # 96% used.
+      full = capacity("hci-01", total: 100_000_000_000, available: 4_000_000_000)
+      snapshot = snap(put_in(healthy().capacity[@a], {:ok, full}))
+
+      store = store(snapshot, @a)
+      assert store.state == :full
+      assert [message] = store.messages
+      assert message =~ "cannot drain"
+    end
+
+    test "a store filling up warns before it is too late to reclaim" do
+      # 88% used: past the warn line, short of the one where a drain fails.
+      filling = capacity("hci-01", total: 100_000_000_000, available: 12_000_000_000)
+      snapshot = snap(put_in(healthy().capacity[@a], {:ok, filling}))
+
+      assert store(snapshot, @a).state == :warn
+      assert snapshot.summary.stores_warn == 1
+      assert snapshot.summary.stores_full == 0
+    end
+
+    test "a node that did not answer is named rather than dropped" do
+      static = put_in(healthy().capacity[@b], {:error, "connection refused"})
+      snapshot = snap(static)
+
+      assert snapshot.stores.state == :partial
+      assert [%{ip: @b, error: "connection refused"}] = snapshot.stores.unreachable
+      # And it is not silently counted as a store with no capacity.
+      assert length(snapshot.stores.entries) == 1
+    end
+
+    test "no node answering is unavailable, not a cluster with no storage" do
+      static =
+        healthy()
+        |> put_in([:capacity, @a], {:error, :timeout})
+        |> put_in([:capacity, @b], {:error, :timeout})
+
+      snapshot = snap(static)
+
+      assert snapshot.stores.state == :unavailable
+      assert snapshot.stores.entries == []
+      refute snapshot.capacity.known?
+    end
+  end
+
+  # -- capacity --------------------------------------------------------------------------
+
+  describe "capacity" do
+    test "usable is raw divided by the number of copies kept" do
+      # rf: 1 means ftt=1, so two copies.
+      snapshot = snap(healthy(rf: 1))
+
+      assert snapshot.expected_replicas == 2
+      assert snapshot.capacity.raw_total_bytes == 2 * 107_374_182_400
+      assert snapshot.capacity.usable_total_bytes == 107_374_182_400
+    end
+
+    test "a single-node cluster keeps one copy however the factor reads" do
+      static = %{
+        node_ips: [@a],
+        redundancy_factor: 2,
+        capacity: %{@a => {:ok, capacity("hci-01")}},
+        vdisks: %{@a => attached([owned("vm1-disk0", replicas: ["hci-01"])])},
+        peers: %{@a => peers("hci-01", [])},
+        disks: %{@a => {:ok, lsblk()}}
+      }
+
+      snapshot = snap(static)
+
+      # ftt=0 is a supported topology, not a broken one: asking for three replicas on one
+      # node would flag every vdisk on a deployment that is behaving exactly as designed.
+      assert snapshot.expected_replicas == 1
+      assert vdisk(snapshot, "vm1-disk0").health == :ok
+      assert snapshot.capacity.usable_total_bytes == snapshot.capacity.raw_total_bytes
+    end
+
+    test "a partial read is not presented as the cluster total" do
+      static = put_in(healthy().capacity[@b], {:error, :timeout})
+      snapshot = snap(static)
+
+      assert snapshot.stores.state == :partial
+      assert snapshot.capacity.raw_total_bytes == 107_374_182_400
+    end
+  end
+
+  # -- vdisk health ----------------------------------------------------------------------
+
+  describe "vdisk health" do
+    test "an owned, fully replicated vdisk is healthy" do
+      snapshot = snap(healthy())
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.health == :ok
+      # Node display names come from the cluster document, which a test has none of, so
+      # `hostname_for/1` correctly falls back to the address. Sidon's own node names --
+      # the ones in `replicas` and in the peer list -- are unaffected, which is what
+      # makes the stranded-replica match below work.
+      assert disk.owner == @a
+      assert disk.epoch == 3
+      assert disk.replica_count == 2
+      assert disk.under_replicated? == false
+      assert disk.issues == []
+      refute snapshot.summary.attention?
+    end
+
+    test "a degraded owner means writes are being refused, and says so" do
+      static = healthy(vdisks: [owned("vm1-disk0", degraded: true)])
+      snapshot = snap(static)
+
+      disk = vdisk(snapshot, "vm1-disk0")
+      assert disk.health == :degraded
+      assert Enum.any?(disk.issues, &(&1 =~ "writes are refused"))
+      assert snapshot.summary.attention?
+    end
+
+    test "a vdisk short of its replica count is flagged with the numbers" do
+      static = healthy(vdisks: [owned("vm1-disk0", replicas: ["hci-01"])])
+      snapshot = snap(static)
+
+      disk = vdisk(snapshot, "vm1-disk0")
+      assert disk.under_replicated? == true
+      assert disk.health == :degraded
+      assert "1 of 2 replicas present" in disk.issues
+      assert snapshot.summary.vdisks_under_replicated == 1
+    end
+
+    test "a sealed vdisk is reported as such and is not a fault" do
+      static = healthy(vdisks: [owned("img-rocky", class: "immutable")])
+      snapshot = snap(static)
+
+      disk = vdisk(snapshot, "img-rocky")
+      assert disk.sealed?
+      assert disk.health == :ok
+    end
+
+    test "forwarding is a role, not a fault" do
+      static =
+        healthy()
+        |> put_in([:vdisks, @b], attached([forwarding("vm1-disk0", "hci-01")]))
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      # A non-owner relaying I/O to the owner is what removes live migration's cutover
+      # instant. It is exercised constantly and must not light the page up.
+      assert disk.forwarders == [@b]
+      assert disk.owner == @a
+      assert disk.health == :ok
+      assert disk.issues == []
+    end
+
+    test "a vdisk that is only being relayed has no owner and is unknown" do
+      static =
+        healthy(vdisks: [forwarding("vm1-disk0", "hci-03")])
+        |> put_in([:vdisks, @b], attached([forwarding("vm1-disk0", "hci-03")]))
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.owner == nil
+      assert disk.health == :unknown
+      assert Enum.any?(disk.issues, &(&1 =~ "no owner"))
+    end
+
+    test "two owners at once is reported as the fence failing, not as a replica problem" do
+      static =
+        healthy()
+        |> put_in([:vdisks, @b], attached([owned("vm1-disk0", epoch: 2)]))
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.health == :degraded
+      assert [issue] = Enum.filter(disk.issues, &(&1 =~ "at once"))
+      assert issue =~ "epoch fence"
+    end
+  end
+
+  # -- peers -----------------------------------------------------------------------------
+
+  describe "peer reachability" do
+    test "a peer that cannot be reached is reported as a refused write, not lost redundancy" do
+      static =
+        put_in(
+          healthy().peers[@a],
+          peers("hci-01", [peer("hci-02", reachable: false, detail: "connection refused")])
+        )
+
+      snapshot = snap(static)
+
+      assert [link] = snapshot.peers.unreachable
+      assert link.from == @a
+      assert link.peer == "hci-02"
+      assert link.detail == "connection refused"
+
+      # The journal is write-all, so a vdisk replicated onto that node is taking EIO --
+      # which is a different and much worse statement than "fewer copies than we want".
+      disk = vdisk(snapshot, "vm1-disk0")
+      assert "hci-02" in disk.stranded_replicas
+      assert Enum.any?(disk.issues, &(&1 =~ "writes are being refused"))
+      assert disk.health == :degraded
+      assert snapshot.summary.peer_links_down == 1
+    end
+
+    test "a reachable peer set produces no links down" do
+      snapshot = snap(healthy())
+
+      assert snapshot.peers.unreachable == []
+      assert snapshot.peers.state == :ok
+      assert snapshot.summary.peer_links_down == 0
+    end
+
+    test "a replica on an unreachable node this vdisk does not use is not its problem" do
+      static =
+        healthy(vdisks: [owned("vm1-disk0", replicas: ["hci-01", "hci-02"])])
+        |> put_in([:peers, @a], peers("hci-01", [peer("hci-09", reachable: false)]))
+
+      snapshot = snap(static)
+
+      assert length(snapshot.peers.unreachable) == 1
+      assert vdisk(snapshot, "vm1-disk0").stranded_replicas == []
+      assert vdisk(snapshot, "vm1-disk0").issues == []
+    end
+  end
+
+  # -- unreachable nodes -------------------------------------------------------------------
+
+  describe "unreachable nodes" do
+    test "a node that did not answer makes an otherwise-clean vdisk unknown" do
+      static = put_in(healthy().vdisks[@b], {:error, "no route to host"})
+      snapshot = snap(static)
+
+      assert snapshot.vdisks.state == :partial
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.health == :unknown
+      # `nil` and not `false`: the unread node might be the one holding the copy we could
+      # not count, and might equally hold nothing.
+      assert disk.under_replicated? == nil
+      assert snapshot.summary.vdisks_unknown == 1
+      assert snapshot.summary.attention?
+    end
+
+    test "a shortfall is not asserted while a node is unread" do
+      static =
+        healthy(vdisks: [owned("vm1-disk0", replicas: ["hci-01"])])
+        |> put_in([:vdisks, @b], {:error, :timeout})
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.replica_count == 1
+      assert disk.under_replicated? == nil
+      # No "1 of 2 replicas present": that would be a claim the data does not support.
+      refute Enum.any?(disk.issues, &(&1 =~ "replicas present"))
+      assert disk.health == :unknown
+    end
+
+    test "no node answering is unavailable, not an empty vdisk list" do
+      static =
+        healthy()
+        |> put_in([:vdisks, @a], {:error, :timeout})
+        |> put_in([:vdisks, @b], {:error, :timeout})
+
+      snapshot = snap(static)
+
+      assert snapshot.vdisks.state == :unavailable
+      assert snapshot.vdisks.entries == []
+      assert length(snapshot.vdisks.unreachable) == 2
+      assert snapshot.summary.attention?
+    end
+
+    test "every node answering with nothing is an honest empty fabric" do
+      static = healthy(vdisks: [])
+      snapshot = snap(static)
+
+      assert snapshot.vdisks.state == :ok
+      assert snapshot.vdisks.entries == []
+      # Nothing attached is not a fault. The stores answered and have room.
+      refute snapshot.summary.attention?
+    end
+
+    test "a fixture that omits a section reports it unavailable rather than empty" do
+      static = %{node_ips: @two_nodes, redundancy_factor: 1}
+      snapshot = snap(static)
+
+      assert snapshot.stores.state == :unavailable
+      assert snapshot.vdisks.state == :unavailable
+      assert Enum.all?(snapshot.disks, &(&1.state == :unavailable))
+    end
+  end
+
+  # -- block devices -----------------------------------------------------------------------
+
+  describe "block devices" do
+    test "children are flattened with their depth and their mountpoints found" do
+      snapshot = snap(healthy())
+      node = Enum.find(snapshot.disks, &(&1.ip == @a))
+
+      assert [disk, part] = node.devices
+      assert disk.name == "sda"
+      assert disk.depth == 0
+      assert disk.rotational? == false
+      assert part.name == "sda1"
+      assert part.depth == 1
+      # lsblk moved from "mountpoint" to a "mountpoints" list; both are read.
+      assert part.mountpoint == "/boot"
+    end
+
+    test "a node that did not answer has unknown disks, not none" do
+      static = put_in(healthy().disks[@b], {:error, "ssh: connect failed"})
+      snapshot = snap(static)
+
+      node = Enum.find(snapshot.disks, &(&1.ip == @b))
+      assert node.state == :unavailable
+      assert node.error == "ssh: connect failed"
+      assert node.devices == []
+      assert snapshot.summary.nodes_unreadable == 1
+    end
+  end
+
+  # -- sourcing ----------------------------------------------------------------------------
+
+  describe "source/0" do
+    test "defaults to live and can be pinned to a static payload" do
+      assert Storage.source() == :live
+
+      Application.put_env(:spectrum_phx, :storage_source, {:static, healthy()})
+      on_exit(fn -> Application.delete_env(:spectrum_phx, :storage_source) end)
+
       snapshot = Storage.snapshot()
-
-      refute snapshot.configured?
-      assert snapshot.nodes == []
-      assert snapshot.pools.state == :unavailable
-      assert snapshot.resources.state == :unavailable
-      assert snapshot.disks == []
-      assert snapshot.summary.attention?
-    end
-
-    test "a fixture that omits a section treats it as unread, not as empty" do
-      snapshot = snapshot(%{node_ips: ["10.10.0.11"]})
-
-      assert snapshot.pools.state == :unavailable
-      assert snapshot.resources.state == :unavailable
-      assert [%{state: :unavailable}] = snapshot.disks
+      assert snapshot.configured?
+      assert length(snapshot.vdisks.entries) == 1
     end
   end
 end

@@ -116,29 +116,127 @@ defmodule SpectrumPhx.Spark do
     post_json(ip, "/api/v1/vm/" <> name <> "/power", %{"action" => action})
   end
 
-  @doc "Parsed DRBD status, optionally for a single resource."
-  def drbd_status(ip, resource \\ nil) do
-    path =
-      if resource,
-        do: "/api/v1/storage/drbd/status?resource=" <> resource,
-        else: "/api/v1/storage/drbd/status"
+  @doc """
+  Call one Sidon operation on a node, through spark-daemon's typed DFS endpoint.
 
-    get_json(ip, path)
+  Every storage call in this module funnels here. The daemon fronts Sidon's unix control
+  socket with an allow-list of operations rather than a pass-through, so this cannot ask
+  for anything the daemon has not agreed to -- which is the point of fronting it at all.
+
+  `{:error, {409, message}}` means the answer will not change on a retry: a refused
+  attach names the host that actually owns the vdisk. `{:error, {503, message}}` means
+  it might.
+  """
+  def dfs(ip, op, params \\ %{}, opts \\ []) do
+    payload = params |> Map.new() |> Map.put("op", op)
+    post_json(ip, "/api/v1/dfs/vdisk", payload, timeout: Keyword.get(opts, :timeout, 30))
   end
 
   @doc """
-  Set a DRBD resource's role, returning the role actually achieved.
+  This node's extent store: total, available, and what Sidon is holding in it.
 
-  The result must be checked: a promotion that does not yield Primary means the peer
-  still holds it, which is the condition that previously allowed one VM to be started
-  on two hosts and corrupt its disk.
+  `%{"node", "path", "total_bytes", "available_bytes", "egroup_bytes", "egroup_count",
+  "journal_bytes"}`. The figures come from `statfs` on the store's own filesystem, so
+  they describe the volume Sidon owns rather than the root filesystem it is not on.
   """
-  def drbd_role(ip, resource, role, force \\ false) when role in ~w(primary secondary) do
-    post_json(ip, "/api/v1/storage/drbd/role", %{
-      "resource" => resource,
-      "role" => role,
-      "force" => force
-    })
+  def dfs_capacity(ip), do: dfs(ip, "capacity")
+
+  @doc """
+  Vdisks attached on this node: `%{"attached" => [%{"vdisk_id", "role", ...}]}`.
+
+  `role` is `"owner"` or `"forwarding"`. An owner's entry carries its epoch, size and
+  whether it is degraded; a forwarding entry names the node it relays to and nothing
+  else, because a relay knows nothing about the disk it is passing through.
+  """
+  def dfs_list(ip), do: dfs(ip, "list")
+
+  @doc "One owned vdisk in detail, including the nodes its replicas are on."
+  def dfs_status(ip, vdisk_id), do: dfs(ip, "status", %{"vdisk_id" => vdisk_id})
+
+  @doc """
+  Which peers this node can reach right now.
+
+  Reachability is not safety -- an append needs *every* replica, and an unreachable one
+  fails the write rather than being skipped -- but an operator looking at a vdisk that
+  will not accept writes needs to see which peer is down without reading a log.
+  """
+  def dfs_peers(ip), do: dfs(ip, "peers")
+
+  @doc """
+  Create a vdisk of `size_bytes`, replicated `rf` ways.
+
+  Sparse: nothing is allocated until something writes. A vdisk is a row and a block map,
+  not a device, so this is a metadata operation and returns in milliseconds -- where a
+  LINSTOR placement built a kernel object on every node and needed minutes.
+
+  An existing vdisk of the same name is an error rather than a silent adoption. That is
+  precisely how a new VM ends up attached to a deleted VM's disk.
+  """
+  def dfs_create(ip, vdisk_id, size_bytes, opts \\ []) do
+    params =
+      %{"vdisk_id" => vdisk_id, "size_bytes" => size_bytes}
+      |> put_present("rf", Keyword.get(opts, :rf))
+
+    dfs(ip, "create", params, timeout: Keyword.get(opts, :timeout, 60))
+  end
+
+  @doc """
+  Take ownership of a vdisk on this node and expose it as an NBD socket.
+
+  This is the successor to `drbdadm primary`, and a stronger one. It wins the
+  `(owner, epoch)` compare-and-swap in Hydra and fences every journal replica at the new
+  epoch, so a previous owner that is wedged, lying about its state, or unreachable cannot
+  complete another write. A promotion could only *infer* that the peer had stopped, and
+  only where quorum was armed.
+
+  A refused attach is `{:error, {409, message}}`, and the message names the host that
+  holds the disk.
+  """
+  def dfs_attach(ip, vdisk_id), do: dfs(ip, "attach", %{"vdisk_id" => vdisk_id})
+
+  @doc "Give up ownership and remove the socket. Drains first."
+  def dfs_detach(ip, vdisk_id), do: dfs(ip, "detach", %{"vdisk_id" => vdisk_id})
+
+  @doc """
+  Delete a vdisk and free its extent groups on every replica.
+
+  Deleting something that is already gone is a success: a rollback wants the vdisk gone,
+  not proof that it once existed.
+  """
+  def dfs_delete(ip, vdisk_id, opts \\ []) do
+    dfs(ip, "delete", %{"vdisk_id" => vdisk_id}, timeout: Keyword.get(opts, :timeout, 120))
+  end
+
+  @doc """
+  Seal a vdisk: drain it, then make it permanently immutable.
+
+  What replaced `--allow-two-primaries`. That option existed because a golden image is
+  attached read-only by guests on several hosts at once, and DRBD needed every one of
+  those hosts to hold Primary in order to read -- which is exactly the state that
+  corrupts a device the moment anything writes. A sealed vdisk cannot reach it: reads are
+  served by any node without a lease, and writes are refused by class at the NBD layer.
+
+  The drain comes first because the drain is itself a write path, and a vdisk frozen
+  around an undrained journal could never finish draining it.
+  """
+  def dfs_seal(ip, vdisk_id, opts \\ []) do
+    dfs(ip, "seal", %{"vdisk_id" => vdisk_id}, timeout: Keyword.get(opts, :timeout, 300))
+  end
+
+  @doc """
+  Grow a vdisk to `size_bytes`.
+
+  Nothing is resized underneath: the vdisk is sparse and its map is keyed by extent
+  index, so the new range simply has no entries and reads as zeroes. Only the recorded
+  size changes, and only qemu needs telling.
+  """
+  def dfs_resize(ip, vdisk_id, size_bytes) do
+    dfs(ip, "resize", %{"vdisk_id" => vdisk_id, "size_bytes" => size_bytes})
+  end
+
+  @doc "Drain a vdisk's journal into extent groups now, rather than at the high-water mark."
+  def dfs_flush(ip, vdisk_id, opts \\ []) do
+    dfs(ip, "flush", %{"vdisk_id" => vdisk_id}, timeout: Keyword.get(opts, :timeout, 120))
   end
 
   @doc "Existence, block-ness and size of a device path."
@@ -168,93 +266,6 @@ defmodule SpectrumPhx.Spark do
   def container_ensure(ip, name),
     do: post_json(ip, "/api/v1/storage/container/ensure", %{"name" => name})
 
-  @doc """
-  Every Linstor resource the cluster holds, or one of them by name.
-
-  Returns `{:ok, %{"resources" => [%{"name", "size_kib", "size_gib", "nodes",
-  "device_path"}]}}`. The shape is the daemon's, not the Linstor client's: the client's
-  machine-readable document renamed its keys between output versions, so a caller that
-  parsed it would be coupled to which version a given cluster happens to run. An unknown
-  name is `{:error, {404, message}}`.
-  """
-  def linstor_resources(ip, resource \\ nil) do
-    path =
-      if resource,
-        do: "/api/v1/storage/linstor/resources?resource=" <> URI.encode(resource),
-        else: "/api/v1/storage/linstor/resources"
-
-    get_json(ip, path, timeout: 45)
-  end
-
-  @doc """
-  Allocate the DRBD-backed storage for one VM disk.
-
-  One call covers the resource definition, the volume definition, placement on every node
-  and the split-brain `drbd-options`. Those four commands are meaningless apart -- a
-  resource definition with no volume backs nothing, a volume definition with no resources
-  exists on no node -- so the daemon runs them as one idempotent operation and deletes its
-  own partial work if a later step fails.
-
-  `size` is `{:gib, n}` for a VM disk or `{:kib, n}` for an image. It is a tagged tuple
-  rather than a bare number because the two are not interchangeable and a silent unit
-  mix-up here allocates a volume a million times too large or too small: an ISO is
-  whatever size it is, and rounding one up to the next GiB both wastes the difference on
-  every node and makes the size guard compare a rounded figure against the real one.
-
-  Options:
-
-    * `:nodes` - place on these nodes. Omitted means every node in the daemon's cluster
-      document, which is what the Python create path did.
-    * `:storage_pool` - omitted means the daemon's `default-pool`. The daemon takes the
-      value from an allowlist, so an unknown pool is a `400` and never a command fragment.
-    * `:allow_two_primaries` - dual-primary DRBD. Correct for a golden image, which
-      guests on several hosts attach read-only at the same time; never for a VM disk,
-      where it is what let one VM run on two hosts and corrupt itself.
-    * `:timeout` - seconds. Placement creates a DRBD device on every node, so this is
-      minutes-scale work rather than the 30s a control-plane call usually needs.
-
-  `%{"created" => false}` means the resource was already there and was adopted rather than
-  created. That is what makes a retry after a timeout safe -- and it is worth logging,
-  because for a VM the database has never seen, an existing resource is a leftover.
-
-  A resource that already exists at a *different* size comes back as
-  `{:error, {409, message}}` rather than being silently reused: that is precisely how a
-  new VM ends up attached to a deleted VM's disk.
-
-  Dual-primary is deliberately not set here. It is what let one VM start on two hosts and
-  corrupt its disk; live migration scopes that window to the hand-over itself.
-  """
-  def linstor_resource_create(ip, resource, size, opts \\ [])
-
-  def linstor_resource_create(ip, resource, {unit, amount}, opts)
-      when unit in [:gib, :kib] and is_integer(amount) do
-    size_key = if unit == :gib, do: "size_gib", else: "size_kib"
-
-    payload =
-      %{"resource" => resource, size_key => amount}
-      |> put_present("nodes", Keyword.get(opts, :nodes))
-      |> put_present("storage_pool", Keyword.get(opts, :storage_pool))
-      |> put_present("allow_two_primaries", Keyword.get(opts, :allow_two_primaries))
-
-    post_json(ip, "/api/v1/storage/linstor/resource", payload,
-      timeout: Keyword.get(opts, :timeout, 240)
-    )
-  end
-
-  @doc """
-  Delete a Linstor resource definition, and with it its volume on every node.
-
-  `%{"deleted" => false}` means there was nothing to delete, which is a success: a
-  rollback wants the resource gone, not proof that it once existed. A resource that is
-  still in use, or one a node cannot release, is `{:error, {409, message}}` -- the state
-  key `deleted` comes back with it, as everywhere else in this API.
-  """
-  def linstor_resource_delete(ip, resource, opts \\ []) do
-    post_json(ip, "/api/v1/storage/linstor/resource/delete", %{"resource" => resource},
-      timeout: Keyword.get(opts, :timeout, 240)
-    )
-  end
-
   @doc "Default interface, gateway and addresses for a host."
   def host_network(ip), do: get_json(ip, "/api/v1/host/network")
 
@@ -264,7 +275,13 @@ defmodule SpectrumPhx.Spark do
   @doc "Parsed lsblk output for a host."
   def host_disks(ip), do: get_json(ip, "/api/v1/host/disks")
 
-  @doc "Whether the host has KVM, the DRBD module, and Secure Boot state."
+  @doc """
+  Whether the host has KVM, and its Secure Boot state.
+
+  Secure Boot is reported and acted on by nothing. It used to gate provisioning, because
+  DRBD was an out-of-tree module the kernel refuses to load unenrolled and a host with
+  Secure Boot on therefore had no storage at all. Sidon is a userspace daemon.
+  """
   def host_capabilities(ip), do: get_json(ip, "/api/v1/host/capabilities")
 
   @doc "Current dnsmasq DHCP leases."
@@ -304,14 +321,15 @@ defmodule SpectrumPhx.Spark do
   end
 
   @doc """
-  The path that streams a request body straight onto a block device.
+  The path that streams a request body straight into a vdisk.
 
-  The device travels in the query string and is validated by the daemon against its own
-  allowlist and a `/dev/drbd/` prefix check, so this is not the security boundary -- but
-  it is encoded here so a path is never concatenated raw into a request line.
+  No allow-list is needed on the far side, and that is the improvement over the device
+  form this replaced: the caller names a *vdisk*, and the daemon derives the socket from
+  it. There is no path in the request, so a caller cannot name a file. It is still
+  encoded here rather than concatenated, so a name is never a request-line fragment.
   """
-  def device_write_path(device) do
-    "/api/v1/storage/device/write?device=" <> URI.encode_www_form(device)
+  def vdisk_write_path(vdisk_id) do
+    "/api/v1/dfs/write?vdisk=" <> URI.encode_www_form(vdisk_id)
   end
 
   @doc false

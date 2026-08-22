@@ -3,7 +3,7 @@ defmodule SpectrumPhx.VmsTest do
   The bulk of this file is VM-name validation.
 
   That weight is deliberate. A VM name reaches a root shell on the hypervisor (Vali builds
-  `drbdadm`, `virsh` and `linstor` command lines from it and hands them to spark-daemon's
+  `virsh` command lines from it and hands them to spark-daemon's
   `/api/v1/execute`, which runs them with a shell as root) and it reaches CQL. If the
   regex is ever loosened, one of these cases starts passing and the failure mode is remote
   code execution as root on a hypervisor, not a cosmetic bug.
@@ -154,7 +154,7 @@ defmodule SpectrumPhx.VmsTest do
   describe "VM name validation: first character" do
     test "rejects a leading hyphen" do
       # A leading hyphen makes the name parse as an option to whatever command receives
-      # it: `virsh destroy --foo`, `linstor resource-definition delete -x`.
+      # it: `virsh destroy --foo`, `virsh undefine -x`.
       refute Vm.valid_name?("-web01")
       refute Vm.valid_name?("--force")
       refute Vm.valid_name?("-")
@@ -359,13 +359,13 @@ defmodule SpectrumPhx.VmsTest do
   end
 
   describe "Vm.disks/1" do
-    test "maps each disk to its DRBD resource and device path" do
+    test "maps each disk to its vdisk and socket path" do
       vm = %Vm{name: "web-01", disks_list: "10G,500G:fast"}
 
       assert [first, second] = Vm.disks(vm)
       assert first.index == 0
       assert first.resource == "web-01-disk0"
-      assert first.path == "/dev/drbd/by-res/web-01-disk0/0"
+      assert first.path == "/var/lib/hci/sidon/nbd/web-01-disk0.sock"
       assert first.container == nil
       assert second.resource == "web-01-disk1"
       assert second.container == "fast"
@@ -410,7 +410,7 @@ defmodule SpectrumPhx.VmsTest do
         "name" => "web-01",
         "vcpu" => 4,
         "memory" => 8192,
-        "disk_path" => "/dev/drbd/by-res/web-01-disk0/0",
+        "disk_path" => "/var/lib/hci/sidon/nbd/web-01-disk0.sock",
         "disk_size" => 10,
         "state" => "Running",
         "host_ip" => "10.0.0.5",

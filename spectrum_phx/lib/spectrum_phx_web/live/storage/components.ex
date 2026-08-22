@@ -3,22 +3,21 @@ defmodule SpectrumPhxWeb.Storage.Components do
   Presentation pieces for the storage fabric view.
 
   The rule these encode is the same one the cluster badges encode, applied to storage:
-  **nothing unknown is drawn as healthy**. A DRBD device that is `Inconsistent`, a
-  connection that is `StandAlone`, a pool whose capacity LINSTOR would not report, and a
+  **nothing unknown is drawn as healthy**. A vdisk whose owner did not answer, a store
+  whose filesystem reported no capacity, a replica on a node no peer can reach, and a
   node that did not answer at all each get their own colour, and none of those colours is
   green. The old storage page had one green "ONLINE" pill driven by the substring "ok"
   appearing in a table cell, and a resource in the middle of a resync rendered exactly
   like one that was fully replicated.
+
+  There are fewer badges here than there were, because there are fewer states. Under DRBD
+  a copy could be `Inconsistent`, `Outdated` or resyncing, and each needed its own colour.
+  A sealed extent group is immutable, so a copy is either byte-identical or absent; the
+  question a replica badge answers is "are all of them here", not "do they agree".
   """
   use SpectrumPhxWeb, :html
 
-  # Not module attributes: inside `~H` a `@name` is an assign, so `@uptodate` in a
-  # template would read `assigns.uptodate` and crash rather than compare a string.
-  defp disk_ok?(state), do: state == "UpToDate"
-  defp link_ok?(state), do: state == "Connected"
-  defp replication_ok?(state), do: state == "Established"
-
-  @doc "Overall health of one DRBD resource."
+  @doc "Overall health of one vdisk."
   attr :health, :atom, required: true
 
   def health_badge(assigns) do
@@ -31,68 +30,79 @@ defmodule SpectrumPhxWeb.Storage.Components do
   end
 
   @doc """
-  A DRBD disk state, coloured by whether it is the only state that means "this copy is
-  a complete copy". `Inconsistent`, `Outdated`, `Failed`, `Attaching` and `DUnknown` are
-  all not that, and none of them is green here.
+  A vdisk's replica count against what the cluster's redundancy factor asks for.
+
+  `nil` for `have` means a node did not answer, so the count is unknown rather than
+  short -- drawn as a warning, never as a satisfied count.
   """
-  attr :state, :string, required: true
-  attr :label, :string, default: nil
+  attr :have, :integer, default: nil
+  attr :want, :integer, required: true
 
-  def disk_state_badge(assigns) do
+  def replica_badge(assigns) do
     ~H"""
     <span class={[
       "badge badge-sm gap-1 font-mono text-xs",
-      if(disk_ok?(@state), do: "badge-success", else: "badge-error")
+      replica_class(@have, @want)
     ]}>
-      <span :if={@label} class="opacity-70">{@label}</span>
-      {@state}
-    </span>
-    """
-  end
-
-  @doc "A DRBD connection state and the peer role behind it."
-  attr :connection, :map, required: true
-
-  def connection_badge(assigns) do
-    ~H"""
-    <span class={[
-      "badge badge-sm gap-1 font-mono text-xs",
-      if(link_ok?(@connection.state), do: "badge-success", else: "badge-error")
-    ]}>
-      {@connection.peer}: {@connection.state}
-      <span class="opacity-70">({@connection.peer_role})</span>
-    </span>
-    """
-  end
-
-  @doc "Replication state for one peer volume: resync is not the same as replicated."
-  attr :peer, :map, required: true
-
-  def replication_badge(assigns) do
-    ~H"""
-    <span class={[
-      "badge badge-sm font-mono text-xs",
-      if(replication_ok?(@peer.replication), do: "badge-ghost", else: "badge-warning")
-    ]}>
-      {@peer.replication}
-    </span>
-    """
-  end
-
-  @doc "State of one LINSTOR storage pool."
-  attr :state, :atom, required: true
-
-  def pool_state_badge(assigns) do
-    ~H"""
-    <span class={["badge badge-sm gap-1 font-medium", pool_class(@state)]}>
-      {pool_label(@state)}
+      <span class="opacity-70">replicas</span>
+      {if is_nil(@have), do: "?", else: @have}/{@want}
     </span>
     """
   end
 
   @doc """
-  A usage bar. Rendered only when the capacity is actually known -- a pool whose totals
-  LINSTOR did not report gets a plain "capacity unknown" line instead of a bar sitting
+  Which node serves a vdisk, and in what role.
+
+  A forwarding node is not a fault: a non-owner relays I/O to the owner, which is what
+  removes live migration's cutover instant. It is drawn plainly, not warned about.
+  """
+  attr :attachment, :map, required: true
+
+  def role_badge(assigns) do
+    ~H"""
+    <span class={[
+      "badge badge-sm gap-1 font-mono text-xs",
+      role_class(@attachment.role)
+    ]}>
+      {@attachment.hostname}: {role_label(@attachment.role)}
+      <span :if={@attachment.role == :forwarding and @attachment.forwarding_to} class="opacity-70">
+        &rarr; {@attachment.forwarding_to}
+      </span>
+    </span>
+    """
+  end
+
+  @doc """
+  A vdisk's epoch, the number the ownership fence turns on.
+
+  Shown because it is the one piece of state that explains a refusal: a replica fenced at
+  a higher epoch refuses the old owner's writes, and the epoch is how an operator sees
+  that a takeover happened at all.
+  """
+  attr :epoch, :integer, default: nil
+
+  def epoch_badge(assigns) do
+    ~H"""
+    <span :if={@epoch} class="badge badge-sm badge-ghost font-mono text-xs">
+      <span class="opacity-70">epoch</span>&nbsp;{@epoch}
+    </span>
+    """
+  end
+
+  @doc "State of one node's extent store."
+  attr :state, :atom, required: true
+
+  def store_state_badge(assigns) do
+    ~H"""
+    <span class={["badge badge-sm gap-1 font-medium", store_class(@state)]}>
+      {store_label(@state)}
+    </span>
+    """
+  end
+
+  @doc """
+  A usage bar. Rendered only when the capacity is actually known -- a store whose
+  filesystem did not answer gets a plain "capacity unknown" line instead of a bar sitting
   reassuringly at zero.
   """
   attr :used, :integer, default: nil
@@ -102,7 +112,8 @@ defmodule SpectrumPhxWeb.Storage.Components do
   def usage_bar(assigns) do
     ~H"""
     <div :if={is_nil(@percent)} class="text-xs text-warning font-medium">
-      Capacity unknown -- LINSTOR did not report totals for this pool.
+      Capacity unknown -- the extent store reported no totals, which usually means it is
+      not mounted.
     </div>
 
     <div :if={@percent} class="space-y-1">
@@ -119,9 +130,9 @@ defmodule SpectrumPhxWeb.Storage.Components do
   @doc """
   Shown in place of a section whose source could not be read.
 
-  Deliberately not an empty table: "there are no storage pools" and "the storage pool
-  list could not be read" are different statements, and the second one rendered as the
-  first is the failure this page exists to prevent.
+  Deliberately not an empty table: "there are no vdisks" and "the vdisk list could not be
+  read" are different statements, and the second one rendered as the first is the failure
+  this page exists to prevent.
   """
   attr :title, :string, required: true
   attr :error, :string, default: nil
@@ -186,15 +197,27 @@ defmodule SpectrumPhxWeb.Storage.Components do
   defp health_label(:degraded), do: "degraded"
   defp health_label(_other), do: "unknown"
 
-  defp pool_class(:ok), do: "badge-success"
-  defp pool_class(:error), do: "badge-error"
-  defp pool_class(:diskless), do: "badge-ghost"
-  defp pool_class(_other), do: "badge-warning"
+  defp replica_class(nil, _want), do: "badge-warning"
+  defp replica_class(have, want) when have >= want, do: "badge-success"
+  defp replica_class(_have, _want), do: "badge-error"
 
-  defp pool_label(:ok), do: "ok"
-  defp pool_label(:error), do: "error"
-  defp pool_label(:diskless), do: "diskless"
-  defp pool_label(_other), do: "unknown"
+  defp role_class(:owner), do: "badge-primary"
+  defp role_class(:forwarding), do: "badge-ghost"
+  defp role_class(_other), do: "badge-warning"
+
+  defp role_label(:owner), do: "owner"
+  defp role_label(:forwarding), do: "forwarding"
+  defp role_label(_other), do: "unknown role"
+
+  defp store_class(:ok), do: "badge-success"
+  defp store_class(:warn), do: "badge-warning"
+  defp store_class(:full), do: "badge-error"
+  defp store_class(_other), do: "badge-warning"
+
+  defp store_label(:ok), do: "ok"
+  defp store_label(:warn), do: "filling"
+  defp store_label(:full), do: "full"
+  defp store_label(_other), do: "unknown"
 
   defp usage_class(percent) when percent >= 85, do: "progress-error"
   defp usage_class(percent) when percent >= 70, do: "progress-warning"

@@ -166,7 +166,8 @@ curl -sS http://127.0.0.1:8444/robots.txt
 
 The Python `spectrum.service` is untouched throughout. Both containers can be
 running at the same time; they share `/etc/hci/spectrum`, `/etc/hci`,
-`/root/.certs` and `/var/lib/hci/aether/volumes` read-side with no conflict.
+`/root/.certs` and `/var/lib/hci/aether/volumes` read-side with no conflict. Neither
+needs Sidon's sockets: storage is reached through spark-daemon, never directly.
 
 To roll back, `systemctl stop spectrum-phx` and delete the unit file. Slate was
 never pointed at it, so there is nothing else to undo.

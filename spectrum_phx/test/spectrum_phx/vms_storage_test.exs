@@ -46,7 +46,7 @@ defmodule SpectrumPhx.VmsStorageTest do
       send(test_pid, {:storage, action, resource, opts})
 
       case {action, Map.get(responses, resource)} do
-        {:create, nil} -> {:ok, %{"created" => true, "device_path" => "/dev/drbd/by-res/x/0"}}
+        {:create, nil} -> {:ok, %{"created" => true, "vdisk_id" => "x"}}
         {:create, response} -> response
         {:delete, _} -> {:ok, %{"deleted" => true}}
       end
@@ -65,7 +65,7 @@ defmodule SpectrumPhx.VmsStorageTest do
   end
 
   describe "allocation" do
-    test "allocates one Linstor resource per disk, named after the VM" do
+    test "creates one vdisk per disk, named after the VM" do
       stub_storage()
 
       assert {:ok, %Vm{name: "web-01"}} =
@@ -88,16 +88,16 @@ defmodule SpectrumPhx.VmsStorageTest do
       assert_received {:storage, :create, "web-01-disk2", %{size_gib: 20}}
     end
 
-    test "the resource names match the paths the VM record carries" do
-      # This is the seam between the two tiers: the daemon builds
-      # /dev/drbd/by-res/<resource>/0 from the same name, and the domain XML points at it.
+    test "the vdisk names match the paths the VM record carries" do
+      # This is the seam between the two tiers: Sidon derives the socket path from the
+      # same name, and the domain XML points at it.
       {:ok, vm} = Vm.new(params(%{"disks" => "10G,20G"}))
 
       assert Enum.map(Vm.disks(vm), & &1.resource) == ["web-01-disk0", "web-01-disk1"]
 
       assert Enum.map(Vm.disks(vm), & &1.path) == [
-               "/dev/drbd/by-res/web-01-disk0/0",
-               "/dev/drbd/by-res/web-01-disk1/0"
+               "/var/lib/hci/sidon/nbd/web-01-disk0.sock",
+               "/var/lib/hci/sidon/nbd/web-01-disk1.sock"
              ]
     end
 

@@ -6,6 +6,8 @@ defmodule SpectrumPhx.ImagesUploadTest do
   alias SpectrumPhx.Images.UploadWriter
   alias SpectrumPhx.UploadStubs
 
+  @socket "/var/lib/hci/sidon/nbd/img-rocky.sock"
+
   setup do
     Application.put_env(:spectrum_phx, :images_source, {:static, []})
     on_exit(fn -> Application.delete_env(:spectrum_phx, :images_source) end)
@@ -31,7 +33,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       :ok
     end
 
-    test "allocates, streams, verifies, then registers -- in that order" do
+    test "creates, claims, streams, seals, then registers -- in that order" do
       state = writer("rocky.iso", 12)
 
       {:ok, state} = UploadWriter.write_chunk("hello ", state)
@@ -41,23 +43,21 @@ defmodule SpectrumPhx.ImagesUploadTest do
       assert %{result: {:ok, image}} = UploadWriter.meta(state)
       assert image.name == "rocky.iso"
       assert image.size_bytes == 12
-      assert image.path == "/dev/drbd/by-res/img-rocky/0"
+      assert image.path == @socket
 
       calls = drain()
 
       # The catalogue row is the last thing that happens. Written earlier it would claim
-      # an image is usable while the bytes were still in flight.
+      # an image is usable while the bytes were still in flight. The seal is second-last,
+      # because an unsealed image is a writable template.
       assert [
-               {:linstor_create, _ip, "img-rocky", 1},
-               {:device_info, _ip2, "/dev/drbd/by-res/img-rocky/0"},
-               {:drbd_role, _ip3, "img-rocky", "primary"},
-               {:open, _ip4, "/dev/drbd/by-res/img-rocky/0", 12},
+               {:create, _ip, "img-rocky", 12},
+               {:attach, _ip2, "img-rocky"},
+               {:open, _ip3, "img-rocky", 12},
                {:chunk, 6},
                {:chunk, 6},
                {:finish, "hello world!"},
-               {:device_prepare, _ip5, _device, "root:qemu", "0660"},
-               {:device_flush, _ip6, _device2},
-               {:drbd_role, _ip7, "img-rocky", "secondary"}
+               {:seal, _ip4, "img-rocky"}
              ] = calls
     end
 
@@ -77,32 +77,47 @@ defmodule SpectrumPhx.ImagesUploadTest do
       assert drain() == []
     end
 
-    test "the device is left root:qemu 0660, never world-writable" do
+    test "the image is sealed, so it can never be written again" do
       state = writer("rocky.iso", 3)
       {:ok, state} = UploadWriter.write_chunk("abc", state)
       {:ok, _state} = UploadWriter.close(state, :done)
 
-      assert Enum.any?(drain(), &match?({:device_prepare, _, _, "root:qemu", "0660"}, &1))
+      # There are no permissions to set: an image is reached over a per-vdisk socket
+      # Sidon creates group-owned by qemu, not through a device node this tier chmods.
+      # Immutability is what makes it safe to attach on several hosts at once.
+      assert Enum.any?(drain(), &match?({:seal, _ip, "img-rocky"}, &1))
+    end
+
+    test "an image the seal refuses is not registered" do
+      UploadStubs.install(%{seal: {:error, "journal is not drained"}})
+
+      state = writer("rocky.iso", 3)
+      {:ok, state} = UploadWriter.write_chunk("abc", state)
+
+      assert {:error, {:seal, message}} = UploadWriter.close(state, :done)
+      assert message =~ "must not be used as a template"
+      assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
   end
 
   describe "failures unwind the allocation" do
-    test "a promotion that does not take aborts rather than writing from a Secondary" do
-      # The peer still holds Primary. Writing the device anyway is the split-brain the
-      # role check exists to prevent, so this must fail and must not open a connection.
-      UploadStubs.install(%{drbd_role: {:ok, %{"role" => "secondary"}}})
+    test "an attach another host refuses aborts rather than writing anyway" do
+      # The ownership compare-and-swap was lost, so another host is serving this vdisk.
+      # Writing it from here is what the epoch fence exists to prevent, and the refusal
+      # names the host that holds it.
+      UploadStubs.install(%{attach: {:error, {409, "hci-02 owns img-rocky at epoch 4"}}})
 
       state = writer()
-      assert {:error, {:promote, message}, state} = UploadWriter.write_chunk("abc", state)
-      assert message =~ "not Primary"
+      assert {:error, {:claim, message}, state} = UploadWriter.write_chunk("abc", state)
+      assert message =~ "hci-02"
 
       calls = drain()
       refute Enum.any?(calls, &match?({:open, _, _, _}, &1))
-      assert Enum.any?(calls, &match?({:linstor_delete, _ip, "img-rocky"}, &1))
+      assert Enum.any?(calls, &match?({:delete, _ip, "img-rocky"}, &1))
 
       # A later chunk must not restart anything.
       assert {:error, _reason, _state} = UploadWriter.write_chunk("def", state)
-      refute Enum.any?(drain(), &match?({:linstor_create, _, _, _}, &1))
+      refute Enum.any?(drain(), &match?({:create, _, _, _}, &1))
     end
 
     test "a connection that cannot be opened deletes the storage it just allocated" do
@@ -113,7 +128,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       assert {:error, {:transport, "connection refused"}, _state} =
                UploadWriter.write_chunk("abc", state)
 
-      assert Enum.any?(drain(), &match?({:linstor_delete, _ip, "img-rocky"}, &1))
+      assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
 
     test "a chunk that fails mid-stream rolls back" do
@@ -122,7 +137,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       state = writer()
       assert {:error, {:transport, "closed"}, _state} = UploadWriter.write_chunk("abc", state)
 
-      assert Enum.any?(drain(), &match?({:linstor_delete, _ip, "img-rocky"}, &1))
+      assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
 
     test "a short write is not registered" do
@@ -133,7 +148,9 @@ defmodule SpectrumPhx.ImagesUploadTest do
 
       assert {:error, {:truncated, message}} = UploadWriter.close(state, :done)
       assert message =~ "2 of 3 bytes"
-      assert Enum.any?(drain(), &match?({:linstor_delete, _ip, "img-rocky"}, &1))
+      assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
+      # And nothing was sealed: a truncated image must not become permanently immutable.
+      refute Enum.any?(drain(), &match?({:seal, _, _}, &1))
     end
 
     test "fewer bytes than declared is caught before the request is even finished" do
@@ -157,7 +174,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       {:ok, state} = UploadWriter.close(state, :cancel)
 
       assert state.allocation == nil
-      assert Enum.any?(drain(), &match?({:linstor_delete, _ip, "img-rocky"}, &1))
+      assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
 
     test "cancelling before any chunk touches nothing" do
@@ -168,8 +185,8 @@ defmodule SpectrumPhx.ImagesUploadTest do
     end
 
     test "the connection is closed before the storage is deleted" do
-      # The daemon holds the device open for the life of the write request, so a delete
-      # issued first is refused with "resource is still in use" and the resource leaks.
+      # The daemon keeps the vdisk attached for the life of the write request, so a
+      # delete issued first is refused and the vdisk leaks.
       UploadStubs.install()
 
       state = writer("rocky.iso", 100)
@@ -179,23 +196,38 @@ defmodule SpectrumPhx.ImagesUploadTest do
 
       calls = drain()
       closed_at = Enum.find_index(calls, &(&1 == :closed))
-      deleted_at = Enum.find_index(calls, &match?({:linstor_delete, _, _}, &1))
+      deleted_at = Enum.find_index(calls, &match?({:delete, _, _}, &1))
 
       assert closed_at, "the transport was never closed"
       assert deleted_at, "the storage was never deleted"
       assert closed_at < deleted_at, "the delete was issued while the request was still open"
     end
 
+    test "the vdisk is detached before it is deleted" do
+      UploadStubs.install()
+
+      state = writer("rocky.iso", 100)
+      {:ok, state} = UploadWriter.write_chunk("abc", state)
+      _ = drain()
+      {:ok, _state} = UploadWriter.close(state, :cancel)
+
+      calls = drain()
+      detached_at = Enum.find_index(calls, &match?({:detach, _, _}, &1))
+      deleted_at = Enum.find_index(calls, &match?({:delete, _, _}, &1))
+
+      assert detached_at < deleted_at
+    end
+
     test "a rollback that is refused is retried rather than abandoned" do
-      # Ditto: the device is released a moment after the request ends, so the first
-      # delete can legitimately fail. Giving up there leaks storage on every node.
-      UploadStubs.install(%{linstor_delete: {:error, "Resource is still in use"}})
+      # The vdisk is released a moment after the request ends, so the first delete can
+      # legitimately fail. Giving up there leaks storage on every replica.
+      UploadStubs.install(%{delete: {:error, "vdisk is attached"}})
 
       state = writer("rocky.iso", 100)
       {:ok, state} = UploadWriter.write_chunk("abc", state)
       {:ok, _state} = UploadWriter.close(state, :cancel)
 
-      deletes = Enum.count(drain(), &match?({:linstor_delete, _, _}, &1))
+      deletes = Enum.count(drain(), &match?({:delete, _, _}, &1))
       assert deletes > 1, "a refused delete was not retried"
     end
 
@@ -206,10 +238,10 @@ defmodule SpectrumPhx.ImagesUploadTest do
       {:error, _reason, state} = UploadWriter.write_chunk("abc", state)
       _ = drain()
 
-      # close/2 after a failure must not delete again: by then the resource name may have
+      # close/2 after a failure must not delete again: by then the vdisk name may have
       # been reused by another upload, and deleting it would take out live storage.
       {:ok, _state} = UploadWriter.close(state, {:error, :whatever})
-      refute Enum.any?(drain(), &match?({:linstor_delete, _, _}, &1))
+      refute Enum.any?(drain(), &match?({:delete, _, _}, &1))
     end
   end
 
@@ -223,51 +255,46 @@ defmodule SpectrumPhx.ImagesUploadTest do
       Application.put_env(
         :spectrum_phx,
         :images_source,
-        {:static, [%{"name" => "rocky.iso", "path" => "/dev/drbd/by-res/img-rocky/0"}]}
+        {:static, [%{"name" => "rocky.iso", "path" => @socket}]}
       )
 
       assert {:error, {:exists, "rocky.iso"}} = Images.prepare_upload("rocky.iso", 10)
       # Nothing was allocated, so there is nothing to roll back either.
-      refute Enum.any?(drain(), &match?({:linstor_create, _, _, _}, &1))
+      refute Enum.any?(drain(), &match?({:create, _, _, _}, &1))
     end
 
-    test "rounds the volume up to whole KiB so the last partial KiB still fits" do
+    test "the vdisk is created at the declared byte count, not a rounded one" do
+      # A vdisk is sparse and its map is keyed by extent index, so there is no volume
+      # alignment to round up to -- the DRBD path rounded to whole KiB and then to
+      # DRBD's own 4 KiB, which made an idempotent retry look like a size conflict.
       assert {:ok, _allocation} = Images.prepare_upload("rocky.iso", 1025)
-      assert Enum.any?(drain(), &match?({:linstor_create, _ip, "img-rocky", 2}, &1))
+      assert Enum.any?(drain(), &match?({:create, _ip, "img-rocky", 1025}, &1))
     end
 
-    test "refuses a size it cannot define a volume for" do
+    test "refuses a size it cannot create a vdisk for" do
       assert {:error, {:upload, _message}} = Images.prepare_upload("rocky.iso", 0)
     end
 
-    test "gives up on a device that never appears, and cleans up" do
-      UploadStubs.install(%{device_info: {:ok, %{"is_block" => false}}})
-      Application.put_env(:spectrum_phx, :images_device_poll_attempts, 3)
-      Application.put_env(:spectrum_phx, :images_device_poll_interval_ms, 1)
-
-      on_exit(fn ->
-        Application.delete_env(:spectrum_phx, :images_device_poll_attempts)
-        Application.delete_env(:spectrum_phx, :images_device_poll_interval_ms)
-      end)
-
-      assert {:error, {:device, message}} = Images.prepare_upload("rocky.iso", 10)
-      assert message =~ "did not appear"
-      assert Enum.any?(drain(), &match?({:linstor_delete, _ip, "img-rocky"}, &1))
-    end
-
     test "reports a size conflict as its own thing, not a generic failure" do
-      UploadStubs.install(%{linstor_create: {:error, {409, "already exists at 4096 KiB"}}})
+      UploadStubs.install(%{create: {:error, {409, "already exists at 4194304 bytes"}}})
 
       assert {:error, {:size_conflict, message}} = Images.prepare_upload("rocky.iso", 10)
-      assert message =~ "4096 KiB"
+      assert message =~ "4194304"
+    end
+
+    test "the socket comes from the daemon, not from a path this tier assembles" do
+      assert {:ok, allocation} = Images.prepare_upload("rocky.iso", 10)
+      assert allocation.socket == @socket
+      assert allocation.vdisk == "img-rocky"
     end
   end
 
   describe "describe_upload_error/1" do
     test "names the subsystem that refused" do
       assert Images.describe_upload_error({:exists, "a.iso"}) =~ "already in the catalogue"
-      assert Images.describe_upload_error({:allocate, "no pool"}) =~ "allocate storage"
-      assert Images.describe_upload_error({:promote, "still Primary"}) == "still Primary"
+      assert Images.describe_upload_error({:allocate, "no space"}) =~ "allocate storage"
+      assert Images.describe_upload_error({:claim, "hci-02 owns it"}) == "hci-02 owns it"
+      assert Images.describe_upload_error({:seal, "not drained"}) == "not drained"
       assert Images.describe_upload_error({:write, "HTTP 500"}) =~ "refused the image write"
       assert Images.describe_upload_error({:transport, "closed"}) =~ "streamed to the host"
 

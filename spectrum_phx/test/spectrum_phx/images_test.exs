@@ -5,12 +5,12 @@ defmodule SpectrumPhx.ImagesTest do
 
   alias SpectrumPhx.Images
 
-  @drbd_image %{
+  @vdisk_image %{
     "name" => "ubuntu-24.04.iso",
     "filename" => "ubuntu-24.04.iso",
     "size_bytes" => 6_303_121_408,
     "type" => "iso",
-    "path" => "/dev/drbd/by-res/img-ubuntu-24-04/0",
+    "path" => "/var/lib/hci/sidon/nbd/img-ubuntu-24-04.sock",
     "created_at" => 1_755_000_000_000
   }
 
@@ -39,7 +39,7 @@ defmodule SpectrumPhx.ImagesTest do
   end
 
   setup do
-    put_source([@drbd_image, @file_image, @undated_image])
+    put_source([@vdisk_image, @file_image, @undated_image])
 
     on_exit(fn ->
       Application.delete_env(:spectrum_phx, :images_source)
@@ -72,8 +72,8 @@ defmodule SpectrumPhx.ImagesTest do
       assert image.type == "iso"
       # The column is `size_bytes`; "Size (GB)" was a label the browser computed.
       assert image.size_bytes == 6_303_121_408
-      assert image.path == "/dev/drbd/by-res/img-ubuntu-24-04/0"
-      assert image.on_drbd?
+      assert image.path == "/var/lib/hci/sidon/nbd/img-ubuntu-24-04.sock"
+      assert image.on_vdisk?
       assert %DateTime{} = image.created_at
     end
 
@@ -81,7 +81,7 @@ defmodule SpectrumPhx.ImagesTest do
       {:ok, images} = Images.list_images()
       image = Enum.find(images, &(&1.name == "seed.img"))
 
-      refute image.on_drbd?
+      refute image.on_vdisk?
     end
 
     test "epoch-millisecond timestamps from the Python tier are decoded" do
@@ -146,20 +146,6 @@ defmodule SpectrumPhx.ImagesTest do
     end
   end
 
-  describe "delete_resource_command/1" do
-    test "names the controllers so the delete reaches a cluster controller" do
-      command = Images.delete_resource_command("img-ubuntu-24-04")
-
-      assert command =~ "LS_CONTROLLERS="
-      assert command =~ "resource-definition delete img-ubuntu-24-04"
-    end
-
-    test "falls back to the loopback rather than emitting an empty variable" do
-      # A development host has no cluster.json, so there are no controllers to name.
-      assert Images.delete_resource_command("img-a") =~ "LS_CONTROLLERS=127.0.0.1 "
-    end
-  end
-
   describe "safe_container_file?/1" do
     test "accepts a file inside the image container directory" do
       assert Images.safe_container_file?(
@@ -169,7 +155,7 @@ defmodule SpectrumPhx.ImagesTest do
 
     test "rejects a path outside it" do
       refute Images.safe_container_file?("/etc/passwd")
-      refute Images.safe_container_file?("/dev/drbd/by-res/img-a/0")
+      refute Images.safe_container_file?("/var/lib/hci/sidon/nbd/img-ubuntu-24-04.sock")
       refute Images.safe_container_file?("")
       refute Images.safe_container_file?(nil)
     end
@@ -250,7 +236,7 @@ defmodule SpectrumPhx.ImagesTest do
     test "says the bytes never land in this tier" do
       note = Images.upload_note()
 
-      assert note =~ "/api/v1/storage/device/write"
+      assert note =~ "/api/v1/dfs/write"
       assert note =~ "Nothing is staged here"
       refute note =~ "not implemented"
     end

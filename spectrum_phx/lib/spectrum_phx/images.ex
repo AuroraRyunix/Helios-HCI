@@ -11,11 +11,10 @@ defmodule SpectrumPhx.Images do
 
   ## Delete removes the backing store *before* the row
 
-  `/api/images/delete` deleted the catalogue row first, then fired
-  `resource-definition delete` and a fan-out `rm -f` without checking either, and
-  answered `200` regardless. A failed LINSTOR delete therefore left a DRBD resource
-  holding storage that nothing in the UI could ever see again, and the operator was told
-  the delete succeeded.
+  `/api/images/delete` deleted the catalogue row first, then fired a storage delete and a
+  fan-out `rm -f` without checking either, and answered `200` regardless. A failed delete
+  therefore left extent groups on every replica that nothing in the UI could ever see
+  again, and the operator was told the delete succeeded.
 
   Here the backing store goes first and its result is checked. If it cannot be removed
   the catalogue row stays and the caller gets the daemon's own message, so the image is
@@ -26,9 +25,10 @@ defmodule SpectrumPhx.Images do
 
   The old `rm -f {path_to_delete}` interpolated a database value straight into a root
   shell. The value is quoted with `Spark.escape/1` here, but quoting alone is not the
-  guard: the path must also be a DRBD device under `/dev/drbd/` (removed by deleting the
-  LINSTOR resource, never with `rm`) or a file under the image container directory.
-  Anything else is refused and reported rather than deleted.
+  guard: the path must be a vdisk socket under `/var/lib/hci/sidon/nbd/` (removed by
+  deleting the vdisk, never with `rm` -- that would unlink a socket and leave the extent
+  groups) or a file under the image container directory. Anything else is refused and
+  reported rather than deleted.
 
   ## Upload never touches the data path
 
@@ -65,11 +65,11 @@ defmodule SpectrumPhx.Images do
   # Where `/api/images` scans for files and where upload writes stage. Only paths under
   # this prefix are eligible for removal with `rm`.
   @container_root "/var/lib/hci/aether/volumes/"
-  @drbd_prefix "/dev/drbd/"
+  @vdisk_prefix "/var/lib/hci/sidon/nbd/"
 
-  # `slugify_image_name` in spectrum_server.py, reproduced exactly: the LINSTOR resource
-  # backing an image is named from the slug, so a different slug would delete the wrong
-  # resource or none at all.
+  # `slugify_image_name` in spectrum_server.py, reproduced exactly: the vdisk backing an
+  # image is named from the slug, so a different slug would delete the wrong vdisk or
+  # none at all.
   @slug_max_length 28
   @image_extensions [".iso", ".qcow2", ".img"]
 
@@ -82,7 +82,7 @@ defmodule SpectrumPhx.Images do
   @doc "CQL used by `delete_image/1`."
   def delete_image_cql, do: @delete_cql
 
-  @doc "Directory images are staged in when they are files rather than DRBD devices."
+  @doc "Directory images are staged in when they are files rather than vdisks."
   def container_root, do: @container_root
 
   @doc "Subscribe the calling process to catalogue change notifications."
@@ -189,71 +189,45 @@ defmodule SpectrumPhx.Images do
 
   defp do_remove_backing(%{path: path} = image) do
     cond do
-      String.starts_with?(path, @drbd_prefix) -> delete_linstor_resource(image)
+      String.starts_with?(path, @vdisk_prefix) -> delete_vdisk(image)
       safe_container_file?(path) -> remove_file_everywhere(path)
       true -> {:error, {:unsafe_path, path}}
     end
   end
 
-  # A DRBD-backed image is removed by deleting the LINSTOR resource definition, which
-  # tears the device down on every node. `rm` on `/dev/drbd/...` would delete a symlink
-  # and leave the resource -- and the storage it holds -- behind.
-  defp delete_linstor_resource(%{name: name}) do
-    command = delete_resource_command(resource_name(name))
+  # A vdisk-backed image is removed by deleting the vdisk, which frees its extent groups
+  # on every replica. `rm` on the socket path would unlink a unix socket and leave the
+  # vdisk -- and the storage it holds -- behind.
+  #
+  # An image is sealed, so it is detached first: a sealed vdisk refuses writes, not
+  # deletes, but a vdisk attached anywhere is still serving reads to whatever has its
+  # socket open.
+  defp delete_vdisk(%{name: name}) do
+    vdisk = resource_name(name)
+    ip = local_ip()
 
-    case Spark.execute(local_ip(), command, timeout: 60) do
-      {0, _stdout, _stderr} ->
+    uploader().detach(ip, vdisk)
+
+    case uploader().delete(ip, vdisk) do
+      {:ok, _result} ->
         {:ok, :removed}
 
-      {_rc, stdout, stderr} ->
-        message = String.trim((stderr || "") <> " " <> (stdout || ""))
+      # A vdisk that is already gone is the state this call was trying to reach, so it is
+      # not a failure -- but every other refusal is, and must not be swallowed the way
+      # the Python path did.
+      {:error, {404, _message}} ->
+        {:ok, :removed}
 
-        # LINSTOR is being asked to delete something that is already gone. That is the
-        # state this call was trying to reach, so it is not a failure -- but every other
-        # non-zero exit is, and must not be swallowed the way the Python path did.
-        if message =~ ~r/not found|does not exist|unknown resource/i do
+      {:error, reason} ->
+        message = describe(reason)
+
+        if message =~ ~r/not found|does not exist|unknown vdisk/i do
           {:ok, :removed}
         else
-          {:error, {:backing, blank_to_default(message, "LINSTOR refused the delete.")}}
+          {:error, {:backing, blank_to_default(message, "Sidon refused the delete.")}}
         end
     end
   end
-
-  @doc """
-  The command used to delete an image's LINSTOR resource definition.
-
-  `LS_CONTROLLERS` is set, as `run_linstor_cmd` in `spectrum_server.py` does: the client
-  inside the container otherwise talks to localhost, and on a cluster whose controller is
-  a different node the delete would fail with a connection error rather than doing
-  anything. The addresses are re-rendered through `:inet.parse_strict_address/1`, so only
-  something that is literally an address reaches the shell Spark runs this with -- and
-  the resource name is `img-<slug>`, whose slug is `[a-z0-9_-]` by construction.
-
-  Exposed so a test can pin the shape without a cluster.
-  """
-  def delete_resource_command(resource) do
-    controllers =
-      node_ips()
-      |> Enum.map(&normalize_ip/1)
-      |> Enum.reject(&is_nil/1)
-      |> case do
-        [] -> ["127.0.0.1"]
-        ips -> ips
-      end
-      |> Enum.join(",")
-
-    "podman exec -e LS_CONTROLLERS=" <>
-      controllers <> " systemd-aether linstor resource-definition delete " <> resource
-  end
-
-  defp normalize_ip(value) when is_binary(value) do
-    case :inet.parse_strict_address(String.to_charlist(String.trim(value))) do
-      {:ok, address} -> address |> :inet.ntoa() |> to_string()
-      {:error, _reason} -> nil
-    end
-  end
-
-  defp normalize_ip(_value), do: nil
 
   # The image file exists on every node, so it has to be removed on every node. A node
   # that does not answer is reported: leaving a copy behind means the next upload of the
@@ -283,11 +257,11 @@ defmodule SpectrumPhx.Images do
   end
 
   @doc """
-  The LINSTOR resource definition backing an image, `img-<slug>`.
+  The vdisk backing an image, `img-<slug>`.
 
   This must keep producing what `slugify_image_name` in `spectrum_server.py` produces:
   images uploaded by the Python tier are named by it, and a delete that computes a
-  different resource name deletes nothing (or, worse, something else).
+  different vdisk name deletes nothing (or, worse, something else).
   """
   def resource_name(image_name) do
     base =
@@ -327,42 +301,39 @@ defmodule SpectrumPhx.Images do
   # -- upload --------------------------------------------------------------------------
 
   @doc """
-  Allocate the replicated storage an image will be written into, and take Primary on it.
+  Create the vdisk an image will be written into, and take ownership of it.
 
-  Everything up to the first byte: the LINSTOR resource, the volume definition sized from
-  the image, placement on every node, dual-primary, and promotion of the local node. On
-  success the device named in the result is a block device this node holds Primary and may
-  be written; on failure nothing is left behind.
+  Everything up to the first byte, and there is much less of it than there used to be:
+  a vdisk is a row and a block map rather than a kernel object on every node, so this is
+  metadata work that returns in milliseconds where a LINSTOR placement took minutes.
+  There is no device to wait for and no role to check -- the attach *is* the ownership
+  claim, and a refused one names the host that holds the disk.
 
-  `size_bytes` has to be known here, because a DRBD volume is defined with a size and
-  cannot be grown into as bytes arrive. It comes from the browser's report of the file
-  size; the byte count actually written is checked against it in `finish_upload/1`, so a
-  client that under-reports produces a failed upload rather than a truncated image.
+  `size_bytes` is still required, and still checked against the byte count actually
+  written in `finish_upload/2`, so a client that under-reports produces a failed upload
+  rather than a truncated image. The reason changed: a vdisk is sparse and could be grown
+  into, but an image whose recorded size does not match its bytes is a template that
+  produces VMs which will not boot.
 
-  Returns `{:ok, %{resource: ..., device: ..., created: boolean}}` or `{:error, reason}`.
-  `created: false` means the resource was already there and was adopted -- which for an
-  image the catalogue has never seen means a previous upload died before registering it.
+  Returns `{:ok, %{vdisk: ..., socket: ..., node: ..., size_bytes: ...}}` or
+  `{:error, reason}`. On failure nothing is left behind.
   """
   @spec prepare_upload(String.t(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
   def prepare_upload(name, size_bytes) when is_integer(size_bytes) and size_bytes > 0 do
     with {:ok, name} <- validate_name(name),
          :ok <- refuse_if_catalogued(name) do
-      resource = resource_name(name)
+      vdisk = resource_name(name)
       ip = local_ip()
 
-      # Round up: a volume has to hold every byte, and the last partial KiB is a byte the
-      # image needs. The daemon aligns further to DRBD's 4 KiB.
-      size_kib = div(size_bytes + 1023, 1024)
-
-      with {:ok, _created_info} <- allocate(ip, resource, size_kib),
-           {:ok, device} <- await_device(ip, resource),
-           :ok <- promote(ip, resource) do
-        {:ok, %{resource: resource, device: device, node: ip, size_bytes: size_bytes}}
+      with {:ok, _created} <- allocate(ip, vdisk, size_bytes),
+           {:ok, socket} <- claim(ip, vdisk) do
+        {:ok, %{vdisk: vdisk, socket: socket, node: ip, size_bytes: size_bytes}}
       else
         {:error, reason} ->
-          # Nothing this call created may survive it. A half-built resource holds storage
-          # on every node and is invisible to the catalogue, so it is never reclaimed.
-          rollback_upload(%{resource: resource, node: ip})
+          # Nothing this call created may survive it. A half-built vdisk is invisible to
+          # the catalogue, so nothing will ever reclaim it -- Purah sweeps extent groups
+          # no map points at, not vdisks nothing points at.
+          rollback_upload(%{vdisk: vdisk, node: ip})
           {:error, reason}
       end
     end
@@ -381,127 +352,110 @@ defmodule SpectrumPhx.Images do
     end
   end
 
-  defp allocate(ip, resource, size_kib) do
-    case uploader().linstor_create(ip, resource, size_kib) do
+  defp allocate(ip, vdisk, size_bytes) do
+    case uploader().create(ip, vdisk, size_bytes) do
       {:ok, info} -> {:ok, info}
       {:error, {409, message}} -> {:error, {:size_conflict, message}}
       {:error, reason} -> {:error, {:allocate, describe(reason)}}
     end
   end
 
-  # The device is created by DRBD a moment after LINSTOR reports the resource placed, so
-  # this polls rather than assuming. Ten seconds by default, as the Python path used; the
-  # bound is configurable only so a test that exercises the give-up path need not take ten
-  # seconds to do it.
-  defp device_poll_attempts,
-    do: Application.get_env(:spectrum_phx, :images_device_poll_attempts, 20)
+  # Attaching is the ownership claim, and it is checked because a refusal means another
+  # host owns the vdisk. This is what replaced polling for a DRBD device to appear and
+  # then reading back the role a promotion produced: there is no device, and the attach
+  # either won the compare-and-swap in Hydra or it did not.
+  defp claim(ip, vdisk) do
+    case uploader().attach(ip, vdisk) do
+      {:ok, %{"socket" => socket}} when is_binary(socket) ->
+        {:ok, socket}
 
-  defp device_poll_interval_ms,
-    do: Application.get_env(:spectrum_phx, :images_device_poll_interval_ms, 500)
+      {:ok, _body} ->
+        {:ok, @vdisk_prefix <> vdisk <> ".sock"}
 
-  defp await_device(ip, resource), do: await_device(ip, resource, device_poll_attempts())
-
-  defp await_device(ip, resource, attempts) do
-    device = "/dev/drbd/by-res/" <> resource <> "/0"
-
-    case uploader().device_info(ip, device) do
-      {:ok, %{"is_block" => true}} ->
-        {:ok, device}
-
-      _other when attempts > 1 ->
-        Process.sleep(device_poll_interval_ms())
-        await_device(ip, resource, attempts - 1)
-
-      _other ->
-        {:error, {:device, "The DRBD device #{device} did not appear on #{ip}."}}
-    end
-  end
-
-  # The role that comes back is checked, not the call's exit status. A promotion that did
-  # not take means a peer still holds Primary, and writing the device from a Secondary is
-  # the split-brain this exists to prevent -- so it aborts the upload rather than logging.
-  defp promote(ip, resource) do
-    case uploader().drbd_role(ip, resource, "primary") do
-      {:ok, %{"role" => role}} ->
-        if String.downcase(to_string(role)) == "primary" do
-          :ok
-        else
-          {:error,
-           {:promote,
-            "#{resource} is #{role}, not Primary, after a promotion request. " <>
-              "Another node may still hold Primary."}}
-        end
+      {:error, {409, message}} ->
+        {:error, {:claim, "#{vdisk} could not be attached here: #{message}"}}
 
       {:error, reason} ->
-        {:error, {:promote, describe(reason)}}
+        {:error, {:claim, describe(reason)}}
     end
   end
 
   @doc """
   Complete an upload whose bytes have all been written: permissions, flush, demote.
 
-  `written` is compared with the size the volume was defined for. A short write is a
+  `written` is compared with the size the image was declared to be. A short write is a
   truncated image, so it fails here rather than being catalogued -- the case that
   previously produced an image that existed, mounted, and was incomplete.
 
-  The device is left `root:qemu 0660`, not `0666`: qemu is the only consumer that needs
-  it, and world-writable lets any local user corrupt the golden image every VM is cloned
-  from.
+  Then the vdisk is **sealed**: drained, so every byte is in an extent group, and made
+  permanently immutable. That is what replaced `--allow-two-primaries`, the flag that
+  existed because guests on several hosts attach a golden image read-only at the same
+  time and DRBD required each of those hosts to hold Primary in order to read -- which
+  is exactly the state that corrupts a device the moment anything writes. A sealed vdisk
+  cannot reach it: reads need no lease and writes are refused by class at the NBD layer.
+
+  There is no permissions step, because there is no device node. The image is reached
+  over a per-vdisk unix socket that Sidon creates group-owned by `qemu`.
   """
   @spec finish_upload(map(), non_neg_integer()) :: :ok | {:error, term()}
-  def finish_upload(
-        %{resource: resource, device: device, node: ip, size_bytes: expected},
-        written
-      ) do
+  def finish_upload(%{vdisk: vdisk, node: ip, size_bytes: expected}, written) do
     if written != expected do
       {:error,
-       {:truncated,
-        "The image was truncated: #{written} of #{expected} bytes reached the device."}}
+       {:truncated, "The image was truncated: #{written} of #{expected} bytes reached the vdisk."}}
     else
-      uploader().device_prepare(ip, device, "root:qemu", "0660")
-      uploader().device_flush(ip, device)
-      demote(ip, resource)
-      :ok
+      case uploader().seal(ip, vdisk) do
+        {:ok, _result} ->
+          :ok
+
+        {:error, reason} ->
+          # Not swallowed. An unsealed image is a writable template, and the next thing
+          # to attach it can change what every VM cloned from it boots.
+          {:error,
+           {:seal,
+            "#{vdisk} was written but could not be sealed: #{describe(reason)}. " <>
+              "It is writable, so it must not be used as a template until it is."}}
+      end
     end
   end
 
   @doc """
-  Undo a prepared upload: demote this node and delete the resource.
+  Undo a prepared upload: detach this node and delete the vdisk.
 
   Called on every failure path, including one where the browser vanished mid-transfer.
   Both steps are best-effort and neither can fail the caller -- there is nothing useful a
   caller can do about a rollback that did not work, and the failure it is rolling back is
-  the one worth reporting. A resource that will not delete is logged, because it is
-  holding storage on every node that nothing will ever reclaim automatically.
+  the one worth reporting. A vdisk that will not delete is logged, because nothing will
+  ever reclaim it automatically: Purah sweeps extent groups the block map does not point
+  at, and a half-built vdisk's map points at its own.
   """
   @spec rollback_upload(map()) :: :ok
-  def rollback_upload(%{resource: resource, node: ip}) do
-    unwind(ip, resource, rollback_attempts())
+  def rollback_upload(%{vdisk: vdisk, node: ip}) do
+    unwind(ip, vdisk, rollback_attempts())
   end
 
-  # Retried, because the device is released asynchronously. spark-daemon holds the block
-  # device open for the life of the write request, so an abandoned upload -- a cancelled
-  # transfer, a truncated body, a browser that vanished -- leaves the device busy for a
-  # moment after this tier has given up on it. The first demote and delete then fail with
-  # "resource is still in use", and a rollback that gives up there leaks a DRBD resource
-  # holding storage on every node, which is the thing it exists to prevent.
-  defp unwind(ip, resource, attempts) do
-    demote(ip, resource)
+  # Retried, because the vdisk is released asynchronously. spark-daemon keeps the NBD
+  # connection open for the life of the write request, so an abandoned upload -- a
+  # cancelled transfer, a truncated body, a browser that vanished -- leaves the vdisk in
+  # use for a moment after this tier has given up on it. The first detach and delete then
+  # fail, and a rollback that gives up there leaks storage on every replica, which is the
+  # thing it exists to prevent.
+  defp unwind(ip, vdisk, attempts) do
+    uploader().detach(ip, vdisk)
 
-    case uploader().linstor_delete(ip, resource) do
+    case uploader().delete(ip, vdisk) do
       {:ok, _result} ->
         :ok
 
       {:error, _reason} when attempts > 1 ->
         Process.sleep(rollback_interval_ms())
-        unwind(ip, resource, attempts - 1)
+        unwind(ip, vdisk, attempts - 1)
 
       {:error, reason} ->
         require Logger
 
         Logger.error(
-          "[images] Could not delete #{resource} while rolling back an upload: " <>
-            "#{describe(reason)}. It is holding storage on every node and must be " <>
+          "[images] Could not delete #{vdisk} while rolling back an upload: " <>
+            "#{describe(reason)}. It is holding storage on every replica and must be " <>
             "removed by hand."
         )
 
@@ -514,11 +468,6 @@ defmodule SpectrumPhx.Images do
   defp rollback_interval_ms,
     do: Application.get_env(:spectrum_phx, :images_rollback_interval_ms, 1_000)
 
-  defp demote(ip, resource) do
-    uploader().drbd_role(ip, resource, "secondary")
-    :ok
-  end
-
   @doc """
   Register a completed image in the catalogue.
 
@@ -527,13 +476,13 @@ defmodule SpectrumPhx.Images do
   reverse order is what let `/api/images` list images whose upload had failed.
   """
   @spec register(map()) :: {:ok, map()} | {:error, term()}
-  def register(%{name: name, size_bytes: size_bytes, device: device}) do
+  def register(%{name: name, size_bytes: size_bytes, socket: socket}) do
     image = %{
       name: name,
       filename: name,
       size_bytes: size_bytes,
       type: image_type(name),
-      path: device,
+      path: socket,
       created_at: DateTime.utc_now() |> DateTime.to_unix(:millisecond)
     }
 
@@ -586,8 +535,8 @@ defmodule SpectrumPhx.Images do
   def describe_upload_error({:allocate, detail}),
     do: "The cluster could not allocate storage for this image: #{detail}"
 
-  def describe_upload_error({:device, detail}), do: detail
-  def describe_upload_error({:promote, detail}), do: detail
+  def describe_upload_error({:claim, detail}), do: detail
+  def describe_upload_error({:seal, detail}), do: detail
   def describe_upload_error({:truncated, detail}), do: detail
 
   def describe_upload_error({:transport, detail}),
@@ -611,8 +560,8 @@ defmodule SpectrumPhx.Images do
   @doc """
   Where the upload's host calls go: `SpectrumPhx.Images.SparkUploader` by default.
 
-  The DRBD sequence is six calls against a real host holding real storage, so a test
-  drives it through a stand-in. This is the seam for that, and the only one -- the writer
+  The sequence is four calls against a real host holding real storage, so a test drives
+  it through a stand-in. This is the seam for that, and the only one -- the writer
   streams bytes through Mint and is exercised separately.
   """
   def uploader, do: Application.get_env(:spectrum_phx, :images_uploader, __MODULE__.SparkUploader)
@@ -626,18 +575,11 @@ defmodule SpectrumPhx.Images do
     """
     alias SpectrumPhx.Spark
 
-    def linstor_create(ip, resource, size_kib) do
-      Spark.linstor_resource_create(ip, resource, {:kib, size_kib},
-        allow_two_primaries: true,
-        timeout: 240
-      )
-    end
-
-    def linstor_delete(ip, resource), do: Spark.linstor_resource_delete(ip, resource)
-    def device_info(ip, device), do: Spark.device_info(ip, device)
-    def drbd_role(ip, resource, role), do: Spark.drbd_role(ip, resource, role)
-    def device_prepare(ip, device, owner, mode), do: Spark.device_prepare(ip, device, owner, mode)
-    def device_flush(ip, device), do: Spark.device_flush(ip, device)
+    def create(ip, vdisk, size_bytes), do: Spark.dfs_create(ip, vdisk, size_bytes)
+    def attach(ip, vdisk), do: Spark.dfs_attach(ip, vdisk)
+    def detach(ip, vdisk), do: Spark.dfs_detach(ip, vdisk)
+    def seal(ip, vdisk), do: Spark.dfs_seal(ip, vdisk)
+    def delete(ip, vdisk), do: Spark.dfs_delete(ip, vdisk)
   end
 
   @doc """
@@ -645,42 +587,41 @@ defmodule SpectrumPhx.Images do
 
   ## The constraint
 
-  The web tier must not touch the data path. A container's `/dev` carries device nodes but
-  not udev's subdirectories, so `/dev/drbd/by-res/<res>/0` does not exist inside one and
-  opening it fails with `ENOENT` -- and mounting `/dev` in would be
-  the wrong fix. Staging the file onto a storage mount instead is equally wrong: it is
-  still the web tier writing cluster storage, and it needs somewhere to put a file the
-  size of an install ISO. Spark owns host storage, the way Stargate rather than Prism
-  owns it on Nutanix, so the bytes have to be handed to Spark and Spark has to do the
-  write. `spectrum_server.py` now does exactly that, streaming the request body to
-  `POST /api/v1/storage/device/write` on spark-daemon.
+  The web tier must not touch the data path. A vdisk is reached over a unix socket under
+  `/var/lib/hci/sidon/nbd/`, which this container does not have and should not get --
+  mounting it in would be the wrong fix. Staging the file onto a storage mount instead is
+  equally wrong: it is still the web tier writing cluster storage, and it needs somewhere
+  to put a file the size of an install ISO. Spark is native to the host and owns storage,
+  the way Stargate rather than Prism owns it on Nutanix, so the bytes are handed to Spark
+  and Spark does the write. `spectrum_server.py` does exactly that, streaming the request
+  body to `POST /api/v1/dfs/write` on spark-daemon.
+
+  That endpoint is also a smaller thing to trust than the one it replaced. The device
+  form took a path and validated it against an allow-list; this one takes a *vdisk name*
+  and derives the socket itself, so a caller cannot name a file at all.
 
   ## What the sequence is
 
-  In order, with the size known up front because a DRBD volume is defined with a size and
-  cannot be grown into as bytes arrive:
+  In order:
 
-    1. `prepare_upload/2` -- resource definition, volume definition sized in KiB,
-       placement on every node, and `--allow-two-primaries` (correct *only* for images,
-       which guests on several hosts attach read-only at the same time; never for a VM
-       disk). Then poll until the device appears, and promote this node to Primary,
-       **checking the role that comes back**. A promotion that did not take means a peer
-       still holds Primary, and writing from a Secondary is the split-brain that check
-       exists to prevent.
-    2. `UploadWriter` streams each chunk onto `POST /api/v1/storage/device/write`.
-    3. `finish_upload/2` -- verify the byte count, set `root:qemu 0660`, flush, demote.
+    1. `prepare_upload/2` -- create the vdisk at the declared size, then attach it here.
+       The attach is the ownership claim and its refusal is checked: a `409` means
+       another host owns the vdisk, and it names which.
+    2. `UploadWriter` streams each chunk onto `POST /api/v1/dfs/write`.
+    3. `finish_upload/2` -- verify the byte count, then seal: drain the journal into
+       extent groups and make the vdisk permanently immutable.
     4. `register/1` -- the catalogue row, last, because a row is a claim that the image
        is usable.
-    5. `rollback_upload/1` on every failure, or the half-built resource holds storage on
-       every node forever.
+    5. `rollback_upload/1` on every failure, or the half-built vdisk holds storage on
+       every replica forever.
 
   ## Why the preparation runs on the first chunk, not in `init/1`
 
   `Phoenix.LiveView.UploadWriter.init/1` runs inside the upload channel's `join`. The
   browser joins that channel with no explicit timeout, so it uses the socket default of
-  ten seconds -- and on timeout it *rejoins*, which would run the whole DRBD sequence a
-  second time and leak the first attempt's connection. Waiting for a DRBD device can take
-  most of that budget on its own.
+  ten seconds -- and on timeout it *rejoins*, which would run the whole preparation a
+  second time and leak the first attempt's connection. The preparation is much faster
+  than the DRBD placement it replaced, but "usually fits" is not a bound.
 
   `write_chunk/2` is bounded by `:chunk_timeout` instead, which `allow_upload/3` accepts
   as an option, so the preparation happens there on the first chunk under a limit this
@@ -703,9 +644,9 @@ defmodule SpectrumPhx.Images do
   def upload_note do
     "Uploads stream straight through to the host that owns the storage: the browser " <>
       "sends chunks over the LiveView channel, and each one is pushed onto an open " <>
-      "request to spark-daemon's /api/v1/storage/device/write. Nothing is staged here. " <>
-      "The web tier never opens the device, which is why this container needs no /dev " <>
-      "and no storage mount."
+      "request to spark-daemon's /api/v1/dfs/write. Nothing is staged here. The web " <>
+      "tier never opens the vdisk, which is why this container needs no storage mount " <>
+      "and no access to Sidon's sockets."
   end
 
   # -- seams ---------------------------------------------------------------------------
@@ -748,7 +689,7 @@ defmodule SpectrumPhx.Images do
       size_bytes: integer(field(row, "size_bytes") || field(row, :size_bytes)),
       path: string(path),
       created_at: timestamp(field(row, "created_at") || field(row, :created_at)),
-      on_drbd?: is_binary(path) and String.starts_with?(path, @drbd_prefix)
+      on_vdisk?: is_binary(path) and String.starts_with?(path, @vdisk_prefix)
     }
   end
 

@@ -4,44 +4,39 @@ defmodule SpectrumPhx.UploadStubs do
   hold a socket open.
 
   Both are configured through application env and report every call back to the test
-  process, so a test asserts on the *sequence* -- allocate, promote, write, permissions,
-  flush, demote, register, and the rollback -- rather than on a mock's return value. That
-  ordering is the part with the failure modes: a resource created and never deleted holds
-  storage on every node, and a row written before the bytes land is an image that looks
-  usable and is not.
+  process, so a test asserts on the *sequence* -- create, attach, write, seal, register,
+  and the rollback -- rather than on a mock's return value. That ordering is the part with
+  the failure modes: a vdisk created and never deleted holds storage on every replica, an
+  unsealed image is a writable template, and a row written before the bytes land is an
+  image that looks usable and is not.
   """
 
   defmodule Uploader do
     @moduledoc "Stands in for `SpectrumPhx.Images.SparkUploader`."
 
-    def linstor_create(ip, resource, size_kib) do
-      report({:linstor_create, ip, resource, size_kib})
-      answer(:linstor_create, {:ok, %{"resource" => resource, "created" => true}})
+    def create(ip, vdisk, size_bytes) do
+      report({:create, ip, vdisk, size_bytes})
+      answer(:create, {:ok, %{"vdisk_id" => vdisk, "created" => true}})
     end
 
-    def linstor_delete(ip, resource) do
-      report({:linstor_delete, ip, resource})
-      answer(:linstor_delete, {:ok, %{"deleted" => true}})
+    def attach(ip, vdisk) do
+      report({:attach, ip, vdisk})
+      answer(:attach, {:ok, %{"socket" => "/var/lib/hci/sidon/nbd/#{vdisk}.sock"}})
     end
 
-    def device_info(ip, device) do
-      report({:device_info, ip, device})
-      answer(:device_info, {:ok, %{"is_block" => true}})
+    def detach(ip, vdisk) do
+      report({:detach, ip, vdisk})
+      answer(:detach, {:ok, %{}})
     end
 
-    def drbd_role(ip, resource, role) do
-      report({:drbd_role, ip, resource, role})
-      answer(:drbd_role, {:ok, %{"role" => role}})
+    def seal(ip, vdisk) do
+      report({:seal, ip, vdisk})
+      answer(:seal, {:ok, %{"class" => "immutable"}})
     end
 
-    def device_prepare(ip, device, owner, mode) do
-      report({:device_prepare, ip, device, owner, mode})
-      answer(:device_prepare, {:ok, %{}})
-    end
-
-    def device_flush(ip, device) do
-      report({:device_flush, ip, device})
-      answer(:device_flush, {:ok, %{}})
+    def delete(ip, vdisk) do
+      report({:delete, ip, vdisk})
+      answer(:delete, {:ok, %{"deleted" => true}})
     end
 
     defp report(message), do: SpectrumPhx.UploadStubs.report(message)
@@ -57,7 +52,7 @@ defmodule SpectrumPhx.UploadStubs do
     """
 
     def open(allocation, size_bytes) do
-      SpectrumPhx.UploadStubs.report({:open, allocation.node, allocation.device, size_bytes})
+      SpectrumPhx.UploadStubs.report({:open, allocation.node, allocation.vdisk, size_bytes})
 
       case SpectrumPhx.UploadStubs.answer(:open, :ok) do
         :ok -> {:ok, %{written: "", size_bytes: size_bytes}}
@@ -88,16 +83,16 @@ defmodule SpectrumPhx.UploadStubs do
   @doc """
   Point `SpectrumPhx.Images` and the writer at the stubs for the duration of one test.
 
-  `answers` overrides individual calls, e.g. `%{drbd_role: {:ok, %{"role" => "secondary"}}}`
-  to make a promotion fail to take.
+  `answers` overrides individual calls, e.g. `%{attach: {:error, {409, "hci-02 owns it"}}}`
+  to make the ownership claim lose.
   """
   def install(answers \\ %{}) do
     Application.put_env(:spectrum_phx, :images_uploader, Uploader)
     Application.put_env(:spectrum_phx, :images_upload_transport, Transport)
     Application.put_env(:spectrum_phx, :upload_stub_owner, self())
     Application.put_env(:spectrum_phx, :upload_stub_answers, answers)
-    # The real rollback retries for six seconds because the device is released
-    # asynchronously. A test has no such device, so it must not wait for one.
+    # The real rollback retries for six seconds because the vdisk is released
+    # asynchronously. A test has no such vdisk, so it must not wait for one.
     Application.put_env(:spectrum_phx, :images_rollback_attempts, 2)
     Application.put_env(:spectrum_phx, :images_rollback_interval_ms, 1)
 

@@ -16,13 +16,15 @@ defmodule SpectrumPhx.Vms do
   The Python tier ran `UPDATE hydra.vms SET host_ip = '<ip>' WHERE name = '<name>'` with
   no condition. Two callers acting on the same VM -- a manual start racing DRS, or a start
   issued while a stale `host_ip` was still in the row -- would both "succeed", and two
-  qemu processes would open the same raw DRBD device. `claim_host/4` uses an LWT so
-  exactly one caller wins and the loser is told it lost.
+  qemu processes would open the same disk. `claim_host/4` uses an LWT so exactly one
+  caller wins and the loser is told it lost.
 
-  Vali has a second, independent guard for this (it promotes each DRBD resource to
-  Primary as a checked step and refuses to boot if the peer still holds Primary). The LWT
-  here is the *first* gate: it stops the second start from ever being submitted, and it
-  works even for the paths that do not go through DRBD promotion.
+  Vali has a second, independent guard for this: it attaches each vdisk on the target as
+  a checked step, and an attach wins the `(owner, epoch)` compare-and-swap in Hydra and
+  fences every journal replica at the new epoch. The LWT here is the *first* gate. It
+  stops the second start from ever being submitted, which is worth having even though the
+  attach is now decisive on its own -- a refusal at the database is a clean error, and a
+  refusal at the storage layer is a half-started VM.
 
   ### 3. The migration lock is conditional
 
@@ -32,8 +34,8 @@ defmodule SpectrumPhx.Vms do
 
   ## Not implemented here (on purpose)
 
-  DRBD promotion, libvirt XML generation, NVRAM handling, host selection and the
-  dual-primary window around live migration all stay in `vali.py`. They are reached by
+  Vdisk attach and detach, libvirt XML generation, NVRAM handling, host selection and
+  ownership transfer during live migration all stay in `vali.py`. They are reached by
   submitting a task to Catalyst, exactly as the Python tier does; see `submit_task/3`.
 
   ## Test seam
@@ -194,7 +196,7 @@ defmodule SpectrumPhx.Vms do
 
   Cassandra/Scylla `UPDATE` is unconditional and last-write-wins. Without the `IF` clause
   two nodes can both write their own IP into `host_ip` a millisecond apart, both believe
-  they own the VM, and both start qemu against the same DRBD device. The `IF` makes the
+  they own the VM, and both start qemu against the same disk. The `IF` makes the
   read-and-write a single Paxos round: one applies, the other comes back `[applied] =
   false`.
   """
@@ -235,9 +237,12 @@ defmodule SpectrumPhx.Vms do
   'migrating'` followed by a separate read of `status` -- which is a check-then-act, and
   two callers can both pass the check. Here the condition and the write are one operation.
 
-  A failed lock must abort the migration, not be logged and stepped over: without it a
-  second migration of the same VM proceeds concurrently, and live migration is exactly the
-  window in which DRBD dual-primary is enabled.
+  A failed lock must abort the migration, not be logged and stepped over. What it
+  prevents changed with the storage layer and is worth stating precisely: it is no longer
+  a corrupted disk, because a vdisk has one owner per epoch and a deposed owner's writes
+  are refused by every replica. It is two concurrent migrations of one VM racing each
+  other's ownership CAS, and the loser leaving a VM defined on a host that does not own
+  its disk.
   """
   @spec set_migration_lock(String.t()) ::
           {:ok, :locked} | {:error, :already_migrating | :invalid_name | term()}
@@ -298,23 +303,21 @@ defmodule SpectrumPhx.Vms do
   @doc """
   Register a new VM and allocate its disks.
 
-  Validates with `SpectrumPhx.Vms.Vm.new/1`, inserts `IF NOT EXISTS`, then allocates one
-  DRBD-backed Linstor resource per disk through `SpectrumPhx.Spark.linstor_resource_create/4`.
-  A VM that comes back `{:ok, vm}` has both a row and its storage.
+  Validates with `SpectrumPhx.Vms.Vm.new/1`, inserts `IF NOT EXISTS`, then creates one
+  vdisk per disk through `SpectrumPhx.Spark.dfs_create/4`. A VM that comes back
+  `{:ok, vm}` has both a row and its storage.
 
   ## The row is written before the storage, on purpose
 
-  Disk resources are named after the VM (`<name>-disk<n>`), so the name is the shared
-  resource two concurrent creates would collide on. The `IF NOT EXISTS` insert is the only
-  thing in this system that makes that collision resolvable: it is one Paxos round, so
-  exactly one caller proceeds to allocate.
+  Vdisks are named after the VM (`<name>-disk<n>`), so the name is the shared resource
+  two concurrent creates would collide on. The `IF NOT EXISTS` insert is the only thing in
+  this system that makes that collision resolvable: it is one Paxos round, so exactly one
+  caller proceeds to allocate.
 
-  Reversing the order breaks the rollback rather than the happy path. `resource-definition
-  create` is idempotent by adoption, so the caller that loses the row insert cannot tell
-  its own resources from the winner's -- and its rollback would delete the winner's live
-  disks. Ordering it row-first also makes the surviving failure mode the recoverable one:
-  a row with no storage is deleted below and shows up in the operator's error, whereas
-  storage with no row is an orphan nothing ever looks at again.
+  Ordering it row-first makes the surviving failure mode the recoverable one: a row with
+  no storage is deleted below and shows up in the operator's error, whereas storage with
+  no row is an orphan nothing ever looks at again -- Purah reclaims extent groups the
+  block map does not point at, and an orphaned vdisk's map points at its own.
 
   ## Rollback
 
@@ -426,12 +429,15 @@ defmodule SpectrumPhx.Vms do
     |> Enum.reduce_while({:ok, []}, fn disk, {:ok, created} ->
       case allocate_disk(disk) do
         # Adopted, not created: it was already there, so this call does not own it and
-        # must not delete it during a rollback.
+        # must not delete it during a rollback. Sidon refuses a duplicate create rather
+        # than adopting, so this is defensive -- but a create that reports adoption and a
+        # rollback that then deletes someone else's live disk is not a failure mode worth
+        # leaving to a version check.
         {:ok, %{"created" => false}} ->
           Logger.warning(
-            "VM #{vm.name}: adopted the existing Linstor resource #{disk.resource} rather " <>
-              "than creating it. The database has never seen this VM, so that resource is " <>
-              "a leftover from an earlier VM of the same name."
+            "VM #{vm.name}: adopted the existing vdisk #{disk.resource} rather than " <>
+              "creating it. The database has never seen this VM, so that vdisk is a " <>
+              "leftover from an earlier VM of the same name."
           )
 
           {:cont, {:ok, created}}
@@ -451,10 +457,10 @@ defmodule SpectrumPhx.Vms do
     end
   end
 
-  # `nodes` is deliberately not sent: Spark reads the same cluster document this node
-  # does, and it is the component that owns the host inventory. Deriving a node list here
-  # would duplicate that knowledge and get it wrong exactly when a hostname is missing
-  # from the web tier's copy of the file.
+  # `rf` is deliberately not sent: Sidon reads the same cluster document this node does,
+  # and it is the component that owns the host inventory. Deriving a replica count here
+  # would duplicate that knowledge and get it wrong exactly when a node is missing from
+  # the web tier's copy of the file.
   defp allocate_disk(%{size_gib: nil, index: index}) do
     {:error, "disk #{index} has no usable size"}
   end
@@ -462,10 +468,8 @@ defmodule SpectrumPhx.Vms do
   defp allocate_disk(%{resource: resource, size_gib: size_gib}) do
     case storage_client() do
       nil ->
-        # {:gib, _} and never :allow_two_primaries: a VM disk is read-write, and
-        # dual-primary on one is what let a VM run on two hosts and corrupt itself.
         on_a_spark_node(fn ip ->
-          Spark.linstor_resource_create(ip, resource, {:gib, size_gib})
+          Spark.dfs_create(ip, resource, size_gib * 1024 * 1024 * 1024)
         end)
 
       fun when is_function(fun, 3) ->
@@ -481,7 +485,7 @@ defmodule SpectrumPhx.Vms do
 
         {:error, reason} ->
           Logger.error(
-            "Rolling back VM creation: Linstor resource #{resource} could not be deleted " <>
+            "Rolling back VM creation: vdisk #{resource} could not be deleted " <>
               "(#{inspect(reason)}). It is now an orphan and has to be removed by hand."
           )
       end
@@ -491,19 +495,19 @@ defmodule SpectrumPhx.Vms do
   defp release_disk(resource) do
     case storage_client() do
       nil ->
-        on_a_spark_node(fn ip -> Spark.linstor_resource_delete(ip, resource) end)
+        on_a_spark_node(fn ip -> Spark.dfs_delete(ip, resource) end)
 
       fun when is_function(fun, 3) ->
         fun.(:delete, resource, %{})
     end
   end
 
-  # Linstor is a cluster-wide service: the client in any node's aether container reaches
-  # whichever node currently holds the controller. A node this call could not *reach* is
-  # therefore retried on the next node, while an answer from a daemon -- including a
-  # refusal -- is final and stops the walk. The endpoints being idempotent is what makes
-  # the retry safe: a create that timed out after the daemon acted is adopted, not
-  # duplicated.
+  # A vdisk create is a write to Hydra, which every node can perform, so any reachable
+  # node will do. A node this call could not *reach* is therefore retried on the next
+  # node, while an answer from a daemon -- including a refusal -- is final and stops the
+  # walk. What makes the retry safe is that the create is a conditional write: a create
+  # that timed out after the daemon acted comes back as a refusal naming the existing
+  # vdisk, not as a second one.
   defp on_a_spark_node(fun) do
     Enum.reduce_while(spark_ips(), {:error, :no_spark_nodes}, fn ip, _last ->
       case fun.(ip) do
@@ -561,13 +565,13 @@ defmodule SpectrumPhx.Vms do
 
     * `:host_ip` - start on this specific host. The host is claimed with `claim_host/4`
       *before* the task is submitted, so a VM that is already placed elsewhere is refused
-      here rather than being handed to a hypervisor that will try to promote a DRBD
-      resource its peer still holds.
+      here rather than being handed to a hypervisor that will try to attach a vdisk
+      another host owns.
 
   With no `:host_ip`, placement is left to Vali's `select_best_start_host`, which filters
   out hosts in maintenance and hosts with a service down, then picks the one with the
   lowest used memory. That choice happens inside Vali, so the claim happens there too --
-  this path relies on Vali's DRBD promotion check as the ownership gate, not on the LWT.
+  this path relies on Vali's vdisk attach as the ownership gate, not on the LWT.
   """
   @spec power_on(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def power_on(name, opts \\ []) do
@@ -697,9 +701,8 @@ defmodule SpectrumPhx.Vms do
   function receiving `(action, resource, opts)`.
 
   `action` is `:create` (with `%{size_gib: n}`) or `:delete` (with `%{}`), and the return
-  value is whatever `SpectrumPhx.Spark.linstor_resource_create/4` and
-  `linstor_resource_delete/3` return -- `{:ok, %{"created" => bool}}`,
-  `{:ok, %{"deleted" => bool}}` or `{:error, reason}`.
+  value is whatever `SpectrumPhx.Spark.dfs_create/4` and `dfs_delete/3` return --
+  `{:ok, %{"created" => bool}}`, `{:ok, %{"deleted" => bool}}` or `{:error, reason}`.
 
   Allocation is the one part of a create that cannot be exercised against a real cluster
   in a test, and it is also the part whose *failure* path matters most, so the seam exists

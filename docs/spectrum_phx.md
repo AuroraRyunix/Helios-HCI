@@ -27,16 +27,23 @@ This is the single hardest architectural rule here, and it was learned the expen
 The web tier does not open block devices, does not mount storage, and does not stage files
 on a storage mount. Everything goes through [Spark](./spark.md)'s typed API
 ([spark_api.md](./spark_api.md)) or through a read of [HydraDB](./hydra.md). Prism does not
-reach into Stargate on Nutanix, and Spectrum does not reach into [Aether](./aether.md) here.
+reach into Stargate on Nutanix, and Spectrum does not reach into [Sidon](./sidon.md) here.
 
 The failure that established the rule: image upload called `test -b` on a device path and
 then opened it. `test -b` ran *on the host* through spark-daemon and passed; the open ran
 *inside the container* and failed with `ENOENT` -- a container's `/dev` has device nodes
-but not udev's subdirectories, so `/dev/drbd/by-res/<res>/0` is simply not there. The
-upload had never worked, and no amount of privilege would have made it. The first attempted fix — staging the file on a storage mount — is the same
-mistake wearing a different hat: it is still the web tier writing cluster storage. The
-correct shape is `POST /api/v1/storage/device/write`, where Spark owns the device and the
-console streams bytes to it.
+but not udev's subdirectories, so `/dev/drbd/by-res/<res>/0` was simply not there. The
+upload had never worked, and no amount of privilege would have made it. The first
+attempted fix — staging the file on a storage mount — is the same mistake wearing a
+different hat: it is still the web tier writing cluster storage. The correct shape is
+`POST /api/v1/dfs/write`, where Spark owns the storage and the console streams bytes to
+it.
+
+The storage layer changed underneath this rule and did not weaken it. A vdisk is reached
+over a unix socket under `/var/lib/hci/sidon/nbd/`, which this container also does not
+have and also should not get. What did improve is the endpoint: the device form took a
+path and checked it against an allow-list, while the vdisk form takes a *name* and derives
+the socket itself, so a caller cannot name a file at all.
 
 ## 3. Pages
 
@@ -44,9 +51,9 @@ console streams bytes to it.
 |---|---|---|
 | `/` | `Cluster.OverviewLive` | ZooKeeper desired state + per-node ephemeral znodes ([cluster_state.md](./cluster_state.md)) |
 | `/hosts` | `Cluster.HostsLive` | ZooKeeper + `Spark.host_disks/1` |
-| `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and Linstor endpoints |
-| `/storage` | `Storage.IndexLive` | DRBD status per node + `linstor --machine-readable storage-pool list` |
-| `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Linstor resource definitions |
+| `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and DFS endpoints |
+| `/storage` | `Storage.IndexLive` | Sidon's `capacity`, `list` and `peers` per node, plus `lsblk` |
+| `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Sidon vdisks |
 | `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks` |
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
@@ -93,11 +100,18 @@ each context is the seam for a real watcher; once one exists the intervals can g
 ### Unknown is never drawn as healthy
 
 The rule enforced across every page: a value that could not be read renders as *unknown*,
-never as zero, empty, or green. Concretely — an unreachable LINSTOR renders differently from
-an answered-but-empty LINSTOR; a pool with no capacity gets no usage bar rather than a
-reassuring 0%; a node with no telemetry says "unknown, not zero"; a DRBD resource on a
-partially-readable cluster is `:unknown` rather than `:ok`, and its replica count is labelled
-a floor; an empty `mimir_results` says diagnostics have not run rather than showing green.
+never as zero, empty, or green. Concretely — a node whose Sidon did not answer renders
+differently from one that answered with nothing; an extent store reporting no capacity gets
+no usage bar rather than a reassuring 0%, and says the likely reason (it is not mounted); a
+node with no telemetry says "unknown, not zero"; a vdisk on a partially-readable cluster is
+`:unknown` rather than `:ok`, and its `under_replicated?` is `nil` rather than `false`; an
+empty `mimir_results` says diagnostics have not run rather than showing green.
+
+One distinction is new and worth stating on its own: a replication link that is down is
+reported as **writes being refused**, not as reduced redundancy. The journal is write-all,
+so an append that has not reached every replica is not acknowledged — the guests on that
+vdisk are taking EIO now, which is a different operational situation from "fewer copies
+than we would like".
 
 ## 6. Where the old pages disagreed with the database
 
@@ -139,14 +153,11 @@ the previous console displayed something confidently false.
 - The storage page's pools never came from `/api/storage/*`. `/api/storage/disks`
   synthesises fake disks from `hydra.vms` rows; it is a VM-volume list, not block devices.
   The "Physical Disks" panel was pool rows whose *name string* began with `"Physical Disk"`.
-- Pool health was a substring test (`"ok" in state.lower()`) with nothing about DRBD
-  anywhere — which is precisely why a resource that was `Inconsistent`, `StandAlone`, or
-  missing a replica rendered identically to a healthy one.
-- The old pool parser split the *human-readable* `linstor storage-pool list` table on the
-  column separator and dropped empty cells, which shifts every later column left for a
-  diskless pool. The machine-readable form is used instead. Capacities there are KiB, and
-  diskless pools report `INT64_MAX` — averaging that into a cluster total makes a full
-  fabric look nearly empty.
+- Pool health was a substring test (`"ok" in state.lower()`) with nothing about the
+  replicas anywhere — which is precisely why a resource missing a replica rendered
+  identically to a healthy one. Both the parser and the substring test are gone with
+  LINSTOR: capacity now comes from `statfs` on the extent store's own filesystem, in
+  bytes, with no sentinel values to filter and no human table to split.
 - `GET /api/images` *writes*: it scans a directory and inserts rows for files it finds.
   Reconciling the catalogue with the filesystem is a job, not a page load.
 - `/api/images/delete` always answered 200 — the row was deleted first, and both the
@@ -187,19 +198,30 @@ it against real hardware rather than by reasoning:
 
 **The preparation runs on the first chunk, not in the writer's `init/1`.** `init/1` is
 called inside the upload channel's `join`, and the browser joins with the socket's default
-ten-second timeout, then *rejoins* if it expires -- which would run the whole DRBD sequence
-a second time and leak the first attempt's connection. Waiting for a DRBD device can use
-most of that budget by itself. `write_chunk/2` is bounded by `:chunk_timeout`, which
-`allow_upload/3` accepts as an option, so the slow work sits under a limit the application
-controls.
+ten-second timeout, then *rejoins* if it expires -- which would run the whole preparation
+a second time and leak the first attempt's connection. Creating a vdisk is metadata work
+that returns in milliseconds, where the LINSTOR placement it replaced built a kernel object
+on every node and could use most of that budget by itself; the reasoning holds anyway,
+because "usually fits" is not a bound. `write_chunk/2` is bounded by `:chunk_timeout`,
+which `allow_upload/3` accepts as an option, so the work sits under a limit the application
+controls rather than one the browser picked.
 
-**Rollback closes the connection before it deletes the resource, and retries.**
-spark-daemon holds the block device open for the life of the write request, so an abandoned
-upload -- a cancelled transfer, a truncated body, a browser that vanished -- leaves the
-device busy for a moment after this tier has given up on it. Deleting first fails with
-"resource is still in use", and the first version of this code gave up there, leaving DRBD
-resources stuck Primary and holding storage on every node. Ordering the teardown and
-retrying the delete for a few seconds is what makes the rollback actually reclaim anything.
+**Rollback closes the connection before it deletes the vdisk, and retries.** spark-daemon
+keeps the vdisk attached for the life of the write request, so an abandoned upload -- a
+cancelled transfer, a truncated body, a browser that vanished -- leaves it in use for a
+moment after this tier has given up on it. Deleting first fails, and the first version of
+this code gave up there, leaving storage held on every replica. Ordering the teardown
+(detach, then delete) and retrying for a few seconds is what makes the rollback actually
+reclaim anything.
+
+**An image is sealed, not left writable.** The last step before the catalogue row makes
+the vdisk permanently immutable. This is what replaced `--allow-two-primaries`, which
+existed because guests on several hosts attach a golden image read-only at the same time
+and DRBD required each of those hosts to hold Primary in order to read -- exactly the state
+that corrupts a device the moment anything writes. A sealed vdisk cannot reach it: reads
+need no lease and writes are refused by class at the NBD layer. A seal that fails is a
+failed upload, because an unsealed template is one attach away from changing what every VM
+cloned from it boots.
 
 ## 8. What is not done yet
 

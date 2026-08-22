@@ -13,7 +13,7 @@ defmodule SpectrumPhx.Health do
 
   The old page worked around this by ignoring the column entirely and re-deriving the
   category from a hardcoded list of check names in `app.js`. That list had drifted from
-  `mcli`'s own `checks_map`: `drbd_split_brain_check` and `broken_disks_check` are storage
+  `mcli`'s own `checks_map`: `orphaned_disks_check` and `broken_disks_check` are storage
   checks in `mcli` but fell through `getCheckCategory`'s `else` branch into the Services
   grid, and seven service checks (`hostname_resolution`, `mtls_cert_expiration`,
   `security_config_audit`, `auth_seeding_check`, `maintenance_mode_check`,
@@ -87,12 +87,16 @@ defmodule SpectrumPhx.Health do
     drs_storage_capacity_check migration_lock_status
   )
 
+  # `mcli`'s storage scope, verbatim. The five `aether_*` names and the two DRBD/LINSTOR
+  # ones are kept because a cluster upgraded from that era still has their rows in
+  # `hydra.health_checks`, and dropping them here would file a historical row under
+  # `:other` rather than showing it where it belongs.
   @storage_checks ~w(
+    replica_health storage_mount_options storage_volume_writable fstab_safety_check
+    orphaned_disks_check broken_disks_check sidon_latency_check
     aether_peers aether_volume aether_split_brain aether_heal_pending
     aether_storage_pools aether_storage_pools_space storage_capacity
-    storage_mount_options storage_volume_writable fstab_safety_check
-    orphaned_disks_check broken_disks_check drbd_split_brain_check
-    linstor_latency_check
+    drbd_split_brain_check linstor_latency_check
   )
 
   @hardware_checks ~w(

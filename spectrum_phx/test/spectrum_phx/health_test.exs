@@ -49,8 +49,11 @@ defmodule SpectrumPhx.HealthTest do
     end
 
     test "follows mcli's own lists where the old page's JavaScript had drifted from them" do
-      # `drbd_split_brain_check` and `broken_disks_check` are storage checks in mcli's
+      # `orphaned_disks_check` and `broken_disks_check` are storage checks in mcli's
       # checks_map but fell through getCheckCategory's else branch into Services.
+      assert Health.category_for("replica_health") == :storage
+      # And the names a cluster upgraded from the DRBD era still has rows for, so a
+      # historical row is shown where it belongs rather than filed under :other.
       assert Health.category_for("drbd_split_brain_check") == :storage
       assert Health.category_for("broken_disks_check") == :storage
 
@@ -71,6 +74,7 @@ defmodule SpectrumPhx.HealthTest do
       assert Health.category_for("drs_storage_capacity_check") == :services
       assert Health.category_for("migration_lock_status") == :services
       assert Health.category_for("hylia_status") == :services
+      assert Health.category_for("sidon_latency_check") == :storage
       assert Health.category_for("linstor_latency_check") == :storage
     end
 

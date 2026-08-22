@@ -1,10 +1,11 @@
 defmodule SpectrumPhxWeb.Storage.IndexLive do
   @moduledoc """
-  The storage fabric view: LINSTOR pools, DRBD resources and per-node disks.
+  The storage fabric view: per-node extent stores, the vdisks served from them, and the
+  disks underneath.
 
   Read-only. Nothing here provisions, resizes or deletes storage -- those paths run
   through Vali and Catalyst, and a view that can only observe cannot be the thing that
-  breaks a resource.
+  breaks a vdisk.
 
   ## Updates are pushed
 
@@ -21,10 +22,10 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
   ## What this page refuses to do
 
-  Render an unknown as a zero. A pool whose capacity LINSTOR would not report gets no
-  usage bar, a node that did not answer is named rather than dropped from the list, and a
-  resource on an unread node is `unknown` rather than `healthy`. The whole reason this
-  view exists is that the previous one showed a degraded resource and a healthy one
+  Render an unknown as a zero. A store whose filesystem reported no capacity gets no usage
+  bar, a node that did not answer is named rather than dropped from the list, and a vdisk
+  whose owner is on an unread node is `unknown` rather than `healthy`. The whole reason
+  this view exists is that the previous one showed a degraded resource and a healthy one
   identically.
 
   ## Route
@@ -73,7 +74,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     |> assign(:page_title, "Storage")
     |> assign(:snapshot, snapshot)
     |> assign(:summary, snapshot.summary)
-    |> assign(:troubled, Enum.reject(snapshot.resources.entries, &(&1.health == :ok)))
+    |> assign(:troubled, Enum.reject(snapshot.vdisks.entries, &(&1.health == :ok)))
     |> assign(:updated_at, DateTime.utc_now())
   end
 
@@ -126,22 +127,52 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         </div>
       </div>
 
+      <%!-- A peer link that is down is stated on its own, above everything else. The
+      journal is write-all, so this is not "reduced redundancy": guests whose vdisks
+      replicate to that node are taking EIO right now. --%>
+      <div
+        :if={@snapshot.peers.unreachable != []}
+        class="alert alert-error items-start"
+        id="peers-down"
+      >
+        <.icon name="hero-signal-slash" class="size-5 shrink-0" />
+        <div class="min-w-0">
+          <p class="font-semibold">
+            {length(@snapshot.peers.unreachable)} replication link(s) are down
+          </p>
+          <p class="text-sm opacity-90">
+            An append has to reach every replica before it is acknowledged, so a vdisk
+            replicated onto an unreachable node is refusing writes -- not merely running
+            with fewer copies.
+          </p>
+          <ul class="mt-1 space-y-0.5 text-sm font-mono">
+            <li
+              :for={link <- @snapshot.peers.unreachable}
+              id={"peer-" <> slug(link.from <> "-" <> link.peer)}
+            >
+              {link.from} &rarr; {link.peer}
+              <span :if={link.detail} class="opacity-70">({link.detail})</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+
       <%!-- The whole point of the page: anything not positively healthy is stated first,
       above the tables, where it cannot be missed. --%>
       <div :if={@troubled != []} class="alert alert-error items-start" id="attention">
         <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
         <div class="min-w-0">
           <p class="font-semibold">
-            {length(@troubled)} of {@summary.resources_total} resources are not healthy
+            {length(@troubled)} of {@summary.vdisks_total} vdisks are not healthy
           </p>
           <ul class="mt-1 space-y-1 text-sm">
-            <li :for={resource <- @troubled} id={"attention-" <> slug(resource.name)}>
-              <span class="font-mono font-semibold">{resource.name}</span>
-              <span :if={resource.issues == []} class="opacity-90">
+            <li :for={vdisk <- @troubled} id={"attention-" <> slug(vdisk.id)}>
+              <span class="font-mono font-semibold">{vdisk.id}</span>
+              <span :if={vdisk.issues == []} class="opacity-90">
                 state could not be established on every node.
               </span>
-              <span :if={resource.issues != []} class="opacity-90">
-                {Enum.join(resource.issues, "; ")}
+              <span :if={vdisk.issues != []} class="opacity-90">
+                {Enum.join(vdisk.issues, "; ")}
               </span>
             </li>
           </ul>
@@ -153,61 +184,69 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         class="stats stats-vertical sm:stats-horizontal w-full shadow"
       >
         <div class="stat">
-          <div class="stat-title">Resources</div>
-          <div class="stat-value text-2xl" id="stat-resources">
-            {@summary.resources_ok}/{@summary.resources_total}
+          <div class="stat-title">Vdisks</div>
+          <div class="stat-value text-2xl" id="stat-vdisks">
+            {@summary.vdisks_ok}/{@summary.vdisks_total}
           </div>
-          <div class="stat-desc">fully replicated and UpToDate</div>
+          <div class="stat-desc">owned and fully replicated</div>
         </div>
 
         <div class="stat">
           <div class="stat-title">Degraded</div>
           <div
-            class={["stat-value text-2xl", @summary.resources_degraded > 0 && "text-error"]}
+            class={["stat-value text-2xl", @summary.vdisks_degraded > 0 && "text-error"]}
             id="stat-degraded"
           >
-            {@summary.resources_degraded}
+            {@summary.vdisks_degraded}
           </div>
           <div class="stat-desc">
             <span
-              :if={@summary.resources_under_replicated > 0}
+              :if={@summary.vdisks_under_replicated > 0}
               id="stat-under-replicated"
               class="text-error font-semibold"
             >
-              {@summary.resources_under_replicated} under-replicated
+              {@summary.vdisks_under_replicated} under-replicated
             </span>
-            <span :if={@summary.resources_under_replicated == 0}>resources</span>
+            <span :if={@summary.vdisks_under_replicated == 0}>vdisks</span>
           </div>
         </div>
 
         <div class="stat">
           <div class="stat-title">Unknown</div>
           <div
-            class={["stat-value text-2xl", @summary.resources_unknown > 0 && "text-warning"]}
+            class={["stat-value text-2xl", @summary.vdisks_unknown > 0 && "text-warning"]}
             id="stat-unknown"
           >
-            {@summary.resources_unknown}
+            {@summary.vdisks_unknown}
           </div>
           <div class="stat-desc">state could not be read</div>
         </div>
 
         <div class="stat">
-          <div class="stat-title">Pools</div>
-          <div class="stat-value text-2xl" id="stat-pools">{@summary.pools_total}</div>
+          <div class="stat-title">Extent stores</div>
+          <div class="stat-value text-2xl" id="stat-stores">{@summary.stores_total}</div>
           <div class="stat-desc">
-            <span :if={@summary.pools_error > 0} class="text-error font-semibold">
-              {@summary.pools_error} reporting errors
+            <span :if={@summary.stores_full > 0} class="text-error font-semibold">
+              {@summary.stores_full} full
             </span>
-            <span :if={@summary.pools_error == 0}>LINSTOR storage pools</span>
+            <span
+              :if={@summary.stores_full == 0 and @summary.stores_warn > 0}
+              class="text-warning font-semibold"
+            >
+              {@summary.stores_warn} filling up
+            </span>
+            <span :if={@summary.stores_full == 0 and @summary.stores_warn == 0}>
+              one per node
+            </span>
           </div>
         </div>
       </div>
 
       <.capacity_card :if={@snapshot.configured?} capacity={@snapshot.capacity} snapshot={@snapshot} />
 
-      <.resources_section resources={@snapshot.resources} configured?={@snapshot.configured?} />
+      <.vdisks_section vdisks={@snapshot.vdisks} configured?={@snapshot.configured?} />
 
-      <.pools_section pools={@snapshot.pools} configured?={@snapshot.configured?} />
+      <.stores_section stores={@snapshot.stores} configured?={@snapshot.configured?} />
 
       <.disks_section disks={@snapshot.disks} configured?={@snapshot.configured?} />
 
@@ -231,7 +270,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         <h2 class="font-semibold">Capacity</h2>
 
         <p :if={not @capacity.known?} class="text-sm text-warning" id="capacity-unknown">
-          No backed storage pool reported a capacity, so the fabric's size is unknown.
+          No node reported an extent store capacity, so the fabric's size is unknown.
           Nothing here is a claim that it is empty.
         </p>
 
@@ -242,8 +281,8 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
             percent={@capacity.used_percent}
           />
           <p class="text-xs opacity-70">
-            Raw across every backed pool. With {copies(@snapshot.expected_replicas)} kept,
-            usable is about <span class="font-semibold">{bytes(@capacity.usable_total_bytes)}</span>
+            Raw across every node's extent store. With {copies(@snapshot.expected_replicas)} kept, usable is about
+            <span class="font-semibold">{bytes(@capacity.usable_total_bytes)}</span>
             of which <span class="font-semibold">{bytes(@capacity.usable_used_bytes)}</span>
             is allocated.
           </p>
@@ -253,116 +292,90 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     """
   end
 
-  attr :resources, :map, required: true
+  attr :vdisks, :map, required: true
   attr :configured?, :boolean, required: true
 
-  defp resources_section(assigns) do
+  defp vdisks_section(assigns) do
     ~H"""
     <section class="space-y-3">
-      <h2 class="font-semibold text-lg">DRBD resources</h2>
+      <h2 class="font-semibold text-lg">Vdisks</h2>
 
       <.unavailable
-        :if={@configured? and @resources.state == :unavailable}
-        id="resources-unavailable"
-        title="DRBD state could not be read from any node"
-        error={format_unreachable(@resources.unreachable)}
+        :if={@configured? and @vdisks.state == :unavailable}
+        id="vdisks-unavailable"
+        title="No node answered with its vdisk list"
+        error={format_unreachable(@vdisks.unreachable)}
       />
 
       <div
-        :if={@resources.state == :partial}
+        :if={@vdisks.state == :partial}
         class="alert alert-warning alert-soft items-start"
-        id="resources-partial"
+        id="vdisks-partial"
       >
         <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
         <div>
           <p class="text-sm">
-            Some nodes did not answer, so this list is incomplete and replica counts are a
-            floor rather than a fact.
+            Some nodes did not answer, so this list is incomplete: a vdisk owned on an
+            unread node does not appear here at all.
           </p>
           <p class="text-xs opacity-70 mt-1 font-mono break-all">
-            {format_unreachable(@resources.unreachable)}
+            {format_unreachable(@vdisks.unreachable)}
           </p>
         </div>
       </div>
 
       <p
-        :if={@resources.state != :unavailable and @resources.entries == []}
+        :if={@vdisks.state != :unavailable and @vdisks.entries == []}
         class="text-sm opacity-70 italic"
-        id="resources-empty"
+        id="vdisks-empty"
       >
-        Every node answered and none of them backs a DRBD resource. There is nothing
-        replicated on this cluster yet.
+        Every node answered and none of them is serving a vdisk. There is nothing attached
+        on this cluster yet.
       </p>
 
       <div
-        :for={resource <- @resources.entries}
-        id={"resource-" <> slug(resource.name)}
+        :for={vdisk <- @vdisks.entries}
+        id={"vdisk-" <> slug(vdisk.id)}
         class={[
           "card card-border bg-base-100",
-          resource.health == :degraded && "border-error/60",
-          resource.health == :unknown && "border-warning/60"
+          vdisk.health == :degraded && "border-error/60",
+          vdisk.health == :unknown && "border-warning/60"
         ]}
       >
         <div class="card-body gap-3 p-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="min-w-0">
-              <p class="font-mono font-semibold truncate">{resource.name}</p>
+              <p class="font-mono font-semibold truncate">{vdisk.id}</p>
               <p class="text-xs opacity-60">
-                {bytes(resource.size_bytes)} &middot; {primary_summary(resource)}
+                {bytes(vdisk.size_bytes)} &middot; {owner_summary(vdisk)}
               </p>
             </div>
             <div class="flex flex-wrap items-center gap-1.5">
-              <.health_badge health={resource.health} />
-              <span class={[
-                "badge badge-sm gap-1 font-medium",
-                replica_class(resource)
-              ]}>
-                <.icon name="hero-square-3-stack-3d" class="size-3" />
-                {resource.replicas}/{resource.expected_replicas} replicas
+              <.health_badge health={vdisk.health} />
+              <.replica_badge have={vdisk.replica_count} want={vdisk.expected_replicas} />
+              <.epoch_badge epoch={vdisk.epoch} />
+              <span :if={vdisk.sealed?} class="badge badge-sm badge-ghost gap-1">
+                <.icon name="hero-lock-closed" class="size-3" /> sealed
               </span>
             </div>
           </div>
 
-          <ul :if={resource.issues != []} class="text-sm text-error space-y-0.5">
-            <li :for={issue <- resource.issues}>&bull; {issue}</li>
+          <ul :if={vdisk.issues != []} class="text-sm text-error space-y-0.5">
+            <li :for={issue <- vdisk.issues}>&bull; {issue}</li>
           </ul>
 
           <div class="space-y-2 border-t border-base-300 pt-2">
-            <div :for={placement <- resource.placements} class="text-xs space-y-1">
-              <div class="flex flex-wrap items-center gap-1.5">
-                <span class="font-semibold">{placement.hostname}</span>
-                <span class="badge badge-sm badge-ghost font-mono">{placement.role}</span>
-                <span :if={placement.suspended?} class="badge badge-sm badge-error">
-                  I/O suspended
-                </span>
-                <span :if={not placement.replica?} class="badge badge-sm badge-ghost">
-                  diskless
-                </span>
-              </div>
-              <div class="flex flex-wrap gap-1.5">
-                <.disk_state_badge
-                  :for={device <- placement.devices}
-                  state={device.disk_state}
-                  label={"vol #{device.volume}"}
-                />
-                <span
-                  :for={device <- placement.devices}
-                  :if={not device.quorum?}
-                  class="badge badge-sm badge-error"
-                >
-                  no quorum
-                </span>
-              </div>
-              <div :for={connection <- placement.connections} class="flex flex-wrap gap-1.5">
-                <.connection_badge connection={connection} />
-                <.replication_badge :for={peer <- connection.peer_devices} peer={peer} />
-                <.disk_state_badge
-                  :for={peer <- connection.peer_devices}
-                  state={peer.peer_disk_state}
-                  label="peer disk"
-                />
-              </div>
+            <div class="flex flex-wrap gap-1.5">
+              <.role_badge :for={attachment <- vdisk.attachments} attachment={attachment} />
             </div>
+
+            <p :if={vdisk.replicas != []} class="text-xs opacity-70">
+              Replicated to <span class="font-mono">{Enum.join(vdisk.replicas, ", ")}</span>.
+            </p>
+
+            <p :if={vdisk.socket} class="text-xs opacity-60 font-mono truncate">
+              {vdisk.socket}
+            </p>
           </div>
         </div>
       </div>
@@ -370,64 +383,72 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     """
   end
 
-  attr :pools, :map, required: true
+  attr :stores, :map, required: true
   attr :configured?, :boolean, required: true
 
-  defp pools_section(assigns) do
+  defp stores_section(assigns) do
     ~H"""
     <section class="space-y-3">
-      <h2 class="font-semibold text-lg">Storage pools</h2>
+      <h2 class="font-semibold text-lg">Extent stores</h2>
 
       <.unavailable
-        :if={@configured? and @pools.state == :unavailable}
-        id="pools-unavailable"
-        title="The LINSTOR controller did not answer"
-        error={@pools.error}
+        :if={@configured? and @stores.state == :unavailable}
+        id="stores-unavailable"
+        title="No node reported its extent store"
+        error={format_unreachable(@stores.unreachable)}
       />
 
-      <p
-        :if={@pools.state == :ok and @pools.entries == []}
-        class="text-sm opacity-70 italic"
-        id="pools-empty"
+      <div
+        :if={@stores.state == :partial}
+        class="alert alert-warning alert-soft items-start"
+        id="stores-partial"
       >
-        LINSTOR answered and reported no storage pools.
-      </p>
+        <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
+        <div>
+          <p class="text-sm">
+            Some nodes did not answer, so the capacity below is a partial view of the
+            cluster and not its total.
+          </p>
+          <p class="text-xs opacity-70 mt-1 font-mono break-all">
+            {format_unreachable(@stores.unreachable)}
+          </p>
+        </div>
+      </div>
 
       <div
-        :for={pool <- @pools.entries}
-        id={"pool-" <> slug(pool.node <> "-" <> pool.name)}
+        :for={store <- @stores.entries}
+        id={"store-" <> slug(store.ip)}
         class={[
           "card card-border bg-base-100",
-          pool.state == :error && "border-error/60",
-          pool.state == :unknown && "border-warning/60"
+          store.state == :full && "border-error/60",
+          store.state in [:warn, :unknown] && "border-warning/60"
         ]}
       >
         <div class="card-body gap-2 p-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="min-w-0">
-              <p class="font-semibold truncate">{pool.name}</p>
+              <p class="font-semibold truncate">{store.hostname}</p>
               <p class="text-xs opacity-60 font-mono truncate">
-                {pool.node} &middot; {pool.provider}
-                <span :if={pool.backing}>&middot; {pool.backing}</span>
+                {store.ip}<span :if={store.path}> &middot; {store.path}</span>
               </p>
             </div>
-            <.pool_state_badge state={pool.state} />
+            <.store_state_badge state={store.state} />
           </div>
 
           <.usage_bar
-            :if={not pool.diskless?}
-            used={pool.used_bytes}
-            total={pool.total_bytes}
-            percent={pool.used_percent}
+            used={store.used_bytes}
+            total={store.total_bytes}
+            percent={store.used_percent}
           />
 
-          <p :if={pool.diskless?} class="text-xs opacity-70">
-            Diskless: an access point for resources stored elsewhere, with no capacity of
-            its own.
+          <p class="text-xs opacity-70">
+            {store.egroup_count || 0} extent group(s), {bytes(store.egroup_bytes)} sealed, {bytes(
+              store.journal_bytes
+            )} still in journals waiting to drain.
           </p>
 
-          <ul :if={pool.messages != []} class="text-xs text-error space-y-0.5">
-            <li :for={message <- pool.messages}>&bull; {message}</li>
+          <ul :if={store.messages != []} class="text-xs text-error space-y-0.5">
+            <li :for={message <- store.messages}>&bull; {message}</li>
           </ul>
         </div>
       </div>
@@ -507,12 +528,11 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
   # -- helpers --------------------------------------------------------------------------
 
-  # "Primary on no node" is a real and normal state: a resource nothing has opened yet.
-  defp primary_summary(%{primaries: []}), do: "Primary on no node"
-
-  defp primary_summary(%{primaries: hosts}) do
-    "Primary on " <> Enum.join(hosts, ", ")
-  end
+  # "Owned by no node" is not a normal state and is not drawn as one: an attachment with
+  # no owner means every node holding this vdisk is relaying to somewhere that did not
+  # answer.
+  defp owner_summary(%{owner: nil}), do: "no owner on any node that answered"
+  defp owner_summary(%{owner: host}), do: "served by " <> host
 
   defp copies(1), do: "1 copy"
   defp copies(count), do: Integer.to_string(count) <> " copies"
@@ -522,11 +542,6 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   defp format_unreachable(nodes) do
     Enum.map_join(nodes, "; ", fn node -> node.hostname <> " (" <> node.error <> ")" end)
   end
-
-  # `nil` means "we could not count", so it must not be coloured like a satisfied count.
-  defp replica_class(%{under_replicated?: true}), do: "badge-error"
-  defp replica_class(%{under_replicated?: nil}), do: "badge-warning"
-  defp replica_class(_resource), do: "badge-ghost"
 
   defp media(%{rotational?: true}), do: "HDD"
   defp media(%{rotational?: false}), do: "SSD"

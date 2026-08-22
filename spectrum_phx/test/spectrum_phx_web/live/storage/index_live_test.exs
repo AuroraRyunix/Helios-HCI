@@ -4,54 +4,48 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
 
   import Phoenix.LiveViewTest
 
+  @a "10.10.0.11"
+  @b "10.10.0.12"
+
   # Mounted through the route, so each test exercises the real path an operator
   # takes: the plug pipeline, the authentication hook, and the layout around the view.
 
   defp mount_view(conn), do: live(log_in(conn), "/storage")
 
-  defp resource(name, opts \\ []) do
+  defp capacity(node, opts \\ []) do
     %{
-      "name" => name,
-      "role" => Keyword.get(opts, :role, "Secondary"),
-      "suspended" => false,
-      "devices" => [
-        %{
-          "volume" => 0,
-          "disk-state" => Keyword.get(opts, :disk_state, "UpToDate"),
-          "client" => false,
-          "quorum" => true,
-          "size" => 10_485_760
-        }
-      ],
-      "connections" => Keyword.get(opts, :connections, [connection()])
+      "node" => node,
+      "path" => "/var/lib/hci/sidon/egroups",
+      "total_bytes" => Keyword.get(opts, :total, 107_374_182_400),
+      "available_bytes" => Keyword.get(opts, :available, 53_687_091_200),
+      "egroup_bytes" => 50_331_648,
+      "egroup_count" => 12,
+      "journal_bytes" => 4_194_304
     }
   end
 
-  defp connection(opts \\ []) do
+  defp owned(id, opts \\ []) do
     %{
-      "name" => Keyword.get(opts, :peer, "hci-02"),
-      "connection" => Keyword.get(opts, :state, "Connected"),
-      "peer-role" => "Secondary",
-      "peer_devices" => [
-        %{
-          "volume" => 0,
-          "replication" => Keyword.get(opts, :replication, "Established"),
-          "peer-disk-state" => Keyword.get(opts, :peer_disk_state, "UpToDate"),
-          "peer-client" => false
-        }
-      ]
+      "vdisk_id" => id,
+      "socket" => "/var/lib/hci/sidon/nbd/#{id}.sock",
+      "role" => "owner",
+      "epoch" => Keyword.get(opts, :epoch, 3),
+      "size_bytes" => 10_737_418_240,
+      "degraded" => Keyword.get(opts, :degraded, false),
+      "class" => Keyword.get(opts, :class, "mutable"),
+      "replicas" => Keyword.get(opts, :replicas, ["hci-01", "hci-02"])
     }
   end
 
-  defp pool(name, node, opts \\ []) do
+  defp attached(entries), do: {:ok, %{"attached" => entries}}
+
+  defp peers(node, entries), do: {:ok, %{"node" => node, "peers" => entries}}
+
+  defp peer(node, opts \\ []) do
     %{
-      "storage_pool_name" => name,
-      "node_name" => node,
-      "provider_kind" => Keyword.get(opts, :provider, "LVM_THIN"),
-      "free_capacity" => Keyword.get(opts, :free, 52_428_800),
-      "total_capacity" => Keyword.get(opts, :total, 104_857_600),
-      "props" => %{"StorDriver/StorPoolName" => "vg0/thinpool"},
-      "reports" => Keyword.get(opts, :reports, [])
+      "node" => node,
+      "reachable" => Keyword.get(opts, :reachable, true),
+      "detail" => Keyword.get(opts, :detail, "")
     }
   end
 
@@ -80,14 +74,15 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
 
   defp healthy do
     %{
-      node_ips: ["10.10.0.11", "10.10.0.12"],
+      node_ips: [@a, @b],
       redundancy_factor: 1,
-      pools: {:ok, [pool("default-pool", "hci-01"), pool("default-pool", "hci-02")]},
-      drbd: %{
-        "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-        "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
+      capacity: %{@a => {:ok, capacity("hci-01")}, @b => {:ok, capacity("hci-02")}},
+      vdisks: %{@a => attached([owned("vm-web-01-disk0")]), @b => attached([])},
+      peers: %{
+        @a => peers("hci-01", [peer("hci-02")]),
+        @b => peers("hci-02", [peer("hci-01")])
       },
-      disks: %{"10.10.0.11" => {:ok, lsblk()}, "10.10.0.12" => {:ok, lsblk()}}
+      disks: %{@a => {:ok, lsblk()}, @b => {:ok, lsblk()}}
     }
   end
 
@@ -102,21 +97,20 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
   end
 
   describe "healthy fabric" do
-    test "renders pools, resources and per-node disks", %{conn: conn} do
+    test "renders vdisks, extent stores and per-node disks", %{conn: conn} do
       {:ok, _view, html} = mount_view(conn)
 
       assert html =~ "vm-web-01-disk0"
-      assert html =~ "default-pool"
-      assert html =~ "hci-01"
+      assert html =~ "/var/lib/hci/sidon/egroups"
       assert html =~ "nvme0n1"
-      assert html =~ "UpToDate"
-      assert html =~ "Connected"
+      assert html =~ "epoch"
+      assert html =~ "owner"
     end
 
     test "reports capacity in real units rather than as a raw byte count", %{conn: conn} do
       {:ok, _view, html} = mount_view(conn)
 
-      # Two 100 GiB pools, two copies kept: 200 GiB raw, 100 GiB usable.
+      # Two 100 GiB stores, two copies kept: 200 GiB raw, 100 GiB usable.
       assert html =~ "200.0 GiB"
       assert html =~ "100.0 GiB"
       assert html =~ "2 copies"
@@ -126,23 +120,23 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       {:ok, view, _html} = mount_view(conn)
 
       assert view |> element("#fabric-state") |> render() =~ "all healthy"
-      refute view |> element("#stat-resources") |> render() =~ "0/1"
-      assert view |> element("#stat-resources") |> render() =~ "1/1"
+      assert view |> element("#stat-vdisks") |> render() =~ "1/1"
     end
 
     test "does not raise an attention banner when nothing needs attention", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
       refute view |> element("#attention") |> has_element?()
+      refute view |> element("#peers-down") |> has_element?()
     end
   end
 
-  describe "a degraded resource is impossible to miss" do
+  describe "a degraded vdisk is impossible to miss" do
     setup do
       put_source(%{
         healthy()
-        | drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", disk_state: "Inconsistent")]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
+        | vdisks: %{
+            @a => attached([owned("vm-web-01-disk0", degraded: true)]),
+            @b => attached([])
           }
       })
 
@@ -154,7 +148,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
 
       banner = view |> element("#attention") |> render()
       assert banner =~ "vm-web-01-disk0"
-      assert banner =~ "Inconsistent"
+      assert banner =~ "writes are refused"
       assert banner =~ "are not healthy"
     end
 
@@ -163,12 +157,12 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       assert view |> element("#fabric-state") |> render() =~ "needs attention"
     end
 
-    test "the resource card is marked degraded, not healthy", %{conn: conn} do
+    test "the vdisk card is marked degraded, not healthy", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
 
-      card = view |> element("#resource-vm-web-01-disk0") |> render()
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
       assert card =~ "degraded"
-      refute card =~ "healthy"
+      refute card =~ ">healthy<"
     end
   end
 
@@ -176,9 +170,9 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     setup do
       put_source(%{
         healthy()
-        | drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", connections: [])]},
-            "10.10.0.12" => {:ok, []}
+        | vdisks: %{
+            @a => attached([owned("vm-web-01-disk0", replicas: ["hci-01"])]),
+            @b => attached([])
           }
       })
 
@@ -188,7 +182,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     test "the replica shortfall is stated on the card and in the banner", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
 
-      assert view |> element("#resource-vm-web-01-disk0") |> render() =~ "1/2 replicas"
+      assert view |> element("#vdisk-vm-web-01-disk0") |> render() =~ "1/2"
       assert view |> element("#attention") |> render() =~ "1 of 2 replicas present"
     end
 
@@ -199,64 +193,88 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     end
   end
 
-  describe "unavailable sources" do
-    test "an unreadable LINSTOR controller says so instead of showing no pools",
-         %{conn: conn} do
-      put_source(%{healthy() | pools: {:error, "controller not reachable"}})
-
-      {:ok, view, _html} = mount_view(conn)
-
-      assert view |> element("#pools-unavailable") |> has_element?()
-      assert view |> element("#pools-unavailable") |> render() =~ "controller not reachable"
-      refute view |> element("#pools-empty") |> has_element?()
-    end
-
-    test "an empty-but-answered LINSTOR is stated as such", %{conn: conn} do
-      put_source(%{healthy() | pools: {:ok, []}})
-
-      {:ok, view, _html} = mount_view(conn)
-
-      assert view |> element("#pools-empty") |> render() =~ "answered and reported no"
-      refute view |> element("#pools-unavailable") |> has_element?()
-    end
-
-    test "no node answering for DRBD is unavailable, not an empty resource list",
-         %{conn: conn} do
+  describe "a replication link that is down" do
+    setup do
       put_source(%{
         healthy()
-        | drbd: %{"10.10.0.11" => {:error, :timeout}, "10.10.0.12" => {:error, :timeout}}
+        | peers: %{
+            @a =>
+              peers("hci-01", [peer("hci-02", reachable: false, detail: "connection refused")]),
+            @b => peers("hci-02", [peer("hci-01")])
+          }
+      })
+
+      :ok
+    end
+
+    test "is stated as refused writes, not as reduced redundancy", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      banner = view |> element("#peers-down") |> render()
+      assert banner =~ "hci-02"
+      assert banner =~ "connection refused"
+      # The distinction that matters operationally: the guest is taking EIO now.
+      assert banner =~ "refusing writes"
+    end
+
+    test "and it degrades the vdisks replicated onto that node", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert card =~ "degraded"
+      assert card =~ "writes are being refused"
+    end
+  end
+
+  describe "unavailable sources" do
+    test "no node reporting an extent store says so instead of showing none", %{conn: conn} do
+      put_source(%{
+        healthy()
+        | capacity: %{@a => {:error, "sidon not answering"}, @b => {:error, :timeout}}
       })
 
       {:ok, view, _html} = mount_view(conn)
 
-      assert view |> element("#resources-unavailable") |> has_element?()
-      refute view |> element("#resources-empty") |> has_element?()
+      assert view |> element("#stores-unavailable") |> has_element?()
+      assert view |> element("#stores-unavailable") |> render() =~ "sidon not answering"
+    end
+
+    test "no node answering for vdisks is unavailable, not an empty list", %{conn: conn} do
+      put_source(%{healthy() | vdisks: %{@a => {:error, :timeout}, @b => {:error, :timeout}}})
+
+      {:ok, view, _html} = mount_view(conn)
+
+      assert view |> element("#vdisks-unavailable") |> has_element?()
+      refute view |> element("#vdisks-empty") |> has_element?()
       assert view |> element("#fabric-state") |> render() =~ "needs attention"
+    end
+
+    test "an empty-but-answered cluster is stated as such", %{conn: conn} do
+      put_source(%{healthy() | vdisks: %{@a => attached([]), @b => attached([])}})
+
+      {:ok, view, _html} = mount_view(conn)
+
+      assert view |> element("#vdisks-empty") |> render() =~ "Every node answered"
+      refute view |> element("#vdisks-unavailable") |> has_element?()
     end
 
     test "one node not answering marks the list partial and names the node", %{conn: conn} do
       put_source(%{
         healthy()
-        | drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0")]},
-            "10.10.0.12" => {:error, :econnrefused}
-          }
+        | vdisks: %{@a => attached([owned("vm-web-01-disk0")]), @b => {:error, :econnrefused}}
       })
 
       {:ok, view, _html} = mount_view(conn)
 
-      partial = view |> element("#resources-partial") |> render()
-      assert partial =~ "10.10.0.12"
+      partial = view |> element("#vdisks-partial") |> render()
+      assert partial =~ @b
       assert partial =~ "incomplete"
-      # And the resource itself is unknown rather than healthy.
-      assert view |> element("#resource-vm-web-01-disk0") |> render() =~ "unknown"
+      # And the vdisk itself is unknown rather than healthy.
+      assert view |> element("#vdisk-vm-web-01-disk0") |> render() =~ "unknown"
     end
 
     test "a node with no disk inventory is unreadable, not diskless", %{conn: conn} do
-      put_source(%{
-        healthy()
-        | disks: %{"10.10.0.11" => {:ok, lsblk()}, "10.10.0.12" => {:error, :nxdomain}}
-      })
+      put_source(%{healthy() | disks: %{@a => {:ok, lsblk()}, @b => {:error, :nxdomain}}})
 
       {:ok, view, _html} = mount_view(conn)
 
@@ -266,14 +284,20 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       assert card =~ "nxdomain"
     end
 
-    test "a pool with no capacity gets no usage bar", %{conn: conn} do
-      put_source(%{healthy() | pools: {:ok, [pool("default-pool", "hci-01", total: nil)]}})
+    test "a store with no capacity gets no usage bar", %{conn: conn} do
+      put_source(%{
+        healthy()
+        | capacity: %{
+            @a => {:ok, capacity("hci-01", total: 0, available: 0)},
+            @b => {:ok, capacity("hci-02")}
+          }
+      })
 
       {:ok, view, _html} = mount_view(conn)
 
-      card = view |> element("#pool-hci-01-default-pool") |> render()
+      card = view |> element("#store-10-10-0-11") |> render()
       assert card =~ "Capacity unknown"
-      assert card =~ "unknown"
+      assert card =~ "not mounted"
       refute card =~ "<progress"
     end
   end
@@ -281,13 +305,13 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
   describe "no cluster" do
     test "a dev machine with no cluster.json says so rather than rendering a clean page",
          %{conn: conn} do
-      put_source(%{node_ips: [], pools: {:error, :no_cluster_configured}, drbd: %{}, disks: %{}})
+      put_source(%{node_ips: [], capacity: %{}, vdisks: %{}, peers: %{}, disks: %{}})
 
       {:ok, view, html} = mount_view(conn)
 
       assert view |> element("#no-cluster") |> has_element?()
       assert html =~ "No cluster configured"
-      refute view |> element("#stat-resources") |> has_element?()
+      refute view |> element("#stat-vdisks") |> has_element?()
     end
   end
 
@@ -299,16 +323,16 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       # Something outside this LiveView noticed the fabric change.
       put_source(%{
         healthy()
-        | drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-web-01-disk0", disk_state: "Inconsistent")]},
-            "10.10.0.12" => {:ok, [resource("vm-web-01-disk0")]}
+        | vdisks: %{
+            @a => attached([owned("vm-web-01-disk0", degraded: true)]),
+            @b => attached([])
           }
       })
 
       SpectrumPhx.Storage.broadcast(SpectrumPhx.Storage.snapshot())
 
       assert render(view) =~ "needs attention"
-      assert view |> element("#attention") |> render() =~ "Inconsistent"
+      assert view |> element("#attention") |> render() =~ "writes are refused"
     end
 
     test "the server-side interval re-reads the fabric", %{conn: conn} do
@@ -316,10 +340,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
 
       put_source(%{
         healthy()
-        | drbd: %{
-            "10.10.0.11" => {:ok, [resource("vm-db-01-disk0")]},
-            "10.10.0.12" => {:ok, [resource("vm-db-01-disk0")]}
-          }
+        | vdisks: %{@a => attached([owned("vm-db-01-disk0")]), @b => attached([])}
       })
 
       send(view.pid, :refresh)
@@ -332,9 +353,12 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     test "the refresh button re-reads without navigating", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
 
-      put_source(%{healthy() | pools: {:ok, [pool("second-pool", "hci-03")]}})
+      put_source(%{
+        healthy()
+        | vdisks: %{@a => attached([owned("vm-cache-01-disk0")]), @b => attached([])}
+      })
 
-      assert view |> element("#refresh-button") |> render_click() =~ "second-pool"
+      assert view |> element("#refresh-button") |> render_click() =~ "vm-cache-01-disk0"
     end
   end
 end

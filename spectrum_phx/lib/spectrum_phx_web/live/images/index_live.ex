@@ -20,7 +20,7 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   ## Delete reports what actually happened
 
   `/api/images/delete` answered `200` whatever the outcome -- it deleted the catalogue
-  row first and then fired the LINSTOR delete and a fan-out `rm` without checking either.
+  row first and then fired the storage delete and a fan-out `rm` without checking either.
   An operator watching the row disappear had no way to know the storage behind it was
   still allocated. `SpectrumPhx.Images.delete_image/1` removes the backing store first and
   returns the daemon's own message on failure; this view puts that message on screen and
@@ -36,9 +36,9 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
 
   The chunk size is raised from the 64 KB default to 1 MiB: an install ISO at 64 KB a
   time is sixteen thousand round trips per gibibyte. `chunk_timeout` is raised because
-  the *first* chunk is the one that waits for the DRBD resource to be created and the
-  device to appear -- see `SpectrumPhx.Images.upload_note/0` for why that work is there
-  and not in the writer's `init/1`.
+  the *first* chunk is the one that creates the vdisk and attaches it -- see
+  `SpectrumPhx.Images.upload_note/0` for why that work is there and not in the writer's
+  `init/1`.
 
   ## Route
 
@@ -57,8 +57,10 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   # 64 KB would be sixteen thousand round trips per gibibyte. Kept under the endpoint's
   # 8 MB frame cap with room for the channel envelope.
   @chunk_bytes 1_048_576
-  # The first chunk waits for a DRBD resource to be created on every node and its device
-  # to appear, so this is not a transfer timeout -- it is a provisioning one.
+  # The first chunk creates the vdisk and wins its ownership claim, so this is not a
+  # transfer timeout -- it is a provisioning one. Creating a vdisk is metadata work and
+  # returns in milliseconds where the LINSTOR placement it replaced took minutes, but a
+  # generous bound costs nothing when it is never reached.
   @chunk_timeout_ms 120_000
   @max_image_bytes 64 * 1024 * 1024 * 1024
 
@@ -213,7 +215,7 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   defp error_message(:invalid_name), do: "that is not a usable image name."
 
   defp error_message({:unsafe_path, path}) do
-    "the catalogue points at #{path}, which is neither a DRBD device nor a file in " <>
+    "the catalogue points at #{path}, which is neither a vdisk socket nor a file in " <>
       "#{Images.container_root()}. Refusing to delete it; fix the row by hand."
   end
 
@@ -334,7 +336,7 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
               <div class="flex flex-wrap items-center gap-2">
                 <span class="font-semibold truncate">{image.name}</span>
                 <span class="badge badge-sm badge-ghost uppercase">{image.type}</span>
-                <span :if={image.on_drbd?} class="badge badge-sm badge-info gap-1">
+                <span :if={image.on_vdisk?} class="badge badge-sm badge-info gap-1">
                   <.icon name="hero-server-stack" class="size-3" /> replicated
                 </span>
               </div>
@@ -367,11 +369,11 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
           >
             <p class="text-sm">
               Delete <span class="font-semibold">{image.name}</span>? This removes
-              <span :if={image.on_drbd?}>
-                the LINSTOR resource <code class="font-mono">{Images.resource_name(image.name)}</code>
-                and every replica of it
+              <span :if={image.on_vdisk?}>
+                the vdisk <code class="font-mono">{Images.resource_name(image.name)}</code>
+                and its extent groups on every replica
               </span>
-              <span :if={not image.on_drbd?}>the file on every node</span>
+              <span :if={not image.on_vdisk?}>the file on every node</span>
               , then the catalogue entry. It cannot be undone, and any VM booting from it
               will lose its source.
             </p>

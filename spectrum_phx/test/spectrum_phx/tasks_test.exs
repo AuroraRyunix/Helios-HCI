@@ -92,12 +92,17 @@ defmodule SpectrumPhx.TasksTest do
     test "a failed task is failed even though its progress reads 100" do
       # spectrum_server.py writes progress = 100 at every failure site. A full bar must
       # never be read as success.
-      row = row(%{"status" => "failed", "progress" => 100, "error_msg" => "DRBD promote failed"})
+      row =
+        row(%{
+          "status" => "failed",
+          "progress" => 100,
+          "error_msg" => "the vdisk attach was refused"
+        })
 
       assert %{tasks: [task], summary: summary} = Tasks.fetch(rows: [row])
       assert task.state == :failed
       assert task.progress == 100
-      assert task.error == "DRBD promote failed"
+      assert task.error == "the vdisk attach was refused"
       assert summary.failed == 1
       assert summary.completed == 0
     end

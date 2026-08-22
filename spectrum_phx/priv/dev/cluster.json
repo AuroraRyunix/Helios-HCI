@@ -1,7 +1,7 @@
 {
     "cluster_name": "hci-01",
     "redundancy_factor": 0,
-    "dfs_engine": "linstor",
+    "dfs_engine": "sidon",
     "vip": "10.10.102.45",
     "hosts": [
         {

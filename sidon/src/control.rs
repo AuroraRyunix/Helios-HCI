@@ -727,12 +727,19 @@ impl Daemon {
             match &a.vdisk {
                 Some(handle) => {
                     let v = handle.lock().expect("vdisk mutex poisoned");
+                    // The replica set is listed here rather than left to a per-vdisk
+                    // `status` call. A console rendering a storage page wants the replica
+                    // count of every vdisk at once, and asking one question per vdisk
+                    // turns one page load into an N+1 fan-out over mTLS.
                     out.push(json!({
                         "vdisk_id": id,
                         "socket": a.socket.to_string_lossy(),
                         "epoch": v.epoch,
                         "size_bytes": v.size,
                         "degraded": v.degraded,
+                        "class": v.class,
+                        "replicas": v.replicas.iter()
+                            .map(|r| r.node.clone()).collect::<Vec<_>>(),
                         "role": "owner",
                     }));
                 }

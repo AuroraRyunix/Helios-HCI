@@ -16,7 +16,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       "filename" => "ubuntu-24.04.iso",
       "size_bytes" => 6_303_121_408,
       "type" => "iso",
-      "path" => "/dev/drbd/by-res/img-ubuntu-24-04/0",
+      "path" => "/var/lib/hci/sidon/nbd/img-ubuntu-24-04.sock",
       "created_at" => 1_755_000_000_000
     },
     %{
@@ -62,7 +62,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       assert html =~ "registered 2025-08"
     end
 
-    test "marks a DRBD-backed image as replicated and a file-backed one not", %{conn: conn} do
+    test "marks a vdisk-backed image as replicated and a file-backed one not", %{conn: conn} do
       {:ok, view, _html} = mount_view(conn)
 
       assert view |> element("#image-ubuntu-24-04-iso") |> render() =~ "replicated"
@@ -71,7 +71,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
 
     test "shows the path each row points at", %{conn: conn} do
       {:ok, _view, html} = mount_view(conn)
-      assert html =~ "/dev/drbd/by-res/img-ubuntu-24-04/0"
+      assert html =~ "/var/lib/hci/sidon/nbd/img-ubuntu-24-04.sock"
     end
 
     test "an empty catalogue says Hydra answered, not merely that there is nothing",
@@ -112,7 +112,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       assert render_upload(upload, "rocky.iso", 0) =~ "rocky.iso"
 
       # auto_upload is false, so selecting a file must not have allocated anything. If it
-      # had, browsing away from this page would leak a DRBD resource per file picked.
+      # had, browsing away from this page would leak a vdisk per file picked.
       assert view |> element("#upload-button") |> has_element?()
       refute view |> element("#upload-button[disabled]") |> has_element?()
     end
@@ -162,7 +162,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
 
     test "a failure is reported with the subsystem that refused, and rolls back", %{conn: conn} do
       # The peer still holds Primary, so the promotion does not take.
-      SpectrumPhx.UploadStubs.install(%{drbd_role: {:ok, %{"role" => "secondary"}}})
+      SpectrumPhx.UploadStubs.install(%{attach: {:error, {409, "hci-02 owns img-rocky"}}})
 
       {:ok, view, _html} = mount_view(conn)
 
@@ -176,7 +176,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
         :exit, _reason -> :ok
       end
 
-      assert_receive {:upload_stub, {:linstor_delete, _ip, "img-rocky"}}
+      assert_receive {:upload_stub, {:delete, _ip, "img-rocky"}}
       refute_receive {:upload_stub, {:finish, _bytes}}
     end
 

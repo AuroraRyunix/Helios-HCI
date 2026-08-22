@@ -18,7 +18,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLiveTest do
     host_ip: "10.10.0.11",
     firmware: "uefi",
     disks_list: "10G,500G:fast",
-    disk_path: "/dev/drbd/by-res/web-01-disk0/0",
+    disk_path: "/var/lib/hci/sidon/nbd/web-01-disk0.sock",
     iso: "debian-13.iso",
     boot_device: "hd",
     network_id: "net-42",
@@ -91,13 +91,13 @@ defmodule SpectrumPhxWeb.Vms.ShowLiveTest do
       assert html =~ "Stopped"
     end
 
-    test "renders each disk with its DRBD resource and device path", %{conn: conn} do
+    test "renders each disk with its vdisk and socket path", %{conn: conn} do
       {:ok, _view, html} = live(conn, ~p"/vms/web-01")
 
       assert html =~ "web-01-disk0"
-      assert html =~ "/dev/drbd/by-res/web-01-disk0/0"
+      assert html =~ "/var/lib/hci/sidon/nbd/web-01-disk0.sock"
       assert html =~ "web-01-disk1"
-      assert html =~ "/dev/drbd/by-res/web-01-disk1/0"
+      assert html =~ "/var/lib/hci/sidon/nbd/web-01-disk1.sock"
       assert html =~ "fast"
     end
 
