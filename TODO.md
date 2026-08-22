@@ -694,13 +694,15 @@ as data* by DRBD and refused with EIO by Sidon.
   and nothing verifies the *cluster*. Rebooting the node holding the last reachable
   replica of a vdisk still makes it unavailable. It needs more than one node to write or
   to test.
-* **Leftover LINSTOR logical volumes on upgraded nodes.** The DRBD teardown unmounts,
-  downs the resources, unloads the module and removes the packages, and deliberately does
-  not touch the backing volumes: removing one is a decision about data, not about
-  packages. On the test node that leaves `img-test`, `linstor-db`, `scratchtest` and
-  `test-disk0` in `vg_aether/thin_pool_aether`, thin, holding tens of megabytes between
-  them and sharing the pool with `sidon`. Worth a documented `lvremove` step somebody
-  performs on purpose, not an automatic one.
+* ~~Leftover LINSTOR logical volumes on upgraded nodes.~~ **Reported, not removed
+  (2026-08-22).** The DRBD teardown unmounts, downs the resources, unloads the module and
+  removes the packages, and deliberately does not touch the backing volumes: one may be a
+  VM disk whose guest was never migrated, and a rollout is not the place to decide that.
+  It now *names* them instead -- LINSTOR suffixed every volume it created with `_00000`,
+  so they are identifiable -- with sizes and the `lvremove` line, because nothing else
+  reports them anywhere and they share the thin pool with the extent store. That is how
+  they sat unnoticed on the test node for four days after the tree was clean; those four
+  (`img-test`, `linstor-db`, `scratchtest`, `test-disk0`) have since been removed by hand.
 * **Snapshots and clones.** The schema and the immutability rules are already in place; a
   snapshot is a map copy against a frozen parent. Nothing creates one yet. This is also
   what closes saga's honest caveat about guest data.

@@ -119,6 +119,24 @@ if ! lsmod | grep -q '^drbd '; then
     rpm -q drbd9x-utils >/dev/null 2>&1 && dnf remove -y drbd9x-utils 2>/dev/null
 fi
 rm -rf /etc/drbd.d /etc/drbd.conf /var/lib/linstor 2>/dev/null
+
+# Name the backing volumes, and remove none of them.
+#
+# LINSTOR suffixed every volume it created with _00000, so they are identifiable, and on
+# a node upgraded from a DRBD cluster they are all that is left of it -- thin, sharing
+# vg_aether/thin_pool_aether with the extent store, and invisible to everything. Nothing
+# reports them anywhere else, which is how they sit for months.
+#
+# Not removed, because one of them may be a VM disk whose guest was never migrated, and
+# this is a rollout rather than a decision about data. The operator gets the names and
+# the sizes and runs lvremove themselves.
+leftover=$(lvs --noheadings -o lv_name,vg_name,lv_size,data_percent 2>/dev/null \
+           | grep -E '_00000[[:space:]]' || true)
+if [ -n "$leftover" ]; then
+    echo "LEFTOVER-LVS-BEGIN"
+    echo "$leftover"
+    echo "LEFTOVER-LVS-END"
+fi
 true"""
 
 
@@ -925,6 +943,17 @@ def deploy_to_node(ip):
             print(f"[{ip}] Tearing down any leftover DRBD...")
             _, stdout_drbd, _ = ssh.exec_command(DRBD_TEARDOWN)
             stdout_drbd.channel.recv_exit_status()
+            teardown_output = stdout_drbd.read().decode()
+            if "LEFTOVER-LVS-BEGIN" in teardown_output:
+                body = teardown_output.split("LEFTOVER-LVS-BEGIN", 1)[1]
+                body = body.split("LEFTOVER-LVS-END", 1)[0]
+                print(f"[{ip}] NOTE: LINSTOR left these logical volumes behind. They are "
+                      f"thin and share the pool with the extent store. Nothing uses them; "
+                      f"nothing will remove them either, because one may be a VM disk "
+                      f"whose guest was never migrated:")
+                for row in body.strip().splitlines():
+                    print(f"[{ip}]   {row.strip()}")
+                print(f"[{ip}]   Remove with: lvremove -y vg_aether/<name>")
             _, stdout_check, _ = ssh.exec_command("lsmod | grep -c '^drbd ' || true")
             stdout_check.channel.recv_exit_status()
             if stdout_check.read().decode().strip() not in ("0", ""):
