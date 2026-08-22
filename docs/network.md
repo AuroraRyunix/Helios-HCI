@@ -20,6 +20,7 @@ This document maps all services, network ports, scope boundaries (localhost-only
 | **Linstor Satellite** | `3376` | TCP | Cluster Mesh | Linstor Satellite communication port. |
 | **DRBD Replication** | `7700`-`7890` | TCP | Cluster Mesh | DRBD synchronous block-level replication traffic. |
 | **VXLAN Overlay** (Urbosa) | `4789` | **UDP** | Cluster Mesh | Tenant overlay segment traffic between hosts. Point-to-multipoint, no multicast required. |
+| **Sidon** (DFS data path) | `9105` | TCP (mTLS) | Cluster Mesh | *Reserved, not yet listening.* Extent replication, journal appends and forwarded guest I/O between per-node data-path daemons. One connection per node **pair**, independent of VM count — see [dfs/architecture.md](./dfs/architecture.md). |
 
 ---
 

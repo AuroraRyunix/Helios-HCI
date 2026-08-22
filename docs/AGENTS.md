@@ -56,6 +56,8 @@ Every service below is named after its Nutanix analog (see the table in the top-
 | `allssh` | Fan-out mTLS command executor across all cluster nodes. |
 | `agahnim/` (Rust) | WebSocket console-proxy sidecar for VNC/SPICE, runs as a native `systemd` unit built from source on each node (**not** a Quadlet container — see the note in §3). |
 
+**Nothing under [dfs/](./dfs/README.md) exists as code.** That directory is a design set for an extent-based replacement of Linstor/DRBD (`sidon`, `purah`, `ganon`). If a task sends you looking for those files, they are not missing — they were never written. Treat the documents as the specification and [dfs/decisions.md](./dfs/decisions.md) as the record of which alternatives were already rejected and why, so a rejected one does not get re-proposed as a fresh idea.
+
 ## 3. How the system actually starts
 
 Boot is owned by `spark-daemon` (`spark_daemon_decoded.py`), not by plain `systemd` dependency ordering. Its `main()` runs an `[AUTOSTART]` sequence before ever calling `serve_forever()`:

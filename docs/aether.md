@@ -1,5 +1,12 @@
 # Aether (Distributed Storage I/O Engine - Linstor/DRBD)
 
+> **A successor is designed.** Aether replicates *devices*: every volume is a DRBD
+> resource holding a standing connection between named peers, which caps the cluster at
+> 191 replicated volumes and costs a kernel object and RF-1 sockets per volume per node.
+> An extent-based replacement is designed in [dfs/](./dfs/README.md) — nothing is built,
+> and Aether remains the substrate until a migration completes. The reasoning for the
+> replacement is in [dfs/architecture.md](./dfs/architecture.md) §1.
+
 Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
 
 > [!WARNING]

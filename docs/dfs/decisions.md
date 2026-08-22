@@ -89,5 +89,4 @@ final rule).
 **D-16 — Names: Sidon, Purah, Ganon.** Sidon (data path — Mipha's sibling, as HA and
 storage fencing genuinely are here), Purah (the scanner), Ganon (the recurring calamity
 the kingdom prepares for). Rejected: Revali — completes the champions set but greps as a
-substring of Vali, and a name you cannot grep for is a name that costs debugging time.
-Proposals until code exists; veto freely.
+substring of `revalidate`, which already appears in `spectrum_server.py` — and a name you cannot grep for cleanly is a name that costs debugging time on every future search. (The collision is with `revalidate`, not with `vali` itself; `vali` and `revali` are distinct tokens.) **Aether is not renamed**: it keeps its name, its documents and its meaning as the Linstor/DRBD substrate, and the two run side by side — reusing the name would make every sentence in every older document ambiguous about which layer it meant. `vg_aether` likewise stays, historical rather than descriptive, because renaming a volume group under live data to fix an aesthetic is not a trade worth making. The CLI is deliberately unnamed until milestone 7 rather than named badly now.

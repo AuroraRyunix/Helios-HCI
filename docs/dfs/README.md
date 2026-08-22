@@ -31,7 +31,11 @@ Sidon is Mipha's brother in the source material, which is apt rather than cute: 
 failover and the storage data path are genuinely siblings here — fencing becomes a
 property of the data path itself (see [ownership.md](./ownership.md)).
 
-Names are proposals; veto freely before code exists.
+**Two naming questions are settled and one is deliberately left open.**
+
+- *Aether keeps its name and its meaning.* It is the Linstor/DRBD substrate, and it is not renamed into this. The two run side by side through the migration and Aether stays afterwards for anything that chooses it, exactly as the GlusterFS-to-Aether transition went. Reusing the name would have made every sentence in every older document ambiguous about which storage layer it meant.
+- *The volume group stays `vg_aether`.* Both substrates carve from the same thin pool, so the name is now historical rather than descriptive. Renaming a VG under live data to fix a naming aesthetic is not a trade worth making; the capacity consequence is real and is handled in [architecture.md](./architecture.md) §4.
+- *The CLI has no name yet.* The pattern is `valcli` / `mcli` / `catcli`, and none of the obvious derivations are good. It is not needed until milestone 7, so it is left blank rather than filled in badly — an unnamed slot is honest; a placeholder that leaks into code is not.
 
 ## Read these in order
 
