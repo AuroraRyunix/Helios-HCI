@@ -409,7 +409,7 @@ FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as 
 # Services this node manages when converging toward the desired cluster state, in start
 # order. Stop order is the reverse. ZooKeeper is deliberately absent: it is the store the
 # desired state lives in, so it is started before convergence begins and stopped last.
-MANAGED_SERVICE_ORDER = ["hydra-db", "daruk", "aether", "linstor-controller", "spectrum",
+MANAGED_SERVICE_ORDER = ["hydra-db", "daruk", "sidon", "spectrum",
                          "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
                          "mimir", "logos", "mipha", "gatoway", "urbosa", "hylia"]
 
@@ -825,76 +825,13 @@ def build_node_status():
 # just before a trailing newline, so "vm1\n" would pass and then be handed to virsh.
 NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
 
-# Paths must resolve under one of these roots. /dev/drbd/by-res/<res>/<vol> is a
-# symlink to the minor device, so realpath legitimately lands on /dev/drbdNNNN --
-# that one target is accepted as well, but only when the path as written was
-# already under /dev/drbd/. Everything else (traversal, a symlink out of the
-# aether tree) is rejected by the realpath check.
-ALLOWED_PATH_ROOTS = ("/dev/drbd/", "/var/lib/hci/aether/")
-DRBD_MINOR_RE = re.compile(r"\A/dev/drbd[0-9]+\Z")
+# Paths must resolve under one of these roots. There are no device nodes in the list any
+# more: a vdisk is reached through a unix socket under /var/lib/hci/sidon/nbd/, and the
+# endpoints that took a /dev/drbd/... path are gone. Everything else (traversal, a symlink
+# out of the tree, a bare /dev entry) is refused.
+ALLOWED_PATH_ROOTS = ("/var/lib/hci/aether/", "/var/lib/hci/sidon/", "/var/lib/hci/images/")
 
-ALLOWED_OWNERS = ("root:qemu", "root:root")
-ALLOWED_MODES = ("0600", "0640", "0644", "0660", "0664", "0666", "0700", "0750", "0755", "0770")
 
-AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
-VIRSH = ["virsh", "-c", "qemu:///system"]
-HYDRA_DB_CONTAINER = "systemd-hydra-db"
-VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
-DRBD_ROLES = ("primary", "secondary")
-
-# -- Linstor ---------------------------------------------------------------
-# The client lives in the aether container, which runs on every node, and finds
-# whichever node currently holds the controller through LS_CONTROLLERS. Calling it
-# there rather than in systemd-linstor-controller is what makes these endpoints work
-# from any host instead of only the leader.
-LINSTOR_CONTAINER = "systemd-aether"
-CLUSTER_JSON = "/etc/hci/cluster.json"
-
-# Cluster creation makes exactly one pool:
-#   linstor storage-pool create lvmthin <node> default-pool vg_aether/thin_pool_aether
-# and Spectrum refuses dynamic container creation on this storage engine. A pool is
-# therefore an allowlisted value like an owner or a mode, never caller text; adding a
-# second pool to the product means adding its name here.
-ALLOWED_STORAGE_POOLS = ("default-pool",)
-DEFAULT_STORAGE_POOL = "default-pool"
-
-# 1 GiB .. 64 TiB. The floor rejects a zero-sized volume-definition; the ceiling is a
-# sanity bound on the number, not a capacity check -- Linstor still refuses what the
-# pool cannot actually back.
-MIN_VOLUME_GIB = 1
-MAX_VOLUME_GIB = 65536
-KIB_PER_GIB = 1024 * 1024
-
-# LINSTOR aligns volume sizes to 4 KiB, one DRBD block. Requests are aligned to match
-# before they are sent, so a resource's stored size equals what was asked for and an
-# idempotent retry compares equal instead of looking like a size conflict.
-VOLUME_ALIGN_KIB = 4
-
-# Automatic split-brain resolution, applied to every VM disk at create time.
-#
-# --allow-two-primaries is deliberately absent. Setting it here let one VM be started
-# on two hosts at once, and two qemu processes writing one raw DRBD device corrupts
-# it. Live migration needs dual-primary only for the hand-over window and enables it
-# around that call itself.
-DRBD_SPLIT_BRAIN_OPTIONS = [
-    "--after-sb-0pri", "discard-zero-changes",
-    "--after-sb-1pri", "discard-secondary",
-    "--after-sb-2pri", "disconnect",
-]
-
-# LINSTOR's ApiCallRc carries its severity in the top two bits: error is both set,
-# warning is the high bit alone, info the next one. Used only as a second opinion --
-# the client's exit status is the primary signal, so a wrong guess about this mask
-# cannot turn a successful call into a failure on its own.
-LINSTOR_MASK_ERROR = 0xC000000000000000
-
-# A resource that is already there is not a failure for an idempotent create; a
-# resource that is already gone is not a failure for a delete. Kept to the phrasings
-# LINSTOR actually uses: a loose marker here would read a real failure as a success and
-# return 200 for a disk that does not exist, which is the bug this whole endpoint is
-# meant to remove.
-LINSTOR_EXISTS_MARKERS = ("already exists", "already registered")
-LINSTOR_ABSENT_MARKERS = ("not found", "does not exist")
 
 IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
 
@@ -987,8 +924,9 @@ def validate_path(value):
     if not under_root(literal):
         return None, "path must be under " + " or ".join(ALLOWED_PATH_ROOTS)
     if not under_root(real):
-        # A /dev/drbd/by-res/... symlink resolves to the bare minor device.
-        if not (literal.startswith("/dev/drbd/") and DRBD_MINOR_RE.match(real)):
+        # Nothing under the allowed roots is a symlink to a device node now, so a
+        # path whose realpath left its root is simply out of bounds.
+        if True:
             return None, "path resolves outside " + " or ".join(ALLOWED_PATH_ROOTS)
     return real, None
 
@@ -1016,6 +954,20 @@ def validate_storage_pool(value):
     return None, "storage_pool must be one of " + ", ".join(ALLOWED_STORAGE_POOLS)
 
 
+VIRSH = ["virsh", "-c", "qemu:///system"]
+
+# 1 GiB .. 64 TiB. The floor rejects a zero-sized volume; the ceiling is a sanity bound on
+# the number, not a capacity check -- a create still fails if the extent store cannot back
+# it, and the capacity endpoint is what answers that question.
+MIN_VOLUME_GIB = 1
+MAX_VOLUME_GIB = 65536
+KIB_PER_GIB = 1024 * 1024
+
+# Sizes are aligned to 4 KiB before they are stored, so a vdisk's recorded size equals what
+# was asked for and an idempotent retry compares equal instead of looking like a conflict.
+VOLUME_ALIGN_KIB = 4
+
+
 def validate_volume_gib(value):
     """Volume size is an integer number of GiB inside sane bounds.
 
@@ -1040,11 +992,11 @@ def validate_volume_size_kib(payload):
     precedence rule, because a caller that sends a size in two units has a bug and
     silently honouring one of them hides it.
 
-    The result is rounded up to a multiple of `VOLUME_ALIGN_KIB`. LINSTOR aligns volumes
+    The result is rounded up to a multiple of `VOLUME_ALIGN_KIB`. The extent store aligns volumes
     to 4 KiB itself, so an unaligned request comes back as a slightly larger volume than
     was asked for -- and the next idempotent create of the same resource would then
     compare its own unaligned request against the aligned reality and reject the retry as
-    a size mismatch. Aligning here makes the request equal to what LINSTOR will store.
+    a size mismatch. Aligning here makes the request equal to what will be stored.
     """
     raw_kib = payload.get("size_kib")
     raw_gib = payload.get("size_gib")
@@ -1066,7 +1018,7 @@ def validate_volume_size_kib(payload):
         return None, "size_kib must not exceed %d" % (MAX_VOLUME_GIB * KIB_PER_GIB)
 
     # Rounding up comes after the bounds and before anything else uses the figure. An
-    # image smaller than one DRBD block is rounded up to one rather than rejected: the
+    # image smaller than one block is rounded up to one rather than rejected: the
     # floor is a property of the volume, not of what may be stored in it.
     remainder = raw_kib % VOLUME_ALIGN_KIB
     if remainder:
@@ -1465,47 +1417,6 @@ def device_size_bytes(path, st_result):
     return st_result.st_size
 
 
-def drbd_local_role(resource):
-    """Local role of a DRBD resource, or None when it cannot be read.
-
-    DRBD 8 prints "Primary/Secondary", DRBD 9 prints just the local role.
-    """
-    rc, stdout, _ = run_argv(["drbdadm", "role", resource], timeout=20)
-    if rc != 0:
-        return None
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
-    if not lines:
-        return None
-    role = lines[0]
-    if "/" in role:
-        role = role.split("/", 1)[0]
-    return role or None
-
-
-def drbd_peer_roles(resource):
-    """Peer roles of a DRBD resource from drbdsetup, [] when unknown.
-
-    This is what makes "the peer already holds Primary" visible to the caller
-    instead of surfacing as a generic promotion failure.
-    """
-    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json", resource], timeout=20)
-    if rc != 0:
-        return []
-    try:
-        data = json.loads(stdout)
-    except Exception:
-        return []
-    roles = []
-    if isinstance(data, list):
-        for resource_entry in data:
-            if not isinstance(resource_entry, dict):
-                continue
-            for connection in resource_entry.get("connections") or []:
-                if isinstance(connection, dict) and connection.get("peer-role"):
-                    roles.append(connection["peer-role"])
-    return roles
-
-
 # ---------------------------------------------------------------------------
 # Fencing
 #
@@ -1520,21 +1431,22 @@ def drbd_peer_roles(resource):
 # host wedged enough to need fencing in the first place.
 #
 # This endpoint does the same work and then answers with the state it can actually
-# observe afterwards: guest processes still alive, DRBD resources still Primary, devices
+# observe afterwards: guest processes still alive, vdisks still served, devices
 # still open. Mipha treats `fenced: false` and an unanswered request identically -- both
 # mean the host is not proven safe to fail over.
 #
 # The marker file is written before anything is demoted. Mipha's storage loop re-promotes
-# linstor-db and the container resources within two seconds on whichever node holds
+# storage back within seconds on whichever node holds
 # ZooKeeper leadership, so a fence that demotes first would be undone before it finished.
 # ---------------------------------------------------------------------------
 
 FENCE_MARKER_PATH = "/run/hci/mipha-self-fence.json"
 
-# Mount points Mipha's storage loop puts on top of DRBD devices. A resource cannot be
+# Mount points a fence has to take down before this host counts as released. A vdisk
+# cannot be
 # demoted while a filesystem sits on it, and the list is fixed rather than derived so a
 # fence never unmounts something it did not put there.
-FENCE_MOUNTS = ("/var/lib/linstor",
+FENCE_MOUNTS = (
                 "/var/lib/hci/aether/volumes/default-vm-container",
                 "/var/lib/hci/aether/volumes/default-image-container")
 
@@ -1562,32 +1474,6 @@ def qemu_process_ids():
     return found
 
 
-def drbd_local_resources():
-    """[(name, role, [open volume numbers])] per loaded resource; None if unreadable.
-
-    None is deliberately distinct from []: "this host has no DRBD resources" and "this
-    host's DRBD state could not be read" must not produce the same fence verdict.
-    """
-    rc, stdout, _ = run_argv(["drbdsetup", "status", "--json"], timeout=30)
-    if rc != 0:
-        return None
-    try:
-        data = json.loads(stdout.strip() or "[]")
-    except Exception:
-        return None
-    if not isinstance(data, list):
-        return None
-    resources = []
-    for entry in data:
-        if not isinstance(entry, dict) or not entry.get("name"):
-            continue
-        opened = [str(device.get("volume", 0))
-                  for device in (entry.get("devices") or [])
-                  if isinstance(device, dict) and device.get("open")]
-        resources.append((entry["name"], str(entry.get("role", "")), opened))
-    return resources
-
-
 def write_fence_marker(reason, report):
     """Record that this host is fenced, where its own Mipha will see it.
 
@@ -1604,10 +1490,10 @@ def write_fence_marker(reason, report):
 
 
 def fence_this_host():
-    """Stop every guest, release every DRBD device, and report what is *still* held.
+    """Stop every guest, release every vdisk, and report what is *still* held.
 
     The return value is evidence, not a receipt. `fenced` is true only when nothing is
-    left: no guest process, no Primary resource, no open device. A DRBD state that could
+    left: no guest process and no vdisk served. A storage state that could
     not be read is `fenced: false` -- an unreadable answer is not a good one.
     """
     report = {"fenced": False, "libvirt_active": False, "qemu_pids": [],
@@ -1615,7 +1501,7 @@ def fence_this_host():
 
     write_fence_marker("fenced through the Spark API", {})
 
-    # 1. Ask libvirt to stop its domains first. A destroy releases the DRBD device
+    # 1. Ask libvirt to stop its domains first. A destroy releases the vdisk
     #    through the normal path and leaves libvirt's own state consistent; the SIGKILL
     #    below is the fallback for when libvirt is part of what has failed.
     rc, stdout, _ = run_argv(VIRSH + ["list", "--name", "--state-running"], timeout=30)
@@ -1647,10 +1533,8 @@ def fence_this_host():
         time.sleep(2)
     report["qemu_pids"] = qemu_process_ids()
 
-    # 4. Drop the filesystems this host's storage loop mounted on DRBD devices; a
+    # 4. Drop the filesystems a fence has to unmount; a
     #    resource cannot go Secondary underneath a mount.
-    if run_argv(["mountpoint", "-q", FENCE_MOUNTS[0]], timeout=15)[0] == 0:
-        run_argv(["systemctl", "stop", "linstor-controller"], timeout=60)
     for mount in FENCE_MOUNTS:
         if run_argv(["mountpoint", "-q", mount], timeout=15)[0] != 0:
             continue
@@ -1658,45 +1542,58 @@ def fence_this_host():
         report["actions"].append("umount %s: %s" % (
             mount, "ok" if rc_u == 0 else (err_u or out_u).strip()[:120]))
 
-    # 5. Give up Primary on everything. Checked, and never --force: a demotion that is
-    #    refused is exactly the information the caller needs, and forcing it past a
-    #    process that still holds the device would not make that process stop writing.
-    resources = drbd_local_resources()
-    if resources is None:
-        report["detail"] = ("guest processes were stopped, but drbdsetup did not answer, "
-                            "so it cannot be shown that this host released its disks")
+    # 5. Give up every vdisk. This used to demote DRBD resources -- checked, never
+    #    --force, because a refused demotion was the information the caller needed and
+    #    forcing it past a process still holding the device would not make that process
+    #    stop writing. Detaching is the equivalent and is strictly better: it drains what
+    #    the guest wrote, releases ownership, and a vdisk this host no longer serves is
+    #    one whose next owner does not have to race it.
+    still_held = []
+    try:
+        sidon = load_sidon_module()
+    except Exception as exc:
+        report["detail"] = ("guest processes were stopped, but helios_sidon is not "
+                            "available (%s), so it cannot be shown that this host "
+                            "released its disks" % exc)
         return report
-    for name, role, _opened in resources:
-        if role.lower() != "primary":
+    try:
+        attached = sidon.list_attached(timeout=15).get("attached", [])
+    except Exception as exc:
+        report["detail"] = ("guest processes were stopped, but sidon did not answer "
+                            "(%s), so it cannot be shown that this host released its "
+                            "disks" % exc)
+        return report
+    for vdisk in attached:
+        vdisk_id = vdisk.get("vdisk_id")
+        if not vdisk_id:
             continue
-        rc_s, out_s, err_s = run_argv(["drbdadm", "secondary", name], timeout=60)
-        report["actions"].append("secondary %s: %s" % (
-            name, "ok" if rc_s == 0 else (err_s or out_s).strip()[:120]))
+        try:
+            sidon.detach(vdisk_id, timeout=60)
+            report["actions"].append("detach %s: ok" % vdisk_id)
+        except Exception as exc:
+            still_held.append(vdisk_id)
+            report["actions"].append("detach %s: %s" % (vdisk_id, str(exc)[:120]))
 
-    after = drbd_local_resources()
-    if after is None:
-        report["detail"] = ("demotions were issued, but drbdsetup did not answer "
-                            "afterwards, so the result could not be read back")
+    # Read it back rather than trusting the detaches: the point of this whole function is
+    # that it reports what is true, not what was attempted.
+    try:
+        remaining = [v.get("vdisk_id") for v in sidon.list_attached(timeout=15).get("attached", [])
+                     if isinstance(v, dict)]
+    except Exception as exc:
+        report["detail"] = ("detaches were issued, but sidon did not answer afterwards "
+                            "(%s), so the result could not be read back" % exc)
         return report
-    report["primary_resources"] = [name for name, role, _o in after
-                                   if role.lower() == "primary"]
-    report["open_devices"] = ["%s/%s" % (name, volume)
-                              for name, _role, opened in after for volume in opened]
+    report["held_vdisks"] = [v for v in remaining if v]
 
-    report["fenced"] = (not report["qemu_pids"]
-                        and not report["primary_resources"]
-                        and not report["open_devices"])
+    report["fenced"] = not report["qemu_pids"] and not report["held_vdisks"]
     if report["fenced"]:
-        report["detail"] = ("no guest process, no Primary DRBD resource and no open DRBD "
-                            "device remain on this host")
+        report["detail"] = "no guest process remains and this host serves no vdisk"
     else:
         parts = []
         if report["qemu_pids"]:
             parts.append("guest processes still running: %s" % report["qemu_pids"])
-        if report["primary_resources"]:
-            parts.append("still Primary on %s" % ", ".join(report["primary_resources"]))
-        if report["open_devices"]:
-            parts.append("devices still open: %s" % ", ".join(report["open_devices"]))
+        if report["held_vdisks"]:
+            parts.append("still serving %s" % ", ".join(report["held_vdisks"]))
         report["detail"] = "the fence did not take -- " + "; ".join(parts)
 
     write_fence_marker("fenced through the Spark API",
@@ -1704,278 +1601,11 @@ def fence_this_host():
     return report
 
 
-# ---------------------------------------------------------------------------
-# Linstor
-#
-# Same rules as the rest of the typed API: every element of every command is a
-# literal or an already-validated value, run_argv() calls subprocess.run() with a
-# list and shell=False, and what comes back is parsed into this daemon's own shape
-# rather than handed to the caller as stdout.
-# ---------------------------------------------------------------------------
-
-
-def cluster_hosts():
-    """[{"hostname","ip"}] from the on-host cluster document; [] when unreadable.
-
-    Values that could not be a node name or an address are dropped rather than
-    repaired, so a damaged cluster.json cannot contribute an argument to a command.
-    """
-    try:
-        with open(CLUSTER_JSON, "r") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return []
-    hosts = data.get("hosts") if isinstance(data, dict) else None
-    if not isinstance(hosts, list):
-        return []
-
-    parsed = []
-    for host in hosts:
-        if not isinstance(host, dict):
-            continue
-        hostname = host.get("hostname")
-        address = host.get("ip")
-        parsed.append({
-            "hostname": hostname if valid_name(hostname) else None,
-            "ip": address if isinstance(address, str) and IPV4_RE.match(address) else None,
-        })
-    return parsed
-
-
-def cluster_node_names():
-    """Every node name in the cluster document, in configured order."""
-    return [host["hostname"] for host in cluster_hosts() if host["hostname"]]
-
-
-def cluster_node_ips():
-    """Every node address in the cluster document, in configured order."""
-    return [host["ip"] for host in cluster_hosts() if host["ip"]]
-
-
-def linstor_argv(args):
-    """argv for one linstor client call inside the aether container.
-
-    LS_CONTROLLERS is one argv element built from the cluster document, so the client
-    reaches whichever node currently runs the controller. `-m` asks for the
-    machine-readable document; every remaining element is a fixed literal or a value
-    that has already passed validation at the boundary.
-    """
-    controllers = ",".join(cluster_node_ips()) or "127.0.0.1"
-    return (["podman", "exec", "-e", "LS_CONTROLLERS=" + controllers,
-             LINSTOR_CONTAINER, "linstor", "-m"] + list(args))
-
-
-def _linstor_entries(node):
-    """Yield the dicts in a machine-readable document, list nesting flattened.
-
-    Some client versions wrap the document in an extra list ([[{...}]]), so this
-    descends through lists but not through dict values -- a nested object inside a
-    resource is data, not another top-level entry.
-    """
-    if isinstance(node, list):
-        for item in node:
-            for found in _linstor_entries(item):
-                yield found
-    elif isinstance(node, dict):
-        yield node
-
-
-def parse_linstor_api_call_rc(text):
-    """[{"ret_code","message","details"}] from a linstor client response document."""
-    try:
-        data = json.loads(text.strip() or "[]")
-    except ValueError:
-        return []
-
-    messages = []
-    for entry in _linstor_entries(data):
-        if "ret_code" not in entry and "message" not in entry:
-            continue
-        ret_code = entry.get("ret_code")
-        if not isinstance(ret_code, int):
-            ret_code = 0
-        messages.append({
-            "ret_code": ret_code,
-            "message": str(entry.get("message") or ""),
-            "details": str(entry.get("details") or ""),
-            # "already exists" lands in `cause` rather than `message` for some of the
-            # client's responses, and that string is what the idempotency check reads.
-            "cause": str(entry.get("cause") or ""),
-        })
-    return messages
-
-
-# The client renamed its keys between output versions. Both spellings are read here so
-# that no caller ever has to know which version a given cluster's client speaks.
-_RD_LIST_KEYS = ("resource_definitions", "rsc_dfns")
-_RD_NAME_KEYS = ("name", "rsc_name")
-_VD_LIST_KEYS = ("volume_definitions", "vlm_dfns")
-_VD_NUMBER_KEYS = ("volume_number", "vlm_nr")
-_VD_SIZE_KEYS = ("size_kib", "vlm_size")
-_RSC_LIST_KEYS = ("resources",)
-_RSC_NAME_KEYS = ("name", "rsc_name")
-_RSC_NODE_KEYS = ("node_name", "node")
-
-
 def _first_key(entry, keys):
     for key in keys:
         if key in entry:
             return entry[key]
     return None
-
-
-def parse_linstor_resource_definitions(text):
-    """[{"name","volumes":[{"number","size_kib"}]}] from `resource-definition list`.
-
-    An unrecognised document yields [] rather than a guess: a caller that gets an
-    empty list and then fails to create is recoverable, one that gets a wrong size is
-    not.
-    """
-    try:
-        data = json.loads(text.strip() or "[]")
-    except ValueError:
-        return []
-
-    definitions = []
-    for entry in _linstor_entries(data):
-        listed = _first_key(entry, _RD_LIST_KEYS)
-        if not isinstance(listed, list):
-            # Piraeus 1.31's client emits the definitions bare -- [[{"name": ...}]] --
-            # with no wrapper key at all, so an entry that already looks like a
-            # definition is one. Verified against the deployed client; without this the
-            # list endpoint reported an empty cluster while resources existed.
-            if _first_key(entry, _RD_NAME_KEYS):
-                listed = [entry]
-            else:
-                continue
-        for definition in listed:
-            if not isinstance(definition, dict):
-                continue
-            name = _first_key(definition, _RD_NAME_KEYS)
-            if not isinstance(name, str) or not name:
-                continue
-            volumes = []
-            for volume in _first_key(definition, _VD_LIST_KEYS) or []:
-                if not isinstance(volume, dict):
-                    continue
-                number = _first_key(volume, _VD_NUMBER_KEYS)
-                size_kib = _first_key(volume, _VD_SIZE_KEYS)
-                volumes.append({
-                    "number": number if isinstance(number, int) else 0,
-                    "size_kib": size_kib if isinstance(size_kib, int) else None,
-                })
-            definitions.append({"name": name, "volumes": volumes})
-    return definitions
-
-
-def parse_linstor_resources(text):
-    """[{"name","node"}] from `resource list`: which nodes actually back a resource."""
-    try:
-        data = json.loads(text.strip() or "[]")
-    except ValueError:
-        return []
-
-    placements = []
-    for entry in _linstor_entries(data):
-        listed = _first_key(entry, _RSC_LIST_KEYS)
-        if not isinstance(listed, list):
-            continue
-        for resource in listed:
-            if not isinstance(resource, dict):
-                continue
-            name = _first_key(resource, _RSC_NAME_KEYS)
-            node = _first_key(resource, _RSC_NODE_KEYS)
-            if not isinstance(name, str) or not name:
-                continue
-            placements.append({
-                "name": name,
-                "node": node if isinstance(node, str) else "",
-            })
-    return placements
-
-
-def linstor_says(detail, markers):
-    """True when the client's own message contains one of `markers`."""
-    lowered = (detail or "").lower()
-    return any(marker in lowered for marker in markers)
-
-
-def linstor_call(args, timeout=120):
-    """Run one linstor client command. Returns (ok, stdout, detail).
-
-    `ok` is False when the client exited non-zero or reported an error-masked
-    ApiCallRc. The exit status is the primary signal and the mask is a second opinion,
-    so a wrong assumption about the mask cannot by itself turn a successful call into
-    a failure. `detail` is the client's own message text -- it drives the idempotency
-    checks and the error string, and is never returned as the body of a success.
-    """
-    rc, stdout, stderr = run_argv(linstor_argv(args), timeout=timeout)
-    messages = parse_linstor_api_call_rc(stdout)
-
-    parts = []
-    for message in messages:
-        for field in ("message", "details", "cause"):
-            if message[field]:
-                parts.append(message[field])
-    if stderr.strip():
-        parts.append(stderr.strip())
-    detail = " ".join(parts)
-
-    reported_error = any(
-        (message["ret_code"] & LINSTOR_MASK_ERROR) == LINSTOR_MASK_ERROR
-        for message in messages
-    )
-    ok = rc == 0 and not reported_error
-    if not ok and not detail:
-        detail = stdout.strip() or ("linstor %s failed with exit code %s" % (args[0], rc))
-    return ok, stdout, detail
-
-
-def linstor_resource_path(resource):
-    """Where a resource's volume 0 appears on every node backing it."""
-    return "/dev/drbd/by-res/%s/0" % resource
-
-
-def linstor_inventory():
-    """(resources, error): what Linstor holds, in this daemon's shape.
-
-    Each entry is {"name","size_kib","size_gib","nodes","device_path"}. Placement comes
-    from a second call because `resource-definition list` describes the definition, not
-    where it is materialised; a failure there degrades `nodes` to [] rather than failing
-    the read, since the definitions are the part a caller cannot do without.
-    """
-    # volume-definition list, not resource-definition list: on the deployed client the
-    # latter omits volume_definitions entirely, so existing sizes came back as null and
-    # the size-mismatch guard below could never fire -- letting a new VM silently adopt
-    # a deleted VM's disk at a different size.
-    ok, stdout, detail = linstor_call(["volume-definition", "list"], timeout=60)
-    if not ok:
-        return None, detail or "linstor resource-definition list failed"
-
-    placements = {}
-    ok_resources, resources_stdout, _ = linstor_call(["resource", "list"], timeout=60)
-    if ok_resources:
-        for placement in parse_linstor_resources(resources_stdout):
-            nodes = placements.setdefault(placement["name"], [])
-            if placement["node"] and placement["node"] not in nodes:
-                nodes.append(placement["node"])
-
-    inventory = []
-    for definition in parse_linstor_resource_definitions(stdout):
-        volume = None
-        for candidate in definition["volumes"]:
-            if candidate["number"] == 0:
-                volume = candidate
-                break
-        size_kib = volume["size_kib"] if volume else None
-        inventory.append({
-            "name": definition["name"],
-            "size_kib": size_kib,
-            "size_gib": (size_kib // KIB_PER_GIB) if isinstance(size_kib, int) else None,
-            "nodes": placements.get(definition["name"], []),
-            "device_path": linstor_resource_path(definition["name"]),
-        })
-    return inventory, None
 
 
 def read_dhcp_leases():
@@ -2004,31 +1634,10 @@ def read_dhcp_leases():
 
 
 def read_host_capabilities():
-    """{"kvm","drbd_module","secure_boot"} read straight from the kernel."""
+    """{"kvm","secure_boot"} read straight from the kernel."""
     kvm = os.path.exists("/dev/kvm")
 
-    drbd_module = os.path.exists("/proc/drbd")
-    if not drbd_module:
-        try:
-            with open("/proc/modules", "r") as handle:
-                for line in handle:
-                    if line.split(" ", 1)[0] == "drbd":
-                        drbd_module = True
-                        break
-        except OSError:
-            pass
-
-    secure_boot = False
-    try:
-        with open(SECURE_BOOT_EFIVAR, "rb") as handle:
-            data = handle.read()
-        # 4-byte EFI attribute prefix followed by the one-byte value.
-        if data:
-            secure_boot = data[-1] == 1
-    except OSError:
-        secure_boot = False
-
-    return {"kvm": kvm, "drbd_module": drbd_module, "secure_boot": secure_boot}
+    return {"kvm": kvm, "secure_boot": secure_boot}
 
 
 DB_REPAIR_LOCK = threading.Lock()
@@ -2196,7 +1805,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     if os.path.exists("/etc/hci/maintenance.state"):
                         os.remove("/etc/hci/maintenance.state")
                     
-                    start_cmd = "systemctl start zookeeper hydra-db aether linstor-controller spectrum bifrost dagur mimir vali catalyst gatoway logos mipha daruk agahnim slate"
+                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway logos mipha daruk agahnim slate"
                     subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                     self.send_json_response(200, {
@@ -2335,26 +1944,28 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         
-        # 2. Get Linstor or Gluster status
+        # 2. Storage status. This used to `podman exec` into the aether container and
+        # run `linstor node list` and `linstor resource list`, then filter the table
+        # it printed. Sidon has no controller to ask and no container to exec into: it
+        # answers on a unix socket with the numbers directly.
         peer_status = ""
         volume_info = ""
         if cluster_exists:
-
-            # Standardized on Linstor client
-            controller_ip = "127.0.0.1"
             try:
-                with open("/etc/hci/cluster.json", "r") as f:
-                    cdata = json.load(f)
-                    hosts = cdata.get("hosts", [])
-                    if hosts:
-                        controller_ip = ",".join([h["ip"] for h in hosts])
-            except Exception:
-                pass
-            res_peer = subprocess.run(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor node list", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            peer_status = res_peer.stdout.decode("utf-8", errors="ignore").strip()
-            res_vol = subprocess.run(f"podman exec -e LS_CONTROLLERS={controller_ip} systemd-aether linstor resource list", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            volume_info = res_vol.stdout.decode("utf-8", errors="ignore").strip()
-        
+                cap = load_sidon_module().capacity(timeout=15)
+                gib = 1024 ** 3
+                peer_status = "%s: %.1f of %.1f GiB used" % (
+                    cap.get("node", "this node"),
+                    (int(cap.get("total_bytes") or 0) - int(cap.get("available_bytes") or 0)) / gib,
+                    int(cap.get("total_bytes") or 0) / gib)
+                attached = load_sidon_module().list_attached(timeout=15).get("attached", [])
+                volume_info = "\n".join(
+                    "%s  epoch %s  %s" % (v.get("vdisk_id", "?"), v.get("epoch", "?"),
+                                         "DEGRADED" if v.get("degraded") else "ok")
+                    for v in attached) or "no vdisk is attached on this node"
+            except Exception as exc:
+                peer_status = "sidon did not answer: %s" % str(exc)[:200]
+
         # Parse query params for verbose flag
         import urllib.parse
         parsed = urllib.parse.urlparse(self.path)
@@ -2614,25 +2225,13 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                 else:
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
  
-            # Start linstor-controller
-            # run_checked_cmd is defined in cluster_new.py, not here -- calling it raised
-            # NameError and broke this path. run_parallel_checked has identical semantics
-            # (checked remote exec, raises on failure) and takes a list.
-            run_parallel_checked([hosts[0]], "systemctl start linstor-controller")
-            for ip in hosts[1:]:
-                run_remote_spark(ip, "systemctl stop linstor-controller")
-            # Wait for Linstor controller
-            leader_ip = hosts[0]
-            for _ in range(30):
-                rc, out, _ = run_remote_spark(leader_ip, "ss -tlnp | grep 3370")
-                if rc == 0 and "3370" in out:
-                    break
-                time.sleep(1)
-            else:
-                raise Exception(f"Linstor Controller failed to start on port 3370 on {leader_ip}")
- 
+            # No storage controller to start. Sidon is a per-node daemon with no
+            # leader and no API port to wait on, so what used to be "start the
+            # controller on host[0], stop it everywhere else, then poll for 3370"
+            # is simply the service list below.
+
             # Start other workloads
-            services = ["aether", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+            services = ["sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
             if check_urbosa_enabled():
                 services.append("urbosa")
             for svc in services:
@@ -2643,7 +2242,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             for ip in hosts:
                 run_mtls_spark_api(ip, "/api/v1/cluster/sync-settings", None, method="POST")
                 
-            # Standardized on Linstor/DRBD storage engine (legacy container mounts skipped)
+            # Storage is a mounted filesystem; there are no container volumes to mount.
             pass
                 
             self.send_json_response(200, {"message": "Cluster start command completed successfully."})
@@ -2671,11 +2270,9 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
         
         run_parallel(hosts, "umount -f /var/lib/hci/aether/volumes/default-vm-container || true")
         run_parallel(hosts, "umount -f /var/lib/hci/aether/volumes/default-image-container || true")
-        run_parallel(hosts, "umount -l /var/lib/linstor || true")
-        run_parallel(hosts, "drbdadm down all || true")
         
         # Stop services
-        services = ["logos", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "hydra-db", "zookeeper"]
+        services = ["logos", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "hydra-db", "zookeeper"]
         for svc in services:
             run_parallel(hosts, f"systemctl stop {svc}")
             
@@ -2722,7 +2319,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             cluster_json_data = {
                 "cluster_name": "hci-01",
                 "redundancy_factor": redundancy_factor,
-                "dfs_engine": "linstor",
+                "dfs_engine": "sidon",
                 "vip": vip,
                 "hosts": hosts_info
             }
@@ -2734,29 +2331,16 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             # Configure SELinux permanently to Permissive on all nodes to prevent helper command failures
             run_parallel_checked(servers, "setenforce 0 || true; sed -i 's/SELINUX=enforcing/SELINUX=permissive/g' /etc/selinux/config || true")
             
-            # Start storage engine (linstor-controller and satellite/aether on all)
-            run_parallel_checked(servers, "systemctl start aether")
-            run_parallel_checked([servers[0]], "systemctl start linstor-controller")
-            for ip in servers[1:]:
-                run_remote_spark(ip, "systemctl stop linstor-controller")
-            # Wait for Linstor controller API to start listening on port 3370 on the leader server
-            leader_ip = servers[0]
-            for _ in range(30):
-                rc, out, _ = run_remote_spark(leader_ip, "ss -tlnp | grep 3370")
-                if rc == 0 and "3370" in out:
-                    break
-                time.sleep(1)
-            else:
-                raise Exception(f"Linstor Controller failed to start on port 3370 on {leader_ip}")
-            
-            # Set Linstor DRBD port range to avoid conflict with ScyllaDB port 7000
-            for ip in servers:
-                run_remote_spark(ip, "podman exec systemd-aether linstor controller set-property TcpPortAutoRange 7700-7890")
-            
-            # Setup Linstor nodes and storage pools
-            for h in hosts_info:
-                execute_checked(f"podman exec systemd-aether linstor node create {h['hostname']} {h['ip']}", allow_already_exists=True)
-                
+            # Start the data path. One daemon per node, no controller, no election,
+            # and nothing to wait for on a port -- so the TcpPortAutoRange property
+            # that used to be set here to keep DRBD off ScyllaDB's port 7000 has
+            # nothing to configure either.
+            run_parallel_checked(servers, "systemctl start sidon")
+
+            # No storage-layer node registration. LINSTOR needed every host declared to
+            # a controller before it would place anything; a vdisk is placed by whoever
+            # attaches it, and the map in Hydra already knows which hosts exist.
+
             # Dynamic Disk Setup (Non-boot disks >= 100GB)
             disk_claim_script = """
 import subprocess, json, sys, os
@@ -2814,7 +2398,7 @@ if not candidate:
 
 dev_path, size_bytes = candidate
 subprocess.run("wipefs -a " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-# Zero first 1024MB and last 1024MB of the raw disk to ensure no old DRBD metadata interferes
+# Zero the first and last 1024MB of the raw disk so no old superblock interferes
 subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 seek_val = (size_bytes // 1048576) - 1024
 subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -2839,115 +2423,29 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             
             udev_helper = UdevHelper(servers)
             udev_helper.start()
-            try:
-                for h in hosts_info:
-                    execute_checked(f"podman exec systemd-aether linstor storage-pool create lvmthin {h['hostname']} default-pool vg_aether/thin_pool_aether", allow_already_exists=True)
-                time.sleep(2)
-                # Create Linstor resource definitions (default containers skipped for Linstor engine)
-                pass
-                
-                # Create linstor-db DRBD volume for database HA
-                print("Creating linstor-db DRBD resource definition for database HA...")
-                execute_checked("podman exec systemd-linstor-controller linstor resource-definition create linstor-db", allow_already_exists=True)
-                execute_checked("podman exec systemd-linstor-controller linstor volume-definition create linstor-db 5G", allow_already_exists=True)
+            # The whole replicated-database bootstrap is gone with the controller.
+            #
+            # LINSTOR kept its own database, and a single controller owning it was a
+            # single point of failure -- so this created a DRBD resource for that
+            # database, formatted it, stopped the controller, copied /var/lib/linstor
+            # onto it, remounted, restarted the controller on top, then waited up to
+            # four minutes for the replication to reach UpToDate on every node. A
+            # bootstrap that could fail in a dozen places, to protect the metadata of
+            # the thing that was storing the metadata.
+            #
+            # Sidon has no database of its own. The map lives in Hydra, which is
+            # already replicated, already backed up by saga, and already the thing
+            # every other daemon depends on.
 
-                # Set automatic split-brain resolution policy for linstor-db database resource
-                execute_checked("podman exec systemd-linstor-controller linstor resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect linstor-db", allow_already_exists=True)
+            # Sidon writes its extent groups onto a filesystem, so the only thing a
+            # node needs is that the filesystem is mounted -- provisioning creates the
+            # thin LV and the fstab entry. There is no storage-pools.json describing a
+            # pool name, a media type and a brick path to a controller that no longer
+            # exists, and no linstor-client.conf naming the controllers.
+            run_parallel_checked(
+                servers,
+                "mountpoint -q /var/lib/hci/sidon || mount /var/lib/hci/sidon")
 
-                print("Deploying replicated database storage volume across all nodes...")
-                for h in hosts_info:
-                    execute_checked(f"podman exec systemd-linstor-controller linstor resource create {h['hostname']} linstor-db --storage-pool default-pool", allow_already_exists=True)
-
-                print("Waiting for linstor-db DRBD block device to appear on leader...")
-                db_drbd_ready = False
-                for _ in range(45):
-                    rc_db, _, _ = run_remote_spark(servers[0], "test -b /dev/drbd/by-res/linstor-db/0")
-                    if rc_db == 0:
-                        db_drbd_ready = True
-                        break
-                    time.sleep(1)
-                if not db_drbd_ready:
-                    raise Exception("linstor-db DRBD block device did not appear within timeout.")
-
-                print("Formatting linstor-db block device with XFS...")
-                execute_checked("mkfs.xfs -f /dev/drbd/by-res/linstor-db/0")
-            finally:
-                udev_helper.stop()
-
-            print("Migrating local database to the replicated linstor-db volume...")
-            # 1. Stop controller to release database lock
-            execute_checked("systemctl stop linstor-controller")
-            # 2. Mount DRBD volume to temp directory
-            execute_checked("mkdir -p /mnt/linstordb-temp && mount -t xfs /dev/drbd/by-res/linstor-db/0 /mnt/linstordb-temp")
-            # 3. Copy files preserving permissions
-            execute_checked("cp -a /var/lib/linstor/. /mnt/linstordb-temp/")
-            # 4. Unmount temp directory
-            execute_checked("umount -f /mnt/linstordb-temp")
-            # 5. Clear local directory and mount DRBD volume to /var/lib/linstor
-            execute_checked("rm -rf /var/lib/linstor/* && mount -t xfs /dev/drbd/by-res/linstor-db/0 /var/lib/linstor")
-            # 6. Restart controller (it is now backed by the DRBD volume!)
-            execute_checked("systemctl start linstor-controller")
-
-            # Verify Node 1 controller is back online
-            controller_ready = False
-            for _ in range(30):
-                rc_check, out_check, _ = run_remote_spark(servers[0], "ss -tlnp | grep 3370")
-                if rc_check == 0 and "3370" in out_check:
-                    controller_ready = True
-                    break
-                time.sleep(1)
-            if not controller_ready:
-                raise Exception("Linstor Controller failed to restart on leader after database migration.")
-
-            print("Cleaning up local database directories and stopping standby nodes...")
-            for target_ip in servers[1:]:
-                run_remote_spark(target_ip, "systemctl stop linstor-controller")
-                run_remote_spark(target_ip, "umount -l /var/lib/linstor || true")
-                run_remote_spark(target_ip, "rm -rf /var/lib/linstor/*")
-                run_remote_spark(target_ip, "drbdadm secondary linstor-db || true")
-
-            print("Waiting for linstor-db DRBD replication to sync and reach UpToDate status cluster-wide...")
-            db_synced = False
-            for i in range(120): # up to 4 minutes
-                rc_stat, out_stat, _ = run_remote_spark(servers[0], "drbdadm status linstor-db")
-                if rc_stat == 0:
-                    out_lower = out_stat.lower()
-                    if "inconsistent" not in out_lower and "sync" not in out_lower and "uptodate" in out_lower:
-                        if out_lower.count("uptodate") >= len(servers):
-                            db_synced = True
-                            print("linstor-db is fully synchronized and UpToDate on all nodes.")
-                            break
-                time.sleep(2)
-            if not db_synced:
-                print("[WARNING] linstor-db replication did not fully sync within timeout. Disk status:")
-                rc_stat, out_stat, _ = run_remote_spark(servers[0], "drbdadm status linstor-db")
-                print(out_stat)
-            
-            # Write storage-pools.json with linstor engine
-            for ip in servers:
-                disk_info = host_claimed_disks[ip]
-                storage_pool_json = {
-                    "storage_pool_name": "default-pool",
-                    "dfs_engine": "linstor",
-                    "local_disks": [{
-                        "device": disk_info["device"],
-                        "role": "data",
-                        "media_type": "ssd",
-                        "fs_type": "xfs",
-                        "size_bytes": disk_info["size_bytes"],
-                        "brick_path": f"/var/lib/hci/aether/bricks/{os.path.basename(disk_info['device'])}/brick"
-                    }],
-                    "storage_containers": []
-                }
-                json_str = json.dumps(storage_pool_json, indent=2)
-                b64_str = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
-                run_remote_spark(ip, f"mkdir -p /etc/hci/aether && echo {b64_str} | base64 -d > /etc/hci/aether/storage-pools.json")
-                
-                controllers_line = ",".join(servers)
-                client_conf = f"[active]\ncontrollers = {controllers_line}\n"
-                client_b64 = base64.b64encode(client_conf.encode('utf-8')).decode('utf-8')
-                run_remote_spark(ip, f"mkdir -p /etc/linstor && echo {client_b64} | base64 -d > /etc/linstor/linstor-client.conf")
-                
             # Write spectrum.env
             seeds = ",".join(servers)
             for ip in servers:
@@ -2957,9 +2455,6 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 
             # Create local directories for images and nvram configs
             run_parallel_checked(servers, "mkdir -p /var/lib/hci/aether/images /var/lib/hci/aether/nvram")
-            
-            # Mount default volumes (skipped for Linstor engine)
-            pass
             
             # Restart zookeeper and DB to form ring
             print("Writing dynamic ZooKeeper container configs on all hosts...")
@@ -3105,12 +2600,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # broadcasting those device names would wipe the wrong disk on any host whose storage
         # sits elsewhere (e.g. /dev/nvme0n1).
 
-        # 1. Stop and Delete Storage Volumes/Resources (Standardized on Linstor/DRBD)
-        pass
-                        
         # 2. Stop services on all hosts in parallel
         # 2. Stop services on all hosts in parallel
-        services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         run_parallel(hosts, f"systemctl stop {svc_list} || true")
         
@@ -3122,16 +2614,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         run_parallel(hosts, "umount -l /var/lib/hci/aether/volumes/default-vm-container || true")
         run_parallel(hosts, "umount -l /var/lib/hci/aether/volumes/default-image-container || true")
         
-        drbd_down_cmd = (
-            "drbdsetup status | grep -v '^[[:space:]]' | grep -v '^#' | while read -r line; do "
-            "  res=$(echo \"$line\" | awk '{print $1}'); "
-            "  if [ ! -z \"$res\" ]; then "
-            "    echo \"Bringing down DRBD resource $res...\"; "
-            "    drbdsetup down \"$res\" || true; "
-            "  fi; "
-            "done"
-        )
-        run_parallel(hosts, drbd_down_cmd)
+        # Sidon's filesystem, unmounted like any other. There is no resource teardown
+        # loop before it: nothing has to be brought down at the block layer, because
+        # nothing was ever brought up there.
+        run_parallel(hosts, "systemctl stop sidon || true")
+        run_parallel(hosts, "umount -l /var/lib/hci/sidon || true")
+        run_parallel(hosts, "sed -i '\\#/var/lib/hci/sidon#d' /etc/fstab || true")
+
         # Wipe the LVM thin pool and VG (device independent) on every host first, so the storage
         # disks are left as bare unmounted devices before the signature wipe discovers them.
         lvm_wipe_cmd = "lvchange -an -f /dev/vg_aether/* || true; lvremove -y -f vg_aether || true; vgremove -y -f vg_aether || true; rm -rf /dev/vg_aether || true; dmsetup ls | grep vg_aether | awk '{print $1}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done"
@@ -3331,12 +2820,12 @@ for dev, mount in claimed:
     subprocess.run(f"wipefs -a {real_dev}", shell=True)
     subprocess.run(f"rm -rf {mount}", shell=True)
 
-# Clean up DRBD devices and Linstor directories
-subprocess.run("umount -l /var/lib/linstor || true", shell=True)
-subprocess.run("drbdadm down all || true", shell=True)
-subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-aether systemd-spectrum systemd-linstor-controller systemd-linstor-satellite || true", shell=True)
+# Clean up the extent store
+subprocess.run("systemctl stop sidon || true", shell=True)
+subprocess.run("umount -l /var/lib/hci/sidon || true", shell=True)
+subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum || true", shell=True)
 subprocess.run("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", shell=True)
-subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/linstor /etc/linstor", shell=True)
+subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", shell=True)
 """
         wipe_b64 = base64.b64encode(wipe_script.encode()).decode()
         cmd_wipe = f"python3 -c \"import base64; exec(base64.b64decode('{wipe_b64}').decode())\""
@@ -3385,20 +2874,11 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         """Dispatch the typed read endpoints. True when the request was handled."""
         path = parsed.path
 
-        if path == "/api/v1/storage/drbd/status":
-            self.handle_storage_drbd_status(parsed)
-            return True
         if path == "/api/v1/storage/device":
             self.handle_storage_device(parsed)
             return True
         if path == "/api/v1/storage/container/mounted":
             self.handle_storage_container_mounted(parsed)
-            return True
-        if path == "/api/v1/storage/drbd/options":
-            self.handle_storage_drbd_options(parsed)
-            return True
-        if path == "/api/v1/storage/linstor/resources":
-            self.handle_storage_linstor_resources(parsed)
             return True
         if path == "/api/v1/host/network":
             self.handle_host_network()
@@ -3447,9 +2927,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/vm/undefine":
             self.handle_vm_undefine()
             return True
-        if path == "/api/v1/storage/drbd/role":
-            self.handle_storage_drbd_role()
-            return True
         if path == "/api/v1/storage/device/prepare":
             self.handle_storage_device_prepare()
             return True
@@ -3467,12 +2944,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/dfs/write":
             self.handle_dfs_write(parsed)
-            return True
-        if path == "/api/v1/storage/linstor/resource":
-            self.handle_storage_linstor_resource()
-            return True
-        if path == "/api/v1/storage/linstor/resource/delete":
-            self.handle_storage_linstor_resource_delete()
             return True
         if path == "/api/v1/host/reboot":
             self.handle_host_reboot()
@@ -3634,100 +3105,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
 
     # -- Storage -------------------------------------------------------
 
-    def handle_storage_drbd_status(self, parsed):
-        resource = self.query_param(parsed, "resource")
-        argv = ["drbdsetup", "status", "--json"]
-        if resource is not None:
-            if not valid_name(resource):
-                self.reject("Invalid resource name")
-                return
-            argv.append(resource)
-
-        rc, stdout, stderr = run_argv(argv, timeout=30)
-        if rc != 0:
-            # A named resource that drbdsetup does not know is a 404, not a
-            # server fault: DRBD resources exist only on the nodes that back them.
-            self.reject((stderr or stdout).strip() or "drbdsetup status failed",
-                        404 if resource is not None else 500)
-            return
-        try:
-            status = json.loads(stdout.strip() or "[]")
-        except Exception:
-            self.reject("Could not parse drbdsetup status output", 500)
-            return
-        self.send_json_response(200, status)
-
-    def handle_storage_drbd_role(self):
-        payload, error = self.read_json_payload()
-        if error:
-            self.reject(error)
-            return
-
-        resource = payload.get("resource")
-        if not valid_name(resource):
-            self.reject("Invalid resource name")
-            return
-        role = payload.get("role")
-        if not isinstance(role, str) or role.lower() not in DRBD_ROLES:
-            self.reject("role must be one of " + ", ".join(DRBD_ROLES))
-            return
-        role = role.lower()
-        force = payload.get("force", False)
-        if not isinstance(force, bool):
-            self.reject("force must be a boolean")
-            return
-
-        argv = ["drbdadm", role]
-        if force and role == "primary":
-            argv.append("--force")
-        argv.append(resource)
-
-        rc, stdout, stderr = run_argv(argv, timeout=60)
-        resulting = drbd_local_role(resource)
-        if resulting is None and rc == 0:
-            # drbdadm confirmed the transition; only the read-back was unavailable.
-            resulting = role.capitalize()
-
-        if resulting is not None and resulting.lower() == role:
-            self.send_json_response(200, {"role": resulting})
-            return
-
-        message = (stderr or stdout).strip() or ("Could not read the role of " + resource)
-        if any(peer.lower() == "primary" for peer in drbd_peer_roles(resource)):
-            message = "Peer already holds Primary for %s. %s" % (resource, message)
-        self.send_json_response(409, {"role": resulting or "Unknown", "error": message})
-
-    def handle_storage_drbd_options(self, parsed):
-        """The *configured* resource options, which `drbdsetup status` does not carry.
-
-        This exists for fencing. A device's `quorum` flag in the status document reads
-        true both when quorum is held and when quorum is switched off altogether, so a
-        caller that only had the status could not tell "we hold the majority" from "this
-        cluster has no quorum at all" -- and those have opposite consequences for whether
-        a partitioned peer has stopped writing.
-        """
-        resource = self.query_param(parsed, "resource")
-        if not valid_name(resource):
-            self.reject("Invalid resource name")
-            return
-        rc, stdout, stderr = run_argv(["drbdsetup", "show", "--json", resource], timeout=30)
-        if rc != 0:
-            self.reject((stderr or stdout).strip() or "drbdsetup show failed", 404)
-            return
-        try:
-            shown = json.loads(stdout.strip() or "[]")
-        except Exception:
-            self.reject("Could not parse drbdsetup show output", 500)
-            return
-        for entry in shown if isinstance(shown, list) else []:
-            if isinstance(entry, dict) and entry.get("resource") == resource:
-                options = entry.get("options")
-                self.send_json_response(200, {
-                    "resource": resource,
-                    "options": options if isinstance(options, dict) else {}})
-                return
-        self.reject("drbdsetup show returned no options for " + resource, 404)
-
     def handle_storage_device(self, parsed):
         raw_path = self.query_param(parsed, "path")
         if raw_path is None:
@@ -3811,9 +3188,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         ok, err = validate_path(device)
         if not ok:
             self.send_json_response(400, {"error": err})
-            return
-        if not str(device).startswith("/dev/drbd/"):
-            self.send_json_response(400, {"error": "device must be under /dev/drbd/"})
             return
         if not os.path.exists(device):
             self.send_json_response(404, {"error": "device does not exist: " + str(device)})
@@ -4008,210 +3382,6 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
 
     # -- Storage: Linstor ----------------------------------------------
 
-    def handle_storage_linstor_resources(self, parsed):
-        """Everything Linstor holds, or one resource when `?resource=` is given."""
-        resource = self.query_param(parsed, "resource")
-        if resource is not None and not valid_name(resource):
-            self.reject("Invalid resource name")
-            return
-
-        inventory, error = linstor_inventory()
-        if inventory is None:
-            self.reject(error, 500)
-            return
-
-        if resource is None:
-            self.send_json_response(200, {"resources": inventory})
-            return
-
-        for entry in inventory:
-            if entry["name"] == resource:
-                self.send_json_response(200, {"resources": [entry]})
-                return
-        self.reject("No such Linstor resource: " + resource, 404)
-
-    def handle_storage_linstor_resource(self):
-        """Create replicated storage: resource definition, volume definition, placement,
-        DRBD options.
-
-        Backs both of the things the cluster stores this way, which differ in exactly two
-        respects. A VM disk is sized in whole GiB (`size_gib`) and is single-primary. A
-        golden image is sized in KiB (`size_kib`), because an ISO is whatever size it is,
-        and needs `allow_two_primaries` so guests on several hosts can attach it
-        read-only at once. Everything else -- idempotency, the size guard, the rollback --
-        is the same for both, so they share this endpoint rather than a copy of it.
-
-        One idempotent operation rather than four endpoints. The four commands are
-        meaningless apart -- a resource definition with no volume definition backs
-        nothing, and a volume definition with no resources exists on no node -- so
-        exposing them separately would just move the sequencing bug into every caller.
-
-        Idempotent in the sense that matters for a retry: each step tolerates the
-        object already being there, and the response says whether this call was the one
-        that created it. A resource that already exists at a *different* size is a 409
-        rather than a silent reuse, because that is how a VM ends up attached to a
-        disk left behind by an earlier VM of the same name.
-
-        Partial work is cleaned up here, not left for the caller: if placement or the
-        DRBD options fail after this call created the resource definition, the
-        definition is deleted again. A definition that already existed is never
-        deleted -- it may be backing a live VM.
-        """
-        payload, error = self.read_json_payload()
-        if error:
-            self.reject(error)
-            return
-
-        resource = payload.get("resource")
-        if not valid_name(resource):
-            self.reject("Invalid resource name")
-            return
-        requested_kib, error = validate_volume_size_kib(payload)
-        if error:
-            self.reject(error)
-            return
-        storage_pool, error = validate_storage_pool(payload.get("storage_pool"))
-        if error:
-            self.reject(error)
-            return
-        nodes, error = validate_node_names(payload.get("nodes"))
-        if error:
-            self.reject(error)
-            return
-        allow_two_primaries, error = validate_flag(
-            payload.get("allow_two_primaries"), "allow_two_primaries")
-        if error:
-            self.reject(error)
-            return
-
-        # Read before write: the controller has to be reachable for this to work at
-        # all, and knowing whether the resource is already there is what makes the
-        # difference between a safe retry and adopting someone else's disk.
-        inventory, error = linstor_inventory()
-        if inventory is None:
-            self.reject(error, 500)
-            return
-
-        existing = None
-        for entry in inventory:
-            if entry["name"] == resource:
-                existing = entry
-                break
-
-        if existing is not None and existing["size_kib"] not in (None, requested_kib):
-            self.send_json_response(409, {
-                "resource": resource,
-                "size_kib": existing["size_kib"],
-                "size_gib": existing["size_gib"],
-                "error": ("Linstor resource %s already exists at %s KiB, not the %d KiB "
-                          "requested" % (resource, existing["size_kib"], requested_kib)),
-            })
-            return
-
-        created = False
-        if existing is None:
-            ok, _stdout, detail = linstor_call(["resource-definition", "create", resource])
-            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
-                self.reject("Could not create resource definition %s: %s" % (resource, detail),
-                            500)
-                return
-            created = ok
-
-        def undo(reason):
-            """Delete only what this call created, then report the original failure."""
-            if created:
-                undone, _out, undo_detail = linstor_call(
-                    ["resource-definition", "delete", resource], timeout=180)
-                if not undone:
-                    print("[LINSTOR] Rollback of %s failed: %s" % (resource, undo_detail))
-                    reason += (" (rollback of %s also failed: %s)" % (resource, undo_detail))
-            self.reject(reason, 500)
-
-        # --vlmnr 0 rather than letting the client pick the next free number. Without it a
-        # retry against a resource that already has volume 0 does not fail as "already
-        # exists" -- it quietly adds a *second* volume, and the VM ends up with a disk it
-        # never asked for. The size check above is what decides whether volume 0 is
-        # already the one that was asked for.
-        if existing is None or existing["size_kib"] != requested_kib:
-            ok, _stdout, detail = linstor_call(
-                ["volume-definition", "create", "--vlmnr", "0", resource,
-                 "%dKiB" % requested_kib])
-            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
-                undo("Could not create volume definition %s: %s" % (resource, detail))
-                return
-
-        for node in nodes:
-            ok, _stdout, detail = linstor_call(
-                ["resource", "create", node, resource, "--storage-pool", storage_pool],
-                timeout=180)
-            if not ok and not linstor_says(detail, LINSTOR_EXISTS_MARKERS):
-                undo("Could not place %s on %s: %s" % (resource, node, detail))
-                return
-
-        # Automatic split-brain resolution, and -- only when the caller asked for it --
-        # dual-primary. See DRBD_SPLIT_BRAIN_OPTIONS for why that is not the default:
-        # dual-primary on a read-write VM disk is what let one VM run on two hosts and
-        # corrupt it. A golden image is the case it is correct for, because guests on
-        # several hosts attach it read-only at the same time and each host must hold
-        # Primary to do so. It is written exactly once, by the upload that creates it,
-        # while the uploading node is the only Primary.
-        drbd_options = list(DRBD_SPLIT_BRAIN_OPTIONS)
-        if allow_two_primaries:
-            drbd_options = ["--allow-two-primaries", "yes"] + drbd_options
-        ok, _stdout, detail = linstor_call(
-            ["resource-definition", "drbd-options"] + drbd_options + [resource])
-        if not ok:
-            undo("Could not set DRBD options on %s: %s" % (resource, detail))
-            return
-
-        self.send_json_response(200, {
-            "resource": resource,
-            "created": created,
-            "size_gib": requested_kib // KIB_PER_GIB,
-            "size_kib": requested_kib,
-            "storage_pool": storage_pool,
-            "nodes": nodes,
-            "allow_two_primaries": allow_two_primaries,
-            "device_path": linstor_resource_path(resource),
-        })
-
-    def handle_storage_linstor_resource_delete(self):
-        """Remove a resource definition, and with it its volumes on every node.
-
-        `deleted` is false when there was nothing to delete. That is a success, not a
-        404: the caller of a rollback wants the resource gone, and a delete that races
-        another delete must not turn a completed rollback into an error.
-        """
-        payload, error = self.read_json_payload()
-        if error:
-            self.reject(error)
-            return
-
-        resource = payload.get("resource")
-        if not valid_name(resource):
-            self.reject("Invalid resource name")
-            return
-
-        ok, _stdout, detail = linstor_call(
-            ["resource-definition", "delete", resource], timeout=180)
-        if ok:
-            self.send_json_response(200, {"resource": resource, "deleted": True})
-            return
-        if linstor_says(detail, LINSTOR_ABSENT_MARKERS):
-            self.send_json_response(200, {"resource": resource, "deleted": False})
-            return
-
-        # The resource is there and did not go away -- in use by a running VM, or a
-        # node holding it is unreachable. 409 with the state key, as elsewhere in this
-        # API, so the caller learns what actually happened rather than "500".
-        self.send_json_response(409, {
-            "resource": resource,
-            "deleted": False,
-            "error": detail or ("Could not delete resource definition " + resource),
-        })
-
-    # -- Host ----------------------------------------------------------
-
     def handle_host_network(self):
         interface = None
         gateway = None
@@ -4355,14 +3525,14 @@ def check_cluster_and_autostart():
     # Check if cluster configuration exists
     if not os.path.exists("/etc/hci/cluster.json"):
         print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return
         
     if os.path.exists("/etc/hci/maintenance.state"):
         print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run("systemctl start zookeeper", shell=True)
@@ -4436,7 +3606,7 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:

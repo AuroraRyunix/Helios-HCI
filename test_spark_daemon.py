@@ -46,7 +46,7 @@ class VolumeSizeTests(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(size, 8192)
 
-    def test_kib_is_rounded_up_to_drbd_alignment(self):
+    def test_kib_is_rounded_up_to_extent_alignment(self):
         # LINSTOR aligns to 4 KiB itself. Without rounding here, the resource comes back
         # larger than the request, and the *next* idempotent create compares its own
         # unaligned request against the aligned reality and rejects the retry as a size
@@ -117,17 +117,6 @@ class FlagTests(unittest.TestCase):
             flag, error = daemon.validate_flag(value, "allow_two_primaries")
             self.assertIsNone(flag, value)
             self.assertIn("allow_two_primaries", error)
-
-
-class DrbdOptionTests(unittest.TestCase):
-    def test_split_brain_options_do_not_include_dual_primary(self):
-        # The default path must never set it: these options are applied to every VM disk.
-        self.assertNotIn("--allow-two-primaries", daemon.DRBD_SPLIT_BRAIN_OPTIONS)
-
-    def test_split_brain_options_are_flag_value_pairs(self):
-        # They are spliced into an argv list, so an odd length means a value is being
-        # passed as a flag or the resource name is being consumed as one.
-        self.assertEqual(len(daemon.DRBD_SPLIT_BRAIN_OPTIONS) % 2, 0)
 
 
 class PathValidationTests(unittest.TestCase):

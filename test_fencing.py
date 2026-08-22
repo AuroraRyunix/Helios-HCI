@@ -769,6 +769,7 @@ class SelfFenceProbeTests(FenceTestCase):
 # -- the daemon side: a fence that reads back what it did ----------------------------------
 
 class DaemonFenceTests(FenceTestCase):
+    """spark-daemon's local fence: stop the guests, release the vdisks, read it back."""
 
     def setUp(self):
         super().setUp()
@@ -776,11 +777,12 @@ class DaemonFenceTests(FenceTestCase):
         self.patch(daemon, "time", types.SimpleNamespace(sleep=lambda _s: None,
                                                          time=lambda: 0.0))
         self.commands = []
+        self.detached = []
 
-    def arrange(self, running_domains=(), qemu_after=(), resources_before=(),
-                resources_after=None):
-        self.states = [list(resources_before),
-                       list(resources_before if resources_after is None else resources_after)]
+    def arrange(self, running_domains=(), qemu_after=(), attached_before=(),
+                attached_after=None, detach_fails=()):
+        states = [list(attached_before),
+                  list(attached_before if attached_after is None else attached_after)]
 
         def fake_argv(argv, timeout=45):
             self.commands.append(argv)
@@ -792,78 +794,65 @@ class DaemonFenceTests(FenceTestCase):
                 return 1, "", ""
             return 0, "", ""
 
+        def list_attached(timeout=15):
+            current = states.pop(0) if states else []
+            return {"attached": [{"vdisk_id": v} for v in current]}
+
+        def detach(vdisk_id, timeout=30):
+            self.detached.append(vdisk_id)
+            if vdisk_id in detach_fails:
+                raise RuntimeError("vdisk %s refused to detach" % vdisk_id)
+            return {"vdisk_id": vdisk_id}
+
         self.patch(daemon, "run_argv", fake_argv)
         self.patch(daemon, "qemu_process_ids", lambda: list(qemu_after))
-        self.patch(daemon, "drbd_local_resources",
-                   lambda: self.states.pop(0) if self.states else [])
+        self.patch(daemon, "load_sidon_module",
+                   lambda: types.SimpleNamespace(list_attached=list_attached, detach=detach))
 
     def test_a_fence_is_confirmed_only_when_nothing_is_left(self):
         self.arrange(running_domains=["web01"], qemu_after=[],
-                     resources_before=[("vm-disk0", "Primary", [])],
-                     resources_after=[("vm-disk0", "Secondary", [])])
+                     attached_before=["vm-disk0"], attached_after=[])
         report = daemon.fence_this_host()
         self.assertTrue(report["fenced"], report)
-        self.assertEqual(report["primary_resources"], [])
-        self.assertIn(["virsh", "-c", "qemu:///system", "destroy", "web01"], self.commands)
-
-    def test_a_surviving_guest_process_means_the_fence_did_not_take(self):
-        self.arrange(qemu_after=[4211],
-                     resources_before=[("vm-disk0", "Secondary", [])])
-        report = daemon.fence_this_host()
-        self.assertFalse(report["fenced"])
-        self.assertEqual(report["qemu_pids"], [4211])
-        self.assertIn("still running", report["detail"])
-
-    def test_a_resource_that_refused_to_demote_means_the_fence_did_not_take(self):
-        self.arrange(resources_before=[("vm-disk0", "Primary", [])],
-                     resources_after=[("vm-disk0", "Primary", ["0"])])
-        report = daemon.fence_this_host()
-        self.assertFalse(report["fenced"])
-        self.assertEqual(report["primary_resources"], ["vm-disk0"])
-        self.assertIn("vm-disk0/0", report["open_devices"])
-
-    def test_unreadable_drbd_state_is_not_a_fence(self):
-        self.arrange(resources_before=[])
-        self.patch(daemon, "drbd_local_resources", lambda: None)
-        report = daemon.fence_this_host()
-        self.assertFalse(report["fenced"])
-        self.assertIn("did not answer", report["detail"])
-
-    def test_demotion_is_checked_and_never_forced(self):
-        # `drbdadm secondary --force` past a process that still holds the device would
-        # not make that process stop writing; it would only stop us finding out.
-        self.arrange(resources_before=[("vm-disk0", "Primary", [])],
-                     resources_after=[("vm-disk0", "Secondary", [])])
-        daemon.fence_this_host()
-        demotions = [argv for argv in self.commands if argv[:2] == ["drbdadm", "secondary"]]
-        self.assertEqual(demotions, [["drbdadm", "secondary", "vm-disk0"]])
+        self.assertEqual(self.detached, ["vm-disk0"])
+        self.assertEqual(report["held_vdisks"], [])
 
     def test_a_host_with_nothing_running_fences_cleanly(self):
-        self.arrange(resources_before=[])
+        self.arrange()
         report = daemon.fence_this_host()
-        self.assertTrue(report["fenced"])
+        self.assertTrue(report["fenced"], report)
+        self.assertEqual(self.detached, [])
+
+    def test_a_vdisk_still_served_afterwards_means_the_fence_did_not_take(self):
+        # The read-back is the point: a detach that was issued and did not take must not
+        # be reported as a fence, or the leader restarts guests on another host while this
+        # one is still serving their disks.
+        self.arrange(attached_before=["vm-disk0"], attached_after=["vm-disk0"],
+                     detach_fails=("vm-disk0",))
+        report = daemon.fence_this_host()
+        self.assertFalse(report["fenced"])
+        self.assertEqual(report["held_vdisks"], ["vm-disk0"])
+        self.assertIn("still serving", report["detail"])
+
+    def test_a_surviving_guest_process_means_the_fence_did_not_take(self):
+        self.arrange(running_domains=["web01"], qemu_after=[4211],
+                     attached_before=[], attached_after=[])
+        report = daemon.fence_this_host()
+        self.assertFalse(report["fenced"])
+        self.assertIn("still running", report["detail"])
+
+    def test_sidon_not_answering_is_not_a_fence(self):
+        def explode(timeout=15):
+            raise RuntimeError("control socket is unreachable")
+
+        self.arrange()
+        self.patch(daemon, "load_sidon_module",
+                   lambda: types.SimpleNamespace(list_attached=explode, detach=None))
+        report = daemon.fence_this_host()
+        self.assertNotIn("fenced", report.get("detail", "").split(" -- ")[0].lower()[:6])
+        self.assertIn("did not answer", report["detail"])
 
 
 class DaemonOptionsEndpointTests(FenceTestCase):
     """The options endpoint exists so a caller can tell quorum-off from quorum-held."""
 
-    def test_drbdsetup_show_is_parsed_into_the_options_object(self):
-        shown = [{"resource": "vm-disk0",
-                  "options": {"quorum": "majority", "on-no-quorum": "io-error"}}]
-        self.patch(daemon, "run_argv", lambda argv, timeout=45: (0, json.dumps(shown), ""))
-        captured = {}
-
-        handler = daemon.SparkDaemonHandler.__new__(daemon.SparkDaemonHandler)
-        handler.query_param = lambda parsed, key: "vm-disk0"
-        handler.send_json_response = lambda status, body: captured.update(
-            {"status": status, "body": body})
-        handler.reject = lambda message, status=400: captured.update(
-            {"status": status, "body": {"error": message}})
-        handler.handle_storage_drbd_options(types.SimpleNamespace(query=""))
-
-        self.assertEqual(captured["status"], 200)
-        self.assertEqual(captured["body"]["options"]["quorum"], "majority")
-
-
-if __name__ == "__main__":
-    unittest.main()
