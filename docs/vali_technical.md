@@ -48,3 +48,45 @@ mindmap
   - **Live Migration**: Executes:
     `virsh migrate --live --undefinesource --persistent qemu+ssh://root@<target_ip>/system`
     Updates database host bindings on success.
+
+### Starting a VM attaches everything the domain names
+
+The domain XML addresses storage as NBD exports on unix sockets, and a Sidon vdisk has no
+socket until it is attached. So the start path in `process_queue_task` attaches before it
+defines the domain, and what it attaches has to be *everything the XML names* — not just
+the VM's own disks.
+
+| Referenced by the XML | Attached by | Detached |
+| --- | --- | --- |
+| Data disks, `vdisk_id_for(vm, idx)` | the start path, checked, rolled back on failure | on VM stop / migrate-away |
+| Images, `image_vdisk_id(iso_spec)` | the start path, checked | never automatically |
+
+Images are the case that was missing. An image is an ordinary vdisk written once and then
+sealed, and `op_seal` detaches it — deliberately, since an immutable vdisk should not keep
+the writer's attachment. An image is therefore **always detached at rest**, and nothing
+re-attached it at boot. Every VM with an ISO failed with:
+
+```
+Cannot access storage file '/var/lib/hci/sidon/nbd/img-<slug>.sock': No such file or directory
+```
+
+which reads as a missing file rather than an unattached disk, and made installing any
+guest OS impossible.
+
+Two rules follow from images being shared and immutable:
+
+* **A failed image attach rolls back the data disks and not the images.** Attach is
+  idempotent, which is what lets several guests mount the same ISO. Detaching one to tidy
+  up after a failure would eject a disc from a VM that is running fine.
+* **Nothing detaches an image on stop**, for the same reason. The cost is a socket.
+
+The CD-ROM element itself was also a DRBD leftover: under DRBD an image really was a block
+device at `/dev/drbd/by-res/img-<slug>/0`, so it was emitted as `type='block'` with
+`<source dev=...>`. The path was later changed to a Sidon socket and the device type was
+not, and qemu cannot open a unix socket as a block device. `helios_sidon.cdrom_xml()` now
+emits the same `type='network'` NBD-over-unix shape as `disk_xml()`, read-only.
+
+`helios_sidon.image_vdisk_id()` is the single definition of an image's vdisk id. There
+were three — upload's, the start path's, and an inline copy in `vali.py` — and a
+disagreement between them does not fail loudly: it points a guest at a vdisk nobody
+created. `test_image_boot.py` asserts they still agree.

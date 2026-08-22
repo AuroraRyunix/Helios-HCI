@@ -15,6 +15,7 @@ retried.
 
 import json
 import os
+import re
 import socket
 
 CONTROL_SOCKET = os.environ.get("SIDON_CONTROL", "/run/sidon/control.sock")
@@ -388,6 +389,50 @@ class NbdWriter(object):
             self.sock.close()
         except Exception:
             pass
+
+
+def image_vdisk_id(name):
+    """The vdisk id an image is stored under: `img-<slug>`.
+
+    Here, and only here, because upload, VM start and VM delete each have to arrive at the
+    same string from the same image name. There were three implementations of this -- two
+    copies of the slug rules and one that re-derived them inline -- and a disagreement
+    between them does not fail loudly: it points a guest at a vdisk nobody ever created.
+    """
+    base = name
+    low = name.lower()
+    for ext in (".iso", ".qcow2", ".img"):
+        if low.endswith(ext):
+            base = name[:-len(ext)]
+            break
+    slug = re.sub(r"[^a-z0-9_-]", "-", base.lower())
+    slug = re.sub(r"-+", "-", slug)
+    return "img-" + slug.strip("-")[:28]
+
+
+def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR):
+    """The libvirt <disk> element for an image-backed CD-ROM.
+
+    The same NBD-over-unix shape as `disk_xml`, because an image is an ordinary vdisk that
+    happens to be sealed. It used to be emitted as `type='block'` with `<source dev=...>`
+    holding the socket path -- correct under DRBD, where an image really was a block device
+    at /dev/drbd/by-res/img-<slug>/0, and wrong the moment the path became a unix socket.
+    qemu cannot open a socket as a block device, so every VM with an ISO failed to start.
+
+    Read-only at both ends: `<readonly/>` here, and the vdisk's immutable class refuses
+    writes at the NBD layer regardless of what the guest tries.
+    """
+    return "\n".join([
+        "",
+        "    <disk type='network' device='cdrom'>",
+        "      <driver name='qemu' type='raw'/>",
+        "      <source protocol='nbd' name='%s'>" % vdisk_id,
+        "        <host transport='unix' socket='%s'/>" % nbd_socket(vdisk_id, nbd_dir),
+        "      </source>",
+        "      <target dev='sd%s' bus='sata'/>" % dev_letter,
+        "      <readonly/>",
+        "    </disk>",
+    ])
 
 
 def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR):

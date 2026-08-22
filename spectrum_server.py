@@ -1934,28 +1934,14 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         for idx, spec in enumerate(cdrom_specs):
             sata_letter = letters[idx % 26]
             if spec != "__empty__":
-                # Query DB or fallback to slugified name
-                iso_path = None
-                try:
-                    spec_esc = spec.replace("'", "''")
-                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec_esc}';")
-                    if rc_img == 0 and stdout_img:
-                        for line in stdout_img.splitlines():
-                            if "/dev/" in line:
-                                iso_path = line.strip().split()[-1].replace("'", "").replace('"', '')
-                                break
-                except Exception:
-                    pass
-                if not iso_path:
-                    iso_path = sidon_module().nbd_socket(f"img-{slugify_image_name(spec)}")
-                
-                disk_devices_xml += f"""
-    <disk type='block' device='cdrom'>
-      <driver name='qemu' type='raw' locking='off'/>
-      <source dev='{iso_path}'/>
-      <target dev='sd{sata_letter}' bus='sata'/>
-      <readonly/>
-    </disk>"""
+                # The vdisk id rather than a path, because NBD addresses an export by name.
+                #
+                # The catalogue lookup this replaced could not succeed: it accepted a row
+                # only if the stored path contained "/dev/", which stopped being true the
+                # moment images moved from DRBD devices to Sidon sockets. Every call fell
+                # through to the slugified fallback, so the query was cost without effect.
+                disk_devices_xml += module.cdrom_xml(
+                    module.image_vdisk_id(spec), sata_letter)
 
     has_kvm = False
     try:

@@ -967,38 +967,11 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         for idx, spec in enumerate(iso.split(",")):
             if spec.strip() and spec.strip() != "__empty__":
                 sata_letter = letters[idx % 26]
-                iso_path = None
-                try:
-                    rc_img, stdout_img, _ = run_cql_query(f"SELECT path FROM hydra.valhalla_images WHERE name = '{spec.strip()}';")
-                    if rc_img == 0 and stdout_img:
-                        for line in stdout_img.splitlines():
-                            if "/dev/" in line:
-                                iso_path = line.strip().split()[-1].replace("'", "").replace('"', '')
-                                break
-                except Exception:
-                    pass
-                if not iso_path:
-                    import re
-                    base = spec.strip()
-                    if base.lower().endswith(".iso"):
-                        base = base[:-4]
-                    elif base.lower().endswith(".qcow2"):
-                        base = base[:-6]
-                    elif base.lower().endswith(".img"):
-                        base = base[:-4]
-                    slug = re.sub(r'[^a-z0-9_-]', '-', base.lower())
-                    slug = re.sub(r'-+', '-', slug)
-                    slug = slug.strip('-')
-                    slug = slug[:28]
-                    iso_path = sidon_module().nbd_socket(f"img-{slug}")
-                    
-                disk_devices_xml += f"""
-    <disk type='block' device='cdrom'>
-      <driver name='qemu' type='raw' locking='off'/>
-      <source dev='{iso_path}'/>
-      <target dev='sd{sata_letter}' bus='sata'/>
-      <readonly/>
-    </disk>"""
+                # The catalogue lookup that stood here only accepted a row whose stored
+                # path contained "/dev/", so it stopped matching when images became Sidon
+                # sockets and every call fell through to the slug anyway.
+                disk_devices_xml += sidon_module().cdrom_xml(
+                    sidon_module().image_vdisk_id(spec.strip()), sata_letter)
 
     global KVM_CACHE, VMWARE_CACHE
     has_kvm = False
@@ -1414,6 +1387,42 @@ def process_queue_task(task):
                                 detail = body_a.get("error") or ""
                             return False, f"Refusing to start {vm_name}: Sidon would not hand {vdisk_id} to {selected_host} ({detail or err_a}). Another host may still own the disk."
                         promoted.append(vdisk_id)
+
+            # Attach the images the domain boots from, for the same reason the data disks
+            # are attached: the XML names a socket, and a vdisk that is not attached has
+            # no socket. Sealing an image detaches it -- deliberately, an immutable vdisk
+            # should not hold the writer's attachment -- so an image is *always* detached
+            # at rest, and nothing here used to re-attach it. Every VM with an ISO failed
+            # to start with "Cannot access storage file .../img-<slug>.sock", which reads
+            # like a missing file rather than an unattached disk.
+            if iso:
+                module = sidon_module()
+                for spec in iso.split(","):
+                    spec = spec.strip()
+                    if not spec or spec == "__empty__":
+                        continue
+                    img_id = module.image_vdisk_id(spec)
+                    rc_i, body_i, err_i = run_mtls_spark_api(
+                        selected_host, "/api/v1/dfs/vdisk",
+                        {"op": "attach", "vdisk_id": img_id})
+                    if rc_i != 0:
+                        # The data disks are this VM's alone, so they are handed back. The
+                        # images are not: an immutable image is attached read-only and may
+                        # be serving another guest's CD-ROM right now, and attach is
+                        # idempotent precisely so that sharing works. Detaching one here to
+                        # tidy up after a failure would eject a disc from a VM that is
+                        # running fine.
+                        for done in promoted:
+                            run_mtls_spark_api(selected_host, "/api/v1/dfs/vdisk",
+                                               {"op": "detach", "vdisk_id": done})
+                        release_failed_claim(vm_name, selected_host)
+                        detail = ""
+                        if isinstance(body_i, dict):
+                            detail = body_i.get("error") or ""
+                        return False, (
+                            f"Refusing to start {vm_name}: its image {spec} could not be "
+                            f"attached on {selected_host} ({detail or err_i}). The guest "
+                            f"would boot with no install medium.")
             cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
             if rc != 0:
