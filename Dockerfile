@@ -18,6 +18,11 @@ COPY helios_sig.py .
 # start and applies no migrations.
 COPY helios_schema.py .
 COPY lanayru.py .
+# The Sidon client. spectrum only ever calls it through spark over mTLS -- it has no
+# access to the control socket from in here, and should not -- but the module carries
+# dfs_engine(), the vdisk naming, and the libvirt disk element, so a VM defined by a
+# rebuilt image without it silently falls back to DRBD paths that no longer exist.
+COPY helios_sidon.py .
 COPY static/ ./static/
 EXPOSE 8443
 CMD ["python", "-u", "server.py"]
