@@ -2,6 +2,7 @@
 import sys
 import argparse
 import json
+import shlex
 import re
 import ssl
 import urllib.request
@@ -45,7 +46,7 @@ BOLD = "\033[1m"
 GRAY = "\033[90m"
 RESET = "\033[0m"
 
-SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Aether", "Spark", "Spectrum",
+SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum",
                          "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia",
                          "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa"]
 
@@ -206,8 +207,44 @@ def get_cluster_ips():
     except Exception:
         return ["127.0.0.1"]
 
+
+# Control-socket one-liners, defined once.
+#
+# Every one of these is a shell command carrying a JSON document with quotes and a
+# trailing newline, run through spark's remote-exec. Building them inline at each call
+# site is how a quote gets lost in the wrong layer of escaping and the command silently
+# becomes a different one.
+SIDON_SOCKET = "/run/sidon/control.sock"
+
+
+def sidon_cmd(payload):
+    """A shell command that sends one control request and prints the reply."""
+    return "printf %s | nc -U %s" % (
+        shlex.quote(json.dumps(payload) + "\n"), SIDON_SOCKET)
+
+
+def sidon_detach_cmd(vdisk_id):
+    return sidon_cmd({"op": "detach", "vdisk_id": vdisk_id})
+
+
+SIDON_CAPACITY_CMD = sidon_cmd({"op": "capacity"})
+SIDON_PEERS_CMD = sidon_cmd({"op": "peers"})
+SIDON_LIST_CMD = sidon_cmd({"op": "list"})
+
+
 def get_dfs_engine():
-    return "linstor"
+    """Which storage engine a new cluster is built with.
+
+    Was hardcoded and called by nothing -- a vestige of the GlusterFS transition. It reads
+    the file when there is one, and defaults to sidon rather than linstor: this decides
+    what a *new* cluster gets, and there is no longer a LINSTOR to build one on.
+    """
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            value = str(json.load(handle).get("dfs_engine") or "").strip().lower()
+    except Exception:
+        return "sidon"
+    return value if value in ("linstor", "sidon") else "sidon"
 
 
 def run_remote_spark(ip, command):
@@ -752,13 +789,13 @@ def main():
                 rc_key, _, _ = run_remote_spark(ip, "mokutil --test-key /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
                 if rc_key != 0:
                     print(f"[ERROR] Secure Boot is enabled on host {ip} and the ELRepo Secure Boot key is not enrolled.")
-                    print(f"[ERROR] Unsigned kernel modules like DRBD will fail to load under Secure Boot.")
+                    print(f"[ERROR] Unsigned out-of-tree kernel modules will fail to load under Secure Boot.")
                     print(f"[ERROR] Please disable Secure Boot in the UEFI/BIOS settings of {ip}, or import the key ('mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der') and reboot to enroll it.")
                     sys.exit(1)
 
-        # Ensure any running core services are stopped to prevent them from interfering with boot (e.g. Mipha stopping Linstor Controller during creation)
+        # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
         run_parallel(ips, f"systemctl stop {' '.join(cleanup_services)} || true")
 
         # 2. Hostname Resolution & Cluster JSON Config
@@ -778,7 +815,7 @@ def main():
         cluster_json_data = {
             "cluster_name": "hci-01",
             "redundancy_factor": rf,
-            "dfs_engine": "linstor",
+            "dfs_engine": "sidon",
             "vip": vip,
             "hosts": hosts_info
         }
@@ -857,7 +894,7 @@ if not candidate:
 
 dev_path, size_bytes = candidate
 subprocess.run("wipefs -a " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-# Zero first 1024MB and last 1024MB of the raw disk to ensure no old DRBD metadata interferes
+# Zero the first and last 1024MB of the raw disk so no old superblock interferes
 subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 seek_val = (size_bytes // 1048576) - 1024
 subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -890,183 +927,61 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 print(f"[ERROR] Host {ip} failed disk claiming: {stderr}")
                 sys.exit(1)
 
-        # 4. Storage Engine Setup (Linstor)
-        print("\n--- Phase 4: Initializing Linstor Storage Engine ---")
-        print("Creating Linstor storage directories on all nodes...")
-        run_parallel_checked(ips, "mkdir -p /var/lib/linstor /etc/linstor")
-        
-        print("Starting Aether storage services in parallel...")
-        run_parallel_checked(ips, "systemctl restart aether")
-        
-        # Start Linstor Controller on leader and stop on standby nodes
-        print("Starting Linstor Controller on leader node...")
-        run_checked_cmd(ips[0], "systemctl start linstor-controller")
-        for ip in ips[1:]:
-            print(f"[{ip}] Ensuring standby Linstor Controller is stopped (active-passive)...")
-            run_remote_spark(ip, "systemctl stop linstor-controller")
-        
-        print("Waiting for Linstor Controller to listen on port 3370 on leader node...")
-        leader_ip = ips[0]
-        controller_ready = False
-        for _ in range(30):
-            rc, out, _ = run_remote_spark(leader_ip, "ss -tlnp | grep 3370")
-            if rc == 0 and "3370" in out:
-                controller_ready = True
-                break
-            time.sleep(1)
-        if not controller_ready:
-            print(f"[ERROR] Linstor Controller failed to start on port 3370 on {leader_ip}.")
-            sys.exit(1)
-        print("Linstor Controller is ready on leader node.")
+        # 4. Storage engine setup.
+        #
+        # What this replaces, in order: create /var/lib/linstor and /etc/linstor on every
+        # node; start the satellites; start the controller on the leader and stop it
+        # everywhere else; wait for port 3370; set TcpPortAutoRange to 7700-7890 so DRBD
+        # would not collide with ScyllaDB on 7000; register every node with the
+        # controller; register a storage pool per node; create a DRBD resource for
+        # LINSTOR's *own* database, format it, stop the controller, copy /var/lib/linstor
+        # onto it, remount, restart the controller on top of it, wait up to four minutes
+        # for that replication to reach UpToDate everywhere, then align the standbys.
+        # Roughly a hundred lines and a dozen ways to fail, most of it protecting the
+        # metadata of the thing that was storing the metadata.
+        #
+        # Sidon has no controller, no node registry, no storage pools and no database of
+        # its own. Its map lives in Hydra, which is already replicated and already backed
+        # up. Provisioning creates the thin LV and the mount; this starts the daemon and
+        # checks that the mount actually took.
+        print("\n--- Phase 4: Starting the storage data path ---")
+        run_parallel_checked(ips, "systemctl enable sidon && systemctl restart sidon")
 
-        print("Setting Linstor DRBD port range (7700-7890) to avoid conflicts...")
-        run_checked_cmd(leader_ip, "podman exec systemd-linstor-controller linstor controller set-property TcpPortAutoRange 7700-7890", allow_already_exists=True)
-
-        udev_helper = UdevHelper(ips)
-        udev_helper.start()
-        try:
-            print("Creating Linstor node definitions...")
-            for h in hosts_info:
-                print(f"Creating Linstor node for {h['hostname']} ({h['ip']})...")
-                run_checked_cmd(ips[0], f"podman exec systemd-linstor-controller linstor node create {h['hostname']} {h['ip']}", allow_already_exists=True)
-
-            print("Registering Linstor storage pools...")
-            for h in hosts_info:
-                print(f"[{h['ip']}] Registering vg_aether/thin_pool_aether...")
-                run_checked_cmd(ips[0], f"podman exec systemd-linstor-controller linstor storage-pool create lvmthin {h['hostname']} default-pool vg_aether/thin_pool_aether", allow_already_exists=True)
-
-            # Create Linstor resource definitions (default containers skipped for Linstor engine)
-            pass
-
-            # Create linstor-db DRBD volume for database HA
-            print("\nCreating linstor-db DRBD resource definition for database HA...")
-            run_checked_cmd(ips[0], "podman exec systemd-linstor-controller linstor resource-definition create linstor-db", allow_already_exists=True)
-            run_checked_cmd(ips[0], "podman exec systemd-linstor-controller linstor volume-definition create linstor-db 5G", allow_already_exists=True)
-
-            # Set automatic split-brain resolution policy for linstor-db database resource
-            run_checked_cmd(ips[0], "podman exec systemd-linstor-controller linstor resource-definition drbd-options --after-sb-0pri discard-zero-changes --after-sb-1pri discard-secondary --after-sb-2pri disconnect linstor-db", allow_already_exists=True)
-
-            print("Deploying replicated database storage volume across all nodes...")
-            for h in hosts_info:
-                print(f"Creating linstor-db resource on {h['hostname']}...")
-                run_checked_cmd(ips[0], f"podman exec systemd-linstor-controller linstor resource create {h['hostname']} linstor-db --storage-pool default-pool", allow_already_exists=True)
-
-            print("Waiting for linstor-db DRBD block device to appear on leader...")
-            db_drbd_ready = False
-            for _ in range(45):
-                rc_db, _, _ = run_remote_spark(ips[0], "test -b /dev/drbd/by-res/linstor-db/0")
-                if rc_db == 0:
-                    db_drbd_ready = True
-                    print("linstor-db DRBD block device is ready on Node 1.")
-                    break
-                time.sleep(1)
-            if not db_drbd_ready:
-                print("[ERROR] linstor-db DRBD block device did not appear within timeout.")
-                sys.exit(1)
-
-            print("Formatting linstor-db block device with XFS...")
-            run_checked_cmd(ips[0], "mkfs.xfs -f /dev/drbd/by-res/linstor-db/0")
-        finally:
-            udev_helper.stop()
-
-        print("Migrating local database to the replicated linstor-db volume...")
-        # 1. Stop controller to release database lock
-        run_checked_cmd(ips[0], "systemctl stop linstor-controller")
-        # 2. Mount DRBD volume to temp directory
-        run_checked_cmd(ips[0], "mkdir -p /mnt/linstordb-temp && mount -t xfs /dev/drbd/by-res/linstor-db/0 /mnt/linstordb-temp")
-        # 3. Copy files preserving permissions
-        run_checked_cmd(ips[0], "cp -a /var/lib/linstor/. /mnt/linstordb-temp/")
-        # 4. Unmount temp directory
-        run_checked_cmd(ips[0], "umount -f /mnt/linstordb-temp")
-        # 5. Clear local directory and mount DRBD volume to /var/lib/linstor
-        run_checked_cmd(ips[0], "rm -rf /var/lib/linstor/* && mount -t xfs /dev/drbd/by-res/linstor-db/0 /var/lib/linstor")
-        # 6. Restart controller (it is now backed by the DRBD volume!)
-        run_checked_cmd(ips[0], "systemctl start linstor-controller")
-
-        # Verify Node 1 controller is back online
-        controller_ready = False
-        for _ in range(30):
-            rc_check, out_check, _ = run_remote_spark(ips[0], "ss -tlnp | grep 3370")
-            if rc_check == 0 and "3370" in out_check:
-                controller_ready = True
-                break
-            time.sleep(1)
-        if not controller_ready:
-            print("[ERROR] Linstor Controller failed to restart on leader after database migration.")
-            sys.exit(1)
-
-        print("Cleaning up local database directories and stopping standby nodes...")
-        for target_ip in ips[1:]:
-            print(f"[{target_ip}] Aligning Linstor Controller state...")
-            run_checked_cmd(target_ip, "systemctl stop linstor-controller")
-            run_checked_cmd(target_ip, "umount -l /var/lib/linstor || true")
-            run_checked_cmd(target_ip, "rm -rf /var/lib/linstor/*")
-            run_checked_cmd(target_ip, "drbdadm secondary linstor-db || true")
-
-        print("Waiting for linstor-db DRBD replication to sync and reach UpToDate status cluster-wide...")
-        db_synced = False
-        for i in range(120): # up to 4 minutes
-            rc_stat, out_stat, _ = run_remote_spark(ips[0], "drbdadm status linstor-db")
-            if rc_stat == 0:
-                out_lower = out_stat.lower()
-                if "inconsistent" not in out_lower and "sync" not in out_lower and "uptodate" in out_lower:
-                    if out_lower.count("uptodate") >= len(ips):
-                        db_synced = True
-                        print("linstor-db is fully synchronized and UpToDate on all nodes.")
-                        break
-            time.sleep(2)
-        if not db_synced:
-            print("[WARNING] linstor-db replication did not fully sync within timeout. Disk status:")
-            rc_stat, out_stat, _ = run_remote_spark(ips[0], "drbdadm status linstor-db")
-            print(out_stat)
+        print("Verifying each node's extent store is mounted and answering...")
+        for ip in ips:
+            rc_cap, out_cap, err_cap = run_remote_spark(ip, SIDON_CAPACITY_CMD)
+            if rc_cap != 0 or not out_cap.strip():
+                print(f"[ERROR] [{ip}] sidon did not answer on its control socket: "
+                      f"{(err_cap or 'no output').strip()[:200]}")
+                return
+            try:
+                cap = json.loads(out_cap.strip().splitlines()[0])
+            except Exception:
+                print(f"[ERROR] [{ip}] sidon answered with something unparseable.")
+                return
+            total = int(cap.get("total_bytes") or 0)
+            if total <= 0:
+                # Almost always an unmounted store. Sidon would write extent groups onto
+                # the root filesystem instead, silently, until the root filesystem filled
+                # and took the host with it -- so this refuses to continue rather than
+                # building a cluster that works until it suddenly does not.
+                print(f"[ERROR] [{ip}] the extent store reports no capacity, which means "
+                      f"it is not mounted. Check vg_aether/sidon and the fstab entry.")
+                return
+            print(f"[{ip}] extent store ready: {total / (1024 ** 3):.1f} GiB.")
 
         print("Writing storage pools config and spectrum configuration on all hosts...")
         for ip in ips:
-            disk_info = host_claimed_disks[ip]
-            storage_pool_json = {
-                "storage_pool_name": "default-pool",
-                "dfs_engine": "linstor",
-                "local_disks": [{
-                    "device": disk_info["device"],
-                    "role": "data",
-                    "media_type": "ssd",
-                    "fs_type": "xfs",
-                    "size_bytes": disk_info["size_bytes"],
-                    "brick_path": f"/var/lib/hci/aether/bricks/{os.path.basename(disk_info['device'])}/brick"
-                }],
-                "storage_containers": [
-                    {
-                        "name": "default-vm-container",
-                        "path": "/default-pool/default-vm",
-                        "ftt": rf,
-                        "compression": "lz4",
-                        "quota_bytes": 0
-                    },
-                    {
-                        "name": "default-image-container",
-                        "path": "/default-pool/default-image",
-                        "ftt": rf,
-                        "compression": "lz4",
-                        "quota_bytes": 0
-                    }
-                ]
-            }
-            json_str = json.dumps(storage_pool_json, indent=2)
-            b64_str = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
-            run_remote_spark(ip, f"mkdir -p /etc/hci/aether && echo {b64_str} | base64 -d > /etc/hci/aether/storage-pools.json")
-
-            controllers_line = ",".join(ips)
-            client_conf = f"[active]\ncontrollers = {controllers_line}\n"
-            client_b64 = base64.b64encode(client_conf.encode('utf-8')).decode('utf-8')
-            run_remote_spark(ip, f"mkdir -p /etc/linstor && echo {client_b64} | base64 -d > /etc/linstor/linstor-client.conf")
+            # No storage-pools.json and no linstor-client.conf. The first described a
+            # pool name, a thin pool and a volume group to a controller that no longer
+            # exists; the second named the controllers. Sidon writes extent groups onto
+            # one filesystem, and where that filesystem is mounted is the configuration.
 
             seeds = ",".join(ips)
             spectrum_env = f"SPECTRUM_API_PORT=8443\nLOCAL_HYPERVISOR_IP={ip}\nCLUSTER_SEEDS={seeds}"
             env_b64 = base64.b64encode(spectrum_env.encode('utf-8')).decode('utf-8')
             run_remote_spark(ip, f"mkdir -p /etc/hci/spectrum && echo {env_b64} | base64 -d > /etc/hci/spectrum/spectrum.env")
 
-        # Mounting storage volumes on all nodes in parallel (skipped for Linstor engine)
-        pass
 
         # 5. Database Quorum Setup
         print("Creating ZooKeeper, ScyllaDB, and Aether volume directories on all nodes...")
@@ -1259,26 +1174,27 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print(f"[ERROR] ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}")
             sys.exit(1)
 
-        print("Verifying Linstor satellite node connections...")
-        linstor_healthy = False
-        controllers_str = ",".join(ips)
-        for i in range(15):
-            rc_l, out_l, _ = run_remote_spark(ips[0], f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list")
-            if rc_l == 0:
-                online_count = 0
-                for line in out_l.splitlines():
-                    if "Online" in line or "ONLINE" in line:
-                        online_count += 1
-                print(f"Linstor health check {i+1}/15: found {online_count}/{len(ips)} online nodes.")
-                if online_count >= len(ips):
-                    linstor_healthy = True
-                    break
-            time.sleep(3)
-        if not linstor_healthy:
-            print("[ERROR] Linstor satellites did not all reach ONLINE state. Status output:")
-            rc_l, out_l, _ = run_remote_spark(ips[0], f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list")
-            print(out_l)
-            sys.exit(1)
+        print("Verifying every node's storage daemon is reachable from its peers...")
+        for ip in ips:
+            rc_p, out_p, _ = run_remote_spark(ip, SIDON_PEERS_CMD)
+            if rc_p != 0 or not out_p.strip():
+                print(f"[WARNING] [{ip}] could not read peer reachability.")
+                continue
+            try:
+                body = json.loads(out_p.strip().splitlines()[0])
+            except Exception:
+                print(f"[WARNING] [{ip}] the peer listing was unparseable.")
+                continue
+            unreachable = [peer.get("node") for peer in (body.get("peers") or [])
+                           if not peer.get("reachable")]
+            if unreachable:
+                # Not fatal to cluster creation: writes are only refused when a node in a
+                # vdisk's own replica set is down, and no vdisk exists yet. But a peer
+                # that cannot be reached now will not be reachable when one does, so it
+                # is said out loud rather than discovered by the first failed write.
+                print(f"[WARNING] [{ip}] cannot reach: {', '.join(str(u) for u in unreachable)}")
+            else:
+                print(f"[{ip}] all peers reachable.")
 
         print("Verifying Spectrum Web UI reachability on port 8443...")
         spectrum_healthy = True
@@ -1373,7 +1289,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print(f"The state of the cluster: {state_str}")
             print("Lockdown mode: Disabled")
             
-            print("\n--- Storage Engine Status (Aether) ---")
+            print("\n--- Storage Engine Status (Sidon) ---")
             print(res.get("peer_status") or "No peer info")
             
             print("\n--- Storage Engine Volumes (Aether) ---")
@@ -1547,8 +1463,6 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 print(f"[{ip}] ERROR: aether service failed to start.")
                 sys.exit(1)
                 
-        # Mounting storage volumes on all nodes (skipped for Linstor engine)
-        pass
 
         # 6. Start remaining services
         print("\n--- Phase 4: Starting Core Workload & Coordination Services ---")
@@ -1643,70 +1557,42 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             sys.exit(1)
         print("  ZooKeeper quorum is healthy.")
 
-        # B. Wait for Mipha to promote linstor-db and start Linstor Controller on one of the nodes
-        print("Waiting for linstor-controller to become active on one of the nodes...")
-        controller_active_ip = None
-        for _ in range(45):
-            for ip in ips:
-                rc_c, out_c, _ = run_remote_spark(ip, "systemctl is-active linstor-controller")
-                if rc_c == 0 and out_c.strip() == "active":
-                    rc_p, out_p, _ = run_remote_spark(ip, "ss -tlnp | grep 3370")
-                    if rc_p == 0 and "3370" in out_p:
-                        controller_active_ip = ip
-                        break
-            if controller_active_ip:
-                break
-            time.sleep(1)
-            
-        if not controller_active_ip:
-            print("[ERROR] Cluster start verification failed: Linstor Controller failed to start or become active on any node.")
-            sys.exit(1)
-            
-        print(f"  Linstor Controller is active on {controller_active_ip}.")
-
-        # C. Verify Linstor Satellites are online
-        print("Verifying Linstor satellite node connections...")
-        linstor_healthy = False
-        controllers_str = ",".join(ips)
-        for i in range(15):
-            rc_l, out_l, _ = run_remote_spark(controller_active_ip, f"podman exec -e LS_CONTROLLERS={controllers_str} systemd-aether linstor node list")
-            if rc_l == 0:
-                online_count = 0
-                for line in out_l.splitlines():
-                    if "Online" in line or "ONLINE" in line:
-                        online_count += 1
-                if online_count >= len(ips):
-                    linstor_healthy = True
-                    break
-            time.sleep(2)
-        if not linstor_healthy:
-            print("[ERROR] Cluster start verification failed: Linstor satellites are not all online.")
-            sys.exit(1)
-        print("  All Linstor storage satellites are online.")
-
-        # D. Verify DRBD Volume Replication Status
-        print("Verifying DRBD volume replication status on all nodes...")
-        drbd_healthy = True
-        bad_vols = []
+        # B. Every node's data path is up.
+        #
+        # This used to wait up to 45 seconds for Mipha to promote the linstor-db DRBD
+        # volume and bring a controller up on one node, then confirm it was listening on
+        # 3370. There is no controller and no election: each node runs its own daemon and
+        # answers for itself, so the check is per node and there is nothing to elect.
         for ip in ips:
-            rc_st, out_st, _ = run_remote_spark(ip, "drbdadm status 2>/dev/null || true")
-            if rc_st == 0:
-                for line in out_st.splitlines():
-                    if "connection:" in line:
-                        parts = line.strip().split()
-                        conn_state = "unknown"
-                        for p in parts:
-                            if p.startswith("connection:"):
-                                conn_state = p.split(":", 1)[1]
-                        if conn_state not in ["Connected", "SyncSource", "SyncTarget", "PausedSyncSource", "PausedSyncTarget", "VerifyS", "VerifyT"]:
-                            drbd_healthy = False
-                            bad_vols.append(f"{ip}: {line.strip()}")
-        if not drbd_healthy:
-            print(f"[ERROR] Cluster start verification failed: DRBD volumes are in an unhealthy replication state: {', '.join(bad_vols)}")
-            sys.exit(1)
-        print("  All DRBD replication rings are connected.")
+            rc_s, out_s, _ = run_remote_spark(ip, "systemctl is-active sidon")
+            if rc_s != 0 or out_s.strip() != "active":
+                print(f"[ERROR] Cluster start verification failed: sidon is not active on {ip}.")
+                sys.exit(1)
+        print("  The storage data path is running on every node.")
 
-        # E. Run Mimir diagnostic verification checks
+        # C. Peers can reach each other
+        print("Verifying every node's storage daemon is reachable from its peers...")
+        for ip in ips:
+            rc_p, out_p, _ = run_remote_spark(ip, SIDON_PEERS_CMD)
+            if rc_p != 0 or not out_p.strip():
+                print(f"[WARNING] [{ip}] could not read peer reachability.")
+                continue
+            try:
+                body = json.loads(out_p.strip().splitlines()[0])
+            except Exception:
+                print(f"[WARNING] [{ip}] the peer listing was unparseable.")
+                continue
+            unreachable = [peer.get("node") for peer in (body.get("peers") or [])
+                           if not peer.get("reachable")]
+            if unreachable:
+                # Not fatal to cluster creation: writes are only refused when a node in a
+                # vdisk's own replica set is down, and no vdisk exists yet. But a peer
+                # that cannot be reached now will not be reachable when one does, so it
+                # is said out loud rather than discovered by the first failed write.
+                print(f"[WARNING] [{ip}] cannot reach: {', '.join(str(u) for u in unreachable)}")
+            else:
+                print(f"[{ip}] all peers reachable.")
+
         print("Running diagnostic verification checks using Mimir...")
         rc_m, out_m, _ = run_remote_spark(ips[0], "/usr/local/bin/mcli health_checks run_all")
         if rc_m != 0:
@@ -1796,49 +1682,51 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
             run_parallel(ips, f"systemctl stop {svc}")
             
-        # 3.5. Wait for DRBD replication sync to finish
-        print("\n--- Step 3.5: Ensuring all DRBD volumes finish syncing ---")
-        for attempt in range(60): # Wait up to 120 seconds
-            syncing = False
-            for ip in ips:
-                rc, stdout, _ = run_remote_spark(ip, "drbdsetup status --json")
-                if rc == 0 and stdout.strip():
-                    try:
-                        data = json.loads(stdout)
-                        for resource in data:
-                            for conn in resource.get("connections", []):
-                                for dev in conn.get("peer_devices", []):
-                                    if dev.get("replication-state") in ("SyncTarget", "SyncSource"):
-                                        syncing = True
-                                        break
-                    except Exception:
-                        pass
-            if not syncing:
-                print("All DRBD resources are fully synced.")
-                break
-            print("Some DRBD volumes are still syncing, waiting 2 seconds...")
-            time.sleep(2)
-        else:
-            print("Warning: Timeout waiting for DRBD resync to finish. Proceeding with shutdown.")
-            
-        # 4. Unmount default volumes in parallel
-        print("\n--- Step 4: Unmounting default volumes in parallel across all nodes ---")
-        run_parallel(ips, "umount -l /var/lib/hci/aether/volumes/default-vm-container || true")
-        run_parallel(ips, "umount -l /var/lib/hci/aether/volumes/default-image-container || true")
-        run_parallel(ips, "umount -l /var/lib/linstor || true")
+        # 3.5. Drain the journals, then unmount.
+        #
+        # This used to wait up to two minutes for DRBD resyncs to finish before shutting
+        # down, because a node stopped mid-resync came back with a stale replica that had
+        # to catch up block by block. There is no resync: extent groups are immutable, so
+        # a returning node's copies are correct or absent, and Purah restores absent ones.
+        #
+        # What is worth doing before stopping is draining. Every acknowledged write is
+        # already durable in the journal, so stopping right now would lose nothing -- but
+        # a full journal is one the next start has to replay, and draining here turns a
+        # slow startup into a slightly slower shutdown. Detach does it, because a clean
+        # detach drains before it releases.
+        print("\n--- Step 3.5: Draining journals before shutdown ---")
+        for ip in ips:
+            rc_l, out_l, _ = run_remote_spark(ip, SIDON_LIST_CMD)
+            if rc_l != 0 or not out_l.strip():
+                continue
+            try:
+                attached = json.loads(out_l.strip().splitlines()[0]).get("attached") or []
+            except Exception:
+                continue
+            for vdisk in attached:
+                vdisk_id = vdisk.get("vdisk_id")
+                # A forwarded vdisk has nothing local to drain: the owner holds the
+                # journal and draining it is the owner's business.
+                if not vdisk_id or vdisk.get("role") == "forwarding":
+                    continue
+                run_remote_spark(ip, sidon_detach_cmd(vdisk_id))
+        print("Journals drained.")
+
+        # 4. Unmount the extent store in parallel
+        print("\n--- Step 4: Unmounting the extent store across all nodes ---")
+        run_parallel(ips, "umount -l /var/lib/hci/sidon || true")
 
         # 5. Stop storage and controller services in parallel
         print("\n--- Step 5: Stopping storage services in parallel across all nodes ---")
-        storage_services = ["linstor-controller", "aether", "daruk"]
+        storage_services = ["sidon", "daruk"]
         if check_urbosa_enabled():
             storage_services.insert(0, "urbosa")
         for svc in storage_services:
             print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
             run_parallel(ips, f"systemctl stop {svc}")
 
-        # 6. Bring down DRBD resources in parallel
-        print("\n--- Step 6: Bringing down DRBD resources in parallel across all nodes ---")
-        run_parallel(ips, "drbdadm down all || true")
+        # Nothing to bring down at the block layer. `drbdadm down all` detached every
+        # resource from its device; a vdisk was never attached to one.
 
         # 7. Stop database and coordination services in parallel
         print("\n--- Step 7: Stopping database and coordination services in parallel across all nodes ---")
@@ -1892,7 +1780,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "linstor-controller", "aether", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
@@ -1902,7 +1790,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             if rc != 0:
                 print(f"[{ip}] [WARNING] Failed to stop services: {err}")
 
-        # 3. Unmount containers and DRBD mounts on all hosts
+        # 3. Unmount the extent store on all hosts
         print("\n--- Phase 3: Unmounting Storage Volumes ---")
         for ip in ips:
             print(f"[{ip}] Unmounting volume paths...")
@@ -1913,25 +1801,17 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             if out2.strip() or err2.strip():
                 print(f"[{ip}] Image Volume Unmount Output: {out2 or err2}")
 
-        # 4. Bring down DRBD resources
-        print("\n--- Phase 4: Bringing down DRBD Resources ---")
-        drbd_down_cmd = (
-            "timeout 15 sh -c \""
-            "drbdsetup status | grep -v '^[[:space:]]' | grep -v '^#' | while read -r line; do "
-            "  res=\\$(echo \\\"\\$line\\\" | awk '{print \\$1}'); "
-            "  if [ ! -z \\\"\\$res\\\" ]; then "
-            "    echo \\\"Bringing down DRBD resource \\$res...\\\"; "
-            "    drbdsetup down \\\"\\$res\\\" || true; "
-            "  fi; "
-            "done\" || echo 'DRBD down timed out'"
-        )
+        # 4. Stop the data path.
+        #
+        # This used to enumerate DRBD resources with drbdsetup and bring each one down,
+        # because a resource left up held its backing device open and the LVM wipe below
+        # would fail on it. A vdisk is a file on a filesystem: stopping the daemon and
+        # unmounting is the whole teardown.
+        print("\n--- Phase 4: Stopping the storage data path ---")
         for ip in ips:
-            print(f"[{ip}] Stopping DRBD replication...")
-            rc, out, err = run_remote_spark(ip, drbd_down_cmd)
-            if out.strip():
-                print(f"[{ip}] Log:\n{out}")
-            if rc != 0:
-                print(f"[{ip}] [WARNING] Failed to stop DRBD: {err}")
+            run_remote_spark(ip, "systemctl stop sidon || true")
+            run_remote_spark(ip, "umount -l /var/lib/hci/sidon || true")
+            print(f"[{ip}] storage stopped and unmounted.")
 
         # 5. Wipe LVM vg/thin-pool and disk signatures dynamically
         print("\n--- Phase 5: Wiping LVM Pools & Disk Signatures ---")
@@ -2156,17 +2036,16 @@ for dev, mount in claimed:
     run_with_timeout(f"wipefs -a {real_dev}", timeout=10)
     run_with_timeout(f"rm -rf {mount}", timeout=10)
 
-print("Unmounting Linstor Controller HA database volume...", flush=True)
-run_with_timeout("umount -l /var/lib/linstor || true", timeout=10)
-print("Bringing down DRBD...", flush=True)
-run_with_timeout("drbdadm down all", timeout=15)
+print("Stopping the storage data path...", flush=True)
+run_with_timeout("systemctl stop sidon || true", timeout=15)
+run_with_timeout("umount -l /var/lib/hci/sidon || true", timeout=10)
 
 print("Removing system containers...", flush=True)
-run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-aether systemd-spectrum systemd-linstor-satellite systemd-linstor-controller || true", timeout=15)
+run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum || true", timeout=15)
 
 print("Removing storage directories...", flush=True)
 run_with_timeout("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", timeout=10)
-run_with_timeout("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/linstor /etc/linstor", timeout=10)
+run_with_timeout("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", timeout=10)
 print("--- Local wipe completed ---", flush=True)
 """
         wipe_b64 = base64.b64encode(wipe_script.encode()).decode()
@@ -2388,9 +2267,10 @@ print("--- Local wipe completed ---", flush=True)
                 print("No hydra.nodes row referenced this address.")
 
             print("\nStill manual, and deliberately so:")
-            print(f"  - LINSTOR: 'linstor node delete <hostname>' once its resources have")
-            print(f"    been re-replicated elsewhere. Deleting a node that still holds the")
-            print(f"    only copy of a volume loses that volume.")
+            print(f"  - Storage: nothing. A removed node needs no deregistration, and Purah")
+            print(f"    re-replicates whatever it held onto a surviving node. Confirm that")
+            print(f"    finished before wiping it -- a node still holding the only copy of a")
+            print(f"    vdisk loses that vdisk.")
             print(f"  - ZooKeeper: remove the node from the ensemble configuration on every")
             print(f"    remaining host and restart them one at a time. A voter that is gone")
             print(f"    still counts toward the ensemble's quorum until it is removed.")
@@ -2400,8 +2280,8 @@ print("--- Local wipe completed ---", flush=True)
             print(f"  1. Drain {target}: put it in maintenance mode so its VMs migrate off.")
             print(f"     The quorum gate refuses this if the cluster cannot spare the replica,")
             print(f"     which is the same condition that makes step 4 unsafe.")
-            print(f"  2. LINSTOR: move its storage replicas to surviving nodes and wait for")
-            print(f"     the DRBD resync to finish. 'linstor resource list' on a survivor.")
+            print(f"  2. Storage: Purah moves its replicas to surviving nodes on its own. Watch")
+            print(f"     'valcli storage.list' until no vdisk shows a short replica set.")
             if replication_factor is not None and ring_member is not None:
                 remaining = len(members) - 1
                 if min(replication_factor, remaining) < quorum_of(replication_factor):
@@ -2426,7 +2306,7 @@ print("--- Local wipe completed ---", flush=True)
                 print(f"  4. (already done -- {target} is not in the ring)")
             print(f"  5. 'cluster decommission --node {target} --finalize' to clear its")
             print(f"     cluster.json entry and its hydra.nodes row.")
-            print(f"  6. LINSTOR node delete and ZooKeeper ensemble reconfiguration, by hand.")
+            print(f"  6. ZooKeeper ensemble reconfiguration, by hand.")
             if blockers:
                 print("\n[ERROR] The blockers above must be resolved before step 4.")
                 sys.exit(1)
@@ -2539,7 +2419,8 @@ print("--- Local wipe completed ---", flush=True)
             print("  - Raising the keyspace replication factor back, if it was lowered for")
             print("    the smaller ring. ALTER KEYSPACE changes the strategy only -- the data")
             print("    is not copied to the new replicas until a repair runs.")
-            print("  - LINSTOR: re-create this node's storage replicas and let DRBD resync.")
+            print("  - Storage: nothing to re-create. Purah replicates onto the returning")
+            print("    node as it becomes the spare for anything short of its replica count.")
         else:
             print("\n--- Rejoin sequence ---")
             print(f"  1. Confirm {target} is meant to come back as the same node. If it was")
@@ -2551,7 +2432,7 @@ print("--- Local wipe completed ---", flush=True)
             print(f"     reports UN. A node stuck at UJ is still streaming, not broken.")
             print(f"  4. Raise the replication factor back if it was lowered, then")
             print(f"     'nodetool repair -pr hydra' on every node.")
-            print(f"  5. LINSTOR: re-create its storage replicas and wait for the resync.")
+            print(f"  5. Storage: Purah restores replica counts in the background; no resync to wait for.")
             print(f"  6. 'cluster rejoin --node {target} --finalize' again to register it in")
             print(f"     hydra.nodes as a schedulable host, then 'cluster start'.")
 

@@ -131,8 +131,8 @@ def get_dfs_engine():
         with open("/etc/hci/cluster.json", "r") as handle:
             value = str(json.load(handle).get("dfs_engine") or "").strip().lower()
     except Exception:
-        return "linstor"
-    return value if value in ("linstor", "sidon") else "linstor"
+        return "sidon"
+    return value if value in ("linstor", "sidon") else "sidon"
 
 def show_status_json():
     services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]

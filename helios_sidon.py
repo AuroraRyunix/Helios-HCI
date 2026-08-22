@@ -21,10 +21,10 @@ CONTROL_SOCKET = os.environ.get("SIDON_CONTROL", "/run/sidon/control.sock")
 NBD_DIR = os.environ.get("SIDON_NBD_DIR", "/var/lib/hci/sidon/nbd")
 CLUSTER_JSON = "/etc/hci/cluster.json"
 
-# The engine names `cluster.json` may carry. "linstor" is what every cluster provisioned
-# to date holds; the key has existed since the GlusterFS transition and was, until now,
-# read by four hardcoded copies of get_dfs_engine() that all returned "linstor" and were
-# called by nothing.
+# The engine names `cluster.json` may carry. The key has existed since the GlusterFS
+# transition and was, until recently, read by four hardcoded copies of get_dfs_engine()
+# that all returned "linstor" and were called by nothing. "linstor" is kept only so an
+# old cluster.json reads as a recognised value rather than a typo.
 ENGINE_LINSTOR = "linstor"
 ENGINE_SIDON = "sidon"
 
@@ -40,17 +40,23 @@ class SidonError(Exception):
 def dfs_engine(cluster_json=CLUSTER_JSON):
     """Which storage engine this cluster uses for VM disks.
 
-    Defaults to LINSTOR when the file is missing or unreadable, because a cluster whose
-    configuration cannot be read is a cluster whose existing disks are DRBD resources.
-    Guessing the new engine there would point a VM at storage that has never held it.
+    The default flipped, and the reason is worth writing down. It used to be LINSTOR:
+    while both existed, a cluster whose configuration could not be read was a cluster
+    whose disks were DRBD resources, and guessing the new engine would have pointed a VM
+    at storage that had never held it. Now there is no LINSTOR code left, so answering
+    "linstor" names an engine nothing can serve -- a failure mode with no recovery rather
+    than a cautious one. Sidon is the only answer that can be acted on.
+
+    ENGINE_LINSTOR survives only to recognise the value in an old cluster.json without
+    treating it as a typo.
     """
     try:
         with open(cluster_json, "r", encoding="utf-8") as handle:
-            value = json.load(handle).get("dfs_engine", ENGINE_LINSTOR)
+            value = json.load(handle).get("dfs_engine", ENGINE_SIDON)
     except (OSError, ValueError):
-        return ENGINE_LINSTOR
+        return ENGINE_SIDON
     value = str(value or "").strip().lower()
-    return value if value in (ENGINE_LINSTOR, ENGINE_SIDON) else ENGINE_LINSTOR
+    return value if value in (ENGINE_LINSTOR, ENGINE_SIDON) else ENGINE_SIDON
 
 
 def using_sidon(cluster_json=CLUSTER_JSON):

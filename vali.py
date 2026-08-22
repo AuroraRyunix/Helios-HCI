@@ -60,7 +60,10 @@ def get_dfs_engine():
     """Which storage engine backs VM disks. Was hardcoded to "linstor" and called by
     nothing; it is now the switch that decides how a VM's disks are made ready to boot."""
     module = sidon_module()
-    return module.dfs_engine() if module else "linstor"
+    # No module means the client is not deployed, which is a deployment fault rather
+    # than a statement about the engine. "sidon" is the only answer anything can act
+    # on now, so it is the honest one.
+    return module.dfs_engine() if module else "sidon"
 
 
 def using_sidon():
