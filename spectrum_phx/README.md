@@ -137,8 +137,24 @@ openssl rand -base64 48 | tr -d '[:space:]'
 
 ## Deploying alongside the existing Spectrum
 
-Nothing in `provision.py` or `deploy_updates.py` knows about this app yet
-(see "Wiring still to be done"). Until it does, per node:
+`deploy_updates.py` does this now, on every node it rolls out to: it tars the
+build context (`mix.exs`, `mix.lock`, `Dockerfile`, and `config/ priv/ lib/
+assets/ rel/` — what the Dockerfile actually COPYs, so `test/`, `_build/` and
+`deps/` are not shipped), extracts it into `/tmp/spectrum_phx_build`, builds the
+image, installs `quadlet/spectrum-phx.container` from this directory rather than
+a duplicate string, and restarts the unit. A build failure stops that node's
+update instead of restarting the console onto the image already running.
+
+`SECRET_KEY_BASE` is read from whichever node already has one and reused, never
+regenerated: rewriting it on every rollout would invalidate every live session.
+Only if no node has one is a value minted, and the env file is written only when
+absent.
+
+`provision.py` still does not know about this app — a fresh cluster gets the
+Python console and gains this one on its first `deploy_updates.py` run.
+
+The manual sequence below is what that automates, and is still what to run when
+deploying by hand:
 
 ```sh
 # 1. Get the image onto the node (build there, or podman load a saved tar)
@@ -323,18 +339,20 @@ logged into the Python console is anonymous here and vice versa.
 
 ## Wiring still to be done
 
-`provision.py`, `deploy_updates.py` and `sync_provision.py` have not been
-touched — building and deploying this image is manual until they are updated.
-In outline, they need:
+`deploy_updates.py` is done — see "Deploying alongside the existing Spectrum".
+What remains:
 
-- `provision.py`: a `SPECTRUM_PHX_QUADLET` entry alongside `QUADLETS["spectrum"]`,
-  a build step for `localhost/spectrum-phx:latest`, generation of
-  `/etc/hci/spectrum/spectrum-phx.env` with a cluster-wide `SECRET_KEY_BASE`,
-  and `systemctl start spectrum-phx`.
-- `deploy_updates.py`: the same unit content in its own
-  `spectrum_phx_container_content`, plus upload/rebuild/restart steps that
-  mirror the existing Spectrum ones.
+- `provision.py`: a fresh cluster does not get this console until its first
+  `deploy_updates.py` run. Wiring it here means the same build step plus
+  generating `/etc/hci/spectrum/spectrum-phx.env` with a `SECRET_KEY_BASE` that
+  is the *same on every node* — a session cookie signed on one node has to
+  verify on the others, or Slate moving a request to a different backend logs
+  the operator out.
 - `sync_provision.py`: this app is a directory tree, not a single file, so it
-  does not fit the existing base64-constant mapping. Either ship the image as a
-  tar (like `traefik.tar`) or upload the source tree with
-  `node.upload_directory`.
+  does not fit the base64-constant mapping. `deploy_updates.py` sidesteps that
+  by shipping a tarball; provisioning would need the same, or the image saved
+  as a tar the way `traefik.tar` is.
+- The signed upgrade package (`create_upgrade_zip.py` and hylia) carries files
+  to fixed paths and has no way to build an image or ship a binary, so it
+  cannot carry this app or the Rust services either. That is a design question
+  about what a signed release contains, not an oversight in a list.

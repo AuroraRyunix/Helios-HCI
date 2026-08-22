@@ -122,6 +122,50 @@ rm -rf /etc/drbd.d /etc/drbd.conf /var/lib/linstor 2>/dev/null
 true"""
 
 
+# What `podman build` needs, from spectrum_phx/'s Dockerfile: mix.exs, mix.lock,
+# config/, priv/, lib/, assets/ and rel/. `test/` is not copied by the Dockerfile and
+# `_build/` and `deps/` are rebuilt in the image, so shipping them would triple the
+# payload for nothing.
+SPECTRUM_PHX_FILES = ("mix.exs", "mix.lock", "Dockerfile")
+SPECTRUM_PHX_DIRS = ("config", "priv", "lib", "assets", "rel")
+
+
+def upload_spectrum_phx(ssh, sftp, local_root):
+    """Stage the Phoenix app's build context as one tarball.
+
+    A hundred-odd files over SFTP is a hundred-odd round trips. One tar upload and one
+    remote extract is the same bytes in a fraction of the time, and -- more usefully --
+    it is atomic enough that a connection dropped mid-transfer leaves an unusable
+    archive rather than a build context that is silently half a version old.
+    """
+    import tarfile
+    import tempfile
+
+    local_app = os.path.join(local_root, "spectrum_phx")
+    handle, archive = tempfile.mkstemp(suffix=".tar.gz")
+    os.close(handle)
+    try:
+        with tarfile.open(archive, "w:gz") as tar:
+            for name in SPECTRUM_PHX_FILES:
+                tar.add(os.path.join(local_app, name), arcname=name)
+            for name in SPECTRUM_PHX_DIRS:
+                tar.add(os.path.join(local_app, name), arcname=name)
+
+        _, stdout, _ = ssh.exec_command(
+            "rm -rf /tmp/spectrum_phx_build && mkdir -p /tmp/spectrum_phx_build")
+        stdout.channel.recv_exit_status()
+        sftp.put(archive, "/tmp/spectrum_phx.tar.gz")
+        _, stdout, _ = ssh.exec_command(
+            "tar -xzf /tmp/spectrum_phx.tar.gz -C /tmp/spectrum_phx_build && "
+            "rm -f /tmp/spectrum_phx.tar.gz")
+        return stdout.channel.recv_exit_status()
+    finally:
+        try:
+            os.unlink(archive)
+        except OSError:
+            pass
+
+
 def live_sftp(ssh, sftp):
     """Return a usable SFTP channel, reopening it if the one we hold has been closed.
 
@@ -196,6 +240,29 @@ if not password:
 shared_cert = None
 shared_key = None
 
+# SECRET_KEY_BASE for the Phoenix console. One value for the whole cluster, because a
+# session cookie signed on one node has to verify on every other -- with per-node
+# secrets, Slate moving a request to a different backend logs the operator out.
+#
+# Read from a node that already has one rather than regenerated: rewriting it would
+# invalidate every live session on every rollout.
+shared_phx_secret = None
+
+def ensure_phx_secret(ssh):
+    """The cluster's SECRET_KEY_BASE, read from this node or newly generated."""
+    _, stdout, _ = ssh.exec_command(
+        "grep -h '^SECRET_KEY_BASE=' /etc/hci/spectrum/spectrum-phx.env 2>/dev/null "
+        "| head -1 | cut -d= -f2-")
+    stdout.channel.recv_exit_status()
+    existing = stdout.read().decode().strip()
+    if existing:
+        return existing, False
+
+    _, stdout, _ = ssh.exec_command("openssl rand -base64 48 | tr -d '[:space:]'")
+    stdout.channel.recv_exit_status()
+    return stdout.read().decode().strip(), True
+
+
 print("=== Ensuring a single shared SSL certificate exists on Node 1 ===")
 ssh_cert = new_ssh_client()
 try:
@@ -205,6 +272,10 @@ try:
     else:
         ssh_cert.connect(nodes[0], username=username, password=password, timeout=15)
     keep_alive(ssh_cert)
+    shared_phx_secret, minted = ensure_phx_secret(ssh_cert)
+    if shared_phx_secret:
+        print("[Node 1] Phoenix console secret %s."
+              % ("generated for this cluster" if minted else "read from this node"))
     cmd_check = "test -f /etc/hci/spectrum/certs/server.crt && test -f /etc/hci/spectrum/certs/server.key"
     stdin_chk, stdout_chk, stderr_chk = ssh_cert.exec_command(cmd_check)
     if stdout_chk.channel.recv_exit_status() != 0:
@@ -1082,6 +1153,55 @@ WantedBy=multi-user.target
                 
             if not fast_mode:
                 # 10. Rebuild the spectrum container image locally
+                # 9b. The Phoenix console, beside the Python one and never instead of
+                # it: different unit, container, port and image. Slate keeps routing to
+                # 8443 until slate_config/dynamic.yml says otherwise.
+                print(f"[{ip}] Uploading spectrum-phx build context...")
+                if upload_spectrum_phx(ssh, sftp, local_dir) != 0:
+                    raise RuntimeError(
+                        "the spectrum-phx build context could not be extracted on %s" % ip)
+
+                # The env file carries the secret and is 0600. Written only when absent,
+                # because rewriting SECRET_KEY_BASE logs every operator out.
+                if shared_phx_secret:
+                    _, stdout_env, _ = ssh.exec_command(
+                        "install -d -m 0755 /etc/hci/spectrum && "
+                        "test -f /etc/hci/spectrum/spectrum-phx.env || { "
+                        "printf 'SECRET_KEY_BASE=%s\\nPHX_HOST=%s\\nPHX_EXTRA_ORIGINS=%s\\n' "
+                        "> /etc/hci/spectrum/spectrum-phx.env && "
+                        "chmod 600 /etc/hci/spectrum/spectrum-phx.env; }"
+                        % (shared_phx_secret, ip, ",".join(nodes)))
+                    stdout_env.channel.recv_exit_status()
+
+                # The unit is read from the repository rather than duplicated into a
+                # string here. This deployment path already keeps five hand-maintained
+                # inventories in step; a sixth copy of a file that exists is not worth
+                # adding.
+                sftp = live_sftp(ssh, sftp)
+                put_text_file(
+                    sftp,
+                    os.path.join(local_dir, "spectrum_phx", "quadlet", "spectrum-phx.container"),
+                    "/etc/containers/systemd/spectrum-phx.container")
+
+                print(f"[{ip}] Rebuilding spectrum-phx container image...")
+                stdin, stdout, stderr = ssh.exec_command(
+                    "podman build -t localhost/spectrum-phx:latest /tmp/spectrum_phx_build")
+                exit_code = stdout.channel.recv_exit_status()
+                if exit_code != 0:
+                    raise RuntimeError(
+                        "the spectrum-phx image failed to build on %s: %s"
+                        % (ip, stderr.read().decode().strip()[:600]))
+
+                print(f"[{ip}] Restarting spectrum-phx...")
+                _, stdout_phx, _ = ssh.exec_command(
+                    "systemctl daemon-reload && "
+                    "systemctl stop spectrum-phx 2>/dev/null; "
+                    "podman rm -f spectrum-phx 2>/dev/null; "
+                    "systemctl start spectrum-phx")
+                if stdout_phx.channel.recv_exit_status() != 0:
+                    print(f"[{ip}] Warning: spectrum-phx did not start. "
+                          f"`journalctl -u spectrum-phx` will say why.")
+
                 print(f"[{ip}] Rebuilding spectrum container image...")
                 stdin, stdout, stderr = ssh.exec_command("podman build -t localhost/spectrum:latest /tmp/spectrum_build")
                 exit_code = stdout.channel.recv_exit_status()
