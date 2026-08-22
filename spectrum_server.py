@@ -2242,8 +2242,22 @@ def metrics_and_cluster_monitor_loop():
                     node_used_gb = (total - avail) / (1024 ** 3)
                     total_gb += node_total_gb
                     used_gb += node_used_gb
+                    # `name`, `path`, `type` and `status` are here for the console,
+                    # which renders a pool by them. They were what the DRBD-era payload
+                    # carried, and dropping them when Sidon replaced it is what put a
+                    # "Lost connection to the Helios management service" banner on a
+                    # cluster whose management service was answering every request:
+                    # the dashboard threw on `pool.name.startsWith(...)` and the throw
+                    # surfaced as a connection error.
                     pools.append({
                         "node": body_c.get("node") or ip,
+                        "name": body_c.get("node") or ip,
+                        "path": body_c.get("path") or "",
+                        "type": "Sidon extent store",
+                        # Reached only when the daemon answered `capacity`; a node whose
+                        # Sidon is down is skipped by the `continue` above and has no pool
+                        # row at all.
+                        "status": "ONLINE",
                         "total_gb": round(node_total_gb, 2),
                         "used_gb": round(node_used_gb, 2),
                         "egroups": body_c.get("egroup_count", 0),

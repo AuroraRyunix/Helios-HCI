@@ -3844,22 +3844,36 @@ document.addEventListener('DOMContentLoaded', async () => {
             return response.json();
         })
         .then(data => {
+            // The service answered, so the connection is up -- whatever the render below
+            // makes of the payload.
             hideConnectionError();
-            state.vms = data.vms.list || [];
-            state.nodes = data.nodes || [];
-            state.clusterName = data.cluster_name || 'unnamed-cluster';
-            state.metrics = data.metrics || null;
-            
-            try {
-                sessionStorage.setItem('status_api_cache', JSON.stringify(data));
-            } catch (e) {}
 
-            updateSharedHeader(data);
-            updatePageSpecificContent(data);
-            fetchDrsStatus();
-            const modal = document.getElementById('drs-details-modal');
-            if (modal && modal.style.display === 'flex') {
-                populateDrsModal();
+            // Rendering is fenced off from the fetch on purpose. A `.catch` placed after
+            // a `.then` also catches whatever that `.then` throws, so before this fence a
+            // single unreadable field turned into "Lost connection to the Helios
+            // management service" on a cluster that was answering every poll with 200.
+            // That message sends whoever is debugging it to the network, the proxy and
+            // the daemon, none of which are broken. A payload the console cannot render
+            // is a console bug and has to read like one.
+            try {
+                state.vms = data.vms.list || [];
+                state.nodes = data.nodes || [];
+                state.clusterName = data.cluster_name || 'unnamed-cluster';
+                state.metrics = data.metrics || null;
+
+                try {
+                    sessionStorage.setItem('status_api_cache', JSON.stringify(data));
+                } catch (e) {}
+
+                updateSharedHeader(data);
+                updatePageSpecificContent(data);
+                fetchDrsStatus();
+                const modal = document.getElementById('drs-details-modal');
+                if (modal && modal.style.display === 'flex') {
+                    populateDrsModal();
+                }
+            } catch (renderErr) {
+                console.error('Error rendering cluster status:', renderErr);
             }
         })
         .catch(err => {
@@ -4503,7 +4517,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const isWarning = pool.status === 'DEGRADED' || pool.status === 'UNKNOWN';
                 const statusColor = isOnline ? 'var(--color-success)' : (isWarning ? 'var(--color-warning)' : 'var(--color-danger)');
                 
-                if (pool.name.startsWith("Physical Disk")) {
+                // Tolerant of a pool that arrives without a name: the routing question
+                // is only whether this row is a physical disk, and a nameless pool is not.
+                if ((pool.name || '').startsWith("Physical Disk")) {
                     if (pePhysicalDisksContainer) {
                         const item = document.createElement('div');
                         item.className = 'physical-disk-item';

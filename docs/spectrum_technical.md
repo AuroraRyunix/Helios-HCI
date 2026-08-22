@@ -111,3 +111,35 @@ Serves static assets, routes frontend routes, and handles REST APIs:
 - **`GET /api/catalyst/tasks`**: Returns recent task progression.
 - **`POST /api/v1/vms/create`**: Provisions vdisks through sidon, creates VM metadata in `hydra.vms`, and registers QEMU guest configuration in libvirt.
 - **`DELETE /api/v1/vms/<name>`**: Stops guest and purges volume resources.
+
+### The status payload is a contract, not an internal structure
+
+`static/app.js` reaches into `/api/status` field by field, so the shape of that payload is
+part of Spectrum's interface and changing it breaks the console rather than merely
+changing a number on it.
+
+Each entry of `storage.pools` therefore carries both halves:
+
+| Field | Read by | Source |
+| --- | --- | --- |
+| `node`, `total_gb`, `used_gb`, `egroups`, `journal_bytes` | `valcli`, `mipha` | sidon `capacity` |
+| `name`, `type`, `status`, `path` | the dashboard's pool cards | sidon `capacity` + the fact that the daemon answered |
+
+`name` and `type` are load-bearing: the console calls `.startsWith` and `.toLowerCase` on
+them. When sidon replaced DRBD the pool dict was rewritten around what the extent store
+knows and these four fields were dropped, so the dashboard threw on
+`pool.name.startsWith(...)` on every poll.
+
+**The throw surfaced as a network error.** `fetchStatus` had its `.catch` attached after
+the `.then` that renders, and a `.catch` in that position catches whatever the `.then`
+throws. A missing field was reported as *"Lost connection to the Helios management
+service. Reconnecting..."* while Spectrum answered every poll with `200` — a message that
+sends whoever is debugging it to the network, the proxy and the daemon, none of which
+were broken.
+
+The render is now fenced in its own `try`, so `showConnectionError()` is reachable only
+from a fetch that actually failed. A payload the console cannot render logs
+`Error rendering cluster status:` and leaves the banner alone.
+
+`test_status_payload.py` holds both ends: that the payload carries every field the pool
+cards read, and that the render stays fenced off from the connection-error path.
