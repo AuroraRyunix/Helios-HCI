@@ -91,7 +91,17 @@ against seal hashes, locality rebuild after ownership moves.
 - **Gate:** corrupt-and-scrub, kill-replica-and-converge (I-6), and a GC soak proving
   reclaimed space never intersects referenced data across ownership churn (I-7).
 
-## 7. Integration
+## 7. Integration -- **partly done**
+
+Done: `dfs_engine` in `cluster.json` selects the substrate; spark fronts the control
+socket at `/api/v1/dfs/vdisk` so Spectrum never needs it mounted; both copies of
+`generate_vm_xml` emit the network/nbd disk; Vali's start path attaches instead of
+running `drbdadm primary`; creation and deletion branch on the engine. A VM is created,
+started and recorded through the ordinary REST API with its disk on Sidon.
+
+Not done: Mipha's ladder still has its DRBD rungs, the capacity readers still count one
+consumer of the thin pool, saga has no extent-aware backup, and mcli has no `dfs_*`
+checks.
 
 Vali places new vdisks and drives migration through forwarding-then-takeover; Mipha's
 ladder gains the exact storage fence and its residual-unsafe list shrinks accordingly;
