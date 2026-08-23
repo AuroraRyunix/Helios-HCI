@@ -244,6 +244,10 @@ Orchestrate cluster-wide lifecycle commands:
 # Bootstrap a 3-node cluster with virtual IP 10.10.102.240
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
 
+# Grow an existing cluster by one node (provision it with --join and enrol it first).
+# Deliberately not 'create' with one more address: create claims disks.
+cluster add-node --node 10.10.102.223
+
 # Query cluster-wide status (verbose includes per-node extent store and vdisk info)
 cluster status --verbose
 
