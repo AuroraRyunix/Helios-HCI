@@ -796,5 +796,123 @@ class DecommissionPlanningTests(RingTestCase):
                              [host_id_for(i) for i in range(3)], module.__name__)
 
 
+# -- ensemble membership -----------------------------------------------------------------
+
+class TheEnsembleKeepsItsIdentities(unittest.TestCase):
+    """A member's ZooKeeper id is its identity, not its position in a list.
+
+    The ensemble can only be changed by rewriting every unit and restarting, because
+    `reconfigEnabled` is off. That rewrite used to derive each id from the member's
+    position, which is harmless while a cluster only grows and wrong the moment one
+    shrinks: removing the middle member renumbers the one after it, so a node comes back
+    claiming an identity that does not match the `myid` in its own data directory.
+    """
+
+    THREE = [(1, "10.0.0.1"), (2, "10.0.0.2"), (3, "10.0.0.3")]
+
+    def test_a_three_node_ensemble_is_written_the_way_it_always_was(self):
+        unit = cluster.zookeeper_quadlet(1, self.THREE)
+        self.assertIn("ZOO_MY_ID=1", unit)
+        self.assertIn('ZOO_SERVERS="server.1=10.0.0.1:2888:3888;2181 '
+                      'server.2=10.0.0.2:2888:3888;2181 '
+                      'server.3=10.0.0.3:2888:3888;2181"', unit)
+        self.assertNotIn("observer", unit)
+
+    def test_removing_the_middle_member_leaves_a_gap_rather_than_renumbering(self):
+        survivors = [(1, "10.0.0.1"), (3, "10.0.0.3")]
+        unit = cluster.zookeeper_quadlet(3, survivors)
+        self.assertIn("ZOO_MY_ID=3", unit)
+        self.assertIn("server.1=10.0.0.1", unit)
+        self.assertIn("server.3=10.0.0.3", unit)
+        self.assertNotIn("server.2=", unit)
+
+    def test_voter_or_observer_follows_position_not_id(self):
+        """The first three members are the quorum. An id with a gap in it must not be
+        mistaken for a fourth member and quietly demoted out of the quorum."""
+        with_gap = [(1, "10.0.0.1"), (4, "10.0.0.4"), (5, "10.0.0.5")]
+        unit = cluster.zookeeper_quadlet(5, with_gap)
+        self.assertNotIn("observer", unit)
+
+        four = with_gap + [(6, "10.0.0.6")]
+        self.assertIn(":observer", cluster.zookeeper_quadlet(6, four))
+        self.assertIn("ZOO_PEER_TYPE=observer", cluster.zookeeper_quadlet(6, four))
+        self.assertNotIn("ZOO_PEER_TYPE=observer", cluster.zookeeper_quadlet(1, four))
+
+    def test_a_single_node_ensemble_names_no_servers(self):
+        self.assertNotIn("ZOO_SERVERS", cluster.zookeeper_quadlet(1, [(1, "10.0.0.1")]))
+
+
+class EveryMemberIsToldItsOwnId(unittest.TestCase):
+    def setUp(self):
+        self.written = {}
+        self.original = cluster.run_remote_spark
+
+        def fake(ip, command):
+            self.written[ip] = command
+            return 0, "", ""
+
+        cluster.run_remote_spark = fake
+        self.addCleanup(setattr, cluster, "run_remote_spark", self.original)
+
+    def decoded(self, ip):
+        import base64 as b64
+        blob = re.search(r"echo (\S+) \| base64 -d", self.written[ip]).group(1)
+        return b64.b64decode(blob).decode()
+
+    def test_each_node_gets_the_id_it_was_given(self):
+        failed = cluster.write_zookeeper_ensemble(
+            [(1, "10.0.0.1"), (3, "10.0.0.3")])
+        self.assertEqual(failed, [])
+        self.assertIn("ZOO_MY_ID=1", self.decoded("10.0.0.1"))
+        self.assertIn("ZOO_MY_ID=3", self.decoded("10.0.0.3"))
+
+    def test_every_member_sees_the_same_ensemble(self):
+        cluster.write_zookeeper_ensemble([(1, "10.0.0.1"), (3, "10.0.0.3")])
+        for ip in ("10.0.0.1", "10.0.0.3"):
+            unit = self.decoded(ip)
+            self.assertIn("server.1=10.0.0.1", unit)
+            self.assertIn("server.3=10.0.0.3", unit)
+
+
+class AnUnreadableIdIsNotGuessed(unittest.TestCase):
+    """Inventing an id for a node that already has one is how two members end up claiming
+    the same identity."""
+
+    def setUp(self):
+        self.original = cluster.run_remote_spark
+        self.addCleanup(setattr, cluster, "run_remote_spark", self.original)
+
+    def test_a_node_whose_unit_cannot_be_read_is_left_out(self):
+        def fake(ip, command):
+            if ip == "10.0.0.2":
+                return 1, "", "no such file"
+            return 0, "ZOO_MY_ID=%s" % ip.split(".")[-1], ""
+
+        cluster.run_remote_spark = fake
+        ids = cluster.read_zookeeper_ids(["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertEqual(ids, {"10.0.0.1": 1, "10.0.0.3": 3})
+
+    def test_a_unit_without_the_variable_is_left_out(self):
+        cluster.run_remote_spark = lambda ip, command: (0, "", "")
+        self.assertEqual(cluster.read_zookeeper_ids(["10.0.0.1"]), {})
+
+
+class RemovingANodeShrinksTheEnsemble(unittest.TestCase):
+    def test_finalize_rewrites_the_ensemble_for_the_survivors(self):
+        """Until it does, the survivors still count the departed node towards their
+        quorum -- so a two-node cluster needs both nodes, which is worse than the
+        three-node cluster it replaced."""
+        source = open(os.path.join(HERE, "cluster_new.py"), encoding="utf-8").read()
+        start = source.index('print("\\n--- Finalizing: removing the node from cluster metadata ---")')
+        block = source[start:start + 4000]
+        self.assertIn("read_zookeeper_ids(survivors)", block)
+        self.assertIn("write_zookeeper_ensemble(zk_members)", block)
+        self.assertIn("systemctl restart zookeeper", block)
+
+    def test_the_plan_no_longer_sends_the_operator_to_do_it_by_hand(self):
+        source = open(os.path.join(HERE, "cluster_new.py"), encoding="utf-8").read()
+        self.assertNotIn("ZooKeeper ensemble reconfiguration, by hand", source)
+
+
 if __name__ == "__main__":
     unittest.main()

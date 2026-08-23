@@ -469,27 +469,39 @@ def get_hydra_replication_factor():
     return parse_replication_factor(stdout)
 
 
-def zookeeper_quadlet(node_id, ips):
-    """One node's ZooKeeper unit for an ensemble of `ips`.
+def zookeeper_quadlet(node_id, members):
+    """One node's ZooKeeper unit for an ensemble of `members`, a list of `(id, ip)`.
 
-    Every node's unit names the whole ensemble, so adding a member means rewriting all of
-    them. ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed
+    Every node's unit names the whole ensemble, so changing the membership means rewriting
+    all of them. ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed
     version is 3.9.2, but `reconfigEnabled` is off, so `reconfig` is refused and the
     ensemble can only be changed by rewriting the config and restarting. That is the cost
     being paid here; see the dynamic-reconfiguration item in TODO.md.
 
-    Nodes beyond the third are observers: they scale reads without joining the quorum, so
-    a five-node cluster still needs two failures to lose consensus rather than three.
+    Ids are passed in rather than derived from position. A member's id *is* its ZooKeeper
+    identity: it has to match the `server.<id>` entry every other member holds for it, and
+    the image writes it into the data directory as `myid`. Deriving it from position is
+    fine while an ensemble only ever grows, but removing a member would then renumber
+    everyone after it -- handing a node a new identity on top of a data directory that
+    remembers the old one. Ids do not have to be contiguous, so a removal simply leaves
+    a gap.
+
+    Voter or observer is decided by position rather than by id: the first three members
+    form the quorum and any beyond that scale reads without joining it, so a five-node
+    cluster still needs two failures to lose consensus rather than three.
     """
-    if len(ips) == 1:
+    if len(members) == 1:
         servers_env = ""
     else:
         parts = []
-        for i, ip in enumerate(ips, start=1):
-            suffix = ":observer" if i > 3 else ""
-            parts.append("server.%d=%s:2888:3888%s;2181" % (i, ip, suffix))
+        for position, (member_id, ip) in enumerate(members, start=1):
+            suffix = ":observer" if position > 3 else ""
+            parts.append("server.%d=%s:2888:3888%s;2181" % (member_id, ip, suffix))
         servers_env = ' ZOO_SERVERS="%s"' % " ".join(parts)
-    peer_type_env = " ZOO_PEER_TYPE=observer" if node_id > 3 else ""
+    own_position = next(
+        (position for position, (member_id, _ip) in enumerate(members, start=1)
+         if member_id == node_id), 1)
+    peer_type_env = " ZOO_PEER_TYPE=observer" if own_position > 3 else ""
     return (
         "[Unit]\n"
         "Description=ZooKeeper Cluster Consensus Service\n"
@@ -509,11 +521,14 @@ def zookeeper_quadlet(node_id, ips):
     )
 
 
-def write_zookeeper_ensemble(ips):
-    """Rewrite every node's ZooKeeper unit for this membership. Returns the nodes that failed."""
+def write_zookeeper_ensemble(members):
+    """Rewrite every node's ZooKeeper unit for this membership. Returns the nodes that failed.
+
+    `members` is a list of `(id, ip)` in ensemble order.
+    """
     failed = []
-    for idx, ip in enumerate(ips):
-        quad = zookeeper_quadlet(idx + 1, ips)
+    for member_id, ip in members:
+        quad = zookeeper_quadlet(member_id, members)
         encoded = base64.b64encode(quad.encode()).decode()
         rc, _, _ = run_remote_spark(
             ip,
@@ -523,6 +538,27 @@ def write_zookeeper_ensemble(ips):
         if rc != 0:
             failed.append(ip)
     return failed
+
+
+def read_zookeeper_ids(ips):
+    """Each node's current ZooKeeper id, keyed by address.
+
+    Read from the unit rather than assumed from position, so that a membership change can
+    leave the survivors' identities exactly as they are. A node whose unit cannot be read
+    is absent from the result and the caller decides what to do about it -- guessing an id
+    for a node that already has one is how two members end up claiming the same identity.
+    """
+    ids = {}
+    for ip in ips:
+        rc, out, _ = run_remote_spark(
+            ip, "grep -o 'ZOO_MY_ID=[0-9]*' /etc/containers/systemd/zookeeper.container "
+                "2>/dev/null | head -1")
+        if rc != 0:
+            continue
+        match = re.search(r"ZOO_MY_ID=(\d+)", out or "")
+        if match:
+            ids[ip] = int(match.group(1))
+    return ids
 
 
 def hydra_db_quadlet(node_ip, seed_ips):
@@ -703,8 +739,23 @@ def cmd_add_node(args):
     print("[config] %s (%s) is in cluster.json on all %d node(s)." % (target, hostname, len(ips)))
 
     # 3. Consensus.
-    print("[zookeeper] rewriting the ensemble for %d member(s)..." % len(ips))
-    failed = write_zookeeper_ensemble(ips)
+    #
+    # Existing members keep the ids they already hold, read from their own units rather
+    # than recomputed from position. A cluster that has had a node removed has a gap in
+    # its ids, and recomputing would renumber every member after the gap -- giving each
+    # of them a new ZooKeeper identity on top of a data directory that remembers the old
+    # one. The joining node takes the first id nothing else is using.
+    known_ids = read_zookeeper_ids(existing)
+    unreadable = [ip for ip in existing if ip not in known_ids]
+    if unreadable:
+        print("[ERROR] Could not read the ZooKeeper id of: %s. Rewriting the ensemble "
+              "without them would hand some node an identity that does not match its "
+              "data directory." % ", ".join(unreadable))
+        return 1
+    members = ([(known_ids[ip], ip) for ip in existing]
+               + [(max(known_ids.values()) + 1, target)])
+    print("[zookeeper] rewriting the ensemble for %d member(s)..." % len(members))
+    failed = write_zookeeper_ensemble(members)
     if failed:
         print("[ERROR] Could not write the ZooKeeper unit on: %s" % ", ".join(failed))
         return 1
@@ -2508,6 +2559,45 @@ print("--- Local wipe completed ---", flush=True)
             else:
                 print("[WARNING] /etc/hci/cluster.json could not be read; skipped.")
 
+            # The ensemble, shrunk to match. `add-node` grows it as part of the join, and
+            # this used to tell the operator to do the reverse by hand -- an asymmetry
+            # with teeth. A survivor whose unit still lists the departed node counts it in
+            # the quorum, so a three-entry ensemble with two live members needs both of
+            # them: the cluster ends up *less* fault-tolerant than the two-node cluster it
+            # has actually become, and one more failure loses consensus entirely.
+            #
+            # Survivors keep the ids they already hold, so removing the middle member
+            # leaves a gap rather than renumbering the one after it.
+            survivor_ids = read_zookeeper_ids(survivors)
+            unreadable = [ip for ip in survivors if ip not in survivor_ids]
+            if unreadable:
+                print(f"[WARNING] Could not read the ZooKeeper id of: {', '.join(unreadable)}. "
+                      f"The ensemble was left alone -- rewriting it without those ids would "
+                      f"hand a node an identity that does not match its data directory.")
+                print(f"[WARNING] Remove {target} from every survivor's "
+                      f"/etc/containers/systemd/zookeeper.container by hand, then restart "
+                      f"zookeeper on each in turn.")
+            else:
+                zk_members = [(survivor_ids[ip], ip) for ip in survivors]
+                print(f"[zookeeper] rewriting the ensemble for {len(zk_members)} member(s)...")
+                failed_zk = write_zookeeper_ensemble(zk_members)
+                if failed_zk:
+                    print(f"[WARNING] Could not write the ZooKeeper unit on: "
+                          f"{', '.join(failed_zk)}. Those nodes still count {target} "
+                          f"towards their quorum.")
+                else:
+                    # One at a time, as in add-node: a rolling restart keeps a quorum of
+                    # the *previous* ensemble alive throughout, which an all-at-once
+                    # restart does not.
+                    for ip in survivors:
+                        rc_z, _, err_z = run_remote_spark(ip, "systemctl restart zookeeper")
+                        if rc_z != 0:
+                            print(f"[WARNING] [{ip}] ZooKeeper did not restart: "
+                                  f"{(err_z or '').strip()[:200]}")
+                        else:
+                            print(f"[zookeeper] {ip} restarted.")
+                        time.sleep(3)
+
             # hydra.nodes is keyed by hostname, and CQL has no DELETE on a non-key column,
             # so the row is looked up by address first.
             rc_r, stdout_r, _ = run_cql_query(
@@ -2572,8 +2662,9 @@ print("--- Local wipe completed ---", flush=True)
             else:
                 print(f"  4. (already done -- {target} is not in the ring)")
             print(f"  5. 'cluster decommission --node {target} --finalize' to clear its")
-            print(f"     cluster.json entry and its hydra.nodes row.")
-            print(f"  6. ZooKeeper ensemble reconfiguration, by hand.")
+            print(f"     cluster.json entry and its hydra.nodes row, and to shrink the")
+            print(f"     ZooKeeper ensemble to the survivors -- which is not optional:")
+            print(f"     until it happens they still count {target} towards their quorum.")
             if blockers:
                 print("\n[ERROR] The blockers above must be resolved before step 4.")
                 sys.exit(1)
