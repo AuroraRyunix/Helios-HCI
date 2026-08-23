@@ -143,10 +143,26 @@ unbounded, and cannot be undone.
 # Check and print the sequence
 cluster decommission --node 10.10.102.223
 
-# Bookkeeping only, after the node is genuinely out of the ring:
-# rewrites cluster.json on the survivors and deletes the hydra.nodes row
+# After the node is genuinely out of the ring: rewrites cluster.json on the
+# survivors, deletes the hydra.nodes row, and shrinks the ZooKeeper ensemble
 cluster decommission --node 10.10.102.223 --finalize
 ```
+
+The ensemble shrink is not bookkeeping and is not optional. Until it runs, every
+survivor's `zookeeper.container` still lists the departed node and still counts it
+towards quorum — so a three-entry ensemble with two live members needs *both* of them,
+leaving the cluster less fault-tolerant than the two-node cluster it has actually become.
+`--finalize` restarts the survivors one at a time, so a quorum of the previous ensemble
+stays alive throughout.
+
+Surviving members keep the ZooKeeper ids they already hold, and a removal simply leaves a
+gap in the numbering. A member's id is its identity — it must match the `server.<id>`
+entry every other member holds for it, and the image writes it into the data directory as
+`myid` — so renumbering the members after the departed one would hand each of them an
+identity that no longer matches their own data. Ids are read back from the units rather
+than assumed; a node whose unit cannot be read is never given a guessed one, because
+inventing an id for a node that already has one is how two members come to claim the same
+identity. When that happens the ensemble is left alone and the manual steps are printed.
 
 ### H. Node Rejoin (`cluster rejoin`)
 Preflight and plan bringing a node back. Checks that a previously decommissioned node has

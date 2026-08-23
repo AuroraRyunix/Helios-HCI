@@ -240,14 +240,24 @@ identical.
    which rebuilds its ranges from the remaining replicas. The preflight prints whichever
    applies, with the host id — parsed out of `nodetool status` by shape, because `Load`
    occupies one field or two and every column after it shifts. *(Manual.)*
-5. **`cluster decommission --node <ip> --finalize`.** Bookkeeping only, and only once the
-   node is genuinely out of the ring: it rewrites `/etc/hci/cluster.json` on the surviving
-   nodes, renumbers `node_id` (position identifies the witness in a three-node layout),
-   and deletes the `hydra.nodes` row.
-6. **ZooKeeper ensemble reconfiguration.** *(Manual: a voter that is gone still counts
-   toward the ensemble's quorum until it is removed from every remaining host's config and
-   they are restarted one at a time.)* There is no storage-side counterpart — a node with no
-   vdisks listing it holds nothing the cluster needs.
+5. **`cluster decommission --node <ip> --finalize`.** Only once the node is genuinely out
+   of the ring. It rewrites `/etc/hci/cluster.json` on the surviving nodes, renumbers
+   `node_id` (position identifies the witness in a three-node layout), deletes the
+   `hydra.nodes` row, and shrinks the ZooKeeper ensemble to the survivors — restarting
+   them one at a time, so a quorum of the previous ensemble stays alive throughout.
+
+   The ensemble shrink is not bookkeeping. A voter that is gone still counts toward
+   quorum until it is out of every remaining host's config, so a three-entry ensemble
+   with two live members needs both of them: strictly worse than the two-node cluster it
+   has become. Survivors keep the ids they already hold and the removal leaves a gap,
+   because a member's id must match the `server.<id>` entry every other member holds for
+   it and the `myid` in its own data directory. Ids are read back rather than assumed, and
+   a node whose unit cannot be read is never given a guessed one — that is how two members
+   come to claim the same identity — so the ensemble is left alone and the manual steps
+   printed instead.
+
+   There is no storage-side counterpart: a node with no vdisks listing it holds nothing
+   the cluster needs.
 
 ### What the preflight blocks
 
