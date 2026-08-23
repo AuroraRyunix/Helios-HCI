@@ -58,8 +58,8 @@ Iterates over node IPs:
 4. Writes systemd unit configuration files (`/etc/systemd/system/*.service`).
 5. If not running in `--fast` mode:
    - Copies static UI assets and `Dockerfile` to target hosts.
-   - Triggers `podman build -t localhost/spectrum:latest /tmp/spectrum_build` on the remote hosts to rebuild the UI container.
-   - Purges old containers and restarts the systemd units.
+   - Triggers `podman build -t localhost/spectrum:latest /tmp/spectrum_build` on the remote hosts to rebuild the UI container. A build failure is fatal, because restarting afterwards would only reinstate the image already running.
+   - Restarts the console with a single `systemctl restart spectrum`, then checks the unit is `active`. Both halves matter: a `stop && podman rm -f && start` chain short-circuits on a failed stop and does nothing at all, and the gap between its commands is long enough for spark-daemon's drift check to start the unit and cancel the pending stop job — see [cluster_state.md](./cluster_state.md#a-unit-that-is-mid-transition-is-not-drift). An accepted job is also not a serving console, so the end state is verified rather than inferred from an exit code, and a console that will not come back stops the rollout for that node.
 6. Calls `systemctl daemon-reload` and restarts services to load updates.
 
 ### It refuses to roll out under running guests

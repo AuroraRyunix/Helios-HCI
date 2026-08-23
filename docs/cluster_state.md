@@ -68,6 +68,29 @@ it actually achieved. The CLI then polls the published state and prints which se
 are still pending until every node is up — rather than declaring success the moment the
 start commands have been issued.
 
+### A unit that is mid-transition is not drift
+
+Between the state changes, the loop runs a periodic drift check: one batched
+`systemctl is-active` over the managed units, acting only on the mismatches. It ignores
+any unit reporting `activating` **or** `deactivating`, because both mean the unit is
+already on its way somewhere and the next poll will see where it landed.
+
+Ignoring `deactivating` is what keeps the reconciler from fighting whoever is doing the
+stopping. A unit being stopped reports not-active for as long as the stop takes — ten
+seconds for `spectrum`, which does not go down on SIGTERM and has to be killed — and
+issuing a start inside that window makes systemd **cancel the pending stop job**. The
+operator's `systemctl stop` then fails with `Job for spectrum.service canceled`.
+
+That is not hypothetical: it is what made `deploy_updates.py`'s console restart a no-op
+on two of three nodes. Its `systemctl stop && podman rm -f && systemctl start` chain
+short-circuited on the cancelled stop, so the removal and the start never ran, and the
+console came back up only because the reconciler had already started it. The rollout now
+restarts the console with a single `systemctl restart`, which systemd will not interleave
+another job into, and verifies the unit is active afterwards.
+
+Nothing is lost by waiting a tick. If the stop was not wanted, the unit reads `inactive`
+at the next poll and is started then — which is the whole point of the drift check.
+
 ---
 
 ## 4. ZooKeeper is infrastructure, not a workload

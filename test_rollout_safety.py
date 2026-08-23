@@ -222,5 +222,103 @@ class NvramIsLabelledForSelinux(unittest.TestCase):
             self.assertIn("command -v semanage", block, os.path.basename(path))
 
 
+class TheReconcilerDoesNotFightAStopInProgress(unittest.TestCase):
+    """spark-daemon converges local services toward the desired state in ZooKeeper.
+
+    A unit that is being stopped reports not-active for as long as the stop takes --
+    spectrum ignores SIGTERM and takes the full ten seconds to be killed -- and issuing a
+    start inside that window makes systemd cancel the pending stop job. `systemctl stop`
+    then fails with "Job for spectrum.service canceled", which is what turned the
+    rollout's restart of the console into a no-op on two of three nodes.
+    """
+
+    ORDER = ["spectrum", "vali"]
+
+    def converge(self, states, desired="started"):
+        """One drift check over `states`, returning the commands it issued."""
+        issued = []
+
+        class FakeCompleted:
+            def __init__(self, out):
+                self.stdout = out
+
+        class FakeSubprocess:
+            DEVNULL = -3
+            PIPE = -1
+
+            @staticmethod
+            def run(command, shell=False, stdout=None, stderr=None):
+                if command.startswith("systemctl is-active"):
+                    return FakeCompleted("\n".join(states).encode())
+                issued.append(command)
+                return FakeCompleted(b"")
+
+        scope = load_functions(
+            SPARK, {"converge_to_desired_state"},
+            {"MANAGED_SERVICE_ORDER": list(self.ORDER),
+             "subprocess": FakeSubprocess,
+             "print": lambda *a, **k: None})
+        scope["converge_to_desired_state"](desired)
+        return issued
+
+    def test_a_unit_being_stopped_is_left_alone(self):
+        self.assertEqual(
+            self.converge(["deactivating", "active"]), [],
+            "starting a unit mid-stop cancels the stop job, which is how an operator's "
+            "restart of the console silently became a no-op")
+
+    def test_a_unit_being_started_is_left_alone(self):
+        self.assertEqual(self.converge(["activating", "active"]), [])
+
+    def test_a_unit_that_is_genuinely_down_is_still_started(self):
+        """The reconciler exists because a service that dies later is otherwise left to
+        systemd, and a unit past its restart limit stays down. Skipping in-flight states
+        must not cost that."""
+        self.assertEqual(self.converge(["inactive", "active"]),
+                         ["systemctl start spectrum"])
+
+    def test_a_unit_still_shutting_down_is_not_stopped_again(self):
+        self.assertEqual(self.converge(["deactivating", "deactivating"], "stopped"), [])
+
+    def test_a_unit_that_is_up_when_it_should_not_be_is_stopped(self):
+        self.assertEqual(self.converge(["active", "inactive"], "stopped"),
+                         ["systemctl stop vali"])
+
+
+class TheConsoleRestartIsOneJobAndIsChecked(unittest.TestCase):
+    """`systemctl stop && podman rm -f && systemctl start` failed twice over.
+
+    The `&&` meant a cancelled stop skipped both the removal and the start, so the step
+    reported an error having done nothing and the console came back only because the
+    reconciler had already started it. The gap between the commands also left the unit
+    stopped and unmanaged, which is the window the reconciler was stepping into.
+    """
+
+    def setUp(self):
+        source = read(DEPLOY)
+        start = source.index("# 11. Restart systemd-spectrum service")
+        self.block = strip_comments(source[start:source.index("# 12.", start)])
+
+    def test_the_restart_is_a_single_systemd_job(self):
+        self.assertIn("systemctl restart spectrum", self.block)
+        self.assertNotIn(
+            "systemctl stop spectrum && ", self.block,
+            "the chain is back: a stop that is cancelled skips the start, and the gap "
+            "between them is the window the reconciler starts the unit in")
+
+    def test_a_restart_that_will_not_work_stops_the_rollout(self):
+        """Reporting the failure and carrying on is how a console serves the old image
+        for a month while every rollout says it succeeded -- the same reasoning the image
+        build above it already follows."""
+        self.assertIn("raise RuntimeError", self.block)
+        self.assertNotIn("Error restarting spectrum service", self.block)
+
+    def test_the_end_state_is_verified_rather_than_assumed(self):
+        """An accepted job is not a serving console: a container that dies on a bad
+        config satisfies the exit code and fails the only thing that matters."""
+        self.assertIn("systemctl is-active spectrum", self.block)
+        self.assertIn('!= "active"', self.block)
+
+
 if __name__ == "__main__":
     unittest.main()

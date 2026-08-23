@@ -501,9 +501,22 @@ def converge_to_desired_state(desired, full=False):
         for idx, svc in enumerate(order):
             state = states[idx].strip() if idx < len(states) else ""
             is_active = state == "active"
-            # "activating" is in-flight, not drift; leave it alone rather than restarting
-            # a unit that is already on its way to the right state.
-            if state == "activating":
+            # "activating" and "deactivating" are both in-flight, not drift: the unit is
+            # already on its way somewhere and the next poll sees where it landed.
+            #
+            # Skipping "deactivating" is what keeps this reconciler from fighting whoever
+            # is doing the stopping. A unit being stopped reports not-active for as long
+            # as the stop takes -- ten seconds for spectrum, which does not go down on
+            # SIGTERM and has to be killed -- and starting it inside that window makes
+            # systemd cancel the pending stop job. The stop then fails with "Job for
+            # spectrum.service canceled", which is how the rollout's restart of the
+            # console was being turned into a no-op: its `stop && rm && start` chain
+            # short-circuited on the cancelled stop, and the console came back only
+            # because this reconciler had already started it.
+            #
+            # Nothing is lost by waiting. If the stop was not wanted, the unit is inactive
+            # at the next poll and gets started then.
+            if state in ("activating", "deactivating"):
                 continue
             if running and not is_active:
                 targets.append(svc)

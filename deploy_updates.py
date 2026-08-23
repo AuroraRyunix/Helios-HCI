@@ -1461,13 +1461,67 @@ WantedBy=multi-user.target
                         % (ip, stderr.read().decode().strip()[:600]))
                 
             # 11. Restart systemd-spectrum service
+            #
+            # One systemd job, not three shell commands joined by `&&`. The old form had
+            # two faults that combined into a silent one.
+            #
+            # The `&&` meant a stop that failed skipped both the removal and the start, so
+            # the step reported an error and moved on having done nothing -- and the
+            # console came back up only because spark-daemon's ZooKeeper reconciler had
+            # already started it. That is the same failure the comment above the image
+            # build warns about, one step later: a console still serving the old image
+            # while the rollout says it is done.
+            #
+            # And the gap between stop and start left the unit stopped and unmanaged for
+            # as long as the three commands took. spectrum ignores SIGTERM and takes the
+            # full ten seconds to be killed, which is ample for the reconciler to see it
+            # not-running and start it -- cancelling the pending stop job (the "Job for
+            # spectrum.service canceled" this used to print), and, had the chain
+            # continued, leaving `podman rm -f` to destroy the container it had just made
+            # while `systemctl start` did nothing because the unit already looked active.
+            # The reconciler no longer acts on a unit that is deactivating; keeping the
+            # restart to a single job means it does not have to.
+            #
+            # The Quadlet's own ExecStop removes the container, so the new one is created
+            # from the image just built. `podman rm -f` was only ever covering a leftover
+            # container blocking the start, which is what the retry below is for.
             print(f"[{ip}] Restarting spectrum service...")
-            stdin, stdout, stderr = ssh.exec_command("systemctl stop spectrum && podman rm -f systemd-spectrum && systemctl start spectrum")
-            exit_code = stdout.channel.recv_exit_status()
-            if exit_code != 0:
-                print(f"[{ip}] Error restarting spectrum service: {stderr.read().decode()}")
-            else:
-                print(f"[{ip}] Spectrum service restarted successfully.")
+            _, stdout_sp, stderr_sp = ssh.exec_command(
+                "systemctl daemon-reload; systemctl restart spectrum")
+            if stdout_sp.channel.recv_exit_status() != 0:
+                why = stderr_sp.read().decode().strip()[:300]
+                print(f"[{ip}] spectrum did not restart ({why}); clearing a leftover "
+                      f"container and retrying once...")
+                # `restart` rather than `start` for the last step, because between the
+                # stop and the removal the unit is inactive and something may have started
+                # it again -- in which case `start` is a no-op and would leave the service
+                # active with the container just deleted out from under it. `restart` ends
+                # in a fresh container either way.
+                _, stdout_rt, stderr_rt = ssh.exec_command(
+                    "systemctl stop spectrum; podman rm -f systemd-spectrum 2>/dev/null; "
+                    "systemctl restart spectrum")
+                if stdout_rt.channel.recv_exit_status() != 0:
+                    raise RuntimeError(
+                        "spectrum would not restart on %s, so the console is still "
+                        "serving the image it was already running: %s"
+                        % (ip, stderr_rt.read().decode().strip()[:600]))
+
+            # The exit code says the job was accepted, not that the console is serving.
+            # A unit that starts and immediately dies satisfies the former and fails the
+            # latter, and a rollout that cannot tell them apart is how the console goes a
+            # month without being upgraded while every deployment reports success.
+            # Asked after a couple of seconds rather than immediately: a container that
+            # exits on a bad config does it just after the unit reports started, and a
+            # check that races it reads 'active' for a console that is already gone.
+            _, stdout_chk, _ = ssh.exec_command(
+                "sleep 2; systemctl is-active spectrum")
+            stdout_chk.channel.recv_exit_status()
+            state = stdout_chk.read().decode().strip()
+            if state != "active":
+                raise RuntimeError(
+                    "spectrum is '%s' rather than active on %s after being restarted; "
+                    "`journalctl -u spectrum` will say why" % (state or "unknown", ip))
+            print(f"[{ip}] Spectrum service restarted successfully.")
                 
             # 12. Restart catalyst, dagur, mimir, and vali if active to apply updates, and manage daruk/hydra-db-proxy cleanup
             print(f"[{ip}] Cleaning up old hydra-db-proxy and restarting services...")
