@@ -656,13 +656,13 @@ def submit_catalyst_cql_task(job_name, cql_query):
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
+        with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=10) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res.get("task_id"), None
     except Exception as e:
         return None, str(e)
 
-def catalyst_ssl_context():
+def catalyst_ssl_context(address=None):
     """Client context for calls to Catalyst, which now requires mutual TLS.
 
     Catalyst dispatches cluster work -- VM start, stop, migrate -- and used to accept it
@@ -675,6 +675,11 @@ def catalyst_ssl_context():
     """
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    if address in ("127.0.0.1", "::1", "localhost"):
+        # Reached only when this node's own address could not be determined, so the
+        # alternative is not a verified call but no call at all. Loopback cannot leave the
+        # machine, and mutual TLS still proves the client half.
+        context.check_hostname = False
     return context
 
 def validate_password_complexity(password):
@@ -4601,7 +4606,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     self.send_json(200, {"task_id": res.get("task_id"), "status": "pending"})
             except Exception as e:
@@ -5272,7 +5277,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA BOOTSTRAP] Task submitted successfully: {res}")
@@ -5295,7 +5300,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json"}
                         )
-                        with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=5) as response:
+                        with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=5) as response:
                             res = json.loads(response.read().decode("utf-8"))
                             task_id = res.get("task_id")
                             print(f"[URBOSA CLEANUP] Task submitted successfully: {res}")
@@ -7033,7 +7038,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -7078,7 +7083,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     data=json.dumps(payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -7146,7 +7151,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     data=json.dumps(submit_payload).encode("utf-8"),
                     headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, context=catalyst_ssl_context(), timeout=10) as response:
+                with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip), timeout=10) as response:
                     res = json.loads(response.read().decode("utf-8"))
                     task_id = res.get("task_id")
                     status = res.get("status", "pending")
@@ -7658,8 +7663,29 @@ def is_zookeeper_leader():
     return get_zookeeper_leader_ip() == LOCAL_IP
 
 def get_catalyst_target_ip():
+    """The active Catalyst's address, chosen so its certificate can be verified.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and loopback is in no node's
+    SAN. This returned "127.0.0.1" whenever this node was the leader -- the common case on
+    a small cluster -- so every submission failed with
+
+        certificate verify failed: IP address mismatch,
+        certificate is not valid for '127.0.0.1'
+
+    and with it everything that reaches the cluster through the task queue: urbosa's
+    routers and segments, and each of the six other callers below.
+
+    Catalyst binds 0.0.0.0:9091, so this node's own address reaches the same listener and
+    does verify. `spark_endpoint()` solves the identical problem for spark-daemon; this is
+    the same reasoning applied to the one caller that never got it.
+    """
     leader_ip = get_zookeeper_leader_ip()
-    if leader_ip == LOCAL_IP or leader_ip == "127.0.0.1" or not leader_ip:
+    local = globals().get("LOCAL_IP")
+    if not leader_ip or leader_ip in ("127.0.0.1", "::1", "localhost") or leader_ip == local:
+        if local and local not in ("127.0.0.1", "::1", "localhost"):
+            return local
+        # This node's own address is unknown. The call cannot leave the machine, and
+        # catalyst_ssl_context() drops the identity check rather than failing it.
         return "127.0.0.1"
     return leader_ip
 
