@@ -48,6 +48,19 @@ pub struct Purah {
 pub struct SweepReport {
     pub egroups_known: usize,
     pub egroups_referenced: usize,
+    /// Extent groups this node is recorded as holding, which are still referenced, and
+    /// whose file is on none of its disks.
+    ///
+    /// This is what a failed disk looks like from here. The sweep already reads the whole
+    /// block map to decide what is live and already walks everything this node owns, so
+    /// naming the ones that have gone costs one `exists()` per referenced group and needs
+    /// no new bookkeeping -- which is the reason the disk a group lives on is a node-local
+    /// fact rather than a column in Hydra.
+    ///
+    /// Reads of these do not fail while a replica holds them: `read_extent_from_replica`
+    /// already falls back. What was missing was anyone *saying* so, and a silently
+    /// half-empty node is the failure that gets noticed at the worst moment.
+    pub missing: Vec<String>,
     pub candidates: usize,
     pub reclaimed: Vec<String>,
     pub bytes_reclaimed: u64,
@@ -135,6 +148,12 @@ impl Purah {
         for (id, state, created_at_ms, size) in inventory {
             if referenced.contains(&id) {
                 report.egroups_referenced += 1;
+                // Referenced and recorded here, so it should be on one of this node's
+                // disks. If it is on none of them the bytes are gone locally -- a disk
+                // that failed, was unmounted, or never came back after a reboot.
+                if !self.store.path_for(&id).exists() {
+                    report.missing.push(id.clone());
+                }
                 // Seen referenced: any grace it had accumulated is void.
                 continue;
             }
@@ -276,6 +295,10 @@ impl SweepReport {
             "skipped_held": self.skipped_held,
             "skipped_young": self.skipped_young,
             "skipped_awaiting_grace": self.skipped_grace,
+            // Named, not just counted: an operator needs to know which extent groups went
+            // with a disk, and a bare number cannot be acted on.
+            "missing": self.missing,
+            "missing_count": self.missing.len(),
         })
     }
 }

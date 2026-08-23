@@ -110,6 +110,47 @@ else
 fi
 """
 
+# Give sidon every empty disk, one filesystem each. Kept identical to the copy in
+# provision.py: one claims disks for a new node, the other reaches nodes that already
+# exist, and a difference between them would mean a disk laid out one way on some
+# nodes and another way on the rest. test_multi_disk.py asserts they match.
+CLAIM_EXTRA_DISKS = r"""
+set -e
+SIDON_DISKS=/var/lib/hci/sidon/disks
+mkdir -p "$SIDON_DISKS"
+claimed_pvs="$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | tr '\n' ' ')"
+added=0
+while read -r name size type _rest; do
+    [ "$type" = "disk" ] || continue
+    dev="/dev/$name"
+    case " $claimed_pvs " in *" $dev "*) continue ;; esac
+    if lsblk -n -o MOUNTPOINT "$dev" | grep -qE '[^[:space:]-]'; then continue; fi
+    if lsblk -n -o TYPE "$dev" | grep -qx part; then continue; fi
+    [ "$size" -ge 100000000000 ] || continue
+
+    target="$SIDON_DISKS/$name"
+    mkdir -p "$target"
+    if ! blkid "$dev" >/dev/null 2>&1; then
+        mkfs.xfs -q "$dev"
+        echo "formatted $dev"
+    fi
+    uuid="$(blkid -s UUID -o value "$dev")"
+    if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
+        echo "UUID=$uuid $target xfs defaults,noatime 0 0" >> /etc/fstab
+    fi
+    mountpoint -q "$target" || mount "$target"
+    mkdir -p "$target/egroups"
+    chown root:qemu "$target/egroups" 2>/dev/null || true
+    echo "extent store disk: $dev at $target"
+    added=$((added + 1))
+done <<EOF
+$(lsblk -b -n -o NAME,SIZE,TYPE)
+EOF
+if [ "$added" -eq 0 ]; then
+    echo "no additional empty disk to claim"
+fi
+"""
+
 DRBD_TEARDOWN = """# Tear down what is left of DRBD on a node upgraded from a DRBD cluster.
 #
 # Removing the Quadlets stops the satellite and the controller; it does nothing about
@@ -1052,6 +1093,18 @@ def deploy_to_node(ip):
             detail_sn = stdout_sn.read().decode("utf-8", "replace").strip()
             if detail_sn:
                 print(f"[{ip}] hydra-db snitch: {detail_sn}")
+
+            # Additional empty disks become extent stores of their own. Provisioning does
+            # this for a new node; an existing one was set up before sidon could use more
+            # than one disk, so the rollout is where it reaches them. Idempotent: a disk
+            # already carrying a filesystem is mounted, never reformatted, and one that is
+            # already an LVM physical volume is the first disk and is skipped.
+            print(f"[{ip}] Claiming any additional disks for the extent store...")
+            _, stdout_dk, _ = ssh.exec_command(CLAIM_EXTRA_DISKS)
+            stdout_dk.channel.recv_exit_status()
+            for line in stdout_dk.read().decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    print(f"[{ip}] {line.strip()}")
 
             print(f"[{ip}] Writing the ScyllaDB rack/datacenter properties...")
             _, stdout_rk, _ = ssh.exec_command(

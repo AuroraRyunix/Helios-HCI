@@ -83,7 +83,8 @@ impl Daemon {
         if let Some(parent) = cfg.control_socket.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let store = crate::extent::EgroupStore::new(&cfg.root.join("egroups"), 0)?;
+        let store = crate::extent::EgroupStore::open(
+            crate::extent::discover_disks(&cfg.root), 0)?;
         let purah = Purah::new(
             Daruk::new(&cfg.daruk_addr, cfg.daruk_timeout),
             store,
@@ -861,21 +862,72 @@ impl Daemon {
     /// reclaimed, and every footer. A capacity gate that refuses a VM needs the second
     /// number -- the DRS gate failing open for a year was exactly this distinction going
     /// unnoticed.
+    /// What this node's extent store holds, per disk and in total.
+    ///
+    /// The per-disk breakdown is the point rather than a nicety: with more than one disk
+    /// an operator needs to see one of them filling faster than the others, and a single
+    /// total is precisely what hides that. The summed fields are kept at the top level
+    /// because every existing reader -- Spectrum's pool cards, valcli's extent-store
+    /// table, the capacity gate -- was written against them.
+    ///
+    /// A disk whose filesystem will not answer `statvfs` is reported with nulls rather
+    /// than zeroes. Zero capacity and unknown capacity are different statements, and only
+    /// one of them means "full".
     fn op_capacity(&self) -> Result<Value> {
-        let root = self.cfg.root.join("egroups");
-        let (total, avail) = statfs(&root)?;
+        let disks = crate::extent::discover_disks(&self.cfg.root);
+        let mut per_disk = Vec::new();
+        let mut total = 0u64;
+        let mut avail = 0u64;
         let mut used = 0u64;
         let mut groups = 0u64;
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        used += meta.len();
-                        groups += 1;
+        let mut readable = 0usize;
+
+        for disk in &disks {
+            let space = crate::extent::disk_space(&disk.root);
+            let mut disk_used = 0u64;
+            let mut disk_groups = 0u64;
+            if let Ok(entries) = std::fs::read_dir(&disk.root) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            disk_used += meta.len();
+                            disk_groups += 1;
+                        }
                     }
                 }
             }
+            used += disk_used;
+            groups += disk_groups;
+            match space {
+                Some((t, a)) => {
+                    total += t;
+                    avail += a;
+                    readable += 1;
+                    per_disk.push(json!({
+                        "id": disk.id,
+                        "path": disk.root.to_string_lossy(),
+                        "total_bytes": t,
+                        "available_bytes": a,
+                        "egroup_bytes": disk_used,
+                        "egroup_count": disk_groups,
+                    }));
+                }
+                None => per_disk.push(json!({
+                    "id": disk.id,
+                    "path": disk.root.to_string_lossy(),
+                    "total_bytes": Value::Null,
+                    "available_bytes": Value::Null,
+                    "egroup_bytes": disk_used,
+                    "egroup_count": disk_groups,
+                })),
+            }
         }
+
+        if readable == 0 {
+            return Err(Error::io(
+                "no disk in the extent store would report its capacity".to_string()));
+        }
+
         let mut journal = 0u64;
         if let Ok(entries) = std::fs::read_dir(self.cfg.root.join("journal")) {
             for entry in entries.flatten() {
@@ -884,14 +936,19 @@ impl Daemon {
                 }
             }
         }
+
         Ok(json!({
             "node": self.cfg.node,
-            "path": root.to_string_lossy(),
+            // The first disk's path, for readers that show one. The full list is `disks`.
+            "path": disks.first().map(|d| d.root.to_string_lossy().to_string())
+                .unwrap_or_default(),
             "total_bytes": total,
             "available_bytes": avail,
             "egroup_bytes": used,
             "egroup_count": groups,
             "journal_bytes": journal,
+            "disks": per_disk,
+            "disk_count": disks.len(),
         }))
     }
 
@@ -1213,44 +1270,6 @@ impl Daemon {
             }
         });
     }
-}
-
-/// Total and available bytes of the filesystem holding `path`.
-///
-/// `statvfs` through a direct syscall rather than a crate: it is one call with a
-/// well-known struct layout, and pulling in a libc binding for it would be the only C
-/// dependency in the daemon.
-fn statfs(path: &std::path::Path) -> Result<(u64, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    #[repr(C)]
-    #[derive(Default)]
-    struct StatVfs {
-        f_bsize: u64,
-        f_frsize: u64,
-        f_blocks: u64,
-        f_bfree: u64,
-        f_bavail: u64,
-        f_files: u64,
-        f_ffree: u64,
-        f_favail: u64,
-        f_fsid: u64,
-        f_flag: u64,
-        f_namemax: u64,
-        f_spare: [u32; 6],
-    }
-    extern "C" {
-        fn statvfs(path: *const u8, buf: *mut StatVfs) -> i32;
-    }
-    let mut c_path: Vec<u8> = path.as_os_str().as_bytes().to_vec();
-    c_path.push(0);
-    let mut buf = StatVfs::default();
-    // SAFETY: c_path is NUL-terminated and buf is a correctly sized, owned struct.
-    let rc = unsafe { statvfs(c_path.as_ptr(), &mut buf) };
-    if rc != 0 {
-        return Err(Error::io(format!("statvfs({}) failed", path.display())));
-    }
-    let unit = if buf.f_frsize > 0 { buf.f_frsize } else { buf.f_bsize };
-    Ok((buf.f_blocks.saturating_mul(unit), buf.f_bavail.saturating_mul(unit)))
 }
 
 /// Guest I/O arriving from a node that forwarded it here.

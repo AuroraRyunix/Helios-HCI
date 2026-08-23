@@ -141,7 +141,8 @@ impl Vdisk {
             .to_string();
         let compress = container_compresses(&daruk, &container);
 
-        let store = EgroupStore::new(&cfg.root.join("egroups"), egroup_bytes)?;
+        let store = EgroupStore::open(
+            crate::extent::discover_disks(&cfg.root), egroup_bytes)?;
         let mut journal = Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?;
 
         let mut v = Vdisk {

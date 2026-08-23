@@ -146,6 +146,63 @@ fi
 #
 # And the step as a whole is skipped when `vg_aether` already exists, so re-running
 # provisioning against a live node never reaches the wipe.
+# Give sidon every empty disk, one filesystem each.
+#
+# Deliberately NOT one volume group across them. A thin pool spans its physical volumes, so
+# adding a second disk to vg_aether would make one disk failure take the node's entire
+# extent store -- and make that twice as likely, because two disks could cause it. One
+# filesystem per disk keeps the failure domain at one disk, which is what sidon's placement
+# is written against. The reasoning is in docs/dfs/multi_disk.md.
+#
+# The first disk keeps its existing vg_aether/thin_pool_aether/sidon layout untouched: it
+# is already mounted at the sidon root and its extent groups are already there, and moving
+# a live extent store to gain a naming convention is all risk for no benefit. Additional
+# disks are plain XFS mounted under <root>/disks/<device>.
+#
+# The guards are the whole safety story, because a claimed disk is wiped:
+#
+#   * a disk that is already an LVM physical volume is skipped -- that is disk one;
+#   * any disk with a mountpoint anywhere in its tree is skipped, swap included;
+#   * any disk carrying partitions is skipped;
+#   * it must be at least 100 GB;
+#   * a disk already carrying a filesystem is mounted, never reformatted.
+CLAIM_EXTRA_DISKS = r"""
+set -e
+SIDON_DISKS=/var/lib/hci/sidon/disks
+mkdir -p "$SIDON_DISKS"
+claimed_pvs="$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | tr '\n' ' ')"
+added=0
+while read -r name size type _rest; do
+    [ "$type" = "disk" ] || continue
+    dev="/dev/$name"
+    case " $claimed_pvs " in *" $dev "*) continue ;; esac
+    if lsblk -n -o MOUNTPOINT "$dev" | grep -qE '[^[:space:]-]'; then continue; fi
+    if lsblk -n -o TYPE "$dev" | grep -qx part; then continue; fi
+    [ "$size" -ge 100000000000 ] || continue
+
+    target="$SIDON_DISKS/$name"
+    mkdir -p "$target"
+    if ! blkid "$dev" >/dev/null 2>&1; then
+        mkfs.xfs -q "$dev"
+        echo "formatted $dev"
+    fi
+    uuid="$(blkid -s UUID -o value "$dev")"
+    if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
+        echo "UUID=$uuid $target xfs defaults,noatime 0 0" >> /etc/fstab
+    fi
+    mountpoint -q "$target" || mount "$target"
+    mkdir -p "$target/egroups"
+    chown root:qemu "$target/egroups" 2>/dev/null || true
+    echo "extent store disk: $dev at $target"
+    added=$((added + 1))
+done <<EOF
+$(lsblk -b -n -o NAME,SIZE,TYPE)
+EOF
+if [ "$added" -eq 0 ]; then
+    echo "no additional empty disk to claim"
+fi
+"""
+
 CLAIM_EXTENT_DISK = r"""
 set -e
 if vgs vg_aether >/dev/null 2>&1; then
@@ -1435,6 +1492,14 @@ WantedBy=multi-user.target
                 check_exit=True)
             node.execute("blkid /dev/vg_aether/sidon >/dev/null 2>&1 || mkfs.xfs -q /dev/vg_aether/sidon",
                          check_exit=True)
+            # Any further empty disks become extent stores of their own. Runs after the
+            # first disk is set up, so its volume group is already a claimed PV and the
+            # guard below skips it.
+            print(f"[{node.ip}] Claiming any additional disks for the extent store...")
+            _rc_x, extra_out, _err_x = node.execute(CLAIM_EXTRA_DISKS, check_exit=True)
+            for line in (extra_out or "").splitlines():
+                if line.strip():
+                    print(f"[{node.ip}] {line.strip()}")
             node.execute("mkdir -p /var/lib/hci/sidon")
             # By UUID, with nofail and a device timeout.
             #
