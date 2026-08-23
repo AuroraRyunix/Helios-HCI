@@ -1948,6 +1948,16 @@ def parse_free_m_all(stdout):
 
 
 def get_default_container():
+    """The container a disk lands in when the request does not name one.
+
+    Defined in helios_sidon so the CLI, the console and the Kubernetes engine cannot
+    drift to different answers -- which they had: Sidon's own fallback is "default" and
+    this returned "default-pool", so a vdisk created without an explicit container
+    referenced a container that did not exist.
+    """
+    module = sidon_module()
+    if module is not None:
+        return getattr(module, "DEFAULT_CONTAINER", "default-pool")
     return "default-pool"
 
 
@@ -5804,6 +5814,24 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 else:
                     disks_parsed.append({"size": d, "container": get_default_container()})
 
+            # The container has to be a real one, because it is about to decide this
+            # disk's compression and is recorded on the vdisk row that outlives the
+            # request. A name nothing matches is not a harmless default: it resolves to no
+            # policy at all, silently.
+            for d_info in disks_parsed:
+                target = d_info["container"]
+                if not is_valid_container_name(target):
+                    self.send_json(400, {"error": CONTAINER_NAME_ERROR})
+                    return
+                rc_c, stdout_c, _ = run_cql_query(
+                    f"SELECT JSON name FROM hydra.storage_containers WHERE name = '{target}';")
+                if rc_c != 0:
+                    self.send_json(503, {"error": "The container catalogue could not be read, so a disk cannot be placed."})
+                    return
+                if not parse_json_rows(stdout_c):
+                    self.send_json(404, {"error": f"No storage container named '{target}'."})
+                    return
+
             disk_paths = []
             created_disks = []
             primary_disk_size_gb = 10
@@ -5823,9 +5851,16 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 vdisk_id = module.vdisk_id_for(name, idx)
                 d_path = module.nbd_socket(vdisk_id)
                 try:
+                    # The container the operator chose for *this* disk. Without it Sidon
+                    # falls back to "default", which is not the same string as this
+                    # cluster's default container ("default-pool") and matches no row --
+                    # so the disk inherited no tier, no quota and no compression, and the
+                    # container recorded in the VM's own disks_list meant nothing below
+                    # the VM record. VM disks are the main thing compression is for.
                     ok, body = sidon_call(
                         "create", vdisk_id=vdisk_id,
-                        size_bytes=int(primary_size) * 1024 * 1024 * 1024)
+                        size_bytes=int(primary_size) * 1024 * 1024 * 1024,
+                        container=d_info["container"])
                     if not ok and "already exists" not in str(body):
                         raise Exception(f"Sidon could not create vdisk {vdisk_id}: {body}")
                     # Attached here rather than at boot: the socket has to exist before

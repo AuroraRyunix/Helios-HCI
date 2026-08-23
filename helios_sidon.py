@@ -20,6 +20,15 @@ import socket
 
 CONTROL_SOCKET = os.environ.get("SIDON_CONTROL", "/run/sidon/control.sock")
 NBD_DIR = os.environ.get("SIDON_NBD_DIR", "/var/lib/hci/sidon/nbd")
+
+# The container a vdisk belongs to when nobody says otherwise.
+#
+# Sidon's own fallback is the literal "default", which is *not* this string -- so a create
+# that omitted the container produced a vdisk referencing a container that matched no row
+# in hydra.storage_containers. That is not a harmless default: the vdisk inherited no
+# tier, no quota and no compression, and nothing said so. Every Python caller passes this
+# explicitly rather than relying on either fallback.
+DEFAULT_CONTAINER = "default-pool"
 CLUSTER_JSON = "/etc/hci/cluster.json"
 
 # The engine names `cluster.json` may carry. The key has existed since the GlusterFS
@@ -128,7 +137,7 @@ def call(op, socket_path=None, timeout=60, **params):
     return body
 
 
-def create_vdisk(vdisk_id, size_bytes, container="default", vdisk_class="rw", **kw):
+def create_vdisk(vdisk_id, size_bytes, container=DEFAULT_CONTAINER, vdisk_class="rw", **kw):
     return call(
         "create",
         vdisk_id=vdisk_id,

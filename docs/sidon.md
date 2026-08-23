@@ -220,7 +220,58 @@ The bind address and the peer list are read from `/etc/hci/cluster.json` rather 
 configured into the unit. A one-host cluster binds loopback, because at ftt=0 there is
 nothing to replicate to; a second host appearing in that document is all it takes.
 
-## 8. What is not built
+## 8. Compression
+
+Compression is a property of the **container**, not of a vdisk and not of the cluster. A
+container is already the unit an operator reasons about for tier, quota and fault
+tolerance, and it is the level where this trade-off is actually decided: a container of
+golden images is written once and read forever and wants it on; one holding a database's
+data files usually does not.
+
+```
+valcli storage.container.create templates --compression lz4
+valcli storage.container.update default-pool --compression lz4
+valcli storage.list                      # the setting is a column
+```
+
+The console's storage page has the same controls, and an image upload takes the container
+it should land in — which matters more there than anywhere, since an ISO is the clearest
+case of write-once-read-many.
+
+### What it does, and when
+
+An extent is compressed as it is **sealed into an extent group**, and an extent group is
+never rewritten. Three consequences follow, and they are the whole reason this is safe to
+change on a live container:
+
+* Turning it on applies to what gets sealed **next**. Nothing already on disk is touched,
+  so enabling it does not start a rewrite storm and does not reclaim anything by itself.
+* Turning it off is equally undramatic. Already-compressed groups stay compressed and stay
+  readable, because each extent's footer records what it actually is rather than what its
+  container currently says.
+* Sidon reads the setting when it **opens** a vdisk. A change therefore takes effect the
+  next time that vdisk is attached, not mid-flight.
+
+An operator who turns compression on and sees usage unchanged is seeing it work.
+
+### What it costs to verify
+
+The footer's checksum covers the bytes **as stored**. A scrub therefore verifies a
+compressed extent group without decompressing any of it, and a repair copies a compressed
+extent to a new replica as a byte copy — neither path has to know the codec. That is why
+compression did not complicate Purah at all.
+
+Incompressible data is stored verbatim. LZ4 on random bytes produces more than it
+consumed, and a setting meant to save space must not be able to cost it.
+
+### Reading old data
+
+`COMP_NONE` is zero, which is what the reserved byte in every footer written before this
+existed already contains. Those extents read back unchanged, with no backfill, no
+migration and no version check. A container with no compression column — every container
+that predates the setting — behaves exactly as it did.
+
+## 9. What is not built
 
 - **Scheduled snapshots.** Taking one is a command; nothing takes them on a timer, prunes
   them by a retention policy, or presents them in the console. The mechanism is done and
@@ -229,8 +280,7 @@ nothing to replicate to; a second host appearing in that document is all it take
   enough to recover data and not the same as putting a VM back. Rolling a vdisk *back* to
   a snapshot in place needs the ownership and epoch story thought through, because it
   changes what an attached guest is reading underneath itself.
-- **Compression** at seal time, which is cheap because sealed groups are immutable and the
-  footer already carries an algorithm byte. **Erasure coding** as a Purah job over cold
+- **Erasure coding** as a Purah job over cold
   sealed groups. **Deduplication** is argued against in
   [decisions.md](./dfs/decisions.md): the win on VM disks is identical OS images, which
   clone-from-image now gets for free as a map copy.

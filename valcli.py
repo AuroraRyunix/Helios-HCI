@@ -708,7 +708,8 @@ def cmd_storage_benchmark(container_name):
     print("Creating temporary vdisk '%s' (100 MiB)..." % vdisk_id)
     rc_c, body_c, err_c = run_mtls_spark_api(
         "127.0.0.1", "/api/v1/dfs/vdisk",
-        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": 100 * 1024 * 1024})
+        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": 100 * 1024 * 1024,
+         "container": default_container()})
     if rc_c != 0:
         detail = body_c.get("error") if isinstance(body_c, dict) else err_c
         print("Error: could not create the benchmark vdisk: %s" % detail)
@@ -1319,6 +1320,20 @@ def cmd_health_check():
             indented = "  " + "\n  ".join(fc["output"].splitlines())
             print(indented)
             print("-" * 50)
+
+def default_container():
+    """The container a vdisk lands in when nothing names one.
+
+    Read from helios_sidon so the CLI cannot disagree with the console about what the
+    default is -- they did, and a vdisk created without an explicit container ended up
+    referencing a container that matched no row at all.
+    """
+    try:
+        import helios_sidon
+        return helios_sidon.DEFAULT_CONTAINER
+    except Exception:
+        return "default-pool"
+
 
 def run_spectrum_api(path, method="GET", payload=None):
     import ssl

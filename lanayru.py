@@ -200,8 +200,11 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
 
             # 1. Create the node's vdisk (50 GiB, per Tanzu/LKE sizing)
             log(f"Creating vdisk '{res_name}' (50 GiB)...", "info")
+            # Named explicitly: Sidon's fallback container is not the cluster's, and a
+            # guest cluster's disks should inherit the same policy as everything else.
             ok_c, body_c = sidon_call("create", vdisk_id=res_name,
-                                      size_bytes=50 * 1024 * 1024 * 1024)
+                                      size_bytes=50 * 1024 * 1024 * 1024,
+                                      container=sidon_module().DEFAULT_CONTAINER)
             if not ok_c and "already exists" not in str(body_c):
                 raise Exception(f"Could not create vdisk {res_name}: {body_c}")
 

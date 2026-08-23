@@ -90,10 +90,131 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     Application.put_env(:spectrum_phx, :storage_source, {:static, payload})
   end
 
+  defp container(name, opts \\ []) do
+    %{
+      "name" => name,
+      "tier" => Keyword.get(opts, :tier, "SSD"),
+      "quota_bytes" => Keyword.get(opts, :quota, 0),
+      "path" => name,
+      "ftt" => Keyword.get(opts, :ftt, 0),
+      "compression" => Keyword.get(opts, :compression, nil)
+    }
+  end
+
+  defp put_containers(rows),
+    do: Application.put_env(:spectrum_phx, :containers_source, {:static, rows})
+
+  defp put_container_vdisks(rows),
+    do: Application.put_env(:spectrum_phx, :containers_vdisk_source, {:static, rows})
+
   setup do
     put_source(healthy())
-    on_exit(fn -> Application.delete_env(:spectrum_phx, :storage_source) end)
+    put_containers([container("default-pool"), container("packed", compression: "lz4")])
+    put_container_vdisks([])
+
+    on_exit(fn ->
+      Application.delete_env(:spectrum_phx, :storage_source)
+      Application.delete_env(:spectrum_phx, :containers_source)
+      Application.delete_env(:spectrum_phx, :containers_vdisk_source)
+    end)
+
     :ok
+  end
+
+  describe "containers" do
+    test "lists them with their compression setting", %{conn: conn} do
+      {:ok, _view, html} = mount_view(conn)
+
+      assert html =~ "default-pool"
+      assert html =~ "packed"
+      assert html =~ "lz4"
+    end
+
+    test "a null compression column is drawn as 'none', not as blank", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      row = view |> element("#container-default-pool") |> render()
+      assert row =~ "none"
+    end
+
+    test "the compression toggle offers the opposite of what is set", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      assert view |> element("#container-default-pool") |> render() =~ "Compress"
+      assert view |> element("#container-packed") |> render() =~ "Stop compressing"
+    end
+
+    test "toggling says plainly that existing data is not rewritten", %{conn: conn} do
+      # The surprising half. An operator who turns compression on and sees usage unchanged
+      # should already know why.
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> element("#container-default-pool button", "Compress")
+        |> render_click()
+
+      assert html =~ "existing data is not rewritten"
+    end
+
+    test "creating one refuses a name that could not be bound", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("form[phx-submit=create_container]", %{
+          "name" => "not a name",
+          "tier" => "SSD",
+          "quota_gb" => "0",
+          "ftt" => "0",
+          "compression" => "none"
+        })
+        |> render_submit()
+
+      assert html =~ "Invalid container name"
+    end
+
+    test "creating one refuses a name already in use", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("form[phx-submit=create_container]", %{
+          "name" => "packed",
+          "tier" => "SSD",
+          "quota_gb" => "0",
+          "ftt" => "0",
+          "compression" => "none"
+        })
+        |> render_submit()
+
+      assert html =~ "already exists"
+    end
+
+    test "deleting one that still holds vdisks names them", %{conn: conn} do
+      put_container_vdisks([
+        %{"vdisk_id" => "vm-a-disk0", "container" => "packed"},
+        %{"vdisk_id" => "vm-b-disk0", "container" => "packed"}
+      ])
+
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> element("#container-packed button", "Delete")
+        |> render_click()
+
+      assert html =~ "still holds 2 vdisk(s)"
+      assert html =~ "vm-a-disk0"
+    end
+
+    test "an unreadable catalogue is not drawn as an empty one", %{conn: conn} do
+      # The same rule the rest of this page follows: unknown is not healthy.
+      Application.put_env(:spectrum_phx, :containers_source, :hydra)
+      {:ok, _view, html} = mount_view(conn)
+
+      assert html =~ "could not be read" or html =~ "containers-error"
+    end
   end
 
   describe "healthy fabric" do

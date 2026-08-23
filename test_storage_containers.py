@@ -23,6 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SPECTRUM = os.path.join(HERE, "spectrum_server.py")
 SCHEMA = os.path.join(HERE, "helios_schema.py")
 VALCLI = os.path.join(HERE, "valcli.py")
+CONTAINERS_EX = os.path.join(
+    HERE, "spectrum_phx", "lib", "spectrum_phx", "storage", "containers.ex")
 EXTENT_RS = os.path.join(HERE, "sidon", "src", "extent.rs")
 VDISK_RS = os.path.join(HERE, "sidon", "src", "vdisk.rs")
 
@@ -231,6 +233,95 @@ class ValcliSurfacesTheReason(unittest.TestCase):
         source = read(VALCLI)
         self.assertIn('"Compression"', source)
         self.assertIn("SELECT JSON name, tier, quota_bytes, path, ftt, compression", source)
+
+
+class EveryVdiskLandsInARealContainer(unittest.TestCase):
+    """A vdisk created without an explicit container referenced one that did not exist.
+
+    Sidon's fallback is the literal "default"; this cluster's default container is
+    "default-pool". They are not the same string, so the row matched nothing in
+    hydra.storage_containers and the vdisk inherited no tier, no quota and no compression
+    -- silently, because a missing container reads as "not configured" rather than as an
+    error. Both live vdisks on the test node were in that state.
+
+    VM disks are the case that matters: the container an operator picks is recorded in the
+    VM's own disks_list, and until this was fixed it meant nothing below the VM record.
+    """
+
+    def test_the_default_has_exactly_one_definition(self):
+        sidon = read(os.path.join(HERE, "helios_sidon.py"))
+        self.assertIn('DEFAULT_CONTAINER = "default-pool"', sidon)
+        self.assertIn("container=DEFAULT_CONTAINER", sidon)
+
+    def test_vm_disks_are_created_in_the_container_they_name(self):
+        source = read(SPECTRUM)
+        self.assertIn('container=d_info["container"]', source)
+
+    def test_a_vm_disk_container_must_exist_before_anything_is_created(self):
+        source = read(SPECTRUM)
+        create = source[source.index("disks_parsed = []"):]
+        create = create[:create.index('sidon_call(')]
+        self.assertIn("is_valid_container_name(target)", create)
+        self.assertIn("No storage container named", create)
+
+    def test_no_python_caller_relies_on_sidon_own_fallback(self):
+        """Each of these creates a vdisk. None may omit the container."""
+        for path, marker in (
+            (os.path.join(HERE, "lanayru.py"), "sidon_module().DEFAULT_CONTAINER"),
+            (VALCLI, '"container": default_container()'),
+        ):
+            self.assertIn(marker, read(path), os.path.basename(path))
+
+
+class TheTwoTiersAgreeOnTheRules(unittest.TestCase):
+    """Phoenix validates natively rather than proxying to the Python tier, which is the
+    point of the migration -- and means the rules exist twice. Two implementations that
+    are allowed to drift are worse than one, because a container the console accepts and
+    the CLI refuses is a bug nobody can reproduce.
+
+    Compared as *values*, not as prose: the constants are the contract.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.elixir = read(CONTAINERS_EX)
+        cls.python = load_from(
+            SPECTRUM,
+            {"CONTAINER_COMPRESSION_MODES", "CONTAINER_TIERS", "_CONTAINER_NAME_RE"},
+            {"re": re})
+
+    def elixir_words(self, function):
+        """The `~w(...)` list a zero-arity Elixir function returns."""
+        m = re.search(r"def %s, do: ~w\(([^)]*)\)" % re.escape(function), self.elixir)
+        self.assertIsNotNone(m, "containers.ex no longer defines %s" % function)
+        return tuple(m.group(1).split())
+
+    def test_the_compression_modes_are_the_same_list(self):
+        self.assertEqual(
+            self.elixir_words("compression_modes"),
+            tuple(self.python["CONTAINER_COMPRESSION_MODES"]),
+            "the console and the CLI would accept different compression settings")
+
+    def test_the_tiers_are_the_same_list(self):
+        self.assertEqual(
+            self.elixir_words("tiers"),
+            tuple(self.python["CONTAINER_TIERS"]),
+            "the console and the CLI would accept different storage tiers")
+
+    def test_the_name_rule_is_the_same_expression(self):
+        m = re.search(r"@name_re ~r/\^(.*)\$/", self.elixir)
+        self.assertIsNotNone(m, "containers.ex no longer defines @name_re")
+        elixir_body = m.group(1)
+        python_body = self.python["_CONTAINER_NAME_RE"].pattern.lstrip("^").rstrip("$")
+        self.assertEqual(
+            elixir_body, python_body,
+            "a name one tier accepts would be refused by the other")
+
+    def test_both_treat_a_missing_container_column_as_default(self):
+        """Sidon assumes `default` when a vdisk has no container recorded. If a tier
+        disagreed, deleting `default` would succeed while vdisks were still using it."""
+        self.assertIn('(row["container"] || "default")', self.elixir)
+        self.assertIn('(row.get("container") or "default")', read(SPECTRUM))
 
 
 if __name__ == "__main__":
