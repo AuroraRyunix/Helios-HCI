@@ -359,8 +359,135 @@ def cmd_drs_status():
         print("No recent DRS migration events.")
     print("==========================================================")
 
+def cmd_storage_container_create(argv):
+    """Create a storage container: the policy every vdisk in it inherits.
+
+    Goes through Spectrum rather than writing the row here, so the CLI and the console
+    enforce one set of rules -- name shape, tier, and a compression value the storage
+    daemon will actually recognise -- instead of two that drift.
+    """
+    if len(argv) < 3:
+        print("Usage: valcli storage.container.create <name> [--tier SSD|HDD|NVME] "
+              "[--quota-gb N] [--ftt N] [--compression none|lz4]")
+        sys.exit(1)
+
+    payload = {"name": argv[2]}
+    i = 3
+    while i < len(argv):
+        flag = argv[i]
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        if value is None:
+            print(f"Error: {flag} needs a value.")
+            sys.exit(1)
+        if flag == "--tier":
+            payload["tier"] = value
+        elif flag == "--quota-gb":
+            try:
+                payload["quota_bytes"] = int(value) * (1024 ** 3)
+            except ValueError:
+                print("Error: --quota-gb must be a whole number of gigabytes.")
+                sys.exit(1)
+        elif flag == "--ftt":
+            payload["ftt"] = value
+        elif flag == "--compression":
+            payload["compression"] = value
+        else:
+            print(f"Error: unknown option {flag}")
+            sys.exit(1)
+        i += 2
+
+    rc, body = run_spectrum_api(
+        "/api/storage/containers/create", method="POST", payload=payload)
+    _print_container_result(rc, body, "created")
+
+
+def cmd_storage_container_update(argv):
+    """Change a container's policy. Only the flags given are touched."""
+    if len(argv) < 3:
+        print("Usage: valcli storage.container.update <name> [--tier ...] [--quota-gb N] "
+              "[--ftt N] [--compression none|lz4]")
+        sys.exit(1)
+
+    payload = {"name": argv[2]}
+    i = 3
+    while i < len(argv):
+        flag = argv[i]
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        if value is None:
+            print(f"Error: {flag} needs a value.")
+            sys.exit(1)
+        if flag == "--tier":
+            payload["tier"] = value
+        elif flag == "--quota-gb":
+            try:
+                payload["quota_bytes"] = int(value) * (1024 ** 3)
+            except ValueError:
+                print("Error: --quota-gb must be a whole number of gigabytes.")
+                sys.exit(1)
+        elif flag == "--ftt":
+            payload["ftt"] = value
+        elif flag == "--compression":
+            payload["compression"] = value
+        else:
+            print(f"Error: unknown option {flag}")
+            sys.exit(1)
+        i += 2
+
+    if len(payload) == 1:
+        print("Nothing to change. Give at least one of --tier, --quota-gb, --ftt, --compression.")
+        sys.exit(1)
+    # The server treats an absent quota as zero, which is "unlimited" rather than "leave
+    # it alone", so an update that does not mean to touch it has to say what it is.
+    if "quota_bytes" not in payload:
+        payload["quota_bytes"] = _current_quota_bytes(argv[2])
+
+    rc, body = run_spectrum_api(
+        "/api/storage/containers/update", method="POST", payload=payload)
+    _print_container_result(rc, body, "updated")
+
+
+def cmd_storage_container_delete(argv):
+    """Delete a container. Refused while any vdisk still names it."""
+    if len(argv) < 3:
+        print("Usage: valcli storage.container.delete <name>")
+        sys.exit(1)
+    rc, body = run_spectrum_api(
+        "/api/storage/containers/delete", method="POST", payload={"name": argv[2]})
+    _print_container_result(rc, body, "deleted")
+
+
+def _current_quota_bytes(name):
+    """This container's quota as it stands, so an update can leave it where it was."""
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON quota_bytes FROM hydra.storage_containers WHERE name = '%s';" % name)
+    if rc != 0:
+        return 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return int(json.loads(line).get("quota_bytes") or 0)
+            except Exception:
+                return 0
+    return 0
+
+
+def _print_container_result(rc, body, verb):
+    if rc != 0:
+        detail = body.get("error") if isinstance(body, dict) else body
+        print("Error: %s" % (detail or "the request was refused"))
+        sys.exit(1)
+    if isinstance(body, dict):
+        print("Success: %s" % body.get("message", "container %s." % verb))
+        if body.get("note"):
+            print("  Note: %s" % body["note"])
+    else:
+        print("Success: container %s." % verb)
+
+
 def cmd_storage_list():
-    cql = "SELECT JSON name, tier, quota_bytes, path, ftt FROM hydra.storage_containers;"
+    cql = ("SELECT JSON name, tier, quota_bytes, path, ftt, compression "
+           "FROM hydra.storage_containers;")
     rc, stdout, err = run_cql_query(cql)
     if rc != 0:
         print(err)
@@ -375,7 +502,7 @@ def cmd_storage_list():
             except Exception:
                 pass
                 
-    headers = ["Container Name", "Storage Tier", "Quota (GB)", "POSIX Path", "FTT"]
+    headers = ["Container Name", "Storage Tier", "Quota (GB)", "POSIX Path", "FTT", "Compression"]
     # Detect host count for FTT override
     hosts_count = 1
     try:
@@ -398,7 +525,10 @@ def cmd_storage_list():
             r.get("tier", "SSD"),
             quota_str,
             r.get("path", "N/A"),
-            ftt_val
+            ftt_val,
+            # Null is how every container that predates the column reads, and it means the
+            # same thing the column means when it is set to "none".
+            r.get("compression") or "none",
         ])
     print("=== Storage Containers ===")
     print_table(headers, rows)
@@ -1192,6 +1322,7 @@ def cmd_health_check():
 
 def run_spectrum_api(path, method="GET", payload=None):
     import ssl
+    import urllib.error
     import urllib.request
     # Pinned to the console certificate rather than CERT_NONE. Loopback, so the exposure
     # was small, but "verify nothing" and "verify the local console" are different things.
@@ -1212,6 +1343,13 @@ def run_spectrum_api(path, method="GET", payload=None):
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
             return 0, json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        # The body is the useful half: Spectrum refuses with a sentence saying why, and
+        # reporting the status line instead throws that sentence away.
+        try:
+            return -1, json.loads(e.read().decode('utf-8'))
+        except Exception:
+            return -1, "%s %s" % (e.code, e.reason)
     except Exception as e:
         return -1, str(e)
 
@@ -1934,6 +2072,10 @@ def print_usage():
     print("  valcli host.maintenance.leave <h>  Take host (or '--all') out of maintenance mode")
     print("  valcli cluster.vip.set <vip>       Configure cluster-wide Virtual IP (VIP)")
     print("  valcli storage.list                List storage containers, per-node extent stores and vdisks")
+    print("  valcli storage.container.create <name> [--tier T] [--quota-gb N] [--ftt N] [--compression none|lz4]")
+    print("                                     Create a storage container")
+    print("  valcli storage.container.update <name> [same options]  Change a container's policy")
+    print("  valcli storage.container.delete <name>  Delete a container (refused while in use)")
     print("  valcli storage.benchmark <name>    Run safe read/write performance benchmark")
     print("  valcli storage.cleanup_orphaned    Delete orphaned virtual disk and NVRAM files")
     print("  valcli storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
@@ -2045,6 +2187,12 @@ def main():
         cmd_cluster_vip_set(sys.argv[2])
     elif cmd == "storage.list":
         cmd_storage_list()
+    elif cmd == "storage.container.create":
+        cmd_storage_container_create(sys.argv)
+    elif cmd == "storage.container.update":
+        cmd_storage_container_update(sys.argv)
+    elif cmd == "storage.container.delete":
+        cmd_storage_container_delete(sys.argv)
     elif cmd == "storage.benchmark":
         if len(sys.argv) < 3:
             print("Error: Storage container name is required.")

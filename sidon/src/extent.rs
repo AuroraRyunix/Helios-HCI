@@ -22,8 +22,14 @@ use crate::err::{Error, Result};
 /// got the bytes it asked for and not a neighbour's.
 ///
 /// ```text
-/// crc u32 | algorithm u8 | reserved [u8;3] | vdisk_hash u64 | extent_index u64
+/// crc u32 | algorithm u8 | codec u8 | reserved [u8;2] | vdisk_hash u64
+///                             | extent_index u64 | plain_len u64
 /// ```
+///
+/// The crc covers the bytes **as stored**, compressed or not, so a scrub can check an
+/// extent group without decompressing any of it and a replica copy stays a byte copy.
+/// `plain_len` is what the extent expands back to; it is meaningless when `codec` is
+/// `COMP_NONE`, which is what every footer written before compression existed says.
 ///
 /// `vdisk_hash` and `extent_index` are what make a *misdirected* read self-evident: a
 /// correct checksum only proves the bytes are undamaged, not that they are the right
@@ -31,13 +37,66 @@ use crate::err::{Error, Result};
 pub const FOOTER_LEN: usize = 32;
 pub const ALGO_CRC32C: u8 = 1;
 
-pub fn footer_for(data: &[u8], vdisk_hash: u64, extent_index: u64) -> [u8; FOOTER_LEN] {
+/// Stored verbatim. Zero on purpose: every footer written before compression existed
+/// already reads as this, so old extents need no backfill and no version check.
+pub const COMP_NONE: u8 = 0;
+pub const COMP_LZ4: u8 = 1;
+
+pub fn footer_with(
+    stored: &[u8],
+    vdisk_hash: u64,
+    extent_index: u64,
+    codec: u8,
+    plain_len: u64,
+) -> [u8; FOOTER_LEN] {
     let mut f = [0u8; FOOTER_LEN];
-    f[0..4].copy_from_slice(&crc32c(0, data).to_le_bytes());
+    f[0..4].copy_from_slice(&crc32c(0, stored).to_le_bytes());
     f[4] = ALGO_CRC32C;
+    f[5] = codec;
     f[8..16].copy_from_slice(&vdisk_hash.to_le_bytes());
     f[16..24].copy_from_slice(&extent_index.to_le_bytes());
+    f[24..32].copy_from_slice(&plain_len.to_le_bytes());
     f
+}
+
+/// Compress an extent, or decline to.
+///
+/// Returns the bytes to store and the codec that describes them. Incompressible data is
+/// stored verbatim rather than slightly larger: a codec that can inflate its input is a
+/// codec that can overrun an extent group's budget on exactly the data that gains nothing
+/// from it.
+pub fn encode_extent(data: &[u8], compress: bool) -> (Vec<u8>, u8) {
+    if !compress || data.is_empty() {
+        return (data.to_vec(), COMP_NONE);
+    }
+    let packed = lz4_flex::block::compress(data);
+    if packed.len() < data.len() {
+        (packed, COMP_LZ4)
+    } else {
+        (data.to_vec(), COMP_NONE)
+    }
+}
+
+/// Expand an extent back to what the guest wrote, per the codec its footer names.
+///
+/// An unknown codec is corruption, not a newer format to be tolerated: the alternative is
+/// handing a guest bytes this build cannot prove are its own.
+pub fn decode_extent(stored: &[u8], footer: &[u8]) -> Result<Vec<u8>> {
+    if footer.len() < FOOTER_LEN {
+        return Err(Error::corrupt("extent footer truncated".to_string()));
+    }
+    match footer[5] {
+        COMP_NONE => Ok(stored.to_vec()),
+        COMP_LZ4 => {
+            let plain_len = u64::from_le_bytes(footer[24..32].try_into().unwrap()) as usize;
+            lz4_flex::block::decompress(stored, plain_len).map_err(|e| {
+                Error::corrupt(format!("extent will not decompress: {e}"))
+            })
+        }
+        other => Err(Error::corrupt(format!(
+            "extent footer names compression codec {other}, which this build cannot read"
+        ))),
+    }
 }
 
 pub fn verify_footer(
@@ -127,16 +186,20 @@ impl EgroupStore {
         data: &[u8],
         vdisk_hash: u64,
         extent_index: u64,
-    ) -> Result<(u32, Vec<u8>)> {
-        let footer = footer_for(data, vdisk_hash, extent_index);
+        compress: bool,
+    ) -> Result<(u32, u32, Vec<u8>)> {
+        let (stored, codec) = encode_extent(data, compress);
+        let footer = footer_with(&stored, vdisk_hash, extent_index, codec, data.len() as u64);
         let offset = eg.size;
-        let mut buf = Vec::with_capacity(data.len() + FOOTER_LEN);
-        buf.extend_from_slice(data);
+        let mut buf = Vec::with_capacity(stored.len() + FOOTER_LEN);
+        buf.extend_from_slice(&stored);
         buf.extend_from_slice(&footer);
         eg.file.seek(SeekFrom::Start(offset))?;
         eg.file.write_all(&buf)?;
         eg.size += buf.len() as u64;
-        Ok((offset as u32, buf))
+        // The stored length, which is what the block map has to record: a read seeks by it
+        // and a compressed extent is not the size the guest thinks it is.
+        Ok((offset as u32, stored.len() as u32, buf))
     }
 
     /// Make everything appended so far durable. Called once per drain batch, before the
@@ -172,9 +235,9 @@ impl EgroupStore {
                 length as usize + FOOTER_LEN
             ))
         })?;
-        let (data, footer) = buf.split_at(length as usize);
-        verify_footer(data, footer, vdisk_hash, extent_index)?;
-        Ok(data.to_vec())
+        let (stored, footer) = buf.split_at(length as usize);
+        verify_footer(stored, footer, vdisk_hash, extent_index)?;
+        decode_extent(stored, footer)
     }
 
     /// One extent plus its footer, exactly as stored.
@@ -230,11 +293,95 @@ mod tests {
         let mut eg = store.create("eg-test-1").unwrap();
         let vh = vdisk_hash("vd-1");
         let data = vec![0x5Au8; 4096];
-        let (off, _) = store.append_framed(&mut eg, &data, vh, 3).unwrap();
+        let (off, _len, _) = store.append_framed(&mut eg, &data, vh, 3, false).unwrap();
         store.sync(&mut eg).unwrap();
         let back = store.read_extent("eg-test-1", off, 4096, vh, 3).unwrap();
         assert_eq!(back, data);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_compressed_extent_reads_back_as_what_was_written() {
+        let dir = tmpdir("comp-roundtrip");
+        let store = EgroupStore::new(&dir, 1 << 20).unwrap();
+        let mut eg = store.create("eg-z").unwrap();
+        let vh = vdisk_hash("vd-z");
+        // Compressible on purpose: a guest filesystem is mostly zeroes and repetition,
+        // which is the case compression exists for.
+        let mut data = vec![0u8; 64 * 1024];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i / 512) as u8;
+        }
+        let (off, stored, _) = store.append_framed(&mut eg, &data, vh, 9, true).unwrap();
+        store.sync(&mut eg).unwrap();
+
+        assert!(
+            (stored as usize) < data.len(),
+            "compressible data was stored at {stored} bytes, no smaller than {}",
+            data.len()
+        );
+        // Read by the *stored* length, which is what the block map records.
+        let back = store.read_extent("eg-z", off, stored, vh, 9).unwrap();
+        assert_eq!(back, data, "an extent did not survive a compress/decompress round trip");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn incompressible_data_is_stored_verbatim_rather_than_larger() {
+        // LZ4 on random bytes produces more than it consumed. Storing that would let a
+        // setting meant to save space cost it, and overrun an egroup's budget on exactly
+        // the data that gains nothing.
+        let mut x: u32 = 0x1234_5678;
+        let data: Vec<u8> = (0..8192)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x & 0xFF) as u8
+            })
+            .collect();
+        let (stored, codec) = encode_extent(&data, true);
+        assert_eq!(codec, COMP_NONE, "random data was kept in compressed form");
+        assert_eq!(stored.len(), data.len());
+    }
+
+    #[test]
+    fn an_uncompressed_footer_still_reads_on_a_build_that_knows_compression() {
+        // Every extent written before compression existed has codec 0 and plain_len 0.
+        // Those must keep reading exactly as they did, with no migration.
+        let dir = tmpdir("legacy");
+        let store = EgroupStore::new(&dir, 1 << 20).unwrap();
+        let mut eg = store.create("eg-l").unwrap();
+        let vh = vdisk_hash("vd-l");
+        let data = vec![0xABu8; 1024];
+        let (off, stored, _) = store.append_framed(&mut eg, &data, vh, 1, false).unwrap();
+        store.sync(&mut eg).unwrap();
+        assert_eq!(stored as usize, data.len());
+        assert_eq!(store.read_extent("eg-l", off, stored, vh, 1).unwrap(), data);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_checksum_covers_the_bytes_as_stored() {
+        // So a scrub can verify an extent group without decompressing any of it, and a
+        // replica copy stays a byte copy.
+        let data = vec![3u8; 4096];
+        let (stored, codec) = encode_extent(&data, true);
+        assert_eq!(codec, COMP_LZ4);
+        let footer = footer_with(&stored, 7, 2, codec, data.len() as u64);
+        verify_footer(&stored, &footer, 7, 2).expect("footer must verify against stored bytes");
+        assert_eq!(decode_extent(&stored, &footer).unwrap(), data);
+    }
+
+    #[test]
+    fn an_unknown_codec_is_refused_rather_than_guessed_at() {
+        let data = vec![1u8; 64];
+        let mut footer = footer_with(&data, 1, 1, COMP_NONE, data.len() as u64);
+        footer[5] = 77;
+        match decode_extent(&data, &footer) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("77"), "{m}"),
+            other => panic!("expected a corruption error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -243,7 +390,7 @@ mod tests {
         let store = EgroupStore::new(&dir, 1 << 20).unwrap();
         let mut eg = store.create("eg-c").unwrap();
         let vh = vdisk_hash("vd-1");
-        let (off, _) = store.append_framed(&mut eg, &vec![7u8; 512], vh, 0).unwrap();
+        let (off, _len, _) = store.append_framed(&mut eg, &vec![7u8; 512], vh, 0, false).unwrap();
         store.sync(&mut eg).unwrap();
         drop(eg);
 
@@ -265,7 +412,7 @@ mod tests {
         let store = EgroupStore::new(&dir, 1 << 20).unwrap();
         let mut eg = store.create("eg-m").unwrap();
         let vh = vdisk_hash("vd-1");
-        let (off, _) = store.append_framed(&mut eg, &vec![1u8; 256], vh, 42).unwrap();
+        let (off, _len, _) = store.append_framed(&mut eg, &vec![1u8; 256], vh, 42, false).unwrap();
         store.sync(&mut eg).unwrap();
 
         // Same bytes, same checksum, wrong extent: this is the failure a CRC alone

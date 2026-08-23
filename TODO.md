@@ -696,7 +696,11 @@ tier. Verified end to end: 8 MiB written to a DRBD device and compared byte for 
 `root:qemu 0660`, demoted to Secondary, volume defined at exactly 8192 KiB, and the
 cancelled and truncated paths leaving no resource behind.
 
-**Still on the Python tier:** networks, snapshots, console proxy, and cluster lifecycle.
+**Still on the Python tier**, counted against `static/*.html` on 2026-08-23: `hardware`,
+`networking`, `sdn`, `settings`, `lcm`, `lanayru`, and the console (`vnc_auto.html`). Phoenix
+carries ten routes against the Python tier's fourteen pages. `sdn.html` (875 lines) and
+`settings.html` (792 lines) are the two large ones and between them account for most of the
+remaining work.
 
 **Costs still outstanding:** `hylia.py` (738 lines) and `lanayru.py` (468 lines) are imported as
 Python modules by Spectrum and have no Elixir counterpart; they must be reimplemented, shelled
@@ -705,6 +709,40 @@ deploy path still know only about the Python image.
 
 This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
 defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
+
+### Not urgent: finish or retire the WebAssembly console
+
+There was a working WebAssembly console at one point -- the goal was ESXi-class console
+performance in a browser, and it carried a network-performance preset the current console has
+no equivalent for. What survives in the tree:
+
+* `static/spice-html5/` -- the vendored client, including `src/lz_decompress.c`.
+* `static/vendor/wasm-spice/wasm_spice.wasm` -- built from that C file by **every rollout**;
+  `deploy_updates.py` compiles it with emscripten on each deploy.
+* `agahnim` already bridges TCP to WebSocket protocol-agnostically, and its own authorisation
+  page tells the operator to "click **Reconnect** on the SPICE console".
+* Spectrum's WebSocket proxy is already parameterised by `console_type` and refuses a
+  protocol mismatch rather than silently downgrading.
+
+What is missing is at both ends rather than in the middle:
+
+1. **No VM is given a SPICE device.** Both XML builders hard-code
+   `<graphics type='vnc' port='-1' autoport='yes'>` (`spectrum_server.py`, `vali.py`), so
+   asking for a SPICE console is correctly refused -- there is nothing to connect to.
+2. **No page loads the client.** `vnc_auto.html` is the only console page, and both console
+   buttons in `static/app.js` open it: the "WebGL" button is a copy of the VNC one with the
+   same URL.
+3. **The cursor encoder in the vendored client is broken.** `create_rgba_png` in
+   `spice-html5/src/png.js` emits an invalid zlib stream -- deflate header `0x80` where
+   BFINAL is bit 0 (should be `0x01`), and LEN/NLEN written big-endian through
+   `DataView.setUint16`'s default when deflate requires little-endian. Reproduced: fixing
+   either alone still fails, both together decompress. The file's own FIXME admits libpng
+   errors on its output. This would bite immediately once a SPICE console rendered.
+
+So it is a two-line codec fix, a graphics device, and a page -- or a decision to delete the
+vendored client and stop building the wasm on every rollout. Whether SPICE becomes the default
+console or sits alongside VNC per-VM decides whether the graphics type is a per-VM field or a
+global switch, and that decision is the gate on the rest.
 
 ### Built: the extent-based store (Sidon), with Hydra as the metadata layer
 

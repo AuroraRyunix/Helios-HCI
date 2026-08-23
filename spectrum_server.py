@@ -344,6 +344,70 @@ def is_valid_vm_name(name):
         return False
     return _VM_NAME_RE.match(name) is not None
 
+# A storage container is a policy row: tier, quota, ftt and now compression, referenced
+# by vdisks. Its name is interpolated into CQL and compared against vdisk rows, so it is
+# validated on the same terms as a VM name rather than quoted and hoped for.
+_CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+
+CONTAINER_NAME_ERROR = (
+    "Invalid container name. A name must be 1-63 characters, start with a letter or "
+    "digit, and contain only letters, digits, '.', '-' and '_'."
+)
+
+# What a container may ask Sidon to do with its extents. An allow-list rather than free
+# text: this value reaches the storage daemon, which refuses a codec it does not know --
+# and a typo that silently means "off" is worse than one that is rejected.
+CONTAINER_COMPRESSION_MODES = ("none", "lz4")
+
+CONTAINER_TIERS = ("SSD", "HDD", "NVME")
+
+
+def is_valid_container_name(name):
+    """True only for container names that are safe to interpolate into CQL."""
+    if not isinstance(name, str):
+        return False
+    return _CONTAINER_NAME_RE.match(name) is not None
+
+
+def normalise_compression(value):
+    """The stored form of a compression setting, or None if it is not one.
+
+    Accepts the shapes a UI sends -- a checkbox's true/false, an absent field -- and
+    resolves them to exactly one of CONTAINER_COMPRESSION_MODES.
+    """
+    if value is None or value is False:
+        return "none"
+    if value is True:
+        return "lz4"
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("", "off", "false", "no"):
+            return "none"
+        if v in ("on", "true", "yes"):
+            return "lz4"
+        if v in CONTAINER_COMPRESSION_MODES:
+            return v
+    return None
+
+
+def container_in_use(name):
+    """The vdisks that reference this container, so a delete can refuse rather than orphan.
+
+    A container is only policy, but deleting one out from under the vdisks that name it
+    leaves rows pointing at a tier, quota and compression setting that no longer exist --
+    and the next thing to read them decides for itself what they meant.
+    """
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON vdisk_id, container FROM hydra.dfs_vdisks;")
+    if rc != 0:
+        return None
+    users = []
+    for row in parse_json_rows(stdout):
+        if (row.get("container") or "default") == name:
+            users.append(row.get("vdisk_id"))
+    return users
+
+
 # Session tokens are minted by secrets.token_hex(32) in the login handler, i.e.
 # exactly 64 lowercase hex characters. Anything else is rejected before it can
 # reach a query: run_cql_query() falls back to piping raw text into cqlsh when
@@ -3973,7 +4037,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             # them. Reconciling the catalogue against the filesystem is a cluster-wide
             # job, and belongs in hydra.dagur_schedules where it can run once and be
             # retried, not in a GET.
-            cql = "SELECT JSON name, filename, size_bytes, type, path, created_at FROM hydra.valhalla_images;"
+            cql = ("SELECT JSON name, filename, size_bytes, type, path, container, created_at "
+                   "FROM hydra.valhalla_images;")
             rc, stdout, stderr = run_cql_query(cql)
             if rc != 0:
                 # An unreadable catalogue is not an empty catalogue, and answering 200
@@ -5439,6 +5504,29 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             filename = query.get("name", [""])[0]
             if not filename:
                 filename = self.headers.get("X-File-Name", "uploaded_image.iso")
+
+            # Where the image is stored. An image is an ordinary vdisk, so it belongs to a
+            # container like any other -- and until this existed every upload went to
+            # whatever `default` was, which meant an operator who had carved out a
+            # container for templates could not actually put templates in it.
+            #
+            # The container decides compression too, which matters more here than
+            # anywhere: an ISO is written once and read many times, and it is the case
+            # compression is most clearly worth having on.
+            target_container = (query.get("container", [""])[0]
+                                or self.headers.get("X-Container", "")
+                                or get_default_container())
+            if not is_valid_container_name(target_container):
+                self.send_json(400, {"error": CONTAINER_NAME_ERROR})
+                return
+            rc_c, stdout_c, _ = run_cql_query(
+                f"SELECT JSON name FROM hydra.storage_containers WHERE name = '{target_container}';")
+            if rc_c != 0:
+                self.send_json(503, {"error": "The container catalogue could not be read, so the image has nowhere it can be shown to belong."})
+                return
+            if not parse_json_rows(stdout_c):
+                self.send_json(404, {"error": f"No storage container named '{target_container}'."})
+                return
                 
             # import uuid
             task_id = str(uuid.uuid4())
@@ -5460,7 +5548,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 # that corrupts a device if anything ever writes. An immutable vdisk
                 # cannot reach that state: reads are served by any node without a lease,
                 # and writes are refused by class at the NBD layer.
-                ok, body = sidon_call("create", vdisk_id=res_name, size_bytes=content_length)
+                ok, body = sidon_call("create", vdisk_id=res_name, size_bytes=content_length,
+                                      container=target_container)
                 if not ok and "already exists" not in str(body):
                     raise Exception(f"Sidon could not create image vdisk {res_name}: {body}")
                 ok, body = sidon_call("attach", vdisk_id=res_name)
@@ -5548,6 +5637,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "size_bytes": content_length,
                     "type": "iso" if filename.lower().endswith(".iso") else "template",
                     "path": vdisk_socket,
+                    "container": target_container,
                     "created_at": created_at
                 }
                 # json.dumps escapes double quotes and backslashes but NOT single quotes,
@@ -6346,14 +6436,65 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
-                tier = payload.get("tier", "SSD")
+                tier = str(payload.get("tier", "SSD")).upper()
                 quota_bytes = int(payload.get("quota_bytes", 0))
                 ftt = int(payload.get("ftt", 1))
+                compression = normalise_compression(payload.get("compression"))
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid payload: {str(e)}"})
                 return
 
-            self.send_json(400, {"error": "Storage containers are a policy object, not an allocation: a Sidon container names an ftt, and vdisks reference it. There is nothing to create at the storage layer."})
+            # This used to refuse outright, on the grounds that a container is policy
+            # rather than an allocation. The premise is right and the conclusion was
+            # wrong: policy is exactly the thing that has to be written down. A container
+            # names the tier, the quota, the fault tolerance and now the compression that
+            # every vdisk referencing it inherits, and without a way to create one an
+            # operator has whatever the installer happened to make and nothing else.
+            if not is_valid_container_name(name):
+                self.send_json(400, {"error": CONTAINER_NAME_ERROR})
+                return
+            if tier not in CONTAINER_TIERS:
+                self.send_json(400, {"error": f"Storage tier must be one of {', '.join(CONTAINER_TIERS)}."})
+                return
+            if compression is None:
+                self.send_json(400, {"error": f"Compression must be one of {', '.join(CONTAINER_COMPRESSION_MODES)}."})
+                return
+            if quota_bytes < 0:
+                self.send_json(400, {"error": "A quota cannot be negative. Use 0 for unlimited."})
+                return
+            if ftt < 0:
+                self.send_json(400, {"error": "Fault tolerance cannot be negative."})
+                return
+
+            rc_e, stdout_e, _ = run_cql_query(
+                f"SELECT JSON name FROM hydra.storage_containers WHERE name = '{name}';")
+            if rc_e != 0:
+                self.send_json(503, {"error": "The container catalogue could not be read, so it is not known whether this name is already taken."})
+                return
+            if parse_json_rows(stdout_e):
+                self.send_json(409, {"error": f"A storage container named '{name}' already exists."})
+                return
+
+            cql = (
+                "INSERT INTO hydra.storage_containers (name, tier, quota_bytes, path, ftt, compression) "
+                f"VALUES ('{name}', '{tier}', {quota_bytes}, '{name}', {ftt}, '{compression}');"
+            )
+            rc_i, _, stderr_i = run_cql_query(cql)
+            if rc_i != 0:
+                self.send_json(500, {"error": f"Could not create storage container '{name}': {stderr_i.strip()[:300]}"})
+                return
+
+            EVENT_LOGS.append({
+                "desc": f"Storage container '{name}' created ({tier}, compression {compression}).",
+                "time": "Just now"
+            })
+            self.send_json(200, {
+                "message": f"Storage container {name} created.",
+                "container": {
+                    "name": name, "tier": tier, "quota_bytes": quota_bytes,
+                    "ftt": ftt, "compression": compression, "path": name,
+                },
+            })
             return
 
         elif self.path == "/api/storage/containers/delete":
@@ -6364,7 +6505,31 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            self.send_json(400, {"error": "Storage containers are a policy object, not an allocation, so there is nothing at the storage layer to delete."})
+            if not is_valid_container_name(name):
+                self.send_json(400, {"error": CONTAINER_NAME_ERROR})
+                return
+
+            # Refused while anything references it. Deleting the row is trivial; the
+            # damage is that every vdisk naming it keeps naming it, and the next reader of
+            # those rows decides for itself what tier, quota and compression meant.
+            users = container_in_use(name)
+            if users is None:
+                self.send_json(503, {"error": "The vdisk catalogue could not be read, so it is not known whether anything still uses this container."})
+                return
+            if users:
+                shown = ", ".join(sorted(u for u in users if u)[:5])
+                more = "" if len(users) <= 5 else f" and {len(users) - 5} more"
+                self.send_json(409, {"error": f"'{name}' still holds {len(users)} vdisk(s): {shown}{more}. Move or delete them first."})
+                return
+
+            rc_d, _, stderr_d = run_cql_query(
+                f"DELETE FROM hydra.storage_containers WHERE name = '{name}';")
+            if rc_d != 0:
+                self.send_json(500, {"error": f"Could not delete storage container '{name}': {stderr_d.strip()[:300]}"})
+                return
+
+            EVENT_LOGS.append({"desc": f"Storage container '{name}' deleted.", "time": "Just now"})
+            self.send_json(200, {"message": f"Storage container {name} deleted."})
             return
 
         elif self.path == "/api/networks/create":
@@ -6989,19 +7154,60 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
-            # Storage quotas are a container policy, not a per-vdisk allocation
-            pass
+            if not is_valid_container_name(name):
+                self.send_json(400, {"error": CONTAINER_NAME_ERROR})
+                return
+            if quota_bytes < 0:
+                self.send_json(400, {"error": "A quota cannot be negative. Use 0 for unlimited."})
+                return
 
-            # Update ScyllaDB
-            cql = f"UPDATE hydra.storage_containers SET quota_bytes = {quota_bytes} WHERE name = '{name}';"
-            run_cql_query(cql)
+            # Only what was actually sent. A form that edits the quota must not silently
+            # reset a container's compression to whatever its own default happened to be.
+            sets = [f"quota_bytes = {quota_bytes}"]
+
+            if "tier" in payload:
+                tier = str(payload.get("tier") or "").upper()
+                if tier not in CONTAINER_TIERS:
+                    self.send_json(400, {"error": f"Storage tier must be one of {', '.join(CONTAINER_TIERS)}."})
+                    return
+                sets.append(f"tier = '{tier}'")
+
+            if "ftt" in payload:
+                try:
+                    ftt = int(payload.get("ftt"))
+                except (TypeError, ValueError):
+                    self.send_json(400, {"error": "Fault tolerance must be a number."})
+                    return
+                if ftt < 0:
+                    self.send_json(400, {"error": "Fault tolerance cannot be negative."})
+                    return
+                sets.append(f"ftt = {ftt}")
+
+            if "compression" in payload:
+                compression = normalise_compression(payload.get("compression"))
+                if compression is None:
+                    self.send_json(400, {"error": f"Compression must be one of {', '.join(CONTAINER_COMPRESSION_MODES)}."})
+                    return
+                sets.append(f"compression = '{compression}'")
+
+            cql = f"UPDATE hydra.storage_containers SET {', '.join(sets)} WHERE name = '{name}';"
+            rc_u, _, stderr_u = run_cql_query(cql)
+            if rc_u != 0:
+                self.send_json(500, {"error": f"Could not update storage container '{name}': {stderr_u.strip()[:300]}"})
+                return
 
             EVENT_LOGS.append({
                 "desc": f"Storage container '{name}' updated.",
                 "time": "Just now"
             })
 
-            self.send_json(200, {"message": f"Storage container {name} updated successfully."})
+            # Said plainly, because it is the surprising half: an extent group is
+            # compressed when it is sealed and never rewritten, so this applies to what
+            # gets sealed next and leaves existing data exactly as it is.
+            self.send_json(200, {
+                "message": f"Storage container {name} updated successfully.",
+                "note": "Compression applies to extents sealed from now on; existing data is not rewritten, and takes effect when a vdisk is next attached.",
+            })
             return
 
         elif self.path == "/api/mimir/schedule/update":

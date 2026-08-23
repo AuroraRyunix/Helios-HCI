@@ -17,6 +17,13 @@ serde_json = "1.0"
 # solve a problem it does not have.
 rustls = "0.21"
 rustls-pemfile = "1.0"
+# Compression at seal time. A codec is the one thing on the byte path that cannot be std,
+# and hand-rolling one to keep the dependency list short would put a bespoke decompressor
+# between a guest and its data. lz4_flex with default-features off is pure safe Rust -- no
+# unsafe blocks and no C to build -- and LZ4 is the right shape for this: an extent group
+# is compressed once when it is sealed and read many times, so decompression speed is what
+# matters and it decompresses at memory bandwidth.
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 
 [profile.release]
 opt-level = 2

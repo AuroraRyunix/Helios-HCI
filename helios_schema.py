@@ -248,6 +248,31 @@ MIGRATIONS = [
             "ALTER TABLE hydra.dfs_block_map ADD vdisk_hash bigint;",
         ],
     },
+    {
+        "id": "0008-container-compression",
+        "statements": [
+            # Compression is a property of the container, not of a vdisk or of the
+            # cluster. A container is already the unit an operator reasons about for tier
+            # and quota, and it is the level where the trade-off is actually decided: a
+            # container of golden images wants it on, one holding a database's data files
+            # usually does not.
+            #
+            # Read at seal time, not at attach: an extent group is compressed once, when
+            # it is sealed, and never rewritten. Turning the flag on therefore applies to
+            # what gets sealed next and leaves existing extent groups exactly as they are,
+            # which is what makes the change safe to make on a live container -- nothing
+            # is rewritten underneath a running guest.
+            #
+            # Null means off. Every container that predates this column keeps behaving the
+            # way it did, and the footer of an uncompressed extent already says so.
+            "ALTER TABLE hydra.storage_containers ADD compression text;",
+
+            # Where an uploaded image is placed. Images used to land wherever the default
+            # container was, which meant an operator with a container carved out for
+            # templates could not actually put templates in it.
+            "ALTER TABLE hydra.valhalla_images ADD container text;",
+        ],
+    },
 ]
 
 

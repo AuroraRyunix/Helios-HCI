@@ -78,6 +78,15 @@ pub struct Vdisk {
     /// compare-and-swap condition the wrong list, so it never matched and every heal
     /// backed itself out reporting a race that had not happened.
     map_replicas: Vec<String>,
+    /// Whether extents sealed by this vdisk are compressed, from its container.
+    ///
+    /// Read once, when the vdisk is opened. Per-extent it would be a Hydra query on the
+    /// drain path; per-cluster it would be the wrong unit, because the trade-off differs
+    /// between a container of golden images and one holding a database's data files.
+    /// Changing it takes effect the next time the vdisk is attached and never rewrites an
+    /// extent group that already exists, which is what makes it safe to change on a live
+    /// container.
+    compress: bool,
     /// The peers an append must reach before it is acknowledged. Write-all, not quorum:
     /// the takeover proof in ownership.md is three lines *because* fencing one replica
     /// stops the old owner (it needed all of them) and reading one replica sees every
@@ -108,8 +117,8 @@ impl Vdisk {
         map_replicas: Vec<String>,
     ) -> Result<Vdisk> {
         let rows = daruk.query(&format!(
-            "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes \
-             FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+            "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes, \
+             container FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(id)
         ))?;
         let row = rows
@@ -125,6 +134,12 @@ impl Vdisk {
             .unwrap_or(CLASS_RW)
             .to_string();
         let drain_seq = field_u64(row, "drain_seq").unwrap_or(0);
+        let container = row
+            .get("container")
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+        let compress = container_compresses(&daruk, &container);
 
         let store = EgroupStore::new(&cfg.root.join("egroups"), egroup_bytes)?;
         let mut journal = Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?;
@@ -146,6 +161,7 @@ impl Vdisk {
             daruk,
             replicas,
             map_replicas,
+            compress,
             degraded: None,
             journal: Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?,
         };
@@ -573,7 +589,10 @@ impl Vdisk {
             // being remote, and accepting its bytes unchecked would turn one damaged copy
             // into a silently propagated one.
             if crate::extent::verify_footer(data, footer, loc.vdisk_hash, idx).is_ok() {
-                return Some(data.to_vec());
+                // Expanded here, not by the replica: what travels between nodes is the
+                // extent exactly as stored, so a repair copy stays a byte copy and the
+                // footer that was checked is the footer that was written.
+                return crate::extent::decode_extent(data, footer).ok();
             }
             eprintln!(
                 "sidon: vdisk {}: replica {} also has a damaged copy of extent {idx}",
@@ -857,21 +876,24 @@ impl Vdisk {
             }
 
             let eg_id = self.ensure_open_egroup()?;
-            let (offset, framed) = {
+            let (offset, stored_len, framed) = {
                 let store = &self.store;
+                let compress = self.compress;
                 let eg = self.open_eg.as_mut().expect("ensure_open_egroup set it");
-                store.append_framed(eg, &buf, self.vh, idx)?
+                store.append_framed(eg, &buf, self.vh, idx, compress)?
             };
             // The same bytes to every replica, extent plus footer. Without this a drained
             // extent exists once: the journal is replicated, so an un-drained write
             // survives a node loss, and draining it would *reduce* its durability. Data
             // that becomes less safe by being tidied up is not a tidy-up.
             self.replicate_extent(&eg_id, offset as u64, &framed)?;
-            new_rows.push((idx, eg_id.clone(), offset, ext_len as u32, self.vh));
+            // The stored length, not the logical one: a read seeks by this, and a
+            // compressed extent is not the size the guest thinks it wrote.
+            new_rows.push((idx, eg_id.clone(), offset, stored_len, self.vh));
             new_locs.push((idx, ExtentLoc {
                 egroup_id: eg_id,
                 offset,
-                length: ext_len as u32,
+                length: stored_len,
                 // Written here, so stamped with this vdisk's identity. A clone
                 // that overwrites a shared extent lands here and takes its own,
                 // which is why the hash belongs to the row and not to the vdisk.
@@ -1034,6 +1056,32 @@ impl Vdisk {
             "degraded": self.degraded,
         })
     }
+}
+
+/// Whether a container asks for its extents to be compressed.
+///
+/// Fails soft, deliberately. A container row that is missing, unreadable, or written by an
+/// older schema means "not configured for compression", which is what every container did
+/// before this existed. Refusing to open a vdisk because a *preference* could not be read
+/// would turn a cosmetic gap into an outage, and the vdisk is perfectly serviceable either
+/// way -- the footer records what each extent actually is, so a container that flips
+/// between settings stays readable in both directions.
+fn container_compresses(daruk: &Daruk, container: &str) -> bool {
+    let rows = match daruk.query(&format!(
+        "SELECT compression FROM hydra.storage_containers WHERE name = {}",
+        cql_str(container)
+    )) {
+        Ok(rows) => rows,
+        Err(_) => return false,
+    };
+    rows.first()
+        .and_then(|r| r.get("compression"))
+        .and_then(Value::as_str)
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            s == "lz4" || s == "on" || s == "true"
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn field_u64(row: &Value, name: &str) -> Result<u64> {
