@@ -45,15 +45,23 @@ LogDriver=journald
 ## Scylla on :9042.
 Network=host
 
-## 8444, not 8443. 8443 is held by the Python spectrum container and is what
-## slate_config/dynamic.yml still points at. Cutting over is then a one-line change
-## to that file (or a second Traefik router in front of the ported routes only)
-## with no restart of the Python tier.
+## 8444, not 8443. 8443 is held by the Python spectrum container, and both tiers serve
+## the console: slate_config/dynamic.yml routes the rebuilt pages here and leaves the
+## rest there. That file and the navigation table in SpectrumPhxWeb.Layouts are the two
+## halves of the split and have to agree.
 ## Changing this port means changing HealthCmd= at the bottom of this file too.
 ## It is spelled out literally there rather than as ${PORT}, because that string
 ## passes through systemd on its way to podman.
 Environment=PORT=8444
 Environment=PHX_SERVER=true
+
+## Loopback only, because Slate is the only thing that should reach it.
+##
+## This tier does not terminate TLS -- Slate does, and forwards over 127.0.0.1. Under
+## Network=host the default 0.0.0.0 bind therefore published the console as plain HTTP
+## on every interface, including the storage network, where a session cookie would cross
+## the wire in clear. Anyone wanting it back for debugging can set PHX_BIND_IP.
+Environment=PHX_BIND_IP=127.0.0.1
 
 ## Per-cluster values, mode 0600, written by provision.py:
 ##   SECRET_KEY_BASE=<64+ random chars, IDENTICAL on every node -- it signs the

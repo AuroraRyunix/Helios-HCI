@@ -1,16 +1,54 @@
+# Slate routes the console. Two tiers serve it while the Phoenix rebuild is in progress,
+# and this file is what decides which one a given path reaches.
+#
+# The split is deliberately expressed as "Phoenix owns these paths, everything else is
+# still Python" rather than the other way round. A catch-all pointing at the new tier
+# would send it every API endpoint, static asset and page that has not been rebuilt yet,
+# and each of those would fail as a 404 the moment it were missed. Listing what has
+# actually moved means anything forgotten keeps working exactly as it did.
+#
+# Each page's entry moves here when it is rebuilt, and the whole `phoenix-ui` router
+# collapses into the catch-all when the last one has. The navigation table in
+# SpectrumPhxWeb.Layouts is the other half of this and has to agree with it.
+#
+# Priorities are explicit. Traefik orders routers by rule length when they are not, which
+# means adding a path could silently reorder the rules.
+
 http:
   routers:
-    # Router for Console WebSockets (VNC & SPICE)
+    # Console WebSockets (VNC & SPICE). Most specific, and served by neither tier.
     console-ws:
       rule: "Path(`/api/vms/console/ws`)"
+      priority: 300
       entryPoints:
         - websecure
       service: agahnim
       tls: {}
 
-    # Router for all other HTTP/HTTPS requests
+    # The rebuilt console.
+    #
+    # Exact paths for the pages, because the Python tier serves its own copies at the
+    # same names with a `.html` suffix -- `PathPrefix(/vms)` would capture `/vms.html`
+    # and hand it to an application that has no route for it.
+    #
+    # The prefixes are the parts that genuinely have children: `/vms/` for a named guest,
+    # `/live/` for the LiveView socket, and the static roots Phoenix serves.
+    phoenix-ui:
+      rule: >-
+        Path(`/`, `/login`, `/logout`, `/hosts`, `/vms`, `/tasks`, `/metrics`,
+        `/health`, `/storage`, `/images`, `/favicon.ico`, `/robots.txt`)
+        || PathPrefix(`/vms/`, `/live/`, `/assets/`, `/fonts/`, `/images/`)
+      priority: 200
+      entryPoints:
+        - websecure
+      service: spectrum-phx
+      tls: {}
+
+    # Everything else: the pages not yet rebuilt, the whole HTTP API, and the Python
+    # tier's own assets.
     webui:
       rule: "PathPrefix(`/`)"
+      priority: 100
       entryPoints:
         - websecure
       service: spectrum-backend
@@ -21,6 +59,15 @@ http:
       loadBalancer:
         servers:
           - url: "http://127.0.0.1:8081"
+
+    # Plain HTTP over loopback, and no insecureTransport: this tier does not terminate
+    # TLS of its own, which is why it must not be reachable anywhere but here. The unit
+    # binds it to 127.0.0.1 for that reason.
+    spectrum-phx:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8444"
+
     spectrum-backend:
       loadBalancer:
         servers:

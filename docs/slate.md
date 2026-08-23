@@ -45,11 +45,40 @@ Configures entrypoints, providers, and disables SSL verification for internal ba
 - **File Provider**: Watches `/etc/traefik/dynamic.yml` for routing rules.
 
 ### 2. `/etc/hci/slate/dynamic.yml` (Dynamic Configuration)
-Defines routers, services, and SSL termination:
-- **Routers**:
-  - `spectrum-router`: Routes all HTTP traffic to Spectrum backend.
-  - `agahnim-router`: Routes WebSocket paths matching `/api/vms/console/ws` to Agahnim backend.
-- **Certificates**: Shares the WebUI certificates located at `/etc/hci/spectrum/certs/server.crt` and `server.key`.
+Defines routers, services, and SSL termination. Three routers, with **explicit
+priorities** — Traefik orders them by rule length when they are not stated, so adding a
+path to one rule could silently reorder the others:
+
+| Priority | Router | Matches | Backend |
+|---|---|---|---|
+| 300 | `console-ws` | `/api/vms/console/ws` | Agahnim (`:8081`, raw WebSocket, no TLS) |
+| 200 | `phoenix-ui` | the rebuilt console pages | `spectrum-phx` (`:8444`, plain HTTP on loopback) |
+| 100 | `webui` | everything else | `spectrum-backend` (`:8443`, its own TLS) |
+
+**Certificates**: shares the WebUI certificates at `/etc/hci/spectrum/certs/server.crt`
+and `server.key`.
+
+#### Why the console is split across two backends
+
+The console is being rebuilt in Phoenix a page at a time
+([spectrum_phx.md](./spectrum_phx.md)), and this file is what decides which tier a given
+path reaches. It is written as *"Phoenix owns these paths, everything else is still
+Python"* rather than the reverse: a catch-all pointing at the new tier would send it every
+API endpoint, static asset and unported page as well, each failing as a 404 the moment it
+was missed. Listing only what has actually moved means anything forgotten keeps working.
+
+The page rules are **exact paths**, not prefixes. The Python tier serves its own copies at
+the same names with a `.html` suffix, so `PathPrefix(/vms)` would capture `/vms.html` and
+hand it to an application with no route for it. Only the paths with genuine children are
+prefixes: `/vms/` for a named guest, `/live/` for the LiveView socket, and Phoenix's
+static roots.
+
+`spectrum-phx` is dialled over **plain HTTP on 127.0.0.1** and needs no
+`insecureTransport`: it does not terminate TLS, which is exactly why its unit binds it to
+loopback. `spectrum-backend` terminates its own, hence `insecureSkipVerify` for it.
+
+`test_console_routing.py` asserts this file and the navigation table in
+`SpectrumPhxWeb.Layouts` agree about which tier owns each page.
 
 ## Lifecycle Management
 

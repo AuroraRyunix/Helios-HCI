@@ -12,10 +12,20 @@ replacing, see [spectrum.md](./spectrum.md) and [spectrum_technical.md](./spectr
 
 ## 1. It is a strangler migration, not a rewrite-and-switch
 
-The Python `spectrum_server.py` keeps running on 8443 and keeps serving the console.
-`spectrum-phx` runs beside it on 8444 with a different unit name, container name and image.
-[Slate](./slate.md) keeps routing to the Python tier until `slate_config/dynamic.yml` says
-otherwise. Nothing under `spectrum_phx/` modifies, restarts, or depends on the Python tier.
+The Python `spectrum_server.py` keeps running on 8443. `spectrum-phx` runs beside it on
+8444 with a different unit name, container name and image. Nothing under `spectrum_phx/`
+modifies, restarts, or depends on the Python tier.
+
+**Both tiers now serve the live console.** [Slate](./slate.md) routes the rebuilt pages to
+Phoenix and everything else — the pages not yet rebuilt, the whole HTTP API, the Python
+tier's own assets — to Python. The two halves of that statement are
+`slate_config/dynamic.yml` and `SpectrumPhxWeb.Layouts.nav_items/0`; `test_console_routing.py`
+asserts they agree, because when they do not the failure is a link in the navigation bar
+that 404s, or a page that quietly loads from the tier it was supposed to replace.
+
+The split is written as "Phoenix owns these paths, everything else is still Python" rather
+than the reverse. A catch-all pointing at the new tier would hand it every API endpoint and
+unported page too, and each would fail the moment it was missed.
 
 Routes move over one at a time, and each one is expected to be *more correct* than what it
 replaced, not merely prettier. Section 6 lists what the old pages were getting wrong.
@@ -58,10 +68,25 @@ the socket itself, so a caller cannot name a file at all.
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
 
-Navigation lives in one list, `SpectrumPhxWeb.Layouts.nav_items/0`. Nothing in the compiler
-notices when a page is renamed, so `test/spectrum_phx_web/navigation_test.exs` walks that
-list against the real router: every entry must resolve to 200 when signed in, redirect to
-`/login` when signed out, and appear in the rendered header.
+Navigation lives in one list, `SpectrumPhxWeb.Layouts.nav_items/0`, and it spans both tiers
+while the migration is in progress. Each entry carries the tier that serves it:
+
+| Tier | Entries | Rendered as |
+|---|---|---|
+| `:live` | the table above | `navigate` — live navigation within this application |
+| `:legacy` | Hardware, Networking, SDN, LCM, Lanayru, Settings | `href` to `/<page>.html` — an ordinary link to the Python tier |
+
+A `:legacy` entry has to be a plain link: live navigation asks *this* router for the page,
+and it has no route for one the other tier serves. As each page is rebuilt its entry moves
+to `:live` and loses the `.html` suffix; when none are left, the split and the routing rule
+that implements it go away together.
+
+Nothing in the compiler notices when a page is renamed, so
+`test/spectrum_phx_web/navigation_test.exs` walks the list against the real router. The two
+tiers are asserted differently on purpose: a `:live` entry must resolve to 200 when signed
+in and redirect to `/login` when signed out, while a `:legacy` entry must **404** here —
+requiring it to be routable is what would silently pass if somebody moved an entry to
+`:live` without building the page.
 
 ## 4. Authentication
 
@@ -70,7 +95,27 @@ signed, HTTP-only cookie. Passwords use the same `pbkdf2_sha256$100000$<salt>$<d
 format the Python tier writes, so both consoles authenticate the same accounts during the
 migration and no account has to be migrated or duplicated.
 
-Two properties worth stating explicitly:
+### One sign-in covers both tiers
+
+The two tiers always shared the session *store* — identical `hydra.sessions` rows, and both
+generate the token as 64 lowercase hex characters. What they did not share was the cookie:
+this application keeps the token inside its own signed session cookie, and the Python tier
+looks for a bare `session_id`. With a navigation bar spanning both, that meant half the
+links bounced the operator to a login page.
+
+So the token is written to both and read from both. `UserAuth.log_in_user/2` sets
+`session_id` alongside the signed session (HTTP-only, Secure, `SameSite=Lax`) and
+`log_out_user/1` clears it; `fetch_current_user/2` falls back to that cookie and **adopts**
+the token into this application's session when it finds one there. The adoption is the part
+that matters: LiveView mounts are handed the session, not the request's cookies, so leaving
+the token in the cookie alone would authenticate the page that renders the socket and then
+refuse the socket itself — a dashboard that appears and vanishes a moment later.
+
+The cookie is unsigned because the other tier expects the raw token. That costs nothing:
+the token is opaque, server-side, and revoked by deleting its row. This goes away with the
+last `:legacy` entry in the navigation table.
+
+Two further properties worth stating explicitly:
 
 - **The token's format is validated before it reaches a query.** The Python tier
   concatenated a header, cookie or query-parameter value straight into CQL.
@@ -225,10 +270,17 @@ cloned from it boots.
 
 ## 8. What is not done yet
 
-The remaining Python-tier routes -- networks, snapshots, console proxy, cluster lifecycle --
-are still served by `spectrum_server.py` on 8443. `hylia.py` and `lanayru.py` are imported
-as Python modules by Spectrum and have no Elixir counterpart, so the routes that use them
-cannot move until they are reimplemented, shelled out to, or kept behind a port.
+Six pages are still served by `spectrum_server.py` on 8443, reached from the navigation bar
+as `:legacy` entries: **Hardware, Networking, SDN, LCM, Lanayru and Settings**. The guest
+console (`/vnc_auto.html`) and the whole HTTP API are there too.
+
+`hylia.py` and `lanayru.py` are imported as Python modules by Spectrum and have no Elixir
+counterpart, so the routes that use them cannot move until they are reimplemented, shelled
+out to, or kept behind a port.
+
+Three things disappear when the last page moves: the `:legacy` half of the navigation
+table, the `phoenix-ui` router in `slate_config/dynamic.yml` (the catch-all can point here
+instead), and the shared `session_id` cookie in section 4.
 
 Upload does not write a `catalyst_tasks` row, unlike the Python endpoint. LiveView reports
 progress on the page itself, which is better for the operator watching it happen; the cost

@@ -12,6 +12,10 @@ INGRESS_PORT = 443
 # Spectrum WebUI/API. Slate proxies to https://127.0.0.1:8443, so a node with
 # 443 up but 8443 down still returns 502 for every client request.
 SPECTRUM_PORT = 8443
+# The Phoenix console. Slate routes the rebuilt pages to http://127.0.0.1:8444 and
+# everything else to 8443, so since that split there are two backends a node has to be
+# able to answer on -- and the rebuilt half includes "/", the page an operator lands on.
+SPECTRUM_PHX_PORT = 8444
 ZK_CLIENT_PORT = 2181
 
 # Probes against other nodes cross the network. 0.2s turned a brief latency
@@ -216,8 +220,12 @@ def is_local_ingress_listening():
     return probe_tcp("127.0.0.1", INGRESS_PORT, LOCAL_PROBE_TIMEOUT)
 
 def is_local_spectrum_listening():
-    """Local Spectrum WebUI/API on 8443 - the only backend Slate proxies to."""
+    """Local Spectrum WebUI/API on 8443 - the API and the pages not yet rebuilt."""
     return probe_tcp("127.0.0.1", SPECTRUM_PORT, LOCAL_PROBE_TIMEOUT)
+
+def is_local_spectrum_phx_listening():
+    """Local Phoenix console on 8444 - the rebuilt pages, including "/"."""
+    return probe_tcp("127.0.0.1", SPECTRUM_PHX_PORT, LOCAL_PROBE_TIMEOUT)
 
 last_health_msg = None
 
@@ -225,12 +233,23 @@ def is_local_stack_healthy():
     """VIP health guard.
 
     443 is the hard gate: it is the client-facing port, and holding the VIP with
-    Traefik down blackholes every client. 8443 is checked as a secondary signal
-    because slate_config/dynamic.yml points Slate at https://127.0.0.1:8443 only
-    - a node with 443 up and 8443 down answers every request with a 502, which
-    is no better for clients than a blackhole. Each is reported separately so an
-    operator can tell which layer failed, but only on transition: this runs
-    every 2s and would otherwise flood the journal while degraded.
+    Traefik down blackholes every client. The backends behind it are checked as
+    secondary signals, because a node with 443 up and a backend down answers 502
+    for whatever that backend serves, which is no better for clients than a
+    blackhole.
+
+    There are two backends since the console was split: slate_config/dynamic.yml
+    routes the rebuilt pages to 8444 and everything else -- the whole HTTP API and
+    the pages not yet rebuilt -- to 8443. Neither half alone is a working console,
+    and the 8444 half includes "/", so both gate.
+
+    Failing the guard is not the same as making the console unreachable: every node
+    serves 443 on its own address and accepts it as an origin, so an operator can
+    still reach one directly while the VIP is looking for a node that has both.
+
+    Each layer is reported separately so an operator can tell which failed, but only
+    on transition: this runs every 2s and would otherwise flood the journal while
+    degraded.
     """
     global last_health_msg
     msg = None
@@ -238,12 +257,16 @@ def is_local_stack_healthy():
         msg = f"Local health guard: Slate ingress on 127.0.0.1:{INGRESS_PORT} is not listening."
     elif not is_local_spectrum_listening():
         msg = f"Local health guard: Slate is up but its backend Spectrum on 127.0.0.1:{SPECTRUM_PORT} is not listening."
+    elif not is_local_spectrum_phx_listening():
+        msg = (f"Local health guard: Slate is up but the Phoenix console on "
+               f"127.0.0.1:{SPECTRUM_PHX_PORT} is not listening, so the pages it serves "
+               f"-- including the landing page -- would answer 502.")
 
     if msg != last_health_msg:
         if msg:
             print(msg)
         elif last_health_msg is not None:
-            print("Local health guard: Slate ingress and Spectrum backend are healthy again.")
+            print("Local health guard: Slate ingress and both console backends are healthy again.")
         last_health_msg = msg
 
     return msg is None

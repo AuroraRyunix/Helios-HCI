@@ -110,6 +110,80 @@ else
 fi
 """
 
+# Reconcile which hostnames the Phoenix console will accept a websocket from.
+#
+# LiveView refuses the socket upgrade when the browser's Origin matches no configured
+# entry, and a refused upgrade is a page that renders and then dies -- the worst shape a
+# failure can take, because it looks like a rendering bug rather than a configuration one.
+#
+# The console is reached by cluster VIP and by bare node IP, and the VIP moves. Every node
+# therefore has to accept every one of those names, or a VIP failover silently breaks the
+# console for as long as it stays failed over. They did not: the env file is written once,
+# when absent, and never revisited -- which is right for SECRET_KEY_BASE, since rewriting
+# it logs every operator out, and wrong for these. Nodes provisioned at different times
+# ended up with different lists, and the two newest did not name the VIP at all.
+#
+# Derived on the node from cluster.json rather than passed in, so that the list follows
+# actual membership: adding a node updates every other node's origins on the next rollout.
+# SECRET_KEY_BASE is copied through untouched.
+RECONCILE_PHX_ORIGINS = r"""
+python3 - <<'PY'
+import json, os
+
+ENV = "/etc/hci/spectrum/spectrum-phx.env"
+if not os.path.exists(ENV):
+    print("phx origins: no env file yet")
+    raise SystemExit(0)
+
+try:
+    cluster = json.load(open("/etc/hci/cluster.json"))
+except Exception as exc:
+    print("phx origins: cluster.json unreadable (%s); left alone" % exc)
+    raise SystemExit(0)
+
+hosts = [h.get("ip") for h in cluster.get("hosts", []) if h.get("ip")]
+names = [h.get("hostname") for h in cluster.get("hosts", []) if h.get("hostname")]
+vip = (cluster.get("vip") or "").strip()
+
+# The canonical URL the console is served at. The VIP is the address that survives a node
+# going away, so it is the one to generate links against.
+this_node = os.environ.get("NODE_IP", "")
+phx_host = vip or this_node or (hosts[0] if hosts else "localhost")
+
+origins = [o for o in ([vip] + hosts + names) if o]
+seen, ordered = set(), []
+for origin in origins:
+    if origin not in seen:
+        seen.add(origin)
+        ordered.append(origin)
+
+wanted = {"PHX_HOST": phx_host, "PHX_EXTRA_ORIGINS": ",".join(ordered)}
+
+lines, changed = [], False
+for line in open(ENV).read().splitlines():
+    key = line.split("=", 1)[0] if "=" in line else None
+    if key in wanted:
+        replacement = "%s=%s" % (key, wanted.pop(key))
+        if replacement != line:
+            changed = True
+        lines.append(replacement)
+    else:
+        lines.append(line)
+
+for key, value in wanted.items():
+    lines.append("%s=%s" % (key, value))
+    changed = True
+
+if changed:
+    with open(ENV, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    os.chmod(ENV, 0o600)
+    print("phx origins: PHX_HOST=%s PHX_EXTRA_ORIGINS=%s" % (phx_host, ",".join(ordered)))
+else:
+    print("phx origins: ok")
+PY
+"""
+
 # Give sidon every empty disk, one filesystem each. Kept identical to the copy in
 # provision.py: one claims disks for a new node, the other reaches nodes that already
 # exist, and a difference between them would mean a disk laid out one way on some
@@ -1417,6 +1491,22 @@ WantedBy=multi-user.target
                         "chmod 600 /etc/hci/spectrum/spectrum-phx.env; }"
                         % (shared_phx_secret, ip, ",".join(nodes)))
                     stdout_env.channel.recv_exit_status()
+
+                # ...and then reconcile the parts of it that are not the secret. Written
+                # once and never revisited is right for SECRET_KEY_BASE and wrong for the
+                # origin list: the VIP moves, membership changes, and a node that does not
+                # accept the name the browser used refuses the LiveView socket.
+                import base64 as _b64
+                script = _b64.b64encode(
+                    RECONCILE_PHX_ORIGINS.encode("utf-8")).decode("ascii")
+                _, stdout_org, _ = ssh.exec_command(
+                    "echo %s | base64 -d | NODE_IP=%s bash" % (script, ip))
+                origins_said = stdout_org.read().decode("utf-8", "replace")
+                stdout_org.channel.recv_exit_status()
+                for line in origins_said.splitlines():
+                    said = line.strip()
+                    if said and said != "phx origins: ok":
+                        print(f"[{ip}] {said}")
 
                 # The unit is read from the repository rather than duplicated into a
                 # string here. This deployment path already keeps five hand-maintained

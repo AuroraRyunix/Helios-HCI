@@ -13,19 +13,50 @@ defmodule SpectrumPhxWeb.Layouts do
 
   # The console's navigation, in one place. Every dashboard renders through `app/1`, so
   # this list is the only thing that has to know a page exists.
+  #
+  # The fourth element says which tier serves the page. `:live` is this application.
+  # `:legacy` is the Python console, still serving the pages that have not been rebuilt
+  # here yet — Slate routes those paths to it, and they keep their `.html` suffix because
+  # that is what it serves them as.
+  #
+  # The distinction is not cosmetic. A `:legacy` entry has to be an ordinary link: live
+  # navigation asks this application's router for the page and it does not have one, so
+  # `navigate` would fail where `href` simply leaves for the other tier. Both tiers accept
+  # the same session, so crossing between them does not ask the operator to sign in again.
+  #
+  # As each page is rebuilt its entry moves from `:legacy` to `:live` and loses the
+  # suffix. When none are left, the split — and the routing rule in
+  # slate_config/dynamic.yml that implements it — goes away with them.
   @nav [
-    {:overview, "Overview", "/"},
-    {:hosts, "Hosts", "/hosts"},
-    {:vms, "VMs", "/vms"},
-    {:storage, "Storage", "/storage"},
-    {:images, "Images", "/images"},
-    {:tasks, "Tasks", "/tasks"},
-    {:metrics, "Metrics", "/metrics"},
-    {:health, "Health", "/health"}
+    {:overview, "Overview", "/", :live},
+    {:hosts, "Hosts", "/hosts", :live},
+    {:vms, "VMs", "/vms", :live},
+    {:storage, "Storage", "/storage", :live},
+    {:images, "Images", "/images", :live},
+    {:tasks, "Tasks", "/tasks", :live},
+    {:metrics, "Metrics", "/metrics", :live},
+    {:health, "Health", "/health", :live},
+    {:hardware, "Hardware", "/hardware.html", :legacy},
+    {:networking, "Networking", "/networking.html", :legacy},
+    {:sdn, "SDN", "/sdn.html", :legacy},
+    {:lcm, "LCM", "/lcm.html", :legacy},
+    {:lanayru, "Lanayru", "/lanayru.html", :legacy},
+    {:settings, "Settings", "/settings.html", :legacy}
   ]
 
-  @doc "The navigation entries, as `{id, label, path}`. Exposed so tests can walk them."
+  @doc """
+  The navigation entries, as `{id, label, path, tier}`. Exposed so tests can walk them.
+
+  `tier` is `:live` for a page this application routes and `:legacy` for one the Python
+  console still serves.
+  """
   def nav_items, do: @nav
+
+  @doc "The navigation entries this application routes itself."
+  def live_nav_items, do: Enum.filter(@nav, fn {_, _, _, tier} -> tier == :live end)
+
+  @doc "The navigation entries still served by the Python console."
+  def legacy_nav_items, do: Enum.filter(@nav, fn {_, _, _, tier} -> tier == :legacy end)
 
   @doc """
   Renders the console layout: navigation, the signed-in operator, and the page itself.
@@ -61,9 +92,18 @@ defmodule SpectrumPhxWeb.Layouts do
 
       <nav class="flex-1 overflow-x-auto" aria-label="Console">
         <ul class="menu menu-horizontal gap-1 flex-nowrap">
-          <li :for={{id, label, path} <- nav_items()}>
+          <li :for={{id, label, path, tier} <- nav_items()}>
             <.link
+              :if={tier == :live}
               navigate={path}
+              aria-current={if @active == id, do: "page"}
+              class={["font-medium whitespace-nowrap", @active == id && "menu-active"]}
+            >
+              {label}
+            </.link>
+            <.link
+              :if={tier == :legacy}
+              href={path}
               aria-current={if @active == id, do: "page"}
               class={["font-medium whitespace-nowrap", @active == id && "menu-active"]}
             >
