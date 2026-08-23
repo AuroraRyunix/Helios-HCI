@@ -31,6 +31,7 @@ live migration; this reuses that channel.
 import argparse
 import base64
 import json
+import ipaddress
 import os
 import re
 import shutil
@@ -50,6 +51,11 @@ CERT_FAIL_DAYS = 7
 # quietly changing the cluster's expiry horizon; --days overrides it.
 DEFAULT_LEAF_DAYS = 3650
 DEFAULT_CA_DAYS = 7300
+
+# How far inside the CA's own expiry a leaf must land. A certificate issued right up to
+# the CA's last day is valid and useless: it cannot be renewed against that CA, so the
+# margin is the window in which somebody can still act.
+CERT_LEAF_MARGIN_DAYS = 30
 
 CA_DIR = "/var/lib/hci/certs_staging"
 NODE_CERT_DIR = "/etc/hci/spark/certs"
@@ -896,6 +902,126 @@ def cmd_rollback(args):
 # Self test.
 # ---------------------------------------------------------------------------
 
+def cmd_enroll(args):
+    """Issue and install certificates for a node joining an existing cluster.
+
+    Provisioning mints the CA on node 1 and signs every node in one pass, which is right
+    for creating a cluster and has nothing to say about adding to one. Without this, a new
+    machine has no certificate the cluster will accept, so spark-daemon on it refuses every
+    peer and every peer refuses it -- and the only documented way forward was to
+    re-provision the whole cluster, which regenerates the CA and disrupts the nodes that
+    were already fine.
+
+    Deliberately does not touch any existing node. The CA is read, not rotated, and the
+    only certificates written are the new node's own plus the client pair every node
+    already shares. A failure here leaves the cluster exactly as it was and the new node
+    unenrolled, which is the state it started in.
+    """
+    target = args.node.strip()
+    try:
+        ipaddress.ip_address(target)
+    except ValueError:
+        print("[ERROR] --node takes an IP address; %r is not one." % target, file=sys.stderr)
+        return 1
+
+    ca_key = os.path.join(CA_DIR, "ca.key")
+    ca_crt = os.path.join(CA_DIR, "ca.crt")
+    if not (os.path.exists(ca_key) and os.path.exists(ca_crt)):
+        print("[ERROR] The cluster CA is not on this host (%s). Run this on the node that "
+              "holds ca.key -- enrolment signs a certificate, so it has to run where the "
+              "signing key lives." % CA_DIR, file=sys.stderr)
+        return 1
+
+    # A leaf that outlives its issuer verifies on the day it is issued and takes the
+    # cluster down when the CA lapses under it.
+    #
+    # Unlike a renewal, enrolment has no reason to insist on a particular lifetime: the
+    # node is new and any certificate that outlasts the CA is wrong regardless. So when no
+    # --days was given, the default is "as long as the CA has left, less a margin" rather
+    # than a fixed number that fails against any CA already part-way through its life --
+    # which is every CA except one minted today. Asking for a specific lifetime that does
+    # not fit is still refused, because that is a statement of intent that cannot be met.
+    days = args.days
+    if days is None:
+        remaining = ca_expiry_epoch(ca_crt)
+        if remaining is None:
+            print("[ERROR] The CA's own expiry could not be read from %s, so a leaf "
+                  "lifetime cannot be chosen safely." % ca_crt, file=sys.stderr)
+            return 1
+        days_left = int((remaining - time.time()) // 86400)
+        days = min(DEFAULT_LEAF_DAYS, days_left - CERT_LEAF_MARGIN_DAYS)
+        if days <= 0:
+            print("[ERROR] The CA at %s has %d days left, which leaves no room to issue a "
+                  "certificate. Rotate it with 'impa renew --rotate-ca' first."
+                  % (ca_crt, days_left), file=sys.stderr)
+            return 1
+        if days < DEFAULT_LEAF_DAYS:
+            print("[%s] issuing for %d days, which is what the CA has left less a %d-day "
+                  "margin." % (target, days, CERT_LEAF_MARGIN_DAYS))
+
+    problem = check_leaf_fits_ca(ca_crt, days)
+    if problem:
+        print("[ERROR] %s" % problem, file=sys.stderr)
+        return 1
+
+    config = cluster_config() or {}
+    vip = config.get("vip")
+    hostname = args.hostname
+    if not hostname:
+        rc, out, err = run_on(target, "hostname")
+        hostname = (out or "").strip()
+        if rc != 0 or not hostname:
+            print("[ERROR] Could not read the hostname of %s: %s"
+                  % (target, (err or out or "").strip()[:200]), file=sys.stderr)
+            return 1
+
+    staging = tempfile.mkdtemp(prefix="impa-enroll-")
+    try:
+        print("[%s] signing a node certificate (CN=%s, hostname %s)" % (target, target, hostname))
+        node_key, node_crt = mint_leaf(
+            staging, target, days, ca_key, ca_crt,
+            eku="serverAuth,clientAuth",
+            san=node_san(target, hostname, vip),
+            stem="node-%s" % target)
+
+        # The client pair is shared cluster-wide and already exists; copying it is what
+        # lets the new node dial the others, and re-minting it would hand this node a
+        # different identity from everyone else's.
+        client_crt_pem = read_file(os.path.join(CLIENT_CERT_DIR, "client.crt"))
+        client_key_pem = read_file(os.path.join(CLIENT_CERT_DIR, "client.key"))
+        if not client_crt_pem or not client_key_pem:
+            print("[ERROR] The shared client certificate is not readable at %s."
+                  % CLIENT_CERT_DIR, file=sys.stderr)
+            return 1
+
+        rc, out, err = install_ca(target, read_file(ca_crt))
+        if rc != 0:
+            print("[ERROR] [%s] installing the CA failed: %s"
+                  % (target, (err or out or "").strip()[:200]), file=sys.stderr)
+            return 1
+
+        rc, out, err = install_leaves(
+            target, read_file(node_crt), read_file(node_key), client_crt_pem, client_key_pem)
+        if rc != 0:
+            print("[ERROR] [%s] installing certificates failed: %s"
+                  % (target, (err or out or "").strip()[:200]), file=sys.stderr)
+            return 1
+
+        restart_spark(target)
+        ok, detail = wait_for_probe(
+            target, ca_crt,
+            os.path.join(CLIENT_CERT_DIR, "client.crt"),
+            os.path.join(CLIENT_CERT_DIR, "client.key"))
+        print("[%s] %s %s" % (target, "enrolled," if ok else "ENROLLED BUT UNVERIFIED,", detail))
+        if not ok:
+            # Said rather than swallowed: an unverified enrolment looks finished and the
+            # node fails on its first real call.
+            return 1
+        return 0
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
 def cmd_selftest(args):
     """Mint a throwaway CA, node and client pair and complete a real mTLS handshake.
 
@@ -1034,6 +1160,17 @@ def build_parser():
     rollback.add_argument("--backup", required=True, help="timestamp of the backup to restore")
     rollback.add_argument("--nodes")
     rollback.set_defaults(func=cmd_rollback)
+
+    enroll = sub.add_parser(
+        "enroll",
+        help="issue and install certificates for a node joining an existing cluster")
+    enroll.add_argument("--node", required=True, help="IP address of the joining node")
+    enroll.add_argument("--hostname", default=None,
+                        help="the node's hostname; read from the node when omitted")
+    enroll.add_argument("--days", type=int, default=None,
+                        help="certificate lifetime in days; defaults to what the CA has "
+                             "left, less a margin, capped at %d" % DEFAULT_LEAF_DAYS)
+    enroll.set_defaults(func=cmd_enroll)
 
     selftest = sub.add_parser(
         "selftest", help="mint a throwaway chain and handshake against it")

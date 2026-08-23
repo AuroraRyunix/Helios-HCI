@@ -710,6 +710,28 @@ deploy path still know only about the Python image.
 This rewrite addresses none of the P0 items and only part of P1: the DFS, networking, and LCM
 defects live in `mipha`, `gatoway`, `urbosa`, `hylia`, `vali`, and `cluster_new`.
 
+### Multiple disks per node
+
+Every node has two 300 GB disks and uses one; `sdc` is idle on all three. The design is in
+[docs/dfs/multi_disk.md](docs/dfs/multi_disk.md), and its first conclusion is that the easy
+answer is the wrong one: `vgextend` into the existing thin pool makes one disk failure take
+the node's whole extent store, and doubles the chance of it happening. That is worse than
+using one disk.
+
+The design is one filesystem per disk with placement in software -- which is what Nutanix
+does and for the same reason. Work is bounded: `EgroupStore` becomes a set, a startup scan
+builds `egroup_id -> disk`, placement picks least-free-first on seal, `op_capacity` sums and
+reports per disk, and Purah treats referenced-but-absent as a repair candidate. No schema
+change: which disk holds an egroup is a node-local fact, and `referenced_egroups()` already
+produces the set that identifies a dead disk's losses.
+
+`hydra.dfs_egroup_replicas` is in the schema, has `egroup_id`/`node`/`path`/`state`, and is
+written by nothing. It suggests a per-egroup placement model that was never built; do not
+mistake it for a source of truth.
+
+Provisioning must not land first -- claiming both disks before sidon can use the second one
+gains nothing and removes the guard currently keeping `sdc` untouched.
+
 ### Not urgent: finish or retire the WebAssembly console
 
 There was a working WebAssembly console at one point -- the goal was ESXi-class console

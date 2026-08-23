@@ -469,6 +469,289 @@ def get_hydra_replication_factor():
     return parse_replication_factor(stdout)
 
 
+def zookeeper_quadlet(node_id, ips):
+    """One node's ZooKeeper unit for an ensemble of `ips`.
+
+    Every node's unit names the whole ensemble, so adding a member means rewriting all of
+    them. ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed
+    version is 3.9.2, but `reconfigEnabled` is off, so `reconfig` is refused and the
+    ensemble can only be changed by rewriting the config and restarting. That is the cost
+    being paid here; see the dynamic-reconfiguration item in TODO.md.
+
+    Nodes beyond the third are observers: they scale reads without joining the quorum, so
+    a five-node cluster still needs two failures to lose consensus rather than three.
+    """
+    if len(ips) == 1:
+        servers_env = ""
+    else:
+        parts = []
+        for i, ip in enumerate(ips, start=1):
+            suffix = ":observer" if i > 3 else ""
+            parts.append("server.%d=%s:2888:3888%s;2181" % (i, ip, suffix))
+        servers_env = ' ZOO_SERVERS="%s"' % " ".join(parts)
+    peer_type_env = " ZOO_PEER_TYPE=observer" if node_id > 3 else ""
+    return (
+        "[Unit]\n"
+        "Description=ZooKeeper Cluster Consensus Service\n"
+        "After=network.target\n\n"
+        "[Service]\n"
+        "Restart=always\n"
+        "CPUWeight=100\n"
+        "MemoryMax=512M\n"
+        "MemoryHigh=400M\n\n"
+        "[Container]\n"
+        "Image=docker.io/library/zookeeper:3.9.2\n"
+        "Network=host\n"
+        "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
+        "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
+        "Environment=ZOO_MY_ID=%d%s%s ZOO_4LW_COMMANDS_WHITELIST=*\n"
+        % (node_id, servers_env, peer_type_env)
+    )
+
+
+def write_zookeeper_ensemble(ips):
+    """Rewrite every node's ZooKeeper unit for this membership. Returns the nodes that failed."""
+    failed = []
+    for idx, ip in enumerate(ips):
+        quad = zookeeper_quadlet(idx + 1, ips)
+        encoded = base64.b64encode(quad.encode()).decode()
+        rc, _, _ = run_remote_spark(
+            ip,
+            "mkdir -p /etc/containers/systemd && echo %s | base64 -d "
+            "> /etc/containers/systemd/zookeeper.container && systemctl daemon-reload"
+            % encoded)
+        if rc != 0:
+            failed.append(ip)
+    return failed
+
+
+def hydra_db_quadlet(node_ip, seed_ips):
+    """The ScyllaDB unit for one node, seeded by the cluster it is joining.
+
+    The seeds are the whole point of writing this again on a joining node. `provision.py
+    --join` seeds a node from the list it was provisioned with, which for a joining node is
+    only the other joiners -- so it would bootstrap into a ring of its own rather than into
+    the cluster. A node that has formed its own ring cannot simply be pointed at another
+    one afterwards.
+    """
+    return (
+        "[Unit]\n"
+        "Description=Hydra Metadata Database (ScyllaDB)\n"
+        "After=zookeeper.service\n\n"
+        "[Service]\n"
+        "Restart=always\n"
+        "CPUWeight=100\n"
+        "MemoryMax=2.5G\n"
+        "MemoryHigh=2.2G\n\n"
+        "[Container]\n"
+        "Image=docker.io/scylladb/scylla:5.4.0\n"
+        "Network=host\n"
+        "Volume=/var/lib/hci/hydra/data:/var/lib/scylla:Z\n"
+        "Volume=/etc/hci/hydra/cassandra-rackdc.properties:"
+        "/etc/scylla/cassandra-rackdc.properties:ro\n"
+        "Exec=--listen-address %s --broadcast-address %s --broadcast-rpc-address %s "
+        "--seeds %s --cluster-name hci-metadata --rpc-address %s --num-tokens 256 "
+        "--overprovisioned 1 --endpoint-snitch GossipingPropertyFileSnitch\n"
+        % (node_ip, node_ip, node_ip, ",".join(seed_ips), node_ip)
+    )
+
+
+def wait_for_ring_member(ips, target, attempts=60, delay=5):
+    """Wait until `target` is up and normal in the ring. Returns (ok, last_state).
+
+    Bootstrapping streams data, so this is minutes rather than seconds on a cluster with
+    anything in it. A node sitting at `UJ` is still joining, which is not a failure and
+    must not be reported as one.
+    """
+    last = "not in the ring"
+    for _ in range(attempts):
+        members, error = read_ring(ips)
+        if not error:
+            member = next((m for m in members if m["address"] == target), None)
+            if member is not None:
+                last = "%s%s" % (member["status"], member["state"])
+                if member["available"] and member["state"] == "N":
+                    return True, last
+        time.sleep(delay)
+    return False, last
+
+
+def cmd_add_node(args):
+    """Bring a provisioned, enrolled machine into this cluster.
+
+    Deliberately not `cluster create` with one more address. That path claims disks --
+    `wipefs -a` on anything it decides is unclaimed -- which is right when building a
+    cluster and catastrophic when run against nodes already serving guests. Adding is a
+    different operation from creating and gets its own command.
+
+    The order matters and is not arbitrary:
+
+      1. **Membership before consensus.** Every node's `cluster.json` learns the new
+         address first, so anything that reads the host list while the ensemble is
+         restarting sees the intended membership rather than a half-written one.
+      2. **Consensus before storage.** ZooKeeper is what the cluster coordinates through;
+         a node whose ScyllaDB is up but which is not in the ensemble is a node the rest
+         cannot agree about.
+      3. **Storage before scheduling.** The node is registered in `hydra.nodes` only once
+         the ring reports it `UN`. Registering it while it is still bootstrapping hands it
+         VMs it cannot run -- the same rule `rejoin` follows, for the same reason.
+    """
+    target = args.node.strip()
+    existing = get_cluster_ips()
+    if not existing:
+        print("[ERROR] /etc/hci/cluster.json lists no hosts, so there is no cluster to "
+              "join. Use 'cluster create' to form one.")
+        return 1
+    # Resumable on purpose. The steps below are ordered so that membership is written
+    # before the ring join, which means a join that fails part-way leaves the node in
+    # cluster.json and out of the ring -- the exact state re-running has to be able to
+    # finish. Refusing here because the name is already in the config would make the first
+    # failure unrecoverable by the tool that caused it.
+    resuming = target in existing
+    if resuming:
+        members, _ = read_ring([ip for ip in existing if ip != target] or existing)
+        live = next((m for m in members if m["address"] == target and m["available"]), None)
+        if live is not None:
+            print("[ERROR] %s is already a live member of this cluster." % target)
+            return 1
+        print("[NOTE] %s is already in cluster.json but not serving in the ring; "
+              "resuming the join." % target)
+        existing = [ip for ip in existing if ip != target]
+
+    print("==========================================================")
+    print("   Adding %s to a %d-node cluster" % (target, len(existing)))
+    print("==========================================================")
+
+    # Preflight. Each of these is a way the join fails silently later.
+    rc, out, err = run_remote_spark(target, "echo online")
+    if rc != 0 or "online" not in (out or "").lower():
+        print("[ERROR] spark-daemon on %s is not answering over mTLS: %s"
+              % (target, (err or out or "").strip()[:200]))
+        print("[ERROR] Provision it with 'provision.py --join' and enrol it with "
+              "'impa enroll --node %s' first. A node the cluster cannot authenticate "
+              "cannot be added to it." % target)
+        return 1
+    print("[%s] spark-daemon answers over mTLS, so it is provisioned and enrolled." % target)
+
+    rc_d, stdout_d, _ = run_remote_spark(
+        target, "ls -A /var/lib/hci/hydra/data/data 2>/dev/null | head -5")
+    if rc_d == 0 and (stdout_d or "").strip():
+        print("[ERROR] %s already carries ScyllaDB data under /var/lib/hci/hydra/data." % target)
+        print("[ERROR] A node bootstrapping on top of existing sstables either refuses to "
+              "start or re-introduces rows deleted while it was away. Wipe that directory, "
+              "or use 'cluster rejoin' if this node was previously a member.")
+        return 1
+
+    members, error = read_ring(existing)
+    if error:
+        print("[ERROR] Could not read the ring: %s" % error)
+        return 1
+    if any(not m["available"] for m in members):
+        print("[ERROR] Not every existing node is up in the ring. Adding a node while the "
+              "cluster is already degraded compounds two problems.")
+        print(render_ring(members, get_hydra_replication_factor()))
+        return 1
+    print("[ring] all %d existing node(s) are up." % len(members))
+
+    ips = existing + [target]
+
+    # 1. Membership.
+    config = cluster_hosts_config()
+    if config is None:
+        print("[ERROR] /etc/hci/cluster.json could not be read.")
+        return 1
+    rc_h, hostname, _ = run_remote_spark(target, "hostname")
+    hostname = (hostname or "").strip()
+    if rc_h != 0 or not hostname:
+        print("[ERROR] Could not resolve the hostname of %s." % target)
+        return 1
+    hosts = list(config.get("hosts", []))
+    # Idempotent, because this runs again on a resumed join. Appending unconditionally
+    # would put the node in cluster.json twice, and every reader that counts hosts -- the
+    # replication factor, the quorum gate, the console -- would believe in a node that
+    # does not exist.
+    if not any(h.get("ip") == target for h in hosts):
+        hosts.append({"node_id": len(hosts) + 1, "ip": target, "hostname": hostname})
+    config["hosts"] = hosts
+    failed = write_cluster_config(ips, config)
+    if failed:
+        print("[ERROR] Could not write /etc/hci/cluster.json on: %s" % ", ".join(failed))
+        return 1
+    print("[config] %s (%s) is in cluster.json on all %d node(s)." % (target, hostname, len(ips)))
+
+    # 2. Consensus.
+    print("[zookeeper] rewriting the ensemble for %d member(s)..." % len(ips))
+    failed = write_zookeeper_ensemble(ips)
+    if failed:
+        print("[ERROR] Could not write the ZooKeeper unit on: %s" % ", ".join(failed))
+        return 1
+    # Restarted one at a time, oldest first: a rolling restart keeps a quorum of the
+    # *previous* ensemble alive throughout, which an all-at-once restart does not.
+    for ip in ips:
+        rc, _, err = run_remote_spark(ip, "systemctl restart zookeeper")
+        if rc != 0:
+            print("[ERROR] [%s] ZooKeeper did not restart: %s" % (ip, (err or "").strip()[:200]))
+            return 1
+        print("[zookeeper] %s restarted." % ip)
+        time.sleep(3)
+
+    # 3. Storage.
+    print("[hydra-db] seeding %s from the existing cluster..." % target)
+    rc, _, err = run_remote_spark(
+        target,
+        "mkdir -p /var/lib/hci/hydra/data /etc/hci/hydra && "
+        "cp -f /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py && "
+        "chmod 644 /var/lib/hci/hydra/data/daruk.py && "
+        "if [ ! -f /etc/hci/hydra/cassandra-rackdc.properties ]; then "
+        "printf 'dc=datacenter1\\nrack=rack1\\nprefer_local=true\\n' "
+        "> /etc/hci/hydra/cassandra-rackdc.properties; fi")
+    if rc != 0:
+        print("[ERROR] [%s] could not prepare the database directories: %s"
+              % (target, (err or "").strip()[:200]))
+        return 1
+
+    quad = hydra_db_quadlet(target, existing)
+    encoded = base64.b64encode(quad.encode()).decode()
+    rc, _, err = run_remote_spark(
+        target,
+        "echo %s | base64 -d > /etc/containers/systemd/hydra-db.container && "
+        "systemctl daemon-reload && systemctl start hydra-db" % encoded)
+    if rc != 0:
+        print("[ERROR] [%s] hydra-db did not start: %s" % (target, (err or "").strip()[:200]))
+        return 1
+    print("[hydra-db] started; bootstrapping from %s." % ", ".join(existing))
+
+    ok, state = wait_for_ring_member(ips, target)
+    members, error = read_ring(ips)
+    if not error:
+        print()
+        print(render_ring(members, get_hydra_replication_factor()))
+    if not ok:
+        print("[ERROR] %s did not reach UN in the ring (last seen '%s')." % (target, state))
+        print("[ERROR] It may still be streaming. Watch 'cluster ring'; once it is UN, "
+              "re-run this command to finish the bookkeeping.")
+        return 1
+    print("[ring] %s is UN." % target)
+
+    # 4. Scheduling, only now.
+    run_cql_query(
+        "INSERT INTO hydra.nodes (hostname, ip, status, maintenance_mode) "
+        "VALUES ('%s', '%s', 'NORMAL', false);" % (hostname, target))
+    print("[hydra] registered %s (%s) as a schedulable host." % (hostname, target))
+
+    print()
+    print("Still to do, and deliberately not automatic:")
+    print("  - Raise the keyspace replication factor now that there are %d nodes:" % len(ips))
+    print("      ALTER KEYSPACE hydra WITH replication = "
+          "{'class': 'NetworkTopologyStrategy', '<datacenter>': %d};" % min(3, len(ips)))
+    print("    then 'nodetool repair -pr hydra' on every node. ALTER changes the strategy")
+    print("    only; the data is not on the new replicas until a repair has run, and until")
+    print("    then the cluster reports a redundancy it does not have.")
+    print("  - Storage needs nothing: Purah places replicas onto the new node as vdisks")
+    print("    come to need them.")
+    return 0
+
+
 def read_ring(ips):
     """Read the ring from whichever node will answer. Returns (members, error).
 
@@ -672,12 +955,19 @@ def main():
     parser.add_argument("-v", "--vip", required=False, help="Floating Cluster Virtual IP (VIP)")
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
-    parser.add_argument("--node", required=False, help="Single host IP, for 'decommission' and 'rejoin'")
+    parser.add_argument("--node", required=False,
+                        help="Single host IP, for 'decommission', 'rejoin' and 'add-node'")
     parser.add_argument("--finalize", action="store_true", help="Perform the bookkeeping half of a decommission or rejoin, once the ring work is done")
     parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy",
-                                            "ring", "decommission", "rejoin"], help="Action to perform")
+                                            "ring", "decommission", "rejoin",
+                                            "add-node"], help="Action to perform")
 
     args = parser.parse_args()
+
+    if args.command == "add-node":
+        if not args.node:
+            parser.error("add-node requires --node <ip>")
+        sys.exit(cmd_add_node(args))
 
     if args.command == "create":
         # Ensure we have servers

@@ -65,6 +65,8 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 6. [ganon.md](./ganon.md) — the harness, and why it runs against DRBD first.
 7. [milestones.md](./milestones.md) — build order, gates, and what each step is worth if abandoned.
 8. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
+9. [multi_disk.md](./multi_disk.md) — using more than one disk per node, and why pooling
+   them into one volume group is the wrong answer.
 
 ## The one-paragraph version
 
