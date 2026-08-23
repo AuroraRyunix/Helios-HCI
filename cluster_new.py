@@ -12,6 +12,18 @@ import base64
 import threading
 import socket
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 def run_parallel(ips, cmd):
     results = {}
     threads = []
@@ -389,49 +401,6 @@ def run_parallel_checked(ips, command, allow_already_exists=False):
                 sys.exit(1)
     return results
 
-def run_cql_query(cql_query, *args, **kwargs):
-    import urllib.request
-    import json
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-        local_ip = "127.0.0.1"
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('10.255.255.255', 1))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 # --- the ScyllaDB ring ------------------------------------------------------------------
 #
 # hydra.nodes and the ring are two different memberships and they are not kept in step.

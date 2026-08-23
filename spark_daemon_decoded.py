@@ -18,6 +18,18 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 socket.setdefaulttimeout(45.0)
 
 PORT = 9099
@@ -235,49 +247,6 @@ def check_urbosa_enabled():
                 return True
     return False
 
-def run_cql_query(cql_query, *args, **kwargs):
-    import urllib.request
-    import json
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-        local_ip = "127.0.0.1"
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('10.255.255.255', 1))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     import ssl, urllib.request, json

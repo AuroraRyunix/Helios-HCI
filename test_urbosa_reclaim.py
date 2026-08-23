@@ -408,9 +408,14 @@ class UrbosaTestCase(unittest.TestCase):
         self.log = io.StringIO()
 
         self._saved = {name: getattr(urbosa, name)
-                       for name in ("run_cmd", "run_cql_query", "read_proc_argv", "is_leader")}
+                       for name in ("run_cmd", "run_cql_query", "run_conditional_cql_query",
+                                    "read_proc_argv", "is_leader")}
         urbosa.run_cmd = self.host.run
         urbosa.run_cql_query = self.db.query
+        # The transit pool's claim and release are lightweight transactions, and they read
+        # the [applied] verdict themselves -- so they go through the unguarded path.
+        # Stubbing only run_cql_query left the real one in place and reached Hydra.
+        urbosa.run_conditional_cql_query = self.db.query
         urbosa.read_proc_argv = self.host.argv
         urbosa.is_leader = lambda: True
 

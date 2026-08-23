@@ -15,6 +15,18 @@ import zipfile
 import hashlib
 import re
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 def run_command_local(cmd):
     res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
@@ -77,54 +89,6 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
-def run_cql_query(cql_query):
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        import socket
-        try:
-            # Resolve local IP
-            local_ip = "127.0.0.1"
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(('10.255.255.255', 1))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                pass
-            b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-            cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-            p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = p.communicate()
-            stdout_str = stdout.decode('utf-8', errors='ignore').strip()
-            # Fix double backslashes introduced by cqlsh formatting
-            stdout_str = stdout_str.replace('\\\\', '\\')
-            return p.returncode, stdout_str, stderr.decode('utf-8', errors='ignore').strip()
-        except Exception as ex:
-            return -1, "", f"HTTP error: {e}, fallback error: {ex}"
 
 def get_cluster_hosts():
     try:

@@ -365,6 +365,7 @@ SPECTRUM_BUILD_FILES = (
     ("helios_schema.py", "helios_schema.py"),
     ("lanayru.py", "lanayru.py"),
     ("helios_sidon.py", "helios_sidon.py"),
+    ("helios_cql.py", "helios_cql.py"),
 )
 
 local_helios_sig = "helios_sig.py"
@@ -833,6 +834,11 @@ def deploy_to_node(ip):
             # the module they call at whatever version the node was built with.
             print(f"[{ip}] Uploading helios_sidon to /usr/local/bin/helios_sidon.py...")
             put_text_file(sftp, "helios_sidon.py", "/usr/local/bin/helios_sidon.py")
+
+            # The one CQL query layer. Every native daemon imports it, so it has to land
+            # before any of them are restarted.
+            print(f"[{ip}] Uploading helios_cql to /usr/local/bin/helios_cql.py...")
+            put_text_file(sftp, "helios_cql.py", "/usr/local/bin/helios_cql.py")
 
             # Imported by spectrum_server at runtime, so it needs to be on the host as
             # well as inside the console image.

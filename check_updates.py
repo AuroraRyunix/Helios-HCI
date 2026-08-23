@@ -7,6 +7,18 @@ import sys
 import re
 import hashlib
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 # Build string reported when an installed component carries no __build__ tag.
 # This script is deployed standalone as /usr/local/bin/check-updates, so the value
 # cannot be imported from hylia; it is the single source of truth within this file.
@@ -33,25 +45,7 @@ HYLIA_PATH = "/usr/local/bin/hylia"
 
 _SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 
-def cql_escape(value):
-    """Escape a value for embedding inside a single-quoted CQL string literal.
-    Everything written here originates from a remote update server, so no value
-    may be interpolated raw."""
-    if value is None:
-        return ""
-    return str(value).replace("'", "''")
 
-def cql_int(value, default=0):
-    """Coerce a remote-supplied numeric field to an integer literal. A non-numeric
-    value would otherwise be injected into the statement unquoted."""
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError, OverflowError):
-        try:
-            coerced = int(float(str(value).strip()))
-        except (TypeError, ValueError, OverflowError):
-            return default
-    return coerced if coerced >= 0 else default
 
 def validate_download_url(url):
     """The download URL is fetched (and shown in the UI) later on, so only accept a
@@ -146,79 +140,6 @@ def resolve_release_document(document, public_key_path=None):
     print(f"Release signature verified against the key pinned at {key_path}{detail}.")
     return release, ""
 
-def run_cql_query(cql_query):
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e1:
-        # Fallback: run cqlsh inside local podman systemd-hydra-db container
-        try:
-            import subprocess
-            import socket
-            import os
-            import tempfile
-            
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                s.connect(('10.255.255.255', 1))
-                local_ip = s.getsockname()[0]
-            except Exception:
-                local_ip = '127.0.0.1'
-            finally:
-                s.close()
-            
-            # Write query to a temporary file on the host
-            fd, temp_path = tempfile.mkstemp(suffix=".cql")
-            try:
-                with os.fdopen(fd, 'w') as tmp:
-                    tmp.write(cql_query)
-                
-                # Copy to container
-                container_tmp = f"/tmp/{os.path.basename(temp_path)}"
-                subprocess.run(f"podman cp {temp_path} systemd-hydra-db:{container_tmp}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                # Run cqlsh -f inside container
-                cmd = f'podman exec systemd-hydra-db cqlsh {local_ip} -f {container_tmp}'
-                proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
-                
-                # Clean up in container
-                subprocess.run(f"podman exec systemd-hydra-db rm -f {container_tmp}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            
-            if proc.returncode == 0:
-                lines = []
-                if "select" in cql_query.lower():
-                    for line in proc.stdout.splitlines():
-                        line_stripped = line.strip()
-                        if line_stripped.startswith('{') and line_stripped.endswith('}'):
-                            lines.append(line_stripped)
-                return 0, "\n".join(lines), ""
-            else:
-                return proc.returncode, "", proc.stderr
-        except Exception as e2:
-            return -1, "", f"Primary failed ({e1}). Fallback failed ({e2})."
 
 def load_schema_module():
     """Import the ordered cluster schema, wherever this process is running from.

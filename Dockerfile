@@ -23,6 +23,7 @@ COPY lanayru.py .
 # dfs_engine(), the vdisk naming, and the libvirt disk element, so a VM defined by a
 # rebuilt image without it silently falls back to DRBD paths that no longer exist.
 COPY helios_sidon.py .
+COPY helios_cql.py .
 COPY static/ ./static/
 EXPOSE 8443
 CMD ["python", "-u", "server.py"]

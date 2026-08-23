@@ -10,6 +10,18 @@ import ssl
 import threading
 import uuid
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 socket.setdefaulttimeout(45.0)
 
 LOCAL_IP = "127.0.0.1"
@@ -61,116 +73,14 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
-class ConditionalStatementError(RuntimeError):
-    """A compare-and-swap was handed to the query path, which cannot report one."""
 
 
-def _cql_outside_string_literals(cql_query):
-    """The statement with every single-quoted literal blanked out.
-
-    This daemon writes the *stdout of arbitrary jobs* into hydra.dagur_runs, so a CQL
-    literal here can hold anything a backup script or a health check printed. Searching
-    the raw statement for the keyword would refuse a run record because the job happened
-    to print "check if the volume is mounted". A doubled quote ('') is an escaped quote
-    inside a literal, not the end of one.
-    """
-    out = []
-    index = 0
-    length = len(cql_query)
-    while index < length:
-        char = cql_query[index]
-        if char != "'":
-            out.append(char)
-            index += 1
-            continue
-        index += 1
-        while index < length:
-            if cql_query[index] == "'":
-                if index + 1 < length and cql_query[index + 1] == "'":
-                    index += 2
-                    continue
-                index += 1
-                break
-            index += 1
-        out.append("''")
-    return "".join(out)
 
 
-# A mutating statement whose text carries an IF clause. DDL is excluded on purpose:
-# "CREATE TABLE IF NOT EXISTS" is not a compare-and-swap and its result carries nothing a
-# caller needs.
-_CONDITIONAL_CQL = re.compile(r"\s*(?:insert|update|delete|begin)\b.*\bif\b", re.I | re.S)
 
 
-def is_conditional_cql(cql_query):
-    """True when the statement is a lightweight transaction rather than a plain write."""
-    return bool(_CONDITIONAL_CQL.match(_cql_outside_string_literals(cql_query or "")))
 
 
-def run_cql_query(cql_query, *args, **kwargs):
-    """Run a statement whose only interesting outcome is "did it execute".
-
-    Conditional statements are refused rather than run. Daruk's /query endpoint renders a
-    *rejected* lightweight transaction as its row of values joined by spaces --
-
-        False 10.10.102.41
-
-    -- and returns rc=0, which is indistinguishable from a successful write, so every
-    caller that used this function for a compare-and-swap was treating lost races as wins.
-    The refusal is here rather than in a review comment because the bug comes back the
-    moment somebody appends "IF ..." to an existing call and the tests still pass.
-
-    Conditional writes belong on one of Daruk's typed /v1/... endpoints. Dagur has none:
-    it takes work from Catalyst, which claims each scheduler tick with
-    /v1/schedule/claim-job before this daemon ever hears about the job.
-    """
-    if is_conditional_cql(cql_query):
-        raise ConditionalStatementError(
-            "a conditional statement cannot be run through run_cql_query(): its result "
-            "cannot say whether the condition held. Use a Daruk /v1/... endpoint. "
-            f"Statement: {' '.join(cql_query.split())[:200]}")
-    import urllib.request
-    import json
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-        local_ip = "127.0.0.1"
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('10.255.255.255', 1))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
     ips = []

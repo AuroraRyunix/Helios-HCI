@@ -23,6 +23,18 @@ import http.client
 import http.cookies
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 socket.setdefaulttimeout(45.0)
 
 PORT = 8443
@@ -483,49 +495,6 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
-def run_cql_query(cql_query, *args, **kwargs):
-    import urllib.request
-    import json
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-        local_ip = "127.0.0.1"
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('10.255.255.255', 1))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 
 DARUK_URL = "http://127.0.0.1:9043"
 
@@ -1788,34 +1757,39 @@ def init_db():
                 schema_ok = False
             if schema_ok:
                 print("Tables checked/created successfully.")
-                run_cql_query(insert_default)
-                run_cql_query(insert_default_image_container)
+                # Seeding, so these go through run_conditional_cql_query: each one is
+                # IF NOT EXISTS and bootstrap runs on every node, so a lost race means the
+                # row is already there -- which is the wanted outcome, not a failure. They
+                # cannot use run_cql_query, which refuses a conditional statement because
+                # it cannot report whether the condition held.
+                run_conditional_cql_query(insert_default)
+                run_conditional_cql_query(insert_default_image_container)
                 run_cql_query("DELETE FROM hydra.storage_containers WHERE name IN ('default-vm-container', 'default-image-container');")
-                run_cql_query(insert_diagnostics)
-                run_cql_query(insert_storage_scrub)
+                run_conditional_cql_query(insert_diagnostics)
+                run_conditional_cql_query(insert_storage_scrub)
                 run_cql_query(f"UPDATE hydra.dagur_schedules SET command = '{scrub_cmd}' WHERE job_name = 'storage_scrub';")
-                run_cql_query(insert_storage_auto_heal)
+                run_conditional_cql_query(insert_storage_auto_heal)
                 # Migrate clusters provisioned before this job pointed at a real command.
                 # The INSERT above is IF NOT EXISTS, so it cannot repair an existing row --
                 # and /usr/local/bin/hci-auto-heal never existed in the first place.
-                run_cql_query(
+                run_conditional_cql_query(
                     "UPDATE hydra.dagur_schedules SET command = '/usr/local/bin/mipha --auto-heal' "
                     "WHERE job_name = 'storage_auto_heal' IF command = '/usr/local/bin/hci-auto-heal';")
-                run_cql_query(insert_db_compaction)
+                run_conditional_cql_query(insert_db_compaction)
                 # Scheduled major compaction is an anti-pattern on size-tiered compaction:
                 # it rewrites everything into one enormous SSTable that then never compacts
                 # again, and it does heavy IO on a host that is also serving VM disks.
                 # Scylla's own guidance is not to schedule it. Disabled rather than deleted
                 # so an operator can see it and re-enable deliberately if they mean to.
-                run_cql_query(
+                run_conditional_cql_query(
                     "UPDATE hydra.dagur_schedules SET enabled = false "
                     "WHERE job_name = 'db_compaction' IF enabled = true;")
-                run_cql_query(insert_mimir_default)
-                run_cql_query(insert_system_cleanup)
-                run_cql_query(insert_orphaned_disks_cleanup)
-                run_cql_query(insert_metadata_backup)
-                run_cql_query(insert_helios_update_check)
-                run_cql_query(insert_default_network)
+                run_conditional_cql_query(insert_mimir_default)
+                run_conditional_cql_query(insert_system_cleanup)
+                run_conditional_cql_query(insert_orphaned_disks_cleanup)
+                run_conditional_cql_query(insert_metadata_backup)
+                run_conditional_cql_query(insert_helios_update_check)
+                run_conditional_cql_query(insert_default_network)
                 # Attempt to alter vms table to add network_id
                 run_cql_query("ALTER TABLE hydra.vms ADD network_id text;")
                 run_cql_query("ALTER TABLE hydra.vms ADD cpu_model text;")

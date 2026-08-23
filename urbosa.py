@@ -12,6 +12,18 @@ import hashlib
 import ipaddress
 import tempfile
 
+# The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
+# of them identical, and the guard against conditional statements had reached only three
+# of them -- see helios_cql for what that cost.
+from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
+    ConditionalStatementError,
+    cql_escape,
+    cql_int,
+    is_conditional_cql,
+    run_conditional_cql_query,
+    run_cql_query,
+)
+
 # Distributed firewall rules live in their own chain so they can be rebuilt
 # wholesale each pass instead of being appended to FORWARD forever.
 FW_CHAIN = "URBOSA-FWD"
@@ -37,49 +49,6 @@ def get_local_ip():
         s.close()
     return IP
 
-def run_cql_query(cql_query, *args, **kwargs):
-    import urllib.request
-    import json
-    try:
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success":
-                lines = []
-                for row in res.get("rows", []):
-                    if isinstance(row, dict):
-                        if "json" in row:
-                            lines.append(row["json"])
-                        else:
-                            vals = [str(v) for v in row.values()]
-                            lines.append(" ".join(vals))
-                    else:
-                        lines.append(str(row))
-                return 0, "\n".join(lines), ""
-            else:
-                return 1, "", res.get("error", "Database query execution error")
-    except Exception as e:
-        import base64
-        import subprocess
-        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-        local_ip = "127.0.0.1"
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('10.255.255.255', 1))
-            local_ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            pass
-        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {local_ip}'
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = p.communicate()
-        return p.returncode, stdout.decode('utf-8', errors='ignore').strip(), stderr.decode('utf-8', errors='ignore').strip()
 def is_urbosa_enabled():
     cql = "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled';"
     rc, stdout, stderr = run_cql_query(cql)
@@ -496,7 +465,9 @@ def claim_transit_index(router_id, node_id, pool=None):
                   f"router {router_id} cannot be given one.")
             return None
 
-        rc, stdout, stderr = run_cql_query(
+        # run_conditional_cql_query, not run_cql_query: this reads the [applied] verdict
+        # below, which is exactly the case the guard makes room for.
+        rc, stdout, stderr = run_conditional_cql_query(
             f"INSERT INTO {TRANSIT_TABLE} (subnet_index, router_id, node_id, allocated_at_ms) "
             f"VALUES ({candidate}, '{router_id}', '{node_id}', {int(time.time() * 1000)}) "
             f"IF NOT EXISTS;")
@@ -531,7 +502,7 @@ def release_transit_index(index, router_id):
     """
     if not is_uuid(router_id):
         return False
-    rc, stdout, stderr = run_cql_query(
+    rc, stdout, stderr = run_conditional_cql_query(
         f"DELETE FROM {TRANSIT_TABLE} WHERE subnet_index = {int(index)} "
         f"IF router_id = '{router_id}';")
     if rc != 0:
