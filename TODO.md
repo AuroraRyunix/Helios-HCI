@@ -228,9 +228,18 @@ already-fixed when it had never worked.
 * **ZooKeeper observers cannot be promoted, so quorum is bound to three arbitrary nodes.**
   `provision.py` makes the first three provisioned nodes voters and everything above node 3 an
   observer (`ZOO_PEER_TYPE=observer if idx > 3`). That part is right -- observers scale reads without
-  slowing writes. The gap is that there is no way to change the set afterwards: lose two of those three
-  and cluster coordination stops with every other node healthy and idle, and a decommissioned voter
-  takes its vote with it.
+  slowing writes. The gap is that there is no way to change the set deliberately: lose two of those
+  three and cluster coordination stops with every other node healthy and idle.
+
+  **Partly narrowed (2026-08-23).** `cluster decommission --finalize` now rewrites the ensemble for
+  the survivors instead of leaving it to the operator, so a departed voter no longer keeps counting
+  toward quorum. Because voter-or-observer follows *position* in the member list, a removal also
+  slides the next member up into the quorum -- on five nodes, removing a voter promotes the first
+  observer. That is the right outcome, but it is reached as a side effect of a config rewrite plus a
+  rolling restart rather than by asking for it, and during the roll the members briefly disagree about
+  who votes. What is still missing is the deliberate form: `reconfigEnabled=true`, a
+  `cluster zk-promote` / `zk-demote` that refuses any change which would lose quorum mid-flight, and
+  a way to move the ZooKeeper role off a permanently-failed node without removing it from the ring.
   ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed version is **3.9.2**, so
   the mechanism is present and merely switched off -- `/conf/zoo.cfg` sets `standaloneEnabled=true` and
   never sets `reconfigEnabled`, so `reconfig` is refused. Verified on the live node.
@@ -311,6 +320,13 @@ already-fixed when it had never worked.
   cannot be re-run, so an interrupted one leaves a node neither in nor out of the ring. Automatic
   detach of an unhealthy node is also not implemented -- from a health check that has failed for
   thirty seconds, a dead node and a partitioned one are indistinguishable.
+* ~~No way to grow a cluster.~~ **Resolved (2026-08-23)**: `cluster add-node` brings a provisioned,
+  enrolled machine in, in the order identity -> membership -> consensus -> storage -> scheduling, and
+  is resumable because a join that fails part-way leaves the node in `cluster.json` and out of the
+  ring. Deliberately not `cluster create` with one more address: create claims disks, and `wipefs -a`
+  against nodes already serving guests is not a recoverable mistake. `cluster decommission --finalize`
+  is the counterpart and now shrinks the ZooKeeper ensemble as part of the removal. Verified live by
+  taking a one-node cluster to three. See [docs/cluster.md](docs/cluster.md).
 
 Suggested shape: keep `/query` working, add typed endpoints (`/v1/vm/claim`, `/v1/vm/migrate-lock`)
 backed by prepared LWT statements, migrate invariant-critical writes first, move schema ownership into
