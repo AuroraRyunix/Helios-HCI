@@ -2417,10 +2417,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 servers,
                 "mountpoint -q /var/lib/hci/sidon || mount /var/lib/hci/sidon")
 
-            # Write spectrum.env
-            seeds = ",".join(servers)
+            # Write spectrum.env. Only the address, because only the address was ever
+            # read -- see the note in provision.py.
             for ip in servers:
-                spectrum_env = f"SPECTRUM_API_PORT=8443\nLOCAL_HYPERVISOR_IP={ip}\nCLUSTER_SEEDS={seeds}"
+                spectrum_env = f"LOCAL_HYPERVISOR_IP={ip}\n"
                 env_b64 = base64.b64encode(spectrum_env.encode('utf-8')).decode('utf-8')
                 run_remote_spark(ip, f"mkdir -p /etc/hci/spectrum && echo {env_b64} | base64 -d > /etc/hci/spectrum/spectrum.env")
                 

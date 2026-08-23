@@ -1818,12 +1818,38 @@ def process_queue_task(task):
 # Queue worker thread
 def queue_thread_loop():
     print("Vali Catalyst worker thread started.")
+    if LOCAL_IP == "127.0.0.1":
+        # LOCAL_IP is read from LOCAL_HYPERVISOR_IP in /etc/hci/spectrum/spectrum.env,
+        # and this is the fallback for a file that does not name the node. It is never a
+        # working state: the check below compares the ZooKeeper leader's address against
+        # this node's, so an anonymous node can never be the worker -- and the leader is
+        # the *only* worker, so leadership landing here stops VM power tasks for the
+        # entire cluster while every one of them merely looks slow. Said loudly, because
+        # the failure it describes is otherwise completely silent.
+        sys.stderr.write(
+            "[vali] WARNING: this node does not know its own address "
+            "(LOCAL_HYPERVISOR_IP is absent from /etc/hci/spectrum/spectrum.env). It can "
+            "never act as the Catalyst queue worker, and if it holds ZooKeeper "
+            "leadership then no VM power task anywhere in this cluster will run.\n")
+        sys.stderr.flush()
+
+    was_worker = None
     while True:
         try:
-            if not is_zookeeper_leader():
+            leading = is_zookeeper_leader()
+            if leading != was_worker:
+                # Whether this process drains the queue at all is decided here, so the
+                # transition earns a line. It is the difference an operator needs between
+                # "the worker is busy" and "no worker is running anywhere".
+                print("Vali Catalyst worker: %s" % (
+                    "draining the queue, this node holds ZooKeeper leadership" if leading
+                    else "standing by, another node holds ZooKeeper leadership"))
+                sys.stdout.flush()
+                was_worker = leading
+            if not leading:
                 time.sleep(2)
                 continue
-                
+
             status, res = call_catalyst_api("/api/v1/queues/vali")
             if status == 200 and res:
                 task_id = res.get("task_id")

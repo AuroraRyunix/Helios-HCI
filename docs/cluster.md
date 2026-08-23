@@ -83,7 +83,58 @@ cluster ring
 Shows the keyspace replication factor, what `QUORUM` therefore requires, each member's
 up/normal state and host ID, and which side of the two memberships each host is on.
 
-### F. Node Decommission (`cluster decommission`)
+### F. Node Addition (`cluster add-node`)
+Bring an already-provisioned, already-enrolled machine into an existing cluster. This is
+deliberately **not** `cluster create` with one more address: create claims disks, and
+`wipefs -a` against nodes that are already serving guests is not a recoverable mistake.
+
+The node must be prepared first. `add-node` refuses a machine that cannot answer over
+mTLS, and refuses one that already carries ScyllaDB data.
+```bash
+# 1. On the workstation: install the stack on the new machine
+python provision.py --join --hosts 10.10.102.43
+
+# 2. Issue it a certificate this cluster's CA signed
+impa enroll --node 10.10.102.43
+
+# 3. On any existing node: bring it in
+cluster add-node --node 10.10.102.43
+```
+
+The order inside step 3 is not arbitrary, and each step exists because skipping it fails
+silently rather than loudly:
+
+| Order | Step | Why it is where it is |
+| --- | --- | --- |
+| 0 | **Identity** | The node is told its own address in `/etc/hci/spectrum/spectrum.env` before it is given any cluster responsibility. See below — this one is not local. |
+| 1 | **Membership** | Every node's `cluster.json` learns the new address first, so anything reading the host list mid-restart sees the intended membership rather than a half-written one. |
+| 2 | **Consensus** | The ZooKeeper ensemble is rewritten and restarted one node at a time, oldest first, which keeps a quorum of the *previous* ensemble alive throughout. |
+| 3 | **Storage** | ScyllaDB is seeded from the existing cluster and the tool waits for the ring to report the node `UN`. |
+| 4 | **Scheduling** | Only now is the node written into `hydra.nodes`. Registering it earlier hands it VMs it cannot yet run. |
+
+`add-node` is **resumable**. A join that fails part-way leaves the node in `cluster.json`
+and out of the ring, and re-running finishes from there rather than refusing because the
+address is already in the config.
+
+#### Why identity comes first
+A node reads its own IP from `LOCAL_HYPERVISOR_IP` in `/etc/hci/spectrum/spectrum.env`.
+Eleven Python modules and the Phoenix console read that key, and every one of them falls
+back to `127.0.0.1` when it is missing.
+
+That fallback is not a degraded mode — it is a cluster-wide outage waiting for an
+election. Vali's Catalyst queue worker runs **only** on the ZooKeeper leader, and decides
+whether it is the leader by comparing the leader's address against its own. A node that
+believes it is `127.0.0.1` can never match, so it never drains the queue; and because the
+leader is the only worker, leadership landing on such a node stops every VM power,
+migrate and DRS task **in the whole cluster**. Each one still returns, eventually, as a
+timeout — which looks exactly like a slow cluster rather than a broken one.
+
+`provision.py` writes this file, `add-node` writes it again so the join is self-sufficient
+against nodes built by an older toolkit, and `deploy_updates.py` repairs any node whose
+copy does not name it. Vali warns on startup if it comes up without an address, and logs
+whenever it takes or gives up the worker role.
+
+### G. Node Decommission (`cluster decommission`)
 Preflight and plan the permanent removal of a node from the ring. Prints the ordered
 sequence and refuses when the destructive step would be unsafe. It never runs
 `nodetool decommission` or `nodetool removenode` itself — those stream data, run
@@ -97,7 +148,7 @@ cluster decommission --node 10.10.102.223
 cluster decommission --node 10.10.102.223 --finalize
 ```
 
-### G. Node Rejoin (`cluster rejoin`)
+### H. Node Rejoin (`cluster rejoin`)
 Preflight and plan bringing a node back. Checks that a previously decommissioned node has
 had its ScyllaDB data wiped — rejoining with it resurrects rows deleted while the node was
 away — and restores its cluster metadata.
@@ -109,7 +160,7 @@ cluster rejoin --node 10.10.102.223 --finalize
 Both sequences, and the quorum gate that governs maintenance mode, are documented in
 [ring_lifecycle.md](./ring_lifecycle.md).
 
-### H. Cluster Destruction (`cluster destroy`)
+### I. Cluster Destruction (`cluster destroy`)
 Wipe all databases, clear claimed disks, remove configuration parameters, and reset the hypervisor hosts to factory default.
 ```bash
 # WARNING: Wipes all VM disks, metadata tables, and system configurations permanently

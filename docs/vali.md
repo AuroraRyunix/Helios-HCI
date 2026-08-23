@@ -9,7 +9,8 @@ Vali is the standalone VM management, placement scheduling, and DRS (load balanc
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/vali`) listening locally on port `9095`. Managed by systemd (`vali.service`).
-- **Leader Election**: All Vali instances run ZooKeeper leader election using ephemeral sequential nodes at `/vali/leader`. The elected Leader is responsible for consuming tasks and executing DRS checks.
+- **Leader Election**: There is no application-level election. Vali does not create a znode and does not compete for one; it asks which node the **ZooKeeper ensemble itself** has elected as its leader (by sending `stat` to each host's port 2181) and compares that address with its own. The instance on the ensemble leader consumes tasks and runs DRS checks; every other instance stands by. This is worth stating precisely, because it makes the worker role depend on two things being true — the ensemble having a leader, *and* the node knowing its own address.
+- **Knowing its own address**: Vali reads `LOCAL_HYPERVISOR_IP` from `/etc/hci/spectrum/spectrum.env` and falls back to `127.0.0.1` when the key is absent. Since the leader check is an address comparison, a node that does not know its address can never match, so it never becomes the worker. As the leader is the *only* worker, leadership landing on such a node stops every VM power, migrate and DRS task in the cluster — each returning as a timeout, which reads as a slow cluster rather than a broken one. Vali warns loudly on startup if it has no address, and logs each time it takes or gives up the worker role. See [cluster.md](./cluster.md#why-identity-comes-first).
 - **Autostart Constraint**: Vali is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ## Database Schema

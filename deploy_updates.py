@@ -642,6 +642,11 @@ ConditionPathExists=!/etc/hci/maintenance.state
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/vali
+# Every other daemon's unit sets this; vali's did not, so its stdout was block-buffered
+# under systemd and none of its diagnostics ever reached the journal. That is how a
+# worker thread that never claimed a task stayed invisible: the line it prints on start
+# sat in a 4 KB buffer for the life of the process.
+Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=3
 User=root
@@ -1060,6 +1065,32 @@ def deploy_to_node(ip):
                     print(f"[{ip}] Removed stale {stale}.container Quadlet.")
                 except IOError:
                     pass
+
+            # The node's own address. Every daemon on it reads LOCAL_HYPERVISOR_IP out of
+            # spectrum.env and silently falls back to 127.0.0.1 when it is missing, and a
+            # node that cannot recognise itself as the ZooKeeper leader never drains the
+            # Catalyst queue -- so leadership landing on an anonymous node stops VM power
+            # tasks for the whole cluster, not just on that node.
+            #
+            # Two writers used to disagree about this file, and the one on the add-node
+            # path wrote no address at all, so every node ever added to a cluster came up
+            # anonymous and the fault stayed hidden until leadership moved to one. The
+            # writers agree now; this repairs the nodes built before they did.
+            #
+            # Repaired rather than rewritten: any other line in the file is left alone.
+            env_repair = (
+                'set -e; env=/etc/hci/spectrum/spectrum.env; '
+                'mkdir -p /etc/hci/spectrum; touch "$env"; '
+                'want="LOCAL_HYPERVISOR_IP=%s"; '
+                'if grep -qx "$want" "$env"; then echo ok; else '
+                'grep -v "^LOCAL_HYPERVISOR_IP=" "$env" > "$env.new" || true; '
+                'echo "$want" >> "$env.new"; mv "$env.new" "$env"; echo repaired; fi' % ip)
+            _, stdout_env, _ = ssh.exec_command(env_repair)
+            env_out = stdout_env.read().decode("utf-8", "replace").strip()
+            stdout_env.channel.recv_exit_status()
+            if env_out.endswith("repaired"):
+                print(f"[{ip}] spectrum.env did not name this node; "
+                      f"LOCAL_HYPERVISOR_IP set to {ip}.")
 
             # `|| true` throughout: on a cluster that never had DRBD none of this exists,
             # and a rollout must not fail because it had nothing to clean up.

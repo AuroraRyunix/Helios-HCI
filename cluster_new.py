@@ -586,6 +586,11 @@ def cmd_add_node(args):
 
     The order matters and is not arbitrary:
 
+      0. **Identity before everything.** A node reads its own address out of
+         `spectrum.env`, and without it every daemon on it believes it is 127.0.0.1.
+         That is not a local problem: the node cannot recognise itself as the ZooKeeper
+         leader, and the leader is the only node that drains the Catalyst queue, so
+         leadership landing there stops VM power tasks for the whole cluster.
       1. **Membership before consensus.** Every node's `cluster.json` learns the new
          address first, so anything that reads the host list while the ensemble is
          restarting sees the intended membership rather than a half-written one.
@@ -655,7 +660,25 @@ def cmd_add_node(args):
 
     ips = existing + [target]
 
-    # 1. Membership.
+    # 1. Identity, before membership. Eleven modules and the Phoenix console read
+    # LOCAL_HYPERVISOR_IP out of spectrum.env and fall back to 127.0.0.1 without it, and
+    # a node that cannot recognise itself as the ZooKeeper leader never drains the
+    # Catalyst queue -- so leadership landing on it stops VM power tasks cluster-wide,
+    # not just on that node. `provision.py` writes this, but a node provisioned by an
+    # older toolkit got the version that carried no address at all; writing it here is
+    # idempotent and makes the join self-sufficient.
+    env_b64 = base64.b64encode(
+        ("LOCAL_HYPERVISOR_IP=%s\n" % target).encode("utf-8")).decode("utf-8")
+    rc_e, _, err_e = run_remote_spark(
+        target, "mkdir -p /etc/hci/spectrum && echo %s | base64 -d "
+                "> /etc/hci/spectrum/spectrum.env" % env_b64)
+    if rc_e != 0:
+        print("[ERROR] Could not write /etc/hci/spectrum/spectrum.env on %s: %s"
+              % (target, (err_e or "").strip()[:200]))
+        return 1
+    print("[config] %s knows its own address." % target)
+
+    # 2. Membership.
     config = cluster_hosts_config()
     if config is None:
         print("[ERROR] /etc/hci/cluster.json could not be read.")
@@ -679,7 +702,7 @@ def cmd_add_node(args):
         return 1
     print("[config] %s (%s) is in cluster.json on all %d node(s)." % (target, hostname, len(ips)))
 
-    # 2. Consensus.
+    # 3. Consensus.
     print("[zookeeper] rewriting the ensemble for %d member(s)..." % len(ips))
     failed = write_zookeeper_ensemble(ips)
     if failed:
@@ -695,7 +718,7 @@ def cmd_add_node(args):
         print("[zookeeper] %s restarted." % ip)
         time.sleep(3)
 
-    # 3. Storage.
+    # 4. Storage.
     print("[hydra-db] seeding %s from the existing cluster..." % target)
     rc, _, err = run_remote_spark(
         target,
@@ -733,7 +756,7 @@ def cmd_add_node(args):
         return 1
     print("[ring] %s is UN." % target)
 
-    # 4. Scheduling, only now.
+    # 5. Scheduling, only now.
     run_cql_query(
         "INSERT INTO hydra.nodes (hostname, ip, status, maintenance_mode) "
         "VALUES ('%s', '%s', 'NORMAL', false);" % (hostname, target))
@@ -1214,8 +1237,11 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             # exists; the second named the controllers. Sidon writes extent groups onto
             # one filesystem, and where that filesystem is mounted is the configuration.
 
-            seeds = ",".join(ips)
-            spectrum_env = f"SPECTRUM_API_PORT=8443\nLOCAL_HYPERVISOR_IP={ip}\nCLUSTER_SEEDS={seeds}"
+            # Only the address is written, because only the address was ever read. See
+            # the note in provision.py: SPECTRUM_API_PORT and CLUSTER_SEEDS had no reader
+            # anywhere in the tree, and the two writers disagreeing about the rest is
+            # what let a node join without an identity.
+            spectrum_env = f"LOCAL_HYPERVISOR_IP={ip}\n"
             env_b64 = base64.b64encode(spectrum_env.encode('utf-8')).decode('utf-8')
             run_remote_spark(ip, f"mkdir -p /etc/hci/spectrum && echo {env_b64} | base64 -d > /etc/hci/spectrum/spectrum.env")
 
