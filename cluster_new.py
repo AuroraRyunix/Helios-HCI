@@ -20,6 +20,7 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     cql_escape,
     cql_int,
     is_conditional_cql,
+    parse_replication_factor,
     run_conditional_cql_query,
     run_cql_query,
 )
@@ -455,29 +456,6 @@ def parse_nodetool_status(text):
     return members
 
 
-def parse_replication_factor(text):
-    """The number of replicas the hydra keyspace declares, or None if it cannot be read.
-
-    The replication map arrives as a stringified dict whichever way it is fetched, so the
-    pairs are read out of the text rather than out of a real mapping. The separator is
-    `[:,]` because the driver's own `OrderedMapSerializedKey` reprs its pairs as tuples
-    rather than with colons.
-    NetworkTopologyStrategy spreads the factor across datacenters and QUORUM is computed
-    from their sum, so those values are added. LocalStrategy and EverywhereStrategy have
-    no replication factor at all.
-    """
-    if not text:
-        return None
-    lowered = text.lower()
-    if "localstrategy" in lowered or "everywherestrategy" in lowered:
-        return None
-    pairs = re.findall(r"['\"]([^'\"]+)['\"]\s*[:,]\s*['\"]?(\d+)['\"]?", text)
-    factors = {key: int(value) for key, value in pairs if key != "class"}
-    if "replication_factor" in factors:
-        return factors["replication_factor"]
-    if not factors:
-        return None
-    return sum(factors.values())
 
 
 def get_hydra_replication_factor():
@@ -2255,8 +2233,12 @@ print("--- Local wipe completed ---", flush=True)
                 remaining = len(members) - 1
                 if min(replication_factor, remaining) < quorum_of(replication_factor):
                     print(f"  3. Lower the keyspace replication factor to at most {remaining}:")
-                    print(f"     ALTER KEYSPACE hydra WITH replication = {{'class': 'SimpleStrategy',")
-                    print(f"       'replication_factor': {remaining}}};")
+                    # The datacenter is left as a placeholder rather than guessed: the
+                    # operator running this is at a cqlsh prompt and can read it from
+                    # `nodetool status`, and printing the wrong one produces a keyspace
+                    # with replicas in a datacenter that has no nodes.
+                    print(f"     ALTER KEYSPACE hydra WITH replication = {{'class': 'NetworkTopologyStrategy',")
+                    print(f"       '<datacenter>': {remaining}}};   -- datacenter per 'nodetool status'")
                     print(f"     then 'nodetool repair -pr hydra' on every remaining node.")
                 else:
                     print(f"  3. Replication factor {replication_factor} still fits a "

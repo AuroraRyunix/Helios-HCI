@@ -31,6 +31,7 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     cql_escape,
     cql_int,
     is_conditional_cql,
+    parse_replication_factor,
     run_conditional_cql_query,
     run_cql_query,
 )
@@ -564,29 +565,78 @@ def reconcile_local_vm(name, host_ip, live_state):
 
 
 def get_actual_replication_factor():
+    """RF as the database reports it, as a string, or "unknown".
+
+    Goes through the shared parser rather than reading `replication_factor` out of the
+    map directly. That key exists only under SimpleStrategy; NetworkTopologyStrategy
+    spreads the factor across datacenters, so the old version reported "unknown" on
+    exactly the clusters that are rack-aware -- and "unknown" is what the console draws
+    when it cannot establish fault tolerance.
+    """
     try:
-        import urllib.request
-        import json
-        cql_query = "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';"
-        url = "http://127.0.0.1:9043/query"
-        req = urllib.request.Request(
-            url,
-            data=cql_query.encode('utf-8'),
-            headers={'Content-Type': 'text/plain'}
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
-            res = json.loads(response.read().decode('utf-8'))
-            if res.get("status") == "success" and res.get("rows"):
-                row = res["rows"][0]
-                rep = row.get("replication", {})
-                if isinstance(rep, dict) and "replication_factor" in rep:
-                    return str(rep["replication_factor"])
+        rc, stdout, _ = run_cql_query(
+            "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';")
+        if rc == 0:
+            factor = parse_replication_factor(stdout)
+            if factor is not None:
+                return str(factor)
     except Exception as e:
         print(f"Error fetching actual replication factor: {e}")
     # Deliberately not "3": returning a plausible-looking RF when the query failed makes
     # a broken cluster report full fault tolerance. "unknown" is the honest answer and is
     # visibly wrong in the UI, which is the point.
     return "unknown"
+
+def migrate_keyspace_to_topology_strategy():
+    """Move hydra off SimpleStrategy, once, if it is still on it.
+
+    SimpleStrategy places replicas by token order and knows nothing about racks, so one
+    rack can hold every copy of the metadata. Without the block map an extent group is
+    four megabytes of unlabelled bytes, which is why this is not merely a control-plane
+    concern.
+
+    **Safe precisely while the cluster is single-rack, which is why it runs now.**
+    NetworkTopologyStrategy with every node in one rack places replicas on the same nodes
+    SimpleStrategy did, so nothing moves and the repair below finds nothing to do. Once
+    racks actually differ, the same change relocates replicas and the cluster runs with
+    replicas it believes exist and does not until a full repair completes. Doing it before
+    a second cabinet is racked costs nothing; doing it after costs a repair window.
+
+    Returns True when it changed something.
+    """
+    rc, stdout, _ = run_cql_query(
+        "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';")
+    if rc != 0:
+        print("[TOPOLOGY] Could not read hydra's replication; leaving it alone.")
+        return False
+    if "simplestrategy" not in stdout.lower():
+        return False
+
+    factor = parse_replication_factor(stdout)
+    if factor is None:
+        print("[TOPOLOGY] hydra is on SimpleStrategy but its factor could not be read; "
+              "refusing to guess one.")
+        return False
+
+    datacenter = local_datacenter()
+    print(f"[TOPOLOGY] Moving hydra from SimpleStrategy to NetworkTopologyStrategy "
+          f"(RF={factor} in {datacenter}).")
+    alter = "ALTER KEYSPACE hydra WITH replication = %s;" % replication_map(factor, datacenter)
+    rc, _, err = run_cql_query(alter)
+    if rc != 0:
+        print(f"[TOPOLOGY] ALTER failed, hydra stays on SimpleStrategy: {err}")
+        return False
+
+    # Cheap when nothing moved, which is the single-rack case this runs in -- and correct
+    # if the operator has already assigned racks, where it is the thing that makes the new
+    # placement real rather than merely declared.
+    import threading
+    threading.Thread(
+        target=run_nodetool_repair,
+        args=("hydra moved to NetworkTopologyStrategy",),
+        daemon=True).start()
+    return True
+
 
 def run_nodetool_repair(reason=""):
     """Run a full repair so an RF increase actually replicates.
@@ -613,11 +663,48 @@ def run_nodetool_repair(reason=""):
     return False
 
 
+def local_datacenter():
+    """The datacenter this node reports, for building a topology-aware replication map.
+
+    Read rather than assumed. A keyspace naming a datacenter the snitch does not report
+    is accepted by Scylla and places no replicas at all, which reads as a healthy ALTER
+    and an empty keyspace. `datacenter1` is Scylla's own default and is what SimpleSnitch
+    reports, so it is the fallback rather than an invention.
+    """
+    try:
+        rc, stdout, _ = run_cql_query("SELECT data_center FROM system.local;")
+        if rc == 0:
+            for line in stdout.splitlines():
+                name = line.strip()
+                if name and name.lower() not in ("data_center", "rows", "(1 rows)"):
+                    return name
+    except Exception:
+        pass
+    return "datacenter1"
+
+
+def replication_map(desired_rf, datacenter=None):
+    """The replication clause hydra is created and altered with.
+
+    NetworkTopologyStrategy rather than SimpleStrategy, which places replicas by token
+    order alone and knows nothing about racks. On any cluster spanning more than one rack
+    a single rack loss can take the whole metadata layer with it -- and without the block
+    map an extent group is four megabytes of unlabelled bytes, so this is not merely a
+    control-plane outage.
+
+    NetworkTopologyStrategy is rack-aware on its own: within a datacenter it walks the
+    ring placing each replica in a rack that does not already hold one. That only means
+    something if the snitch reports real racks, which is why the Quadlet asks for
+    GossipingPropertyFileSnitch and provisioning writes cassandra-rackdc.properties.
+    """
+    return "{'class': 'NetworkTopologyStrategy', '%s': %d}" % (
+        datacenter or local_datacenter(), int(desired_rf))
+
+
 def alter_keyspace_rf(desired_rf, reason=""):
     """Change the keyspace replication factor, then repair if it increased."""
     before = get_actual_replication_factor()
-    alter = ("ALTER KEYSPACE hydra WITH replication = "
-             "{'class': 'SimpleStrategy', 'replication_factor': %d};" % desired_rf)
+    alter = "ALTER KEYSPACE hydra WITH replication = %s;" % replication_map(desired_rf)
     rc, _, err = run_cql_query(alter)
     if rc != 0:
         print(f"[REPAIR] ALTER KEYSPACE to RF={desired_rf} failed: {err}")
@@ -1648,7 +1735,8 @@ def init_db():
     nodes = get_cluster_nodes()
     node_count = len(nodes) if nodes else 1
     desired_rf = min(3, node_count)
-    create_keyspace = f"CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': {desired_rf}}};"
+    create_keyspace = ("CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = %s;"
+                       % replication_map(desired_rf))
     
     # Detect tier from local storage-pools.json
     detected_tier = "HDD"
@@ -1731,6 +1819,10 @@ def init_db():
     # Retry loop since ScyllaDB may take a moment to bootstrap on boot
     for i in range(15):
         rc, out, err = run_cql_query(create_keyspace)
+    # An existing cluster was created before this and is still on SimpleStrategy. The
+    # CREATE above is IF NOT EXISTS, so it cannot move one.
+    if rc == 0:
+        migrate_keyspace_to_topology_strategy()
         if rc == 0:
             print("Keyspace 'hydra' checked/created successfully.")
             # The tables are no longer defined here. helios_schema holds one ordered,

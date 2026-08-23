@@ -236,3 +236,37 @@ def _cqlsh_fallback(cql_query):
         stdout.decode("utf-8", errors="ignore").strip(),
         stderr.decode("utf-8", errors="ignore").strip(),
     )
+
+
+def parse_replication_factor(text):
+    """The number of replicas the hydra keyspace declares, or None if it cannot be read.
+
+    The replication map arrives as a stringified dict whichever way it is fetched -- Daruk
+    flattens result rows into space-joined `str(value)`, and the cqlsh fallback prints the
+    same shape -- so this reads the pairs out of the text rather than expecting a real
+    mapping. The separator is `[:,]` because the driver's own `OrderedMapSerializedKey`
+    reprs its pairs as tuples rather than with colons, and the difference is invisible
+    until the gate quietly reports "replication factor unknown" and refuses every
+    maintenance request.
+
+    `SimpleStrategy` gives `replication_factor` directly. `NetworkTopologyStrategy` spreads
+    the factor across datacenters and QUORUM is computed from their sum, so the
+    per-datacenter values are added. `LocalStrategy` and `EverywhereStrategy` have no
+    replication factor at all and give None.
+
+    Here rather than in three files because Spectrum had its own version that read only
+    `replication_factor` -- correct for SimpleStrategy and silently "unknown" under
+    NetworkTopologyStrategy, which is the strategy any rack-aware cluster uses.
+    """
+    if not text:
+        return None
+    lowered = text.lower()
+    if "localstrategy" in lowered or "everywherestrategy" in lowered:
+        return None
+    pairs = re.findall(r"['\"]([^'\"]+)['\"]\s*[:,]\s*['\"]?(\d+)['\"]?", text)
+    factors = {key: int(value) for key, value in pairs if key != "class"}
+    if "replication_factor" in factors:
+        return factors["replication_factor"]
+    if not factors:
+        return None
+    return sum(factors.values())

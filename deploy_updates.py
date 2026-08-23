@@ -1028,6 +1028,43 @@ def deploy_to_node(ip):
                 "systemctl reset-failed aether linstor-controller 2>/dev/null; true")
             stdout_stale.channel.recv_exit_status()
 
+            # The snitch config for an already-provisioned node. Written, not applied:
+            # changing endpoint_snitch needs a ScyllaDB restart, and restarting the
+            # metadata layer under a running cluster is a decision for a maintenance
+            # window rather than a side effect of a rollout. The Quadlet below carries the
+            # flag, so the next restart picks both up together.
+            # The snitch flag on an already-provisioned node. provision.py writes it into
+            # the Quadlet for new clusters; an existing node's Quadlet predates it, so
+            # without this the properties file above is written and never read. Applied to
+            # the unit file only -- the running container keeps SimpleSnitch until it is
+            # restarted, which is deliberate.
+            print(f"[{ip}] Ensuring the hydra-db Quadlet asks for a rack-aware snitch...")
+            _, stdout_sn, _ = ssh.exec_command(
+                "Q=/etc/containers/systemd/hydra-db.container; "
+                "if [ -f $Q ] && ! grep -q endpoint-snitch $Q; then "
+                "sed -i 's|^Exec=.*$|& --endpoint-snitch GossipingPropertyFileSnitch|' $Q && "
+                "grep -q 'cassandra-rackdc.properties' $Q || "
+                r"sed -i '\|^Volume=/var/lib/hci/hydra/data|a Volume=/etc/hci/hydra/cassandra-rackdc.properties:/etc/scylla/cassandra-rackdc.properties:ro' $Q; "
+                "echo 'snitch added, applies on the next hydra-db restart'; "
+                "elif [ -f $Q ]; then echo 'already asks for it'; "
+                "else echo 'no hydra-db Quadlet on this node'; fi")
+            stdout_sn.channel.recv_exit_status()
+            detail_sn = stdout_sn.read().decode("utf-8", "replace").strip()
+            if detail_sn:
+                print(f"[{ip}] hydra-db snitch: {detail_sn}")
+
+            print(f"[{ip}] Writing the ScyllaDB rack/datacenter properties...")
+            _, stdout_rk, _ = ssh.exec_command(
+                "mkdir -p /etc/hci/hydra && "
+                "if [ ! -f /etc/hci/hydra/cassandra-rackdc.properties ]; then "
+                "printf 'dc=datacenter1\\nrack=rack1\\nprefer_local=true\\n' "
+                "> /etc/hci/hydra/cassandra-rackdc.properties; "
+                "echo written; else echo 'already present, left alone'; fi")
+            stdout_rk.channel.recv_exit_status()
+            detail_rk = stdout_rk.read().decode("utf-8", "replace").strip()
+            if detail_rk:
+                print(f"[{ip}] rack/dc properties: {detail_rk}")
+
             print(f"[{ip}] Labelling the UEFI nvram directory for SELinux...")
             _, stdout_nv, _ = ssh.exec_command(NVRAM_SELINUX)
             stdout_nv.channel.recv_exit_status()

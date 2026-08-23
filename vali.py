@@ -22,6 +22,7 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     cql_escape,
     cql_int,
     is_conditional_cql,
+    parse_replication_factor,
     run_conditional_cql_query,
     run_cql_query,
 )
@@ -1928,33 +1929,6 @@ def ensure_cluster_locks_table():
     _cluster_locks_table_ready = True
 
 
-def parse_replication_factor(text):
-    """The number of replicas the hydra keyspace declares, or None if it cannot be read.
-
-    The replication map arrives as a stringified dict whichever way it is fetched --
-    Daruk flattens result rows into space-joined `str(value)`, and the cqlsh fallback
-    prints the same shape -- so this reads the pairs out of the text rather than
-    expecting a real mapping. The separator is `[:,]` because the driver's own
-    `OrderedMapSerializedKey` reprs its pairs as tuples rather than with colons, and the
-    difference is invisible until the gate quietly reports "replication factor unknown"
-    and refuses every maintenance request.
-
-    NetworkTopologyStrategy spreads the factor across datacenters and QUORUM is computed
-    from their sum, so the per-datacenter values are added. LocalStrategy and
-    EverywhereStrategy have no replication factor at all and give None.
-    """
-    if not text:
-        return None
-    lowered = text.lower()
-    if "localstrategy" in lowered or "everywherestrategy" in lowered:
-        return None
-    pairs = re.findall(r"['\"]([^'\"]+)['\"]\s*[:,]\s*['\"]?(\d+)['\"]?", text)
-    factors = {key: int(value) for key, value in pairs if key != "class"}
-    if "replication_factor" in factors:
-        return factors["replication_factor"]
-    if not factors:
-        return None
-    return sum(factors.values())
 
 
 def get_hydra_replication_factor():
