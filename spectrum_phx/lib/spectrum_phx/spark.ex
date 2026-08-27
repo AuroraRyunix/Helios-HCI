@@ -293,6 +293,14 @@ defmodule SpectrumPhx.Spark do
   """
   def host_capabilities(ip), do: get_json(ip, "/api/v1/host/capabilities")
 
+  @doc """
+  Per-segment tunnel throughput across the cluster.
+
+  Cluster-wide from whichever node is asked: the daemon walks every node and segment
+  itself, so this is one call rather than a fan-out.
+  """
+  def urbosa_tunnels(ip), do: get_json(ip, "/api/v1/urbosa/tunnels/status")
+
   @doc "Current dnsmasq DHCP leases."
   def dhcp_leases(ip), do: get_json(ip, "/api/v1/host/dhcp-leases")
 

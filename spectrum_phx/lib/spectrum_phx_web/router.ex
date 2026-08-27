@@ -60,6 +60,7 @@ defmodule SpectrumPhxWeb.Router do
       live "/images", Images.IndexLive, :index
 
       live "/hardware", Hardware.IndexLive, :index
+      live "/sdn", Sdn.IndexLive, :index
     end
   end
 
