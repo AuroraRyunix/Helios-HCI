@@ -276,6 +276,15 @@ defmodule SpectrumPhx.Spark do
   def host_disks(ip), do: get_json(ip, "/api/v1/host/disks")
 
   @doc """
+  The host's processors: model, online logical cores, physical cores, sockets, load.
+
+  A typed endpoint rather than `execute/3` with `nproc; grep model name /proc/cpuinfo`,
+  which is how the Python console reads the same fact. Every `execute` call site is one
+  more place the unsandboxed root executor has to stay trusted.
+  """
+  def host_cpu(ip), do: get_json(ip, "/api/v1/host/cpu")
+
+  @doc """
   Whether the host has KVM, and its Secure Boot state.
 
   Secure Boot is reported and acted on by nothing. It used to gate provisioning, because

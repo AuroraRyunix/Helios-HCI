@@ -36,7 +36,7 @@ http:
     phoenix-ui:
       rule: >-
         Path(`/`, `/login`, `/logout`, `/hosts`, `/vms`, `/tasks`, `/metrics`,
-        `/health`, `/storage`, `/images`, `/favicon.ico`, `/robots.txt`)
+        `/health`, `/storage`, `/images`, `/hardware`, `/favicon.ico`, `/robots.txt`)
         || PathPrefix(`/vms/`, `/live/`, `/assets/`, `/fonts/`, `/images/`)
       priority: 200
       entryPoints:

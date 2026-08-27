@@ -1601,6 +1601,63 @@ def read_dhcp_leases():
     return leases
 
 
+def read_host_cpu():
+    """The host's processors, read from /proc rather than shelled out.
+
+    The console's hardware page used to get this by sending
+    `nproc; grep -m1 "model name" /proc/cpuinfo` through /api/v1/execute -- a general
+    "run this string as root" endpoint reached for a fact that is two file reads. Every
+    such call site is one more place the unsandboxed executor has to stay trusted, so
+    the fact gets an endpoint of its own and the call site goes away.
+
+    `cores` counts online logical processors, which is what `nproc` reports and what the
+    scheduler actually has to place against. Physical cores and sockets are reported
+    separately where cpuinfo gives them, because a 2-socket 8-core host with hyper-
+    threading and a 32-thread single socket are not the same machine.
+    """
+    model, cores, physical, sockets = "unknown", 0, None, None
+    try:
+        with open("/proc/cpuinfo", "r") as handle:
+            content = handle.read()
+    except OSError:
+        content = ""
+
+    physical_ids, core_ids = set(), set()
+    for line in content.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if key == "processor":
+            cores += 1
+        elif key == "model name" and model == "unknown":
+            model = value
+        elif key == "physical id":
+            physical_ids.add(value)
+        elif key == "core id":
+            core_ids.add(value)
+
+    if physical_ids:
+        sockets = len(physical_ids)
+    if core_ids:
+        physical = len(core_ids) * (sockets or 1)
+
+    load = None
+    try:
+        with open("/proc/loadavg", "r") as handle:
+            load = [float(value) for value in handle.read().split()[:3]]
+    except (OSError, ValueError):
+        load = None
+
+    return {
+        "model": model,
+        "cores": cores,
+        "physical_cores": physical,
+        "sockets": sockets,
+        "load_average": load,
+    }
+
+
 def read_host_capabilities():
     """{"kvm","secure_boot"} read straight from the kernel.
 
@@ -2873,7 +2930,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/host/disks":
             self.handle_host_disks()
             return True
-        if path == "/api/v1/host/capabilities":
+        if path == "/api/v1/host/cpu":
+            self.handle_host_cpu()
+        elif path == "/api/v1/host/capabilities":
             self.handle_host_capabilities()
             return True
         if path == "/api/v1/host/dhcp-leases":
@@ -3425,6 +3484,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject("Could not parse lsblk output", 500)
             return
         self.send_json_response(200, disks)
+
+    def handle_host_cpu(self):
+        self.send_json_response(200, read_host_cpu())
 
     def handle_host_capabilities(self):
         self.send_json_response(200, read_host_capabilities())
