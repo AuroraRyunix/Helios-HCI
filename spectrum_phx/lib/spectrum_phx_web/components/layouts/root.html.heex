@@ -23,8 +23,12 @@
             document.documentElement.setAttribute("data-theme-source", "user");
           }
         };
+        // Dark unless the operator has asked for something else. The console this
+        // replaces was dark only, so following the browser's preference means an
+        // operator on a light-mode machine opens what looks like a different product.
+        // "system" remains available from the toggle; it is just not the default.
         if (!document.documentElement.hasAttribute("data-theme")) {
-          setTheme(localStorage.getItem("phx:theme") || "system");
+          setTheme(localStorage.getItem("phx:theme") || "dark");
         }
         window.addEventListener("storage", (e) => e.key === "phx:theme" && setTheme(e.newValue || "system"));
         window.addEventListener("phx:set-theme", (e) => setTheme(e.target.dataset.phxTheme));
