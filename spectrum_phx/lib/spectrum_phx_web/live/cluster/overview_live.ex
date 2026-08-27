@@ -293,13 +293,13 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
                   id="figure-vdisks"
                   label="vDisks"
                   value={@storage.summary.vdisks_total}
-                  caption="#{@storage.summary.vdisks_ok} healthy"
+                  caption={"#{@storage.summary.vdisks_ok} healthy"}
                 />
                 <.figure
                   id="figure-degraded"
                   label="Degraded"
                   value={@storage.summary.vdisks_degraded}
-                  caption="under-replicated #{@storage.summary.vdisks_under_replicated}"
+                  caption={"#{@storage.summary.vdisks_under_replicated} under-replicated"}
                   tone={if @storage.summary.vdisks_degraded > 0, do: :warn, else: :neutral}
                 />
                 <.figure

@@ -324,7 +324,26 @@ defmodule SpectrumPhx.StorageTest do
       assert Enum.any?(disk.issues, &(&1 =~ "no owner"))
     end
 
-    test "two owners at once is reported as the fence failing, not as a replica problem" do
+    test "two owners at the same epoch is reported as the fence failing" do
+      static =
+        healthy()
+        |> put_in([:vdisks, @b], attached([owned("vm1-disk0", epoch: 3)]))
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
+      assert disk.health == :degraded
+      assert [issue] = Enum.filter(disk.issues, &(&1 =~ "same epoch"))
+      assert issue =~ "epoch fence"
+    end
+
+    test "a former owner at a lower epoch is stale, not a second owner" do
+      # Attaching bumps the epoch and fences every replica against the new one, so a node
+      # that used to own the vdisk keeps a local record at a lower epoch until something
+      # clears it. The fence has already refused it. Calling that "owned by two nodes at
+      # once, which the epoch fence is supposed to prevent" reports a working fence as a
+      # broken one -- and it happens to every guest that has ever been scheduled onto a
+      # different host.
       static =
         healthy()
         |> put_in([:vdisks, @b], attached([owned("vm1-disk0", epoch: 2)]))
@@ -332,9 +351,21 @@ defmodule SpectrumPhx.StorageTest do
       snapshot = snap(static)
       disk = vdisk(snapshot, "vm1-disk0")
 
+      assert disk.health == :ok
+      assert Enum.filter(disk.issues, &(&1 =~ "epoch fence")) == []
+    end
+
+    test "two owners whose epochs cannot be read are treated as contested" do
+      # Two claims and no way to tell which is current is exactly when to say so.
+      static =
+        healthy()
+        |> put_in([:vdisks, @b], attached([owned("vm1-disk0", epoch: nil)]))
+
+      snapshot = snap(static)
+      disk = vdisk(snapshot, "vm1-disk0")
+
       assert disk.health == :degraded
-      assert [issue] = Enum.filter(disk.issues, &(&1 =~ "at once"))
-      assert issue =~ "epoch fence"
+      assert Enum.any?(disk.issues, &(&1 =~ "epoch fence"))
     end
   end
 

@@ -399,22 +399,47 @@ defmodule SpectrumPhx.Storage do
   # it means the fence itself is not working -- reported as loudly as it deserves rather
   # than folded in with a missing replica.
   defp owner_issues(id, _owner, attachments) do
-    owners = for a <- attachments, a.role == :owner, do: a.hostname
+    claimants = for a <- attachments, a.role == :owner, do: a
 
     cond do
-      length(owners) > 1 ->
+      contested?(claimants) ->
         [
-          "#{id} is owned by #{Enum.join(owners, " and ")} at once, which the epoch fence " <>
-            "is supposed to prevent"
+          "#{id} is owned by #{claimants |> Enum.map(& &1.hostname) |> Enum.join(" and ")} " <>
+            "at the same epoch, which the epoch fence is supposed to prevent"
         ]
 
-      owners == [] ->
+      claimants == [] ->
         ["#{id} has no owner on any node that answered; it is being relayed, not served"]
 
       true ->
         degraded_issue(attachments)
     end
   end
+
+  @doc false
+  # Two nodes claiming ownership is only a fault when they claim it at the *same* epoch.
+  #
+  # Attaching a vdisk bumps its epoch and fences every replica against the new one, so a
+  # node that used to own it keeps a local record at a lower epoch until something clears
+  # it. That record is stale, not a second owner -- the fence has already refused it, and
+  # the highest epoch is the owner by definition.
+  #
+  # Reporting those as "owned by two nodes at once, which the epoch fence is supposed to
+  # prevent" is how a working fence gets reported as a broken one. It happens routinely:
+  # any guest that has been scheduled onto a different host leaves the old one behind.
+  #
+  # Epochs that cannot be read are treated as contested, because two owners and no way to
+  # tell which is current is exactly when an operator should be told.
+  def contested?(claimants) when length(claimants) > 1 do
+    epochs = Enum.map(claimants, & &1.epoch)
+
+    cond do
+      Enum.any?(epochs, &is_nil/1) -> true
+      true -> length(Enum.uniq(epochs)) < length(epochs)
+    end
+  end
+
+  def contested?(_claimants), do: false
 
   defp degraded_issue(attachments) do
     for a <- attachments, a.role == :owner, a.degraded?, do: "#{a.hostname}: writes are refused"

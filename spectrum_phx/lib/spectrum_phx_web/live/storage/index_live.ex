@@ -633,7 +633,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
           <div class="space-y-2 border-t border-base-300 pt-2">
             <div class="flex flex-wrap gap-1.5">
-              <.role_badge :for={attachment <- vdisk.attachments} attachment={attachment} />
+              <.role_badge :for={attachment <- vdisk.attachments} attachment={attachment} current_epoch={vdisk.epoch} />
             </div>
 
             <p :if={vdisk.replicas != []} class="text-xs opacity-70">

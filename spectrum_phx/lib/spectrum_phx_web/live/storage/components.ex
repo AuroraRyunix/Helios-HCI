@@ -58,19 +58,36 @@ defmodule SpectrumPhxWeb.Storage.Components do
   """
   attr :attachment, :map, required: true
 
+  attr :current_epoch, :any,
+    default: nil,
+    doc: "the vdisk's epoch, so a claim from before the last hand-over can be marked stale"
+
   def role_badge(assigns) do
     ~H"""
     <span class={[
       "badge badge-sm gap-1 font-mono text-xs",
-      role_class(@attachment.role)
+      stale?(@attachment, @current_epoch) && "badge-ghost opacity-60",
+      not stale?(@attachment, @current_epoch) && role_class(@attachment.role)
     ]}>
       {@attachment.hostname}: {role_label(@attachment.role)}
       <span :if={@attachment.role == :forwarding and @attachment.forwarding_to} class="opacity-70">
         &rarr; {@attachment.forwarding_to}
       </span>
+      <span :if={stale?(@attachment, @current_epoch)} title={"epoch #{@attachment.epoch}, superseded by #{@current_epoch}"}>
+        (stale)
+      </span>
     </span>
     """
   end
+
+  # A node that owned the vdisk before the last hand-over keeps its local record until
+  # something clears it. The fence has already refused it -- the highest epoch is the
+  # owner -- so it is drawn faded rather than as a second owner.
+  defp stale?(%{role: :owner, epoch: epoch}, current)
+       when is_integer(epoch) and is_integer(current),
+       do: epoch < current
+
+  defp stale?(_attachment, _current), do: false
 
   @doc """
   A vdisk's epoch, the number the ownership fence turns on.
