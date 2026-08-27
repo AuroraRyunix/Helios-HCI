@@ -84,10 +84,10 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLiveTest do
     test "summarises nodes and services", %{conn: conn} do
       {:ok, view, _html} = live(conn, ~p"/")
 
-      assert view |> element("#stat-nodes") |> render() =~ "2/3"
-      assert view |> element("#stat-services-up") |> render() =~ "3"
-      assert view |> element("#stat-services-down") |> render() =~ "1"
-      assert view |> element("#stat-services-flapping") |> render() =~ "1"
+      assert view |> element("#figure-nodes") |> render() =~ "2/3"
+      assert view |> element("#figure-services-up") |> render() =~ "3"
+      assert view |> element("#figure-services-down") |> render() =~ "1"
+      assert view |> element("#figure-flapping") |> render() =~ "1"
     end
 
     test "links each node through to its host detail", %{conn: conn} do
@@ -200,7 +200,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLiveTest do
 
       assert html =~ "No cluster configured"
       assert html =~ "no cluster.json"
-      refute has_element?(view, "#stat-nodes")
+      refute has_element?(view, "#figure-nodes")
     end
   end
 

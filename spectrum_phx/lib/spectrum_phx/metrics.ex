@@ -401,6 +401,47 @@ defmodule SpectrumPhx.Metrics do
     end
   end
 
+  @doc """
+  One series for the whole cluster: `field` averaged across the nodes reporting it, at
+  each instant any of them reported.
+
+  Grouped by the sample's own timestamp rather than by position in each node's list. Nodes
+  do not necessarily hold the same number of samples -- one that joined late, or was
+  briefly silent, has fewer -- and zipping by index would then plot one node's Tuesday
+  against another's Wednesday and call the result a cluster average.
+
+  A node missing from an instant is left out of that instant's average rather than counted
+  as zero. Silence and idleness look identical on a chart and mean opposite things.
+
+  Returns `[%{at: DateTime.t(), value: number()}]`, oldest first, shaped so `spark_points/3`
+  can plot it with `:value` as the field.
+  """
+  def cluster_series(nodes, field) do
+    nodes
+    |> Enum.flat_map(fn node -> node.samples || [] end)
+    |> Enum.filter(fn sample -> is_number(Map.get(sample, field)) and sample.at end)
+    |> Enum.group_by(& &1.at, &Map.get(&1, field))
+    |> Enum.map(fn {at, values} -> %{at: at, value: Enum.sum(values) / length(values)} end)
+    |> Enum.sort_by(& &1.at, DateTime)
+  end
+
+  @doc """
+  The ceiling to plot a series against.
+
+  Percentages are always drawn against 100, so two panels side by side are comparable and
+  a quiet cluster looks quiet rather than being stretched to fill its panel. Everything
+  else has no natural maximum and is scaled to its own peak, with a floor of 1 so a series
+  that is entirely zero does not divide by it.
+  """
+  def series_ceiling(_series, :percent), do: 100
+
+  def series_ceiling(series, :peak) do
+    case Enum.map(series, & &1.value) do
+      [] -> 1
+      values -> max(Enum.max(values), 1)
+    end
+  end
+
   @doc "The largest value of `field` across every sample of every node, or nil."
   def peak(nodes, field) do
     nodes

@@ -23,70 +23,85 @@
   on Elixir colors. Build your own at: https://daisyui.com/theme-generator/ */
 @plugin "daisyui/packages/bundle/daisyui-theme" {
   name: "dark";
-  default: false;
+  default: true;
   prefersdark: true;
   color-scheme: "dark";
-  --color-base-100: oklch(30.33% 0.016 252.42);
-  --color-base-200: oklch(25.26% 0.014 253.1);
-  --color-base-300: oklch(20.15% 0.012 254.09);
-  --color-base-content: oklch(97.807% 0.029 256.847);
-  --color-primary: oklch(58% 0.233 277.117);
-  --color-primary-content: oklch(96% 0.018 272.314);
-  --color-secondary: oklch(58% 0.233 277.117);
-  --color-secondary-content: oklch(96% 0.018 272.314);
-  --color-accent: oklch(60% 0.25 292.717);
-  --color-accent-content: oklch(96% 0.016 293.756);
-  --color-neutral: oklch(37% 0.044 257.287);
-  --color-neutral-content: oklch(98% 0.003 247.858);
-  --color-info: oklch(58% 0.158 241.966);
-  --color-info-content: oklch(97% 0.013 236.62);
-  --color-success: oklch(60% 0.118 184.704);
-  --color-success-content: oklch(98% 0.014 180.72);
-  --color-warning: oklch(66% 0.179 58.318);
-  --color-warning-content: oklch(98% 0.022 95.277);
-  --color-error: oklch(58% 0.253 17.585);
-  --color-error-content: oklch(96% 0.015 12.422);
-  --radius-selector: 0.25rem;
-  --radius-field: 0.25rem;
-  --radius-box: 0.5rem;
+
+  /* Helios. These are the tokens static/styles.css has always used, so the rebuilt
+     pages read as the same console rather than a different product wearing its name.
+     Kept in hsl() at the values the original declared: converting them to oklch would
+     shift them slightly, and "slightly off" is worse than either. */
+  --color-base-100: hsl(222, 25%, 9%);            /* --bg-main */
+  --color-base-200: hsl(222, 25%, 14%);           /* --bg-card-solid */
+  --color-base-300: hsl(222, 25%, 7%);            /* --bg-sidebar */
+  --color-base-content: hsl(210, 20%, 95%);       /* --text-primary */
+
+  --color-primary: hsl(245, 75%, 65%);
+  --color-primary-content: hsl(210, 20%, 98%);
+  --color-secondary: hsl(275, 70%, 60%);          /* --purple-accent */
+  --color-secondary-content: hsl(210, 20%, 98%);
+  --color-accent: hsl(180, 70%, 45%);             /* --cyan-accent */
+  --color-accent-content: hsl(222, 25%, 9%);
+  --color-neutral: hsl(222, 20%, 25%);
+  --color-neutral-content: hsl(210, 20%, 95%);
+
+  --color-info: hsl(180, 70%, 45%);
+  --color-info-content: hsl(222, 25%, 9%);
+  --color-success: hsl(145, 65%, 45%);
+  --color-success-content: hsl(222, 25%, 9%);
+  --color-warning: hsl(38, 90%, 55%);
+  --color-warning-content: hsl(222, 25%, 9%);
+  --color-error: hsl(0, 75%, 55%);
+  --color-error-content: hsl(210, 20%, 98%);
+
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 12px;                             /* --border-radius */
   --size-selector: 0.21875rem;
   --size-field: 0.21875rem;
-  --border: 1.5px;
+  --border: 1px;
   --depth: 1;
   --noise: 0;
 }
 
 @plugin "daisyui/packages/bundle/daisyui-theme" {
   name: "light";
-  default: true;
+  default: false;
   prefersdark: false;
   color-scheme: "light";
-  --color-base-100: oklch(98% 0 0);
-  --color-base-200: oklch(96% 0.001 286.375);
-  --color-base-300: oklch(92% 0.004 286.32);
-  --color-base-content: oklch(21% 0.006 285.885);
-  --color-primary: oklch(70% 0.213 47.604);
-  --color-primary-content: oklch(98% 0.016 73.684);
-  --color-secondary: oklch(55% 0.027 264.364);
-  --color-secondary-content: oklch(98% 0.002 247.839);
-  --color-accent: oklch(0% 0 0);
-  --color-accent-content: oklch(100% 0 0);
-  --color-neutral: oklch(44% 0.017 285.786);
-  --color-neutral-content: oklch(98% 0 0);
-  --color-info: oklch(62% 0.214 259.815);
-  --color-info-content: oklch(97% 0.014 254.604);
-  --color-success: oklch(70% 0.14 182.503);
-  --color-success-content: oklch(98% 0.014 180.72);
-  --color-warning: oklch(66% 0.179 58.318);
-  --color-warning-content: oklch(98% 0.022 95.277);
-  --color-error: oklch(58% 0.253 17.585);
-  --color-error-content: oklch(96% 0.015 12.422);
-  --radius-selector: 0.25rem;
-  --radius-field: 0.25rem;
-  --radius-box: 0.5rem;
+
+  /* The Python console was dark only, so there is nothing to be faithful to here. This
+     is the same palette read the other way up -- the same hues at the same saturations,
+     so the toggle changes the lighting rather than the product. */
+  --color-base-100: hsl(220, 30%, 98%);
+  --color-base-200: hsl(220, 25%, 94%);
+  --color-base-300: hsl(220, 20%, 88%);
+  --color-base-content: hsl(222, 30%, 14%);
+
+  --color-primary: hsl(245, 65%, 55%);
+  --color-primary-content: hsl(210, 20%, 98%);
+  --color-secondary: hsl(275, 55%, 50%);
+  --color-secondary-content: hsl(210, 20%, 98%);
+  --color-accent: hsl(180, 60%, 36%);
+  --color-accent-content: hsl(210, 20%, 98%);
+  --color-neutral: hsl(222, 18%, 35%);
+  --color-neutral-content: hsl(210, 20%, 98%);
+
+  --color-info: hsl(180, 60%, 36%);
+  --color-info-content: hsl(210, 20%, 98%);
+  --color-success: hsl(145, 55%, 35%);
+  --color-success-content: hsl(210, 20%, 98%);
+  --color-warning: hsl(38, 80%, 42%);
+  --color-warning-content: hsl(210, 20%, 98%);
+  --color-error: hsl(0, 65%, 48%);
+  --color-error-content: hsl(210, 20%, 98%);
+
+  --radius-selector: 0.5rem;
+  --radius-field: 0.5rem;
+  --radius-box: 12px;
   --size-selector: 0.21875rem;
   --size-field: 0.21875rem;
-  --border: 1.5px;
+  --border: 1px;
   --depth: 1;
   --noise: 0;
 }
@@ -103,3 +118,117 @@
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
 /* This file is for your main application CSS */
+/* Every panel on every page, not just the ones written since the palette landed.
+ *
+ * The ported pages build their surfaces out of daisyUI's `card`, which is opaque and
+ * flat. Rather than rewrite that markup in five files -- and have the next page written
+ * from the same habit come out wrong again -- the class itself is given the console's
+ * surface. `card` *is* a panel here.
+ *
+ * `bg-base-100` is what the markup pairs with it, so it is overridden too: a solid panel
+ * on a solid field is the flatness being removed.
+ */
+@layer components {
+  .card {
+    background: color-mix(in srgb, var(--color-base-200) 75%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid color-mix(in srgb, var(--color-neutral) 40%, transparent);
+    border-radius: var(--radius-box);
+    box-shadow: 0 8px 32px 0 rgb(0 0 0 / 0.3);
+    transition: border-color 0.25s;
+  }
+
+  .card:hover {
+    border-color: color-mix(in srgb, var(--color-primary) 35%, transparent);
+  }
+
+  /* A table on glass needs its own separation, or the rows read as one block. */
+  .table :where(thead th) {
+    background: color-mix(in srgb, var(--color-base-300) 60%, transparent);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.7rem;
+  }
+
+  .table :where(tbody tr:hover) {
+    background: color-mix(in srgb, var(--color-primary) 7%, transparent);
+  }
+}
+
+
+/* --- The console's own surfaces -------------------------------------------------
+ *
+ * The Python console's signature is a translucent, blurred card on a deep navy field.
+ * daisyUI's `card` is opaque and flat, so these are defined here rather than themed:
+ * the look is the point, not a nicety.
+ *
+ * `@utility` rather than a plain class so Tailwind emits them in the right layer and
+ * they can be composed with utilities in markup.
+ */
+
+@utility glass-card {
+  background: color-mix(in srgb, var(--color-base-200) 75%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid color-mix(in srgb, var(--color-neutral) 40%, transparent);
+  border-radius: var(--radius-box);
+  box-shadow: 0 8px 32px 0 rgb(0 0 0 / 0.3);
+  transition: transform 0.25s, border-color 0.25s;
+}
+
+@utility glass-card-hover {
+  &:hover {
+    border-color: color-mix(in srgb, var(--color-primary) 45%, transparent);
+    transform: translateY(-1px);
+  }
+}
+
+/* The indigo halo the original used to mark the live/primary element. */
+@utility glow-primary {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-primary) 30%, transparent),
+              0 0 24px color-mix(in srgb, var(--color-primary) 25%, transparent);
+}
+
+@utility glow-success {
+  box-shadow: 0 0 18px color-mix(in srgb, var(--color-success) 20%, transparent);
+}
+
+@utility glow-error {
+  box-shadow: 0 0 18px color-mix(in srgb, var(--color-error) 20%, transparent);
+}
+
+/* A small caps label above a panel, as the original's .panel-title. */
+@utility panel-title {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-base-content) 65%, transparent);
+}
+
+/* Status dot with the halo that made state readable at a glance. */
+@utility status-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: currentColor;
+  box-shadow: 0 0 8px currentColor;
+}
+
+/* The page field itself. Tailwind's preflight paints base-100 flat; the original had a
+   pair of very soft radial washes that keep a full-width dashboard from reading as a
+   slab. Fixed so they do not travel with scroll. */
+@layer base {
+  body {
+    background-image:
+      radial-gradient(60rem 40rem at 15% -10%,
+        color-mix(in srgb, var(--color-primary) 10%, transparent), transparent 60%),
+      radial-gradient(50rem 35rem at 100% 0%,
+        color-mix(in srgb, var(--color-secondary) 8%, transparent), transparent 55%);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+  }
+}
+

@@ -158,6 +158,161 @@ defmodule SpectrumPhxWeb.Cluster.Components do
     """
   end
 
+  @doc """
+  A panel on the dashboard.
+
+  The console's surface is a translucent, blurred card on a deep field -- see
+  `glass-card` in assets/css/app.css. daisyUI's `card` is opaque and flat, and a
+  dashboard built out of those reads as a different product wearing the same name.
+  """
+  attr :title, :string, default: nil
+  attr :subtitle, :string, default: nil
+  attr :class, :any, default: nil
+  attr :id, :string, default: nil
+  slot :actions
+  slot :inner_block, required: true
+
+  def panel(assigns) do
+    ~H"""
+    <section id={@id} class={["glass-card glass-card-hover p-4 sm:p-5", @class]}>
+      <header :if={@title} class="flex items-start justify-between gap-3 mb-3">
+        <div class="min-w-0">
+          <h2 class="panel-title">{@title}</h2>
+          <p :if={@subtitle} class="text-xs opacity-55 mt-0.5">{@subtitle}</p>
+        </div>
+        <div :if={@actions != []} class="flex-none">{render_slot(@actions)}</div>
+      </header>
+      {render_slot(@inner_block)}
+    </section>
+    """
+  end
+
+  @doc """
+  One headline number, with a label above and a caption below.
+
+  `value` of `nil` renders as an em dash rather than as zero: a figure the cluster did
+  not report and a figure that is genuinely zero are different statements, and only one
+  of them is reassuring.
+  """
+  attr :label, :string, required: true
+  attr :value, :any, default: nil
+  attr :caption, :string, default: nil
+  attr :tone, :atom, default: :neutral, values: [:neutral, :good, :warn, :bad, :primary]
+  attr :id, :string, default: nil
+
+  def figure(assigns) do
+    ~H"""
+    <div id={@id} class="min-w-0">
+      <p class="panel-title truncate">{@label}</p>
+      <p class={["text-2xl font-semibold tabular-nums leading-tight mt-1", tone_class(@tone)]}>
+        <span :if={@value not in [nil, ""]}>{@value}</span>
+        <span :if={@value in [nil, ""]} class="opacity-40">&mdash;</span>
+      </p>
+      <p :if={@caption} class="text-xs opacity-55 truncate">{@caption}</p>
+    </div>
+    """
+  end
+
+  defp tone_class(:good), do: "text-success"
+  defp tone_class(:warn), do: "text-warning"
+  defp tone_class(:bad), do: "text-error"
+  defp tone_class(:primary), do: "text-primary"
+  defp tone_class(_), do: nil
+
+  @doc """
+  A filled area chart over a series of `{x, y}` points in a 0..100 viewBox.
+
+  Server-rendered SVG, like the sparkline on the telemetry page and for the same reason:
+  the canvases this replaces were redrawn from a full-table scan on a browser timer, so
+  every panel flickered and no two agreed on which instant they were showing. Here
+  LiveView patches the `points` attribute and the browser does no work at all.
+
+  The fill is a gradient to the panel floor rather than a solid, which is what makes a
+  thin line legible at a glance without drawing more ink than the data deserves. The
+  gradient needs an id unique in the document, so one is required.
+  """
+  attr :id, :string, required: true
+  attr :points, :list, required: true
+  attr :class, :any, default: "text-primary"
+  attr :height, :string, default: "h-24"
+  attr :empty_note, :string, default: "not enough samples to plot"
+
+  def area_chart(assigns) do
+    ~H"""
+    <div class={["w-full", @height]} id={@id}>
+      <svg
+        :if={@points != []}
+        viewBox="0 0 100 100"
+        preserveAspectRatio="none"
+        class={["h-full w-full overflow-visible", @class]}
+        aria-hidden="true"
+      >
+        <defs>
+          <linearGradient id={"#{@id}-fill"} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="currentColor" stop-opacity="0.35" />
+            <stop offset="100%" stop-color="currentColor" stop-opacity="0.02" />
+          </linearGradient>
+        </defs>
+        <polygon
+          points={area_points(@points)}
+          fill={"url(##{@id}-fill)"}
+          stroke="none"
+        />
+        <polyline
+          points={line_points(@points)}
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linejoin="round"
+          stroke-linecap="round"
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+      <p :if={@points == []} class="text-xs opacity-40 italic pt-6">{@empty_note}</p>
+    </div>
+    """
+  end
+
+  defp line_points(points), do: Enum.map_join(points, " ", fn {x, y} -> "#{x},#{y}" end)
+
+  # The line, closed down to the baseline at both ends so the fill has an area. Only ever
+  # called from the branch that has already established there are points to draw.
+  defp area_points(points) do
+    {first_x, _} = hd(points)
+    {last_x, _} = List.last(points)
+    "#{first_x},100 " <> line_points(points) <> " #{last_x},100"
+  end
+
+  @doc """
+  A chart panel: a caption, the current reading, and the plot beneath it.
+
+  `value` is drawn from the latest sample rather than from the end of the line, so a
+  series that stops updating shows a stale reading next to a flat tail instead of
+  silently asserting the last value is current.
+  """
+  attr :label, :string, required: true
+  attr :value, :any, default: nil
+  attr :ceiling, :string, default: nil
+  attr :points, :list, required: true
+  attr :tone, :string, default: "text-primary"
+  attr :id, :string, required: true
+
+  def chart_panel(assigns) do
+    ~H"""
+    <div class="glass-card glass-card-hover p-4" id={@id}>
+      <div class="flex items-baseline justify-between gap-2">
+        <span class="panel-title truncate">{@label}</span>
+        <span :if={@ceiling} class="text-[0.65rem] opacity-40 tabular-nums">{@ceiling}</span>
+      </div>
+      <p class={["text-2xl font-semibold tabular-nums leading-tight mt-1", @tone]}>
+        <span :if={@value not in [nil, ""]}>{@value}</span>
+        <span :if={@value in [nil, ""]} class="opacity-40">&mdash;</span>
+      </p>
+      <.area_chart id={"#{@id}-plot"} points={@points} class={@tone} height="h-20" />
+    </div>
+    """
+  end
+
   @doc "A DOM-safe slug for a service name, so tests and JS can target rows."
   def dom_slug(name) do
     name |> to_string() |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "-")

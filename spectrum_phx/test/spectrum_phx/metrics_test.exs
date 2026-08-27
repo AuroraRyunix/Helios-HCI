@@ -194,6 +194,86 @@ defmodule SpectrumPhx.MetricsTest do
     end
   end
 
+  describe "cluster_series/2" do
+    defp at(second), do: DateTime.new!(~D[2026-08-23], Time.new!(12, 0, second), "Etc/UTC")
+
+    defp node_with(samples), do: %{samples: samples}
+
+    test "averages the nodes reporting at each instant" do
+      nodes = [
+        node_with([%{at: at(0), cpu_pct: 10.0}, %{at: at(30), cpu_pct: 30.0}]),
+        node_with([%{at: at(0), cpu_pct: 20.0}, %{at: at(30), cpu_pct: 50.0}])
+      ]
+
+      assert [%{value: 15.0}, %{value: 40.0}] = Metrics.cluster_series(nodes, :cpu_pct)
+    end
+
+    test "groups by the sample's timestamp, not by its position in the list" do
+      # The second node joined late and holds one fewer sample. Zipping by index would
+      # pair its only reading with the first node's *oldest* one and call that a cluster
+      # average.
+      nodes = [
+        node_with([%{at: at(0), cpu_pct: 10.0}, %{at: at(30), cpu_pct: 30.0}]),
+        node_with([%{at: at(30), cpu_pct: 50.0}])
+      ]
+
+      assert [%{at: first, value: 10.0}, %{at: second, value: 40.0}] =
+               Metrics.cluster_series(nodes, :cpu_pct)
+
+      assert first == at(0)
+      assert second == at(30)
+    end
+
+    test "a node absent from an instant is left out of it, not counted as zero" do
+      nodes = [
+        node_with([%{at: at(0), cpu_pct: 80.0}]),
+        node_with([%{at: at(30), cpu_pct: 80.0}])
+      ]
+
+      # Both instants read 80, not 40: the cluster was busy at both, seen by one node each.
+      assert [%{value: 80.0}, %{value: 80.0}] = Metrics.cluster_series(nodes, :cpu_pct)
+    end
+
+    test "a sample missing the field is skipped rather than read as zero" do
+      nodes = [
+        node_with([%{at: at(0), cpu_pct: 40.0}, %{at: at(30), cpu_pct: nil}])
+      ]
+
+      assert [%{at: only, value: 40.0}] = Metrics.cluster_series(nodes, :cpu_pct)
+      assert only == at(0)
+    end
+
+    test "comes back oldest first, whatever order the nodes held" do
+      nodes = [node_with([%{at: at(30), cpu_pct: 1.0}, %{at: at(0), cpu_pct: 2.0}])]
+
+      assert [%{at: first}, %{at: second}] = Metrics.cluster_series(nodes, :cpu_pct)
+      assert DateTime.compare(first, second) == :lt
+    end
+
+    test "no samples is an empty series, which plots as nothing" do
+      assert Metrics.cluster_series([node_with([])], :cpu_pct) == []
+      assert Metrics.spark_points(Metrics.cluster_series([], :cpu_pct), :value, 100) == []
+    end
+  end
+
+  describe "series_ceiling/2" do
+    test "a percentage is always drawn against 100" do
+      # So two panels side by side are comparable, and a quiet cluster looks quiet rather
+      # than being stretched to fill its panel.
+      assert Metrics.series_ceiling([%{value: 3.0}], :percent) == 100
+      assert Metrics.series_ceiling([], :percent) == 100
+    end
+
+    test "an unbounded series is scaled to its own peak" do
+      assert Metrics.series_ceiling([%{value: 20.0}, %{value: 140.0}], :peak) == 140.0
+    end
+
+    test "an all-zero series does not produce a zero ceiling to divide by" do
+      assert Metrics.series_ceiling([%{value: 0.0}, %{value: 0.0}], :peak) == 1
+      assert Metrics.series_ceiling([], :peak) == 1
+    end
+  end
+
   describe "statement" do
     test "reads one partition at a time with a bound limit" do
       assert Metrics.node_cql() =~ "WHERE node_ip = ?"
