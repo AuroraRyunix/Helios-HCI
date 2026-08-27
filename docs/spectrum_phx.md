@@ -67,6 +67,8 @@ the socket itself, so a caller cannot name a file at all.
 | `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks` |
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
+| `/hardware` | `Hardware.IndexLive` | Spark's `host/cpu`, `host/memory`, `host/disks`, `host/network` per node |
+| `/sdn` | `Sdn.IndexLive` | the five `hydra.urbosa_*` tables, plus Spark's tunnel status |
 
 Navigation lives in one list, `SpectrumPhxWeb.Layouts.nav_items/0`, and it spans both tiers
 while the migration is in progress. Each entry carries the tier that serves it:
@@ -74,7 +76,7 @@ while the migration is in progress. Each entry carries the tier that serves it:
 | Tier | Entries | Rendered as |
 |---|---|---|
 | `:live` | the table above | `navigate` — live navigation within this application |
-| `:legacy` | Hardware, Networking, SDN, LCM, Lanayru, Settings | `href` to `/<page>.html` — an ordinary link to the Python tier |
+| `:legacy` | Networking, LCM, Lanayru, Settings | `href` to `/<page>.html` — an ordinary link to the Python tier |
 
 A `:legacy` entry has to be a plain link: live navigation asks *this* router for the page,
 and it has no route for one the other tier serves. As each page is rebuilt its entry moves
@@ -268,11 +270,62 @@ need no lease and writes are refused by class at the NBD layer. A seal that fail
 failed upload, because an unsealed template is one attach away from changing what every VM
 cloned from it boots.
 
+## 7a. Hardware
+
+The physical inventory. Four reads per node — CPU, memory, disks, network — in parallel,
+each kept or lost on its own: a host whose `lsblk` fails still reports its processors, and
+a host that answers nothing still appears, marked unreachable. An inventory that silently
+omits a machine is worse than one that admits it could not reach it.
+
+Porting it **removed** an `/api/v1/execute` call site. The Python page reads the processor
+by sending `nproc; grep -m1 "model name" /proc/cpuinfo` through the general
+run-this-string-as-root endpoint — the last open P1 security item in
+[TODO.md](../TODO.md) — for a fact that is two file reads. Spark grew a typed
+`/api/v1/host/cpu` instead, reporting logical cores, physical cores and sockets
+separately: a 2-socket 8-core host with hyper-threading and a 32-thread single socket both
+answer 32 to `nproc` and are not the same machine.
+
+Disks are listed once. `lsblk -J` nests partitions under their disk and the obvious
+rendering counts the same platter three times, so partitions are folded into a count and
+the mountpoints they carry.
+
+It refreshes every two minutes. Hardware does not change between two page loads, and each
+refresh is four reads against every node.
+
+## 7b. SDN
+
+Urbosa's five tables are flat and join by uuid — a segment names a T1, a T1 names a T0, a
+guest names a segment. `SpectrumPhx.Sdn` assembles them into the tree they describe and
+`SpectrumPhxWeb.Sdn.Topology` computes the diagram's geometry from it.
+
+That is the difference from the page it replaces, which drew a **fixed** diagram: the
+boxes were in the markup and the data was written into them, so it could only show the
+shape somebody anticipated. A cluster with two Tier-0s had nowhere to put the second, and
+a segment whose router had been deleted had nowhere to appear at all — which is the one
+shape an operator most needs to see, because it is a guest that cannot reach anything.
+
+Anything dangling is kept and drawn detached, in its own band with no edge to it. Edges
+are elbows rather than diagonals: through four bands of boxes a diagonal crosses whatever
+is between them and the eye cannot follow which line entered which box. Guests are dots
+along the bottom of their segment, hollow when not running — a segment with four stopped
+guests and one with none are different situations.
+
+Selecting a box filters the tables beneath it, which is the reason to draw it rather than
+tabulate it.
+
+The logical tree and the tunnels are read on separate clocks (15s and 30s). T0/T1/segments
+are rows somebody created; the tunnels are what those rows are carried over, and they fail
+independently — a perfectly configured segment on a host whose tunnels are down is
+unreachable, and nothing in the logical tree shows it.
+
+A firewall action the table cannot parse renders as `unknown`, never as `allow`. A table
+that guesses permissive when it cannot read a row is worse than one that admits it.
+
 ## 8. What is not done yet
 
-Six pages are still served by `spectrum_server.py` on 8443, reached from the navigation bar
-as `:legacy` entries: **Hardware, Networking, SDN, LCM, Lanayru and Settings**. The guest
-console (`/vnc_auto.html`) and the whole HTTP API are there too.
+Four pages are still served by `spectrum_server.py` on 8443, reached from the navigation
+bar as `:legacy` entries: **Networking, LCM, Lanayru and Settings**. The guest console
+(`/vnc_auto.html`) and the whole HTTP API are there too.
 
 `hylia.py` and `lanayru.py` are imported as Python modules by Spectrum and have no Elixir
 counterpart, so the routes that use them cannot move until they are reimplemented, shelled
