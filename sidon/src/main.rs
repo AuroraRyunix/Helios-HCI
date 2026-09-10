@@ -106,6 +106,34 @@ fn peers_from_cluster(me: &str, port: u16) -> Vec<(String, String)> {
     out
 }
 
+/// The fault tolerance this cluster was created with, from `cluster.json`.
+///
+/// This is where the redundancy factor actually lives. It is not in ZooKeeper --
+/// `/cluster_state` holds one word, `started` or `stopped` -- and it is not a row in
+/// Hydra: `cluster_settings.replication_factor` is the *keyspace's* replication, which
+/// governs copies of the metadata and says nothing about copies of a guest's disk.
+/// `cluster.json` is written by `cluster create -r`, copied to every host, and is the
+/// same document this daemon already reads to find its peers.
+///
+/// `SIDON_CLUSTER_FTT` overrides it so the replication semantics can be exercised with
+/// several instances on one host, which is the only way they are tested today.
+fn cluster_ftt() -> Option<u64> {
+    if let Ok(v) = std::env::var("SIDON_CLUSTER_FTT") {
+        return v.trim().parse().ok();
+    }
+    // Not `as_u64` alone: a document written by hand with `"redundancy_factor": 1.0`, or
+    // with the number quoted, should still be read rather than silently becoming "the
+    // cluster did not say" and dropping every create back to a single copy.
+    let doc = cluster_document()?;
+    match doc.get("redundancy_factor")? {
+        Value::Number(n) if n.is_u64() => n.as_u64(),
+        Value::Number(n) if n.is_i64() => n.as_i64().filter(|v| *v >= 0).map(|v| v as u64),
+        Value::Number(n) => n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// What to bind the replication port to.
 ///
 /// This node's own address from `cluster.json`, so peers can reach it -- but loopback
@@ -188,16 +216,29 @@ fn main() {
         // of them, so fencing any one is already sufficient.
         peer_timeout: Duration::from_secs(env_bytes("SIDON_PEER_TIMEOUT", 20)),
         fence_timeout: Duration::from_secs(env_bytes("SIDON_FENCE_TIMEOUT", 5)),
+        // How many copies a create makes when nothing in the request says. Read here
+        // rather than per-create so it is printed at startup beside the peer list: the
+        // two together are this node's placement policy, and an operator wondering why a
+        // vdisk has one copy should be able to answer it from the log.
+        cluster_ftt: cluster_ftt(),
     };
 
     println!(
-        "sidon: node={} root={} control={} daruk={} peer_bind={} peers=[{}]",
+        "sidon: node={} root={} control={} daruk={} peer_bind={} peers=[{}] ftt={}",
         cfg.node,
         cfg.root.display(),
         cfg.control_socket.display(),
         cfg.daruk_addr,
         cfg.peer_bind,
-        cfg.peers.iter().map(|(n, a)| format!("{n}@{a}")).collect::<Vec<_>>().join(" ")
+        cfg.peers.iter().map(|(n, a)| format!("{n}@{a}")).collect::<Vec<_>>().join(" "),
+        // "unset" and "0" print differently on purpose. One of them is a cluster that
+        // asked for no replication; the other is a node that could not read the document
+        // saying what it asked for, and those want different responses from whoever is
+        // reading this line.
+        match cfg.cluster_ftt {
+            Some(f) => f.to_string(),
+            None => "unset".to_string(),
+        }
     );
 
     let daemon = match Daemon::new(cfg) {

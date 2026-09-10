@@ -824,6 +824,238 @@ def cmd_storage_children(parent):
     print("vdisk references it.")
 
 
+def _replication_policy():
+    """(ftt, node_count) from cluster.json -- the redundancy factor and who could hold a copy.
+
+    `redundancy_factor` counts failures survived, not copies kept, which is the same unit a
+    container's `ftt` uses and one less than `dfs_vdisks.rf`. Returning it in its own unit
+    and converting once, at the single place that needs copies, is deliberate: the reason
+    every vdisk on this cluster was created single-copy is that the two units met at a
+    boundary where nothing named either of them.
+
+    `(None, n)` means the document could not be read. Distinct from ftt 0, which is a
+    cluster that asked for one copy and got what it asked for.
+    """
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None, 1
+    nodes = len(data.get("hosts") or []) or 1
+    try:
+        return int(data["redundancy_factor"]), nodes
+    except (KeyError, TypeError, ValueError):
+        return None, nodes
+
+
+def _copies_for_ftt(ftt, nodes):
+    """Copies a vdisk should hold to survive `ftt` failures on a cluster of `nodes`.
+
+    The +1 that went missing. Clamped to the cluster, because a single-node deployment
+    holding one copy at ftt=1 is a supported topology and not a disk to shout about.
+    """
+    return max(1, min(int(ftt) + 1, max(int(nodes), 1)))
+
+
+def cmd_storage_replication():
+    """What each vdisk asked for against what it actually has.
+
+    This view did not exist, and its absence is the whole reason a cluster of
+    single-copy vdisks looked healthy for as long as it did. Everything that reported on
+    replication compared a vdisk's replica list to the `rf` on its own row -- and since
+    creates defaulted to `rf=1` and duly placed one replica, every disk in the fleet read
+    1/1 and nothing was ever short of anything. The number being satisfied was the number
+    that was wrong.
+
+    So this prints three columns rather than two, and the third is the one that was
+    missing: the copies the *container or cluster policy* asks for, beside the copies the
+    vdisk asked for, beside the copies that exist. A row where the last two agree and the
+    first is larger is not a degraded disk -- it is a disk that was never asked to be
+    durable, which is a different problem with a different fix.
+    """
+    cluster_ftt, nodes = _replication_policy()
+
+    # Container policy first: migration 0006 records a vdisk's rf as copied from its
+    # container's ftt, so the container is what a vdisk is measured against. The cluster's
+    # own factor stands in for containers that say nothing, which today includes every
+    # vdisk created without naming one.
+    container_ftt = {}
+    rc, stdout, _ = run_cql_query("SELECT JSON name, ftt FROM hydra.storage_containers;")
+    if rc == 0:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("ftt") is not None:
+                container_ftt[row.get("name")] = row.get("ftt")
+
+    rc, stdout, err = run_cql_query(
+        "SELECT JSON vdisk_id, container, class, rf, replicas FROM hydra.dfs_vdisks;")
+    if rc != 0:
+        print("Error: could not read hydra.dfs_vdisks: %s" % (err or stdout))
+        sys.exit(1)
+
+    rows = []
+    short_of_policy = 0
+    degraded = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+
+        container = row.get("container") or ""
+        ftt = container_ftt.get(container, cluster_ftt)
+        want = _copies_for_ftt(ftt, nodes) if ftt is not None else None
+        asked = int(row.get("rf") or 0)
+        have = len(row.get("replicas") or [])
+
+        # Three states, and keeping them apart is the point of the command. A disk short
+        # of its own rf has lost copies it once had and Purah's heal is the answer. A disk
+        # whose rf is below policy never asked for them, so there is nothing to restore --
+        # it needs a top-up, which is a deliberate act and says so here rather than
+        # happening on a timer.
+        if want is not None and asked < want:
+            verdict = "under-policy"
+            short_of_policy += 1
+        elif asked and have < asked:
+            verdict = "degraded"
+            degraded += 1
+        elif row.get("class") == "immutable":
+            verdict = "sealed"
+        else:
+            verdict = "ok"
+
+        rows.append([
+            row.get("vdisk_id", "?"),
+            container or "(unset)",
+            "?" if want is None else str(want),
+            str(asked or "?"),
+            str(have),
+            verdict,
+        ])
+
+    if not rows:
+        print("No vdisks exist yet.")
+        return
+
+    print("=== Replication ===")
+    if cluster_ftt is None:
+        print("cluster.json could not be read, so policy is unknown for any container")
+        print("that does not set its own ftt.")
+    else:
+        print("Cluster redundancy factor %d (survive %d host loss%s) across %d node(s)."
+              % (cluster_ftt, cluster_ftt, "" if cluster_ftt == 1 else "es", nodes))
+    print()
+    print_table(["Vdisk", "Container", "Policy", "Asked (rf)", "Copies", "State"],
+                sorted(rows))
+    print()
+    if short_of_policy:
+        print("%d vdisk(s) record an rf below what their container or the cluster asks"
+              % short_of_policy)
+        print("for. They are not damaged and nothing is missing: they were created before")
+        print("the create path consulted the redundancy factor, so they never requested a")
+        print("second copy. Topping one up copies its extents to another node, so it is")
+        print("something to schedule rather than something to trigger by reading this:")
+        print()
+        print("  valcli storage.replicate <vdisk_id>       one vdisk, on its owner")
+        print("  valcli storage.replicate --all            every vdisk this cluster owns")
+        print()
+    if degraded:
+        print("%d vdisk(s) hold fewer copies than their own rf asks for. Purah re-replicates"
+              % degraded)
+        print("these on its own; a persistent count here means no spare node was available.")
+
+
+def cmd_storage_replicate(target, everything=False):
+    """Add a copy to vdisks that are short of the rf they record.
+
+    The deliberate half of `storage.replication`. Purah has done re-replication since the
+    DFS shipped, but only ever as an *emergency*: it replaces a replica that stopped
+    answering, because write-all means the guest is taking EIO until it does. A vdisk that
+    is merely short of copies is not an emergency and must not be treated as one -- healing
+    those on the timer would have turned the create-time fix into an unannounced copy of
+    every disk on the cluster the next time a node restarted.
+
+    So the top-up is this, typed by an operator, and it adds one copy per vdisk per run.
+    Run it again for the next one. That is not a limitation to work around: it is how the
+    amount of copying stays something you can watch finish.
+    """
+    hosts = []
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            hosts = json.load(handle).get("hosts", [])
+    except Exception:
+        pass
+    if not hosts:
+        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
+
+    # Addressed to the owner, because only the owner holds the data to copy. For --all
+    # that means every node: each answers for the vdisks it owns and ignores the rest.
+    if everything:
+        targets = [h.get("ip") for h in hosts if h.get("ip")]
+    else:
+        owner = None
+        rc, stdout, _ = run_cql_query(
+            "SELECT JSON vdisk_id, owner FROM hydra.dfs_vdisks WHERE vdisk_id = '%s';" % target)
+        if rc != 0:
+            print("Error: could not read hydra.dfs_vdisks.")
+            sys.exit(1)
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    owner = (json.loads(line).get("owner") or "").strip()
+                except ValueError:
+                    pass
+        if not owner:
+            print("Error: '%s' is not attached anywhere, so no node holds it to copy from."
+                  % target)
+            print("Attach it to a host first -- re-replication runs on the owner.")
+            sys.exit(1)
+        targets = [_ip_for_host(owner) or "127.0.0.1"]
+
+    healed_total = 0
+    for ip in targets:
+        # The vdisk id goes to the daemon rather than being used to filter its report.
+        # Asking it to heal everything and then printing one line would top up every disk
+        # on the node while looking like it had touched one, which is the whole thing this
+        # command exists not to do.
+        payload = {"op": "purah-heal", "restore_rf": True}
+        if not everything:
+            payload["vdisk_id"] = target
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", payload)
+        if rc != 0 or not isinstance(body, dict):
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] re-replication could not be started: %s" % (ip, detail))
+            continue
+        healed = body.get("healed") or []
+        stuck = body.get("degraded") or []
+        for entry in healed:
+            healed_total += 1
+            print("[%s] %s: copied %s extent(s) to %s"
+                  % (ip, entry.get("vdisk_id"), entry.get("extents_copied"),
+                     entry.get("with")))
+        for entry in stuck:
+            print("[%s] %s: %s" % (ip, entry.get("vdisk_id"), entry.get("detail")))
+
+    if healed_total:
+        print()
+        print("%d vdisk(s) gained a copy. Run `valcli storage.replication` to see what is"
+              % healed_total)
+        print("still short -- a vdisk needing two more copies takes two runs.")
+    else:
+        print("Nothing was re-replicated. Either everything already holds the copies it")
+        print("asks for, or no spare node was free to take one.")
+
+
 def cmd_storage_cleanup_orphaned():
     """Report reclaimable space, and ask Purah to reclaim it.
 
@@ -2059,6 +2291,9 @@ def print_usage():
     print("  valcli storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
     print("  valcli storage.clone <vdisk> <name>     Writable copy of a vdisk or snapshot")
     print("  valcli storage.children <vdisk>         Snapshots and clones taken from a vdisk")
+    print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
+    print("                                          asked for, copies it actually has")
+    print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
     print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
@@ -2194,6 +2429,17 @@ def main():
             print("Usage: valcli storage.children <vdisk_id>")
             sys.exit(1)
         cmd_storage_children(sys.argv[2])
+    elif cmd == "storage.replication":
+        cmd_storage_replication()
+    elif cmd == "storage.replicate":
+        if len(sys.argv) < 3:
+            print("Usage: valcli storage.replicate <vdisk_id>")
+            print("       valcli storage.replicate --all")
+            sys.exit(1)
+        if sys.argv[2] == "--all":
+            cmd_storage_replicate(None, everything=True)
+        else:
+            cmd_storage_replicate(sys.argv[2])
     elif cmd == "image.list":
         cmd_image_list()
     elif cmd == "image.delete":

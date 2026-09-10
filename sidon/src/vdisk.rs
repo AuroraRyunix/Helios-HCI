@@ -61,6 +61,15 @@ pub struct Vdisk {
     pub class: String,
     pub extent_bytes: u64,
     pub drain_seq: u64,
+    /// How many copies this vdisk was created asking for.
+    ///
+    /// Carried on the open vdisk purely so `stats()` and the `list` op can report it
+    /// beside the replica set, because "how many copies were asked for" and "how many
+    /// exist" are different questions and nothing could answer the first one without a
+    /// Hydra query of its own. Nothing on the write path reads it: the write-all set is
+    /// `map_replicas`, and a number that disagreed with that list would be a durability
+    /// claim rather than a durability mechanism.
+    pub rf: u64,
 
     vh: u64,
     node: String,
@@ -118,7 +127,7 @@ impl Vdisk {
     ) -> Result<Vdisk> {
         let rows = daruk.query(&format!(
             "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes, \
-             container FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+             container, rf FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(id)
         ))?;
         let row = rows
@@ -140,6 +149,12 @@ impl Vdisk {
             .unwrap_or("default")
             .to_string();
         let compress = container_compresses(&daruk, &container);
+        // A row written before rf existed has no value here, and one written by the
+        // create-time default that this column was added to record has a 1. Neither is
+        // worth failing an attach over -- the number is reported, never acted on -- so an
+        // unreadable rf opens the vdisk as "one copy asked for", which is what such a row
+        // is actually saying.
+        let rf = field_u64(row, "rf").unwrap_or(1).max(1);
 
         let store = EgroupStore::open(
             crate::extent::discover_disks(&cfg.root), egroup_bytes)?;
@@ -152,6 +167,7 @@ impl Vdisk {
             class,
             extent_bytes,
             drain_seq,
+            rf,
             vh: vdisk_hash(id),
             node: cfg.node.clone(),
             overlay: Overlay::new(),
@@ -1053,6 +1069,10 @@ impl Vdisk {
             // the dialled list under this name is how a reader counting replicas against
             // the redundancy factor concludes every vdisk is one copy down.
             "replicas": self.map_replicas.clone(),
+            // Beside the set, never instead of it. `rf` is what was asked for and
+            // `replicas` is what exists, and a reader that has only one of the two cannot
+            // tell a vdisk that is short of its copies from one that never asked for any.
+            "rf": self.rf,
             "peers": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
             "degraded": self.degraded,
         })
@@ -1083,6 +1103,32 @@ fn container_compresses(daruk: &Daruk, container: &str) -> bool {
             s == "lz4" || s == "on" || s == "true"
         })
         .unwrap_or(false)
+}
+
+/// The fault tolerance a container asks its vdisks to survive, if it says.
+///
+/// `None` covers every way the answer can be absent -- no such container, an unreadable
+/// Hydra, a row from before the column existed, a null -- and the caller falls back to
+/// the cluster's own setting rather than to a number invented here. That distinction
+/// matters more than it looks: a container whose ftt reads 0 has *chosen* not to
+/// replicate, and collapsing that into "unknown" would quietly overrule an operator who
+/// asked for a single copy on purpose.
+///
+/// Note the unit. This is a count of failures to survive, not a count of copies, which is
+/// the same thing `cluster.json`'s `redundancy_factor` means and one less than the number
+/// `dfs_vdisks.rf` holds. See `copies_for_ftt` in control.rs, where the conversion lives.
+pub(crate) fn container_ftt(daruk: &Daruk, container: &str) -> Option<u64> {
+    let rows = daruk
+        .query(&format!(
+            "SELECT ftt FROM hydra.storage_containers WHERE name = {}",
+            cql_str(container)
+        ))
+        .ok()?;
+    match rows.first()?.get("ftt") {
+        Some(Value::Number(n)) if n.is_i64() => n.as_i64().filter(|v| *v >= 0).map(|v| v as u64),
+        Some(Value::Number(n)) => n.as_u64(),
+        _ => None,
+    }
 }
 
 pub(crate) fn field_u64(row: &Value, name: &str) -> Result<u64> {
