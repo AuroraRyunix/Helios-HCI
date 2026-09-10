@@ -125,11 +125,34 @@ which a caller could easily misread as the new state.
 | `POST /v1/lock/acquire` | `IF NOT EXISTS` | another holder has the lock |
 | `POST /v1/lock/renew` | `IF holder_token = ?` | the caller is not this acquisition |
 | `POST /v1/lock/release` | `IF holder_token = ?` | the caller is not this acquisition |
+| `POST /v1/network/claim-vlan` | `IF NOT EXISTS` | another network already has this VLAN |
+| `POST /v1/network/release-vlan` | `IF net_id = ?` | the claim belongs to another network |
+| `POST /v1/network/reclaim-vlan` | `IF net_id = ?` | the stranded claim changed hands first |
 
 `migrate-commit` moves the placement and drops the lock in one Paxos round. Two statements
 would leave a window in which the VM is recorded on the target with the lock still held, or
 unlocked while still recorded on the source — and a start arriving in that window picks the
 wrong host.
+
+### Claiming a VLAN
+
+`hydra.gatoway_networks` is keyed by `net_id`, so a VLAN id is an ordinary column and two
+networks on VLAN 100 are legal as far as that table goes. `hydra.gatoway_vlan_claims` is
+keyed by the VLAN id — the only thing two racing creates share, and therefore the only
+thing a lightweight transaction can serialise them on.
+
+`release-vlan` is where the shape of a refusal matters most. A `DELETE ... IF` against a
+row that does not exist is *also* refused, with every conditioned column null, so
+`applied: false` alone cannot distinguish "another network holds this claim" from "there
+was nothing to release". Only `current` can, and the second is success — a caller that
+reads it as a lost race turns an ordinary second delete into a conflict.
+
+`reclaim-vlan` exists because a claim outliving the create that took it makes its VLAN
+unusable forever, which is worse than the duplicate the claim prevents. It is conditional
+on the stale `net_id` so two callers finding the same stranded claim produce one winner,
+and callers only reach for it once the claim is older than a few minutes — for the first
+milliseconds of its life a claim belongs to a create that is simply still running, and
+taking it then would put two networks on the VLAN by way of repairing it.
 
 ### Claiming a scheduler tick
 

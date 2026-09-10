@@ -384,6 +384,83 @@ LWT_OPS = {
         },
     },
 
+    # ---- VLAN uniqueness ----------------------------------------------------------
+    # hydra.gatoway_networks is keyed by net_id, so a VLAN id is an ordinary column and
+    # two networks on VLAN 100 are perfectly legal as far as the database is concerned.
+    # Both consoles read the table and refuse a clash, which catches the mistake an
+    # operator actually makes and cannot serialise against a *concurrent* create: a read
+    # followed by a write is two operations, and two creates a millisecond apart both read
+    # "VLAN 100 is free". The result is two networks in one broadcast domain and neither
+    # operator told.
+    #
+    # A lightweight transaction is confined to one partition, so the exclusion has to live
+    # in a table whose key *is* the VLAN id. That is all hydra.gatoway_vlan_claims is.
+    "/v1/network/claim-vlan": {
+        # Columns listed, never `INSERT ... JSON ? IF NOT EXISTS`: Scylla accepts that form
+        # and then executes it unconditionally, returning no [applied] column and
+        # overwriting the row -- which here would hand VLAN 100 to the second caller and
+        # report it as a win.
+        "cql": (
+            "INSERT INTO hydra.gatoway_vlan_claims (vlan_id, net_id, name, claimed_at_ms) "
+            "VALUES (?, ?, ?, ?) IF NOT EXISTS"
+        ),
+        "binds": ("vlan_id", "net_id", "name", "claimed_at_ms"),
+        "params": {
+            "vlan_id": {"type": "int", "required": True},
+            # The holder token. A release conditions on it, so a late cleanup from a
+            # create that failed cannot drop the claim a later create legitimately holds
+            # -- the same flaw daruk.md records against releasing a lock by holder alone.
+            "net_id": {"type": "text", "required": True},
+            "name": {"type": "text", "default": ""},
+            "claimed_at_ms": {"type": "int", "required": True},
+        },
+    },
+    # Giving a VLAN back, on delete and on a create that could not finish. Conditional on
+    # the claim still being this network's.
+    #
+    # A refusal here is not always a lost race: a DELETE ... IF against a row that does not
+    # exist also answers [applied] = false, with every conditioned column null. Verified
+    # against this cluster's Scylla. The caller has to tell "somebody else holds it" from
+    # "there was nothing to release", and `current` is what lets it -- a null net_id is
+    # the second case, and the second case is success.
+    "/v1/network/release-vlan": {
+        "cql": "DELETE FROM hydra.gatoway_vlan_claims WHERE vlan_id = ? IF net_id = ?",
+        "binds": ("vlan_id", "net_id"),
+        "params": {
+            "vlan_id": {"type": "int", "required": True},
+            "net_id": {"type": "text", "required": True},
+        },
+    },
+    # Taking over a claim whose network no longer exists.
+    #
+    # A create claims the VLAN before it writes the network row, and gives the claim back
+    # if the write fails. A daemon that dies in between leaves a claim pointing at a
+    # net_id nothing will ever create -- and a VLAN that can never be used again, which is
+    # a worse failure than the duplicate this table exists to prevent. So the caller that
+    # loses a claim checks whether the holder still exists, and takes the claim over if it
+    # does not.
+    #
+    # Conditional on the stale net_id, not unconditional: two callers finding the same
+    # orphan produce one winner, and a claim whose owner was re-created in the meantime is
+    # left alone.
+    "/v1/network/reclaim-vlan": {
+        "cql": (
+            "UPDATE hydra.gatoway_vlan_claims SET net_id = ?, name = ?, claimed_at_ms = ? "
+            "WHERE vlan_id = ? IF net_id = ?"
+        ),
+        "binds": ("net_id", "name", "claimed_at_ms", "vlan_id", "expected_net_id"),
+        "params": {
+            "vlan_id": {"type": "int", "required": True},
+            "net_id": {"type": "text", "required": True},
+            "name": {"type": "text", "default": ""},
+            "claimed_at_ms": {"type": "int", "required": True},
+            # Required and nullable, with no default: a default would match the claim
+            # whose net_id has never been written and turn the takeover into an
+            # unconditional seizure of whatever is there.
+            "expected_net_id": {"type": "text", "required": True, "nullable": True},
+        },
+    },
+
     # ---- The extent-based DFS (Sidon) --------------------------------------------
     # Explicit columns, never `INSERT ... JSON ? IF NOT EXISTS`: that form silently
     # ignores the condition and overwrites the row, which was verified against this

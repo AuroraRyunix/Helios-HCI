@@ -530,6 +530,20 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   not serving, Bifrost no longer elects a replacement by sort order -- a second election that can
   disagree with the ensemble's, and in a partition each side would pick the lowest candidate it can
   see. It releases the VIP instead: briefly unreachable is visible and recoverable, duplicated is not.
+* ~~A VLAN id has no uniqueness constraint.~~ **Resolved (2026-09-10)**: `hydra.gatoway_vlan_claims`
+  (migration `0009`), keyed by the VLAN id and claimed with `IF NOT EXISTS`, so two creates racing for
+  VLAN 100 resolve rather than both taking it. Wired into create, delete and re-tag in both consoles;
+  the read-then-refuse check stays in front of it because it gives the better message. Written up under
+  the Phoenix rewrite below and in `docs/gatoway.md` §2C.
+* **A VNI has no uniqueness constraint either, and no check at all.** `hydra.urbosa_segments` is keyed
+  by `segment_id`, so nothing stops two overlay segments declaring VNI 5001 -- and unlike the VLAN case
+  there is not even an advisory read: `/api/urbosa/segments/create` validates the CIDR, the gateway and
+  the DHCP range and then inserts whatever VNI it was handed. Two segments on one VNI put their frames
+  on the same VXLAN interface, which is the overlay's version of the broadcast-domain merge the VLAN
+  claim now prevents. The fix is the same shape and can reuse it directly: a claim table keyed by
+  `vni`, taken before the segment row and released with it. It is a bigger job than the VLAN one only
+  because the segment create goes through a Catalyst task rather than writing inline, so the claim and
+  the release have to be part of what the task does -- the console returns before the row exists.
 ---
 
 ## P3 — Code health
@@ -758,12 +772,36 @@ to is still carrying those; what changed is that no page points at the Python ti
   behind a request that returns instantly and leaves the work happening somewhere. That is
   the remaining work on this migration.
 
-* **A VLAN id has no uniqueness constraint.** `hydra.gatoway_networks` is keyed by
-  `net_id`, so nothing in the database stops two networks claiming VLAN 100. The console
-  reads the existing networks and refuses a duplicate, which catches the mistake an
-  operator actually makes but cannot serialise against a concurrent create. Making it
-  airtight needs a claim table keyed by vlan id written with `IF NOT EXISTS`, which is a
-  schema change and Gatoway's business as much as the console's.
+**A VLAN id now has a uniqueness constraint (2026-09-10).** `hydra.gatoway_networks` is
+keyed by `net_id`, so nothing in that table stopped two networks claiming VLAN 100. Both
+consoles read the existing networks and refused a duplicate, which catches the mistake an
+operator actually makes and cannot serialise against a concurrent create: a read followed
+by a write is two operations, and two creates a millisecond apart both read "VLAN 100 is
+free". Gatoway builds one `br-vlan-100` either way, so the guests of both networks end up
+in the same broadcast domain and neither operator is told.
+
+`hydra.gatoway_vlan_claims` (migration `0009-vlan-claims`) is keyed by the VLAN id, which
+is the only thing two racing creates share and therefore the only thing an `IF NOT EXISTS`
+can serialise them on. The advisory check stays -- it gives the better message -- and the
+claim is the backstop behind it. Every path that assigns a VLAN takes it and every path
+that gives one up releases it: create, delete and re-tag, in both consoles, through
+Daruk's `/v1/network/claim-vlan`, `release-vlan` and `reclaim-vlan` on the Python side and
+`Hydra.apply_lwt_row/3` on the Phoenix side. Order is the part that matters: the claim is
+taken before the network row is written and released after it is removed, because the
+other way round reopens the window it exists to close. A claim left behind by a create
+that could not finish is given back on the failure path, and one left by a create that
+died outright is taken over by the next create of that VLAN once it is older than five
+minutes -- a VLAN nothing can ever use again is a worse failure than the duplicate. The
+migration claims the VLANs a cluster already has and reports any duplicates by name
+rather than failing or fixing them itself. Documented in
+[docs/gatoway.md](docs/gatoway.md#c-vlan-uniqueness).
+
+That work turned up one thing that had never fired: four daemons handed `ensure_schema`
+the *guarded* `run_cql_query`, which refuses the conditional statements the schema lock is
+made of. It was invisible because `ensure_schema` returns before taking the lock when
+nothing is pending, so it would have surfaced on the first day a migration was added, as
+every daemon failing at once. All five call sites now pass `run_conditional_cql_query`,
+and `test_vlan_claims.SchemaExecutorTests` reads the call sites to keep it that way.
 
 **Ported and verified against the live cluster:** authentication (shared `pbkdf2_sha256` hashes
 and `hydra.sessions` with the Python tier, enforced once via a router `live_session`), cluster

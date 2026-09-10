@@ -47,7 +47,31 @@ mindmap
   - `net_id` (uuid)
   - `name` (text)
   - `type` (text) - e.g. `direct` or `vlan`
-  - `vlan_id` (int)
+  - `vlan_id` (int) — **null for every `direct` network**, which is what the seeded
+    `Physical-Direct` row carries on a live cluster. A reader that treats the column as
+    always present will build a bridge named after nothing.
+
+### The VLAN claim (`hydra.gatoway_vlan_claims`)
+
+Nothing in this daemon reads or writes it: Gatoway reconciles from `hydra.gatoway_networks`
+and the claim exists to stop two rows appearing there on one VLAN in the first place. It
+is documented here because the failure it prevents is Gatoway's — one `br-vlan-100` per
+VLAN means two networks sharing a tag share a broadcast domain.
+
+The writers are the two consoles, and the operations are Daruk's, not this daemon's:
+
+| Operation | Statement | Taken by |
+| --- | --- | --- |
+| claim | `INSERT INTO hydra.gatoway_vlan_claims (…) VALUES (…) IF NOT EXISTS` | create, and re-tag onto a new VLAN |
+| release | `DELETE FROM hydra.gatoway_vlan_claims WHERE vlan_id = ? IF net_id = ?` | delete, re-tag off an old VLAN, and a create that could not write its row |
+| take over | `UPDATE … SET net_id = ?, name = ?, claimed_at_ms = ? WHERE vlan_id = ? IF net_id = ?` | a create losing to a claim whose network no longer exists |
+
+The Python tier reaches them through `/v1/network/claim-vlan`, `release-vlan` and
+`reclaim-vlan`; the Phoenix tier issues the same statements through
+`SpectrumPhx.Hydra.apply_lwt_row/3`, which returns the refused row so the loser can be
+told who beat it. See [gatoway.md](./gatoway.md#c-vlan-uniqueness) for the ordering rules
+and [daruk.md](./daruk.md#claiming-a-vlan) for why a refused release is not always a lost
+race.
 
 ### `get_active_vlan_bridges()`
 - Scans host network interfaces using `ip -o link show` and filters for bridge interfaces matching `br-vlan-[0-9]*`.

@@ -263,8 +263,10 @@ def collect_inventory():
                 _, version = f.result()
                 inventory[host_name]["versions"][comp_name] = version
                 
-        # hydra.lcm_inventory belongs to the cluster schema, not to this script.
-        load_schema_module().ensure_schema(run_cql_query)
+        # hydra.lcm_inventory belongs to the cluster schema, not to this script. The
+        # unguarded executor, because helios_schema's cluster lock is an IF NOT EXISTS
+        # insert and it reads the [applied] verdict itself.
+        load_schema_module().ensure_schema(run_conditional_cql_query)
         
         inventory_escaped = cql_escape(json.dumps(inventory))
         cql_insert = f"""
