@@ -38,6 +38,9 @@ _UPDATE_RE = re.compile(
 _INSERT_RE = re.compile(
     r"\AINSERT\s+INTO\s+(?P<table>[\w.]+)\s*\((?P<columns>[^)]*)\)\s*"
     r"VALUES\s*\([^)]*\)\s+IF\s+NOT\s+EXISTS\Z", re.S)
+_DELETE_RE = re.compile(
+    r"\ADELETE\s+FROM\s+(?P<table>[\w.]+)\s+WHERE\s+(?P<key>\w+)\s*=\s*\?"
+    r"\s+IF\s+(?P<conditions>.+)\Z", re.S)
 _ASSIGNMENT_RE = re.compile(r"(\w+)\s*=\s*\?")
 _CONDITION_RE = re.compile(r"(\w+)\s*(!=|=)\s*\?")
 
@@ -77,12 +80,22 @@ class FakeScyllaSession:
       * `IF col = ''` does *not* match a row whose column is null, so it fails on an
         absent row.
       * `INSERT ... IF NOT EXISTS` that is refused returns the whole existing row.
+      * `DELETE ... IF col = ?` against a row that does not exist is refused, with every
+        conditioned column null -- which is *not* a lost race, and a caller that reads it
+        as one turns an ordinary second delete into a conflict.
       * A statement with no IF clause returns no rows and no `[applied]` column at all.
+
+    Statements run one at a time, under a lock. That is not a convenience for the tests:
+    a lightweight transaction is one Paxos round and Scylla resolves them in order per
+    partition, so a fake that let two `IF NOT EXISTS` interleave between their read and
+    their write would report a flaw in the fake as a flaw in the code under test -- and,
+    worse, would make a correct claim look racy.
     """
 
     def __init__(self):
         self.store = {}
         self.prepared = []
+        self.lock = threading.Lock()
 
     # -- driver surface ------------------------------------------------------------
     def prepare(self, cql):
@@ -92,12 +105,16 @@ class FakeScyllaSession:
     def execute(self, statement, parameters=None):
         cql = getattr(statement, "cql", None) or str(statement)
         params = list(parameters or ())
-        insert = _INSERT_RE.match(cql.strip())
-        if insert:
-            return self._insert_if_not_exists(insert, params)
-        update = _UPDATE_RE.match(cql.strip())
-        if update:
-            return self._conditional_update(update, params)
+        with self.lock:
+            insert = _INSERT_RE.match(cql.strip())
+            if insert:
+                return self._insert_if_not_exists(insert, params)
+            update = _UPDATE_RE.match(cql.strip())
+            if update:
+                return self._conditional_update(update, params)
+            delete = _DELETE_RE.match(cql.strip())
+            if delete:
+                return self._conditional_delete(delete, params)
         raise AssertionError(f"FakeScyllaSession was handed a statement it cannot run: {cql}")
 
     # -- test helpers --------------------------------------------------------------
@@ -146,6 +163,24 @@ class FakeScyllaSession:
             return FakeResultSet(names, [tuple([False] + [existing.get(c) for c in columns])])
         table[key_value] = dict(zip(columns, params))
         return FakeResultSet(names, [tuple([True] + [None] * len(columns))])
+
+    def _conditional_delete(self, match, params):
+        table = self.store.setdefault(match.group("table"), {})
+        conditions = _CONDITION_RE.findall(match.group("conditions"))
+        key_value = params[0]
+        condition_values = params[1:]
+
+        # A missing row answers with nulls rather than being an error, which is the shape
+        # that lets "somebody else holds it" be told from "there was nothing to release".
+        row = table.get(key_value) or {}
+        current = [row.get(column) for column, _operator in conditions]
+        applied = all(
+            (row.get(column) == expected) if operator == "=" else (row.get(column) != expected)
+            for (column, operator), expected in zip(conditions, condition_values))
+        if applied:
+            table.pop(key_value, None)
+        names = ["[applied]"] + [column for column, _operator in conditions]
+        return FakeResultSet(names, [tuple([applied] + current)])
 
 
 SESSION = FakeScyllaSession()

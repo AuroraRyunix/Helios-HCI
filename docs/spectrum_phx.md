@@ -69,7 +69,7 @@ the socket itself, so a caller cannot name a file at all.
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
 | `/hardware` | `Hardware.IndexLive` | Spark's `host/cpu`, `host/memory`, `host/disks`, `host/network` per node |
 | `/sdn` | `Sdn.IndexLive` | the five `hydra.urbosa_*` tables, plus Spark's tunnel status |
-| `/networking` | `Networking.IndexLive` | `hydra.gatoway_networks` + `hydra.urbosa_segments`, and the host adapter reads |
+| `/networking` | `Networking.IndexLive` | `hydra.gatoway_networks` + `hydra.urbosa_segments`, and the host adapter reads; writes take the VLAN claim in `hydra.gatoway_vlan_claims` |
 | `/settings` | `Settings.IndexLive` | `hydra.cluster_settings` over defaults, `cluster.json`, `system_schema.keyspaces` |
 | `/lcm` | `Lcm.IndexLive` | `hydra.lcm_inventory`, `hydra.lcm_update_state`, `hydra.hylia_jobs` + `hylia_logs` |
 | `/lanayru` | `Lanayru.IndexLive` | `hydra.lanayru_clusters`, plus live ring / capacity / memory reads |
@@ -356,6 +356,34 @@ Announcements slide out beside it as tasks start and finish, preferring finishes
 starts and failures over both — somebody who walked away wants to know how it went, not
 that it began. A task already finished when first seen is not announced, or every page
 load replays the last hour at them.
+
+## 7d. Networking, and the VLAN that has to be unique
+
+The page shows Gatoway networks and Urbosa segments in one list, because from a guest's
+point of view "which network am I on" has one answer whether it is a VLAN on a bridge or a
+VXLAN segment. Creating and deleting the first kind happens here.
+
+A tagged network's id is unique and its VLAN is not: `hydra.gatoway_networks` is keyed by
+`net_id`. The page reads the existing networks and refuses a clash before writing, which is
+what the Python console does and is worth keeping — it names the offending network, and it
+catches the mistake an operator actually makes. It is also advisory, because a read
+followed by a write is two operations and two creates a millisecond apart both read "VLAN
+100 is free".
+
+Behind it, `hydra.gatoway_vlan_claims` is keyed by the VLAN id and taken with
+`IF NOT EXISTS`. The claim comes before the network row is written and is released after it
+is removed; a create that then fails to write gives the claim back, and a re-tag claims the
+new VLAN before it releases the old. The reasoning for each of those orderings is in
+[gatoway.md](./gatoway.md#c-vlan-uniqueness), and it is the same on both tiers.
+
+Two things are this tier's own:
+
+* `Hydra.apply_lwt_row/3` returns the row a refusal came back with, not only the verdict.
+  Scylla answers a refused lightweight transaction with the conditioned columns as they
+  stand now, which is what lets the loser be told "VLAN 100 is already used by production"
+  rather than "the write did not happen". `apply_lwt/3` is now written in terms of it.
+* The `net_id` is minted here rather than by the database's `uuid()`. It is the claim's
+  holder token, so this side has to know it before the row it will name exists.
 
 ## 8. What is not done yet
 

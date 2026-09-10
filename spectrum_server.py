@@ -1820,8 +1820,16 @@ def init_db():
             #
             # Twenty-three tables lived here, six of them also declared by vali.py or
             # check_updates.py. They agreed, but nothing made them agree.
+            #
+            # The executor is the unguarded one, as Catalyst's already was. helios_schema
+            # takes its cluster lock with IF NOT EXISTS and reads the [applied] verdict
+            # itself; `run_cql_query` refuses a conditional statement outright, so this
+            # raised -- but only once something was actually pending, since ensure_schema
+            # returns before the lock when nothing is. It therefore read as "Scylla is
+            # still bootstrapping" below and retried forever.
             try:
-                applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+                applied = load_schema_module().ensure_schema(
+                    run_conditional_cql_query, node_id=LOCAL_IP)
                 if applied:
                     print(f"Applied schema migrations: {', '.join(applied)}")
                 schema_ok = True
@@ -2543,6 +2551,156 @@ def metrics_and_cluster_monitor_loop():
         except Exception as e:
             print(f"[Collector Thread] Error: {e}")
         time.sleep(25.0)
+
+
+_UUID_TEXT = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+
+# How old a VLAN claim must be before a create that lost to it may take it over.
+#
+# The takeover exists because a claim whose network was never written makes its VLAN
+# unusable forever. Without an age it would also break the thing it is protecting: a
+# create claims the VLAN and then writes the row, and for the few milliseconds in between
+# its network legitimately "does not exist". A second create checking in that window would
+# take the claim from a create that is still running, and both would write a network on
+# VLAN 100 -- the duplicate, reintroduced by the repair.
+#
+# Five minutes is far longer than the two writes take and far shorter than an operator's
+# patience with a VLAN that cannot be used. This is what `claimed_at_ms` is for.
+VLAN_CLAIM_GRACE_MS = 300000
+
+
+def is_network_id(value):
+    """Whether `value` is a canonical uuid, and therefore safe to write into a statement.
+
+    A uuid column cannot be quoted in CQL, so every net_id here is interpolated. On the
+    Daruk path a statement with a second one appended fails to prepare, but the cqlsh
+    fallback executes `;`-separated statements -- which is precisely why helios_cql says
+    anything reaching it must already be trusted text.
+    """
+    return bool(_UUID_TEXT.match(str(value or "")))
+
+
+def network_exists(net_id):
+    """Whether a network row still exists. True, False, or None for "could not tell".
+
+    The three states are not decoration. This answers the question "is the claim on this
+    VLAN an orphan", and treating an unreadable table as "the network is gone" would take
+    a live network's VLAN away from it -- a worse outcome than the duplicate the claim
+    exists to prevent. `container_in_use` returns None for the same reason.
+    """
+    if not is_network_id(net_id):
+        return False
+    rc, stdout, _stderr = run_cql_query(
+        f"SELECT JSON net_id FROM hydra.gatoway_networks WHERE net_id = {net_id};")
+    if rc != 0:
+        return None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            return True
+    return False
+
+
+def claim_vlan(vlan_id, net_id, name):
+    """Take the cluster-wide claim on a VLAN id. Returns `(claimed, message)`.
+
+    This is the backstop behind the read-then-refuse check the handlers do first. That
+    check gives the better message and catches the mistake an operator actually makes --
+    typing a VLAN that is visibly in use -- but a read followed by a write is two
+    operations, and two creates a millisecond apart both read "VLAN 100 is free". Only the
+    claim serialises them, and it does it deterministically rather than by timing.
+
+    `message` is empty when the claim was taken and is meant for an operator otherwise. A
+    backstop that fires with an unreadable error is a backstop that gets removed.
+    """
+    ok, applied, current, error = run_lwt("/v1/network/claim-vlan", {
+        "vlan_id": int(vlan_id),
+        "net_id": str(net_id),
+        "name": str(name or ""),
+        "claimed_at_ms": int(time.time() * 1000),
+    })
+    if not ok:
+        return False, (
+            f"VLAN {int(vlan_id)} could not be claimed, so it is not known whether "
+            f"another network already has it: {error}")
+    if applied:
+        return True, ""
+
+    holder_id = str(current.get("net_id") or "")
+    holder_name = str(current.get("name") or "").strip() or "an unnamed network"
+    still_there = network_exists(holder_id)
+    if still_there is None:
+        return False, (
+            f"VLAN {int(vlan_id)} is claimed by '{holder_name}' ({holder_id}), and the "
+            f"network table could not be read to confirm it still exists. Refusing "
+            f"rather than taking the VLAN away from a network that may be live.")
+    if still_there:
+        return False, (
+            f"VLAN {int(vlan_id)} is already assigned to network '{holder_name}' "
+            f"({holder_id}). Two networks on one VLAN put their guests in the same "
+            f"broadcast domain.")
+
+    # No network, so either a create died between claiming the VLAN and writing its row --
+    # in which case the VLAN is unusable until somebody takes the claim over -- or a create
+    # is running right now and has not reached its second write yet. Only the age tells
+    # them apart. A claim with no timestamp at all cannot have been written by this code
+    # and is treated as old, because the alternative is a VLAN nothing can recover.
+    try:
+        claimed_at = int(current.get("claimed_at_ms") or 0)
+    except (TypeError, ValueError):
+        claimed_at = 0
+    age_ms = int(time.time() * 1000) - claimed_at
+    if age_ms < VLAN_CLAIM_GRACE_MS:
+        return False, (
+            f"VLAN {int(vlan_id)} was just claimed by a network create that has not "
+            f"finished writing its row. If that create failed, the claim can be taken "
+            f"over in about {max(1, (VLAN_CLAIM_GRACE_MS - age_ms) // 1000)} seconds.")
+
+    # Conditional on the stale net_id, so two callers finding the same stranded claim
+    # still produce one winner.
+    ok, applied, _current, error = run_lwt("/v1/network/reclaim-vlan", {
+        "vlan_id": int(vlan_id),
+        "net_id": str(net_id),
+        "name": str(name or ""),
+        "claimed_at_ms": int(time.time() * 1000),
+        "expected_net_id": holder_id,
+    })
+    if ok and applied:
+        print(f"[Networks] VLAN {int(vlan_id)} was claimed by {holder_id}, which no "
+              f"longer exists; the claim has been taken over by {net_id}.")
+        return True, ""
+    return False, (
+        f"VLAN {int(vlan_id)} is held by a claim belonging to network {holder_id}, which "
+        f"no longer exists, and the claim could not be taken over"
+        + (f": {error}" if error else " because something else took it first")
+        + ". Try again.")
+
+
+def release_vlan(vlan_id, net_id):
+    """Give a VLAN claim back. Returns `(released, message)`.
+
+    Conditional on the claim still being this network's, so a late release from a create
+    that failed cannot drop the claim a later create legitimately holds.
+
+    A claim that is not there at all is a release that has already happened, and is
+    reported as success: `DELETE ... IF` against a missing row answers `[applied] = false`
+    with every conditioned column null, which is not a lost race. Getting that backwards
+    would make an ordinary second delete look like a conflict.
+    """
+    ok, applied, current, error = run_lwt("/v1/network/release-vlan", {
+        "vlan_id": int(vlan_id),
+        "net_id": str(net_id),
+    })
+    if not ok:
+        return False, f"the claim on VLAN {int(vlan_id)} could not be released: {error}"
+    if applied:
+        return True, ""
+    holder = str(current.get("net_id") or "")
+    if not holder:
+        return True, ""
+    return False, (
+        f"the claim on VLAN {int(vlan_id)} now belongs to {holder} and was left alone")
 
 
 def get_network_details(net_id):
@@ -6649,7 +6807,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "VLAN ID must be an integer between 1 and 4094"})
                     return
 
-                # Check if VLAN ID is already in use
+                # Check if VLAN ID is already in use. Advisory, and kept because it names
+                # the clashing network and is the check that catches the mistake an
+                # operator actually makes. It cannot serialise against a concurrent
+                # create -- a read followed by a write is two operations -- which is what
+                # the claim below is for.
                 cql_check = "SELECT JSON * FROM hydra.gatoway_networks;"
                 rc, stdout, _ = run_cql_query(cql_check)
                 if rc == 0 and stdout:
@@ -6666,10 +6828,35 @@ class SpectrumHandler(BaseHTTPRequestHandler):
 
             # import uuid
             net_id = str(uuid.uuid4())
+
+            # Claimed before the network row is written, never after: the claim is what
+            # decides the race, so anything written before it is written on the strength
+            # of a read that may already be stale. Gatoway polls this table every five
+            # seconds and builds bridges from what it finds, so a network row that exists
+            # for even a moment is a network that may be configured on every host.
+            if vlan_val != "null":
+                claimed, claim_error = claim_vlan(vlan_val, net_id, name)
+                if not claimed:
+                    self.send_json(409, {"error": claim_error})
+                    return
+
             cql = f"INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id) VALUES ({net_id}, '{name}', '{net_type}', {vlan_val});"
             rc, stdout, stderr = run_cql_query(cql)
             if rc != 0:
-                self.send_json(500, {"error": f"Failed to create network in database: {stderr or stdout}"})
+                detail = ""
+                if vlan_val != "null":
+                    # A claim left behind by a create that could not finish makes its VLAN
+                    # unusable, which is worse than the duplicate the claim prevents. If
+                    # even the release fails the claim is still recoverable -- it names a
+                    # net_id no network has, and the next create of this VLAN takes it
+                    # over -- but say so, because "try again" is only true if it is.
+                    released, release_error = release_vlan(vlan_val, net_id)
+                    if not released:
+                        detail = (f" The claim on VLAN {vlan_val} could not be given back "
+                                  f"({release_error}); it names a network that does not "
+                                  f"exist, so the next create of this VLAN will take it "
+                                  f"over.")
+                self.send_json(500, {"error": f"Failed to create network in database: {stderr or stdout}{detail}"})
                 return
 
             EVENT_LOGS.append({
@@ -6688,9 +6875,34 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
+            if not is_network_id(net_id):
+                self.send_json(400, {"error": "That is not a network id."})
+                return
+
             if net_id == "7a68e0d6-11f8-4e89-9430-b3b44b8bc438":
                 self.send_json(400, {"error": "Cannot delete Physical-Direct system network."})
                 return
+
+            # Read before the delete, because afterwards there is nothing left to say
+            # which VLAN this network was holding and the claim would be stranded. A read
+            # that fails refuses the delete rather than proceeding without it: a VLAN
+            # nobody can use again is worse than a delete an operator has to retry.
+            rc_net, stdout_net, stderr_net = run_cql_query(
+                f"SELECT JSON net_id, vlan_id FROM hydra.gatoway_networks WHERE net_id = {net_id};")
+            if rc_net != 0:
+                self.send_json(503, {"error": f"The network could not be read, so its VLAN claim cannot be given back: {stderr_net or stdout_net}"})
+                return
+            claimed_vlan = None
+            for line in (stdout_net or "").splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        found = json.loads(line).get("vlan_id")
+                    except Exception:
+                        continue
+                    if isinstance(found, int) and not isinstance(found, bool):
+                        claimed_vlan = found
+                    break
 
             # Check if any VM is using this network
             cql_vms = "SELECT JSON name, network_id FROM hydra.vms;"
@@ -6717,12 +6929,27 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": f"Failed to delete network: {stderr or stdout}"})
                 return
 
+            # After the row is gone, never before. Releasing first would leave a window in
+            # which the network still exists and its VLAN is free, so a create racing this
+            # delete could take VLAN 100 while a network still carries it -- the exact
+            # duplicate the claim exists to prevent, reintroduced by the delete path.
+            #
+            # The cost of this order is that a failed release strands a claim, and that is
+            # the right way round: a stranded claim names a net_id no network has, so the
+            # next create of that VLAN takes it over.
+            release_note = ""
+            if claimed_vlan is not None:
+                released, release_error = release_vlan(claimed_vlan, net_id)
+                if not released:
+                    release_note = f" ({release_error})"
+                    print(f"[Networks] {release_error}")
+
             EVENT_LOGS.append({
                 "desc": f"Network segment '{net_id}' deleted.",
                 "time": "Just now"
             })
 
-            self.send_json(200, {"message": f"Network segment deleted successfully."})
+            self.send_json(200, {"message": f"Network segment deleted successfully.{release_note}"})
             return
 
         elif self.path == "/api/urbosa/t0/create":
@@ -7169,6 +7396,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Network ID and Name are required"})
                 return
 
+            if not is_network_id(net_id):
+                self.send_json(400, {"error": "That is not a network id."})
+                return
+
             if net_id == "7a68e0d6-11f8-4e89-9430-b3b44b8bc438":
                 self.send_json(400, {"error": "Cannot edit Physical-Direct system network."})
                 return
@@ -7195,6 +7426,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 return
                 
             net_type = net_data.get("type", "direct")
+            previous_vlan = net_data.get("vlan_id")
+            if isinstance(previous_vlan, bool) or not isinstance(previous_vlan, int):
+                previous_vlan = None
             vlan_val = "null"
             if net_type == "vlan":
                 try:
@@ -7205,7 +7439,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     self.send_json(400, {"error": "VLAN ID must be an integer between 1 and 4094"})
                     return
 
-                # Check if VLAN ID is already in use by another network
+                # Check if VLAN ID is already in use by another network. Advisory, like
+                # the one on create, and behind the same claim.
                 cql_all = "SELECT JSON * FROM hydra.gatoway_networks;"
                 rc_all, stdout_all, _ = run_cql_query(cql_all)
                 if rc_all == 0 and stdout_all:
@@ -7220,11 +7455,37 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             except Exception:
                                 pass
 
+            # Re-tagging is a create and a delete of a VLAN assignment, so it goes through
+            # the same claim. Without this an edit is the way round the constraint: create
+            # on a free VLAN, then edit onto the one somebody else already has.
+            #
+            # A rename that leaves the VLAN alone claims nothing. `previous_vlan` may be
+            # absent on a network that predates the claim table and whose backfill lost to
+            # a duplicate; claiming it now is exactly right in that case.
+            retagged = vlan_val != "null" and vlan_val != previous_vlan
+            if retagged:
+                claimed, claim_error = claim_vlan(vlan_val, net_id, name)
+                if not claimed:
+                    self.send_json(409, {"error": claim_error})
+                    return
+
             cql_upd = f"UPDATE hydra.gatoway_networks SET name = '{name}', vlan_id = {vlan_val} WHERE net_id = {net_id};"
             rc_upd, stdout_upd, stderr_upd = run_cql_query(cql_upd)
             if rc_upd != 0:
+                if retagged:
+                    release_vlan(vlan_val, net_id)
                 self.send_json(500, {"error": f"Failed to update network in database: {stderr_upd or stdout_upd}"})
                 return
+
+            # The old VLAN is given back only once the row no longer names it. A network
+            # that is no longer on VLAN 100 must not keep the claim on it, or nothing can
+            # ever use VLAN 100 again. Written against the value that was actually stored
+            # rather than against `retagged`, so a network that ends up with no VLAN at
+            # all still gives its claim back.
+            if previous_vlan is not None and previous_vlan != vlan_val:
+                released, release_error = release_vlan(previous_vlan, net_id)
+                if not released:
+                    print(f"[Networks] {release_error}")
 
             EVENT_LOGS.append({
                 "desc": f"Network segment '{name}' updated.",

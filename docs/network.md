@@ -39,6 +39,20 @@ Urbosa's logical networking consumes two address ranges that are invisible to th
 
 ---
 
+## 1b. Cluster-Wide Identifier Spaces
+
+Three numbers must be unique across the whole cluster, and none of them is a primary key of the table that stores the thing using it. Each is therefore claimed in a table keyed by the number itself, with a lightweight transaction — an `IF NOT EXISTS` is confined to one partition, so an exclusion between two concurrent creates has to live in the row they both contend for.
+
+| Space | Range | Claimed in | What a duplicate does |
+| :--- | :--- | :--- | :--- |
+| **VLAN id** (Gatoway) | `1`–`4094` | `hydra.gatoway_vlan_claims`, keyed by `vlan_id` | Gatoway builds one `br-vlan-100` per VLAN, so two networks sharing a tag put their guests in the same broadcast domain — and neither operator is told. See [gatoway.md](./gatoway.md#c-vlan-uniqueness). |
+| **Transit `/30`** (Urbosa) | `100.64.0.0/16` | `hydra.urbosa_transit_pool`, keyed by `subnet_index` | The Tier-0 delivers one tenant's return traffic into another's namespace. |
+| **VNI** (Urbosa segments) | segment-defined | *Not claimed.* `hydra.urbosa_segments` is keyed by `segment_id`, so nothing stops two segments sharing a VNI. | Two overlay segments' frames arrive on one VXLAN interface. Recorded in TODO.md; the VLAN claim is the pattern it would follow. |
+
+VLAN ids and VNIs are separate spaces: a VLAN 100 and a VNI 100 do not collide, and the consoles deliberately do not treat them as if they did.
+
+---
+
 ## 2. Cluster Communication Flow Chart
 
 The following diagram illustrates how requests flow from the Web UI / Console down to the hypervisor host command layer, distinguishing between localhost-only bindings and inter-node Mutual TLS / consensus connections.
