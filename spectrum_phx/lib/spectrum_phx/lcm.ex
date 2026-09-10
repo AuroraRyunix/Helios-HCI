@@ -73,22 +73,46 @@ defmodule SpectrumPhx.Lcm do
     end
   end
 
-  # The inventory is a JSON blob per row. A blob that will not parse is reported as one
-  # unreadable entry rather than dropped: an inventory quietly missing a component is an
-  # operator upgrading something they cannot see.
+  # The inventory is a JSON blob per row, and it comes in two shapes.
+  #
+  # What the cluster actually writes is `{"ip": ..., "versions": {name => version}}` --
+  # one row per node, with the node's address beside the component list. A bare
+  # `{name => version}` map is also accepted, because that is the shape the schema's name
+  # suggests and the shape a hand-written row would take.
+  #
+  # A blob that will not parse is reported as one unreadable entry rather than dropped: an
+  # inventory quietly missing a component is an operator upgrading something they cannot
+  # see. So is a version that is not a scalar -- rendering one crashed this page, and the
+  # fix is to say "unreadable" about that component rather than to lose the other thirty.
   defp components_of(row) do
     key = string(Map.get(row, "key")) || "inventory"
 
     case Jason.decode(Map.get(row, "inventory_json") || "") do
+      {:ok, %{"versions" => versions} = blob} when is_map(versions) ->
+        source = string(Map.get(blob, "ip")) || key
+        components(versions, source)
+
       {:ok, map} when is_map(map) ->
-        Enum.map(map, fn {name, version} ->
-          %{name: to_string(name), version: to_string(version), source: key, readable?: true}
-        end)
+        components(map, key)
 
       _ ->
         [%{name: key, version: "unreadable", source: key, readable?: false}]
     end
   end
+
+  defp components(versions, source) do
+    Enum.map(versions, fn {name, version} ->
+      case scalar(version) do
+        nil -> %{name: to_string(name), version: "unreadable", source: source, readable?: false}
+        text -> %{name: to_string(name), version: text, source: source, readable?: true}
+      end
+    end)
+  end
+
+  defp scalar(value) when is_binary(value), do: value
+  defp scalar(value) when is_number(value), do: to_string(value)
+  defp scalar(value) when is_boolean(value), do: to_string(value)
+  defp scalar(_value), do: nil
 
   defp update_state(static) do
     case read(static, :update, @state_cql) do

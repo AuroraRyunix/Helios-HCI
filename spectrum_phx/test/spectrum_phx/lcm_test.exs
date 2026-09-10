@@ -102,12 +102,47 @@ defmodule SpectrumPhx.LcmTest do
   describe "inventory" do
     defp overview(static), do: Lcm.overview(source: {:static, static})
 
-    test "flattens each row's component map" do
+    test "reads the shape the cluster actually writes: an ip and a versions map" do
+      # This is a real row off the cluster. Assuming a flat map crashed the page with
+      # Protocol.UndefinedError, because `versions` is a map and to_string/1 has no
+      # clause for one.
+      rows = [
+        %{
+          "key" => "10.10.102.43",
+          "inventory_json" =>
+            ~s({"ip":"10.10.102.43","versions":{"sidon":"1.2.0","vali":"1.2.2"}})
+        }
+      ]
+
+      result = overview(%{inventory: rows})
+
+      assert Enum.map(result.inventory.components, & &1.name) == ["sidon", "vali"]
+      assert Enum.all?(result.inventory.components, &(&1.source == "10.10.102.43"))
+      assert Enum.all?(result.inventory.components, & &1.readable?)
+    end
+
+    test "a bare name-to-version map is read too" do
       rows = [%{"key" => "cluster", "inventory_json" => ~s({"sidon":"1.2.0","vali":"0.9"})}]
       result = overview(%{inventory: rows})
 
       assert Enum.map(result.inventory.components, & &1.name) == ["sidon", "vali"]
       assert Enum.all?(result.inventory.components, & &1.readable?)
+    end
+
+    test "a version that is not a scalar loses that component, not the whole list" do
+      rows = [
+        %{
+          "key" => "n1",
+          "inventory_json" => ~s({"versions":{"sidon":"1.2.0","weird":{"nested":true}}})
+        }
+      ]
+
+      result = overview(%{inventory: rows})
+      by_name = Map.new(result.inventory.components, &{&1.name, &1})
+
+      assert by_name["sidon"].readable?
+      refute by_name["weird"].readable?
+      assert by_name["weird"].version == "unreadable"
     end
 
     test "a blob that will not parse is reported, not dropped" do
