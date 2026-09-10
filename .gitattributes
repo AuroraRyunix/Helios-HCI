@@ -12,6 +12,9 @@
 *.md            text eol=lf
 *.rs            text eol=lf
 *.toml          text eol=lf
+# Config mounted into containers, for the same reason: a CRLF file is a file the thing
+# reading it did not expect.
+*.xml           text eol=lf
 Dockerfile      text eol=lf
 
 # Extensionless CLIs and wrappers -- same reason, no extension to match on.
