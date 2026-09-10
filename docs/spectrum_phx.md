@@ -16,9 +16,9 @@ The Python `spectrum_server.py` keeps running on 8443. `spectrum-phx` runs besid
 8444 with a different unit name, container name and image. Nothing under `spectrum_phx/`
 modifies, restarts, or depends on the Python tier.
 
-**Both tiers now serve the live console.** [Slate](./slate.md) routes the rebuilt pages to
-Phoenix and everything else — the pages not yet rebuilt, the whole HTTP API, the Python
-tier's own assets — to Python. The two halves of that statement are
+**Every page is served here now**, as of 2026-09-10. [Slate](./slate.md) routes the pages
+to Phoenix and everything else — the whole HTTP API, the guest console, the Python tier's
+own assets — to Python. The two halves of that statement are
 `slate_config/dynamic.yml` and `SpectrumPhxWeb.Layouts.nav_items/0`; `test_console_routing.py`
 asserts they agree, because when they do not the failure is a link in the navigation bar
 that 404s, or a page that quietly loads from the tier it was supposed to replace.
@@ -27,7 +27,7 @@ The split is written as "Phoenix owns these paths, everything else is still Pyth
 than the reverse. A catch-all pointing at the new tier would hand it every API endpoint and
 unported page too, and each would fail the moment it was missed.
 
-Routes move over one at a time, and each one is expected to be *more correct* than what it
+Routes moved over one at a time, and each was expected to be *more correct* than what it
 replaced, not merely prettier. Section 6 lists what the old pages were getting wrong.
 
 ## 2. The console never touches the data path
@@ -69,19 +69,28 @@ the socket itself, so a caller cannot name a file at all.
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
 | `/hardware` | `Hardware.IndexLive` | Spark's `host/cpu`, `host/memory`, `host/disks`, `host/network` per node |
 | `/sdn` | `Sdn.IndexLive` | the five `hydra.urbosa_*` tables, plus Spark's tunnel status |
+| `/networking` | `Networking.IndexLive` | `hydra.gatoway_networks` + `hydra.urbosa_segments`, and the host adapter reads |
+| `/settings` | `Settings.IndexLive` | `hydra.cluster_settings` over defaults, `cluster.json`, `system_schema.keyspaces` |
+| `/lcm` | `Lcm.IndexLive` | `hydra.lcm_inventory`, `hydra.lcm_update_state`, `hydra.hylia_jobs` + `hylia_logs` |
+| `/lanayru` | `Lanayru.IndexLive` | `hydra.lanayru_clusters`, plus live ring / capacity / memory reads |
 
 Navigation lives in one list, `SpectrumPhxWeb.Layouts.nav_items/0`, and it spans both tiers
 while the migration is in progress. Each entry carries the tier that serves it:
 
 | Tier | Entries | Rendered as |
 |---|---|---|
-| `:live` | the table above | `navigate` — live navigation within this application |
-| `:legacy` | Networking, LCM, Lanayru, Settings | `href` to `/<page>.html` — an ordinary link to the Python tier |
+| `:live` | all of them | `navigate` — live navigation within this application |
+| `:legacy` | none, as of 2026-09-10 | `href` to `/<page>.html` — an ordinary link to the Python tier |
+
+**Every page is now served here.** The `:legacy` machinery stays because the split it
+implements has not gone away: the Python tier still serves the whole HTTP API, the guest
+console (`/vnc_auto.html`) and its own assets, so Slate's catch-all still belongs to it.
+What changed is that no *page* points there any more.
 
 A `:legacy` entry has to be a plain link: live navigation asks *this* router for the page,
-and it has no route for one the other tier serves. As each page is rebuilt its entry moves
-to `:live` and loses the `.html` suffix; when none are left, the split and the routing rule
-that implements it go away together.
+and it has no route for one the other tier serves. The machinery is kept rather than
+deleted, because it is what a page moved *back* would need, and because the routing rule
+it belongs to is still carrying the API and the guest console.
 
 Nothing in the compiler notices when a page is renamed, so
 `test/spectrum_phx_web/navigation_test.exs` walks the list against the real router. The two
@@ -321,11 +330,52 @@ unreachable, and nothing in the logical tree shows it.
 A firewall action the table cannot parse renders as `unknown`, never as `allow`. A table
 that guesses permissive when it cannot read a row is worse than one that admits it.
 
+## 7c. The task ring
+
+The Python console's header carried a progress ring that reported without being asked --
+an operator kicks off a migration and watches that, not a page. It is ported, and the
+numbers are the port:
+
+| | |
+|---|---|
+| `r = 9` | so the dasharray is `2*pi*9 = 56.55` |
+| `stroke-dashoffset` | the full circumference draws nothing, zero draws the whole ring; progress interpolates |
+| `rotate(-90deg)` | starts the arc at twelve o'clock rather than three |
+| `scale(--tasks-scale)` | 1.0 → 1.3 with progress, so the thing being watched grows as it closes |
+
+The scale is repeated inside the `tasks-spin` keyframes as well as the base rule. An
+animation replaces the `transform` property outright, so leaving it out of the keyframes
+is what makes a spinning ring snap back to 1.0 — exactly when it should be largest.
+
+`SpectrumPhxWeb.Tasks.RingLive` is mounted from the layout with `sticky: true`. A function
+component would have to be fed by every page's socket, and would be torn down and
+re-mounted on each navigation: a ring showing a running task must not reset because the
+operator changed page.
+
+Announcements slide out beside it as tasks start and finish, preferring finishes over
+starts and failures over both — somebody who walked away wants to know how it went, not
+that it began. A task already finished when first seen is not announced, or every page
+load replays the last hour at them.
+
 ## 8. What is not done yet
 
-Four pages are still served by `spectrum_server.py` on 8443, reached from the navigation
-bar as `:legacy` entries: **Networking, LCM, Lanayru and Settings**. The guest console
-(`/vnc_auto.html`) and the whole HTTP API are there too.
+No pages are left on the Python tier. What is still there: the whole HTTP API, the guest
+console (`/vnc_auto.html`), and Spectrum's own static assets.
+
+Three *controls* are deliberately not offered on the rebuilt pages, and each says so on
+the page rather than presenting a button that is not wired:
+
+* **starting an upgrade** and **uploading a package** (LCM) -- one rolls every node
+  through maintenance and a reboot, the other accepts a signed archive the cluster then
+  installs;
+* **deploying and destroying** a Kubernetes cluster (Lanayru);
+* **toggling `urbosa_enabled`** (Settings) -- it bootstraps or tears down namespaces,
+  bridges and VXLAN interfaces on every host.
+
+All five are long, cluster-wide and failure-prone, and they belong behind Catalyst tasks
+where the header ring reports their progress -- not behind a request that returns
+instantly and leaves the work happening somewhere. They remain on the previous console
+until they run as tasks.
 
 `hylia.py` and `lanayru.py` are imported as Python modules by Spectrum and have no Elixir
 counterpart, so the routes that use them cannot move until they are reimplemented, shelled

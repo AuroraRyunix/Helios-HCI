@@ -92,9 +92,18 @@ class TheTwoHalvesAgree(unittest.TestCase):
     def test_the_navigation_table_was_actually_read(self):
         """Every assertion below is vacuously true against an empty table."""
         self.assertTrue(self.nav, "no navigation entries parsed out of layouts.ex")
-        tiers = {tier for _, _, tier in self.nav}
-        self.assertEqual(tiers, {"live", "legacy"},
-                         "the table no longer spans both tiers; this file may be obsolete")
+
+    def test_every_page_is_now_served_by_phoenix(self):
+        """The page migration finished: no navigation entry points at the Python tier.
+
+        The routing split has *not* gone away with it, and the tests below are why. The
+        Python tier still serves the whole HTTP API, the guest console and its own
+        assets, so the catch-all still belongs to it -- what changed is that no page does.
+        """
+        legacy = [entry for entry in self.nav if entry[2] == "legacy"]
+        self.assertEqual(
+            legacy, [],
+            "these pages are still on the Python tier: %s" % ", ".join(e[0] for e in legacy))
 
     def test_every_rebuilt_page_is_routed_to_phoenix(self):
         for name, path, tier in self.nav:
@@ -105,14 +114,17 @@ class TheTwoHalvesAgree(unittest.TestCase):
                 "%s (%s) is served by Phoenix, but Slate sends it to the Python tier"
                 % (name, path))
 
-    def test_every_page_not_yet_rebuilt_still_goes_to_python(self):
+    def test_a_page_moved_back_to_the_python_tier_would_be_routed_there(self):
+        """Nothing is `:legacy` today, but the rule that made the split work has to keep
+        working: a page moved back must be routed back, not left pointing at a Phoenix
+        route that no longer exists."""
         for name, path, tier in self.nav:
             if tier != "legacy":
                 continue
             self.assertFalse(
                 self.rule.matches(path),
-                "%s (%s) has not been rebuilt, but Slate sends it to Phoenix, which has "
-                "no route for it" % (name, path))
+                "%s (%s) is served by the Python tier, but Slate sends it to Phoenix, "
+                "which has no route for it" % (name, path))
 
 
 class ThePythonTierKeepsEverythingElse(unittest.TestCase):
@@ -132,6 +144,9 @@ class ThePythonTierKeepsEverythingElse(unittest.TestCase):
     def test_the_python_tiers_own_pages_and_assets_are_not_captured(self):
         """The Python tier serves its pages with a `.html` suffix, so a prefix match on a
         page name would swallow them -- `/vms.html` is not `/vms`."""
+        # `/vnc_auto.html` especially: the guest console is the one page-shaped thing
+        # still served by the Python tier, and routing it to Phoenix would take the VM
+        # console away entirely.
         for path in ("/vms.html", "/images.html", "/health.html", "/storage.html",
                      "/index.html", "/app.js", "/styles.css", "/vnc_auto.html"):
             self.assertFalse(

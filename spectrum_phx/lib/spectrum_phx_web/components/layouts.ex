@@ -39,9 +39,9 @@ defmodule SpectrumPhxWeb.Layouts do
     {:hardware, "Hardware", "/hardware", :live},
     {:sdn, "SDN", "/sdn", :live},
     {:networking, "Networking", "/networking", :live},
-    {:lcm, "LCM", "/lcm.html", :legacy},
-    {:lanayru, "Lanayru", "/lanayru.html", :legacy},
-    {:settings, "Settings", "/settings.html", :legacy}
+    {:lcm, "LCM", "/lcm", :live},
+    {:lanayru, "Lanayru", "/lanayru", :live},
+    {:settings, "Settings", "/settings", :live}
   ]
 
   @doc """

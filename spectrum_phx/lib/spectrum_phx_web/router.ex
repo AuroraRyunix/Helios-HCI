@@ -62,6 +62,9 @@ defmodule SpectrumPhxWeb.Router do
       live "/hardware", Hardware.IndexLive, :index
       live "/sdn", Sdn.IndexLive, :index
       live "/networking", Networking.IndexLive, :index
+      live "/lcm", Lcm.IndexLive, :index
+      live "/lanayru", Lanayru.IndexLive, :index
+      live "/settings", Settings.IndexLive, :index
     end
   end
 
