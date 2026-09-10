@@ -192,11 +192,18 @@ PY
 # is the shape of bug this repository keeps finding: the toolkit is correct and the node
 # never hears about it.
 #
-# Both additions exist because ZooKeeper logs two INFO lines for every four-letter-word
-# probe, and a cluster asks which node leads continuously:
+# Two of the three additions exist because ZooKeeper logs two INFO lines for every
+# four-letter-word probe, and a cluster asks which node leads continuously:
 #
 #   * the logback mount quietens those two loggers and leaves everything else at INFO;
 #   * the rate limit is the ceiling for whatever the next mistake turns out to be.
+#
+# The third is `ZOO_CFG_EXTRA=reconfigEnabled=true`, without which `reconfig` is refused
+# and the ensemble can only be changed by rewriting every unit and restarting. It is
+# appended to the Environment= line and nothing else on that line is touched, because
+# ZOO_MY_ID is the node's identity and ZOO_SERVERS is the membership -- a rollout that
+# had an opinion about either of those, running on every node at once, is the failure
+# this whole file is careful about.
 #
 # Additive and idempotent: it inserts what is missing and leaves every other line alone,
 # because this file is also written by three other paths and a rollout should not have
@@ -223,6 +230,16 @@ changed = False
 out = []
 
 for line in lines:
+    # An exact duplicate of a line already kept. `cluster add-node` briefly wrote the
+    # logback mount twice, and podman refuses a container with two mounts on the same
+    # destination -- so the node keeps a unit that cannot start, which for the consensus
+    # layer is the expensive kind of cannot. Dropping a repeat of a line that is already
+    # in the output is the one thing here that removes rather than adds, and it changes
+    # nothing about what the unit says.
+    if line.startswith("Volume=") and line in out:
+        changed = True
+        continue
+
     # The ceiling goes at the top of [Service], where the unit's own writers put it.
     if line.strip() == "[Service]" and not any("LogRateLimit" in l for l in lines):
         out.append(line)
@@ -237,6 +254,15 @@ for line in lines:
             and not any("logback.xml:/conf/logback.xml" in l for l in lines)):
         out.append("Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z")
         out.append(line)
+        changed = True
+        continue
+
+    # Dynamic reconfiguration, appended to whatever the Environment line already says.
+    # Only appended: the rest of that line is this node's identity and the ensemble's
+    # membership, and neither is a rollout's business.
+    if (line.startswith("Environment=ZOO_MY_ID=")
+            and "ZOO_CFG_EXTRA" not in line):
+        out.append(line.rstrip() + " ZOO_CFG_EXTRA=reconfigEnabled=true")
         changed = True
         continue
 
