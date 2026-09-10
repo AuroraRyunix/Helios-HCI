@@ -102,23 +102,82 @@ defmodule SpectrumPhx.LcmTest do
   describe "inventory" do
     defp overview(static), do: Lcm.overview(source: {:static, static})
 
-    test "reads the shape the cluster actually writes: an ip and a versions map" do
-      # This is a real row off the cluster. Assuming a flat map crashed the page with
-      # Protocol.UndefinedError, because `versions` is a map and to_string/1 has no
-      # clause for one.
+    # The real row, taken off the cluster: one `latest` row holding hostname => node.
+    defp inventory_row(nodes, extra \\ %{}) do
+      blob =
+        nodes
+        |> Map.new(fn {host, versions} -> {host, %{"ip" => "10.0.0.1", "versions" => versions}} end)
+        |> Map.merge(extra)
+
+      [%{"key" => "latest", "inventory_json" => Jason.encode!(blob)}]
+    end
+
+    test "reads the shape the cluster actually writes: hostname to versions" do
+      rows =
+        inventory_row(%{
+          "Valkyrie-997A49" => %{"sidon" => "1.2.0", "vali" => "1.2.2"},
+          "Valkyrie-3CA91E" => %{"sidon" => "1.2.0", "vali" => "1.2.2"}
+        })
+
+      result = overview(%{inventory: rows})
+
+      assert Enum.map(result.inventory.components, & &1.name) == ["sidon", "vali"]
+      assert result.inventory.nodes == ["Valkyrie-3CA91E", "Valkyrie-997A49"]
+    end
+
+    test "a key beside the hostnames is not read as a machine" do
+      # The real blob carries a `level` key. Treating it as a node put "level" in the
+      # component table.
+      rows =
+        inventory_row(%{"Valkyrie-997A49" => %{"sidon" => "1.2.0"}}, %{"level" => "stable"})
+
+      result = overview(%{inventory: rows})
+
+      assert Enum.map(result.inventory.components, & &1.name) == ["sidon"]
+      assert result.inventory.nodes == ["Valkyrie-997A49"]
+    end
+
+    test "nodes running different versions of a component are reported as disagreeing" do
+      # A rolling upgrade that stopped part way looks exactly like this, and one version
+      # number per component hides it.
+      rows =
+        inventory_row(%{
+          "node-a" => %{"sidon" => "1.2.0", "vali" => "1.2.2"},
+          "node-b" => %{"sidon" => "1.3.0", "vali" => "1.2.2"}
+        })
+
+      result = overview(%{inventory: rows})
+      by_name = Map.new(result.inventory.components, &{&1.name, &1})
+
+      refute by_name["sidon"].consistent?
+      assert by_name["sidon"].by_node == %{"node-a" => "1.2.0", "node-b" => "1.3.0"}
+      assert by_name["vali"].consistent?
+      assert by_name["vali"].version == "1.2.2"
+      assert result.inventory.disagreements == 1
+    end
+
+    test "disagreements sort to the top, where they will be seen" do
+      rows =
+        inventory_row(%{
+          "node-a" => %{"aaa" => "1.0", "zzz" => "1.0"},
+          "node-b" => %{"aaa" => "1.0", "zzz" => "2.0"}
+        })
+
+      assert [%{name: "zzz"} | _] = overview(%{inventory: rows}).inventory.components
+    end
+
+    test "a lone ip-and-versions object is read too" do
       rows = [
         %{
           "key" => "10.10.102.43",
-          "inventory_json" =>
-            ~s({"ip":"10.10.102.43","versions":{"sidon":"1.2.0","vali":"1.2.2"}})
+          "inventory_json" => ~s({"ip":"10.10.102.43","versions":{"sidon":"1.2.0"}})
         }
       ]
 
       result = overview(%{inventory: rows})
 
-      assert Enum.map(result.inventory.components, & &1.name) == ["sidon", "vali"]
-      assert Enum.all?(result.inventory.components, &(&1.source == "10.10.102.43"))
-      assert Enum.all?(result.inventory.components, & &1.readable?)
+      assert [%{name: "sidon", by_node: %{"10.10.102.43" => "1.2.0"}}] =
+               result.inventory.components
     end
 
     test "a bare name-to-version map is read too" do
@@ -126,32 +185,24 @@ defmodule SpectrumPhx.LcmTest do
       result = overview(%{inventory: rows})
 
       assert Enum.map(result.inventory.components, & &1.name) == ["sidon", "vali"]
-      assert Enum.all?(result.inventory.components, & &1.readable?)
     end
 
     test "a version that is not a scalar loses that component, not the whole list" do
-      rows = [
-        %{
-          "key" => "n1",
-          "inventory_json" => ~s({"versions":{"sidon":"1.2.0","weird":{"nested":true}}})
-        }
-      ]
+      # Rendering one raised Protocol.UndefinedError and took the page down with a 500.
+      rows = inventory_row(%{"node-a" => %{"sidon" => "1.2.0", "weird" => %{"nested" => true}}})
 
       result = overview(%{inventory: rows})
       by_name = Map.new(result.inventory.components, &{&1.name, &1})
 
       assert by_name["sidon"].readable?
       refute by_name["weird"].readable?
-      assert by_name["weird"].version == "unreadable"
     end
 
     test "a blob that will not parse is reported, not dropped" do
-      # An inventory quietly missing a component is an operator upgrading something they
-      # cannot see.
       rows = [%{"key" => "cluster", "inventory_json" => "{not json"}]
       result = overview(%{inventory: rows})
 
-      assert [%{readable?: false, version: "unreadable"}] = result.inventory.components
+      assert [%{readable?: false}] = result.inventory.components
     end
 
     test "a table that will not read says so rather than reporting nothing installed" do

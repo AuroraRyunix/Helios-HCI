@@ -172,7 +172,18 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
           </div>
         </.panel>
 
-        <.panel id="inventory" title="Installed components" subtitle="What each part of the stack is running">
+        <.panel
+          id="inventory"
+          title="Installed components"
+          subtitle="One column per node, so a half-finished upgrade is visible"
+        >
+          <:actions>
+            <span :if={@overview.inventory.disagreements > 0} class="badge badge-sm badge-warning gap-1">
+              <.icon name="hero-exclamation-triangle" class="size-3" />
+              {@overview.inventory.disagreements} disagree
+            </span>
+          </:actions>
+
           <p :if={not @overview.inventory.available?} class="text-sm opacity-55 italic">
             The inventory could not be read: <span class="font-mono">{@overview.inventory.error}</span>
           </p>
@@ -180,22 +191,44 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
             No inventory has been recorded yet.
           </p>
 
+          <p :if={@overview.inventory.disagreements > 0} class="text-sm text-warning mb-2">
+            The nodes are not all running the same build of everything. A rolling upgrade
+            that stopped part way looks exactly like this, and a single version number per
+            component would hide it.
+          </p>
+
           <div :if={@overview.inventory.components != []} class="overflow-x-auto">
-            <table class="table table-sm">
+            <table class="table table-xs">
               <thead>
                 <tr>
                   <th>Component</th>
-                  <th>Version</th>
-                  <th>Source</th>
+                  <th :for={node <- @overview.inventory.nodes}>{node}</th>
                 </tr>
               </thead>
               <tbody>
-                <tr :for={component <- @overview.inventory.components} id={"component-#{dom_slug(component.name)}"}>
-                  <td class="font-medium">{component.name}</td>
-                  <td class={["font-mono", not component.readable? && "text-warning"]}>
-                    {component.version}
+                <tr
+                  :for={component <- @overview.inventory.components}
+                  id={"component-#{dom_slug(component.name)}"}
+                  class={not component.consistent? && "bg-warning/10"}
+                >
+                  <td class="font-medium whitespace-nowrap">
+                    {component.name}
+                    <.icon
+                      :if={not component.consistent?}
+                      name="hero-exclamation-triangle"
+                      class="size-3 text-warning ml-1"
+                    />
                   </td>
-                  <td class="font-mono opacity-55">{component.source}</td>
+                  <td
+                    :for={node <- @overview.inventory.nodes}
+                    class={[
+                      "font-mono whitespace-nowrap",
+                      not component.consistent? && "font-semibold",
+                      version_of(component, node) == "Unknown" && "opacity-40"
+                    ]}
+                  >
+                    {version_of(component, node)}
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -217,6 +250,8 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
     </Layouts.app>
     """
   end
+
+  defp version_of(component, node), do: Map.get(component.by_node, node, "—")
 
   defp checked_at(%{last_checked: nil}), do: "never checked"
   defp checked_at(%{last_checked: at}), do: "last checked #{at}"

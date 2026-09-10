@@ -60,52 +60,95 @@ defmodule SpectrumPhx.Lcm do
   defp inventory(static) do
     case read(static, :inventory, @inventory_cql) do
       {:ok, rows} ->
-        components =
-          rows
-          |> Enum.map(&stringify/1)
-          |> Enum.flat_map(&components_of/1)
-          |> Enum.sort_by(& &1.name)
+        pairs = rows |> Enum.map(&stringify/1) |> Enum.flat_map(&components_of/1)
+        components = group_by_component(pairs)
 
-        %{available?: true, error: nil, components: components}
+        %{
+          available?: true,
+          error: nil,
+          components: components,
+          nodes: pairs |> Enum.map(& &1.node) |> Enum.uniq() |> Enum.sort(),
+          # The single most useful thing this page can say. A rolling upgrade that stopped
+          # half way leaves the cluster on two versions of something, and every other view
+          # of this data -- including the one the Python console draws -- shows one number
+          # per component and hides it.
+          disagreements: Enum.count(components, &(not &1.consistent?))
+        }
 
       {:error, reason} ->
-        %{available?: false, error: describe(reason), components: []}
+        %{available?: false, error: describe(reason), components: [], nodes: [], disagreements: 0}
     end
   end
 
-  # The inventory is a JSON blob per row, and it comes in two shapes.
+  # One entry per component, carrying what each node reports for it.
+  defp group_by_component(pairs) do
+    pairs
+    |> Enum.group_by(& &1.name)
+    |> Enum.map(fn {name, entries} ->
+      by_node = Map.new(entries, &{&1.node, &1.version})
+      distinct = entries |> Enum.map(& &1.version) |> Enum.uniq()
+
+      %{
+        name: name,
+        by_node: by_node,
+        version: if(length(distinct) == 1, do: hd(distinct)),
+        consistent?: length(distinct) == 1,
+        readable?: Enum.all?(entries, & &1.readable?)
+      }
+    end)
+    |> Enum.sort_by(&{&1.consistent?, &1.name})
+  end
+
+  # The inventory is a JSON blob, and what the cluster actually writes is a map of
+  # hostname to `{"ip": ..., "versions": {name => version}}` -- one entry per node inside
+  # a single `latest` row.
   #
-  # What the cluster actually writes is `{"ip": ..., "versions": {name => version}}` --
-  # one row per node, with the node's address beside the component list. A bare
-  # `{name => version}` map is also accepted, because that is the shape the schema's name
-  # suggests and the shape a hand-written row would take.
+  # Two narrower shapes are accepted too, because they are what the column name suggests
+  # and what a hand-written row would look like: a lone `{"ip", "versions"}` object, and a
+  # bare `{name => version}` map.
+  #
+  # Everything else at the top level is skipped rather than treated as a node. The real
+  # blob carries a `level` key beside the hostnames, and reading that as a machine is how
+  # the first attempt produced a component table listing "level".
   #
   # A blob that will not parse is reported as one unreadable entry rather than dropped: an
   # inventory quietly missing a component is an operator upgrading something they cannot
-  # see. So is a version that is not a scalar -- rendering one crashed this page, and the
-  # fix is to say "unreadable" about that component rather than to lose the other thirty.
+  # see. So is a version that is not a scalar -- rendering one crashed this page.
   defp components_of(row) do
     key = string(Map.get(row, "key")) || "inventory"
 
     case Jason.decode(Map.get(row, "inventory_json") || "") do
       {:ok, %{"versions" => versions} = blob} when is_map(versions) ->
-        source = string(Map.get(blob, "ip")) || key
-        components(versions, source)
+        components(versions, node_name(blob, key))
 
       {:ok, map} when is_map(map) ->
-        components(map, key)
+        per_node =
+          for {host, blob} <- map,
+              is_map(blob),
+              versions = Map.get(blob, "versions"),
+              is_map(versions),
+              component <- components(versions, to_string(host)),
+              do: component
+
+        if per_node == [], do: components(map, key), else: per_node
 
       _ ->
-        [%{name: key, version: "unreadable", source: key, readable?: false}]
+        [%{name: key, version: "unreadable", node: key, readable?: false}]
     end
   end
 
-  defp components(versions, source) do
+  defp node_name(blob, fallback), do: string(Map.get(blob, "ip")) || fallback
+
+  defp components(versions, node) do
     Enum.map(versions, fn {name, version} ->
-      case scalar(version) do
-        nil -> %{name: to_string(name), version: "unreadable", source: source, readable?: false}
-        text -> %{name: to_string(name), version: text, source: source, readable?: true}
-      end
+      readable = scalar(version)
+
+      %{
+        name: to_string(name),
+        version: readable || "unreadable",
+        node: node,
+        readable?: readable != nil
+      }
     end)
   end
 
