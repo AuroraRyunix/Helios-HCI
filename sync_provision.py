@@ -40,7 +40,8 @@ mapping = {
     "HELIOS_CQL_B64": "helios_cql.py",
     "IMPA_B64": "impa.py",
     "HELIOS_SCHEMA_B64": "helios_schema.py",
-    "SAGA_B64": "saga.py"
+    "SAGA_B64": "saga.py",
+    "ZOOKEEPER_LOGBACK_B64": "zookeeper_config/logback.xml"
 }
 
 # Any constant provision.py embeds must be listed above, otherwise editing its source

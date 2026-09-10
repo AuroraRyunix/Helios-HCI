@@ -195,12 +195,54 @@ class TheProbesAreNotLoggedAtInfo(unittest.TestCase):
         config = read(os.path.join("zookeeper_config", "logback.xml"))
         self.assertIn('<root level="INFO">', config)
 
-    def test_every_unit_writer_mounts_it(self):
+    def test_every_unit_writer_mounts_it_exactly_once(self):
+        """Once, not merely at least once.
+
+        The first version of this asserted `in`, which is true of a file that mounts it
+        twice -- and `cluster_new.py` did, from the moment the mount was added. Podman
+        refuses a container with two mounts on one destination, so every node built by
+        `cluster add-node` or `decommission --finalize` got a ZooKeeper that could not
+        start, and this test stayed green throughout.
+        """
         for name in UNIT_WRITERS:
-            self.assertIn(
-                "logback.xml:/conf/logback.xml", read(name),
-                "%s writes a ZooKeeper unit that uses the image's own logging config"
-                % name)
+            self.assertEqual(
+                read(name).count("logback.xml:/conf/logback.xml"), 1,
+                "%s does not mount the logging config exactly once; podman refuses two "
+                "mounts on one destination" % name)
+
+    def test_something_creates_the_file_the_units_mount(self):
+        """A bind mount is not a request for a file, it is an assertion that one exists.
+
+        Only the rollout wrote this. A cluster built by `provision.py` mounted a path
+        that had never been created -- and podman answers a missing bind source by
+        creating a directory there, so ZooKeeper reads an empty config rather than
+        failing in a way anyone would notice.
+        """
+        self.assertIn('"/etc/hci/zookeeper/logback.xml", "w"', read("deploy_updates.py"),
+                      "the rollout no longer writes the file")
+        provision = read("provision.py")
+        self.assertIn('node.write_file("/etc/hci/zookeeper/logback.xml"', provision,
+                      "provision.py mounts the logging config but never writes it")
+        self.assertIn("ZOOKEEPER_LOGBACK_B64", provision)
+
+    def test_the_embedded_copy_is_the_one_in_the_tree(self):
+        """provision.py ships a base64 copy, and an unlisted constant is re-embedded by
+        nothing -- so editing the XML would quietly keep shipping the previous copy."""
+        import base64
+        import re as _re
+
+        self.assertIn('"ZOOKEEPER_LOGBACK_B64"', read("sync_provision.py"),
+                      "the constant is not in sync_provision's mapping, so it is never "
+                      "re-embedded")
+
+        match = _re.search(r'^ZOOKEEPER_LOGBACK_B64\s*=\s*"([^"]*)"',
+                           read("provision.py"), _re.MULTILINE)
+        self.assertTrue(match and match.group(1), "the embedded copy is empty")
+        embedded = base64.b64decode(match.group(1)).decode("utf-8")
+        self.assertEqual(embedded.splitlines(),
+                         read(os.path.join("zookeeper_config", "logback.xml")).splitlines(),
+                         "provision.py ships a different logback.xml than the tree; run "
+                         "sync_provision.py")
 
     def test_the_rollout_ships_it(self):
         """A config the units mount and the rollout never uploads is a container that
