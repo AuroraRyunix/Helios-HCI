@@ -4,6 +4,7 @@ import os
 import json
 import time
 import socket
+import helios_zk
 import subprocess
 
 # Slate/Traefik client-facing ingress. This is the port clients actually reach
@@ -87,20 +88,13 @@ def get_zookeeper_leader_ip():
     except Exception:
         ips = ["127.0.0.1"]
         
-    leader_ip = None
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(REMOTE_PROBE_TIMEOUT)
-            s.connect((ip, ZK_CLIENT_PORT))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                leader_ip = ip
-                break
-        except Exception:
-            pass
+    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine copies of
+    # this loop on nine timers had the ensemble answering eleven `stat` probes a second
+    # forever, and ZooKeeper logs two INFO lines for each one.
+    #
+    # The timeout stays this module's: these probes cross the network, and 0.2s turned a
+    # brief latency spike into an apparent consensus loss and flapped the VIP every 2s.
+    leader_ip = helios_zk.leader_ip(ips, timeout=REMOTE_PROBE_TIMEOUT)
 
     # Check the leader is actually serving clients on the Slate ingress port.
     # 8443 (Spectrum) was the wrong signal here: clients reach 443, not 8443.

@@ -5,6 +5,7 @@ import os
 import json
 import time
 import socket
+import helios_zk
 import urllib.request
 import ssl
 import subprocess
@@ -112,18 +113,8 @@ except Exception:
 def get_zookeeper_leader_ip():
     hosts = get_cluster_hosts()
     ips = [h.get("ip") for h in hosts if h.get("ip")] if hosts else []
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                return ip
-        except Exception:
-            pass
+    # One cached probe, shared by every daemon -- see helios_zk.leader_ip.
+    return helios_zk.leader_ip(ips)
     return None
 
 def is_zookeeper_leader():

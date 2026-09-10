@@ -23,6 +23,108 @@ import struct
 import threading
 import time
 
+# -- Which node is the leader -----------------------------------------------------------
+#
+# Nine daemons each carried their own copy of this loop, and each ran it on its own timer.
+# vali's queue worker alone asked every two seconds, and every call into Catalyst asked
+# again, so the ensemble was answering roughly eleven `stat` probes a second across the
+# cluster -- forever, on an idle cluster. ZooKeeper logs two INFO lines per probe, which
+# turned into a permanent log storm: 11 lines/second into the journal, and the CPU to
+# ingest them.
+#
+# The probe is cheap. Asking constantly is not, and there is no reason to: leadership
+# changes only at an election, which is measured in seconds at best. A short cache turns
+# a hot loop into one probe every `ttl` seconds however many callers there are, and costs
+# nothing in correctness -- a caller that acts on a five-second-old leader is in exactly
+# the position of a caller whose probe raced an election, which every caller already has
+# to tolerate.
+#
+# Callers keep their own fallbacks. What each daemon does when the leader is missing or
+# not serving differs on purpose -- bifrost refuses a split-brain candidate where vali
+# picks any node running Catalyst -- and consolidating that would be consolidating
+# reasoning, not code. Only the probe is shared.
+
+LEADER_CACHE_SECONDS = 5.0
+
+_LEADER_LOCK = threading.Lock()
+_LEADER_CACHE = {"ip": None, "at": 0.0, "key": None}
+
+
+def leader_ip(ips, ttl=LEADER_CACHE_SECONDS, timeout=0.2, now=None):
+    """The address in `ips` the ensemble reports as leader, or None.
+
+    "standalone" counts: a one-node ensemble has no leader to elect and answers that way,
+    and every caller means "the node to talk to" rather than "the winner of an election".
+
+    Cached for `ttl` seconds, keyed by the address list so that a membership change is not
+    served from a cache built against the old one. `None` is cached too: a cluster with no
+    leader is a cluster mid-election, and hammering it with probes is the least useful
+    thing to do about that.
+    """
+    addresses = tuple(ip for ip in (ips or []) if ip)
+    if not addresses:
+        return None
+
+    moment = time.time() if now is None else now
+
+    with _LEADER_LOCK:
+        fresh = moment - _LEADER_CACHE["at"] < ttl
+        if fresh and _LEADER_CACHE["key"] == addresses:
+            return _LEADER_CACHE["ip"]
+
+    found = None
+    for ip in addresses:
+        mode = server_mode(ip, timeout=timeout)
+        if mode in ("leader", "standalone"):
+            found = ip
+            break
+
+    with _LEADER_LOCK:
+        _LEADER_CACHE["ip"] = found
+        _LEADER_CACHE["at"] = moment
+        _LEADER_CACHE["key"] = addresses
+
+    return found
+
+
+def server_mode(ip, port=2181, timeout=0.2):
+    """One server's role from its `stat` output: "leader", "follower", "observer",
+    "standalone", or None when it did not answer.
+
+    Uncached on purpose. `leader_ip` is the cached question; this is the raw one, for the
+    places that want to know about a *particular* server rather than find the leader.
+    """
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        sock.sendall(b"stat")
+        reply = sock.recv(4096).decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    for role in ("leader", "follower", "observer", "standalone"):
+        if "mode: " + role in reply:
+            return role
+    return None
+
+
+def leader_cache_clear():
+    """Forget the cached leader. For tests, and for a caller that has just changed
+    membership and knows the answer is stale."""
+    with _LEADER_LOCK:
+        _LEADER_CACHE["ip"] = None
+        _LEADER_CACHE["at"] = 0.0
+        _LEADER_CACHE["key"] = None
+
+
 # Opcodes
 OP_CREATE = 1
 OP_DELETE = 2

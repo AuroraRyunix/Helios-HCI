@@ -481,6 +481,7 @@ SPECTRUM_BUILD_FILES = (
     ("lanayru.py", "lanayru.py"),
     ("helios_sidon.py", "helios_sidon.py"),
     ("helios_cql.py", "helios_cql.py"),
+    ("helios_zk.py", "helios_zk.py"),
 )
 
 local_helios_sig = "helios_sig.py"

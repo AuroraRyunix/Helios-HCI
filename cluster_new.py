@@ -507,6 +507,15 @@ def zookeeper_quadlet(node_id, members):
         "Description=ZooKeeper Cluster Consensus Service\n"
         "After=network.target\n\n"
         "[Service]\n"
+        # A ceiling on what this unit can put in the journal, whatever it decides to say.
+        # ZooKeeper logs two INFO lines for every four-letter-word probe, and nine daemons
+        # each running their own leader check had it writing eleven lines a second forever
+        # on an idle cluster. The probing is fixed at the source -- helios_zk.leader_ip
+        # caches it -- and this is the guard that makes the next caller to get it wrong
+        # cost a rate-limit notice instead of a saturated journal. Generous enough for the
+        # burst an election legitimately produces.
+        "LogRateLimitIntervalSec=10s\n"
+        "LogRateLimitBurst=100\n"
         "Restart=always\n"
         "CPUWeight=100\n"
         "MemoryMax=512M\n"
@@ -1326,6 +1335,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 "Description=ZooKeeper Cluster Consensus Service\n"
                 "After=network.target\n\n"
                 "[Service]\n"
+                # Journal ceiling. See zookeeper_quadlet above for why.
+                "LogRateLimitIntervalSec=10s\n"
+                "LogRateLimitBurst=100\n"
                 "Restart=always\n"
                 "CPUWeight=100\n"
                 "MemoryMax=512M\n"

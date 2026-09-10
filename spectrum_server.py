@@ -7,6 +7,7 @@ import json
 import ssl
 import shlex
 import socket
+import helios_zk
 import ipaddress
 import subprocess
 import urllib.request
@@ -1445,22 +1446,9 @@ def get_zookeeper_leader_ip():
     nodes = get_cluster_nodes()
     if not nodes:
         return "127.0.0.1"
-    for node in nodes:
-        ip = node.get("ip")
-        if not ip:
-            continue
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            s.connect((ip, 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                return ip
-        except Exception:
-            pass
-    return "127.0.0.1"
+    # One cached probe, shared by every daemon -- see helios_zk.leader_ip.
+    ips = [node.get("ip") for node in nodes if node.get("ip")]
+    return helios_zk.leader_ip(ips, timeout=0.5) or "127.0.0.1"
 
 VM_CPU_CACHE = {}
 VM_IO_CACHE = {}
@@ -7919,19 +7907,10 @@ def get_zookeeper_leader_ip():
         ips = [LOCAL_IP]
         
     leader_ip = None
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                leader_ip = ip
-                break
-        except Exception:
-            pass
+    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine
+    # copies of this loop on nine timers had the ensemble answering eleven `stat`
+    # probes a second forever, and ZooKeeper logs two INFO lines for each one.
+    leader_ip = helios_zk.leader_ip(ips)
             
     # Check if leader is active on port 9091
     leader_active = False

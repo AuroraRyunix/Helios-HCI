@@ -24,6 +24,7 @@ COPY lanayru.py .
 # rebuilt image without it silently falls back to DRBD paths that no longer exist.
 COPY helios_sidon.py .
 COPY helios_cql.py .
+COPY helios_zk.py .
 COPY static/ ./static/
 EXPOSE 8443
 CMD ["python", "-u", "server.py"]

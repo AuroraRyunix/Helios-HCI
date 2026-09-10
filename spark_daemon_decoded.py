@@ -2519,6 +2519,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     "Description=ZooKeeper Cluster Consensus Service\n"
                     "After=network.target\n\n"
                     "[Service]\n"
+                    # Journal ceiling. See zookeeper_quadlet in cluster_new.py for why.
+                    "LogRateLimitIntervalSec=10s\n"
+                    "LogRateLimitBurst=100\n"
                     "Restart=always\n"
                     "CPUWeight=100\n"
                     "MemoryMax=512M\n"

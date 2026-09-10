@@ -7,6 +7,7 @@ import re
 import time
 import stat
 import socket
+import helios_zk
 import urllib.request
 import ssl
 import subprocess
@@ -174,16 +175,9 @@ def run_mtls_spark_api_full(ip, path, payload, method="POST"):
 def is_zookeeper_leader(ip="127.0.0.1"):
     if ip == "127.0.0.1" or ip == LOCAL_IP:
         return get_zookeeper_leader_ip() == LOCAL_IP
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect((ip, 2181))
-        s.sendall(b"stat")
-        resp = s.recv(1024).decode('utf-8', errors='ignore')
-        s.close()
-        return "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
-    except Exception:
-        return False
+    # A different question from "who leads": this asks about one named server, so it is
+    # the uncached `server_mode` rather than `leader_ip`.
+    return helios_zk.server_mode(ip, timeout=0.5) in ("leader", "standalone")
 
 def get_zookeeper_leader_ip(hosts=None):
     if not hosts:
@@ -194,19 +188,10 @@ def get_zookeeper_leader_ip(hosts=None):
         ips = [h.get("ip") for h in hosts if h.get("ip")]
         
     leader_ip = None
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 2181))
-            s.sendall(b"stat")
-            resp = s.recv(1024).decode('utf-8', errors='ignore')
-            s.close()
-            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                leader_ip = ip
-                break
-        except Exception:
-            pass
+    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine
+    # copies of this loop on nine timers had the ensemble answering eleven `stat`
+    # probes a second forever, and ZooKeeper logs two INFO lines for each one.
+    leader_ip = helios_zk.leader_ip(ips)
             
     # Check if leader is active on port 9091
     leader_active = False
