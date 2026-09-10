@@ -63,6 +63,14 @@ byte makes "stronger later" a value change, not a format migration.
 **D-10 — RF comes from the existing `storage_containers.ftt` column (RF = ftt+1).** No
 parallel policy object; the concept operators already have keeps meaning what it meant.
 
+  Decided here, and then not done: `op_create` defaulted `rf` to 1 and read neither the
+  container nor `cluster.json`, so every vdisk was single-copy no matter what either
+  said. Implemented 2026-09-10, with `cluster.json`'s `redundancy_factor` as the fallback
+  for a container that sets no `ftt` — which, until every caller passes a container, is
+  most of them. The `+1` in this line is the entire defect: `ftt` counts failures
+  survived and `dfs_vdisks.rf` counts copies, and dropping the conversion turns "survive
+  one host loss" into "keep one copy" without failing anything visible.
+
 **D-11 — One data port, 9105, mTLS with the cluster CA and per-node IP-SAN certs.**
 Reserved here; lands in `network.md` at implementation. Peer connections are per
 node-pair — the head count that was the whole complaint about the old substrate.

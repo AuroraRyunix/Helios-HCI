@@ -824,6 +824,26 @@ restarts, ownership transfer with recovery from a replica's journal, forwarding 
 non-owners, extent replication with read repair, and Purah's re-replication, mark-sweep
 reclamation and scrub. LINSTOR and DRBD are gone from the tree.
 
+The re-replication in that list was never the defect, and it is worth being exact about
+what was. It restored a replica set correctly the whole time and simply never had cause
+to run: `op_create` defaulted `rf` to 1 and no caller has ever sent one — not vali, not
+the console, not the CLI, not the Elixir tier — so every vdisk on every cluster was
+created single-copy whatever the operator had configured, and one copy *was* the
+requested count. Nothing reported it either, because every replication view compared a
+vdisk's replica list against the `rf` on its own row, which the same default had written
+as 1. One replica, one requested, healthy.
+
+**Fixed 2026-09-10.** A create now takes its count from the container's `ftt`, falling
+back to `cluster.json`'s `redundancy_factor`, converting the fault tolerance to copies
+(`ftt + 1`) and clamping to the nodes that could hold one; a clone takes the policy in
+force now rather than inheriting its parent's, which is what propagated the single-copy
+default one generation at a time. An explicit `rf` or `replicas` in the request still
+wins. `valcli storage.replication` is the view whose absence hid all of this: policy,
+requested, actual, side by side. Vdisks created before the fix are left alone — restoring
+a replica that stopped answering is an emergency and stays automatic, while topping one
+up to a factor it never asked for is a bulk data copy and is `valcli storage.replicate`,
+opt-in and one copy per vdisk per run.
+
 Ganon was built first and calibrated against DRBD, as designed. That calibration produced
 the finding worth keeping: the same corruption injected under both substrates is *served
 as data* by DRBD and refused with EIO by Sidon.
