@@ -523,6 +523,8 @@ def zookeeper_quadlet(node_id, members):
         "[Container]\n"
         "Image=docker.io/library/zookeeper:3.9.2\n"
         "Network=host\n"
+        "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
+        "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
         "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
         "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
         "Environment=ZOO_MY_ID=%d%s%s ZOO_4LW_COMMANDS_WHITELIST=*\n"

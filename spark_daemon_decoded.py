@@ -2529,6 +2529,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     "[Container]\n"
                     "Image=docker.io/library/zookeeper:3.9.2\n"
                     "Network=host\n"
+                    "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
                     "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
                     "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
                     f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} ZOO_4LW_COMMANDS_WHITELIST=*\n\n"

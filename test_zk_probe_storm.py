@@ -174,5 +174,80 @@ class TheJournalHasACeiling(unittest.TestCase):
         self.assertLess(int(burst.group(1)) / int(interval.group(1)), 11.0)
 
 
+class TheProbesAreNotLoggedAtInfo(unittest.TestCase):
+    """The probes are cheap. Logging two INFO lines for each of them was not.
+
+    Caching took the rate down but cannot take it to zero: every daemon process keeps its
+    own cache and there are a couple of dozen across a cluster. What removes the cost
+    entirely is ZooKeeper not narrating a health check.
+    """
+
+    def test_the_quietened_config_is_in_the_toolkit(self):
+        config = read(os.path.join("zookeeper_config", "logback.xml"))
+
+        self.assertIn('name="org.apache.zookeeper.server.NIOServerCnxn" level="WARN"', config)
+        self.assertIn('name="org.apache.zookeeper.server.command" level="WARN"', config)
+
+    def test_everything_else_still_logs_at_info(self):
+        """Elections, quorum changes and session commits are what this log is for. A
+        blanket WARN would have taken those too, which is why the two loggers are named
+        rather than the root being raised."""
+        config = read(os.path.join("zookeeper_config", "logback.xml"))
+        self.assertIn('<root level="INFO">', config)
+
+    def test_every_unit_writer_mounts_it(self):
+        for name in UNIT_WRITERS:
+            self.assertIn(
+                "logback.xml:/conf/logback.xml", read(name),
+                "%s writes a ZooKeeper unit that uses the image's own logging config"
+                % name)
+
+    def test_the_rollout_ships_it(self):
+        """A config the units mount and the rollout never uploads is a container that
+        will not start."""
+        deploy = read("deploy_updates.py")
+
+        self.assertIn("/etc/hci/zookeeper/logback.xml", deploy)
+        self.assertIn('"zookeeper_config", "logback.xml"', deploy)
+
+
+class TheRolloutConvergesTheUnit(unittest.TestCase):
+    """The unit is written by three paths, none of which a rollout runs.
+
+    Before this, `deploy_updates.py` only stripped `[Install]` from zookeeper.container --
+    so a change to what the Quadlet writers produce reached a node through `cluster
+    create` or `cluster add-node` and no other way, and an existing cluster kept the old
+    unit forever. That is the shape of bug this repository keeps finding: the toolkit is
+    correct and the node never hears about it.
+    """
+
+    def test_the_rollout_reconciles_the_unit(self):
+        deploy = read("deploy_updates.py")
+
+        self.assertIn("RECONCILE_ZOOKEEPER_UNIT", deploy)
+        self.assertIn("zookeeper.container", deploy)
+
+    def test_it_is_additive_rather_than_a_rewrite(self):
+        """Three other paths write this file. A rollout should add what is missing and
+        have no opinion about the rest of it."""
+        block = read("deploy_updates.py")
+        block = block[block.index("RECONCILE_ZOOKEEPER_UNIT"):]
+        block = block[: block.index('"""', block.index('r"""') + 4)]
+
+        self.assertIn("if changed:", block)
+        self.assertIn("zookeeper unit: ok", block, "it does not report the no-op case")
+
+    def test_it_does_not_restart_zookeeper(self):
+        """The rollout runs against every node in parallel. Restarting the consensus layer
+        on all of them at once is how a rollout takes quorum away; the change is staged
+        and the operator is told it needs a rolling restart."""
+        block = read("deploy_updates.py")
+        block = block[block.index("RECONCILE_ZOOKEEPER_UNIT"):]
+        block = block[: block.index('"""', block.index('r"""') + 4)]
+
+        self.assertNotIn("systemctl restart zookeeper", block)
+        self.assertIn("rolling restart", block)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -184,6 +184,74 @@ else:
 PY
 """
 
+# Bring an existing node's ZooKeeper unit up to what the toolkit now writes.
+#
+# The rollout never rewrote this unit -- it only stripped [Install] from it -- so the two
+# directives below would have reached a node only through `cluster create` or
+# `cluster add-node`, and an existing cluster would have kept the old unit forever. That
+# is the shape of bug this repository keeps finding: the toolkit is correct and the node
+# never hears about it.
+#
+# Both additions exist because ZooKeeper logs two INFO lines for every four-letter-word
+# probe, and a cluster asks which node leads continuously:
+#
+#   * the logback mount quietens those two loggers and leaves everything else at INFO;
+#   * the rate limit is the ceiling for whatever the next mistake turns out to be.
+#
+# Additive and idempotent: it inserts what is missing and leaves every other line alone,
+# because this file is also written by three other paths and a rollout should not have
+# opinions about the rest of it.
+#
+# Deliberately does NOT restart ZooKeeper. This runs against every node in parallel, and
+# restarting the consensus layer on all of them at once is how a rollout takes quorum
+# away. The unit is reloaded so the change is staged, and the operator is told it needs a
+# rolling restart -- which `cluster add-node` already knows how to do one node at a time.
+RECONCILE_ZOOKEEPER_UNIT = r"""
+python3 - <<'PY'
+import os
+
+UNIT = "/etc/containers/systemd/zookeeper.container"
+
+if not os.path.exists(UNIT):
+    print("zookeeper unit: absent")
+    raise SystemExit(0)
+
+with open(UNIT) as handle:
+    lines = handle.read().splitlines()
+
+changed = False
+out = []
+
+for line in lines:
+    # The ceiling goes at the top of [Service], where the unit's own writers put it.
+    if line.strip() == "[Service]" and not any("LogRateLimit" in l for l in lines):
+        out.append(line)
+        out.append("LogRateLimitIntervalSec=10s")
+        out.append("LogRateLimitBurst=100")
+        changed = True
+        continue
+
+    # The quietened logging config mounts over the image's, immediately before the data
+    # volume so the ordering matches what the Quadlet writers produce.
+    if (line.startswith("Volume=/var/lib/hci/zookeeper/data:")
+            and not any("logback.xml:/conf/logback.xml" in l for l in lines)):
+        out.append("Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z")
+        out.append(line)
+        changed = True
+        continue
+
+    out.append(line)
+
+if changed:
+    with open(UNIT, "w") as handle:
+        handle.write("\n".join(out) + "\n")
+    os.system("systemctl daemon-reload")
+    print("zookeeper unit: updated (needs a rolling restart to take effect)")
+else:
+    print("zookeeper unit: ok")
+PY
+"""
+
 # Give sidon every empty disk, one filesystem each. Kept identical to the copy in
 # provision.py: one claims disks for a new node, the other reaches nodes that already
 # exist, and a difference between them would mean a disk laid out one way on some
@@ -1281,6 +1349,27 @@ def deploy_to_node(ip):
                 f_rem.write(slate_yml)
             with sftp.open("/etc/hci/slate/dynamic.yml", "w") as f_rem:
                 f_rem.write(dynamic_yml)
+
+            # ZooKeeper's logging config, mounted over the image's by every Quadlet that
+            # writes the unit. Its own default logs two INFO lines for every four-letter-
+            # word probe, and a cluster asks which node leads continuously -- ~11 lines a
+            # second into the journal on an idle cluster, and 151 MB of it. The probing is
+            # cached now (helios_zk.leader_ip) but cannot reach zero: every daemon process
+            # keeps its own cache and there are two dozen across a cluster. The probes are
+            # cheap; logging them at INFO is what was not.
+            print(f"[{ip}] Writing ZooKeeper logging configuration...")
+            ssh.exec_command("mkdir -p /etc/hci/zookeeper")
+            with open(os.path.join(local_dir_path, "zookeeper_config", "logback.xml"),
+                      "r", encoding="utf-8") as f_lb:
+                logback_xml = f_lb.read()
+            with sftp.open("/etc/hci/zookeeper/logback.xml", "w") as f_rem:
+                f_rem.write(logback_xml)
+
+            _, stdout_zk, _ = ssh.exec_command(RECONCILE_ZOOKEEPER_UNIT)
+            zk_said = stdout_zk.read().decode("utf-8", "replace").strip()
+            stdout_zk.channel.recv_exit_status()
+            if zk_said and not zk_said.endswith("ok"):
+                print(f"[{ip}] {zk_said}")
     
             # Upload and load traefik.tar offline if it exists
             local_tar = os.path.join(local_dir_path, "traefik.tar")
