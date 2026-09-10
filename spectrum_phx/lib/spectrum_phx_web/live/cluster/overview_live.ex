@@ -142,7 +142,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash} current_username={@current_username} active={:overview}>
+    <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:overview}>
       <.header>
         Cluster
         <:subtitle>

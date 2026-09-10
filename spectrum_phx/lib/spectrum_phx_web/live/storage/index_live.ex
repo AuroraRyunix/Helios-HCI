@@ -187,7 +187,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash} current_username={@current_username} active={:storage}>
+    <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:storage}>
       <.header>
         Storage fabric
         <:subtitle>

@@ -38,7 +38,7 @@ defmodule SpectrumPhxWeb.Layouts do
     {:health, "Health", "/health", :live},
     {:hardware, "Hardware", "/hardware", :live},
     {:sdn, "SDN", "/sdn", :live},
-    {:networking, "Networking", "/networking.html", :legacy},
+    {:networking, "Networking", "/networking", :live},
     {:lcm, "LCM", "/lcm.html", :legacy},
     {:lanayru, "Lanayru", "/lanayru.html", :legacy},
     {:settings, "Settings", "/settings.html", :legacy}
@@ -63,7 +63,7 @@ defmodule SpectrumPhxWeb.Layouts do
 
   ## Examples
 
-      <Layouts.app flash={@flash} current_username={@current_username} active={:hosts}>
+      <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:hosts}>
         <h1>Content</h1>
       </Layouts.app>
 
@@ -77,6 +77,10 @@ defmodule SpectrumPhxWeb.Layouts do
   attr :active, :atom,
     default: nil,
     doc: "which entry of `nav_items/0` is the current page"
+
+  attr :socket, :any,
+    default: nil,
+    doc: "the LiveView socket, so the header can nest the task ring under it"
 
   slot :inner_block, required: true
 
@@ -114,6 +118,9 @@ defmodule SpectrumPhxWeb.Layouts do
       </nav>
 
       <div class="flex-none flex items-center gap-2">
+        <%!-- Sticky, so a running task's ring keeps its state across live navigation
+              instead of resetting every time the operator changes page. --%>
+        {live_render(@socket, SpectrumPhxWeb.Tasks.RingLive, id: "tasks-ring-live", sticky: true)}
         <.theme_toggle />
         <span :if={@current_username} class="text-sm opacity-70" data-role="current-user">
           {@current_username}

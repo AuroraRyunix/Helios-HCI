@@ -78,7 +78,7 @@ defmodule SpectrumPhxWeb.Metrics.IndexLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash} current_username={@current_username} active={:metrics}>
+    <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:metrics}>
       <.header>
         Metrics
         <:subtitle>

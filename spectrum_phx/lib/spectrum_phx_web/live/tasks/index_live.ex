@@ -115,7 +115,7 @@ defmodule SpectrumPhxWeb.Tasks.IndexLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash} current_username={@current_username} active={:tasks}>
+    <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:tasks}>
       <.header>
         Tasks
         <:subtitle>

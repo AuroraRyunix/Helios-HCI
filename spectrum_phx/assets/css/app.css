@@ -118,6 +118,154 @@
 [data-phx-session], [data-phx-teleported-src] { display: contents }
 
 /* This file is for your main application CSS */
+/* --- The task ring ---------------------------------------------------------------
+ *
+ * A faithful port of the Python console's header widget, geometry and all. It is the
+ * one thing on that console that reported progress without being asked, and it earned
+ * its place: an operator kicks off a migration and watches the ring rather than a page.
+ *
+ * The numbers are not arbitrary and are kept exactly:
+ *
+ *   r = 9  ->  circumference 2*pi*9 = 56.55, which is the dasharray. Offsetting the
+ *              dash by the full circumference draws nothing; offsetting by zero draws
+ *              the whole ring. Progress is the interpolation between them.
+ *   rotate(-90deg) starts the arc at twelve o'clock instead of three.
+ *   scale(--tasks-scale) grows the ring 1.0 -> 1.3 as the task approaches done, so the
+ *              thing you are watching gets bigger the closer it is.
+ *
+ * The spin is on the whole SVG, so while work is running the arc travels *and* fills.
+ * Both transforms live in the keyframes because an animation replaces the transform
+ * property outright -- leaving the scale out of them is what makes the ring snap back
+ * to 1.0 the moment it starts spinning.
+ */
+@layer components {
+  .tasks-ring {
+    width: 20px;
+    height: 20px;
+    transform: rotate(-90deg) scale(var(--tasks-scale, 1));
+    transition: transform 0.3s ease;
+  }
+
+  .tasks-ring-track {
+    fill: none;
+    stroke: color-mix(in srgb, var(--color-base-content) 10%, transparent);
+    stroke-width: 3;
+  }
+
+  .tasks-ring-fill {
+    fill: none;
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-dasharray: 56.55;
+    transition: stroke-dashoffset 0.3s ease, stroke 0.3s ease;
+  }
+
+  .tasks-ring-spin {
+    animation: tasks-spin 2s linear infinite;
+  }
+
+  @keyframes tasks-spin {
+    0% {
+      transform: rotate(-90deg) scale(var(--tasks-scale, 1));
+    }
+
+    100% {
+      transform: rotate(270deg) scale(var(--tasks-scale, 1));
+    }
+  }
+
+  /* The pill the ring sits in. Tinted, bordered and haloed per state, as the original. */
+  .tasks-trigger {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 20px;
+    padding: 0.35rem 0.8rem;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.25s ease, border-color 0.25s ease, box-shadow 0.25s ease;
+  }
+
+  .tasks-trigger[data-state="idle"] {
+    background: color-mix(in srgb, var(--color-base-content) 5%, transparent);
+    border-color: color-mix(in srgb, var(--color-base-content) 10%, transparent);
+  }
+
+  .tasks-trigger[data-state="idle"] .tasks-ring-fill {
+    stroke: color-mix(in srgb, var(--color-base-content) 20%, transparent);
+  }
+
+  .tasks-trigger[data-state="running"] {
+    background: color-mix(in srgb, var(--color-info) 12%, transparent);
+    border-color: color-mix(in srgb, var(--color-info) 35%, transparent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--color-info) 25%, transparent);
+  }
+
+  .tasks-trigger[data-state="running"] .tasks-ring-fill {
+    stroke: var(--color-info);
+  }
+
+  .tasks-trigger[data-state="failed"] {
+    background: color-mix(in srgb, var(--color-error) 12%, transparent);
+    border-color: color-mix(in srgb, var(--color-error) 35%, transparent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--color-error) 25%, transparent);
+  }
+
+  .tasks-trigger[data-state="failed"] .tasks-ring-fill {
+    stroke: var(--color-error);
+  }
+
+  .tasks-trigger[data-state="done"] {
+    background: color-mix(in srgb, var(--color-success) 12%, transparent);
+    border-color: color-mix(in srgb, var(--color-success) 35%, transparent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--color-success) 25%, transparent);
+  }
+
+  .tasks-trigger[data-state="done"] .tasks-ring-fill {
+    stroke: var(--color-success);
+  }
+
+  .tasks-trigger:hover {
+    filter: brightness(1.25);
+  }
+
+  /* The label that slides out beside the ring when something happens. Animating
+     max-width rather than width is what lets it collapse to nothing without the text
+     reflowing on the way. */
+  .tasks-announcement {
+    display: inline-flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 2px;
+    max-width: 0;
+    max-height: 16px;
+    opacity: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    font-size: 11px;
+    font-weight: 600;
+    transition: max-width 0.5s cubic-bezier(0.4, 0, 0.2, 1), max-height 0.3s ease,
+      opacity 0.4s ease, margin-left 0.5s ease;
+  }
+
+  .tasks-announcement[data-expanded="true"] {
+    max-width: 350px;
+    opacity: 1;
+    margin-left: 6px;
+  }
+
+  .tasks-announcement[data-expanded="true"][data-dual="true"] {
+    max-height: 36px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tasks-ring-spin {
+    animation: none;
+  }
+}
+
 /* Every panel on every page, not just the ones written since the palette landed.
  *
  * The ported pages build their surfaces out of daisyUI's `card`, which is opaque and
