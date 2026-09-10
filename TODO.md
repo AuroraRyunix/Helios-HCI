@@ -694,11 +694,39 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   they were. Verified by building the image from a clean checkout on the test node.
 ## Design / future work
 
-### In progress: Phoenix LiveView rewrite of Spectrum
+### Phoenix LiveView rewrite of Spectrum
 
-Underway as a strangler migration, documented in [docs/spectrum_phx.md](docs/spectrum_phx.md).
-`spectrum-phx` runs beside the Python tier on port 8444; Slate still routes to 8443, so nothing
-is cut over yet.
+A strangler migration, documented in [docs/spectrum_phx.md](docs/spectrum_phx.md).
+`spectrum-phx` runs beside the Python tier on port 8444.
+
+**Every page is now served by Phoenix (2026-09-10).** Slate routes the pages to 8444 and
+everything else -- the whole HTTP API, the guest console, Spectrum's own assets -- to 8443.
+The `:legacy` machinery in the navigation table stays, because the routing split it belongs
+to is still carrying those; what changed is that no page points at the Python tier.
+
+**Still on the Python tier, and the reason each is:**
+
+* **The guest console** (`/vnc_auto.html`). Needs the WebAssembly/SPICE work below.
+* **The whole HTTP API.** Nothing in the console calls it any more, but `mcli`, `valcli`
+  and the deployment tooling do.
+* **Five controls**, deliberately not wired to buttons in the rebuilt pages, each of which
+  says so where the button would be:
+  * starting an upgrade and uploading a package (LCM);
+  * deploying and destroying a Kubernetes cluster (Lanayru);
+  * toggling `urbosa_enabled` (Settings), which bootstraps or tears down namespaces,
+    bridges and VXLAN interfaces on every host.
+
+  All five are long, cluster-wide and failure-prone. They belong behind Catalyst tasks,
+  where the header's task ring reports their progress and a failure is visible -- not
+  behind a request that returns instantly and leaves the work happening somewhere. That is
+  the remaining work on this migration.
+
+* **A VLAN id has no uniqueness constraint.** `hydra.gatoway_networks` is keyed by
+  `net_id`, so nothing in the database stops two networks claiming VLAN 100. The console
+  reads the existing networks and refuses a duplicate, which catches the mistake an
+  operator actually makes but cannot serialise against a concurrent create. Making it
+  airtight needs a claim table keyed by vlan id written with `IF NOT EXISTS`, which is a
+  schema change and Gatoway's business as much as the console's.
 
 **Ported and verified against the live cluster:** authentication (shared `pbkdf2_sha256` hashes
 and `hydra.sessions` with the Python tier, enforced once via a router `live_session`), cluster
