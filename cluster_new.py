@@ -469,14 +469,39 @@ def get_hydra_replication_factor():
     return parse_replication_factor(stdout)
 
 
-def zookeeper_quadlet(node_id, members):
+PARTICIPANT = "participant"
+OBSERVER = "observer"
+
+
+def ensemble_roles(members, roles=None):
+    """`{member id: role}` for a membership of `(id, ip)` pairs.
+
+    Without an explicit mapping the first three members vote and everything after them
+    observes, which is what position has always decided here and what `cluster create` and
+    `cluster add-node` still want: a cluster that has only ever grown has its voters at the
+    front of the list by construction.
+
+    With one -- which is what a `reconfig` produces -- position decides nothing, because
+    the entire point of asking for a change is that the voters are no longer the first
+    three. Passing the roles through rather than recomputing them is what keeps a unit
+    rewrite from silently undoing a promotion.
+    """
+    if roles:
+        return {member_id: roles.get(member_id, PARTICIPANT) for member_id, _ip in members}
+    return {member_id: (OBSERVER if position > 3 else PARTICIPANT)
+            for position, (member_id, _ip) in enumerate(members, start=1)}
+
+
+def zookeeper_quadlet(node_id, members, roles=None):
     """One node's ZooKeeper unit for an ensemble of `members`, a list of `(id, ip)`.
 
-    Every node's unit names the whole ensemble, so changing the membership means rewriting
-    all of them. ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed
-    version is 3.9.2, but `reconfigEnabled` is off, so `reconfig` is refused and the
-    ensemble can only be changed by rewriting the config and restarting. That is the cost
-    being paid here; see the dynamic-reconfiguration item in TODO.md.
+    Every node's unit names the whole ensemble. With `reconfigEnabled=true` the running
+    ensemble can be changed without touching any of them -- but the unit is still the only
+    *durable* record of the membership, because the image regenerates `/conf/zoo.cfg` from
+    `ZOO_SERVERS` on every start and `/conf` does not survive the container. So a unit that
+    disagrees with the live configuration is a membership change waiting to be undone by a
+    restart, and every path that reconfigures the ensemble writes these again to match.
+    See docs/zookeeper.md.
 
     Ids are passed in rather than derived from position. A member's id *is* its ZooKeeper
     identity: it has to match the `server.<id>` entry every other member holds for it, and
@@ -486,22 +511,25 @@ def zookeeper_quadlet(node_id, members):
     remembers the old one. Ids do not have to be contiguous, so a removal simply leaves
     a gap.
 
-    Voter or observer is decided by position rather than by id: the first three members
-    form the quorum and any beyond that scale reads without joining it, so a five-node
-    cluster still needs two failures to lose consensus rather than three.
+    Voter or observer is `roles`, and by default position: the first three members form
+    the quorum and any beyond that scale reads without joining it, so a five-node cluster
+    still needs two failures to lose consensus rather than three.
+
+    `ZOO_PEER_TYPE` is written because it has always been written, and it is worth being
+    clear that it does nothing: the official image never reads it. The `:observer` suffix
+    on the member's own `server.<id>` entry is what decides the role, so the two are kept
+    saying the same thing rather than one of them being quietly wrong.
     """
+    resolved = ensemble_roles(members, roles)
     if len(members) == 1:
         servers_env = ""
     else:
         parts = []
-        for position, (member_id, ip) in enumerate(members, start=1):
-            suffix = ":observer" if position > 3 else ""
+        for member_id, ip in members:
+            suffix = ":observer" if resolved.get(member_id) == OBSERVER else ""
             parts.append("server.%d=%s:2888:3888%s;2181" % (member_id, ip, suffix))
         servers_env = ' ZOO_SERVERS="%s"' % " ".join(parts)
-    own_position = next(
-        (position for position, (member_id, _ip) in enumerate(members, start=1)
-         if member_id == node_id), 1)
-    peer_type_env = " ZOO_PEER_TYPE=observer" if own_position > 3 else ""
+    peer_type_env = " ZOO_PEER_TYPE=observer" if resolved.get(node_id) == OBSERVER else ""
     return (
         "[Unit]\n"
         "Description=ZooKeeper Cluster Consensus Service\n"
@@ -524,22 +552,28 @@ def zookeeper_quadlet(node_id, members):
         "Image=docker.io/library/zookeeper:3.9.2\n"
         "Network=host\n"
         "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
-        "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
         "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
         "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
-        "Environment=ZOO_MY_ID=%d%s%s ZOO_4LW_COMMANDS_WHITELIST=*\n"
+        # ZOO_CFG_EXTRA is appended to the generated zoo.cfg verbatim, one entry per
+        # whitespace-separated token. reconfigEnabled is what makes `reconfig` anything
+        # other than a refusal, and it has to be the same on every member: whichever server
+        # becomes leader is the one that decides, so a half-enabled ensemble answers
+        # differently depending on an election.
+        "Environment=ZOO_MY_ID=%d%s%s ZOO_4LW_COMMANDS_WHITELIST=* "
+        "ZOO_CFG_EXTRA=reconfigEnabled=true\n"
         % (node_id, servers_env, peer_type_env)
     )
 
 
-def write_zookeeper_ensemble(members):
+def write_zookeeper_ensemble(members, roles=None):
     """Rewrite every node's ZooKeeper unit for this membership. Returns the nodes that failed.
 
-    `members` is a list of `(id, ip)` in ensemble order.
+    `members` is a list of `(id, ip)` in ensemble order, `roles` an optional
+    `{id: role}` for an ensemble whose voters are no longer its first three members.
     """
     failed = []
     for member_id, ip in members:
-        quad = zookeeper_quadlet(member_id, members)
+        quad = zookeeper_quadlet(member_id, members, roles)
         encoded = base64.b64encode(quad.encode()).decode()
         rc, _, _ = run_remote_spark(
             ip,
@@ -570,6 +604,461 @@ def read_zookeeper_ids(ips):
         if match:
             ids[ip] = int(match.group(1))
     return ids
+
+
+# -- Changing who votes ------------------------------------------------------------------
+#
+# Until now the voters were the first three nodes ever provisioned, and the only way to
+# change that was to rewrite every unit and restart the ensemble. Losing two of those three
+# stopped cluster coordination with every other node healthy and idle, and the nearest
+# thing to a fix -- `cluster decommission --finalize` -- reached the right membership as a
+# *side effect* of a config rewrite, because voter-or-observer followed position in the
+# list. During the rolling restart the members briefly disagreed about who votes.
+#
+# ZooKeeper 3.9.2 can do this properly. `reconfig` is one atomic operation: no restart, no
+# window in which the members hold different configurations, and the server itself will
+# only commit it while a quorum of *both* the old and the new configuration is available.
+#
+# What ZooKeeper will not do is decide whether the change is a good idea. It will happily
+# take a three-voter ensemble down to one, or hand a vote to a node that is not answering
+# -- both of those satisfy the dual-quorum rule at the instant of the change and leave a
+# cluster that the next single failure finishes off. That judgement is `plan_ensemble_roles`
+# below, and it is the whole point of the command: a promotion that is merely usually fine
+# is worse than not having one, because it will be trusted.
+
+def helios_zk_module():
+    """The shared ZooKeeper module, or a failure that names what is missing.
+
+    Loudly rather than by returning None: every caller of this is about to reason about
+    quorum, and a silent fallback there is exactly the wrong shape of mistake.
+    """
+    zkmod = load_helios_zk()
+    if zkmod is None or not hasattr(zkmod, "member_spec_with_role"):
+        raise RuntimeError(
+            "helios_zk is missing or predates ensemble reconfiguration. Roll the toolkit "
+            "out (deploy_updates.py) before changing the ensemble.")
+    return zkmod
+
+
+def read_ensemble_config(ips):
+    """What the running ensemble says its membership is, or None if it cannot be read.
+
+    Read from ZooKeeper's own /zookeeper/config rather than from the units, because with
+    reconfiguration enabled those answer different questions: a unit says what a node would
+    come back with after a restart, and /zookeeper/config says who is voting now. Acting on
+    the first would be reasoning about an ensemble that is not running.
+    """
+    zkmod = load_helios_zk()
+    if zkmod is None or not hasattr(zkmod, "read_ensemble_config"):
+        return None
+    hosts = ["127.0.0.1"] + [ip for ip in ips if ip != "127.0.0.1"]
+    client = None
+    try:
+        client = zkmod.connect(hosts, timeout=3.0)
+        return zkmod.read_ensemble_config(client)
+    except Exception:
+        return None
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def probe_ensemble_modes(members, timeout=1.0):
+    """Each member's mode as the member itself reports it, keyed by id.
+
+    None means it did not answer, which for this purpose covers both "the node is down"
+    and "the node is up and mid-election" -- a server that is not serving requests answers
+    `stat` without a mode line. Both are reasons not to reconfigure, so they need no
+    distinction here.
+
+    `server_mode` and not `leader_ip`: this asks about a particular server rather than
+    which one leads, and the cached form would answer the second question.
+    """
+    zkmod = load_helios_zk()
+    if zkmod is None:
+        return None
+    return {member["id"]: zkmod.server_mode(member["host"], timeout=timeout)
+            for member in members}
+
+
+def reconfig_enabled_on(hosts):
+    """`{address: bool}` -- whether each node's *running* ZooKeeper accepts a reconfig.
+
+    Read out of the container's own /conf/zoo.cfg and not out of the unit, because those
+    stop agreeing the moment a rollout has staged the change: `deploy_updates` writes the
+    unit and deliberately does not restart the consensus layer, so a node can have the
+    setting in its unit and still be running the configuration it started with. A check
+    against the unit would say yes and the server would then refuse the reconfiguration.
+    """
+    enabled = {}
+    for host in hosts:
+        rc, out, _ = run_remote_spark(
+            host, "podman exec systemd-zookeeper grep -c '^reconfigEnabled=true' "
+                  "/conf/zoo.cfg 2>/dev/null || true")
+        enabled[host] = rc == 0 and (out or "").strip().startswith("1")
+    return enabled
+
+
+def quorum_size(voters):
+    """A strict majority of `voters` -- what ZooKeeper needs to commit anything."""
+    return voters // 2 + 1
+
+
+def plan_ensemble_roles(members, modes, promote=(), demote=(), drop=()):
+    """The membership a role change would produce, or the reason it is refused.
+
+    Returns `(new_members, refusal)`; exactly one of them is None. `members` is the parsed
+    /zookeeper/config membership, `modes` the `{id: mode}` every member reports, and the
+    three id collections say what is being asked for.
+
+    Four refusals, and between them they are the argument that this cannot lose quorum:
+
+      * a member that is not in the ensemble -- promotion moves a vote between members
+        that already exist, it does not add or remove one;
+      * no single leader among the current voters, which means either no quorum or an
+        election in progress, and an election is the worst possible moment to change the
+        membership out from under;
+      * fewer than a quorum of the *current* voters answering, so the reconfiguration
+        could not be committed by the configuration it is leaving;
+      * any voter in the *new* set not answering. This is the one that matters. A vote
+        held by a node that is down is counted in every quorum and cast in none of them,
+        so the ensemble is weaker afterwards than it was before -- and because it demands
+        that *every* new voter is live, it also gives the new configuration its quorum for
+        free, which is the other half of what ZooKeeper needs to commit.
+
+    Then one refusal that is not about the transition but about what it leaves behind: an
+    ensemble whose quorum is its entire membership tolerates no failure at all, so a
+    result of fewer than three voters is refused. That is why demoting a voter on a
+    three-node cluster is not a thing you can do: all three of them have to vote.
+    """
+    known = {member["id"]: member for member in members}
+    for member_id in list(promote) + list(demote) + list(drop):
+        if member_id not in known:
+            return None, ("server.%d is not in the ensemble. Promotion and demotion move "
+                          "the vote between members that are already there; adding or "
+                          "removing one is `cluster add-node` or `cluster decommission`."
+                          % member_id)
+
+    voters = [member["id"] for member in members if member["role"] == PARTICIPANT]
+    leaders = [member_id for member_id in voters if modes.get(member_id) == "leader"]
+    if len(leaders) != 1:
+        return None, ("the ensemble reports %d leaders among its %d voters. It is either "
+                      "mid-election or partitioned, and changing the membership of an "
+                      "ensemble that is not agreeing on one is how both halves end up "
+                      "believing they are the quorum." % (len(leaders), len(voters)))
+
+    answering = [member_id for member_id in voters if modes.get(member_id)]
+    needed = quorum_size(len(voters))
+    if len(answering) < needed:
+        return None, ("%d of the %d current voters are answering and a reconfiguration "
+                      "needs a quorum of the configuration it is leaving, which is %d. "
+                      "Get the ensemble healthy before changing it."
+                      % (len(answering), len(voters), needed))
+
+    with_role = helios_zk_module().member_spec_with_role
+    new_members = []
+    for member in members:
+        if member["id"] in drop:
+            continue
+        role = member["role"]
+        if member["id"] in promote:
+            role = PARTICIPANT
+        elif member["id"] in demote:
+            role = OBSERVER
+        entry = dict(member)
+        entry["role"] = role
+        entry["spec"] = with_role(member["spec"], role)
+        new_members.append(entry)
+
+    new_voters = [member["id"] for member in new_members if member["role"] == PARTICIPANT]
+    silent = [member_id for member_id in new_voters if not modes.get(member_id)]
+    if silent:
+        return None, ("this would leave %s voting without answering. A vote held by a node "
+                      "that is down counts towards every quorum and is cast in none of "
+                      "them, so the ensemble comes out of this weaker than it went in. "
+                      "Hand that member's vote to a live one in the same change instead "
+                      "(--replacing)."
+                      % ", ".join("server.%d" % member_id for member_id in sorted(silent)))
+
+    if len(new_voters) < 3:
+        return None, ("this would leave %d voter(s), whose quorum is %d -- an ensemble "
+                      "that tolerates no failure at all, which is worse than the one it "
+                      "replaces. Changing the *size* of the cluster is `cluster add-node` "
+                      "and `cluster decommission`; this changes which of its nodes vote."
+                      % (len(new_voters), quorum_size(len(new_voters))))
+
+    return new_members, None
+
+
+def ensemble_warnings(members):
+    """What is worth saying about a membership that is not worth refusing over."""
+    warnings = []
+    voters = [member for member in members if member["role"] == PARTICIPANT]
+    if len(voters) % 2 == 0:
+        # Not unsafe, just paid for and not delivered: four voters tolerate the single
+        # failure three do, and put a fourth node in the way of every write.
+        warnings.append(
+            "%d voters is an even number: it tolerates the same %d failure(s) that %d "
+            "voters would, and adds a node to every quorum. An odd count is usually what "
+            "was meant." % (len(voters), len(voters) - quorum_size(len(voters)),
+                            len(voters) - 1))
+    return warnings
+
+
+def format_reconfig_members(members):
+    """The `-members` argument for a non-incremental reconfig: comma-separated
+    `server.<id>=<spec>`, with each spec exactly as ZooKeeper last wrote it apart from the
+    role. Addresses and ports are never reconstructed here -- they are whatever the
+    ensemble already believes, which is the only version of them that cannot be wrong."""
+    return ",".join("server.%d=%s" % (member["id"], member["spec"]) for member in members)
+
+
+def describe_ensemble(members, modes):
+    """One line per member: who it is, what it does, and whether it is answering."""
+    lines = []
+    for member in members:
+        mode = modes.get(member["id"]) or "not answering"
+        lines.append("  server.%-3d %-15s %-12s %s"
+                     % (member["id"], member["host"], member["role"], mode))
+    return "\n".join(lines)
+
+
+def write_units_from(members):
+    """Rewrite every member's unit to say exactly this membership.
+
+    Returns `(written, unwritten)`. Takes the parsed configuration rather than a plan, so
+    what lands in the units is what the ensemble said when it was last read -- which also
+    repairs a unit that had drifted, without anyone having to notice that it had.
+    """
+    pairs = [(member["id"], member["host"]) for member in members]
+    roles = {member["id"]: member["role"] for member in members}
+    unwritten = write_zookeeper_ensemble(pairs, roles)
+    return len(pairs) - len(unwritten), unwritten
+
+
+def apply_ensemble_reconfig(new_members, version, leader_host, modes):
+    """Commit `new_members` and make the units say the same thing. Returns (ok, message).
+
+    Three steps, in this order and no other:
+
+      1. `reconfig -v <version>`, which is atomic and refuses to commit if the ensemble has
+         been reconfigured since the plan was made -- the version is the guard against
+         acting on a membership that was read a moment ago and has moved since.
+      2. read the membership back and check it is the one that was asked for, because a
+         client that reports success is a weaker claim than the ensemble agreeing.
+      3. rewrite every member's unit from what step 2 read, so that a container restart
+         reproduces this ensemble rather than reverting to whichever one the unit
+         described. Nothing is restarted: the running ensemble is already correct, and the
+         unit is only what it would be rebuilt from.
+
+    Step 3 is not bookkeeping. The image regenerates /conf/zoo.cfg from ZOO_SERVERS
+    whenever it is absent, and /conf lives in the container rather than on a volume, so the
+    dynamic configuration ZooKeeper writes next to it is gone the moment the container is
+    recreated. The unit is the only durable record there is.
+    """
+    if not version:
+        return False, ("the ensemble did not report a configuration version, so the "
+                       "change cannot be made conditional on it. Refusing.")
+    argument = format_reconfig_members(new_members)
+    _rc, out, err = run_remote_spark(
+        leader_host,
+        "podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 reconfig -v %s "
+        "-members %s" % (shlex.quote(version), shlex.quote(argument)))
+    said = ((err or "") + (out or "")).strip()[:400]
+
+    # The client's exit status is not the answer. What decides whether this worked is the
+    # ensemble agreeing that it did, so the membership is read back and compared, and the
+    # client's output is kept only to explain a disagreement.
+    after = read_ensemble_config([member["host"] for member in new_members])
+    if after is None:
+        return False, ("the reconfiguration was submitted and the result could not be read "
+                       "back. Check `cluster status` and /zookeeper/config before doing "
+                       "anything else; the units have NOT been rewritten. zkCli said: %s"
+                       % said)
+    wanted = {(member["id"], member["role"]) for member in new_members}
+    got = {(member["id"], member["role"]) for member in after["members"]}
+    if wanted != got:
+        return False, ("the ensemble did not take the membership it was asked for, and is "
+                       "running:\n%s\nThe units have NOT been rewritten. zkCli said: %s"
+                       % ("\n".join("  server.%d %s %s" % (m["id"], m["host"], m["role"])
+                                    for m in after["members"]), said))
+
+    ids = {member["host"]: member["id"] for member in after["members"]}
+    written, unwritten = write_units_from(after["members"])
+    answering = [host for host in unwritten if modes.get(ids[host])]
+    if answering:
+        return False, ("the ensemble is reconfigured, but the unit could not be written on "
+                       "%s, which is answering. It will revert to the previous membership "
+                       "the next time its container is recreated -- rerun this."
+                       % ", ".join(answering))
+    message = ("ensemble reconfigured to version %s and %d unit(s) rewritten to match. "
+               "Nothing was restarted." % (after["version"], written))
+    if unwritten:
+        # Moving a role off a permanently failed node means the node is not there to be
+        # written to, so this is the expected outcome of the operation that matters most --
+        # returning failure would say nothing happened, which is the opposite of true. It
+        # is still a loose end, and it is the one that bites later rather than now.
+        message += ("\n[WARNING] %s did not answer, so its unit still describes the "
+                    "membership it has just left. Rerun this command once it does: until "
+                    "then, starting ZooKeeper there brings up a member that believes it "
+                    "still holds the role it was relieved of." % ", ".join(unwritten))
+    return True, message
+
+
+def cmd_zk_role(args, promoting):
+    """`cluster zk-promote` / `cluster zk-demote`."""
+    ips = get_cluster_ips()
+    config = read_ensemble_config(ips)
+    if config is None or not config["members"]:
+        print("[ERROR] Could not read /zookeeper/config. The ensemble has to be readable "
+              "before its membership can be changed -- check `cluster status`.")
+        return 1
+
+    members = config["members"]
+    by_host = {member["host"]: member for member in members}
+
+    def resolve(address):
+        member = by_host.get((address or "").strip())
+        if member is None:
+            print("[ERROR] %s is not a member of the ensemble. It has: %s"
+                  % (address, ", ".join(sorted(by_host))))
+        return member
+
+    target = resolve(args.node)
+    if target is None:
+        return 1
+    other = None
+    if args.replacing:
+        other = resolve(args.replacing)
+        if other is None:
+            return 1
+        if other["id"] == target["id"]:
+            print("[ERROR] --node and --replacing name the same member.")
+            return 1
+
+    # --replacing is the other half of the same sentence, so it takes the opposite role.
+    # It is not decoration: on a three-voter ensemble it is the *only* legal change, because
+    # promoting without it makes four voters of which one is the node being replaced, and
+    # demoting without it makes two.
+    promote = {target["id"]} if promoting else set()
+    demote = set() if promoting else {target["id"]}
+    if other is not None:
+        (demote if promoting else promote).add(other["id"])
+
+    enabled = reconfig_enabled_on([member["host"] for member in members])
+    missing = sorted(host for host, ok in enabled.items() if not ok)
+    if missing:
+        print("[ERROR] Reconfiguration is not enabled on the running ZooKeeper on: %s"
+              % ", ".join(missing))
+        print("        Roll the toolkit out to write the unit, then restart ZooKeeper one "
+              "node at a time, waiting for each to report a mode before the next.")
+        return 1
+
+    modes = probe_ensemble_modes(members)
+    if modes is None:
+        print("[ERROR] helios_zk is not available, so no member's mode can be read.")
+        return 1
+
+    print("Ensemble now (configuration version %s):" % config["version"])
+    print(describe_ensemble(members, modes))
+    print()
+
+    new_members, refusal = plan_ensemble_roles(members, modes, promote, demote)
+    if refusal:
+        print("[REFUSED] %s" % refusal)
+        return 1
+    if {(m["id"], m["role"]) for m in new_members} == {(m["id"], m["role"]) for m in members}:
+        # Nothing for the ensemble, but the units may still disagree with it -- which is
+        # exactly the state a node that was down during an earlier change is left in. So
+        # the no-op writes them, and this doubles as the way to bring that node into line
+        # when it comes back: ask for the role it already has.
+        print("The ensemble already has that membership. Making the units say so.")
+        written, unwritten = write_units_from(members)
+        print("%d unit(s) written; nothing restarted." % written)
+        if unwritten:
+            print("[WARNING] Still not reachable, and still describing an older "
+                  "membership: %s" % ", ".join(unwritten))
+            return 1
+        return 0
+
+    print("Ensemble after:")
+    print(describe_ensemble(new_members, modes))
+    for warning in ensemble_warnings(new_members):
+        print("\n[NOTE] %s" % warning)
+    print()
+
+    try:
+        leader = next(member["host"] for member in members
+                      if modes.get(member["id"]) == "leader")
+    except StopIteration:  # plan_ensemble_roles refuses this, so it cannot happen here
+        print("[ERROR] The ensemble has no leader.")
+        return 1
+
+    ok, message = apply_ensemble_reconfig(new_members, config["version"], leader, modes)
+    print(("" if ok else "[ERROR] ") + message)
+    return 0 if ok else 1
+
+
+def hand_off_ensemble_vote(target, survivors):
+    """Give a departing voter's vote to a live observer, in one reconfiguration.
+
+    Returns `(handled, message)`. `handled` is False whenever there is nothing deliberate
+    to be done -- reconfiguration is unavailable, the departing node does not vote, or
+    there is no observer to hand the vote to -- and the caller falls back to rewriting the
+    units and restarting them one at a time, which is what a decommission always did.
+
+    The fallback is not a lesser path; on a three-node cluster it is the only one. Removing
+    a node from three leaves two voters, and there is no observer waiting to become a third,
+    so the ensemble genuinely does become one that tolerates no failure. That is a property
+    of the cluster the operator asked for and not something a reconfiguration can fix, and
+    `plan_ensemble_roles` refuses to pretend otherwise.
+
+    Where it does apply -- five nodes, three voters, two observers -- this replaces the
+    whole rewrite-and-roll: the vote moves atomically, no member ever holds a different
+    view of who votes, and nothing is restarted.
+    """
+    config = read_ensemble_config(survivors)
+    if config is None or not config["members"]:
+        return False, "[zookeeper] /zookeeper/config could not be read."
+    departing = next((m for m in config["members"] if m["host"] == target), None)
+    if departing is None:
+        return False, "[zookeeper] %s is not in the ensemble configuration." % target
+    if departing["role"] != PARTICIPANT:
+        return False, "[zookeeper] %s does not vote; there is no vote to hand on." % target
+
+    enabled = reconfig_enabled_on([m["host"] for m in config["members"] if m["host"] != target])
+    if not all(enabled.values()):
+        return False, ("[zookeeper] reconfiguration is not enabled on every survivor, so "
+                       "the vote cannot be handed on deliberately.")
+
+    modes = probe_ensemble_modes(config["members"])
+    if modes is None:
+        return False, "[zookeeper] helios_zk is not available."
+    successor = next((m for m in config["members"]
+                      if m["role"] == OBSERVER and modes.get(m["id"])), None)
+    if successor is None:
+        return False, ("[zookeeper] no live observer to take over the vote, so the "
+                       "ensemble shrinks with the cluster.")
+
+    new_members, refusal = plan_ensemble_roles(
+        config["members"], modes, promote={successor["id"]}, drop={departing["id"]})
+    if refusal:
+        return False, "[zookeeper] %s" % refusal
+
+    print("[zookeeper] handing server.%d's vote to server.%d (%s) and removing it..."
+          % (departing["id"], successor["id"], successor["host"]))
+    leader = next((m["host"] for m in config["members"]
+                   if modes.get(m["id"]) == "leader"), None)
+    if leader is None or leader == target:
+        # The departing node may be the leader. Reconfiguring through it works -- it is
+        # still the leader -- but it is about to be wiped, so the change is sent to a
+        # survivor and forwarded.
+        leader = next((m["host"] for m in new_members if modes.get(m["id"])), None)
+    ok, message = apply_ensemble_reconfig(new_members, config["version"], leader, modes)
+    return ok, "[zookeeper] " + message
 
 
 def hydra_db_quadlet(node_ip, seed_ips):
@@ -1041,11 +1530,17 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
     parser.add_argument("--node", required=False,
-                        help="Single host IP, for 'decommission', 'rejoin' and 'add-node'")
+                        help="Single host IP, for 'decommission', 'rejoin', 'add-node', "
+                             "'zk-promote' and 'zk-demote'")
+    parser.add_argument("--replacing", required=False,
+                        help="For 'zk-promote'/'zk-demote': the member that takes the "
+                             "opposite role in the same change, so a vote is handed over "
+                             "rather than added or dropped")
     parser.add_argument("--finalize", action="store_true", help="Perform the bookkeeping half of a decommission or rejoin, once the ring work is done")
     parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy",
                                             "ring", "decommission", "rejoin",
-                                            "add-node"], help="Action to perform")
+                                            "add-node", "zk-promote", "zk-demote"],
+                        help="Action to perform")
 
     args = parser.parse_args()
 
@@ -1053,6 +1548,11 @@ def main():
         if not args.node:
             parser.error("add-node requires --node <ip>")
         sys.exit(cmd_add_node(args))
+
+    if args.command in ("zk-promote", "zk-demote"):
+        if not args.node:
+            parser.error("%s requires --node <ip>" % args.command)
+        sys.exit(cmd_zk_role(args, promoting=args.command == "zk-promote"))
 
     if args.command == "create":
         # Ensure we have servers
@@ -1347,9 +1847,15 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 "[Container]\n"
                 "Image=docker.io/library/zookeeper:3.9.2\n"
                 "Network=host\n"
+                # No logback mount here, deliberately, and it is a divergence rather than a
+                # decision: nothing writes /etc/hci/zookeeper/logback.xml except
+                # deploy_updates.py, so on a cluster that has only ever been provisioned
+                # the file this would mount does not exist. See TODO.md.
                 "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
                 "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
-                f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} ZOO_4LW_COMMANDS_WHITELIST=*\n\n"
+                # reconfigEnabled from the first boot. See zookeeper_quadlet above.
+                f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} "
+                f"ZOO_4LW_COMMANDS_WHITELIST=* ZOO_CFG_EXTRA=reconfigEnabled=true\n\n"
                 "[Install]\n"
                 "WantedBy=multi-user.target\n"
             )
@@ -2582,9 +3088,16 @@ print("--- Local wipe completed ---", flush=True)
             #
             # Survivors keep the ids they already hold, so removing the middle member
             # leaves a gap rather than renumbering the one after it.
-            survivor_ids = read_zookeeper_ids(survivors)
+            #
+            # First, though, ask for it rather than arrive at it: see
+            # hand_off_ensemble_vote. The rewrite below is what happens when it cannot.
+            handed_off, note = hand_off_ensemble_vote(target, survivors)
+            print(note)
+            survivor_ids = {} if handed_off else read_zookeeper_ids(survivors)
             unreadable = [ip for ip in survivors if ip not in survivor_ids]
-            if unreadable:
+            if handed_off:
+                pass  # the reconfiguration wrote the units already, and correctly
+            elif unreadable:
                 print(f"[WARNING] Could not read the ZooKeeper id of: {', '.join(unreadable)}. "
                       f"The ensemble was left alone -- rewriting it without those ids would "
                       f"hand a node an identity that does not match its data directory.")

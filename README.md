@@ -248,6 +248,10 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
 # Deliberately not 'create' with one more address: create claims disks.
 cluster add-node --node 10.10.102.223
 
+# Move the ZooKeeper vote between members without changing cluster membership.
+# One reconfiguration, no restart, and refused outright if it would cost quorum.
+cluster zk-promote --node 10.10.102.43 --replacing 10.10.102.223
+
 # Query cluster-wide status (verbose includes per-node extent store and vdisk info)
 cluster status --verbose
 
@@ -260,7 +264,7 @@ cluster stop
 # Wipe cluster configurations, databases, and formats claimed drives
 cluster destroy
 ```
-For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md). For virtual networking, subnets, and VLAN management, see [network.md](./docs/network.md).
+For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md). For who votes in the consensus ensemble, how that set is changed, and why the Quadlet rather than ZooKeeper's own dynamic config is the durable record of it, see [zookeeper.md](./docs/zookeeper.md#changing-which-nodes-vote). For virtual networking, subnets, and VLAN management, see [network.md](./docs/network.md).
 
 ---
 

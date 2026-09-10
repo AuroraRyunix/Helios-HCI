@@ -225,30 +225,55 @@ already-fixed when it had never worked.
 
 ## P1 — Metadata layer (Daruk as a Medusa Store)
 
-* **ZooKeeper observers cannot be promoted, so quorum is bound to three arbitrary nodes.**
-  `provision.py` makes the first three provisioned nodes voters and everything above node 3 an
-  observer (`ZOO_PEER_TYPE=observer if idx > 3`). That part is right -- observers scale reads without
-  slowing writes. The gap is that there is no way to change the set deliberately: lose two of those
-  three and cluster coordination stops with every other node healthy and idle.
+* ~~ZooKeeper observers cannot be promoted, so quorum is bound to three arbitrary nodes.~~
+  **Resolved (2026-09-10)**: `reconfigEnabled=true` ships in all three Quadlet writers and
+  `deploy_updates.py` adds it to nodes that already exist, and `cluster zk-promote` /
+  `cluster zk-demote` move the vote between members in one `reconfig` -- no restart, and no instant
+  at which two members disagree about who votes. The first three nodes are still the *starting* set,
+  which remains right: observers scale reads without slowing writes.
 
-  **Partly narrowed (2026-08-23).** `cluster decommission --finalize` now rewrites the ensemble for
-  the survivors instead of leaving it to the operator, so a departed voter no longer keeps counting
-  toward quorum. Because voter-or-observer follows *position* in the member list, a removal also
-  slides the next member up into the quorum -- on five nodes, removing a voter promotes the first
-  observer. That is the right outcome, but it is reached as a side effect of a config rewrite plus a
-  rolling restart rather than by asking for it, and during the roll the members briefly disagree about
-  who votes. What is still missing is the deliberate form: `reconfigEnabled=true`, a
-  `cluster zk-promote` / `zk-demote` that refuses any change which would lose quorum mid-flight, and
-  a way to move the ZooKeeper role off a permanently-failed node without removing it from the ring.
-  ZooKeeper has supported dynamic reconfiguration since 3.5 and the deployed version is **3.9.2**, so
-  the mechanism is present and merely switched off -- `/conf/zoo.cfg` sets `standaloneEnabled=true` and
-  never sets `reconfigEnabled`, so `reconfig` is refused. Verified on the live node.
-  Needs: `reconfigEnabled=true` in the Quadlet config, a `cluster zk-promote` / `zk-demote` path that
-  refuses any change that would lose quorum mid-reconfiguration, promotion wired into
-  `cluster decommission` so removing a voter hands its vote on, and the dynamic config file
-  (`zoo.cfg.dynamic`) accounted for in provisioning -- once reconfig is enabled, ZooKeeper owns
-  membership and a provisioner that rewrites `zoo.cfg` wholesale will fight it.
-  Nutanix migrates the ZooKeeper role off a permanently-failed node; this is the same idea.
+  The refusals are the feature. ZooKeeper commits any membership for which a quorum of the old and of
+  the new configuration exists at that instant, which includes handing a vote to a node that is not
+  answering and taking three voters down to one -- both leave a cluster the next single failure
+  finishes off, and both report success. So a change is refused unless *every* voter in the new set is
+  answering (which also gives the new configuration its quorum), at least a quorum of the current
+  voters is answering, there is exactly one leader among them, and the result still has three voters.
+  An even count warns rather than refuses. The plan is submitted as `reconfig -v <version>` against
+  the version `/zookeeper/config` reported, so a membership that moved in between is refused rather
+  than overwritten, and the result is read back and compared instead of trusted from the client's exit
+  status. `--replacing` makes a swap one operation: on a three-voter ensemble it is the only legal
+  change, and it is what moves the role off a permanently-failed node -- which stays an observer, in
+  the ring and in `cluster.json`. `cluster decommission --finalize` hands the departing voter's vote to
+  a live observer the same way, and falls back to the old rewrite-and-roll where there is none, which
+  on three nodes is always.
+
+  **The `zoo.cfg.dynamic` interaction turned out to be the opposite of the worry.** With reconfig on,
+  ZooKeeper moves the `server.N` lines into `zoo.cfg.dynamic.<version>` and points `zoo.cfg` at it --
+  both in `/conf`, which is in the container: the image declares volumes for `/data`, `/datalog` and
+  `/logs` and no other, and its entrypoint regenerates `zoo.cfg` from `ZOO_SERVERS` whenever the file
+  is absent, which for a recreated container is every start. Persisting the dynamic file does not help
+  and makes it worse: ZooKeeper names it from the path of the *static* config
+  (`QuorumPeer.makeDynamicConfigFilename`), so the first committed reconfiguration writes it back
+  beside `/conf/zoo.cfg` wherever `dynamicConfigFile` pointed, leaving a membership file on a volume
+  that outlives the pointer naming it. So the dynamic config is deliberately left ephemeral: the pair
+  is lost together and a restarted node re-derives everything from its unit rather than reading a
+  stale half. **ZooKeeper owns membership while it is running; the Quadlet owns it across a restart.**
+  A provisioner rewriting `zoo.cfg` is therefore not fighting ZooKeeper -- it is what rebuilds what
+  ZooKeeper was running -- and what would fight it is a unit disagreeing with the live ensemble, so
+  every path that reconfigures also rewrites the units from the membership it read back, without
+  restarting anything. Asking for the role a member already has is a repair rather than a no-op, which
+  is how a node that was down during a change is brought into line when it returns.
+  `standaloneEnabled` stays `true`: with three or more participants it has no effect, and the only
+  thing `false` buys is reconfiguring below two voters, which `zk-demote` refuses anyway.
+  See [docs/zookeeper.md](docs/zookeeper.md#changing-which-nodes-vote); 31 tests in
+  `test_zk_reconfig.py`.
+  **Outstanding**: enabling reconfiguration widens what an unauthenticated client on 2181 can do --
+  ZooKeeper 3.9 runs no ACL check on the `reconfig` operation, so anything that reaches the client
+  port can change the ensemble. That port already takes unauthenticated writes and has
+  `4lw.commands.whitelist=*`, so this widens an existing exposure rather than creating one, but it is
+  another reason the 2181 boundary has to stay a network boundary. Nothing yet reports a unit that has
+  drifted from the live configuration until someone runs one of these commands; `mimir` is where that
+  check belongs.
 
 * ~~Catalyst double-claims scheduled jobs.~~ **Resolved (2026-08-21)**: `claim_scheduled_run()` takes
   the tick with `IF last_run_epoch = ?` through Daruk's `/v1/schedule/claim-job` before anything is
@@ -574,6 +599,18 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   resolving under the `aether` key: the same image today, so it worked by coincidence and would have
   broken the moment either moved.
 ## Missing tooling / process
+
+* **Only `deploy_updates.py` ever writes `/etc/hci/zookeeper/logback.xml`.** `provision.py`'s
+  Quadlet mounts that path into the container and nothing in the provisioning path creates it, so a
+  cluster that has been provisioned and never had a rollout run against it bind-mounts a file that
+  does not exist -- podman creates a directory there, and the quietened logging config that mount
+  exists to install is not what the container reads. `cluster create` and `spark_daemon_decoded.py`
+  rewrite the unit without the mount at all, so the three writers disagree about it, which is the
+  shape of divergence `test_zk_probe_storm.py` was written to catch and does not: it asserts the
+  string appears in each file, not that the file it names is ever written. Noted 2026-09-10 while
+  adding `reconfigEnabled` to the same units. The fix is for provisioning to ship the config the way
+  the rollout does -- an embedded payload in `provision.py` and a `sync_provision.py` mapping entry --
+  after which all three writers can mount it.
 
 * ~~No top-level `LICENSE` file.~~ **Resolved**: Business Source License 1.1, converting to
   MPL-2.0 on 2030-08-19. MPL rather than Apache-2.0 because the BSL covenants require a

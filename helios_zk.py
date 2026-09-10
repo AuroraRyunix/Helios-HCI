@@ -18,6 +18,7 @@ Wire format notes (all integers are big-endian):
   reply  : int32 frame_len + int32 xid + int64 zxid + int32 err + payload
 """
 
+import re
 import socket
 import struct
 import threading
@@ -123,6 +124,85 @@ def leader_cache_clear():
         _LEADER_CACHE["ip"] = None
         _LEADER_CACHE["at"] = 0.0
         _LEADER_CACHE["key"] = None
+
+
+# -- Who votes ---------------------------------------------------------------------------
+#
+# ZooKeeper publishes its own membership at /zookeeper/config: one `server.<id>=` line per
+# member, and a `version=` in hexadecimal. The znode is world-readable, so this needs no
+# credentials, and it is the only honest answer to "who votes right now".
+#
+# A unit file answers a different question. Before `reconfigEnabled`, the two were the same
+# thing because the only way to change membership was to rewrite the unit and restart. With
+# reconfiguration on, the unit says what a node would come back with after a restart and
+# /zookeeper/config says what the ensemble is doing, and a caller that confuses them is
+# reasoning about an ensemble that does not exist.
+#
+# The role is derived rather than read straight out, in one direction: ZooKeeper always
+# writes it (`:participant` or `:observer`), but a member spec that a human wrote may leave
+# it off, and an omitted role means participant. Treating that as "no role" would drop a
+# voter out of the count -- which is the arithmetic every quorum decision here is built on.
+
+ENSEMBLE_CONFIG_PATH = "/zookeeper/config"
+
+PARTICIPANT = "participant"
+OBSERVER = "observer"
+
+_MEMBER_LINE = re.compile(r"^server\.(\d+)\s*=\s*(.+?)\s*$")
+# The role is the last field of the address half and never appears anywhere else, so both
+# reading it and replacing it are anchored to the end. Searching the whole spec for the
+# word instead would read a host called `observer.example.com` as an observer.
+_ROLE_SUFFIX = re.compile(r":(?:participant|observer)$")
+
+
+def parse_ensemble_config(text):
+    """The ensemble's membership, from the body of the /zookeeper/config znode.
+
+    Returns {"members": [...], "version": "<hex>"}, where each member is
+    {"id": int, "host": str, "spec": str, "role": "participant"|"observer"} in the order
+    the config lists them. `version` is the hexadecimal string ZooKeeper wrote, kept as a
+    string because that is exactly the form `reconfig -v` wants back.
+
+    `spec` is kept verbatim so that a caller handing membership back to ZooKeeper changes
+    only the role and never reconstructs an address or a port it did not choose.
+    """
+    members = []
+    version = None
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("version="):
+            version = line.split("=", 1)[1].strip()
+            continue
+        match = _MEMBER_LINE.match(line)
+        if not match:
+            continue
+        spec = match.group(2)
+        address = spec.split(";", 1)[0]
+        members.append({
+            "id": int(match.group(1)),
+            "host": address.split("|", 1)[0].split(":", 1)[0],
+            "spec": spec,
+            "role": OBSERVER if address.endswith(":" + OBSERVER) else PARTICIPANT,
+        })
+    return {"members": members, "version": version}
+
+
+def member_spec_with_role(spec, role):
+    """The same member spec with its role set to `role`, and nothing else touched.
+
+    The role sits on the address half, before the `;` that introduces the client address,
+    and there is at most one of it however many addresses the member lists.
+    """
+    address, separator, client = spec.partition(";")
+    address = _ROLE_SUFFIX.sub("", address)
+    return address + ":" + role + separator + client
+
+
+def read_ensemble_config(client):
+    """Read and parse /zookeeper/config over an existing connection."""
+    return parse_ensemble_config(client.get(ENSEMBLE_CONFIG_PATH).decode("utf-8", "replace"))
 
 
 # Opcodes

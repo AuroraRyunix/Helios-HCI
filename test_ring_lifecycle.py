@@ -801,11 +801,15 @@ class DecommissionPlanningTests(RingTestCase):
 class TheEnsembleKeepsItsIdentities(unittest.TestCase):
     """A member's ZooKeeper id is its identity, not its position in a list.
 
-    The ensemble can only be changed by rewriting every unit and restarting, because
-    `reconfigEnabled` is off. That rewrite used to derive each id from the member's
-    position, which is harmless while a cluster only grows and wrong the moment one
-    shrinks: removing the middle member renumbers the one after it, so a node comes back
-    claiming an identity that does not match the `myid` in its own data directory.
+    Growing or shrinking the ensemble means rewriting every unit. That rewrite used to
+    derive each id from the member's position, which is harmless while a cluster only
+    grows and wrong the moment one shrinks: removing the middle member renumbers the one
+    after it, so a node comes back claiming an identity that does not match the `myid` in
+    its own data directory.
+
+    Which members *vote* is a separate question, and since `reconfigEnabled` it is no
+    longer decided by position either -- see test_zk_reconfig.py. These stay about
+    identity, which a reconfiguration never changes.
     """
 
     THREE = [(1, "10.0.0.1"), (2, "10.0.0.2"), (3, "10.0.0.3")]
