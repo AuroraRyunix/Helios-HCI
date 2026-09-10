@@ -26,6 +26,9 @@ replace it. The remaining ~2.4 MB of spice-html5 JavaScript is vendored but not
 referenced by any served page -- removing it would reduce this obligation to the
 single compiled file.
 
+`src/png.js` carries a local fix to its cursor encoder, marked as such in the
+file. Nothing else in the vendored tree differs from upstream.
+
 ## Runtime dependencies (not redistributed)
 
 | Package | License |

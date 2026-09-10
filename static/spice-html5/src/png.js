@@ -163,10 +163,14 @@ PngIDAT.prototype =
         dv.setUint8(at, 0x78); at++;
         dv.setUint8(at, 0x01); at++;
 
-        /* Deflate header.  Specifies uncompressed, final bit */
-        dv.setUint8(at, 0x80); at++;
-        dv.setUint16(at, this.data.byteLength + this.height); at += 2;
-        dv.setUint16(at, ~(this.data.byteLength + this.height)); at += 2;
+        /* Deflate header.  Specifies uncompressed, final bit.
+           Local fix: BFINAL is bit 0 of the header byte, not bit 7, and the
+           LEN/NLEN of a stored block are little endian, not the big endian
+           a DataView writes by default.  Either one alone leaves a stream
+           no inflater will read.  */
+        dv.setUint8(at, 0x01); at++;
+        dv.setUint16(at, this.data.byteLength + this.height, true); at += 2;
+        dv.setUint16(at, ~(this.data.byteLength + this.height), true); at += 2;
         var u8 = new Uint8Array(this.data);
         for (i = 0, y = 0; y < this.height; y++)
         {
@@ -189,10 +193,6 @@ PngIDAT.prototype =
         /* zlib checksum.   */
         dv.setUint16(at, zsum.s2); at+=2;
         dv.setUint16(at, zsum.s1); at+=2;
-
-        /* FIXME - something is not quite right with the zlib code;
-                   you get an error from libpng if you open the image in
-                   gimp.  But it works, so it's good enough for now... */
 
         dv.setUint32(at, crc32(a, orig + 4, this.buffer_size() - 8)); at += 4;
         return at;

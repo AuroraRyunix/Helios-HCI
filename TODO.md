@@ -790,25 +790,37 @@ no equivalent for. What survives in the tree:
 * Spectrum's WebSocket proxy is already parameterised by `console_type` and refuses a
   protocol mismatch rather than silently downgrading.
 
-What is missing is at both ends rather than in the middle:
+What is missing is at both ends rather than in the middle, and neither end is a coding
+problem:
 
 1. **No VM is given a SPICE device.** Both XML builders hard-code
    `<graphics type='vnc' port='-1' autoport='yes'>` (`spectrum_server.py`, `vali.py`), so
    asking for a SPICE console is correctly refused -- there is nothing to connect to.
+   `docs/vali.md` says both displays are enabled concurrently; that describes an intention
+   rather than the XML, and whoever settles the decision below should correct it.
 2. **No page loads the client.** `vnc_auto.html` is the only console page, and both console
    buttons in `static/app.js` open it: the "WebGL" button is a copy of the VNC one with the
    same URL.
-3. **The cursor encoder in the vendored client is broken.** `create_rgba_png` in
-   `spice-html5/src/png.js` emits an invalid zlib stream -- deflate header `0x80` where
-   BFINAL is bit 0 (should be `0x01`), and LEN/NLEN written big-endian through
-   `DataView.setUint16`'s default when deflate requires little-endian. Reproduced: fixing
-   either alone still fails, both together decompress. The file's own FIXME admits libpng
-   errors on its output. This would bite immediately once a SPICE console rendered.
 
-So it is a two-line codec fix, a graphics device, and a page -- or a decision to delete the
-vendored client and stop building the wasm on every rollout. Whether SPICE becomes the default
-console or sits alongside VNC per-VM decides whether the graphics type is a per-VM field or a
-global switch, and that decision is the gate on the rest.
+Both are gated on the same unmade decision. Whether SPICE becomes the default console or
+sits alongside VNC per-VM decides whether the graphics type is a per-VM field or a global
+switch, and writing either change now would presume the answer. Deleting the vendored client
+and dropping the wasm from every rollout remains the other way to close this out.
+
+~~**The cursor encoder in the vendored client is broken.**~~ **Fixed 2026-09-10.**
+`create_rgba_png` in `spice-html5/src/png.js` put BFINAL in bit 7 of the deflate header
+instead of bit 0, and wrote a stored block's LEN/NLEN big-endian -- what a DataView does
+unless asked otherwise, and the opposite of what deflate wants. Either alone was fatal. The
+FIXME the file carried about libpng rejecting its output was this, and it is gone.
+
+Worth keeping: the obvious check does not see this bug. Byte-swapping *both* LEN and NLEN
+preserves their one's-complement relationship, so zlib's stored-block length check still
+passes and the block merely declares a length that is not there. A test asserting NLEN is
+the complement of LEN would have gone green on the broken file, and so would one asserting
+the header byte, once either half was fixed. `test_spice_cursor_png.py` therefore asserts
+nothing about the bytes: it runs the real `png.js` under node, inflates the IDAT with
+Python's `zlib`, and compares the pixels that come back against the ones that went in. It
+fails on the shipped file and on each half-fix, and it skips where node is absent.
 
 ### Built: the extent-based store (Sidon), with Hydra as the metadata layer
 
