@@ -70,6 +70,67 @@ echo cons | nc 127.0.0.1 2181
 echo ruok | nc 127.0.0.1 2181
 ```
 
+### Who asks which node is the leader, and how often
+
+Nine daemons need to know which node leads the ensemble: `vali`, `catalyst`, `mimir`,
+`dagur`, `valcli`, `mipha`, `bifrost`, `hylia` and `spectrum_server`. Each used to carry
+its own copy of the same `stat` probe loop and run it on its own timer -- vali's queue
+worker every two seconds, and every call into Catalyst again on top.
+
+That summed to roughly **eleven journal lines a second on a completely idle cluster**, and
+it had been doing it since the cluster was built: 151 MB of journal, and enough journald
+work to be the second-largest CPU consumer on two of three nodes. Nothing was wrong with
+any individual copy. There were just nine of them, none cached.
+
+Two things changed, because either alone leaves the cost in place:
+
+**The probe is shared and cached.** `helios_zk.leader_ip(ips)` is the one implementation,
+cached for `LEADER_CACHE_SECONDS` (5s). Leadership changes only at an election, so a
+caller acting on a five-second-old answer is in the same position as one whose probe raced
+an election -- which every caller already tolerates. `None` is cached too: a cluster
+mid-election is the worst moment to add probe load to.
+
+`helios_zk.server_mode(ip)` is the uncached form, for asking about one *named* server
+rather than finding the leader. `mipha.is_zookeeper_leader(ip)` uses it.
+
+The fallbacks stayed where they were. What each daemon does when the leader is missing or
+not serving differs deliberately -- `bifrost` refuses to elect a replacement independently,
+because in a partition both sides would choose the lowest candidate they can see and both
+would bind the VIP -- and consolidating that would be consolidating reasoning, not code.
+
+**ZooKeeper no longer logs the probes.** Caching lowers the rate but cannot reach zero:
+each daemon *process* holds its own cache and there are a couple of dozen across a cluster,
+so the floor is set by how many processes exist. The probes were never the expense -- a TCP
+connect and a nine-byte write -- but two INFO lines about each one is. `zookeeper_config/logback.xml`
+sets `org.apache.zookeeper.server.NIOServerCnxn` and `.server.command` to `WARN` and leaves
+everything else at `INFO`, because elections, quorum changes, session commits and connection
+errors are what this log is for. It is vendored from the pinned 3.9.2 image and mounted over
+the container's own; both are pinned in the same toolkit.
+
+Each unit also carries `LogRateLimitIntervalSec=10s` / `LogRateLimitBurst=100` -- a ceiling
+for whatever the next mistake turns out to be, generous enough for a real election's burst.
+
+`test_zk_probe_storm.py` holds all of it: no daemon may open its own connection to 2181,
+the cache must be honoured, the config must ship, and every writer of the unit must mount
+it and set the limit.
+
+### Restarting the ensemble
+
+Never all at once. `deploy_updates.py` reconciles `zookeeper.container` and reloads systemd
+but deliberately **does not** restart ZooKeeper, because the rollout runs against every node
+in parallel and restarting the consensus layer everywhere simultaneously is how a rollout
+takes quorum away. Restart followers first and the leader last -- restarting the leader
+forces an election, and doing the followers afterwards would force a second -- waiting for
+each node to report a mode again before touching the next:
+
+```bash
+# On any node, one at a time, checking in between:
+systemctl restart zookeeper
+(echo stat; sleep 0.3) | nc 127.0.0.1 2181 | grep '^Mode:'
+```
+
+`cluster add-node` does exactly this when it rewrites the ensemble.
+
 ### B. Interactive ZooKeeper Shell (`zkCli.sh`)
 Use the interactive client tool inside the container to inspect znode trees and cluster states:
 ```bash
