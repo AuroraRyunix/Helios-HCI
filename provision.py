@@ -188,7 +188,20 @@ while read -r name size type _rest; do
     fi
     uuid="$(blkid -s UUID -o value "$dev")"
     if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
-        echo "UUID=$uuid $target xfs defaults,noatime 0 0" >> /etc/fstab
+        # nofail and a device timeout, the same as the sidon volume this sits inside.
+        #
+        # Without them a data disk that is slow to appear, or whose UUID moved, fails
+        # local-fs.target and drops the whole node into emergency mode at boot -- no
+        # network, no SSH, console only. Two of three nodes did exactly that, and because
+        # a three-node ensemble needs two, the survivor's ZooKeeper then ran and answered
+        # nothing, which reads as a ZooKeeper fault three layers from the cause.
+        #
+        # The nesting matters too. This path is inside /var/lib/hci/sidon, which is itself
+        # a nofail mount, so systemd orders this after it and refuses it if the parent was
+        # skipped. Without nofail here, that refusal is what reaches emergency mode.
+        #
+        # One extra disk is not worth a node: sidon copes with a store that is not there.
+        echo "UUID=$uuid $target xfs defaults,noatime,nofail,x-systemd.device-timeout=5s 0 0" >> /etc/fstab
     fi
     mountpoint -q "$target" || mount "$target"
     mkdir -p "$target/egroups"

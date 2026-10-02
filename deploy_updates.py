@@ -213,6 +213,75 @@ PY
 # restarting the consensus layer on all of them at once is how a rollout takes quorum
 # away. The unit is reloaded so the change is staged, and the operator is told it needs a
 # rolling restart -- which `cluster add-node` already knows how to do one node at a time.
+# Make an existing node's sidon mounts survive a disk that is not there.
+#
+# A node whose extra data disk is slow to appear, or whose UUID moved, fails
+# local-fs.target and boots into emergency mode: no network, no SSH, console only. Two of
+# three nodes did exactly that, which takes quorum with them and leaves the survivor's
+# ZooKeeper running but answering nothing -- correct behaviour that reads as a ZooKeeper
+# fault.
+#
+# The writers are fixed, but they only ever *append*: `grep -q "$uuid" /etc/fstab` means a
+# line already present is never rewritten, so every node provisioned before the fix keeps
+# the fstab that breaks it. This is the repair, and it is why the fix is not just the two
+# one-line changes to the writers.
+#
+# Additive and idempotent: it adds only the options that are missing, to sidon mounts only,
+# and leaves every other line byte-identical. A reflowed root filesystem entry is not worth
+# the tidiness.
+RECONCILE_SIDON_FSTAB = r"""
+set -e
+FSTAB=/etc/fstab
+[ -f "$FSTAB" ] || { echo "sidon fstab: absent"; exit 0; }
+
+# awk signals "I changed something" with exit 10, so the exit status has to be captured
+# rather than allowed to trip `set -e`.
+rc=0
+awk '
+    # Comments and blank lines are copied untouched.
+    /^[[:space:]]*#/ { print; next }
+    NF < 4           { print; next }
+
+    # Only the sidon mounts. Field 2 is the mount point, field 4 the options.
+    $2 !~ /^\/var\/lib\/hci\/sidon/ { print; next }
+
+    {
+        add = ""
+        if ($4 !~ /(^|,)nofail(,|$)/)            { add = add ",nofail" }
+        if ($4 !~ /x-systemd\.device-timeout=/)  { add = add ",x-systemd.device-timeout=5s" }
+        if (add != "") { $4 = $4 add; changed = 1 }
+        print
+    }
+
+    END { if (changed) exit 10 }
+' "$FSTAB" > "$FSTAB.hci-new" || rc=$?
+
+if [ "${rc:-0}" = "10" ]; then
+    # Parse the candidate before installing it. `--fake` walks the table and mounts
+    # nothing, and `-T` points it at the new file rather than the live one, so a table
+    # this host could not boot from is never written. This is /etc/fstab: the failure
+    # being repaired is a node that boots to a console prompt, and a botched repair is
+    # the same outcome with fewer clues.
+    if ! mount --fake -T "$FSTAB.hci-new" -a >/dev/null 2>&1; then
+        rm -f "$FSTAB.hci-new"
+        echo "sidon fstab: candidate did not parse; left alone"
+        exit 0
+    fi
+    cp -p "$FSTAB" "$FSTAB.hci-bak.$(date +%Y%m%d%H%M%S)"
+    cat "$FSTAB.hci-new" > "$FSTAB"
+    rm -f "$FSTAB.hci-new"
+    systemctl daemon-reload
+    echo "sidon fstab: updated (data disks will no longer fail the boot)"
+elif [ "$rc" = "0" ]; then
+    rm -f "$FSTAB.hci-new"
+    echo "sidon fstab: ok"
+else
+    rm -f "$FSTAB.hci-new"
+    echo "sidon fstab: could not be read (awk rc=$rc); left alone"
+    exit 0
+fi
+"""
+
 RECONCILE_ZOOKEEPER_UNIT = r"""
 python3 - <<'PY'
 import os
@@ -304,7 +373,20 @@ while read -r name size type _rest; do
     fi
     uuid="$(blkid -s UUID -o value "$dev")"
     if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
-        echo "UUID=$uuid $target xfs defaults,noatime 0 0" >> /etc/fstab
+        # nofail and a device timeout, the same as the sidon volume this sits inside.
+        #
+        # Without them a data disk that is slow to appear, or whose UUID moved, fails
+        # local-fs.target and drops the whole node into emergency mode at boot -- no
+        # network, no SSH, console only. Two of three nodes did exactly that, and because
+        # a three-node ensemble needs two, the survivor's ZooKeeper then ran and answered
+        # nothing, which reads as a ZooKeeper fault three layers from the cause.
+        #
+        # The nesting matters too. This path is inside /var/lib/hci/sidon, which is itself
+        # a nofail mount, so systemd orders this after it and refuses it if the parent was
+        # skipped. Without nofail here, that refusal is what reaches emergency mode.
+        #
+        # One extra disk is not worth a node: sidon copes with a store that is not there.
+        echo "UUID=$uuid $target xfs defaults,noatime,nofail,x-systemd.device-timeout=5s 0 0" >> /etc/fstab
     fi
     mountpoint -q "$target" || mount "$target"
     mkdir -p "$target/egroups"
@@ -1396,6 +1478,16 @@ def deploy_to_node(ip):
             stdout_zk.channel.recv_exit_status()
             if zk_said and not zk_said.endswith("ok"):
                 print(f"[{ip}] {zk_said}")
+
+            # Repair the fstab the writers used to produce. Safe to run on every node every
+            # time, and it has to be here rather than only in the writers, because those
+            # only append: a line already in the file is never rewritten, so a node
+            # provisioned before the fix keeps the fstab that boots it into emergency mode.
+            _, stdout_fs, _ = ssh.exec_command(RECONCILE_SIDON_FSTAB)
+            fs_said = stdout_fs.read().decode("utf-8", "replace").strip()
+            stdout_fs.channel.recv_exit_status()
+            if fs_said and not fs_said.endswith("ok"):
+                print(f"[{ip}] {fs_said}")
     
             # Upload and load traefik.tar offline if it exists
             local_tar = os.path.join(local_dir_path, "traefik.tar")
