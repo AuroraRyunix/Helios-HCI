@@ -9,7 +9,9 @@ its entry removed by the ensemble rather than by anyone noticing and cleaning up
 
 This repo is stdlib-only by design (no requirements.txt; EL10.2 host image), so kazoo is
 not available. This implements the subset of the ZooKeeper 3.x wire protocol Helios
-needs: connect/session, ping keepalive, create, exists, get, set, get_children, delete.
+needs: connect/session, ping keepalive, create, exists, get, set, get_children, delete,
+and watches -- one reader thread demultiplexing replies and server-pushed events off the
+one socket, with every watch re-armed after it fires and after every reconnect.
 
 Wire format notes (all integers are big-endian):
   string : int32 length + UTF-8 bytes            (-1 means null)
@@ -18,6 +20,7 @@ Wire format notes (all integers are big-endian):
   reply  : int32 frame_len + int32 xid + int64 zxid + int32 err + payload
 """
 
+import queue
 import re
 import socket
 import struct
@@ -216,6 +219,37 @@ OP_PING = 11
 OP_CLOSE = -11
 
 XID_PING = -2
+# Every frame the server pushes without being asked carries this xid. A watch firing is
+# the only one of them this client cares about.
+XID_WATCH_EVENT = -1
+
+# WatcherEvent types. NONE is the session itself changing rather than any one path.
+EVENT_NONE = -1
+EVENT_NODE_CREATED = 1
+EVENT_NODE_DELETED = 2
+EVENT_NODE_DATA_CHANGED = 3
+EVENT_NODE_CHILDREN_CHANGED = 4
+
+# Keeper states, as they arrive on a session event.
+STATE_DISCONNECTED = 0
+STATE_SYNC_CONNECTED = 3
+STATE_AUTH_FAILED = 4
+STATE_CONNECTED_READ_ONLY = 5
+STATE_EXPIRED = -112
+
+# What a registered watch is watching. The three are distinct in ZooKeeper: a data watch
+# and an exists watch both fire on create/delete/data-change, a child watch only on the
+# child list changing, and they are armed by different reads.
+WATCH_DATA = "data"
+WATCH_EXISTS = "exists"
+WATCH_CHILDREN = "children"
+
+# Why a callback is being called. There is no reason for the *initial* arm, because that
+# read hands its value straight back to whoever registered the watch; a callback only ever
+# sees one of these three.
+REASON_EVENT = "event"            # the ensemble fired the watch
+REASON_RECONNECTED = "reconnected"  # the session came back and the watch was re-armed
+REASON_ERROR = "error"            # re-arming failed; `error` carries why
 
 # Error codes we care about
 ERR_OK = 0
@@ -298,11 +332,76 @@ def _raise_for(code, path):
     raise ZKError(code, f"ZooKeeper error {code} on {path}")
 
 
-class ZKClient(object):
-    """A single-threaded-request ZooKeeper client with a background ping keepalive.
+class WatchEvent(object):
+    """What a watch callback is told.
 
-    Requests are serialized under a lock, so it is safe to share one client between the
-    publisher loop and ad-hoc reads.
+    `value` is the result of the read that re-armed the watch, so a callback never has to
+    go and ask: bytes (or None when the node does not exist) for a data watch, a bool for
+    an exists watch, a list of names for a child watch. When `reason` is REASON_ERROR the
+    re-arm failed, `value` is None and `error` says why.
+    """
+
+    __slots__ = ("path", "kind", "reason", "event_type", "state", "value", "error")
+
+    def __init__(self, path, kind, reason, value=None, error=None,
+                 event_type=EVENT_NONE, state=STATE_SYNC_CONNECTED):
+        self.path = path
+        self.kind = kind
+        self.reason = reason
+        self.event_type = event_type
+        self.state = state
+        self.value = value
+        self.error = error
+
+    def __repr__(self):
+        return "<WatchEvent %s %s %s>" % (self.kind, self.path, self.reason)
+
+
+class Watch(object):
+    """A standing interest in one path.
+
+    ZooKeeper watches are one-shot: the server forgets a watch the moment it fires, so
+    anything long-lived has to re-arm. This object is the *registration*, which outlives
+    both the firing and the session -- the client re-arms it after it fires and again
+    after every reconnect, and only `cancel` ends it.
+    """
+
+    __slots__ = ("client", "kind", "path", "callback", "active")
+
+    def __init__(self, client, kind, path, callback):
+        self.client = client
+        self.kind = kind
+        self.path = path
+        self.callback = callback
+        self.active = True
+
+    def cancel(self):
+        """Stop re-arming this watch. The ensemble may still deliver one event that was
+        already in flight; it is dropped here rather than handed to the callback."""
+        self.active = False
+        self.client._unregister_watch(self)
+
+    def __repr__(self):
+        return "<Watch %s %s%s>" % (self.kind, self.path, "" if self.active else " cancelled")
+
+
+class ZKClient(object):
+    """A ZooKeeper client with a frame demultiplexer, watches, and a ping keepalive.
+
+    One socket carries everything: replies, server-pushed watch events, and ping traffic.
+    A dedicated reader thread owns the receive side and routes each frame by its xid --
+    `xid >= 0` to whichever thread is waiting for that request, `xid == -1` to the watch
+    dispatcher, `XID_PING` to the floor. Senders hold a lock only for the length of a
+    `sendall`, so any number of threads can have requests in flight at once.
+
+    That split is what makes watches possible at all. The previous shape held one lock
+    across send-and-receive, so the only thread that could read a frame was the one that
+    had just sent a request -- and anything it did not recognise, including every watch
+    event, had to be discarded to find its own reply.
+
+    Watch callbacks run on a third thread, the dispatcher. They run there rather than on
+    the reader because re-arming a watch means issuing a read, and a read waits for a
+    reply that only the reader can deliver.
     """
 
     def __init__(self, hosts=("127.0.0.1",), port=2181, timeout=10.0, session_timeout_ms=15000):
@@ -314,19 +413,45 @@ class ZKClient(object):
         self.session_timeout_ms = session_timeout_ms
         self._sock = None
         self._xid = 0
+        # Held for the duration of a send, and nothing else. `_lock` keeps its name
+        # because `close` and the connect path have always taken it.
         self._lock = threading.RLock()
+        self._state = threading.Lock()
+        self._pending = {}
+        self._alive = False
         self._session_id = 0
         self._passwd = b"\x00" * 16
         self._ping_thread = None
+        self._reader_thread = None
+        self._dispatch_thread = None
+        self._events = queue.Queue()
+        self._watches = {}
         self._stop = threading.Event()
+        self._closing = False
         self.connected_host = None
+        self.session_expired = False
 
     # -- connection ---------------------------------------------------------
 
-    def connect(self):
-        """Establish a session against the first reachable host. Returns self."""
+    def connect(self, _after_expiry=False):
+        """Establish a session against the first reachable host. Returns self.
+
+        Reconnecting the same client object is supported and is how a watch survives a
+        session loss: every registration still on the client is re-armed here, and its
+        callback is told REASON_RECONNECTED. The ensemble delivers no events for the
+        window a client was away, so a reconnect has to be treated as "the value may have
+        changed" -- a callback that was told nothing would be a watch that silently
+        stopped working, which is worse than polling because nothing looks wrong.
+        """
+        self._drop_transport()
+        # `_drop_transport` raises the "this is deliberate" flag so retiring the old socket
+        # does not look like a disconnect to the watches. Lower it again here, or a connect
+        # that fails outright would leave the next real failure silent.
+        self._closing = False
         last_err = None
+        resumed = self._session_id
         for host in self.hosts:
+            sock = None
             try:
                 sock = socket.create_connection((host, self.port), timeout=self.timeout)
                 sock.settimeout(self.timeout)
@@ -341,15 +466,43 @@ class ZKClient(object):
                 _, negotiated, session_id = struct.unpack_from("!iiq", reply, 0)
                 passwd, _ = _unpack_buffer(reply, 16)
                 if session_id == 0:
-                    raise ZKError(ERR_SESSION_EXPIRED, "server refused the session")
+                    raise ZKSessionExpired(ERR_SESSION_EXPIRED, "server refused the session")
+                # The reader blocks on recv for as long as the session is idle, so the
+                # handshake timeout must not outlive the handshake. A request's own
+                # deadline is enforced where it waits for its reply, not on the socket.
+                sock.settimeout(None)
                 self._sock = sock
                 self._session_id = session_id
                 self._passwd = passwd or b"\x00" * 16
                 self.session_timeout_ms = negotiated or self.session_timeout_ms
                 self.connected_host = host
+                self.session_expired = _after_expiry
+                self._closing = False
                 self._stop.clear()
+                with self._state:
+                    self._alive = True
+                # The dispatcher first: the reader starts pushing events onto the queue
+                # immediately, and the dispatcher owns which queue that is.
+                self._start_dispatcher()
+                self._start_reader(sock)
                 self._start_pinger()
+                self._rearm_all()
                 return self
+            except ZKSessionExpired:
+                # The session we asked to resume is gone. A fresh one is the only way
+                # back, and the caller has to be able to find out: ephemeral nodes made
+                # under the old session -- a published node entry, an election ballot --
+                # did not come with it.
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                if not resumed:
+                    raise
+                self._session_id = 0
+                self._passwd = b"\x00" * 16
+                resumed = 0
+                return self.connect(_after_expiry=True)
             except Exception as exc:  # try the next host
                 last_err = exc
                 try:
@@ -358,19 +511,70 @@ class ZKClient(object):
                     pass
         raise ZKError(-1, f"could not connect to any ZooKeeper host {self.hosts}: {last_err}")
 
+    def _drop_transport(self):
+        """Retire the previous socket and its threads, keeping the watch registrations.
+
+        `connect` calls this first, because the threads are guarded by `is_alive()` and a
+        reconnect that left the previous reader running would start a new socket nobody
+        reads from -- a client that looks connected, accepts requests, and times out every
+        one of them. The registrations deliberately survive: they are what `_rearm_all`
+        puts back.
+        """
+        had_threads = any(t and t.is_alive() for t in
+                          (self._reader_thread, self._dispatch_thread, self._ping_thread))
+        if self._sock is None and not had_threads:
+            return
+        self._closing = True        # a deliberate reconnect is not a disconnect to report
+        self._stop.set()
+        sock = self._sock
+        self._sock = None
+        if sock:
+            for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
+                try:
+                    action()
+                except Exception:
+                    pass
+        self._fail_transport(ZKError(-1, "reconnecting"))
+        self._events.put(None)
+        current = threading.current_thread()
+        for thread in (self._reader_thread, self._dispatch_thread, self._ping_thread):
+            if thread is not None and thread is not current:
+                thread.join(self.timeout)
+        self._reader_thread = None
+        self._dispatch_thread = None
+        self._ping_thread = None
+
+    def is_connected(self):
+        """True while the transport is usable.
+
+        A caller that drives itself off watches has no request in flight to fail, so this
+        is how it notices the socket died: there is no other symptom.
+        """
+        with self._state:
+            return self._alive and self._sock is not None
+
     def close(self):
+        self._closing = True
         self._stop.set()
         with self._lock:
-            if self._sock:
+            sock = self._sock
+            if sock:
                 try:
-                    self._request(OP_CLOSE, b"", expect_reply=False)
+                    self._send(OP_CLOSE, b"")
                 except Exception:
                     pass
+        if sock:
+            # Shut the socket down rather than only closing it: the reader is parked in a
+            # blocking recv and a close alone does not necessarily wake it.
+            for action in (lambda: sock.shutdown(socket.SHUT_RDWR), sock.close):
                 try:
-                    self._sock.close()
+                    action()
                 except Exception:
                     pass
-                self._sock = None
+        self._fail_transport(ZKError(-1, "client closed"))
+        with self._lock:
+            self._sock = None
+        self._events.put(None)
         self.connected_host = None
 
     def __enter__(self):
@@ -402,27 +606,296 @@ class ZKClient(object):
         self._xid += 1
         return self._xid
 
-    def _request(self, opcode, payload, expect_reply=True, path="/"):
-        """Send one request and return (reply_bytes, offset_after_header)."""
-        with self._lock:
-            if not self._sock:
-                raise ZKError(-1, "not connected")
+    # -- demultiplexer ------------------------------------------------------
+
+    def _start_reader(self, sock):
+        if self._reader_thread and self._reader_thread.is_alive():
+            return
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, args=(sock,), name="zk-reader", daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self, sock):
+        """Own the receive side of the socket and route every frame by its xid."""
+        try:
+            while not self._stop.is_set():
+                frame = self._recv_frame(sock)
+                xid, _zxid, err = struct.unpack_from("!iqi", frame, 0)
+                if xid == XID_WATCH_EVENT:
+                    self._queue_event(frame)
+                    continue
+                if xid == XID_PING:
+                    continue        # the keepalive wants nothing back
+                waiter = None
+                with self._state:
+                    waiter = self._pending.pop(xid, None)
+                if waiter is None:
+                    continue        # a reply nobody is waiting for any more
+                waiter["frame"] = frame
+                waiter["err"] = err
+                waiter["event"].set()
+        except Exception as exc:
+            self._fail_transport(exc)
+        else:
+            self._fail_transport(ZKError(-1, "reader stopped"))
+
+    def _fail_transport(self, exc):
+        """Mark the connection dead and wake everyone waiting on it.
+
+        This is the lost-wakeup guard: a request that is parked on its event when the
+        socket dies would otherwise wait out its whole timeout, and one that registers
+        after the reader has gone would wait forever.
+        """
+        with self._state:
+            was_alive = self._alive
+            self._alive = False
+            waiters = list(self._pending.values())
+            self._pending.clear()
+        for waiter in waiters:
+            waiter["error"] = exc
+            waiter["event"].set()
+        if was_alive and not self._closing:
+            # Tell the watches the session is down. They are re-armed by `connect`, not
+            # from here; whoever owns the client decides when to reconnect.
+            self._events.put(("disconnected", exc))
+
+    def _queue_event(self, frame):
+        # WatcherEvent: type, state, path -- after the 16-byte reply header.
+        event_type, state = struct.unpack_from("!ii", frame, 16)
+        path, _ = _unpack_string(frame, 24)
+        self._events.put(("event", event_type, state, path))
+
+    def _send(self, opcode, payload, xid=None):
+        """Frame and write one request. Caller holds `self._lock`."""
+        sock = self._sock
+        if sock is None:
+            raise ZKError(-1, "not connected")
+        if xid is None:
             xid = XID_PING if opcode == OP_PING else self._next_xid()
-            body = struct.pack("!ii", xid, opcode) + payload
-            self._sock.sendall(struct.pack("!i", len(body)) + body)
-            if not expect_reply:
-                return b"", 0
-            while True:
-                reply = self._recv_frame()
-                r_xid, _zxid, err = struct.unpack_from("!iqi", reply, 0)
-                # Skip notifications (xid -1) and stray pings we did not ask for.
-                if r_xid == -1:
-                    continue
-                if r_xid == XID_PING and opcode != OP_PING:
-                    continue
-                if err != ERR_OK:
-                    _raise_for(err, path)
-                return reply, 16
+        body = struct.pack("!ii", xid, opcode) + payload
+        sock.sendall(struct.pack("!i", len(body)) + body)
+        return xid
+
+    def _request(self, opcode, payload, expect_reply=True, path="/"):
+        """Send one request and return (reply_bytes, offset_after_header).
+
+        Safe from any thread, including from inside a watch callback: the xid is
+        registered before the bytes go out, and the reader hands the reply back through
+        it. Nothing is read from the socket here.
+        """
+        if opcode == OP_PING:
+            # The keepalive is fire-and-forget. Its reply arrives on the shared socket
+            # and the reader drops it; the session's health shows up as the reader
+            # surviving, not as a round trip anyone waits for.
+            with self._lock:
+                self._send(OP_PING, payload)
+            return b"", 0
+
+        waiter = {"event": threading.Event(), "frame": None, "err": ERR_OK, "error": None}
+        with self._lock:
+            with self._state:
+                if not self._alive or self._sock is None:
+                    raise ZKError(-1, "not connected")
+                xid = XID_PING if opcode == OP_PING else self._next_xid()
+                if expect_reply:
+                    self._pending[xid] = waiter
+            try:
+                self._send(opcode, payload, xid=xid)
+            except Exception:
+                with self._state:
+                    self._pending.pop(xid, None)
+                raise
+        if not expect_reply:
+            return b"", 0
+
+        if not waiter["event"].wait(self.timeout):
+            with self._state:
+                self._pending.pop(xid, None)
+            raise ZKError(-1, f"timed out waiting for a reply to {opcode} on {path}")
+        if waiter["error"] is not None:
+            error = waiter["error"]
+            if isinstance(error, ZKError):
+                raise error
+            raise ZKError(-1, f"connection lost waiting for {opcode} on {path}: {error}")
+        if waiter["err"] != ERR_OK:
+            _raise_for(waiter["err"], path)
+        return waiter["frame"], 16
+
+    # -- watches ------------------------------------------------------------
+
+    def _start_dispatcher(self):
+        if self._dispatch_thread and self._dispatch_thread.is_alive():
+            return
+        # A queue per dispatcher. Events queued against the session that just died are
+        # worthless -- `_rearm_all` re-reads every watched path anyway -- and keeping the
+        # old queue risks the new dispatcher consuming the sentinel that stopped the old
+        # one and exiting immediately.
+        events = queue.Queue()
+        self._events = events
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop, args=(events,), name="zk-watch", daemon=True)
+        self._dispatch_thread.start()
+
+    def _dispatch_loop(self, events):
+        # The queue is an argument rather than read off `self`: a dispatcher must keep
+        # draining the queue it was started on even after a reconnect has installed a new
+        # one, or the sentinel that is supposed to stop it lands somewhere it never looks.
+        while True:
+            item = events.get()
+            if item is None:
+                return
+            try:
+                if item[0] == "event":
+                    self._deliver(item[1], item[2], item[3])
+                elif item[0] == "disconnected":
+                    self._notify_disconnect(item[1])
+            except Exception:
+                # A callback that raises must not take the dispatcher with it, or every
+                # later event on this client is lost without a trace.
+                pass
+
+    def _watch_kinds_for(self, event_type):
+        if event_type == EVENT_NODE_CHILDREN_CHANGED:
+            return (WATCH_CHILDREN,)
+        if event_type in (EVENT_NODE_CREATED, EVENT_NODE_DELETED, EVENT_NODE_DATA_CHANGED):
+            return (WATCH_DATA, WATCH_EXISTS)
+        return ()
+
+    def _deliver(self, event_type, state, path):
+        if event_type == EVENT_NONE:
+            if state == STATE_EXPIRED:
+                # The ensemble says so before it closes the socket. Taking its word for it
+                # means `is_connected` is false immediately rather than whenever the close
+                # lands, and ephemeral state is already gone either way.
+                self._fail_transport(ZKSessionExpired(ERR_SESSION_EXPIRED, "session expired"))
+            return
+        for kind in self._watch_kinds_for(event_type):
+            for watch in self._registered(kind, path):
+                self._rearm_and_call(watch, REASON_EVENT, event_type=event_type, state=state)
+
+    def _notify_disconnect(self, exc):
+        for watch in self._all_registered():
+            self._call(watch, WatchEvent(watch.path, watch.kind, REASON_ERROR,
+                                         error=exc, state=STATE_DISCONNECTED))
+
+    def _registered(self, kind, path):
+        with self._state:
+            return list(self._watches.get((kind, path), ()))
+
+    def _all_registered(self):
+        with self._state:
+            return [w for group in self._watches.values() for w in group]
+
+    def _register_watch(self, watch):
+        with self._state:
+            self._watches.setdefault((watch.kind, watch.path), []).append(watch)
+
+    def _unregister_watch(self, watch):
+        with self._state:
+            group = self._watches.get((watch.kind, watch.path))
+            if not group:
+                return
+            if watch in group:
+                group.remove(watch)
+            if not group:
+                self._watches.pop((watch.kind, watch.path), None)
+
+    def _arm(self, watch):
+        """Issue the read that leaves the watch set, and return what it saw."""
+        if watch.kind == WATCH_CHILDREN:
+            return self.get_children(watch.path, watch=True)
+        if watch.kind == WATCH_EXISTS:
+            return self.exists(watch.path, watch=True)
+        try:
+            return self.get(watch.path, watch=True)
+        except ZKNoNode:
+            # A getData that fails leaves no watch behind -- the server registers it only
+            # on the success path -- so a data watch on a path that does not exist yet
+            # would arm once and never fire. An exists watch does get registered on a
+            # missing node, and fires on the create, which is the event the caller wants.
+            self.exists(watch.path, watch=True)
+            return None
+
+    def _rearm_and_call(self, watch, reason, event_type=EVENT_NONE, state=STATE_SYNC_CONNECTED):
+        if not watch.active:
+            return
+        try:
+            value = self._arm(watch)
+        except (ZKError, OSError) as exc:
+            self._call(watch, WatchEvent(watch.path, watch.kind, REASON_ERROR,
+                                         error=exc, event_type=event_type, state=state))
+            return
+        self._call(watch, WatchEvent(watch.path, watch.kind, reason, value=value,
+                                     event_type=event_type, state=state))
+
+    @staticmethod
+    def _call(watch, event):
+        if not watch.active:
+            return
+        try:
+            watch.callback(event)
+        except Exception:
+            pass
+
+    def _rearm_all(self):
+        """Re-arm every registration against a freshly connected session.
+
+        On its own thread, not inline: the reads it issues need the reader thread `connect`
+        has only just started, and a callback must never run on the thread that is still
+        inside `connect` -- a caller whose callback reconnects would recurse into it.
+        """
+        watches = self._all_registered()
+        if not watches:
+            return
+
+        def rearm():
+            for watch in watches:
+                self._rearm_and_call(watch, REASON_RECONNECTED)
+
+        threading.Thread(target=rearm, name="zk-rearm", daemon=True).start()
+
+    def _watch(self, kind, path, callback):
+        """Register a watch and arm it. Returns (watch, what the arming read saw).
+
+        Registered before it is armed, so an event the ensemble sends the moment the read
+        lands has somewhere to be delivered. Unregistered again if the arming read fails,
+        because a registration that was never armed would be re-armed on the next reconnect
+        and look like a watch that works.
+        """
+        watch = Watch(self, kind, path, callback)
+        self._register_watch(watch)
+        try:
+            return watch, self._arm(watch)
+        except Exception:
+            self._unregister_watch(watch)
+            raise
+
+    def watch_data(self, path, callback):
+        """Call `callback` whenever `path` is created, deleted or written.
+
+        Returns the Watch. Use `watch_data_now` when the current value is wanted too: the
+        arming read has already fetched it, so taking it from there costs nothing where a
+        second `get` costs a round trip.
+        """
+        return self._watch(WATCH_DATA, path, callback)[0]
+
+    def watch_data_now(self, path, callback):
+        """`watch_data`, also returning what the arming read saw.
+
+        A caller about to act on the value needs it now rather than at the first change.
+        Returns (watch, value); value is None when the node does not exist.
+        """
+        return self._watch(WATCH_DATA, path, callback)
+
+    def watch_children(self, path, callback):
+        """Call `callback` whenever the child list of `path` changes. Returns
+        (watch, children)."""
+        return self._watch(WATCH_CHILDREN, path, callback)
+
+    def watch_exists(self, path, callback):
+        """Call `callback` whenever `path` appears or disappears. Returns
+        (watch, exists)."""
+        return self._watch(WATCH_EXISTS, path, callback)
 
     # -- keepalive ----------------------------------------------------------
 
@@ -475,16 +948,29 @@ class ZKClient(object):
                 pass
         return path or "/"
 
-    def exists(self, path):
+    def exists(self, path, watch=False):
+        """True when the node exists.
+
+        `watch=True` leaves a watch that fires when the node is created or deleted. Unlike
+        `get`, this registers the watch whether or not the node is there, which is the only
+        way to be told about a path that does not exist yet.
+        """
         try:
-            self._request(OP_EXISTS, _pack_string(path) + struct.pack("!?", False), path=path)
+            self._request(OP_EXISTS, _pack_string(path) + struct.pack("!?", bool(watch)), path=path)
             return True
         except ZKNoNode:
             return False
 
-    def get(self, path):
-        """Return the node's data as bytes."""
-        reply, off = self._request(OP_GET_DATA, _pack_string(path) + struct.pack("!?", False), path=path)
+    def get(self, path, watch=False):
+        """Return the node's data as bytes.
+
+        `watch=True` leaves a watch that fires when the node is written or deleted -- but
+        only if this read succeeds; a getData that raises leaves no watch behind. Callers
+        that want to hear about a path appearing want `exists(watch=True)`, which is what
+        the watch machinery falls back to.
+        """
+        reply, off = self._request(
+            OP_GET_DATA, _pack_string(path) + struct.pack("!?", bool(watch)), path=path)
         data, _ = _unpack_buffer(reply, off)
         return data or b""
 
@@ -492,8 +978,11 @@ class ZKClient(object):
         payload = _pack_string(path) + _pack_buffer(data) + struct.pack("!i", version)
         self._request(OP_SET_DATA, payload, path=path)
 
-    def get_children(self, path):
-        reply, off = self._request(OP_GET_CHILDREN, _pack_string(path) + struct.pack("!?", False), path=path)
+    def get_children(self, path, watch=False):
+        """The node's child names. `watch=True` leaves a watch that fires when a child is
+        added or removed -- not when a child's data changes."""
+        reply, off = self._request(
+            OP_GET_CHILDREN, _pack_string(path) + struct.pack("!?", bool(watch)), path=path)
         (count,) = struct.unpack_from("!i", reply, off)
         off += 4
         names = []
@@ -543,9 +1032,9 @@ def connect(hosts=("127.0.0.1",), port=2181, timeout=10.0, session_timeout_ms=15
 # gone, not because somebody noticed.
 #
 # Correctness here does not depend on watches. The lowest-sequence rule holds whenever it
-# is evaluated, so asking periodically is correct and only costs latency; a watch on the
-# predecessor would make handover prompt rather than eventual. That is a later change and
-# this is written so it can be added underneath without the callers moving.
+# is evaluated, so asking periodically is correct and only costs latency; a watch makes
+# handover prompt rather than eventual. `Election.watch` is that, and it is strictly
+# additive: a caller that never calls it behaves exactly as before.
 LEADERS_ROOT = "/helios/leaders"
 
 # The prefix for a ballot. The ensemble appends ten digits to it.
@@ -638,6 +1127,29 @@ class Election(object):
             return self.client.get("%s/%s" % (self.parent, winner))
         except (ZKError, OSError):
             return None
+
+    def watch(self, callback):
+        """Call `callback(is_leader)` whenever the standing set changes.
+
+        Additive: `stand`/`is_leader`/`leader_identity`/`resign` are unchanged and still
+        correct without this. What it buys is promptness -- the survivor of a lost session
+        learns it leads when the ballot disappears rather than at its next poll.
+
+        This watches the parent's children rather than only the predecessor ballot. The
+        predecessor watch is the textbook form because it makes exactly one candidate wake
+        per handover; the child watch wakes all of them. With three candidates per service
+        that difference is two extra `get_children` calls per election, against having to
+        re-pick a predecessor every time the set changes -- which is where the subtle bug
+        in this recipe lives. Promptness is the point here, not herd size.
+
+        Returns the Watch, or None if this client cannot watch (a test double, or an older
+        deployed copy of this module).
+        """
+        watcher = getattr(self.client, "watch_children", None)
+        if watcher is None:
+            return None
+        watch, _children = watcher(self.parent, lambda _event: callback(self.is_leader()))
+        return watch
 
     def resign(self):
         if self.ballot is None:

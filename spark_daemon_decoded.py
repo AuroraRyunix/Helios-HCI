@@ -372,6 +372,11 @@ ZK_NODES_PATH = ZK_ROOT + "/nodes"
 ZK_CLUSTER_STATE = "/cluster_state"
 ZK_PUBLISH_INTERVAL = 5          # seconds between state refreshes
 ZK_DRIFT_CHECK_INTERVAL = 30     # seconds between drift re-assertions
+# How often the reconcile loop re-reads /cluster_state when no watch has fired. This is a
+# safety net, not the mechanism: a watch delivers a change in milliseconds, and this bounds
+# how long a *missed* one can wedge a node. Long on purpose -- short enough and it becomes
+# the poll it replaced, with the watch as decoration.
+ZK_STATE_REREAD_INTERVAL = 300
 ZK_SESSION_TIMEOUT_MS = 15000
 FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as FLAPPING
 
@@ -463,11 +468,7 @@ def read_desired_cluster_state(client):
     state could not be read, which was read as 'stopped', which stopped ZooKeeper.
     """
     try:
-        raw = client.get(ZK_CLUSTER_STATE)
-        if raw is None:
-            return None
-        value = raw.decode("utf-8", "replace").strip()
-        return value or None
+        return _decode_desired_state(client.get(ZK_CLUSTER_STATE))
     except Exception:
         return None
 
@@ -537,29 +538,77 @@ def zk_reconcile_loop():
     This is what makes `cluster start` a declaration rather than an imperative drive: the
     CLI records intent once, and every node moves itself toward it and republishes what
     it actually achieved.
+
+    The trigger is a **watch** on `/cluster_state`, not a timer. A declaration that takes
+    up to thirty seconds to be noticed is not much of a declaration -- it is why `cluster
+    start` still drives services in numbered phases -- and a real Zeus ensemble shows what
+    the alternative looks like: ninety connections watching three hundred-odd paths, and
+    not one of them polling for state.
+
+    Two timers remain, and neither is the mechanism:
+
+      * `ZK_DRIFT_CHECK_INTERVAL` -- the local drift check, which has nothing to do with
+        ZooKeeper. A unit that dies while the desired state is unchanged produces no event
+        to watch for, so the only way to notice is to look.
+      * `ZK_STATE_REREAD_INTERVAL` -- a long re-read of `/cluster_state`, so a dropped
+        event cannot wedge a node indefinitely. Convergence must not depend on every
+        notification arriving; promptness is all it depends on them for.
     """
     try:
         zkmod = _load_helios_zk()
     except ImportError:
         return
 
+    # The watch callback runs on the client's dispatcher thread and the convergence runs
+    # here, so the two communicate through one dict and one event rather than by the
+    # callback doing the work. Running `systemctl` from inside a watch callback would block
+    # the dispatcher, and the dispatcher is what delivers every other watch on this client.
+    seen = {"desired": None}
+    woken = threading.Event()
+
+    def on_state_change(event):
+        if event.reason == zkmod.REASON_ERROR:
+            # The re-arm failed. Waking is still right: the loop below checks the transport
+            # and rebuilds the client, which is what re-establishes the watch.
+            woken.set()
+            return
+        seen["desired"] = _decode_desired_state(event.value)
+        woken.set()
+
     client = None
     applied = None
     last_drift_check = 0.0
+    last_reread = 0.0
     while True:
         try:
-            if client is None:
+            if client is None or not client.is_connected():
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
                 client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
-                print("[ZK] Reconcile loop connected.", flush=True)
-            # Read inline rather than through a helper that swallows errors: a dead
-            # socket must propagate to the handler below so the client is rebuilt.
-            # Swallowing it returns None forever, which looks like "no desired state"
-            # and silently wedges the loop against a socket that will never recover.
-            try:
-                raw = client.get(ZK_CLUSTER_STATE)
-                desired = raw.decode("utf-8", "replace").strip() or None
-            except zkmod.ZKNoNode:
-                desired = None      # state genuinely unset; nothing to converge toward
+                _watch, raw = client.watch_data_now(ZK_CLUSTER_STATE, on_state_change)
+                seen["desired"] = _decode_desired_state(raw)
+                last_reread = time.time()
+                print(f"[ZK] Reconcile loop connected; watching {ZK_CLUSTER_STATE}.", flush=True)
+
+            now = time.time()
+            if (now - last_reread) >= ZK_STATE_REREAD_INTERVAL:
+                # Re-reading also re-arms the watch, so this doubles as the repair for a
+                # watch the ensemble dropped. Read inline rather than through a helper that
+                # swallows errors: a dead socket must propagate to the handler below so the
+                # client is rebuilt. Swallowing it returns None forever, which looks like
+                # "no desired state" and silently wedges the loop against a socket that
+                # will never recover.
+                try:
+                    seen["desired"] = _decode_desired_state(
+                        client.get(ZK_CLUSTER_STATE, watch=True))
+                except zkmod.ZKNoNode:
+                    seen["desired"] = None   # genuinely unset; nothing to converge toward
+                last_reread = now
+
+            desired = seen["desired"]
             if desired:
                 if os.path.exists("/etc/hci/maintenance.state"):
                     if desired != applied:
@@ -567,7 +616,6 @@ def zk_reconcile_loop():
                         applied = desired
                 else:
                     changed = desired != applied
-                    now = time.time()
                     due = (now - last_drift_check) >= ZK_DRIFT_CHECK_INTERVAL
                     if changed or due:
                         last_drift_check = now
@@ -581,7 +629,32 @@ def zk_reconcile_loop():
             except Exception:
                 pass
             client = None
-        time.sleep(ZK_PUBLISH_INTERVAL)
+            # A failed reconnect must not spin. There is no watch to be prompt about while
+            # there is no session.
+            woken.wait(ZK_PUBLISH_INTERVAL)
+            woken.clear()
+            continue
+        # Woken by the watch, or by the drift timer -- whichever comes first. Clearing
+        # after the wait rather than before it is deliberate: the callback stores the new
+        # value before it sets the event, and the next pass through the loop reads that
+        # value after this clear, so a notification arriving in the gap is acted on rather
+        # than dropped.
+        woken.wait(ZK_DRIFT_CHECK_INTERVAL)
+        woken.clear()
+
+
+def _decode_desired_state(raw):
+    """The desired state out of whatever `/cluster_state` holds, or None.
+
+    None is meaningfully different from 'stopped': it means intent could not be
+    determined, and the correct response is to change nothing -- treating "unknown" as
+    "stopped" is what deadlocked the old autostart path.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    return raw.strip() or None
 
 
 def build_node_status():

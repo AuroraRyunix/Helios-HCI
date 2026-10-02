@@ -363,7 +363,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.
-* [docs/cluster_state.md](./docs/cluster_state.md) - ZooKeeper-backed cluster state: desired state, ephemeral per-node liveness, convergence, and the probe fallback.
+* [docs/cluster_state.md](./docs/cluster_state.md) - ZooKeeper-backed cluster state: desired state, ephemeral per-node liveness, convergence driven by a watch rather than a poll, how `helios_zk` re-arms a watch across a reconnect, and the probe fallback.
 * [docs/deployment.md](./docs/deployment.md) - The Podman Quadlet deployment model and the update-rollout pipeline.
 * [docs/setup-guide.md](./docs/setup-guide.md) - Local dev prerequisites and workflow.
 * [docs/hci_master_architecture_guide.md](./docs/hci_master_architecture_guide.md) - The deepest existing architecture reference (1500+ lines).

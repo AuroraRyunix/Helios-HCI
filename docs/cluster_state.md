@@ -54,8 +54,8 @@ keepalive pings continue.
 ```mermaid
 flowchart TB
     CLI["cluster start"] -->|"set /cluster_state = started"| ZK[("ZooKeeper (Odin/Zeus)")]
-    ZK -->|"reconcile loop reads desired state"| SD1["spark-daemon (node 1)"]
-    ZK -->|"reconcile loop reads desired state"| SD2["spark-daemon (node 2)"]
+    ZK -->|"watch on /cluster_state fires"| SD1["spark-daemon (node 1)"]
+    ZK -->|"watch on /cluster_state fires"| SD2["spark-daemon (node 2)"]
     SD1 -->|"systemctl start/stop, in order"| SVC1["local services"]
     SD2 -->|"systemctl start/stop, in order"| SVC2["local services"]
     SD1 -->|"publish ephemeral /helios/nodes/ip"| ZK
@@ -67,6 +67,34 @@ flowchart TB
 it actually achieved. The CLI then polls the published state and prints which services
 are still pending until every node is up — rather than declaring success the moment the
 start commands have been issued.
+
+### The trigger is a watch, not a timer
+
+Each node's reconcile loop holds a **data watch** on `/cluster_state` and blocks until it
+is woken. A `cluster start` is noticed in milliseconds.
+
+It used to poll: re-read `/cluster_state` every 5s, re-assert every 30s. That is why
+`cluster start` still drove services in numbered phases — a declaration that takes up to
+half a minute to be noticed is not much of a declaration, so the CLI did the driving
+itself. A real Nutanix Zeus shows what the alternative looks like: **90 connections
+watching 319 paths, 568 watches total**, and nothing polling for state.
+
+Two timers remain, and neither is the mechanism:
+
+| Timer | Interval | What it is for |
+| :--- | :--- | :--- |
+| `ZK_DRIFT_CHECK_INTERVAL` | 30s | The local drift check. Nothing to do with ZooKeeper: a unit that dies while the desired state is unchanged produces no event to watch for. |
+| `ZK_STATE_REREAD_INTERVAL` | 300s | A re-read of `/cluster_state`, so a **dropped** notification cannot wedge a node indefinitely. It also re-arms the watch, so it repairs as well as reads. |
+
+The long one is deliberately long. Shorten it and it becomes the poll it replaced, with
+the watch as decoration. Convergence depends on the notifications only for *promptness*;
+correctness still comes from re-reading and from the lowest-sequence/drift rules, which
+hold whenever they are evaluated.
+
+The watch callback does not converge anything. It records the new value and sets an event;
+the loop thread does the `systemctl` work. Shelling out from inside the callback would
+block the client's watch dispatcher, and that dispatcher is what delivers every other
+watch on that connection.
 
 ### A unit that is mid-transition is not drift
 
@@ -167,12 +195,74 @@ standard library, because the repo carries no third-party dependencies (see
 [AGENTS.md](./AGENTS.md)) and the pre-existing code spoke only the read-only
 four-letter-word commands (`stat` over a raw socket), which cannot create znodes.
 
-It implements connect/session, ping keepalive, `create` (including ephemeral), `exists`,
-`get`, `set`, `get_children`, and `delete`. Requests are serialized under a lock, so one
-client is safe to share between the publisher loop and ad-hoc reads.
+It implements connect/session, ping keepalive, `create` (including ephemeral and
+sequential), `exists`, `get`, `set`, `get_children`, `delete`, and **watches**.
 
 It is deployed to `/usr/local/bin/helios_zk.py` and imported by both `spark-daemon` and
-the `cluster` CLI via `SourceFileLoader`, matching how `check_updates` loads `hylia`.
+the `cluster` CLI via `SourceFileLoader`, matching how `check_updates` loads `hylia`. It is
+also embedded in `provision.py` as base64, so a change to it needs `sync_provision.py`.
+
+### The demultiplexer
+
+One socket carries replies, server-pushed watch events and ping traffic. A dedicated
+reader thread owns the receive side and routes each frame by its xid: `xid >= 0` to
+whichever thread is waiting for that request, `xid == -1` to the watch dispatcher,
+`XID_PING` to the floor. Senders hold a lock only for the length of a `sendall`, so any
+number of threads can have requests outstanding at once.
+
+That split is what makes watches possible at all. The previous shape held one lock across
+send-*and*-receive, so the only thread allowed to read a frame was the one that had just
+sent a request — and anything it did not recognise, **including every watch event**, had
+to be discarded to find its own reply. The plumbing to receive notifications existed and
+threw them away.
+
+Callbacks run on a third thread, the dispatcher, rather than on the reader: re-arming a
+watch means issuing a read, and a read waits for a reply only the reader can deliver.
+
+### How re-arming works
+
+ZooKeeper watches are one-shot — the server forgets a watch the moment it fires — so
+anything long-lived has to re-arm, and a watch that silently stops firing is worse than a
+poll because nothing looks wrong. The durable thing here is therefore the **registration**
+(`Watch`), which outlives both the firing and the session. Arming is the act of performing
+the read with the watch flag set, and three moments do it:
+
+1. `watch_data` / `watch_children` / `watch_exists` arm once at registration and hand back
+   what that read saw, so a caller about to act on the value does not need a second round
+   trip.
+2. When an event arrives, the dispatcher **re-arms first and then calls back**, passing the
+   value the re-arming read returned. A callback is never told "something changed, go and
+   look"; it is told what is there now.
+3. `connect()` re-arms **every** registration still on the client, and reports
+   `REASON_RECONNECTED`. The ensemble delivers nothing for the window a client was away, so
+   a reconnect has to be treated as "the value may have changed" — this is the case a
+   hand-rolled client gets wrong, and the symptom is a watch that works until the first
+   blip and then never fires again.
+
+Only `Watch.cancel()` ends a registration.
+
+A data watch on a path that **does not exist yet** is the one asymmetry worth knowing: a
+`getData` that fails leaves no watch behind, because ZooKeeper arms it only on the success
+path. `exists` does register on a missing node. So the client falls back to an exists watch
+when the arming `get` raises `ZKNoNode`, and reports the value as `None` — which matters
+directly, because `/cluster_state` does not exist on a cluster that has never been started.
+
+A session the ensemble refuses to resume is an expiry: the client drops the session, comes
+back with a fresh one, and sets `session_expired` so the caller can see that the ephemeral
+nodes it held — a published node entry, an election ballot — did not come back with it.
+
+### Per-service leadership
+
+`helios_zk.Election` is the standard recipe: a persistent parent per service, one ephemeral
+sequential child per candidate, lowest counter wins. `Election.watch(callback)` is the
+optional promptness layer on top — it watches the parent's children, so the survivor of a
+lost session learns it leads at handover rather than at its next poll. `stand`,
+`is_leader`, `leader_identity` and `resign` are correct without it.
+
+`test_zk_watches.py` covers the ugly half of all this against a fake ensemble that speaks
+the real wire protocol over loopback and answers each request on its own thread: two
+requests in flight at once, a notification arriving in the middle of one, a reconnect
+mid-watch, an expired session, and the server closing the socket.
 
 ---
 
