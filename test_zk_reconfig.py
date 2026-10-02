@@ -273,13 +273,22 @@ class TheUnitStillOwnsTheMembershipAcrossARestart(unittest.TestCase):
     def setUp(self):
         self.written = {}
         original = cluster.run_remote_spark
+        original_units = cluster.unit_action
 
         def fake(ip, command):
             self.written[ip] = command
             return 0, "", ""
 
+        # Writing the unit and reloading systemd are two calls: the file write has no
+        # typed endpoint, the reload does. A unit file systemd has not been told to
+        # re-read changes nothing until something else happens to reload it.
+        def fake_units(ip, action, units=None, **kwargs):
+            return True, ""
+
         cluster.run_remote_spark = fake
+        cluster.unit_action = fake_units
         self.addCleanup(setattr, cluster, "run_remote_spark", original)
+        self.addCleanup(setattr, cluster, "unit_action", original_units)
 
     def unit(self, ip):
         blob = re.search(r"echo (\S+) \| base64 -d", self.written[ip]).group(1)
@@ -324,8 +333,10 @@ class ANodeThatIsDownStillHasAUnitToFix(unittest.TestCase):
         self.written = []
         original_remote = cluster.run_remote_spark
         original_read = cluster.read_ensemble_config
+        original_units = cluster.unit_action
         self.addCleanup(setattr, cluster, "run_remote_spark", original_remote)
         self.addCleanup(setattr, cluster, "read_ensemble_config", original_read)
+        self.addCleanup(setattr, cluster, "unit_action", original_units)
 
         def fake(ip, command):
             if ip not in self.reachable:
@@ -333,7 +344,15 @@ class ANodeThatIsDownStillHasAUnitToFix(unittest.TestCase):
             self.written.append(ip)
             return 0, "", ""
 
+        # The daemon-reload that follows the unit write, which is a typed call now and so
+        # does not go through run_remote_spark. Unreachable is unreachable either way.
+        def fake_units(ip, action, units=None, **kwargs):
+            if ip not in self.reachable:
+                return False, "unreachable"
+            return True, ""
+
         cluster.run_remote_spark = fake
+        cluster.unit_action = fake_units
         self.after = members("participant", "participant", "observer", "participant")
         cluster.read_ensemble_config = lambda ips: {"members": self.after,
                                                     "version": "100000006"}
@@ -423,7 +442,7 @@ class ADecommissionHandsTheVoteOnDeliberately(unittest.TestCase):
             'print("\\n--- Finalizing: removing the node from cluster metadata ---")')
         block = source[start:start + 4000]
         self.assertIn("read_zookeeper_ids(survivors)", block)
-        self.assertIn("systemctl restart zookeeper", block)
+        self.assertIn('unit_action(ip, "restart", ["zookeeper"])', block)
 
     def test_a_departing_observer_needs_no_hand_off(self):
         original = cluster.read_ensemble_config

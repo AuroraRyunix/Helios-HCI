@@ -1112,6 +1112,329 @@ def hylia_rolling_upgrade(job_id):
     finally:
         running_jobs.discard(job_id)
 
+# --- the two console entry points -----------------------------------------------------
+#
+# Loading a package and starting an upgrade used to happen inside the Spectrum web tier:
+# `/api/lcm/upload` validated the archive and fanned it out on the request thread, and
+# `/api/lcm/upgrade/start` flipped a row and answered 200 while the actual upgrade ran
+# somewhere the caller could not see. Both are now Catalyst tasks, and a task has to be a
+# command, so both live here -- next to the code that already did the work, on the node
+# that already runs the upgrade.
+#
+# Neither changes how an upgrade proceeds. `start_upgrade` marks the job and watches it;
+# the rolling upgrade itself is still run by `hylia_loop` on the leader.
+
+CATALYST_PORT = 9091
+CATALYST_CA = "/etc/hci/spark/certs/ca.crt"
+CATALYST_CERT = "/etc/hci/spark/certs/node.crt"
+CATALYST_KEY = "/etc/hci/spark/certs/node.key"
+
+# How long to wait for the leader's hylia daemon to pick a STARTING job up. Its loop runs
+# every five seconds, so a minute is many chances; past that, the honest report is that
+# nothing is going to run this, not that the upgrade is slow.
+STARTING_GRACE_SEC = 60
+UPGRADE_POLL_SEC = 5
+
+
+def get_catalyst_target_ip():
+    """The active Catalyst's address, chosen so its certificate can be verified.
+
+    Node certificates carry `subjectAltName = IP:<node ip>` and loopback is in no node's
+    SAN, so addressing the leader as 127.0.0.1 -- which is what it is whenever this node
+    *is* the leader, the common case -- fails verification. Catalyst binds 0.0.0.0:9091, so
+    this node's own address reaches the same listener and does verify. `spark_endpoint()`
+    solves the identical problem one port down.
+    """
+    leader_ip = get_zookeeper_leader_ip()
+    if not leader_ip or leader_ip in ("127.0.0.1", "::1", "localhost") or leader_ip == LOCAL_IP:
+        if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
+            return LOCAL_IP
+        return "127.0.0.1"
+    return leader_ip
+
+
+def call_catalyst_api(path, payload=None, method="GET", address=None):
+    """Call Catalyst over the cluster's mutual TLS. Returns (status, body-or-error)."""
+    target = address or get_catalyst_target_ip()
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=CATALYST_CA)
+    context.load_cert_chain(certfile=CATALYST_CERT, keyfile=CATALYST_KEY)
+    # Loopback cannot be answered by another node, so dropping the identity check there is
+    # not a weakening; failing it would just make the call impossible on a node that does
+    # not know its own address.
+    context.check_hostname = target not in ("127.0.0.1", "::1", "localhost")
+
+    url = f"https://{target}:{CATALYST_PORT}{path}"
+    data = json.dumps(payload).encode("utf-8") if (payload is not None and method != "GET") else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=35) as response:
+            if response.status == 204:
+                return 204, None
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        return -1, str(e)
+
+
+def report_task_progress(progress, status="processing", error_msg=""):
+    """Tell Catalyst where this command has got to, if it is running as a task.
+
+    `CATALYST_TASK_ID` is put in the environment by dagur, which is what runs these
+    commands. Absent it, this is a no-op: the same command run by hand from a shell has no
+    task to report against, and inventing one would put a row in the task log that no
+    operator asked for.
+
+    A failure to report is swallowed. The command's exit code is the verdict that matters
+    and dagur writes it; losing a progress tick must not fail an upgrade.
+    """
+    task_id = os.environ.get("CATALYST_TASK_ID")
+    if not task_id:
+        return
+    body = {"task_id": task_id, "status": status, "progress": int(progress)}
+    if error_msg:
+        body["error_msg"] = error_msg
+    try:
+        call_catalyst_api("/api/v1/tasks/update", body, method="POST")
+    except Exception as exc:
+        sys.stderr.write(f"[Hylia] Could not report progress for task {task_id}: {exc}\n")
+
+
+def distribute_package(zip_path):
+    """Copy a validated package to every other node and extract it there.
+
+    Moved here from the console tier, which had it only because that is where the upload
+    landed. Every line of it was already hylia's: hylia's cluster host list, hylia's spark
+    client, and hylia's own `validate_and_extract_zip` re-run on the far side so a node
+    never trusts an archive it has not checked itself.
+
+    A node that cannot be reached is reported and the rest continue. A partial fan-out is
+    not silently acceptable -- the rolling upgrade will fail on that node -- but stopping
+    at the first unreachable node would leave the cluster worse off than finishing.
+    """
+    if not os.path.exists(zip_path):
+        raise Exception(f"There is nothing to distribute: {zip_path} does not exist.")
+
+    with open(zip_path, "rb") as f:
+        b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    local_ips = {"127.0.0.1", "::1", LOCAL_IP}
+    try:
+        local_ips.add(socket.gethostbyname(socket.gethostname()))
+    except Exception:
+        pass
+
+    other_ips = [h.get("ip") for h in get_cluster_hosts()
+                 if h.get("ip") and h.get("ip") not in local_ips]
+
+    failures = []
+    for ip in other_ips:
+        print(f"[Hylia] Distributing package to {ip}...", flush=True)
+        run_remote_spark(ip, f"rm -rf {zip_path} {zip_path}.tmp /tmp/helios_update")
+
+        chunk_size = 64000
+        for idx in range(0, len(b64_data), chunk_size):
+            chunk = b64_data[idx:idx + chunk_size]
+            rc, _, err = run_remote_spark(ip, f"echo '{chunk}' >> {zip_path}.tmp")
+            if rc != 0:
+                failures.append(f"{ip}: {err or 'chunk write failed'}")
+                break
+        else:
+            decode_cmd = (
+                f"cat {zip_path}.tmp | base64 -d > {zip_path} && "
+                f"rm -f {zip_path}.tmp && "
+                f"python3 -c \"import importlib.util, importlib.machinery; "
+                f"loader = importlib.machinery.SourceFileLoader('hylia', '/usr/local/bin/hylia'); "
+                f"spec = importlib.util.spec_from_loader('hylia', loader); "
+                f"hylia = importlib.util.module_from_spec(spec); loader.exec_module(hylia); "
+                f"hylia.validate_and_extract_zip('{zip_path}', '/tmp/helios_update')\""
+            )
+            rc, _, err = run_remote_spark(ip, decode_cmd, timeout=180)
+            if rc != 0:
+                failures.append(f"{ip}: {err or 'extraction failed'}")
+
+    return failures
+
+
+def load_package(zip_path):
+    """Validate a staged package, fan it out, and record the job it describes.
+
+    This is `/api/lcm/upload` minus the bytes: the console streams the archive to this
+    node's spark-daemon and then submits this as a task, so what is left is the part that
+    talks to every node -- which is exactly the part that had no business happening on a
+    web request thread.
+
+    Returns a process exit code, because dagur reads the exit code and nothing else.
+    """
+    extract_dir = "/tmp/helios_update"
+
+    if not os.path.exists(zip_path):
+        print(f"No package is staged at {zip_path}.", file=sys.stderr)
+        return 1
+
+    try:
+        # The signature over the manifest is checked in here, before a single declared
+        # digest is read. A package handed straight to the console never passed through
+        # `check-updates`, so this is the only anchor it gets.
+        manifest, changelog_content = validate_and_extract_zip(zip_path, extract_dir)
+    except Exception as exc:
+        print(f"The package was rejected: {exc}", file=sys.stderr)
+        return 1
+
+    report_task_progress(30)
+
+    failures = distribute_package(zip_path)
+
+    report_task_progress(80)
+
+    target_nodes = [h["ip"] for h in get_cluster_hosts() if h.get("ip")] or ["127.0.0.1"]
+
+    build_num = manifest.get("build", "0000")
+    if "-b" not in str(build_num):
+        build_num = f"{manifest.get('version', '1.2.0')}-b{build_num}"
+
+    job_id = str(uuid.uuid4())
+    manifest_json = cql_escape(json.dumps(manifest))
+    changelog_escaped = cql_escape(changelog_content)
+    nodes_list_str = "[" + ", ".join([f"'{cql_escape(ip)}'" for ip in target_nodes]) + "]"
+
+    # One loaded package at a time, exactly as the console endpoint did: the job row is
+    # the thing `--start-upgrade` and the LCM page both read, and two of them would leave
+    # which one gets installed up to row order.
+    run_cql_query("TRUNCATE hydra.hylia_jobs;")
+    run_cql_query("TRUNCATE hydra.hylia_logs;")
+
+    cql = f"""
+    INSERT INTO hydra.hylia_jobs (
+        job_id, state, target_nodes, current_node, build_number, manifest_json, changelog_md
+    ) VALUES (
+        {job_id}, 'IDLE', {nodes_list_str}, '', '{cql_escape(build_num)}',
+        '{manifest_json}', '{changelog_escaped}'
+    );
+    """
+    rc, _, err = run_cql_query(cql)
+    if rc != 0:
+        print(f"The package was valid but the job could not be recorded: {err}", file=sys.stderr)
+        return 1
+
+    if failures:
+        # Loud, and a failure. A package that reached two nodes out of three produces a
+        # rolling upgrade that dies on the third with its own confusing error, hours later.
+        print("The package was recorded but did not reach every node:", file=sys.stderr)
+        for failure in failures:
+            print(f"  {failure}", file=sys.stderr)
+        return 1
+
+    print(f"Package {build_num} loaded as job {job_id} for {len(target_nodes)} node(s).")
+    return 0
+
+
+def read_job_row():
+    """The one loaded upgrade job, or None."""
+    rc, stdout, _ = run_cql_query(
+        "SELECT JSON job_id, state, target_nodes, current_node FROM hydra.hylia_jobs;")
+    if rc != 0 or not stdout:
+        return None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
+    return None
+
+
+def upgrade_percent(job):
+    """How far a rolling upgrade has got, as whole nodes finished.
+
+    Nodes finished is the part that is countable. The phase inside the node being worked
+    on is a guess, and a guess belongs on the page that can caveat it -- not in the number
+    a task reports, which is read as fact.
+    """
+    targets = job.get("target_nodes") or []
+    current = job.get("current_node")
+    if not targets:
+        return 0
+    if current in targets:
+        return int(targets.index(current) * 100 / len(targets))
+    return 0
+
+
+def start_upgrade(job_id):
+    """Mark the loaded job STARTING and watch it to its verdict.
+
+    The upgrade is run by the hylia daemon on the leader, which is where it has always
+    been run and where its resume-after-reboot behaviour lives. This does not run it; it
+    exists so there is one Catalyst task whose lifetime is the upgrade's lifetime, which
+    is what puts the upgrade in the header's task ring and its failure in the task log.
+
+    Exit code 0 only for COMPLETED. FAILED, and a job nothing picks up, are both non-zero.
+    """
+    if not re.match(r'^[0-9a-fA-F-]{36}$', str(job_id or "")):
+        print(f"'{job_id}' is not a job id.", file=sys.stderr)
+        return 1
+
+    job = read_job_row()
+    if not job:
+        print("No upgrade job is loaded. Upload a package first.", file=sys.stderr)
+        return 1
+    if str(job.get("job_id")) != str(job_id):
+        print(f"The loaded job is {job.get('job_id')}, not {job_id}. Re-read the page.",
+              file=sys.stderr)
+        return 1
+
+    state = job.get("state")
+    if state in ("STARTING", "UPGRADING"):
+        print(f"Job {job_id} is already {state}; watching it rather than starting it again.")
+    else:
+        rc, _, err = run_cql_query(
+            f"UPDATE hydra.hylia_jobs SET state = 'STARTING' WHERE job_id = {job_id};")
+        if rc != 0:
+            print(f"The job could not be marked for upgrade: {err}", file=sys.stderr)
+            return 1
+
+    report_task_progress(1)
+
+    waited_for_pickup = 0
+    last_reported = -1
+    while True:
+        time.sleep(UPGRADE_POLL_SEC)
+        job = read_job_row()
+        if not job:
+            print("The upgrade job disappeared from the database while it was running.",
+                  file=sys.stderr)
+            return 1
+
+        state = job.get("state")
+
+        if state == "COMPLETED":
+            report_task_progress(100, status="processing")
+            print(f"Rolling upgrade {job_id} completed.")
+            return 0
+
+        if state == "FAILED":
+            # The line hylia wrote when it gave up is what an operator needs; the task's
+            # error_msg is dagur's copy of this output.
+            print(f"Rolling upgrade {job_id} failed. See the job log on the LCM page.",
+                  file=sys.stderr)
+            return 1
+
+        if state == "STARTING":
+            waited_for_pickup += UPGRADE_POLL_SEC
+            if waited_for_pickup >= STARTING_GRACE_SEC:
+                print(
+                    f"No hylia daemon picked job {job_id} up within {STARTING_GRACE_SEC}s. "
+                    f"The upgrade has not started; check that hylia is running on the "
+                    f"ZooKeeper leader.", file=sys.stderr)
+                return 1
+            continue
+
+        percent = upgrade_percent(job)
+        if percent != last_reported:
+            report_task_progress(percent)
+            last_reported = percent
+
+
 def hylia_loop():
     print("[Hylia] Daemon loop started.")
     while True:
@@ -1133,5 +1456,35 @@ def hylia_loop():
             sys.stderr.write(f"[Hylia Loop Error] {e}\n")
         time.sleep(5)
 
+def main(argv):
+    """The daemon, or one of the two console entry points.
+
+    No arguments is the daemon, unchanged: `hylia.service` runs `/usr/local/bin/hylia`
+    with none, and that has to keep meaning exactly what it meant. The subcommands are
+    what a Catalyst task runs, and each is one operation with an exit code.
+    """
+    if len(argv) <= 1:
+        hylia_loop()
+        return 0
+
+    command = argv[1]
+
+    if command == "--load-package":
+        if len(argv) < 3:
+            print("--load-package needs the path of the staged archive.", file=sys.stderr)
+            return 2
+        return load_package(argv[2])
+
+    if command == "--start-upgrade":
+        if len(argv) < 3:
+            print("--start-upgrade needs the job id to start.", file=sys.stderr)
+            return 2
+        return start_upgrade(argv[2])
+
+    print(f"Unknown option '{command}'. Use --load-package <zip> or --start-upgrade <job-id>, "
+          f"or no arguments to run the daemon.", file=sys.stderr)
+    return 2
+
+
 if __name__ == "__main__":
-    hylia_loop()
+    sys.exit(main(sys.argv))

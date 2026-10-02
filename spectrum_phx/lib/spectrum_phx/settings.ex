@@ -19,22 +19,31 @@ defmodule SpectrumPhx.Settings do
   The page has to keep those apart or an operator edits a field and gets a different
   outcome than the one next to it.
 
-  ## `urbosa_enabled` is deliberately not writable here
+  ## `urbosa_enabled` is not a field on the settings form
 
-  Turning it on bootstraps network namespaces, bridges and VXLAN interfaces on every
-  node; turning it off tears them down, and the Python tier refuses the second while
-  Lanayru is running because a Kubernetes cluster on the overlay loses its network. That
-  is a cluster-wide, host-mutating operation and it belongs behind a Catalyst task where
-  it can report progress and fail visibly -- not behind a checkbox that returns 200 and
-  leaves the work happening somewhere. It is shown, with its state, and not offered.
+  It is the one setting whose write is an operation. Turning it on bootstraps network
+  namespaces, bridges and VXLAN interfaces on every node; turning it off tears them down,
+  and doing that under a running Lanayru cluster takes that cluster's network away. So it
+  is refused by `update/2` along with every other key that is not in the allow-list, and
+  has its own path -- `set_urbosa_enabled/2` -- which writes the row *and* submits the
+  Catalyst task that does the work, reports which of the two directions it took, and puts
+  the row back if the task could not be queued.
+
+  That last part is the whole reason it is not a checkbox. A row saying `true` with no
+  bootstrap behind it is a cluster that believes it has an overlay and has not got one,
+  and everything downstream -- Lanayru's pre-flight, the SDN page, a deploy -- reads the
+  row.
   """
 
+  alias SpectrumPhx.Catalyst
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
 
   @settings_cql "SELECT key, value FROM hydra.cluster_settings"
   @users_cql "SELECT username FROM hydra.users"
   @rf_cql "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra'"
+  @urbosa_cql "SELECT value FROM hydra.cluster_settings WHERE key = 'urbosa_enabled'"
+  @lanayru_cql "SELECT name, status FROM hydra.lanayru_clusters"
 
   # Every key the console will write, and what it means. Anything not here is refused
   # rather than written: `cluster_settings` is a free-form key/value table, so the
@@ -53,14 +62,17 @@ defmodule SpectrumPhx.Settings do
     "drs_enabled" => "true"
   }
 
-  # Read and shown, never written from here.
-  @read_only ~w(urbosa_enabled)
+  # Read and shown, never written by `update/2`. The value is what it defaults to when the
+  # table has no row for it -- which is not the same as the table being unreadable, and
+  # both have to end up false: an overlay reported as enabled because a read failed is a
+  # deploy that will be allowed and will not work.
+  @read_only %{"urbosa_enabled" => "false"}
 
   @doc "The keys this console will write."
   def writable_keys, do: Map.keys(@stored)
 
-  @doc "Keys that are shown but not editable here."
-  def read_only_keys, do: @read_only
+  @doc "Keys that are shown but not editable through the settings form."
+  def read_only_keys, do: Map.keys(@read_only)
 
   @doc "The defaults a missing row falls back to."
   def defaults, do: @stored
@@ -94,9 +106,15 @@ defmodule SpectrumPhx.Settings do
   defp stored_settings(static) do
     case read(static, :settings, @settings_cql) do
       {:ok, rows} ->
+        # Seeded with the read-only keys as well as the writable ones. The reduce only
+        # accepts a key the accumulator already has -- that is what stops a stray row in
+        # this free-form table becoming a setting -- so a key absent from the seed can
+        # never be read at all, however often the cluster writes it. `urbosa_enabled` was
+        # exactly that: written by both consoles, never seeded, and therefore reported as
+        # "disabled" on every settings page ever rendered.
         rows
         |> Enum.map(&stringify/1)
-        |> Enum.reduce(@stored, fn row, acc ->
+        |> Enum.reduce(Map.merge(@stored, @read_only), fn row, acc ->
           key = string(Map.get(row, "key"))
           value = string(Map.get(row, "value"))
 
@@ -109,9 +127,7 @@ defmodule SpectrumPhx.Settings do
   end
 
   defp read_only_settings(stored) do
-    # These are not in @stored, so they are read straight from the rows rather than
-    # merged over a default.
-    %{"urbosa_enabled" => Map.get(stored, "urbosa_enabled", "false")}
+    Map.new(@read_only, fn {key, default} -> {key, Map.get(stored, key, default)} end)
   end
 
   # `cluster.json` is the authority for these, not a row. A stored row that disagrees is
@@ -224,10 +240,175 @@ defmodule SpectrumPhx.Settings do
           statement = "INSERT INTO hydra.cluster_settings (key, value) VALUES (?, ?)"
 
           case query(statement, [key, to_string(value)]) do
-            {:ok, _} -> {:cont, :ok}
-            {:error, reason} -> {:halt, {:error, "#{key} could not be saved: #{describe(reason)}"}}
+            {:ok, _} ->
+              {:cont, :ok}
+
+            {:error, reason} ->
+              {:halt, {:error, "#{key} could not be saved: #{describe(reason)}"}}
           end
         end)
+    end
+  end
+
+  # -- the overlay switch ------------------------------------------------------------------
+
+  # Both already exist on every node and both are already what the Python console submits
+  # for this switch: the same script, with and without `--cleanup`.
+  @bootstrap_job "urbosa_bootstrap"
+  @cleanup_job "urbosa_cleanup"
+  @bootstrap_command "python3 /usr/local/bin/urbosa-bootstrap"
+  @cleanup_command "python3 /usr/local/bin/urbosa-bootstrap --cleanup"
+
+  # Building or removing namespaces, bridges and VXLAN interfaces on every host, one host
+  # at a time through spark.
+  @urbosa_timeout 1_800
+
+  # A Lanayru cluster in either of these states is using the overlay right now.
+  @lanayru_live ~w(active deploying running ready)
+
+  @doc "The two job names the overlay switch submits."
+  def urbosa_job_names, do: %{bootstrap: @bootstrap_job, cleanup: @cleanup_job}
+
+  @doc "The CQL the overlay switch reads."
+  def urbosa_statements, do: %{urbosa: @urbosa_cql, lanayru: @lanayru_cql}
+
+  @doc """
+  Whether the overlay is recorded as enabled.
+
+  Anything that is not exactly `true` is false, including an unreadable table. Defaulting
+  the other way would have a database outage read as "the overlay is up".
+  """
+  @spec urbosa_enabled?(keyword()) :: boolean()
+  def urbosa_enabled?(opts \\ []) do
+    case static_source(opts) do
+      %{urbosa_enabled: value} ->
+        to_string(value) == "true"
+
+      %{} = static ->
+        Map.get(read_only_settings(stored_or_empty(static)), "urbosa_enabled") == "true"
+
+      nil ->
+        case query(@urbosa_cql, []) do
+          {:ok, [row | _]} -> string(Map.get(stringify(row), "value")) == "true"
+          _other -> false
+        end
+    end
+  end
+
+  @doc """
+  Turn overlay networking on or off.
+
+  Returns `{:ok, %{direction: :bootstrap | :teardown, task_id: id}}`, `{:ok, :unchanged}`
+  when the row already says what was asked for, or `{:error, message}`.
+
+  The order is: refuse, write, submit, and put the row back if the submission failed. It
+  cannot be "submit then write" -- the bootstrap reads the row -- and it must not be
+  "write and hope", which is what the Python endpoint does: it writes the row, tries to
+  submit, prints the failure to a log and answers `200` either way.
+  """
+  @spec set_urbosa_enabled(term(), keyword()) ::
+          {:ok, :unchanged} | {:ok, map()} | {:error, String.t()}
+  def set_urbosa_enabled(value, opts \\ []) do
+    wanted = to_string(value) == "true"
+    current = urbosa_enabled?(opts)
+
+    # Read once. Asked twice -- in the condition and again in the message -- this is two
+    # round trips to say one thing, and the second could disagree with the first.
+    holder = if wanted, do: nil, else: lanayru_holder(opts)
+
+    cond do
+      wanted == current ->
+        {:ok, :unchanged}
+
+      holder != nil ->
+        {:error,
+         "'#{holder}' is running on the overlay. Tearing it down would take that Kubernetes " <>
+           "cluster's network away; destroy the cluster first."}
+
+      true ->
+        apply_urbosa(wanted, current, opts)
+    end
+  end
+
+  defp apply_urbosa(wanted, previous, opts) do
+    with :ok <- write_urbosa(wanted, opts) do
+      {job, command} =
+        if wanted,
+          do: {@bootstrap_job, @bootstrap_command},
+          else: {@cleanup_job, @cleanup_command}
+
+      case Catalyst.run_on_leader(job, command, timeout: @urbosa_timeout) do
+        {:ok, %{"task_id" => id}} when is_binary(id) ->
+          {:ok, %{direction: direction(wanted), task_id: id}}
+
+        {:ok, _other} ->
+          restore_urbosa(previous, opts)
+          {:error, "Catalyst accepted the task but did not name it, so nothing was changed."}
+
+        {:error, reason} ->
+          # The row is put back before the error is reported. A row that says the overlay
+          # is on, with no bootstrap behind it, is worse than the refusal an operator can
+          # act on: Lanayru's pre-flight and the SDN page both believe it.
+          restore_urbosa(previous, opts)
+
+          {:error,
+           "The overlay task could not be queued, so the setting was left as it was: " <>
+             Catalyst.describe(reason)}
+      end
+    end
+  end
+
+  defp direction(true), do: :bootstrap
+  defp direction(false), do: :teardown
+
+  defp write_urbosa(value, opts) do
+    case static_source(opts) do
+      %{} ->
+        :ok
+
+      nil ->
+        statement = "INSERT INTO hydra.cluster_settings (key, value) VALUES (?, ?)"
+
+        case query(statement, ["urbosa_enabled", to_string(value)]) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, "urbosa_enabled could not be saved: #{describe(reason)}"}
+        end
+    end
+  end
+
+  defp restore_urbosa(previous, opts), do: write_urbosa(previous, opts)
+
+  # The name of a Kubernetes cluster that is using the overlay, or nil. Read rather than
+  # counted: the refusal names the cluster, because "something is running" is not a
+  # sentence an operator can act on.
+  defp lanayru_holder(opts) do
+    rows =
+      case static_source(opts) do
+        %{lanayru: rows} when is_list(rows) ->
+          rows
+
+        %{} ->
+          []
+
+        nil ->
+          case query(@lanayru_cql, []) do
+            {:ok, rows} -> rows
+            _other -> []
+          end
+      end
+
+    rows
+    |> Enum.map(&stringify/1)
+    |> Enum.find_value(fn row ->
+      status = row |> Map.get("status") |> to_string() |> String.downcase()
+      if status in @lanayru_live, do: string(Map.get(row, "name")) || "A Kubernetes cluster"
+    end)
+  end
+
+  defp stored_or_empty(static) do
+    case stored_settings(static) do
+      :error -> %{}
+      stored -> stored
     end
   end
 
@@ -262,10 +443,27 @@ defmodule SpectrumPhx.Settings do
 
   # -- plumbing ---------------------------------------------------------------------------
 
+  @doc """
+  Where reads come from when the caller does not say: `:live`, or `{:static, map}` set in
+  `Application.get_env(:spectrum_phx, :settings_source)`.
+
+  The same seam `SpectrumPhx.Tasks` carries. Under a static source nothing is written
+  anywhere -- an in-memory stand-in for a row is a test of the stand-in -- so what it
+  exercises is the ordering: refuse, write, submit, and put the row back if the
+  submission failed.
+  """
+  def source, do: Application.get_env(:spectrum_phx, :settings_source, :live)
+
   defp static_source(opts) do
     case Keyword.get(opts, :source, :live) do
-      {:static, map} -> map
-      :live -> nil
+      {:static, map} ->
+        map
+
+      :live ->
+        case source() do
+          {:static, map} -> map
+          _live -> nil
+        end
     end
   end
 

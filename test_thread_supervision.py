@@ -141,7 +141,11 @@ class WiringTests(unittest.TestCase):
         }
         self.assertEqual(
             supervised,
-            {"db_reconcile", "metrics_and_cluster_monitor", "internal_token_verifier"})
+            {"db_reconcile", "metrics_and_cluster_monitor", "internal_token_verifier",
+             # The Kubernetes engine's Catalyst queue. It is the only thing anywhere that
+             # runs a deploy or a teardown, so a copy of it that died quietly would leave
+             # every such task `pending` with nothing on the console to say why.
+             "lanayru_tasks"})
 
     def test_main_starts_no_bare_background_thread(self):
         # A new loop added as threading.Thread(...) would reintroduce the silent death.

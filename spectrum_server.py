@@ -2862,6 +2862,130 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
     lanayru.deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_id, created_at)
 
 
+def destroy_lanayru_worker(task_id, cluster_name, created_at):
+    import lanayru
+    lanayru.destroy_lanayru_worker(task_id, cluster_name, created_at)
+
+
+def call_catalyst_api(path, payload=None, method="GET", timeout=35):
+    """Call Catalyst over the cluster's mutual TLS. Returns (status, body-or-error).
+
+    The seven call sites in this file each built this request inline. This is the same
+    request; it exists because the queue worker below needs to make it in a loop and a
+    long-poll is not something to open-code an eighth time.
+    """
+    leader_ip = get_catalyst_target_ip()
+    url = f"https://{leader_ip}:9091{path}"
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=catalyst_ssl_context(leader_ip),
+                                    timeout=timeout) as response:
+            if response.status == 204:
+                return 204, None
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        return -1, str(e)
+
+
+def run_lanayru_task(task_id, action, payload):
+    """Run one Kubernetes-engine task and report its outcome to Catalyst.
+
+    Both workers already write their own progress into `hydra.catalyst_tasks` through
+    `log_catalyst_task`, keyed by the task id they are handed -- which is why they are
+    handed Catalyst's, rather than minting one of their own as the HTTP endpoints do. The
+    row the queue submission wrote and the rows the worker writes are then the same row,
+    and the task ring follows a deploy from `pending` to its verdict without a gap.
+
+    Catalyst is told as well as the table, because Catalyst holds an in-memory event for
+    each submitted task and a caller long-polling `/tasks/status` waits on it.
+    """
+    created_at = int(time.time() * 1000)
+    cluster_name = (payload.get("cluster_name") or "").strip()
+
+    call_catalyst_api("/api/v1/tasks/update", {
+        "task_id": task_id, "status": "processing", "progress": 5,
+    }, method="POST")
+
+    try:
+        if action == "deploy":
+            deploy_lanayru_worker(
+                task_id,
+                cluster_name,
+                int(payload.get("control_nodes") or 1),
+                (payload.get("overlay_segment_id") or "").strip(),
+                created_at)
+        elif action == "destroy":
+            destroy_lanayru_worker(task_id, cluster_name, created_at)
+        else:
+            raise Exception(f"Unsupported Lanayru action '{action}'.")
+    except Exception as exc:
+        traceback.print_exc()
+        # The workers record their own failure too, but only for the failures they catch.
+        # This is for the ones they do not -- an import that fails, a name that is not
+        # what they expected -- which would otherwise leave the task `processing` forever.
+        log_catalyst_task("lanayru", action, "failed", 100, {"cluster_name": cluster_name},
+                          error_msg=str(exc), task_id=task_id, created_at=created_at)
+        call_catalyst_api("/api/v1/tasks/update", {
+            "task_id": task_id, "status": "failed", "progress": 100, "error_msg": str(exc),
+        }, method="POST")
+        return
+
+    call_catalyst_api("/api/v1/tasks/update", {
+        "task_id": task_id, "status": "completed", "progress": 100,
+    }, method="POST")
+
+
+def lanayru_queue_loop():
+    """Drain Catalyst's `lanayru` queue while this node holds ZooKeeper leadership.
+
+    Deploying and destroying a Kubernetes cluster used to start from an HTTP handler:
+    `/api/lanayru/deploy` spawned a bare thread and answered 200, so the operation's
+    progress lived in one node's process memory and its failure lived in a log. Both are
+    now tasks, and this is what runs them.
+
+    It has to be this tier and not a daemon of its own: `lanayru.py`'s workers import
+    `run_cql_query`, `run_lwt`, `sidon_call`, `get_cluster_nodes` and the log buffer from
+    this module. Giving them a home somewhere else means moving all of that first.
+
+    The leadership check is the same one vali and dagur make, and for the same reason:
+    Catalyst's queues are in-memory on the leader, so a worker anywhere else long-polls a
+    queue that nothing is ever put on.
+    """
+    print("Lanayru Catalyst worker thread started.")
+    was_worker = None
+    while True:
+        leading = is_zookeeper_leader()
+        if leading != was_worker:
+            # Whether this process drains the queue at all is decided here, so the
+            # transition earns a line: "the deploy is slow" and "no worker is running
+            # anywhere" look identical from the console otherwise.
+            print("Lanayru Catalyst worker: %s" % (
+                "draining the queue, this node holds ZooKeeper leadership" if leading
+                else "standing by, another node holds ZooKeeper leadership"))
+            sys.stdout.flush()
+            was_worker = leading
+        if not leading:
+            time.sleep(2)
+            continue
+
+        status, res = call_catalyst_api("/api/v1/queues/lanayru")
+        if status == 200 and res:
+            task_id = res.get("task_id")
+            action = res.get("action")
+            payload = res.get("payload") or {}
+            print(f"[Lanayru] Received task from Catalyst: {action} ({task_id})")
+            threading.Thread(target=run_lanayru_task,
+                             args=(task_id, action, payload),
+                             daemon=True).start()
+        else:
+            # 204 is the long poll expiring with nothing queued, which is the normal case.
+            time.sleep(2)
+
+
 class SpectrumHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -6004,10 +6128,6 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             created_at_ms = int(datetime.datetime.now().timestamp() * 1000)
             task_id, created_at = log_catalyst_task("lanayru", "destroy", "processing", 10, {"cluster_name": cluster_name})
 
-            def destroy_lanayru_worker(task_id, cluster_name, created_at):
-                import lanayru
-                lanayru.destroy_lanayru_worker(task_id, cluster_name, created_at)
-
             threading.Thread(
                 target=destroy_lanayru_worker,
                 args=(task_id, cluster_name, created_at),
@@ -8415,6 +8535,11 @@ def main():
     supervise("db_reconcile", db_reconcile_loop)
     supervise("metrics_and_cluster_monitor", metrics_and_cluster_monitor_loop)
     supervise("internal_token_verifier", internal_token_verifier_loop)
+
+    # The Kubernetes engine's Catalyst queue. Supervised like the rest: this loop is the
+    # only thing that runs a deploy or a teardown, so a thread of it that died quietly
+    # would leave every such task sitting `pending` with nothing to say why.
+    supervise("lanayru_tasks", lanayru_queue_loop)
 
     # The Mimir and Dagur scheduler loops are deliberately not started here. Catalyst
     # owns both schedules and now claims each tick with a compare-and-swap; running a

@@ -31,6 +31,30 @@ defmodule SpectrumPhx.SettingsTest do
       assert result.stored["ntp_servers"] == "pool.ntp.org", "an unset key keeps its default"
     end
 
+    test "the overlay's recorded state is read from its row, not defaulted" do
+      # The reduce that builds `stored` only accepts a key the accumulator already has --
+      # that is what stops a stray row in this free-form table becoming a setting -- so a
+      # key missing from the seed can never be read at all, however often the cluster
+      # writes it. `urbosa_enabled` was exactly that: written by both consoles, absent from
+      # the seed, and therefore reported as disabled on every settings page ever rendered.
+      result = all(%{settings: [row("urbosa_enabled", "true")]})
+
+      assert result.read_only["urbosa_enabled"] == "true"
+
+      assert Settings.urbosa_enabled?(
+               source: {:static, %{settings: [row("urbosa_enabled", "true")]}}
+             )
+    end
+
+    test "an unreadable settings table reports the overlay as off, not on" do
+      # Defaulting the other way would have a database outage read as "the overlay is up",
+      # which is a Kubernetes deploy that is allowed and then does not work.
+      result = all(%{settings: {:error, "connection refused"}})
+
+      assert result.read_only["urbosa_enabled"] == "false"
+      refute Settings.urbosa_enabled?(source: {:static, %{settings: {:error, "down"}}})
+    end
+
     test "a row for a key this console does not write is ignored" do
       # The table is free-form, so anything could be in it. Rendering an unknown key as a
       # field would offer to write something the allow-list then refuses.
@@ -40,7 +64,8 @@ defmodule SpectrumPhx.SettingsTest do
     end
 
     test "the cluster's identity comes from cluster.json, not from a row" do
-      result = all(%{settings: [row("cluster_name", "impostor")], cluster: cluster(name: "hci-01")})
+      result =
+        all(%{settings: [row("cluster_name", "impostor")], cluster: cluster(name: "hci-01")})
 
       assert result.cluster.name == "hci-01"
       refute Map.has_key?(result.stored, "cluster_name")

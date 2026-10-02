@@ -9,9 +9,10 @@ mindmap
   root((Catalyst Task Coordinator))
     Task Queuing System
       In-Memory queues
-        vali queue
-        dagur queue
-        spark queue
+        vali queue - drained by vali.py
+        dagur queue - drained by dagur.py
+        lanayru queue - drained by spectrum_server.py
+        spark queue - nothing drains it
       Database Storage
         hydra.catalyst_tasks ScyllaDB Table
       Long polling via ThreadingHTTPServer

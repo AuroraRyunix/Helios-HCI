@@ -3324,6 +3324,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if path == "/api/v1/host/units":
             self.handle_host_units_action()
             return True
+        if path == "/api/v1/lcm/package":
+            self.handle_lcm_package()
+            return True
         if path == "/api/v1/host/reboot":
             self.handle_host_reboot()
             return True
@@ -3769,6 +3772,91 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             })
             return
         self.send_json_response(200, {"vdisk_id": vdisk_id, "written": written})
+
+    # -- LCM: the upgrade package staging point ------------------------
+
+    # The one path an upgrade archive may be written to. It is a constant and not a
+    # parameter, which is the same guard `handle_dfs_write` gets for free by naming a
+    # vdisk instead of a file: there is nothing in the request for a caller to point
+    # somewhere else, so this endpoint cannot place bytes anywhere on a hypervisor but
+    # here. `hylia --load-package` reads exactly this path.
+    LCM_PACKAGE_PATH = "/tmp/helios_update.zip"
+
+    # An upgrade package is a handful of scripts, a container image tar and a changelog.
+    # Four gibibytes is far above any real one and far below filling /tmp on a host.
+    LCM_PACKAGE_MAX_BYTES = 4 * 1024 * 1024 * 1024
+
+    def handle_lcm_package(self):
+        """Stream the request body into the upgrade-package staging file.
+
+        The console tier receives the operator's upload and must not hold it -- it is a
+        container whose disk exists for an application, not for a package that may be
+        hundreds of megabytes -- so it proxies the bytes here, to the daemon that is native
+        to the host and that the loader runs on. Same reasoning as /api/v1/dfs/write, one
+        layer up.
+
+        Written to a temporary file and renamed at the end, so a request that dies half way
+        cannot leave a truncated archive at the path the loader is about to read. A
+        truncated zip does fail validation, but it fails it as "not a zip file", which
+        sends an operator looking at the wrong thing.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            self.send_json_response(400, {"error": "Content-Length required and must be > 0"})
+            return
+        if length > self.LCM_PACKAGE_MAX_BYTES:
+            self.send_json_response(413, {
+                "error": "Package is larger than %d bytes" % self.LCM_PACKAGE_MAX_BYTES,
+            })
+            return
+
+        staging = self.LCM_PACKAGE_PATH + ".part"
+        written = 0
+        try:
+            with open(staging, "wb") as handle:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception as exc:
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+            self.send_json_response(500, {"error": "package write failed: %s" % exc})
+            return
+
+        if written != length:
+            # Reported rather than raised, and the partial file is removed: the caller
+            # knows what it sent and is the only one that can tell a truncated upload from
+            # a client that hung up. "wrote 4 of 900 bytes" beats "failed".
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+            self.send_json_response(500, {
+                "error": "package write was short",
+                "written": written,
+                "expected": length,
+            })
+            return
+
+        try:
+            os.replace(staging, self.LCM_PACKAGE_PATH)
+        except Exception as exc:
+            self.send_json_response(500, {"error": "package could not be staged: %s" % exc})
+            return
+
+        self.send_json_response(200, {"path": self.LCM_PACKAGE_PATH, "written": written})
 
     # -- Storage: Linstor ----------------------------------------------
 

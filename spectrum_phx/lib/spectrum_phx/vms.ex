@@ -48,6 +48,7 @@ defmodule SpectrumPhx.Vms do
 
   require Logger
 
+  alias SpectrumPhx.Catalyst
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Spark
@@ -90,7 +91,6 @@ defmodule SpectrumPhx.Vms do
   @migration_lock "migrating"
   @unlocked_status "running"
 
-  @catalyst_port 9091
   @catalyst_service "vali"
 
   @pubsub SpectrumPhx.PubSub
@@ -636,7 +636,7 @@ defmodule SpectrumPhx.Vms do
 
     case task_submitter() do
       nil ->
-        post_task(@catalyst_service, action, payload)
+        Catalyst.submit(@catalyst_service, action, payload)
 
       fun when is_function(fun, 3) ->
         fun.(@catalyst_service, action, payload)
@@ -746,61 +746,8 @@ defmodule SpectrumPhx.Vms do
   defp maybe_put(map, _key, ""), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  # Mutual TLS, with the same client material `SpectrumPhx.Spark` uses.
-  #
-  # Catalyst dispatches cluster work -- start, stop, migrate -- and used to accept it from
-  # anything that could open a socket to port 9091, with no credential and no source
-  # check. It now requires a certificate the cluster CA signed, so this has to present
-  # one; over plain HTTP the submission is simply refused at the handshake.
-  defp post_task(service, action, payload) do
-    settings = Spark.connection_settings()
-
-    url =
-      "https://" <>
-        catalyst_ip() <> ":" <> Integer.to_string(@catalyst_port) <> "/api/v1/tasks/submit"
-
-    body = %{"service" => service, "action" => action, "payload" => payload}
-
-    case Req.post(url,
-           json: body,
-           connect_options: [transport_opts: settings.transport_opts],
-           receive_timeout: 35_000
-         ) do
-      {:ok, %Req.Response{status: 200, body: response}} -> {:ok, response}
-      {:ok, %Req.Response{status: status, body: response}} -> {:error, {:http, status, response}}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  # Catalyst runs on every node but only the ZooKeeper leader holds the dispatch queue
-  # (the queue is an in-process `queue.Queue`, not a table), so tasks must be submitted
-  # there and nowhere else.
-  #
-  # TODO: leader resolution. `vali.py`'s `get_zookeeper_leader_ip/0` probes each node's
-  # ZooKeeper four-letter `stat` for "mode: leader", then checks that the leader is
-  # actually answering on 9091 and otherwise falls back to the lowest-numbered node that
-  # is. `SpectrumPhx.Zk` has no equivalent yet -- `Zk.Client` and `Zk.State` cover the
-  # connection and the cluster-state document, not leader election -- and that module is
-  # owned elsewhere. This resolves the function at runtime rather than compile time so it
-  # wires itself up when the capability lands; until then it submits to the local node,
-  # which is correct only when this node happens to be the leader. Configure
-  # `:catalyst_ip` to pin it in the meantime.
-  defp catalyst_ip do
-    case Application.get_env(:spectrum_phx, :catalyst_ip) do
-      ip when is_binary(ip) and ip != "" ->
-        ip
-
-      _ ->
-        [Module.concat([:SpectrumPhx, :Zk]), Module.concat([:SpectrumPhx, :Zk, :State])]
-        |> Enum.find_value(fn module ->
-          if Code.ensure_loaded?(module) and function_exported?(module, :leader_ip, 0) do
-            case apply(module, :leader_ip, []) do
-              ip when is_binary(ip) and ip != "" -> ip
-              _ -> nil
-            end
-          end
-        end)
-        |> Kernel.||(Config.local_ip())
-    end
-  end
+  # Submission itself lives in `SpectrumPhx.Catalyst`: the mutual-TLS post, the refusal to
+  # name a queue nothing drains, and the leader resolution this module used to carry are
+  # the same for a VM power action and for a Kubernetes deploy, and having had two copies
+  # of them is how one of the two would have been the one to get the leader wrong.
 end

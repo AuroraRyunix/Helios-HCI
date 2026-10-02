@@ -7,15 +7,31 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
   check here asks a real component a real question rather than reporting that a component
   is installed.
 
-  Deploying and destroying are not offered from this console yet: both are cluster-wide
-  Catalyst tasks, and they belong behind the task queue where the header ring reports them
-  rather than behind a button that returns instantly and leaves the work happening
-  somewhere.
+  Deploying and destroying are Catalyst tasks. Pressing either button queues work on the
+  ZooKeeper leader and returns; what happens after that is reported by the ring in the
+  header and by `/tasks`, which is the only honest way to present an operation that runs
+  for minutes and can fail at any point in them.
+
+  ## A blocked pre-flight blocks the deploy
+
+  A check that came back `:error` is not advice. It means the deploy has already been
+  established to be unable to succeed -- no overlay segment, an unmounted extent store, a
+  ring with no member up -- so the button is disabled and the reasons are listed under it.
+  Warnings do not block: a degraded ring or a nearly-full store is a judgement call, and
+  it is the operator's.
+
+  ## Destroy asks for the name
+
+  Not a `data-confirm`, which is a browser dialog and guards only the browser, and not a
+  second click either -- a second click is a reflex. The cluster's name has to be typed
+  back, because the thing on the other side of this button is every guest node of a
+  Kubernetes cluster and the rows describing them.
   """
   use SpectrumPhxWeb, :live_view
 
   import SpectrumPhxWeb.Cluster.Components, only: [panel: 1, figure: 1]
 
+  alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Lanayru
 
   @refresh_interval_ms 30_000
@@ -24,7 +40,17 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
   def mount(_params, _session, socket) do
     if connected?(socket), do: :timer.send_interval(@refresh_interval_ms, self(), :refresh)
 
-    {:ok, socket |> assign(page_title: "Lanayru") |> load()}
+    {:ok,
+     socket
+     |> assign(
+       page_title: "Lanayru",
+       deploy_error: nil,
+       destroy_error: nil,
+       confirming_destroy?: false,
+       submitted: nil,
+       form: default_form()
+     )
+     |> load()}
   end
 
   @impl true
@@ -34,19 +60,85 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
   @impl true
   def handle_event("refresh", _params, socket), do: {:noreply, load(socket)}
 
+  # Keeps what was typed across a re-render. Without it the periodic refresh empties a
+  # half-filled form under the operator's hands.
+  def handle_event("validate_deploy", params, socket) do
+    {:noreply, assign(socket, form: take_form(params), deploy_error: nil)}
+  end
+
+  def handle_event("deploy", params, socket) do
+    case Lanayru.deploy(take_form(params)) do
+      {:ok, task_id} ->
+        {:noreply,
+         socket
+         |> assign(deploy_error: nil, submitted: {:deploy, task_id}, form: default_form())
+         |> put_flash(
+           :info,
+           "Kubernetes deployment queued. It runs on the leader; watch the ring."
+         )
+         |> load()}
+
+      {:error, message} ->
+        {:noreply, assign(socket, form: take_form(params), deploy_error: message)}
+    end
+  end
+
+  def handle_event("ask_destroy", _params, socket) do
+    {:noreply, assign(socket, confirming_destroy?: true, destroy_error: nil, submitted: nil)}
+  end
+
+  def handle_event("cancel_destroy", _params, socket) do
+    {:noreply, assign(socket, confirming_destroy?: false, destroy_error: nil)}
+  end
+
+  def handle_event("destroy", params, socket) do
+    case Lanayru.destroy(Map.get(params, "confirmation", "")) do
+      {:ok, task_id} ->
+        {:noreply,
+         socket
+         |> assign(confirming_destroy?: false, destroy_error: nil, submitted: {:destroy, task_id})
+         |> put_flash(
+           :info,
+           "Teardown queued. The cluster is removed by the task, not by this page."
+         )
+         |> load()}
+
+      {:error, message} ->
+        {:noreply, assign(socket, destroy_error: message)}
+    end
+  end
+
+  defp default_form,
+    do: %{"cluster_name" => "", "control_nodes" => "1", "overlay_segment_id" => ""}
+
+  defp take_form(params) do
+    Map.take(params, ["cluster_name", "control_nodes", "overlay_segment_id"])
+  end
+
   defp load(socket) do
     overview = Lanayru.overview()
+    blocking = Enum.filter(overview.checks, &(&1.status == :error))
 
     socket
     |> assign(:overview, overview)
     |> assign(:ready?, Lanayru.ready?(overview.checks))
+    |> assign(:blocking, blocking)
+    |> assign(:node_count, max(length(Config.node_ips()), 1))
     |> assign(:read_at, DateTime.utc_now())
   end
+
+  defp submitted_word({:deploy, _id}), do: "Deployment"
+  defp submitted_word({:destroy, _id}), do: "Teardown"
 
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:lanayru}>
+    <Layouts.app
+      socket={@socket}
+      flash={@flash}
+      current_username={@current_username}
+      active={:lanayru}
+    >
       <.header>
         Lanayru
         <:subtitle>
@@ -77,7 +169,13 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
           subtitle="On record in hydra.lanayru_clusters"
         >
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <.figure id="k8s-name" label="Name" value={@overview.cluster.name} caption="cluster" tone={:primary} />
+            <.figure
+              id="k8s-name"
+              label="Name"
+              value={@overview.cluster.name}
+              caption="cluster"
+              tone={:primary}
+            />
             <.figure
               id="k8s-status"
               label="Status"
@@ -125,23 +223,149 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
           </ul>
         </.panel>
 
+        <.panel
+          :if={is_nil(@overview.cluster)}
+          id="lanayru-deploy"
+          title="Deploy a Kubernetes cluster"
+          subtitle="Queued as a Catalyst task and run on the ZooKeeper leader"
+        >
+          <p :if={@blocking != []} class="text-sm text-error" id="deploy-blocked">
+            The pre-flight has already established that this cannot succeed:
+          </p>
+          <ul :if={@blocking != []} class="text-xs text-error list-disc ml-5 mt-1">
+            <li :for={check <- @blocking}>{check.message}</li>
+          </ul>
+
+          <form
+            id="deploy-form"
+            phx-submit="deploy"
+            phx-change="validate_deploy"
+            class="mt-3 flex flex-col gap-3"
+          >
+            <div class="grid gap-3 sm:grid-cols-3">
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Cluster name</span>
+                <input
+                  type="text"
+                  name="cluster_name"
+                  value={@form["cluster_name"]}
+                  class="input input-bordered input-sm w-full"
+                  autocomplete="off"
+                  id="deploy-cluster-name"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Control-plane nodes</span>
+                <input
+                  type="number"
+                  name="control_nodes"
+                  value={@form["control_nodes"]}
+                  min="1"
+                  max={@node_count}
+                  class="input input-bordered input-sm w-full"
+                  id="deploy-control-nodes"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Overlay segment</span>
+                <select
+                  name="overlay_segment_id"
+                  class="select select-bordered select-sm w-full"
+                  id="deploy-segment"
+                >
+                  <option value="">default routing elements</option>
+                  <option
+                    :for={segment <- @overview.segments}
+                    value={to_string(segment.id)}
+                    selected={to_string(segment.id) == @form["overlay_segment_id"]}
+                  >
+                    {segment.name}
+                  </option>
+                </select>
+              </label>
+            </div>
+
+            <p :if={@deploy_error} class="text-sm text-error" id="deploy-error">{@deploy_error}</p>
+
+            <div class="flex items-center gap-3">
+              <button
+                type="submit"
+                class="btn btn-primary btn-sm"
+                disabled={@blocking != []}
+                id="deploy-submit"
+              >
+                <.icon name="hero-rocket-launch" class="size-4" /> Deploy
+              </button>
+              <span :if={@blocking == [] and not @ready?} class="text-xs text-warning">
+                The pre-flight has warnings. Read them before you press this.
+              </span>
+            </div>
+          </form>
+        </.panel>
+
+        <.panel
+          :if={@overview.cluster}
+          id="lanayru-destroy"
+          title="Destroy this cluster"
+          subtitle="Every guest node of it, and the rows describing them"
+        >
+          <p class="text-sm opacity-70">
+            Teardown removes the Kubernetes guest VMs and the state Lanayru keeps for them
+            in Hydra. It runs as a Catalyst task, so its progress and its failure are in the
+            task ring rather than in a request that returned.
+          </p>
+
+          <div :if={not @confirming_destroy?} class="mt-3">
+            <button
+              phx-click="ask_destroy"
+              class="btn btn-error btn-outline btn-sm"
+              id="destroy-start"
+            >
+              <.icon name="hero-trash" class="size-4" /> Destroy {@overview.cluster.name}
+            </button>
+          </div>
+
+          <form
+            :if={@confirming_destroy?}
+            phx-submit="destroy"
+            class="alert alert-error alert-soft mt-3 flex-col items-start gap-2"
+            id="destroy-confirm"
+          >
+            <span class="text-sm">
+              Type <span class="font-mono font-semibold">{@overview.cluster.name}</span>
+              to confirm. This cannot be undone from here.
+            </span>
+            <div class="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                name="confirmation"
+                class="input input-bordered input-sm"
+                autocomplete="off"
+                id="destroy-confirmation"
+              />
+              <button type="submit" class="btn btn-error btn-xs" id="destroy-submit">
+                Destroy it
+              </button>
+              <button type="button" phx-click="cancel_destroy" class="btn btn-ghost btn-xs">
+                Cancel
+              </button>
+            </div>
+            <p :if={@destroy_error} class="text-sm" id="destroy-error">{@destroy_error}</p>
+          </form>
+        </.panel>
+
         <.panel :if={is_nil(@overview.cluster)} id="lanayru-none" title="No cluster deployed">
           <p class="text-sm opacity-70">
             Nothing is recorded in <span class="font-mono">hydra.lanayru_clusters</span>.
-            The pre-flight above is what a deploy would be checked against.
+            The pre-flight above is what a deploy is checked against.
           </p>
         </.panel>
 
-        <.panel id="lanayru-not-offered" title="Not offered here yet">
-          <p class="text-sm opacity-70">
-            Deploying and destroying a Kubernetes cluster are cluster-wide operations that
-            run for minutes and fail in interesting ways. They belong behind the task queue,
-            where the ring in the header reports their progress -- not behind a button that
-            returns instantly and leaves the work happening somewhere. Both remain on the
-            <.link href="/lanayru.html" class="link">previous console</.link>
-            until they run as tasks.
-          </p>
-        </.panel>
+        <p :if={@submitted} class="text-xs opacity-70" id="lanayru-task">
+          {submitted_word(@submitted)} submitted as
+          <span class="font-mono">{elem(@submitted, 1)}</span>
+          &mdash; <.link navigate={~p"/tasks"} class="link">watch it</.link>.
+        </p>
       </div>
     </Layouts.app>
     """
