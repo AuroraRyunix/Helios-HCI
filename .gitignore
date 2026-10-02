@@ -30,3 +30,8 @@ sidon/target/
 /spectrum_phx/priv/static/cache_manifest.json
 /spectrum_phx/erl_crash.dump
 /spectrum_phx/*.ez
+
+# Field notes from a commercial Nutanix cluster. Observations about how a
+# licensed product behaves are useful to us and have no business in a public
+# repository that reimplements the same ideas.
+NUTANIX_FINDINGS.md
