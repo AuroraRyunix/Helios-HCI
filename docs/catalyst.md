@@ -13,7 +13,12 @@ Catalyst is the task orchestrator, coordinator, and execution scheduler for the 
 - **Task Schema & Persistence**: Tasks are persisted in the ScyllaDB table `hydra.catalyst_tasks`. This ensures tasks can be tracked across node failovers and server restarts.
 - **Service Queues**: Distributes tasks to specialized background workers via in-memory queues:
   - `vali`: For VM scheduling, placement, load balancing, and maintenance migrations.
-  - `dagur`: For cron scheduling and maintenance task execution.
+  - `dagur`: For cron scheduling and maintenance task execution, and for any console
+    operation whose code already exists on the host as a command — the Urbosa bootstrap
+    and teardown, and hylia's package and upgrade entry points.
+  - `lanayru`: For building and tearing down the guest Kubernetes cluster. Drained by the
+    console backend rather than by a daemon of its own, because `lanayru.py`'s workers
+    import half of `spectrum_server.py`.
   - `spark`: For node bootstrap and remote systemd control.
 - **Task Long Polling**: Exposes endpoints for worker long-polling and client completion syncing, avoiding unnecessary database CPU polling overhead.
 - **Cron Scheduler Thread**: Runs a background loop that evaluates clustered cron job definitions in `hydra.dagur_schedules` (maintained by Dagur) and dispatches execution tasks to the queue when intervals elapse.
@@ -121,6 +126,45 @@ Allows system daemons and workers to update the progress, status, and optional e
     "status": "ok"
   }
   ```
+
+---
+
+## A queue with no worker is worse than a missing queue
+
+A service name is a queue, and a queue only moves if some daemon is long-polling
+`/api/v1/queues/<name>` on the node holding leadership. Submitting to a name that is in the
+dict and has nobody draining it writes the row, returns a task id, and then nothing ever
+happens — and `pending` on the console's task ring is indistinguishable from a task that is
+merely slow. Submitting to a name that is *not* in the dict is a `404` the caller can at
+least report.
+
+`spark` is currently in that first category: it is declared here and nothing polls it. It
+is left in place because removing a queue changes what a submission means, which belongs
+with whichever component finally claims the name.
+
+The console's own guard is `SpectrumPhx.Catalyst.services/0`, which lists only the queues
+that are drained and refuses everything else before a request is made.
+`test_console_tasks.py` asserts that list against this daemon's queue dict and against the
+daemons that poll them, so the three files remain one statement.
+
+## Commands as tasks
+
+`dagur`/`execute` is the general "do a thing to this cluster" task: dagur runs the command
+on the leader through its spark-daemon and reports the exit code back here, so a non-zero
+exit becomes a `failed` row carrying the command's own output. Two fields on the payload
+matter for anything longer than a maintenance script:
+
+* **`timeout`** — seconds the command may run for. spark-daemon applies **45 seconds** to a
+  request that does not carry one and kills the command there, so a cluster-wide operation
+  that omits it is capped at forty-five seconds and comes back as a timeout from a daemon
+  the caller never mentioned.
+* **`reports_progress`** — the command updates its own task, so dagur's ticker stands down.
+  The ticker climbs to 95% in ten seconds and stays there, which is honest enough for a job
+  with nothing better to say and actively wrong beside one that knows where it is: two
+  writers on the same column have a true 20% overwritten by an invented 95% a second later.
+
+Dagur also puts `CATALYST_TASK_ID` in the executed command's environment, which is how a
+command can address the task it is running as. Nothing is required to read it.
 
 ---
 

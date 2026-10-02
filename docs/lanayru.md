@@ -147,6 +147,49 @@ Before initiating a Lanayru deployment, the Spectrum API executes a series of ri
 4. **Urbosa SDN Status:**
    * Verify that the selected overlay segment is active and has a designated Tier-1 distributed router gateway configured.
 
+The Phoenix console draws these four as a pre-flight and treats an `:error` check as
+*blocking*: the deploy button is disabled and the reasons are listed under it. Each such
+check is a condition already established to make the deploy fail — no overlay segment, an
+unmounted extent store, a ring with no member up — and a deploy started anyway runs for
+minutes on real hosts before saying so. Warnings do not block; a degraded ring or a
+nearly-full store is a judgement call and it is the operator's.
+
+---
+
+## 5. Deploy and destroy are Catalyst tasks
+
+Both build or tear down a Kubernetes cluster across every node, so both go on Catalyst's
+`lanayru` queue and are drained on the ZooKeeper leader. What drains it is the **console
+backend** rather than a daemon of its own: `deploy_lanayru_worker` and
+`destroy_lanayru_worker` import `run_cql_query`, `run_lwt`, `sidon_call`,
+`get_cluster_nodes` and the log buffer from `spectrum_server.py`, so a worker anywhere else
+means moving all of that first.
+
+`lanayru_queue_loop()` runs under `supervise()` and long-polls `/api/v1/queues/lanayru`
+only while this node holds ZooKeeper leadership — Catalyst's queues are in-process on the
+leader, so a worker elsewhere polls a queue nothing is ever put on. It is supervised
+because it is the only thing anywhere that runs a deploy or a teardown: a copy that died
+quietly would leave every such task `pending` with nothing on the console to say why.
+
+Each worker is handed **Catalyst's** task id rather than minting its own. Both already
+write their progress into `hydra.catalyst_tasks` through `log_catalyst_task`, keyed by the
+id they are given, so the row the submission wrote and the rows the worker writes are the
+same row and the console's task ring follows a deploy from `pending` to its verdict without
+a gap. A worker that raises where it does not catch is ended as `failed` by the loop, in
+the table and in Catalyst; otherwise the task would stay `processing` for ever and the ring
+would spin on it.
+
+The console refuses before it submits: a second deploy while a cluster is on record would
+overwrite the row describing the one that exists, a deploy onto a disabled overlay produces
+a cluster whose pods cannot reach each other, and a destroy requires the cluster's name to
+be typed back.
+
+> [!NOTE]
+> The Python tier's `/api/lanayru/deploy` and `/api/lanayru/destroy` still spawn a thread
+> on whichever node served the request. They are the old console's path and are unchanged;
+> they are also why the queue worker reuses Catalyst's task id, since the two paths write
+> the same table.
+
 ---
 
 ## Technical Reference

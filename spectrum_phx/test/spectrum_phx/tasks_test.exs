@@ -36,6 +36,12 @@ defmodule SpectrumPhx.TasksTest do
           "action" => "host_maintenance_enter",
           "payload" => ~s({"hostname":"hci-02"})
         }),
+        row(%{
+          "task_id" => "d",
+          "service" => "lanayru",
+          "action" => "destroy",
+          "payload" => ~s({"cluster_name":"kube-01"})
+        }),
         row(%{"task_id" => "c", "service" => "gatoway", "action" => "sync", "payload" => nil})
       ]
 
@@ -45,6 +51,10 @@ defmodule SpectrumPhx.TasksTest do
       assert "Job 'storage_scrub' - execute" in labels
       assert "Host 'hci-02' - enter maintenance" in labels
       assert "gatoway - sync" in labels
+      # The ring announces this string when a task starts or fails, and "lanayru -
+      # destroy" is the service and the verb with the subject missing -- which for the one
+      # task that removes a whole Kubernetes cluster is the word that matters.
+      assert "Kubernetes cluster 'kube-01' - destroy" in labels
     end
 
     test "accepts atom keys and epoch milliseconds as well as Xandra's shapes" do

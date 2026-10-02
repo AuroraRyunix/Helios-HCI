@@ -32,13 +32,31 @@ configured yet**, so it fails once a day with a message naming the command that 
 schedule disabled by default would be silent, which is what "no backup / disaster
 recovery" looked like before it existed.
 
-> [!NOTE]
-> `execute_dagur_job_thread` calls `run_remote_spark("127.0.0.1", command)` with no
-> `timeout` in the payload, so spark-daemon applies its **45-second default** to every
-> scheduled job. That is ample for the jobs above today — a full metadata backup of the
-> single-node test cluster takes about 6.6 seconds — but it is a ceiling, and a job that
-> exceeds it is recorded as FAILED with `Command timed out after 45 seconds` even when
-> the work completed.
+### A job's time limit travels with it
+
+`run_remote_spark` used to send no `timeout`, and an absent `timeout` does not mean "no
+limit": spark-daemon applies **45 seconds** and kills the command there. Every scheduled
+job was therefore capped at forty-five seconds of work, and one that exceeded it was
+recorded FAILED with `Command timed out after 45 seconds` even though the work had
+completed. Ample for the jobs above today — a full metadata backup of the single-node test
+cluster takes about 6.6 seconds — but a ceiling nobody had chosen.
+
+The limit is now stated. A task may carry `timeout` (seconds) in its payload; absent that,
+`DEFAULT_JOB_TIMEOUT` is an hour. The urllib read gets the same budget plus a margin, so a
+job that legitimately runs to its limit is reported as its own exit code rather than as a
+transport failure.
+
+Two more payload fields matter now that the console submits cluster-wide work through this
+queue:
+
+* **`reports_progress`** — the command updates its own Catalyst task, so the ticker stands
+  down. The ticker climbs 5% → 95% in ten seconds and then sits there, which is a
+  reasonable "still working" signal for a job with nothing better to say and actively wrong
+  beside one that knows where it is: two writers on the same column would have a true 20%
+  overwritten by an invented 95% a second later.
+* **`CATALYST_TASK_ID`** — not a payload field but its consequence. Dagur prefixes the
+  executed command with it so a command that wants to report real progress can name the
+  task it is running as. A command that ignores it behaves exactly as before.
 
 ---
 

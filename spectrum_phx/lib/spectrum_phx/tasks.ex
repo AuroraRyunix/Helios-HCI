@@ -263,6 +263,12 @@ defmodule SpectrumPhx.Tasks do
       %{"job_name" => name} when is_binary(name) and name != "" ->
         "Job '" <> name <> "' - execute"
 
+      # The Kubernetes engine's two tasks. Without this they render as "lanayru - deploy",
+      # which is the service and the verb and not the thing being deployed -- and the ring
+      # announces this string when a task starts or fails.
+      %{"cluster_name" => name} when is_binary(name) and name != "" ->
+        "Kubernetes cluster '" <> name <> "' - " <> action
+
       %{"hostname" => host} when is_binary(host) and host != "" ->
         host_label(host, action)
 

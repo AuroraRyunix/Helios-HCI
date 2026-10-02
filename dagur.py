@@ -25,6 +25,12 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
 
 socket.setdefaulttimeout(45.0)
 
+# How long a job's command may run when the task does not say. Scheduled maintenance --
+# a scrub, a repair, a health sweep -- is measured in minutes, and the console now submits
+# cluster-wide operations through this same queue. The task can raise or lower it with a
+# `timeout` in its payload; this is only the number for a task that does not care.
+DEFAULT_JOB_TIMEOUT = 3600
+
 LOCAL_IP = "127.0.0.1"
 
 # Load local environment settings if available
@@ -58,17 +64,30 @@ def spark_endpoint(ip):
         return ip, False
     return ip, True
 
-def run_remote_spark(ip, command):
+def run_remote_spark(ip, command, timeout=DEFAULT_JOB_TIMEOUT):
+    """Run one command on a node and return (returncode, stdout, stderr).
+
+    The timeout is passed to spark-daemon rather than left out. Omitting it does not mean
+    "no limit": spark-daemon defaults an absent `timeout` to 45 seconds and kills the
+    command there, so every job dagur has ever run was silently capped at forty-five
+    seconds of work and anything longer came back as "Command timed out" from a daemon the
+    caller never named. That is a control-plane number, and a scheduled job is not a
+    control-plane call.
+
+    The urllib read gets the same budget plus a margin, so the socket outlives the command
+    it is waiting for -- otherwise a job that legitimately runs to its limit is reported as
+    a transport failure rather than as its own exit code.
+    """
     ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
     context.check_hostname = verify_identity
 
     url = f"https://{ip}:9099/api/v1/execute"
-    data = json.dumps({"command": command}).encode("utf-8")
+    data = json.dumps({"command": command, "timeout": timeout}).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=timeout + 15) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res["returncode"], res["stdout"], res["stderr"]
     except Exception as e:
@@ -172,23 +191,24 @@ def insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, 
     """
     run_cql_query(cql)
 
-def execute_dagur_job_thread(task_id, job_name, command):
+def execute_dagur_job_thread(task_id, job_name, command,
+                             timeout=DEFAULT_JOB_TIMEOUT, reports_progress=False):
     run_id = str(uuid.uuid4())
     start_time = int(time.time() * 1000)
-    
+
     cql_start = f"""
     INSERT INTO hydra.dagur_runs (job_name, start_time, run_id, status, exit_code, output)
     VALUES ('{job_name}', {start_time}, {run_id}, 'RUNNING', -1, 'Job started...');
     """
     run_cql_query(cql_start)
-    
+
     # Notify Catalyst we are processing
     call_catalyst_api("/api/v1/tasks/update", {
         "task_id": task_id,
         "status": "processing",
         "progress": 5
     }, method="POST")
-    
+
     stop_progress_ticker = threading.Event()
     def progress_ticker():
         current_prog = 5
@@ -202,12 +222,25 @@ def execute_dagur_job_thread(task_id, job_name, command):
                     "status": "processing",
                     "progress": current_prog
                 }, method="POST")
-                
-    ticker_thread = threading.Thread(target=progress_ticker)
-    ticker_thread.start()
-    
+
+    # The ticker is a guess -- it climbs to 95 in ten seconds and sits there however long
+    # the job runs. That is honest enough for a job with nothing better to say, and it is
+    # actively wrong for one that knows where it is: two writers on the same `progress`
+    # column would have a real 20% overwritten by an invented 95% a second later. A task
+    # that says it reports its own progress gets the column to itself.
+    ticker_thread = None
+    if not reports_progress:
+        ticker_thread = threading.Thread(target=progress_ticker)
+        ticker_thread.start()
+
     try:
-        exit_code, stdout, stderr = run_remote_spark("127.0.0.1", command)
+        # The task id travels into the command's environment, so a command that wants to
+        # report real progress can address the task it is running as. Nothing is required
+        # to read it; a command that ignores it behaves exactly as before.
+        exit_code, stdout, stderr = run_remote_spark(
+            "127.0.0.1",
+            f"CATALYST_TASK_ID={task_id} {command}" if task_id else command,
+            timeout=timeout)
         out_str = stdout + stderr
         status = 'SUCCESS' if exit_code == 0 else 'FAILED'
     except Exception as e:
@@ -216,8 +249,9 @@ def execute_dagur_job_thread(task_id, job_name, command):
         status = 'FAILED'
     finally:
         stop_progress_ticker.set()
-        ticker_thread.join()
-        
+        if ticker_thread:
+            ticker_thread.join()
+
     end_time = int(time.time() * 1000)
     insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, out_str)
     
@@ -246,9 +280,18 @@ def main():
                 
                 job_name = payload.get("job_name")
                 command = payload.get("command")
-                
+                timeout = payload.get("timeout") or DEFAULT_JOB_TIMEOUT
+                try:
+                    timeout = max(1, int(timeout))
+                except (TypeError, ValueError):
+                    timeout = DEFAULT_JOB_TIMEOUT
+                reports_progress = bool(payload.get("reports_progress"))
+
                 print(f"[Dagur] Received task from Catalyst: {job_name} ({action})")
-                t = threading.Thread(target=execute_dagur_job_thread, args=(task_id, job_name, command), daemon=True)
+                t = threading.Thread(
+                    target=execute_dagur_job_thread,
+                    args=(task_id, job_name, command, timeout, reports_progress),
+                    daemon=True)
                 t.start()
                 
             elif status == 204:

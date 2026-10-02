@@ -23,15 +23,22 @@ defmodule SpectrumPhx.Lcm do
   rather than defaulting to the start, because "we do not know where it is" and "it has
   just begun" are different states.
 
-  ## Only reads and the two safe actions live here
+  ## The two long operations are Catalyst tasks, not requests
 
-  Checking the feed asks a remote for a version, and aborting stops a running upgrade --
-  both are things an operator watching a bad upgrade must be able to do. *Starting* one
-  rolls every node through maintenance and reboots, and *uploading* a package accepts a
-  signed archive; neither is offered from the rebuilt console yet, and the page says so
-  rather than presenting a button that is not wired.
+  Starting an upgrade rolls every node through maintenance and a reboot; loading a package
+  validates a signed archive and copies it to every node. Both run for minutes and both
+  fail in ways an operator has to see, so neither happens inside a LiveView event. Each is
+  submitted to Catalyst as a `dagur` task running a hylia entry point on the ZooKeeper
+  leader, which puts its progress in the header's task ring and its failure -- the
+  command's own output -- in `hydra.catalyst_tasks` where the console reads it back.
+
+  The upgrade task is *not* the upgrade. `hylia --start-upgrade` marks the job STARTING and
+  then watches it: the rolling upgrade itself is run by the hylia daemon on the leader,
+  exactly as it was before, so nothing about how an upgrade proceeds changes here. What the
+  task adds is a row that lives as long as the upgrade does and ends in its verdict.
   """
 
+  alias SpectrumPhx.Catalyst
   alias SpectrumPhx.Hydra
 
   @inventory_cql "SELECT key, inventory_json, last_updated FROM hydra.lcm_inventory"
@@ -285,7 +292,13 @@ defmodule SpectrumPhx.Lcm do
   def progress(_state, _targets, _current, _logs), do: 0
 
   # The phases hylia logs as it works a node, as a fraction of that node's share.
-  @phases [{"restore", 1.0}, {"reboot", 0.83}, {"deploy", 0.5}, {"cop", 0.5}, {"maintenance", 0.17}]
+  @phases [
+    {"restore", 1.0},
+    {"reboot", 0.83},
+    {"deploy", 0.5},
+    {"cop", 0.5},
+    {"maintenance", 0.17}
+  ]
 
   defp phase_fraction(nil, _logs), do: 0.0
 
@@ -314,15 +327,181 @@ defmodule SpectrumPhx.Lcm do
   def finished_nodes(_targets, _current, _state), do: []
 
   @doc "Whether a job is still moving."
-  def running?(%{state: state}), do: state in ["UPGRADING", "DOWNLOADING", "PENDING"]
+  def running?(%{state: state}), do: state in ["UPGRADING", "DOWNLOADING", "PENDING", "STARTING"]
   def running?(_job), do: false
+
+  # -- the two long operations ------------------------------------------------------------
+
+  # Where the console stages an uploaded package on the leader, and the only path
+  # `--load-package` will read. It is fixed rather than passed, so nothing an operator
+  # types reaches a command line: the browser names the file, the daemon does not care
+  # what it was called, and hylia is told to look in one place.
+  @package_path "/tmp/helios_update.zip"
+
+  # Read by `SpectrumPhx.Tasks` out of the row's payload and shown in the ring, so they
+  # are part of what an operator sees rather than internal labels.
+  @upgrade_job "lcm_rolling_upgrade"
+  @package_job "lcm_load_package"
+
+  # A rolling upgrade drains, deploys, reboots and waits for each node in turn. Three nodes
+  # with a reboot apiece is comfortably an hour; the ceiling exists so a wedged upgrade
+  # eventually becomes a failed task rather than one that is pending forever.
+  @upgrade_timeout 14_400
+  # Validating an archive is quick; copying it to every node is not, and it goes through
+  # spark in base64 chunks.
+  @package_timeout 1_800
+
+  @doc "Where an uploaded package is staged on the leader."
+  def package_path, do: @package_path
+
+  @doc "The `job_name` each of the two tasks carries."
+  def job_names, do: %{upgrade: @upgrade_job, package: @package_job}
+
+  @doc """
+  Start the rolling upgrade for the package that is already loaded.
+
+  Refused when there is no job -- an upgrade with nothing to install is an operator who
+  believes a package was uploaded and was not -- and when one is already running, because
+  the second start would have hylia resuming a job it is in the middle of.
+
+  On success, `{:ok, task_id}`. The task is the *watcher*: hylia's daemon runs the upgrade,
+  and this row tracks it from STARTING to its verdict.
+  """
+  @spec start_upgrade(keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def start_upgrade(opts \\ []) do
+    with {:ok, job} <- loaded_job(opts),
+         :ok <- refuse_if_running(job),
+         {:ok, id} <- upgrade_job_id(job) do
+      Catalyst.run_on_leader(
+        @upgrade_job,
+        "python3 /usr/local/bin/hylia --start-upgrade " <> id,
+        timeout: @upgrade_timeout,
+        reports_progress: true,
+        payload: %{"job_id" => id, "build" => job.build}
+      )
+      |> submitted("The upgrade could not be started")
+    end
+  end
+
+  @doc """
+  Validate the staged package, distribute it, and record the job it describes.
+
+  The bytes are already on the leader by the time this is called --
+  `SpectrumPhx.Lcm.PackageUploadWriter` streams them there from the browser, so this tier
+  never holds an archive. What is left is the part that talks to every node, and that is
+  the task.
+
+  `size_bytes` is carried only so the row says how big the thing being installed was; the
+  daemon reads the file it was handed and checks the signature over the manifest before it
+  trusts a single digest inside it.
+  """
+  @spec load_package(String.t(), non_neg_integer()) :: {:ok, String.t()} | {:error, String.t()}
+  def load_package(filename, size_bytes) do
+    Catalyst.run_on_leader(
+      @package_job,
+      "python3 /usr/local/bin/hylia --load-package " <> @package_path,
+      timeout: @package_timeout,
+      payload: %{"filename" => clean_filename(filename), "size_bytes" => size_bytes}
+    )
+    |> submitted("The package could not be handed to the cluster")
+  end
+
+  @doc """
+  Why the package upload is built the way it is.
+
+  Shown on the page, because an operator watching a multi-hundred-megabyte transfer is
+  owed an explanation of where it is going.
+  """
+  def upload_note do
+    """
+    The archive streams from your browser to the ZooKeeper leader's own daemon and is
+    staged at #{@package_path}. Nothing is written in the console tier, so a package
+    larger than this container's disk is not a problem. Validating the signature,
+    checking every component digest and copying the archive to the other nodes then runs
+    as a Catalyst task, and its result is in the task ring.
+    """
+  end
+
+  defp loaded_job(opts) do
+    case job(static_source(opts)) do
+      nil ->
+        {:error,
+         "No upgrade package is loaded. Upload one first -- there is nothing for a " <>
+           "rolling upgrade to install."}
+
+      job ->
+        {:ok, job}
+    end
+  end
+
+  defp refuse_if_running(job) do
+    if running?(job),
+      do:
+        {:error,
+         "An upgrade is already running (#{job.state}). Abort it before starting another."},
+      else: :ok
+  end
+
+  # `job_id` is a CQL uuid, and it is about to be a word in a root shell command on the
+  # leader. Xandra hands it back as a string in the normal case and as a `%Xandra.UUID{}`
+  # or a raw binary in others, so it is coerced and then *matched*: anything that is not a
+  # UUID is refused rather than escaped, because there is no legitimate way for this value
+  # to be anything else.
+  @uuid_regex ~r/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
+
+  defp upgrade_job_id(job) do
+    id = to_string(job.id || "")
+
+    if Regex.match?(@uuid_regex, id) do
+      {:ok, id}
+    else
+      {:error,
+       "The loaded upgrade job has no usable id (#{inspect(job.id)}). Re-upload the package."}
+    end
+  end
+
+  defp submitted({:ok, %{"task_id" => id}}, _context) when is_binary(id), do: {:ok, id}
+
+  defp submitted({:ok, _other}, context),
+    do: {:error, context <> ": Catalyst accepted the task but did not name it."}
+
+  defp submitted({:error, reason}, context),
+    do: {:error, context <> ": " <> Catalyst.describe(reason)}
+
+  # The row is read back and rendered, and the browser chose this string. Keeping it to a
+  # basename of ordinary characters means a task label cannot carry a path or markup.
+  defp clean_filename(name) when is_binary(name) do
+    name
+    |> Path.basename()
+    |> String.replace(~r/[^A-Za-z0-9._-]/, "_")
+    |> String.slice(0, 120)
+  end
+
+  defp clean_filename(_name), do: "update.zip"
 
   # -- plumbing ---------------------------------------------------------------------------
 
+  @doc """
+  Where reads come from when the caller does not say: `:live`, or `{:static, map}` set in
+  `Application.get_env(:spectrum_phx, :lcm_source)`.
+
+  The same seam `SpectrumPhx.Tasks` carries, and it exists for the same reason: the
+  controls on this page are only worth having if they are exercised through the real
+  route, and a page that can only be mounted against a cluster is a page whose buttons
+  are never tested.
+  """
+  def source, do: Application.get_env(:spectrum_phx, :lcm_source, :live)
+
   defp static_source(opts) do
     case Keyword.get(opts, :source, :live) do
-      {:static, map} -> map
-      :live -> nil
+      {:static, map} ->
+        map
+
+      :live ->
+        case source() do
+          {:static, map} -> map
+          _live -> nil
+        end
     end
   end
 
