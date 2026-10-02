@@ -174,14 +174,59 @@ already-fixed when it had never worked.
   paste in the public half, or update checks stay failed-closed.
 * **Unsandboxed root command execution.** `/api/v1/execute` runs caller-supplied strings via
   `shell=True` as root. **In progress**: the typed API in [docs/spark_api.md](./docs/spark_api.md)
-  covers 22 endpoints. **The remaining count was wrong, and larger than recorded**: 184 call sites,
-  not 105, because `cluster_new.py` (62) and `dagur.py` (1) were never counted -- they reach the same
-  shell through their own copies of `run_remote_spark`. Current: `spectrum_server.py` 64,
-  `cluster_new.py` 62, `vali.py` 28, `hylia.py` 22, `mipha.py` 7, `dagur.py` 1. They group into roughly
-  ten endpoint families -- systemd unit control (~15), filesystem operations (~22, needing careful path
-  allowlisting), network probing via `ss`/`ip` (~12), linstor/drbd (~14, mostly already typed), virsh
-  (~4), and `podman exec` for cqlsh (~8, which belongs behind Daruk rather than Spark). This is a
-  programme of work rather than a task: each family needs an endpoint designed, validated and tested.
+  covers 28 paths. **149 call sites remain**, down from 194: `cluster_new.py` 58, `hylia.py` 38,
+  `spectrum_server.py` 34, `vali.py` 15, `mipha.py` 3, `dagur.py` 1.
+
+  Those figures are counted, by one stated rule, and the rule matters because the last two
+  recordings were both wrong. A **call site** is a call to `run_remote_spark` or to any function
+  that takes a command as a parameter and forwards it to one -- `run_parallel`,
+  `run_checked_cmd`, `run_parallel_checked`; `run_linstor_cmd` before it -- not counting the
+  forwarding call inside the wrapper, which is the wrapper. The figure of 105 missed
+  `cluster_new.py` and `dagur.py` entirely. The 184 that replaced it had the total nearly right
+  and the split badly wrong: when it was written `hylia.py` held 37 and was recorded as 22, and
+  `spectrum_server.py` held 36 and was recorded as 64. The total is what gets quoted; the split is what anyone
+  planning the next family actually reads.
+
+  **Two families are finished.** Counted as shell strings rather than call sites, because a
+  string in a loop over every node is one place to get wrong and many invocations:
+
+  * **systemd unit control** -- **48** strings, not the ~15 estimated here. 44 are gone: 42 that
+    were handed to spark-daemon, and two local `subprocess.run("systemctl restart ...",
+    shell=True)` in `spectrum_server.py` that became argv lists on the way past. `GET`/`POST`
+    `/api/v1/host/units`, with unit names matched against `MANAGED_UNITS` -- every unit
+    `provision.py` installs, plus `chronyd`, `libvirtd` and `virtqemud`, the three host units the
+    stack drives without owning. `ignore_failed` is the `|| true` these strings carried and
+    `detach` is the backgrounded subshell a node needed to restart the daemon answering the
+    request. Four strings remain and each has a reason recorded in the test: printed advice to
+    an operator; a line inside the base64 wipe script `cluster destroy` runs (a
+    filesystem-family call site, and it moves when that does); hylia restarting itself locally
+    with a constant command; and `mipha.legacy_spark_fence`, which is reached only when a host
+    answered 404 to the typed fence and therefore must not require a typed endpoint of its own.
+  * **network probing** -- **11** strings, all gone. `GET /api/v1/host/listeners` (with `?port=`,
+    answering a boolean, because `ss -tlnp | grep 9042` also matches a peer address of
+    10.0.90.42, a queue depth and another process's pid), `GET /api/v1/host/interfaces`, and a
+    `cidr` field on `/api/v1/host/network`'s addresses so the console stops re-reading
+    `ip addr show` through a shell for a string it was handed the parts of. `mipha.ping_host`
+    went to argv in passing -- it interpolated an address out of `cluster.json` straight into a
+    root shell.
+
+  `test_spark_shell_calls.py` asserts the property rather than the change -- no caller builds a
+  shell string in either family -- reading string literals out of the AST, so an f-string is as
+  visible as a plain one and the comments explaining what each call site used to be are not
+  mistaken for the thing they replaced. Its allow-list checks found two dead unit names in
+  hylia's restart map (`aether`, removed with DRBD; `spark`, which was never the unit name --
+  it is `spark-daemon`), both of which had been failing silently as unknown units, and a whole
+  stale phase in `cluster start` that restarted `aether` and then exited when it did not come
+  up. `cluster create` lost that phase when the unit was deleted; `cluster start` kept it, so
+  every `cluster start` since has failed on a service that does not exist.
+
+  The remaining families: filesystem operations (the largest, and needing careful path
+  allowlisting), `podman`/container operations, `virsh`, base64 file transfer in the LCM paths,
+  `podman exec` for cqlsh (which belongs behind Daruk rather than Spark), process control
+  (`pkill`/`pgrep`, the half of the legacy fence that is not a unit action), journal reading,
+  and the dagur scheduled-job path, which is the one place a free command string is the feature.
+  This is a programme of work rather than a task: each family needs an endpoint designed,
+  validated and tested.
 * ~~Catalyst/Vali internal APIs are reachable on the LAN with no auth.~~ **Resolved (2026-08-20)**:
   both now require mutual TLS against the cluster CA, with `CERT_REQUIRED`, and neither starts if its
   certificates are absent -- falling back to plain HTTP when something is already wrong would reopen

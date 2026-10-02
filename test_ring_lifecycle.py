@@ -849,14 +849,24 @@ class TheEnsembleKeepsItsIdentities(unittest.TestCase):
 class EveryMemberIsToldItsOwnId(unittest.TestCase):
     def setUp(self):
         self.written = {}
+        self.reloaded = []
         self.original = cluster.run_remote_spark
+        self.original_units = cluster.unit_action
 
         def fake(ip, command):
             self.written[ip] = command
             return 0, "", ""
 
+        # Writing the unit file and reloading systemd are two calls now: the file write
+        # has no typed endpoint, the reload does.
+        def fake_units(ip, action, units=None, **kwargs):
+            self.reloaded.append((ip, action))
+            return True, ""
+
         cluster.run_remote_spark = fake
+        cluster.unit_action = fake_units
         self.addCleanup(setattr, cluster, "run_remote_spark", self.original)
+        self.addCleanup(setattr, cluster, "unit_action", self.original_units)
 
     def decoded(self, ip):
         import base64 as b64
@@ -869,6 +879,10 @@ class EveryMemberIsToldItsOwnId(unittest.TestCase):
         self.assertEqual(failed, [])
         self.assertIn("ZOO_MY_ID=1", self.decoded("10.0.0.1"))
         self.assertIn("ZOO_MY_ID=3", self.decoded("10.0.0.3"))
+        # A unit file systemd has not been told to re-read is a unit file that does
+        # nothing until something else happens to reload it.
+        self.assertEqual(self.reloaded,
+                         [("10.0.0.1", "daemon-reload"), ("10.0.0.3", "daemon-reload")])
 
     def test_every_member_sees_the_same_ensemble(self):
         cluster.write_zookeeper_ensemble([(1, "10.0.0.1"), (3, "10.0.0.3")])
@@ -911,7 +925,7 @@ class RemovingANodeShrinksTheEnsemble(unittest.TestCase):
         block = source[start:start + 4000]
         self.assertIn("read_zookeeper_ids(survivors)", block)
         self.assertIn("write_zookeeper_ensemble(zk_members)", block)
-        self.assertIn("systemctl restart zookeeper", block)
+        self.assertIn('unit_action(ip, "restart", ["zookeeper"])', block)
 
     def test_the_plan_no_longer_sends_the_operator_to_do_it_by_hand(self):
         source = open(os.path.join(HERE, "cluster_new.py"), encoding="utf-8").read()

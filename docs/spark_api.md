@@ -15,9 +15,10 @@ string is an injection sink, which is why VM names, image filenames, session tok
 update-server values each had to be patched separately; and the web tier ends up
 re-implementing host orchestration, which is why it grew to 95 endpoints.
 
-Spark already has the right shape -- 22 typed endpoints, and `forward_to_vali()` already
-brokers VM power/migrate/balance and host maintenance through to Vali. The work is to
-finish that pattern and stop routing around it.
+Spark already has the right shape -- **28 typed paths**, counted off the router in
+`spark_daemon_decoded.py` rather than off the table below, which had drifted behind it --
+and `forward_to_vali()` already brokers VM power/migrate/balance and host maintenance
+through to Vali. The work is to finish that pattern and stop routing around it.
 
 ## Design rules
 
@@ -181,9 +182,87 @@ need no lease, and writes are refused by class at the NBD layer. The seal drains
 because the drain is itself a write path and a vdisk frozen around an undrained journal
 could never finish draining it.
 
+### Host
+
+| Method | Path | Body / Query | Returns |
+| :-- | :-- | :-- | :-- |
+| GET | `/api/v1/host/cpu` | -- | `{"model","cores","physical_cores","sockets","load_average"}` |
+| GET | `/api/v1/host/memory` | -- | parsed `/proc/meminfo` |
+| GET | `/api/v1/host/disks` | -- | the `{"blockdevices":[...]}` object from `lsblk -J` |
+| GET | `/api/v1/host/network` | -- | `{"default_interface","default_gateway","addresses":[...]}` |
+| GET | `/api/v1/host/interfaces` | -- | `{"interfaces":[{"name","mac","operstate","virtual","addresses"}]}` |
+| GET | `/api/v1/host/listeners` | `?port=` (optional) | `{"listeners":[...]}`, or `{"port","listening","listeners"}` |
+| GET | `/api/v1/host/units` | `?units=a,b` (optional) | `{"units":[{"unit","load_state","active_state","sub_state","unit_file_state","active"}]}` |
+| POST | `/api/v1/host/units` | `{"action","units","detach"?,"ignore_failed"?}` | `{"action","units","ok"}` |
 | GET | `/api/v1/host/capabilities` | -- | `{"kvm":bool,"secure_boot":bool}` |
 | GET | `/api/v1/host/dhcp-leases` | -- | `{"leases":[{"mac","ip","hostname","expires"}]}` |
 | POST | `/api/v1/host/reboot` | `{"confirm":true}` | `{"rebooting":true}` |
+
+#### `/api/v1/host/units`
+
+Unit control is the one place where design rule 1 has to be read carefully. "Model domain
+operations, not shell verbs" rules out `/exec/rm`, but starting and stopping a service *is*
+a domain operation on a host -- it is what `cluster start`, a maintenance window and a
+rolling upgrade are made of -- so it earns an endpoint the way `/host/reboot` does.
+
+What makes it safe is not the shape of the verb, it is the allow-list behind the unit
+name. `MANAGED_UNITS` in `spark_daemon_decoded.py` is every unit `provision.py` installs,
+plus `chronyd`, `libvirtd` and `virtqemud` -- three host units the stack drives without
+owning. A name outside it is refused with `400` and a message naming it; nothing is
+stripped, normalised or dropped. `zookeeper.service` is refused too: one spelling per
+unit, or the allow-list has to be checked in two forms and the second is the one an edit
+forgets.
+
+`action` is one of `start` `stop` `restart` `enable` `disable` `daemon-reload`, and
+`daemon-reload` is the only one that takes no `units`. The whole list goes to systemd in
+one transaction rather than one call per unit, because systemd orders a transaction by the
+units' own dependencies and fifteen sequential stops in the caller's order is a different
+operation.
+
+Two flags carry idioms the shell strings used to spell out:
+
+* `ignore_failed: true` is `|| true`. The failure is still reported in the body; it is
+  just answered `200` instead of `409`. Stopping a service that is not running is the
+  usual case on a clean host.
+* `detach: true` is `(sleep 1 && systemctl restart <unit>) >/dev/null 2>&1 < /dev/null &`.
+  It answers immediately and acts afterwards, and it exists because `spark-daemon` is in
+  the list: restarting it inline means systemd kills the process partway through writing
+  the reply, and the caller sees a connection reset it cannot tell from a node that has
+  gone away. A detached call returns `{"detached": true}` and reads nothing back; a caller
+  that wants the outcome asks `GET /api/v1/host/units` afterwards.
+
+A failed action answers `409` and carries `states` -- the per-unit read-back -- so the
+caller learns which unit is in what state rather than only that something failed.
+
+The read side uses `systemctl show` rather than `systemctl is-active`, and that is not a
+detail. `is-active a b c` prints three bare words and leaves the caller matching answers
+to units by line number, so a single missing line shifts every unit's state onto its
+neighbour. `show` prints `Id=` with each block, distinguishes "inactive" from "there is no
+such unit", and the response carries `active` as a boolean so that the comparison against
+the literal `"active"` happens once here instead of at every call site.
+
+#### `/api/v1/host/listeners` and `/api/v1/host/interfaces`
+
+`listeners` parses `ss -ltnp` into `{"protocol","address","port","process","pid"}`, with
+`port` as a **number**. Every caller this replaced wrote `ss -tlnp | grep <port>` and read
+a match as "the service is up" -- but `grep 9042` also matches a peer address of
+10.0.90.42, a queue depth, and another process's pid, so the check could pass on a node
+where nothing had bound the port at all. `?port=` answers `{"listening": bool}` directly,
+because the caller doing the scanning was the thing that was wrong.
+
+`interfaces` reads `/sys/class/net` and `ip -j addr` and returns every interface with a
+`virtual` flag. The flag is by name -- `lo`, `virbr*`, `br-*`, `vxlan*`, `veth*`, `vnet*`,
+`macvtap*` -- because that is the rule it replaces, a `find /sys/class/net` carrying
+exactly those `-not -name` clauses, shelled out to every node in the cluster. Asking sysfs
+whether an interface has a backing device would answer differently for a bond or a bridge,
+which are genuine uplinks. Every interface is reported and the caller filters; the daemon
+says what is on the host, and which of those a user may pick is the console's business.
+
+`/api/v1/host/network`'s `addresses` elements are
+`{"interface","family","address","prefixlen","cidr","scope"}`. `cidr` is new, and it
+closes the gap that used to be listed below: the console was handed `address` and
+`prefixlen` and then ran `ip addr show <iface> | grep 'inet '` through a shell to get the
+joined string back.
 
 ### Database (ScyllaDB via the hydra-db container)
 
@@ -198,9 +277,17 @@ keyspace and must not block an HTTP request.
 ## Migration
 
 Each call site moves from `run_remote_spark(ip, "<shell string>")` to
-`run_mtls_spark_api(ip, "<path>", payload, method=...)`. The raw-call count is the metric:
-79 today in `spectrum_server.py`. `/api/v1/execute` is removed when it reaches zero across
-`spectrum_server.py`, `vali.py`, `hylia.py`, `mipha.py` and `cluster_new.py`.
+`run_mtls_spark_api(ip, "<path>", payload, method=...)`. The raw-call count is the metric,
+and it is counted rather than estimated -- see the correction below for what estimating it
+cost. `/api/v1/execute` is removed when the count reaches zero across `spectrum_server.py`,
+`cluster_new.py`, `vali.py`, `hylia.py`, `mipha.py` and `dagur.py`.
+
+**149 call sites remain**, down from 194: `cluster_new.py` 58, `hylia.py` 38,
+`spectrum_server.py` 34, `vali.py` 15, `mipha.py` 3, `dagur.py` 1. Two families are finished --
+systemd unit control and network probing -- and `test_spark_shell_calls.py` is what keeps
+them finished: it asserts that no caller builds a shell string in either family, reading
+string literals out of the AST so that an f-string is as visible as a plain one and a
+comment quoting the command it replaced is not mistaken for the command.
 
 Note this work is not contingent on the Phoenix rewrite: it improves the Python tier
 directly, and the Elixir client consumes the same contract.
@@ -220,13 +307,15 @@ calls each would retire.
 | `POST /api/v1/vm/{name}/disk/resize` | 1 | `virsh blockresize`. |
 | ~~`drbdadm resize`~~ | ~~1~~ | **Gone with DRBD.** A vdisk is sparse and its map is keyed by extent index, so growing one changes a recorded size and nothing else; `resize` on `/api/v1/dfs/vdisk` covers it, and only qemu needs telling afterwards. |
 | ~~Linstor resource operations~~ | ~~3~~ | **Gone with LINSTOR.** Every storage operation goes through `/api/v1/dfs/vdisk`, and the figure of 3 was wrong in a way worth keeping — see the correction below. |
-| `GET /api/v1/host/cpu` | 1 | Core count and model. |
+| ~~`GET /api/v1/host/cpu`~~ | ~~1~~ | **Landed.** Core count, model and load average, read from `/proc`. |
 | `GET /api/v1/host/ping` | 2 | A liveness probe for the reboot task. Currently `echo 1`, and not migrated because `run_mtls_spark_api` has a 120s timeout against `run_remote_spark`'s 60s, which would change reboot detection timing. |
+| Process control (`pkill`, `pgrep`) | 2 | `mipha.legacy_spark_fence` and the reading back that proves it took. A name-pattern kill needs the same treatment a unit name got: an allow-list, not a string. Note the fence's `systemctl` clause is deliberately **not** migrated with the rest of its family: that function is reached only when a host answered 404 to the typed fence, so a daemon old enough to reach it is old enough to 404 on `/host/units` as well, and a compatibility path that requires the endpoint it exists to be compatible without fails silently. |
+| Journal reading (`journalctl -u <unit>`) | 1 | `cluster_new` reads hydra-db's bootstrap progress out of the journal. Adjacent to unit control and deliberately not folded into it: reading a unit's log is a different operation from acting on the unit, with a different answer shape. |
 
-Two shape ambiguities in v1 worth tightening when these land: the element shape of
-`/host/network`'s `addresses` array was left unspecified (a caller needing a per-interface
-CIDR had to keep shelling out), and `/host/disks` returning `{"blockdevices": [...]}`
-follows `lsblk -J` rather than being stated in the contract.
+One shape ambiguity in v1 is left: `/host/disks` returns `{"blockdevices": [...]}` because
+`lsblk -J` does, which follows upstream rather than being stated in the contract. The other
+one is closed -- `/host/network`'s `addresses` elements are specified above and now carry
+`cidr`, which is the field the caller who "had to keep shelling out" was shelling out for.
 
 Remaining by design: `rm`, `echo >`, `mkdir` and base64-decode calls in the LCM
 file-transfer and config-sync paths. Exposing file verbs as endpoints would reproduce
@@ -255,6 +344,27 @@ question rather than answering it — the shape cannot drift out from under a ca
 because nothing upstream owns it.
 
 Nothing storage-related requires `/execute` any more.
+
+The correction needed a correction of its own. The next figure recorded -- 184 call sites,
+split `spectrum_server.py` 64, `cluster_new.py` 62, `vali.py` 28, `hylia.py` 22,
+`mipha.py` 7, `dagur.py` 1 -- had the right total to within five and the wrong split by a
+long way: `hylia.py` had 37 and not 22, and `spectrum_server.py` 36 and not 64. A total
+that is nearly right hides a per-file breakdown that is not, and the breakdown is what
+anyone planning the next family reads.
+
+So the count is now produced the same way every time, and stated so it can be reproduced:
+a **call site** is a call to `run_remote_spark`, or to any function that takes a command as
+a parameter and forwards it to one -- `run_parallel`, `run_checked_cmd` and
+`run_parallel_checked` in `cluster_new.py` today, `run_linstor_cmd` before it -- excluding
+the forwarding call inside the wrapper itself, which is the wrapper and not a site.
+
+Also worth writing down, because it will happen again: two of the four call sites removed
+from `hylia.py` came back as one. Splitting a chained shell string moves the clauses that
+have a typed endpoint and leaves the ones that do not, and where those alternate, the
+remainder becomes more than one call. `podman rm -f systemd-spectrum` sat between a stop
+and a start; the two service clauses left the shell and the container clause became a call
+site of its own. The number went down by two rather than three, and that is the right
+trade.
 
 ## Related
 

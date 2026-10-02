@@ -91,6 +91,55 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         return -1, {}, str(e)
 
 
+def run_mtls_spark_api_full(ip, path, payload=None, method="POST"):
+    """Like run_mtls_spark_api, but keeps the status code and the 4xx body.
+
+    The typed API refuses a bad parameter with 400 and a sentence naming it;
+    run_mtls_spark_api would reduce that to "HTTP Error 400: Bad Request" and the
+    sentence is the whole value. An upgrade that names a component the cluster no longer
+    installs needs to say so in the job log, not fail silently.
+
+    Returns (status, body, error). status is 0 when the request could not be made.
+    """
+    import urllib.error
+    address, verify_identity = spark_endpoint(ip)
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = verify_identity
+
+    url = f"https://{address}:9099{path}"
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8")), ""
+        except Exception:
+            return exc.code, {}, str(exc)
+    except Exception as e:
+        return 0, {}, str(e)
+
+
+def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
+    """Act on systemd units on a host. Returns (ok, detail)."""
+    payload = {"action": action, "units": list(units)}
+    if detach:
+        payload["detach"] = True
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    status, body, error = run_mtls_spark_api_full(ip, "/api/v1/host/units", payload)
+    if status == 200:
+        return True, ""
+    if error:
+        return False, error
+    return False, str((body or {}).get("error") or "spark-daemon answered %s" % status)
+
+
 def get_cluster_hosts():
     try:
         with open("/etc/hci/cluster.json", "r") as f:
@@ -825,6 +874,11 @@ def hylia_rolling_upgrade(job_id):
 
                 if "spectrum" in components:
                     log_upgrade(job_id, f"[{hostname}] Rebuilding Spectrum container on host...")
+                    # The copies and the image build are still one shell string --
+                    # they are file and container operations, and neither family has a
+                    # typed endpoint yet. The two service clauses that used to hang off
+                    # the end of the same `&&` chain do, so they are separate calls, and
+                    # the chain's ordering is kept by not going on when a step fails.
                     build_cmd = (
                         "rm -rf /tmp/spectrum_build && mkdir -p /tmp/spectrum_build/static && "
                         "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/spectrum_server.py && "
@@ -834,12 +888,22 @@ def hylia_rolling_upgrade(job_id):
                         # absence on nodes provisioned before it shipped.
                         "if [ -f /usr/local/bin/lanayru.py ]; then cp /usr/local/bin/lanayru.py /tmp/spectrum_build/lanayru.py; fi && "
                         "cp -r /usr/local/bin/static/* /tmp/spectrum_build/static/ && "
-                        "podman build -t localhost/spectrum:latest /tmp/spectrum_build && "
-                        "systemctl stop spectrum && podman rm -f systemd-spectrum && systemctl start spectrum"
+                        "podman build -t localhost/spectrum:latest /tmp/spectrum_build"
                     )
                     rc_b, out_b, err_b = run_remote_spark(node_ip, build_cmd)
                     if rc_b != 0:
                         log_upgrade(job_id, f"[{hostname}] Warning during Spectrum build: {err_b or out_b}")
+                    else:
+                        ok_s, detail_s = spark_unit_action(node_ip, "stop", ["spectrum"])
+                        if ok_s:
+                            rc_rm, out_rm, err_rm = run_remote_spark(
+                                node_ip, "podman rm -f systemd-spectrum")
+                            if rc_rm == 0:
+                                ok_s, detail_s = spark_unit_action(node_ip, "start", ["spectrum"])
+                            else:
+                                ok_s, detail_s = False, (err_rm or out_rm)
+                        if not ok_s:
+                            log_upgrade(job_id, f"[{hostname}] Warning restarting Spectrum: {detail_s}")
                         
                 log_upgrade(job_id, f"[{hostname}] All files successfully copied.")
                 
@@ -974,16 +1038,21 @@ def hylia_rolling_upgrade(job_id):
                 run_remote_spark(node_ip, f"rm -f /var/lib/hylia/upgrade_rebooted_{job_id}")
                 
                 log_upgrade(job_id, f"[{hostname}] Starting Hylia daemon service on upgraded host...")
-                rc_st, stdout_st, stderr_st = run_remote_spark(node_ip, "systemctl start hylia")
-                if rc_st != 0:
-                    log_upgrade(job_id, f"[{hostname}] Warning: failed to start Hylia service: {stderr_st or stdout_st}")
+                ok_st, detail_st = spark_unit_action(node_ip, "start", ["hylia"])
+                if not ok_st:
+                    log_upgrade(job_id, f"[{hostname}] Warning: failed to start Hylia service: {detail_st}")
                 else:
                     log_upgrade(job_id, f"[{hostname}] Hylia daemon service started successfully.")
             else:
                 # Fast Patch Mode Service Restarts (excluding hylia itself until job completion)
                 log_upgrade(job_id, f"[{hostname}] Restarting service components for fast patch...")
+                # Component name to unit name. `aether` and `spark` used to be in here
+                # and are gone: aether.service was removed with DRBD, and Spark's unit
+                # is spark-daemon, which is not restarted from inside a request the
+                # daemon is answering -- a patch that ships a new spark-daemon takes
+                # effect on the reboot the full-upgrade path already performs.
                 service_components = {
-                    "zookeeper": "zookeeper", "hydra-db": "hydra-db", "aether": "aether", "spark": "spark", 
+                    "zookeeper": "zookeeper", "hydra-db": "hydra-db",
                     "spectrum": "spectrum", "bifrost": "bifrost", "dagur": "dagur", "mimir": "mimir", 
                     "vali": "vali", "catalyst": "catalyst", "gatoway": "gatoway", "logos": "logos", 
                     "mipha": "mipha", "daruk": "daruk", "agahnim": "agahnim", "slate": "slate", "urbosa": "urbosa"
@@ -992,7 +1061,9 @@ def hylia_rolling_upgrade(job_id):
                     if comp in service_components and comp != "hylia":
                         svc_name = service_components[comp]
                         log_upgrade(job_id, f"[{hostname}] Restarting service '{svc_name}'...")
-                        run_remote_spark(node_ip, f"systemctl restart {svc_name}")
+                        ok_r, detail_r = spark_unit_action(node_ip, "restart", [svc_name])
+                        if not ok_r:
+                            log_upgrade(job_id, f"[{hostname}] Warning restarting '{svc_name}': {detail_r}")
             
             log_upgrade(job_id, f"[{hostname}] Upgraded successfully and returned to normal service.")
             
@@ -1033,7 +1104,7 @@ def hylia_rolling_upgrade(job_id):
                     subprocess.Popen("nohup sh -c 'sleep 2 && systemctl restart hylia' > /dev/null 2>&1 &", shell=True)
                 else:
                     log_upgrade(job_id, f"[{node_hostname}] Restarting remote Hylia service...")
-                    run_remote_spark(node_ip, "systemctl restart hylia")
+                    spark_unit_action(node_ip, "restart", ["hylia"], detach=True)
                     
     except Exception as ex:
         log_upgrade(job_id, f"CRITICAL ERROR: Rolling Upgrade Failed: {ex}")

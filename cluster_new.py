@@ -6,6 +6,7 @@ import shlex
 import re
 import ssl
 import urllib.request
+import urllib.error
 import os
 import time
 import base64
@@ -284,6 +285,146 @@ def run_remote_spark(ip, command):
             return res["returncode"], res["stdout"], res["stderr"]
     except Exception as e:
         return -1, "", str(e)
+
+
+def run_mtls_spark_api_full(ip, path, payload=None, method="POST", timeout=120):
+    """Call a typed spark-daemon endpoint, keeping the status code and the 4xx body.
+
+    The same connection to the same daemon as run_remote_spark -- the same certificate
+    search, the same context -- differing only in which endpoint it reaches. The status
+    and the body are both kept because the typed API answers a refused parameter with
+    400 and a message naming it, and a refused parameter here means *this* call site is
+    wrong: `systemctl restart aether` was a shell string that failed silently as an
+    unknown unit for months, and "aether is not a unit this cluster manages" is the
+    sentence that would have ended it.
+
+    Returns (status, body, error). status is 0 when the request could not be made.
+    """
+    cert_paths = [
+        ("C:/Users/AuraFlight/.hci_temp_certs/ca.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.key"),
+        ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
+    ]
+    cert_path, key_path = None, None
+    for ca, cert, key in cert_paths:
+        if os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key):
+            cert_path, key_path = cert, key
+            break
+
+    context = ssl._create_unverified_context()
+    if cert_path and key_path:
+        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+    url = f"https://{ip}:9099{path}"
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8")), ""
+        except Exception:
+            return exc.code, {}, str(exc)
+    except Exception as e:
+        return 0, {}, str(e)
+
+
+def spark_api_error(status, body, error):
+    """The one sentence worth printing about a failed typed call."""
+    if error:
+        return error
+    detail = body.get("error") if isinstance(body, dict) else None
+    return str(detail or "spark-daemon answered %s" % status)
+
+
+def unit_action(ip, action, units=None, detach=False, ignore_failed=False):
+    """Act on systemd units on one node. Returns (ok, detail).
+
+    Replaces `run_remote_spark(ip, "systemctl <verb> <names>")`. The unit names are
+    parameters the far side checks against its own allow-list, so a name this cluster
+    does not manage is refused with a message instead of being run as root.
+
+    `ignore_failed` is what those shell strings wrote as `|| true`, and `detach` is what
+    they wrote as `(sleep 1 && ...) >/dev/null 2>&1 < /dev/null &`.
+    """
+    payload = {"action": action}
+    if units:
+        payload["units"] = list(units)
+    if detach:
+        payload["detach"] = True
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    status, body, error = run_mtls_spark_api_full(ip, "/api/v1/host/units", payload)
+    if status == 200:
+        return True, ""
+    return False, spark_api_error(status, body, error)
+
+
+def unit_action_parallel(ip_list, action, units=None, detach=False, ignore_failed=False):
+    """`unit_action` across every node at once, keyed by address."""
+    results = {}
+    threads = []
+
+    def worker(ip):
+        results[ip] = unit_action(ip, action, units, detach, ignore_failed)
+
+    for ip in ip_list:
+        thread = threading.Thread(target=worker, args=(ip,))
+        threads.append(thread)
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def unit_action_checked(ip_list, action, units=None, ignore_failed=False):
+    """`unit_action_parallel`, exiting on the first node that refuses.
+
+    The counterpart of run_parallel_checked, and it keeps that function's contract: a
+    service that will not start is not something the rest of a cluster build can be run
+    on top of.
+    """
+    print(f"Running '{action} {' '.join(units or [])}' on {ip_list}")
+    failures = unit_action_parallel(ip_list, action, units, ignore_failed=ignore_failed)
+    for ip, (ok, detail) in sorted(failures.items()):
+        if not ok:
+            print(f"[ERROR] [{ip}] could not {action} {' '.join(units or [])}: {detail}")
+            sys.exit(1)
+
+
+def unit_is_active(ip, unit):
+    """True when the unit is active on that node, False when it is not or unreadable.
+
+    Where the shell form compared `systemctl is-active` output against the literal
+    string "active", this reads a boolean the daemon derived from the same fact -- and
+    from `systemctl show`, which names the unit each answer belongs to rather than
+    leaving the caller to match answers to units by line number.
+    """
+    status, body, _ = run_mtls_spark_api_full(
+        ip, f"/api/v1/host/units?units={unit}", method="GET")
+    if status != 200:
+        return False
+    for state in body.get("units") or []:
+        if state.get("unit") == unit:
+            return bool(state.get("active"))
+    return False
+
+
+def port_listening(ip, port):
+    """True when the node has something in LISTEN on that TCP port.
+
+    This replaces `ss -tlnp | grep <port>`, which matched the port number anywhere in
+    the output -- a peer address of 10.0.90.42, a queue depth, another process's pid --
+    and so could report a service as listening on a node where nothing had bound it.
+    """
+    status, body, _ = run_mtls_spark_api_full(
+        ip, f"/api/v1/host/listeners?port={port}", method="GET")
+    if status != 200:
+        return False
+    return bool(body.get("listening"))
 
 
 class UdevHelper:
@@ -575,12 +716,20 @@ def write_zookeeper_ensemble(members, roles=None):
     for member_id, ip in members:
         quad = zookeeper_quadlet(member_id, members, roles)
         encoded = base64.b64encode(quad.encode()).decode()
+        # The file write is still a shell string -- writing a unit file is a filesystem
+        # operation and has no typed endpoint yet -- but the reload that follows it does,
+        # so it is a separate call rather than a third clause of an `&&` chain. The
+        # ordering the `&&` gave is kept explicitly: no reload unless the write landed.
         rc, _, _ = run_remote_spark(
             ip,
             "mkdir -p /etc/containers/systemd && echo %s | base64 -d "
-            "> /etc/containers/systemd/zookeeper.container && systemctl daemon-reload"
+            "> /etc/containers/systemd/zookeeper.container"
             % encoded)
         if rc != 0:
+            failed.append(ip)
+            continue
+        ok, _ = unit_action(ip, "daemon-reload")
+        if not ok:
             failed.append(ip)
     return failed
 
@@ -1262,9 +1411,9 @@ def cmd_add_node(args):
     # Restarted one at a time, oldest first: a rolling restart keeps a quorum of the
     # *previous* ensemble alive throughout, which an all-at-once restart does not.
     for ip in ips:
-        rc, _, err = run_remote_spark(ip, "systemctl restart zookeeper")
-        if rc != 0:
-            print("[ERROR] [%s] ZooKeeper did not restart: %s" % (ip, (err or "").strip()[:200]))
+        ok, detail = unit_action(ip, "restart", ["zookeeper"])
+        if not ok:
+            print("[ERROR] [%s] ZooKeeper did not restart: %s" % (ip, detail[:200]))
             return 1
         print("[zookeeper] %s restarted." % ip)
         time.sleep(3)
@@ -1288,10 +1437,16 @@ def cmd_add_node(args):
     encoded = base64.b64encode(quad.encode()).decode()
     rc, _, err = run_remote_spark(
         target,
-        "echo %s | base64 -d > /etc/containers/systemd/hydra-db.container && "
-        "systemctl daemon-reload && systemctl start hydra-db" % encoded)
+        "echo %s | base64 -d > /etc/containers/systemd/hydra-db.container" % encoded)
     if rc != 0:
-        print("[ERROR] [%s] hydra-db did not start: %s" % (target, (err or "").strip()[:200]))
+        print("[ERROR] [%s] could not write the hydra-db unit: %s"
+              % (target, (err or "").strip()[:200]))
+        return 1
+    ok, detail = unit_action(target, "daemon-reload")
+    if ok:
+        ok, detail = unit_action(target, "start", ["hydra-db"])
+    if not ok:
+        print("[ERROR] [%s] hydra-db did not start: %s" % (target, detail[:200]))
         return 1
     print("[hydra-db] started; bootstrapping from %s." % ", ".join(existing))
 
@@ -1597,13 +1752,22 @@ def main():
                 sys.exit(1)
             print(f"[{ip}] spark-daemon is online.")
             
-            # Check port conflicts
+            # Check port conflicts. The shell form searched `ss -tlnp` output for the
+            # port as a *substring*, which is why this used to warn about port 7000 on a
+            # node whose only match was a pid of 7000 -- the endpoint answers with the
+            # ports themselves, and holder names them.
             print(f"[{ip}] Checking port conflicts...")
-            rc, stdout, _ = run_remote_spark(ip, "ss -tlnp")
-            if rc == 0:
-                for port in ["7000", "3370"]:
-                    if port in stdout:
-                        print(f"[WARNING] Port {port} is already in use on {ip}. This may cause conflicts.")
+            status, body, _ = run_mtls_spark_api_full(
+                ip, "/api/v1/host/listeners", method="GET")
+            if status == 200:
+                held = {}
+                for entry in body.get("listeners") or []:
+                    held.setdefault(entry.get("port"), entry.get("process"))
+                for port in (7000, 3370):
+                    if port in held:
+                        holder = held[port] or "an unidentified process"
+                        print(f"[WARNING] Port {port} is already in use on {ip} by "
+                              f"{holder}. This may cause conflicts.")
 
             # Validate Secure Boot and ELRepo module signing key
             rc_sb, sb_out, _ = run_remote_spark(ip, "mokutil --is-sb-enabled")
@@ -1618,7 +1782,9 @@ def main():
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
         cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
-        run_parallel(ips, f"systemctl stop {' '.join(cleanup_services)} || true")
+        # `ignore_failed` is the `|| true` this used to carry: a service that is not
+        # running cannot be stopped, and on a clean host none of them are.
+        unit_action_parallel(ips, "stop", cleanup_services, ignore_failed=True)
 
         # 2. Hostname Resolution & Cluster JSON Config
         print("\n--- Phase 2: Hostname Resolution & Cluster Setup ---")
@@ -1767,7 +1933,8 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # up. Provisioning creates the thin LV and the mount; this starts the daemon and
         # checks that the mount actually took.
         print("\n--- Phase 4: Starting the storage data path ---")
-        run_parallel_checked(ips, "systemctl enable sidon && systemctl restart sidon")
+        unit_action_checked(ips, "enable", ["sidon"])
+        unit_action_checked(ips, "restart", ["sidon"])
 
         print("Verifying each node's extent store is mounted and answering...")
         for ip in ips:
@@ -1860,14 +2027,16 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 "WantedBy=multi-user.target\n"
             )
             zk_b64 = base64.b64encode(zk_quad.encode()).decode()
-            run_remote_spark(ip, f"mkdir -p /etc/containers/systemd && echo {zk_b64} | base64 -d > /etc/containers/systemd/zookeeper.container && systemctl daemon-reload")
+            # The unit file is written through /execute because writing a file has no
+            # typed endpoint; the reload it used to be chained to has one.
+            run_remote_spark(ip, f"mkdir -p /etc/containers/systemd && echo {zk_b64} | base64 -d > /etc/containers/systemd/zookeeper.container")
+            unit_action(ip, "daemon-reload")
 
         print("Starting ZooKeeper service in parallel...")
-        run_parallel_checked(ips, "systemctl restart zookeeper")
+        unit_action_checked(ips, "restart", ["zookeeper"])
         for ip in ips:
             for _ in range(30):
-                rc, out, _ = run_remote_spark(ip, "systemctl is-active zookeeper")
-                if rc == 0 and out.strip() == "active":
+                if unit_is_active(ip, "zookeeper"):
                     break
                 time.sleep(1)
             else:
@@ -1885,11 +2054,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print("[WARNING] Could not write cluster state to ZooKeeper.")
 
         print("Starting ScyllaDB Database Service in parallel...")
-        run_parallel_checked(ips, "systemctl restart hydra-db")
+        unit_action_checked(ips, "restart", ["hydra-db"])
         for ip in ips:
             for _ in range(40):
-                rc, out, _ = run_remote_spark(ip, "systemctl is-active hydra-db")
-                if rc == 0 and out.strip() == "active":
+                if unit_is_active(ip, "hydra-db"):
                     break
                 time.sleep(1)
             else:
@@ -1901,8 +2069,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print(f"[{ip}] Waiting for ScyllaDB to listen on port 9042...")
             last_progress = None
             for i in range(600):
-                rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9042")
-                if rc == 0 and "9042" in out:
+                if port_listening(ip, 9042):
                     break
                 
                 # Check and print bootstrap/repair progress every 10 seconds
@@ -1917,13 +2084,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 sys.exit(1)
 
         print("Starting Daruk query proxy service on all hosts...")
-        run_parallel_checked(ips, "systemctl restart daruk")
+        unit_action_checked(ips, "restart", ["daruk"])
         print("Waiting for Daruk query proxy to listen on port 9043 on all nodes...")
         for ip in ips:
             daruk_ready = False
             for _ in range(30):
-                rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9043")
-                if rc == 0 and "9043" in out:
+                if port_listening(ip, 9043):
                     daruk_ready = True
                     break
                 time.sleep(1)
@@ -1950,11 +2116,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         for svc in services:
             print(f"Starting {svc} service in parallel across all nodes...")
-            run_parallel_checked(ips, f"systemctl restart {svc}")
+            unit_action_checked(ips, "restart", [svc])
             for ip in ips:
                 for _ in range(30):
-                    rc, out, _ = run_remote_spark(ip, f"systemctl is-active {svc}")
-                    if rc == 0 and out.strip() == "active":
+                    if unit_is_active(ip, svc):
                         break
                     time.sleep(1)
                 else:
@@ -2035,8 +2200,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         for ip in ips:
             reached = False
             for _ in range(20):
-                rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 8443")
-                if rc == 0 and "8443" in out:
+                if port_listening(ip, 8443):
                     reached = True
                     break
                 time.sleep(2)
@@ -2182,14 +2346,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("\n--- Phase 1: Starting ZooKeeper Service ---")
         for ip in ips:
             print(f"[{ip}] Starting ZooKeeper service...")
-            run_checked_cmd(ip, "systemctl restart zookeeper")
+            unit_action_checked([ip], "restart", ["zookeeper"])
             
         # Poll ZooKeeper active state
         for ip in ips:
             print(f"[{ip}] Waiting for ZooKeeper service to become active...")
             for _ in range(30):
-                rc, out, _ = run_remote_spark(ip, "systemctl is-active zookeeper")
-                if rc == 0 and out.strip() == "active":
+                if unit_is_active(ip, "zookeeper"):
                     print(f"[{ip}] ZooKeeper service is active.")
                     break
                 time.sleep(1)
@@ -2228,13 +2391,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("\n--- Phase 2: Starting ScyllaDB Database Service ---")
         for ip in ips:
             print(f"[{ip}] Starting hydra-db systemd service...")
-            run_checked_cmd(ip, "systemctl restart hydra-db")
+            unit_action_checked([ip], "restart", ["hydra-db"])
             
         for ip in ips:
             print(f"[{ip}] Waiting for hydra-db service to become active...")
             for _ in range(35):
-                rc, out, _ = run_remote_spark(ip, "systemctl is-active hydra-db")
-                if rc == 0 and out.strip() == "active":
+                if unit_is_active(ip, "hydra-db"):
                     break
                 time.sleep(1)
             else:
@@ -2245,8 +2407,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print(f"[{ip}] Waiting for ScyllaDB to start listening on port 9042...")
             last_progress = None
             for i in range(300):
-                rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9042")
-                if rc == 0 and "9042" in out:
+                if port_listening(ip, 9042):
                     print(f"[{ip}] ScyllaDB is accepting database connections on port 9042.")
                     break
                 
@@ -2264,14 +2425,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # 4.5 Start Daruk Query Proxy
         for ip in ips:
             print(f"[{ip}] Starting Daruk ScyllaDB query proxy...")
-            run_checked_cmd(ip, "systemctl restart daruk")
+            unit_action_checked([ip], "restart", ["daruk"])
 
         print("Waiting for Daruk query proxy to listen on port 9043 on all nodes...")
         for ip in ips:
             daruk_ready = False
             for _ in range(30):
-                rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9043")
-                if rc == 0 and "9043" in out:
+                if port_listening(ip, 9043):
                     daruk_ready = True
                     break
                 time.sleep(1)
@@ -2280,26 +2440,15 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 sys.exit(1)
         print("Daruk query proxy is ready on all nodes.")
 
-        # 5. Start Aether Storage Service
-        print("\n--- Phase 3: Starting Aether Storage Service ---")
-        for ip in ips:
-            print(f"[{ip}] Starting aether systemd service...")
-            run_checked_cmd(ip, "systemctl restart aether")
-            
-        for ip in ips:
-            print(f"[{ip}] Waiting for aether service to become active...")
-            for _ in range(30):
-                rc, out, _ = run_remote_spark(ip, "systemctl is-active aether")
-                if rc == 0 and out.strip() == "active":
-                    break
-                time.sleep(1)
-            else:
-                print(f"[{ip}] ERROR: aether service failed to start.")
-                sys.exit(1)
-                
+        # There is no aether phase. `cluster start` restarted `aether` here and then
+        # waited thirty seconds for it to report active, exiting when it never did --
+        # which it never could, because the unit went away with DRBD. `cluster create`
+        # lost its copy of this phase when the unit was deleted and this one was
+        # missed, so every `cluster start` since has failed on a service that does not
+        # exist. Sidon starts with the rest of the services below.
 
-        # 6. Start remaining services
-        print("\n--- Phase 4: Starting Core Workload & Coordination Services ---")
+        # 5. Start remaining services
+        print("\n--- Phase 3: Starting Core Workload & Coordination Services ---")
         services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
         if check_urbosa_enabled():
             services.append("urbosa")
@@ -2316,7 +2465,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 if ip in maintenance_ips:
                     continue
                 print(f"[{ip}] Starting systemd service: {svc}...")
-                run_checked_cmd(ip, f"systemctl restart {svc}")
+                unit_action_checked([ip], "restart", [svc])
                 
         for svc in services:
             for ip in ips:
@@ -2324,8 +2473,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     continue
                 print(f"[{ip}] Verifying service {svc} is active...")
                 for _ in range(30):
-                    rc, out, _ = run_remote_spark(ip, f"systemctl is-active {svc}")
-                    if rc == 0 and out.strip() == "active":
+                    if unit_is_active(ip, svc):
                         break
                     time.sleep(1)
                 else:
@@ -2336,8 +2484,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     port = service_ports[svc]
                     print(f"[{ip}] Waiting for service {svc} to listen on port {port}...")
                     for _ in range(45):
-                        rc_p, out_p, _ = run_remote_spark(ip, f"ss -tlnp | grep {port}")
-                        if rc_p == 0 and str(port) in out_p:
+                        if port_listening(ip, port):
                             print(f"[{ip}] Service {svc} is listening on port {port}.")
                             break
                         time.sleep(1)
@@ -2398,8 +2545,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # 3370. There is no controller and no election: each node runs its own daemon and
         # answers for itself, so the check is per node and there is nothing to elect.
         for ip in ips:
-            rc_s, out_s, _ = run_remote_spark(ip, "systemctl is-active sidon")
-            if rc_s != 0 or out_s.strip() != "active":
+            if not unit_is_active(ip, "sidon"):
                 print(f"[ERROR] Cluster start verification failed: sidon is not active on {ip}.")
                 sys.exit(1)
         print("  The storage data path is running on every node.")
@@ -2514,7 +2660,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         workload_services = ["hylia", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate"]
         for svc in workload_services:
             print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            run_parallel(ips, f"systemctl stop {svc}")
+            unit_action_parallel(ips, "stop", [svc])
             
         # 3.5. Drain the journals, then unmount.
         #
@@ -2557,7 +2703,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             storage_services.insert(0, "urbosa")
         for svc in storage_services:
             print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            run_parallel(ips, f"systemctl stop {svc}")
+            unit_action_parallel(ips, "stop", [svc])
 
         # Nothing to bring down at the block layer. `drbdadm down all` detached every
         # resource from its device; a vdisk was never attached to one.
@@ -2567,11 +2713,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         db_services = ["hydra-db", "zookeeper"]
         for svc in db_services:
             print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            run_parallel(ips, f"systemctl stop {svc}")
+            unit_action_parallel(ips, "stop", [svc])
             
         # 8. Restart spark-daemon asynchronously in parallel
         print("\n--- Step 8: Restarting spark-daemon asynchronously in parallel ---")
-        run_parallel(ips, "(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &")
+        # Detached, because spark-daemon is the daemon answering the request:
+        # restarting it inline kills the connection the reply travels back on.
+        unit_action_parallel(ips, "restart", ["spark-daemon"], detach=True)
             
         print("Stop command execution completed.")
 
@@ -2615,14 +2763,11 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
         services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
-        svc_list = " ".join(services)
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
-            rc, out, err = run_remote_spark(ip, f"systemctl stop {svc_list} || true")
-            if out.strip():
-                print(f"[{ip}] Log:\n{out}")
-            if rc != 0:
-                print(f"[{ip}] [WARNING] Failed to stop services: {err}")
+            ok, detail = unit_action(ip, "stop", services, ignore_failed=True)
+            if not ok:
+                print(f"[{ip}] [WARNING] Failed to stop services: {detail}")
 
         # 3. Unmount the extent store on all hosts
         print("\n--- Phase 3: Unmounting Storage Volumes ---")
@@ -2643,7 +2788,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # unmounting is the whole teardown.
         print("\n--- Phase 4: Stopping the storage data path ---")
         for ip in ips:
-            run_remote_spark(ip, "systemctl stop sidon || true")
+            unit_action(ip, "stop", ["sidon"], ignore_failed=True)
             run_remote_spark(ip, "umount -l /var/lib/hci/sidon || true")
             print(f"[{ip}] storage stopped and unmounted.")
 
@@ -2896,9 +3041,9 @@ print("--- Local wipe completed ---", flush=True)
         print("\n--- Phase 7: Restarting spark-daemon Services ---")
         for ip in ips:
             print(f"[{ip}] Restarting spark-daemon...")
-            rc, out, err = run_remote_spark(ip, "(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &")
-            if rc != 0:
-                print(f"[{ip}] [WARNING] Failed to launch background spark-daemon restart: {err or out}")
+            ok, detail = unit_action(ip, "restart", ["spark-daemon"], detach=True)
+            if not ok:
+                print(f"[{ip}] [WARNING] Failed to launch background spark-daemon restart: {detail}")
 
         print("\n==========================================================")
         print("      HCI Cluster Destroyed & Cleaned Successfully!        ")
@@ -3117,8 +3262,8 @@ print("--- Local wipe completed ---", flush=True)
                     # the *previous* ensemble alive throughout, which an all-at-once
                     # restart does not.
                     for ip in survivors:
-                        rc_z, _, err_z = run_remote_spark(ip, "systemctl restart zookeeper")
-                        if rc_z != 0:
+                        ok_z, err_z = unit_action(ip, "restart", ["zookeeper"])
+                        if not ok_z:
                             print(f"[WARNING] [{ip}] ZooKeeper did not restart: "
                                   f"{(err_z or '').strip()[:200]}")
                         else:

@@ -235,13 +235,14 @@ def get_cluster_hosts():
         return []
 
 def ping_host(ip):
-    # Runs standard Linux ping command, sending 1 packet with 2 second timeout
-    try:
-        p = subprocess.Popen(f"ping -c 1 -W 2 {ip}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        p.communicate()
-        return p.returncode == 0
-    except Exception:
-        return False
+    """One packet, two second timeout. True when the host answered.
+
+    An argv list, not a shell string: `ip` comes out of cluster.json, and the shell form
+    interpolated it straight into a command Mipha runs as root. Nothing in the fencing
+    path should be reachable by editing a hostname.
+    """
+    rc, _, _ = run_argv_local(["ping", "-c", "1", "-W", "2", ip], timeout=10)
+    return rc == 0
 
 def check_vali_health(ip):
     # Vali requires mutual TLS, so even a health probe presents a certificate. A probe
@@ -589,6 +590,26 @@ def clear_fence_record(ip):
     return FENCE_LEDGER.pop(ip, None) is not None
 
 
+def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
+    """Act on systemd units on a host. Returns (ok, detail).
+
+    Replaces `run_remote_spark(ip, "systemctl <verb> <names>")`. The names are
+    parameters the far side matches against its own allow-list, so a unit this
+    cluster does not manage is refused rather than stopped.
+    """
+    payload = {"action": action, "units": list(units)}
+    if detach:
+        payload["detach"] = True
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    status, body, error = run_mtls_spark_api_full(ip, "/api/v1/host/units", payload)
+    if status == 200:
+        return True, ""
+    if error:
+        return False, error
+    return False, str((body or {}).get("error") or f"spark-daemon answered {status}")
+
+
 def spark_fence_host(ip):
     """In-band fence: tell the host to stop, then read back that it did.
 
@@ -619,6 +640,13 @@ def legacy_spark_fence(ip):
     Kept for a rolling upgrade, where the host being fenced may still be running the old
     spark-daemon. The command itself is unchanged; what is new is that its exit status is
     ignored and the host is asked afterwards what is actually still running.
+
+    The `systemctl` clause deliberately stays shell text, and it is the one place in this
+    file that does. This function is reached only when the far side answered 404 to the
+    typed fence -- which is to say, only on a daemon that predates the typed endpoints, so
+    it predates `/api/v1/host/units` too. Migrating it would make the compatibility path
+    require the thing it exists to be compatible without, and it would fail silently:
+    a 404 on the unit call reads exactly like a fence that was attempted.
     """
     fence_cmd = ("systemctl stop libvirtd virtqemud || true; "
                  "pkill -9 qemu-system-x86_64 || true; pkill -9 qemu || true")
@@ -1944,8 +1972,13 @@ def main():
                         
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
-                        start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway logos mipha"
-                        run_remote_spark(ip, start_cmd)
+                        start_units = ["zookeeper", "hydra-db", "sidon", "spectrum",
+                                       "bifrost", "dagur", "mimir", "vali", "catalyst",
+                                       "gatoway", "logos", "mipha"]
+                        ok_start, detail_start = spark_unit_action(ip, "start", start_units)
+                        if not ok_start:
+                            print(f"[Mipha HA] Could not start services on {hostname}: "
+                                  f"{detail_start}")
                         
                         # Sleep 10 seconds to allow services (especially Aether/storage) to boot
                         time.sleep(10)
@@ -2133,7 +2166,7 @@ def main():
                         print("[Mipha HA] Vali is unresponsive. Initiating remote restart across surviving hosts...")
                         surviving_hosts = [sh.get("ip") for sh in hosts if sh.get("ip") != ip]
                         for sh_ip in surviving_hosts:
-                            run_remote_spark(sh_ip, "systemctl restart vali")
+                            spark_unit_action(sh_ip, "restart", ["vali"])
                             
                         # Active polling loop for Vali startup
                         print("[Mipha HA] Polling Vali API for recovery status...")

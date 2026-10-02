@@ -465,6 +465,25 @@ def validate_update_download_url(download_url):
         )
     return True, ""
 
+def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
+    """Act on systemd units on a host. Returns (ok, detail).
+
+    Replaces `run_remote_spark(ip, "... && systemctl restart <name>")`. The unit
+    names are parameters the far side matches against its own allow-list, so a name
+    the cluster does not manage is refused with a message rather than run as root.
+    """
+    payload = {"action": action, "units": list(units)}
+    if detach:
+        payload["detach"] = True
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    rc, body, error = run_mtls_spark_api(ip, "/api/v1/host/units", payload)
+    if rc == 0:
+        return True, ""
+    return False, (error or str((body or {}).get("error")
+                                or "spark-daemon did not answer"))
+
+
 def run_mtls_spark_api(ip, path, payload, method="POST"):
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
@@ -3675,12 +3694,17 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             for node in nodes:
                 ip = node.get("ip")
                 if ip:
-                    cmd = 'find /sys/class/net -type l -not -name lo -not -name "virbr*" -not -name "br-*" -not -name "vxlan*" -not -name "veth*" -not -name "vnet*" -not -name "macvtap*" -exec basename {} \\;'
-                    rc, stdout, _ = run_remote_spark(ip, cmd)
+                    # The daemon reads /sys/class/net itself and says which
+                    # interfaces are virtual, which is the same rule this used to
+                    # express as a `find` with seven -not -name clauses shelled out
+                    # to every node in the cluster.
+                    rc, res_if, _ = run_mtls_spark_api(
+                        ip, "/api/v1/host/interfaces", None, method="GET")
                     if rc == 0:
-                        for line in stdout.splitlines():
-                            if line.strip():
-                                interfaces.add(line.strip())
+                        for entry in res_if.get("interfaces") or []:
+                            name = str(entry.get("name") or "").strip()
+                            if name and not entry.get("virtual"):
+                                interfaces.add(name)
             
             if not interfaces:
                 interfaces.update(["ens192", "ens3", "ens33", "eth0", "eno1"])
@@ -3693,19 +3717,23 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             if rc_route == 0 and "error" not in res_route:
                 default_gateway = str(res_route.get("default_gateway", "")).strip() or None
                 default_interface = str(res_route.get("default_interface", "")).strip() or None
-            
+
+            # The address of that interface came back in the same response. This used
+            # to be a second call, `ip addr show <iface> | grep 'inet '` through the
+            # shell, parsing a CIDR back out of text that had been built from the very
+            # fields the reply above already carries.
             if default_interface:
-                rc_ip, out_ip, _ = run_remote_spark("127.0.0.1", f"ip addr show {default_interface} | grep 'inet '")
-                if rc_ip == 0 and out_ip:
-                    parts = out_ip.strip().split()
-                    if len(parts) >= 2:
-                        ip_cidr = parts[1]
-                        if "/" in ip_cidr:
-                            ip_part, mask_part = ip_cidr.split("/", 1)
-                            octets = ip_part.split(".")
-                            if len(octets) == 4:
-                                octets[3] = "250"
-                                suggested_ip = ".".join(octets) + "/" + mask_part
+                for entry in res_route.get("addresses") or []:
+                    if entry.get("interface") != default_interface:
+                        continue
+                    if entry.get("family") != "inet" or not entry.get("cidr"):
+                        continue
+                    ip_part, _, mask_part = str(entry["cidr"]).partition("/")
+                    octets = ip_part.split(".")
+                    if mask_part and len(octets) == 4:
+                        octets[3] = "250"
+                        suggested_ip = ".".join(octets) + "/" + mask_part
+                        break
 
             self.send_json(200, {
                 "interfaces": sorted(list(interfaces)),
@@ -5649,8 +5677,13 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         if host_ip:
                             cmd_dns = f"echo {b64_resolv} | base64 -d > /etc/resolv.conf"
                             run_remote_spark(host_ip, cmd_dns)
-                            cmd_ntp = f"echo {b64_chrony} | base64 -d > /etc/chrony.conf && systemctl restart chronyd"
-                            run_remote_spark(host_ip, cmd_ntp)
+                            # Writing the file is still a shell string; restarting the
+                            # unit that reads it is not, so the `&&` becomes an
+                            # ordering the caller keeps rather than one the shell does.
+                            cmd_ntp = f"echo {b64_chrony} | base64 -d > /etc/chrony.conf"
+                            rc_ntp, _, _ = run_remote_spark(host_ip, cmd_ntp)
+                            if rc_ntp == 0:
+                                spark_unit_action(host_ip, "restart", ["chronyd"])
                             if timezone_sanitized:
                                 cmd_tz = f"timedatectl set-timezone {timezone_sanitized} || true"
                                 run_remote_spark(host_ip, cmd_tz)
@@ -5663,9 +5696,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                 f"data.update(updates); "
                                 f"json.dump(data, open(path,'w'), indent=4)\""
                             )
-                            if vip_changed:
-                                update_json_cmd += " && systemctl restart bifrost"
-                            run_remote_spark(host_ip, update_json_cmd)
+                            rc_json, _, _ = run_remote_spark(host_ip, update_json_cmd)
+                            if vip_changed and rc_json == 0:
+                                spark_unit_action(host_ip, "restart", ["bifrost"])
 
                 import threading
                 threading.Thread(target=propagate_settings, daemon=True).start()
@@ -7877,16 +7910,20 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         cmd = (
                             f"mkdir -p /etc/hci/spectrum/certs && "
                             f"echo {b64_cert} | base64 -d > /etc/hci/spectrum/certs/server.crt && "
-                            f"echo {b64_key} | base64 -d > /etc/hci/spectrum/certs/server.key && "
-                            f"systemctl restart slate"
+                            f"echo {b64_key} | base64 -d > /etc/hci/spectrum/certs/server.key"
                         )
-                        run_remote_spark(host_ip, cmd)
+                        rc_cert, _, _ = run_remote_spark(host_ip, cmd)
+                        if rc_cert == 0:
+                            spark_unit_action(host_ip, "restart", ["slate"])
 
                 def restart_console():
                     import time
                     time.sleep(2)
-                    subprocess.run("systemctl restart slate", shell=True)
-                    subprocess.run("systemctl restart spectrum", shell=True)
+                    # argv rather than a shell string. Nothing here is caller-supplied,
+                    # but a shell that is never needed is one that cannot be got wrong
+                    # by the next edit.
+                    subprocess.run(["systemctl", "restart", "slate"])
+                    subprocess.run(["systemctl", "restart", "spectrum"])
 
                 threading.Thread(target=restart_console, daemon=True).start()
                 self.send_json(200, {"status": "success", "message": "SSL Certificate applied successfully. Web console restarting..."})
