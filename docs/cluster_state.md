@@ -35,11 +35,29 @@ Four consequences:
 
 | Path | Type | Written by | Meaning |
 | :--- | :--- | :--- | :--- |
-| `/cluster_state` | persistent | `cluster start` / `stop`, Spectrum | Desired state: `started` or `stopped` |
+| `/cluster_state` | persistent | a node's `spark-daemon`, on `POST /api/v1/cluster/state` from `cluster start` / `stop` or the console | Desired state: `started` or `stopped` |
 | `/helios/nodes/<ip>` | **ephemeral** | each node's `spark-daemon` | That node's actual state, refreshed every 5s |
 
 `/helios/nodes/<ip>` carries the node's hostname, ZooKeeper leadership, maintenance
-status, disk count, build, a timestamp, and per-service `{status, pids, restarts}`.
+status, disk count, build, a timestamp, the services it has declared but switched off,
+`retry` — the node's own answer to whether it is finished converging — and per-service
+`{status, pids, restarts, last_error}`.
+
+Two of those fields exist so that a caller never has to read a journal:
+
+* **`last_error`** is why a service is not where it was asked to be. The reconcile loop
+  latches what `systemctl` said when it refused; systemd's own `Result` fills in the units
+  that failed without anyone asking them to do anything. A watching CLI prints the reason
+  beside the service.
+* **`retry`** is the node's judgement, not the CLI's. The CLI loops on it rather than
+  re-deriving convergence from the rows it can see, which is what lets the node own the
+  ordering: a service whose requirements are not ready yet is left for the next pass, and
+  the node says it is not done.
+
+`pids` is also what compliance is measured by, symmetrically: a started service has
+processes and a stopped one does not. Not `status` — `active` is what a unit with
+`Restart=always` reports during each restart window, so a service that has never once
+stayed up answers "started" as often as not. A PID list is a fact.
 
 The node entries are **ephemeral**: their lifetime is bound to the publisher's ZooKeeper
 session. A node that dies has its entry removed by the ensemble rather than inferred
@@ -49,7 +67,7 @@ keepalive pings continue.
 
 ---
 
-## 3. Flow
+## 3. One actor per service
 
 ```mermaid
 flowchart TB
@@ -64,9 +82,61 @@ flowchart TB
 ```
 
 `cluster start` records intent once; each node converges toward it and republishes what
-it actually achieved. The CLI then polls the published state and prints which services
+it actually achieved. The CLI then watches the published state and prints which services
 are still pending until every node is up — rather than declaring success the moment the
 start commands have been issued.
+
+**The CLI names no service, and that is the property worth keeping.** It used to: start
+ZooKeeper, start ScyllaDB and wait for 9042, start Daruk and wait for 9043, then thirteen
+more units — and *then* wait for the reconcile loop to converge the same services toward
+the state it had recorded in its first phase. Two actors drove every service on a cold
+start, which is what the visible flapping was, and the ordering existed in two places,
+which is what let one copy rot:
+
+> `cluster start` restarted `aether` for months after the unit was deleted with DRBD.
+> Every start failed on a service that does not exist, unnoticed, because nothing read
+> that list but the CLI, and the reconcile loop did not care what was in it.
+
+So the whole of `cluster start` is now: declare the desired state on each node
+(`POST /api/v1/cluster/state`), then watch. `cluster stop` is the same inverted. A test
+asserts the start and stop paths contain zero service names, since that is the property
+whose violation produced the `aether` bug.
+
+### The declared service table
+
+The inventory and the dependency ordering are a table in the loop — `MANAGED_SERVICES` in
+`spark_daemon_decoded.py` — with a unit, a display name, what it requires, an optional
+readiness port, and an optional setting that can switch it off:
+
+| Field | Meaning |
+| :--- | :--- |
+| `requires` | A gate, not documentation. The unit is not started until everything it requires is **ready**. Stopping, the same relation is read backwards: a service is not taken out from under the services using it. |
+| `ready_port` | Ready means *answering*. `systemctl is-active hydra-db` goes true tens of seconds before ScyllaDB accepts a query on 9042, so gating on `active` gates on nothing — this is the wait the CLI's Phase 2 existed to do. |
+| `setting` | Declared but switchable. A disabled service stays in the table and is reported as `DISABLED` rather than vanishing, so an operator can tell "switched off" from "never deployed". |
+
+Systemd keeps doing lifecycle — starting, restarting, backoff. The loop owns the declared
+inventory and the order, and drives systemd; it is not a supervisor and does not parent any
+daemon. (This is where Helios deliberately differs from Genesis, which supervises its 49
+services as its own child processes.)
+
+A disabled service is published in `disabled_services` rather than in `services`, because
+`vali.select_best_start_host()` requires every entry in `services` to be `UP` — a row that
+can never be `UP` makes every host ineligible for placement, which is precisely what the
+stale `aether` entry did.
+
+ZooKeeper is absent from the table on purpose, and so is `spark-daemon`: one is the store
+the desired state lives in, the other is the process running the loop. They are the only
+two services the CLI path touches by name — and it does not, because the node names them
+behind `/api/v1/cluster/state`.
+
+### Failures ride in the published status
+
+The wait aborts at the **first** published `last_error` and prints the full table — which
+service, on which node, with which reason — rather than waiting out a timeout and then
+having nothing useful to say. An unreachable node is the opposite case: it is retried a
+bounded number of times and then reported, because the desired state outlives it and the
+node converges when it returns. A node in maintenance publishes that it is, and is not
+waited on.
 
 ### A unit that is mid-transition is not drift
 
@@ -112,6 +182,16 @@ and retry, never "tear everything down".
 
 Note this differs from `spark stop all`, which does stop ZooKeeper: that is an explicit
 operator instruction to quiesce one host, not an inference drawn from missing state.
+
+`cluster stop` ends the same way, and only at the end: once every node reports that
+everything it manages is down, the CLI makes a second call
+(`{"desired": "stopped", "stop_state_store": true}`) which stops the store and restarts
+`spark-daemon`. It is a separate call, and not something the loop could ever do, for the
+reason above — a loop cannot take away the store it reads its instructions from. If the
+cluster did **not** converge, the store is deliberately left running so the stop can be
+retried; taking it down then would leave services up with no readable intent, which is the
+latch again. The console's stop button never stops the store at all: it declares `stopped`
+and nothing more.
 
 ---
 

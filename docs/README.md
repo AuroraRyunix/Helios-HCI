@@ -14,7 +14,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [setup-guide.md](./setup-guide.md) | Local dev prerequisites, what runs standalone vs. what needs a real cluster. |
 | [hci_master_architecture_guide.md](./hci_master_architecture_guide.md) | The deepest existing architecture reference (1500+ lines). |
 | [spark_api.md](./spark_api.md) | The typed per-domain Spark API that replaces raw shell execution: the contract, the design rules, and the migration metric. |
-| [cluster_state.md](./cluster_state.md) | How desired cluster state and per-node actual state are held in ZooKeeper, the ephemeral-znode liveness model, and the direct-probe fallback. |
+| [cluster_state.md](./cluster_state.md) | How desired cluster state and per-node actual state are held in ZooKeeper, the declared service table and dependency ordering the reconcile loop walks, the ephemeral-znode liveness model, how a failure is published rather than logged, and the direct-probe fallback. |
 | [network.md](./network.md) | Full network scope/port allocation reference. |
 | [backup_restore.md](./backup_restore.md) | What the cluster cannot rebuild, how `saga` captures it, the restore sequence, retention — and, explicitly, what is *not* backed up (guest data is not). |
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
