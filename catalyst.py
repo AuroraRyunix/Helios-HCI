@@ -126,57 +126,58 @@ def run_lwt(endpoint, params, timeout=15):
     return True, bool(res.get("applied")), res.get("current") or {}, ""
 
 
-def get_zookeeper_leader_ip():
-    """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
-    ips = []
+def cluster_ips():
     try:
         with open("/etc/hci/cluster.json", "r") as f:
-            cdata = json.load(f)
-            ips = [h["ip"] for h in cdata.get("hosts", [])]
+            return [h["ip"] for h in json.load(f).get("hosts", []) if h.get("ip")]
     except Exception:
-        ips = [LOCAL_IP]
-        
-    leader_ip = None
-    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine
-    # copies of this loop on nine timers had the ensemble answering eleven `stat`
-    # probes a second forever, and ZooKeeper logs two INFO lines for each one.
-    leader_ip = helios_zk.leader_ip(ips)
-            
-    # Check if leader is active on port 9091
-    leader_active = False
-    if leader_ip:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((leader_ip, 9091))
-            s.close()
-            leader_active = True
-        except Exception:
-            leader_active = False
-            
-    if leader_active:
-        return leader_ip
-        
-    # If leader is inactive, find active candidates with port 9091 open
-    candidates = []
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 9091))
-            s.close()
-            candidates.append(ip)
-        except Exception:
-            pass
-            
-    if not candidates:
-        return leader_ip if leader_ip else "127.0.0.1"
-        
-    candidates.sort()
-    return candidates[0]
+        return [LOCAL_IP]
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+
+# -- Which Catalyst holds the queues, and which one runs the schedule ---------------------
+#
+# Two jobs, so two candidacies. They are deliberately not one: a node that happens to hold
+# the queues has no reason to also be the node that submits every scheduled job, and
+# funnelling both through one name is the coupling this replaces wearing a different hat.
+#
+# Both used to be `get_zookeeper_leader_ip() == LOCAL_IP` -- a string comparison against the
+# node the *ZooKeeper ensemble* had elected for its own reasons. An ensemble election is a
+# restart, a blip, a rolling upgrade, and it moved every leader-only workload in the cluster
+# onto one node at once. Neither of these jobs has anything to do with who leads ZooKeeper.
+#
+# `dispatch` is the one with a visible consequence: the queues are in memory, so the node
+# holding this candidacy is the node a submission has to reach and a worker has to poll.
+# Everybody finds it the same way -- by reading what the winner published, not by probing.
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP, hosts=cluster_ips())
+            _CANDIDACIES[service] = existing
+        return existing
+
+
+def holds_dispatch():
+    """True when this process is the one holding the queues."""
+    return candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leading()
+
+
+def dispatch_ip():
+    """The address of the Catalyst holding the queues, or None.
+
+    What every submitter needs and nobody could previously ask for. The winner publishes
+    its own address in its ballot, so this is a read of a znode rather than a round of
+    `stat` probes followed by a port check followed by a guess.
+    """
+    published = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    if not published:
+        return None
+    return published.decode("utf-8", "replace").strip() or None
+
 
 # Initialize Database Schema
 def load_schema_module():
@@ -221,14 +222,59 @@ def init_db_schema():
     verdict itself. It is the one caller allowed to run a conditional statement through
     the text path.
     """
-    applied = load_schema_module().ensure_schema(run_conditional_cql_query, node_id=LOCAL_IP)
+    applied = schema_module().ensure_schema(run_conditional_cql_query, node_id=LOCAL_IP)
     if applied:
         print(f"[Catalyst] Applied schema migrations: {', '.join(applied)}")
 
+
+_SCHEMA_MODULE = None
+
+
+def schema_module():
+    """The schema module, loaded once.
+
+    It owns the task table's column list and the statements that write it, so every writer
+    of a task row builds the same row. Four independent column lists is how
+    `parent_task_id` came to live inside a JSON payload in one of them and nowhere else.
+    """
+    global _SCHEMA_MODULE
+    if _SCHEMA_MODULE is None:
+        _SCHEMA_MODULE = load_schema_module()
+    return _SCHEMA_MODULE
+
+
+# The component a task belongs to, when the submitter did not say. `service` is the queue
+# that executes a task, which is not the same question -- a Hylia upgrade step runs on the
+# `dagur` queue -- so defaulting one to the other is a last resort and not the intent.
+DEFAULT_COMPONENT = "Catalyst"
+
+# The last sequence id this process claimed per component, used only as the starting guess
+# for the next claim. Wrong is free: the compare-and-swap refuses and hands back the right
+# value, which costs one round trip and never a duplicate.
+_SEQUENCE_HINTS = {}
+_SEQUENCE_LOCK = threading.Lock()
+
+
+def next_sequence_id(component):
+    """The next sequence id for `component`, or None if one could not be claimed.
+
+    None is not an error the submission should fail on. The number is how an operator orders
+    a component's history; it is not how the cluster executes anything, and a task framework
+    that refuses work because a counter was contended is worse than a task with no number.
+    """
+    with _SEQUENCE_LOCK:
+        hint = _SEQUENCE_HINTS.get(component)
+    claimed = schema_module().claim_task_sequence(run_lwt, component, expected=hint)
+    if claimed is None:
+        return None
+    with _SEQUENCE_LOCK:
+        _SEQUENCE_HINTS[component] = claimed
+    return claimed
+
 # In-Memory Event Queues & Completion Sync
 #
-# One entry per worker that long-polls /api/v1/queues/<name> on this node while it holds
-# ZooKeeper leadership. A name with no worker behind it is worse than a missing name: the
+# One entry per worker that long-polls /api/v1/queues/<name> on the node holding the dispatch
+# candidacy. A name with no worker behind it is worse than a missing name: the
 # submission succeeds, a row is written, and the task sits `pending` forever, which reads
 # as "slow" rather than "nothing is going to happen". `spark` is exactly that today --
 # nothing drains it -- and it is left in place only because removing a queue is a change
@@ -247,12 +293,20 @@ task_events = {}
 task_results = {}
 lock = threading.Lock()
 
+# Every task id this process has put on a queue. The recovery sweep replays `pending` rows
+# the queues do not already hold, and without this it would replay the ones it had just
+# queued itself -- a task is `pending` from the moment it is recorded until a worker picks it
+# up, which is exactly the window the sweep runs in.
+queued_task_ids = set()
+
+
 def submit_task_to_memory(service, task_data):
     if service in queues:
         queues[service].put(task_data)
         task_id = task_data["task_id"]
         with lock:
             task_events[task_id] = threading.Event()
+            queued_task_ids.add(task_id)
 
 def claim_scheduled_run(job_name, expected_last_run, now):
     """Take this tick of `job_name`, or report that somebody else already has it.
@@ -262,10 +316,12 @@ def claim_scheduled_run(job_name, expected_last_run, now):
     per scheduler that reaches the row -- two Dagur runs of the same backup, the same
     scrub, the same compaction, against the same volumes at the same moment.
 
-    Two schedulers is not a hypothetical: is_zookeeper_leader() probes ZooKeeper's
-    four-letter `stat` and, when the leader does not answer on 9091, falls back to "lowest
-    node with 9091 open". A ZooKeeper that is slow, restarting or partitioned hands that
-    answer to two nodes at once, and both then believe they are the only scheduler.
+    Two schedulers is not a hypothetical, and it stays possible with a real election. A
+    candidacy answers correctly when it answers, but the answer is read from the ensemble at
+    some instant and acted on at a later one: a scheduler that reads "I lead", then stalls
+    long enough to lose its session, is still inside the pass it started. The condition on
+    the clock is what closes that window, and it is the only thing that can -- the claim and
+    the clock are one Paxos round, so the second scheduler is told the tick is taken.
 
     Conditioning the clock write on the value that was read makes the claim and the clock
     one Paxos round, so exactly one caller proceeds. Returning False on a Daruk failure is
@@ -291,9 +347,10 @@ def claim_scheduled_run(job_name, expected_last_run, now):
 def scheduler_thread_loop():
     print("Catalyst scheduler thread started.")
     local_last_run = {}
+    scheduler = candidacy(helios_zk.SERVICE_CATALYST_SCHEDULER)
     while True:
         try:
-            if is_zookeeper_leader():
+            if scheduler.leading():
                 cql = "SELECT JSON * FROM hydra.dagur_schedules;"
                 rc, stdout, stderr = run_cql_query(cql)
                 if rc == 0 and stdout:
@@ -338,11 +395,17 @@ def scheduler_thread_loop():
                                 now_ms = int(time.time() * 1000)
                                 payload = json.dumps({"job_name": name, "command": command})
                                 
-                                cql_insert = f"""
-                                INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-                                VALUES ({task_id}, 'dagur', 'execute', 'pending', '{payload.replace("'", "''")}', 0, {now_ms}, {now_ms});
-                                """
-                                run_cql_query(cql_insert)
+                                # Recorded as Catalyst's own task even though Dagur runs it:
+                                # the schedule is Catalyst's, and `service` already says who
+                                # executes. `task_type` carries what the row otherwise could
+                                # not -- every scheduled job has the action `execute`, so
+                                # without it a component's history is a column of identical
+                                # verbs.
+                                run_cql_query(schema_module().task_insert_statement(
+                                    task_id, "dagur", "execute", payload, now_ms,
+                                    component=DEFAULT_COMPONENT,
+                                    task_type="scheduled_job",
+                                    sequence_id=next_sequence_id(DEFAULT_COMPONENT)))
                                 
                                 submit_task_to_memory("dagur", {
                                     "task_id": task_id,
@@ -386,6 +449,15 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
         if len(parts) == 5 and parts[3] == "queues":
             service = parts[4]
             if service in queues:
+                if not holds_dispatch():
+                    # The queues are in memory, so only the node holding the dispatch
+                    # candidacy has anything in them. Answering 204 here would be
+                    # indistinguishable from "nothing queued" and a worker polling the
+                    # wrong node would wait forever on an empty queue while work piled up
+                    # on the right one. Said as an error so the worker's log names it.
+                    self.send_json(503, {"error": "this node does not hold the Catalyst "
+                                                  "dispatch candidacy"})
+                    return
                 try:
                     task = queues[service].get(timeout=30.0)
                     self.send_json(200, task)
@@ -402,7 +474,9 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
             task_id = parts[5]
             
             # Query DB first to see if task is already completed/failed in the database
-            cql = f"SELECT JSON status, progress, error_msg FROM hydra.catalyst_tasks WHERE task_id = {task_id};"
+            cql = (f"SELECT JSON status, progress, error_msg, parent_task_id, component, "
+                   f"sequence_id, task_type, completed_at "
+                   f"FROM hydra.catalyst_tasks WHERE task_id = {task_id};")
             rc, stdout, _ = run_cql_query(cql)
             status_obj = None
             if rc == 0 and stdout:
@@ -458,31 +532,47 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
                 service = payload.get("service")
                 action = payload.get("action")
                 task_payload = payload.get("payload", {})
+                if not isinstance(task_payload, dict):
+                    task_payload = {}
+                component = payload.get("component")
+                task_type = payload.get("task_type") or payload.get("type")
+                # A parent may be named at the top level or inside the payload. The payload
+                # is where it has always lived -- mipha.py put it there because there was no
+                # column -- and those submissions still arrive, so both are read and the
+                # column is written from either.
+                parent_task_id = payload.get("parent_task_id") or task_payload.get("parent_task_id")
             except Exception as e:
                 self.send_json(400, {"error": f"Invalid JSON payload: {str(e)}"})
                 return
-                
+
             if not service or not action:
                 self.send_json(400, {"error": "service and action fields required"})
                 return
-                
+
             task_id = str(uuid.uuid4())
             now_ms = int(time.time() * 1000)
             payload_str = json.dumps(task_payload)
-            
-            cql = f"""
-            INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-            VALUES ({task_id}, '{service}', '{action}', 'pending', '{payload_str.replace("'", "''")}', 0, {now_ms}, {now_ms});
-            """
-            run_cql_query(cql)
-            
-            task_data = {
-                "task_id": task_id,
-                "action": action,
-                "payload": task_payload
-            }
-            submit_task_to_memory(service, task_data)
-            
+            component = component or service or DEFAULT_COMPONENT
+
+            run_cql_query(schema_module().task_insert_statement(
+                task_id, service, action, payload_str, now_ms,
+                component=component,
+                task_type=task_type,
+                sequence_id=next_sequence_id(component),
+                parent_task_id=parent_task_id))
+
+            # The row is written before anything is queued, and on every node whether or not
+            # it holds the dispatch candidacy. A submission that reached the wrong Catalyst
+            # used to be queued where nothing drained it and sat `pending` forever, which
+            # reads as "slow". Recorded, it is work the dispatcher's sweep finds and replays
+            # -- which is the whole point of persisting a task rather than noting it.
+            if holds_dispatch():
+                submit_task_to_memory(service, {
+                    "task_id": task_id,
+                    "action": action,
+                    "payload": task_payload,
+                })
+
             self.send_json(200, {"task_id": task_id, "status": "pending"})
             return
             
@@ -506,18 +596,12 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
                 return
                 
             now_ms = int(time.time() * 1000)
-            escaped_error = error_msg.replace("'", "''")
-            err_field = f", error_msg = '{escaped_error}'" if error_msg else ""
-            
-            cql = f"""
-            UPDATE hydra.catalyst_tasks 
-            SET status = '{status}', progress = {progress}, updated_at = {now_ms}{err_field} 
-            WHERE task_id = {task_id};
-            """
-            run_cql_query(cql)
-            
+            run_cql_query(schema_module().task_update_statement(
+                task_id, status, progress, now_ms, error_msg=error_msg))
+
             if status in ["completed", "failed"]:
                 with lock:
+                    queued_task_ids.discard(task_id)
                     if task_id in task_events:
                         task_results[task_id] = {
                             "status": status,
@@ -531,52 +615,194 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
             
         self.send_json(404, {"error": "Not Found"})
 
-def recover_stuck_tasks():
-    print("Catalyst recovering stuck tasks on startup...")
-    import time
-    stdout = None
-    for attempt in range(30):
-        cql = "SELECT JSON task_id, status FROM hydra.catalyst_tasks;"
-        rc, stdout, stderr = run_cql_query(cql)
-        if rc == 0:
-            break
-        print(f"Waiting for database to become available to recover tasks (attempt {attempt+1}/30)...")
-        time.sleep(2)
-    else:
-        print("Database not available. Skipping stuck tasks recovery.")
-        return
+# -- Recovery ----------------------------------------------------------------------------
+#
+# What this used to do: at every start, on every node, mark every `pending` and every
+# `processing` task `failed` with "Task aborted due to system daemon restart." That is data
+# loss as designed behaviour, and it threw away exactly the tasks persistence exists to keep
+# -- the ones that had not run yet. A task submitted a second before a restart was recorded,
+# aborted, and never attempted.
+#
+# The two states are not the same thing and must not be handled the same way:
+#
+#   * `pending` means nothing has happened. No worker has seen it, so nothing in the cluster
+#     has been touched and replaying it is simply doing what was asked. It is re-queued.
+#
+#   * `processing` means a worker had it. What it did before the dispatcher holding its
+#     queue stopped is unknown, and the actions behind these rows are not replayable on a
+#     guess -- a half-finished live migration replayed is a second migration of a guest that
+#     may already be running somewhere else. So it is failed, with a reason that says it was
+#     in flight rather than that a daemon restarted.
+#
+# Either way the task ends up in a state someone can act on. Nothing is dropped silently,
+# which is the property that was missing.
+IN_FLIGHT_REASON = ("Interrupted: this task was running when the Catalyst holding its queue "
+                    "stopped, so how far it got is not recorded. Re-submit it after checking "
+                    "what it had already changed.")
 
-    if stdout:
-        stuck_tasks = []
-        for line in stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{") and line.endswith("}"):
-                try:
-                    t = json.loads(line)
-                    status = t.get("status")
-                    if status in ["pending", "processing"]:
-                        stuck_tasks.append(t.get("task_id"))
-                except:
-                    pass
-        for task_id in stuck_tasks:
-            print(f"Aborting stuck task: {task_id}")
-            now_ms = int(time.time() * 1000)
-            update_cql = f"""
-            UPDATE hydra.catalyst_tasks 
-            SET status = 'failed', error_msg = 'Task aborted due to system daemon restart.', updated_at = {now_ms} 
-            WHERE task_id = {task_id};
-            """
-            run_cql_query(update_cql)
+
+def read_open_tasks():
+    """Every task that is still `pending` or `processing`, or None if the table could not
+    be read. None and an empty list are different answers: recovery must not conclude there
+    is nothing to replay because the database did not answer."""
+    rc, stdout, _stderr = run_cql_query(
+        "SELECT JSON task_id, service, action, status, payload FROM hydra.catalyst_tasks;")
+    if rc != 0:
+        return None
+    open_tasks = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or not line.endswith("}"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            # A row that will not parse is a row nothing can decide about. Skipping it
+            # leaves it exactly as it was, which is better than failing a task on the
+            # strength of not having been able to read it.
+            continue
+        if row.get("status") in ("pending", "processing"):
+            open_tasks.append(row)
+    return open_tasks
+
+
+def fail_task(task_id, reason):
+    now_ms = int(time.time() * 1000)
+    run_cql_query(schema_module().task_update_statement(
+        task_id, "failed", 100, now_ms, error_msg=reason))
+
+
+def recover_open_tasks(fail_in_flight=False):
+    """Replay what can be replayed and fail the rest with a reason. Returns (requeued, failed).
+
+    Runs on the node that has just taken the dispatch candidacy, not at start-up on every
+    node. That is the difference between recovery and a cleanup pass: the queues live with
+    the candidacy, so the process that can act on these rows is the one that just acquired
+    it -- and running it on every node at start-up meant three nodes rewriting the same rows
+    while two of them had nowhere to put the work.
+
+    `fail_in_flight` is the whole reason this takes an argument, and it is True on exactly one
+    pass: the first after acquiring the candidacy. A `processing` row means a worker had the
+    task, and on that first pass the worker in question was talking to a dispatcher that has
+    stopped -- so the row is a corpse. On every later pass it means a worker *here* is running
+    it right now, and failing it would mean this sweep killing every live task in the cluster
+    on a timer. The two readings of one status are a few seconds apart, which is why the
+    caller has to say which one it means rather than this inferring it.
+    """
+    open_tasks = read_open_tasks()
+    if open_tasks is None:
+        print("[Catalyst] Task recovery skipped: the task table could not be read. "
+              "Nothing has been failed or replayed.")
+        return 0, 0
+
+    requeued = failed = 0
+    for row in open_tasks:
+        task_id = row.get("task_id")
+        service = row.get("service")
+        status = row.get("status")
+        if not task_id:
+            continue
+
+        if status == "processing":
+            if fail_in_flight:
+                fail_task(task_id, IN_FLIGHT_REASON)
+                failed += 1
+            continue
+
+        if service not in queues:
+            # A pending task for a name nothing drains would be replayed on every pass
+            # forever. Failing it says what is wrong, which is the thing an operator can
+            # act on; leaving it pending says "slow".
+            fail_task(task_id, "No queue named '%s' exists, so this task has no worker and "
+                               "cannot run." % service)
+            failed += 1
+            continue
+
+        with lock:
+            already = task_id in queued_task_ids
+        if already:
+            continue
+
+        try:
+            task_payload = json.loads(row.get("payload") or "{}")
+        except ValueError:
+            task_payload = {}
+        if not isinstance(task_payload, dict):
+            task_payload = {}
+        submit_task_to_memory(service, {
+            "task_id": task_id,
+            "action": row.get("action"),
+            "payload": task_payload,
+        })
+        requeued += 1
+
+    return requeued, failed
+
+
+# How often the dispatcher looks for pending work it is not already holding. Slow on purpose:
+# a submission that reached this node is queued the moment it is recorded, so the sweep is
+# for the submissions that did not -- a task recorded by a node that was not the dispatcher,
+# and the backlog left by a dispatcher that stopped.
+DISPATCH_SWEEP_SECONDS = 15
+
+
+def dispatch_thread_loop():
+    """Hold the dispatch candidacy, and replay the backlog whenever it is acquired."""
+    print("Catalyst dispatch thread started.")
+    dispatch = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH)
+    was_dispatcher = None
+    last_sweep = 0.0
+    just_acquired = False
+    while True:
+        try:
+            leading = dispatch.leading()
+            if leading != was_dispatcher:
+                # Whether this node holds the queues decides whether any task in the cluster
+                # moves, so the transition earns a line. An operator looking at a stuck task
+                # needs to be able to tell "the worker is busy" from "the queues are
+                # somewhere else".
+                print("Catalyst dispatch: %s" % (
+                    "holding the queues on this node" if leading
+                    else "standing by, another node holds the queues"))
+                sys.stdout.flush()
+                was_dispatcher = leading
+                if leading:
+                    # Immediately, not on the next sweep: everything recorded under the
+                    # previous dispatcher is waiting, and the window between acquiring the
+                    # candidacy and replaying is a window where the cluster looks idle.
+                    last_sweep = 0.0
+                    just_acquired = True
+                    with lock:
+                        queued_task_ids.clear()
+
+            if not leading:
+                time.sleep(2)
+                continue
+
+            if time.time() - last_sweep >= DISPATCH_SWEEP_SECONDS:
+                last_sweep = time.time()
+                requeued, failed = recover_open_tasks(fail_in_flight=just_acquired)
+                just_acquired = False
+                if requeued or failed:
+                    print(f"[Catalyst] Recovered tasks: {requeued} re-queued, "
+                          f"{failed} failed with a reason.")
+                    sys.stdout.flush()
+        except Exception as e:
+            sys.stderr.write(f"Error in Catalyst dispatch loop: {e}\n")
+        time.sleep(2)
+
 
 def main():
     print("Catalyst task coordination service starting...")
     init_db_schema()
-    recover_stuck_tasks()
-    
+
     # Start scheduler thread
     t = threading.Thread(target=scheduler_thread_loop, daemon=True)
     t.start()
-    
+
+    # Hold the queues, and replay what the last holder left behind.
+    threading.Thread(target=dispatch_thread_loop, daemon=True).start()
+
     # Mutual TLS, against the same cluster CA every other inter-node call uses.
     #
     # This API dispatched cluster work -- VM start, stop, migrate -- to anything that

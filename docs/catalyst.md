@@ -10,7 +10,13 @@ Catalyst is the task orchestrator, coordinator, and execution scheduler for the 
 ## Architecture & Features
 
 - **Daemon Service**: Runs as a local Python service (`/usr/local/bin/catalyst`) managed by systemd (`catalyst.service`), binding to `127.0.0.1:9091`.
-- **Task Schema & Persistence**: Tasks are persisted in the ScyllaDB table `hydra.catalyst_tasks`. This ensures tasks can be tracked across node failovers and server restarts.
+- **Task Schema & Persistence**: Tasks are persisted in the ScyllaDB table `hydra.catalyst_tasks`,
+  with a parent, an owning component, a per-component sequence id and a completion time —
+  see [The task tree](#the-task-tree) and [Recovery](#recovery).
+- **Which node holds the queues**: the one holding the `catalyst-dispatch` candidacy, which is
+  an election of its own and *not* the ZooKeeper ensemble's leader. The winner publishes its
+  address, and every submitter and every worker resolves the queues by reading it. See
+  [service_leadership.md](./service_leadership.md).
 - **Service Queues**: Distributes tasks to specialized background workers via in-memory queues:
   - `vali`: For VM scheduling, placement, load balancing, and maintenance migrations.
   - `dagur`: For cron scheduling and maintenance task execution, and for any console
@@ -32,10 +38,14 @@ time back. That read-modify-write used to be blind, so it submitted the job **on
 scheduler that reached the row** — two Dagur runs of the same backup, the same scrub, the
 same compaction, against the same volumes at the same moment.
 
-Two schedulers is not a hypothetical. `is_zookeeper_leader()` probes ZooKeeper's four-letter
-`stat` and, when the leader does not answer on port 9091, falls back to *"lowest node with
-9091 open"*. A ZooKeeper that is slow, restarting or partitioned gives that answer to two
-nodes at once, and both then believe they are the only scheduler.
+Two schedulers is not a hypothetical, and it stays possible with a real election. The
+scheduler now stands for the `catalyst-scheduler` candidacy, which answers correctly when it
+answers — but the answer is read from the ensemble at one instant and acted on at a later one.
+A scheduler that reads "I lead", then stalls long enough to lose its session, is still inside
+the pass it started. (Before the candidacy it was worse: `is_zookeeper_leader()` probed
+ZooKeeper's four-letter `stat` and, when the leader did not answer on port 9091, fell back to
+*"lowest node with 9091 open"* — an answer a slow or partitioned ZooKeeper gave to two nodes at
+the same time.)
 
 `claim_scheduled_run()` takes the tick through Daruk's
 [`POST /v1/schedule/claim-job`](./daruk.md#claiming-a-scheduler-tick), whose
@@ -64,6 +74,94 @@ Three behaviours the loop depends on:
 > Spectrum runs its own copy of this loop over the same table, and Mimir runs the same shape
 > over `hydra.mimir_schedules`. Both still write the clock blind and can race a Catalyst
 > that is claiming correctly. `POST /v1/schedule/claim-check` exists for the Mimir side.
+
+---
+
+## The task tree
+
+A task used to be a flat row: a service, a verb, a status and two timestamps. Three things a
+real task framework records were missing, and all three start at the table.
+
+Measured against a Nutanix cluster's Ergon, read directly with `ecli task.list`:
+
+| Ergon | Helios | Why it matters |
+| :--- | :--- | :--- |
+| Task UUID | `task_id` | was already there |
+| **Parent Task UUID** | `parent_task_id` | a rolling upgrade *is* a tree — one job per node, each with steps — and was reported as a list of unrelated rows |
+| Component (`Acropolis`, `Narsil`) | `component` | not the same as `service`: a Hylia upgrade step runs on the `dagur` queue, so `service` attributes it to the cron runner |
+| Sequence-id (`255227`, per component) | `sequence_id` | two tasks created in the same millisecond had no defined order at all |
+| Type (`kVmSetPowerState`) | `task_type` | every scheduled job has the action `execute`; the type is what says what each one did |
+| Creation + completion, UTC | `created_at` + `completed_at` | `updated_at` moves on every progress report, so a completed task's duration was unknowable from the row |
+
+Added by migration `0011-catalyst-task-tree`. Every column is nullable and nothing rewrites an
+existing row: a task recorded before the migration keeps reading correctly with all of them
+null, which is the truth about it. Backfilling a component or a sequence id would be inventing
+a fact about work that has already happened.
+
+**`parent_task_id` was a key inside the JSON `payload` before it was a column**, because there
+was nowhere else to put it. Both are still read — column first — and will be for as long as the
+thirty-day retention window holds rows written the old way.
+
+### The sequence id
+
+Per component, and claimed rather than incremented. `hydra.catalyst_task_sequence` holds one
+row per component with the next number to hand out, and a submitter takes it through Daruk's
+`POST /v1/catalyst/claim-sequence`, whose `IF next_sequence_id = ?` makes the read and the
+write one Paxos round. A blind `n + 1` is a lost update, and a lost update here is two tasks
+carrying the same number — the single property the column exists to provide.
+
+A refused claim is retried with the value the refusal carries back. A claim that **cannot** be
+made at all yields no number, and the task is submitted anyway: the number is how an operator
+orders a component's history, not how the cluster executes anything, and a task framework that
+refuses work because a counter was contended is worse than a task with no number.
+
+Not a cluster-wide counter, deliberately. One sequence would have to be claimed by every
+submitter in the cluster for every task, which is a permanently contended compare-and-swap on
+the submission path.
+
+---
+
+## Recovery
+
+What this replaces: `recover_stuck_tasks()` ran at every start, on every node, and marked every
+`pending` and every `processing` row `failed` with *"Task aborted due to system daemon
+restart."* A task submitted a second before a restart was recorded, aborted, and never
+attempted. That is data loss, arrived at deliberately, in the function named after recovering
+from it.
+
+The two states are not the same thing and are no longer handled the same way:
+
+* **`pending`** — nothing has happened. No worker has seen it, so nothing in the cluster has
+  been touched and replaying it is simply doing what was asked. It is **re-queued**.
+* **`processing`** — a worker had it. What it did before the dispatcher holding its queue
+  stopped is not recorded, and the actions behind these rows are not replayable on a guess: a
+  half-finished live migration replayed is a second migration of a guest that may already be
+  running elsewhere. It is **failed, with a reason that says it was in flight** and that how
+  far it got is unknown.
+* **`pending` for a queue nothing drains** — failed, naming the missing queue. Left pending it
+  would be replayed on every sweep forever and read as "slow".
+
+Recovery runs on the node that has just **acquired** the dispatch candidacy, not at start-up on
+every node, and then on a slow sweep while it holds it. That is the difference between recovery
+and a cleanup pass: the queues live with the candidacy, so the process that can act on these
+rows is the one that just took it.
+
+The `processing` rule applies on **exactly one pass**: the first after acquiring the candidacy.
+`processing` reads two ways a few seconds apart. On that first pass it means a worker was
+talking to a dispatcher that has stopped, so the row is a corpse. On every later pass it means a
+worker here is running the task right now — and failing those would be the sweep killing every
+live task in the cluster on a fifteen-second timer. A `processing` row whose worker dies
+*while* this node holds the queues is therefore left alone here and surfaces through Mimir's
+stuck-task check instead; it is not this loop's to judge.
+
+It also closes a gap that persistence did not previously pay for. A submission is recorded by
+whichever Catalyst receives it, whether or not that node holds the queues — so a submission
+that reaches the wrong node is now work the dispatcher's sweep finds and replays, where before
+it was queued where nothing drained it and sat `pending` forever.
+
+An unreadable task table fails nothing and replays nothing. "The database did not answer" and
+"there is nothing to replay" are different facts, and acting on the first as though it were the
+second fails every task in the cluster.
 
 ---
 

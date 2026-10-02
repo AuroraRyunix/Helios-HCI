@@ -676,7 +676,7 @@ Vali is the standalone VM management, placement scheduling, and DRS (load balanc
 
 ### Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/vali`) listening locally on port `9095`. Managed by systemd (`vali.service`).
-- **Leader Election**: All Vali instances run ZooKeeper leader election using ephemeral sequential nodes at `/vali/leader`. The elected Leader is responsible for consuming tasks and executing DRS checks.
+- **Leader Election**: All Vali instances stand in two elections, using ephemeral sequential ballots under `/helios/leaders/vali-queue` and `/helios/leaders/vali-drs`. The winner of the first consumes tasks; the winner of the second runs the DRS pass. They are separate on purpose — see [service_leadership.md](./service_leadership.md).
 - **Autostart Constraint**: Vali is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ### Database Schema
@@ -878,7 +878,7 @@ Dagur is the background central task runner and scheduler service for the HCI cl
 
 ### Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/dagur`) managed by systemd (`dagur.service`).
-- **Consensus Execution**: To prevent duplicate job runs, Dagur only executes tasks on the node elected as the ZooKeeper leader.
+- **Consensus Execution**: To prevent duplicate job runs, Dagur only executes tasks on the node holding the `dagur-queue` candidacy.
 - **Autostart Constraint**: Dagur is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ### Database Schema
@@ -906,7 +906,7 @@ Mimir is the background cluster health diagnostics and checking service for the 
 
 ### Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/mimir`) managed by systemd (`mimir.service`).
-- **Consensus Execution**: Mimir queries ZooKeeper status and only triggers checks on the node elected as the ZooKeeper leader to prevent concurrent execution.
+- **Consensus Execution**: Mimir triggers the check schedule only on the node holding the `mimir-schedules` candidacy, to prevent concurrent execution.
 - **Autostart Constraint**: Mimir is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ### Database Schema
@@ -1377,7 +1377,7 @@ podman exec -i systemd-hydra-db cqlsh 127.0.0.1 -e "DESCRIBE TABLE hydra.logos_m
 
 ### 1. System Architecture
 
-Mipha runs as a native systemd daemon (`mipha.service`) on every hypervisor host. It employs ZooKeeper (Odin) to establish active leadership. While Mipha is installed on all hosts, only the active ZooKeeper leader node runs the monitoring and recovery control loop.
+Mipha runs as a native systemd daemon (`mipha.service`) on every hypervisor host. While it is installed on all hosts, only the host holding the `mipha-ha` candidacy runs the monitoring and recovery control loop — see [service_leadership.md](./service_leadership.md).
 
 ```mermaid
 graph TD

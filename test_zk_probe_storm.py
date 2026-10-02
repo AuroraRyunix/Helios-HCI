@@ -28,10 +28,20 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Every module that asks which node leads the ensemble.
+# Every module that used to carry its own copy of the probe loop.
 LEADER_CALLERS = (
     "vali.py", "catalyst.py", "mimir.py", "dagur.py", "valcli.py",
     "mipha.py", "bifrost.py", "hylia.py", "spectrum_server.py",
+)
+
+# The ones that still ask which node leads the ensemble, because they still mean it:
+# `valcli` and `cluster status` report it, `mipha` decides whether to hand ensemble
+# leadership off when it fences itself, and the rest keep it as the fallback for addressing
+# Catalyst when no candidacy has published an answer. The others stopped asking entirely --
+# see WorkloadPlacementIsNotAnEnsembleQuestion -- and a module that does not ask cannot be
+# required to ask it through the shared helper.
+ENSEMBLE_CALLERS = (
+    "vali.py", "valcli.py", "mipha.py", "hylia.py", "spectrum_server.py",
 )
 
 # Every file that writes the ZooKeeper unit.
@@ -66,13 +76,32 @@ class NobodyRollsTheirOwnProbe(unittest.TestCase):
                 "helios_zk.leader_ip, which caches -- nine private copies of this is what "
                 "produced eleven probes a second." % name)
 
-    def test_every_caller_uses_the_shared_one(self):
-        for name in LEADER_CALLERS:
+    def test_every_caller_that_still_asks_uses_the_shared_one(self):
+        for name in ENSEMBLE_CALLERS:
             source = read(name)
             self.assertIn(
                 "helios_zk.leader_ip(", source,
                 "%s no longer calls the shared probe" % name)
             self.assertIn("import helios_zk", source, "%s does not import it" % name)
+
+    def test_the_ones_that_stopped_asking_did_not_keep_a_private_copy(self):
+        """The cheapest probe is the one nobody makes.
+
+        Four of the nine callers asked only in order to compare the answer to their own
+        address and decide whether to run a leader-only loop. That question moved to a
+        per-service candidacy, so they do not probe at all any more -- and what has to be
+        asserted about them is not that they use the shared helper, but that removing the
+        caller removed the loop rather than leaving a copy behind under another name.
+        """
+        for name in set(LEADER_CALLERS) - set(ENSEMBLE_CALLERS):
+            source = read(name)
+            self.assertNotIn(
+                "def get_zookeeper_leader_ip", source,
+                "%s still defines its own leader lookup; its only caller was the "
+                "leadership gate, and the gate has gone" % name)
+            self.assertIn("import helios_zk", source,
+                          "%s no longer imports helios_zk at all, so it is not standing "
+                          "for anything either" % name)
 
     def test_the_shared_module_ships_everywhere_its_callers_run(self):
         """Two of the callers run inside the Spectrum container, which has its own

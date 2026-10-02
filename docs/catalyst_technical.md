@@ -48,8 +48,8 @@ mindmap
 - Queries ZooKeeper port `2181` to locate the leader.
 - Fallback designated candidate search on Catalyst port `9091` if the current leader is unavailable.
 
-### `is_zookeeper_leader()`
-- Compares the resolved ZooKeeper leader IP with the local hypervisor IP.
+### `holds_dispatch()` / `dispatch_ip()`
+- `holds_dispatch()` is True when this process holds the `catalyst-dispatch` candidacy, which is what makes its in-memory queues *the* queues. `dispatch_ip()` reads the winner's published address, which is how any submitter or worker resolves where to go.
 
 ### `init_db_schema()`
 - Seeds the `hydra.catalyst_tasks` table on service start:
@@ -67,7 +67,7 @@ mindmap
 - Creates a `threading.Event` to coordinate client long-polling.
 
 ### `scheduler_thread_loop()`
-- Runs every 10 seconds on the ZooKeeper leader node.
+- Runs every 10 seconds on the node holding the `catalyst-scheduler` candidacy.
 - Queries `hydra.dagur_schedules` to find active cron jobs.
 - Compares current time against interval checks. If due, creates a task in the database and dispatches it to the `dagur` queue.
 

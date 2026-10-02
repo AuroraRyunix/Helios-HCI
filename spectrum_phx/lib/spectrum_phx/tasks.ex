@@ -19,9 +19,27 @@ defmodule SpectrumPhx.Tasks do
       "finished", not "worked". `state/1` is the only thing that says whether it worked.
 
     * `payload` is a JSON *string*, not a map, and it is the only place a task's subject
-      lives: `vm_name`, `job_name`, `hostname`, `filename`. It also carries
-      `parent_task_id`, which is how `mipha.py` relates a workflow to its steps -- there is
-      no parent column.
+      lives: `vm_name`, `job_name`, `hostname`, `filename`.
+
+    * `parent_task_id` is a column now, and it used to be a key inside `payload` because
+      there was nowhere else to put it. Both are read, column first: every row written
+      before the column existed carries its parent in the payload and nowhere else, and
+      those rows stay in the table for the length of the retention window. A row that names
+      a parent in both is not a conflict worth adjudicating -- the writers that set the
+      column set it from the payload -- so the column simply wins.
+
+    * `component` is who the task belongs to, which is *not* `service`. `service` is the
+      queue that executed it. They differ exactly where it matters: a Hylia upgrade step
+      runs on the `dagur` queue, so reading `service` as the owner attributes a rolling
+      upgrade to the cron runner.
+
+    * `sequence_id` is monotonic per component and may be null -- on every row written
+      before the column existed, and on a submission whose claim on the counter could not
+      be made. Null is not zero and must not be rendered as a position.
+
+    * `completed_at` is set only when a task reaches a terminal status. `updated_at` moves
+      on every progress report, so it is not an end time and a duration taken from it is
+      the time since the last progress report of a task that may still be running.
 
     * `created_at`/`updated_at` are `timestamp` columns; Xandra decodes them to
       `DateTime`. Rows written from JSON fixtures may carry epoch milliseconds instead, so
@@ -45,7 +63,8 @@ defmodule SpectrumPhx.Tasks do
 
   alias SpectrumPhx.Hydra
 
-  @columns "task_id, service, action, status, payload, progress, error_msg, created_at, updated_at"
+  @columns "task_id, parent_task_id, component, sequence_id, service, action, task_type, " <>
+             "status, payload, progress, error_msg, created_at, updated_at, completed_at"
   @list_cql "SELECT #{@columns} FROM hydra.catalyst_tasks"
 
   @default_limit 200
@@ -177,11 +196,20 @@ defmodule SpectrumPhx.Tasks do
     status = row |> get("status") |> normalize_status()
     id = string(get(row, "task_id")) || ""
 
+    service = string(get(row, "service")) || "system"
+    action = string(get(row, "action")) || "task"
+
     %{
       id: id,
       short_id: String.slice(id, 0, 8),
-      service: string(get(row, "service")) || "system",
-      action: string(get(row, "action")) || "task",
+      service: service,
+      action: action,
+      # The owner, falling back to the executor. A row written before the column existed has
+      # no better answer available, and leaving it blank would read as "nobody's task".
+      component: string(get(row, "component")) || service,
+      sequence_id: integer(get(row, "sequence_id")),
+      # What the task *is*. Defaulted to the verb because that is all an older row has.
+      task_type: string(get(row, "task_type")) || action,
       status: status,
       state: state(status),
       progress: progress(get(row, "progress")),
@@ -189,9 +217,10 @@ defmodule SpectrumPhx.Tasks do
       payload: payload,
       payload_raw: payload_raw,
       label: label(row, payload),
-      parent_id: parent_id(payload),
+      parent_id: parent_id(row, payload),
       created_at: timestamp(get(row, "created_at")),
       updated_at: timestamp(get(row, "updated_at")),
+      completed_at: timestamp(get(row, "completed_at")),
       depth: 0
     }
   end
@@ -247,8 +276,18 @@ defmodule SpectrumPhx.Tasks do
   defp decode_payload(map) when is_map(map), do: stringify(map)
   defp decode_payload(_other), do: nil
 
-  defp parent_id(%{"parent_task_id" => id}) when is_binary(id) and id != "", do: id
-  defp parent_id(_payload), do: nil
+  # Column first, payload second. The payload is where the relationship lived before there
+  # was a column, and those rows are still in the table -- the retention window is thirty
+  # days, so a cluster that upgrades today keeps reading them for a month.
+  defp parent_id(row, payload) do
+    case string(get(row, "parent_task_id")) do
+      nil -> payload_parent(payload)
+      id -> id
+    end
+  end
+
+  defp payload_parent(%{"parent_task_id" => id}) when is_binary(id) and id != "", do: id
+  defp payload_parent(_payload), do: nil
 
   # The same naming the old tasks page derived in JS, kept because it is what operators
   # read: the payload is where the subject of a task lives.

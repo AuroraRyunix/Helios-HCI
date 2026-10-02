@@ -7,7 +7,7 @@ Dagur is the background central task runner and scheduler service for the HCI cl
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/dagur`) managed by systemd (`dagur.service`).
-- **Consensus Execution**: To prevent duplicate job runs, Dagur only executes tasks on the node elected as the ZooKeeper leader.
+- **Consensus Execution**: To prevent duplicate job runs, Dagur only executes tasks on the node holding the `dagur-queue` candidacy ([service_leadership.md](./service_leadership.md)). It used to be the node elected as the ZooKeeper leader, which moved the runner -- along with every other leader-only workload in the cluster -- every time the ensemble re-elected.
 - **Autostart Constraint**: Dagur is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ## Database Schema

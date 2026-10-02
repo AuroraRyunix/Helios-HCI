@@ -3,11 +3,12 @@
 Bifrost is the floating Virtual IP (VIP) manager service for the HCI cluster. It is the direct equivalent of Nutanix **Vipmonitor**. It acts as a lightweight, consensus-aware IP router to ensure that the user-facing WebUI (Spectrum) is always reachable via a single, highly available virtual IP address.
 
 > [!NOTE]
-> **Name Origin:** In Norse mythology, **Bifröst** is the burning rainbow bridge that connects Midgard (the realm of humans) to Asgard (the realm of the gods). In Helios-HCI, the **Bifrost** daemon acts as a network bridge, dynamically routing management traffic to the active ZooKeeper leader node using a floating Virtual IP (VIP).
+> **Name Origin:** In Norse mythology, **Bifröst** is the burning rainbow bridge that connects Midgard (the realm of humans) to Asgard (the realm of the gods). In Helios-HCI, the **Bifrost** daemon acts as a network bridge, dynamically routing management traffic to whichever node currently holds the `bifrost-vip` candidacy, using a floating Virtual IP (VIP).
 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/bifrost`) managed by systemd (`bifrost.service`).
-- **WebUI-Aligned VIP Binding**: Bifrost queries ZooKeeper status and verifies WebUI (Spectrum port `8443`) responsiveness. The node elected as the ZooKeeper leader that is actively serving the WebUI binds the cluster VIP to its physical interface. If the leader node's WebUI is restarting or down, the VIP manager dynamically falls back to an active follower node running Spectrum, ensuring zero-downtime failover.
+- **WebUI-Aligned VIP Binding**: Bifrost stands for the `bifrost-vip` candidacy ([service_leadership.md](./service_leadership.md)) and stands **only while this node is actually serving clients** — Slate's ingress on `443` and both console backends (`8443` and `8444`). Local health is the entry condition, not a veto applied after winning, so the lowest ballot is by construction a node that can serve the console and there is exactly one of it. A node that stops serving withdraws, which hands the address to a healthy peer.
+- **This is a behaviour change, not only a mechanism change.** The VIP used to go to the ZooKeeper ensemble's leader if that node was also serving `443`, and *nowhere* otherwise: electing a replacement by sort order was deliberately refused, because that is a second independent election that can disagree with the ensemble's and put the same address on both sides of a partition. The cost was that one node's Traefik being down took the console offline cluster-wide while two healthy nodes watched. The safe direction is unchanged — a candidacy that cannot establish that it leads reports False, so an unreachable ensemble releases the VIP rather than binding it on a guess.
 - **Autostart Constraint**: Bifrost is a static systemd service that is dynamically started/stopped by Spark commands (`cluster start` / `cluster stop`) and does not auto-start on boot unless the cluster is online.
 
 ## Technical Execution
@@ -53,7 +54,7 @@ ip addr show dev ens192
 ```
 
 ### 4. Manually Query ZK Leader IP
-Query the current ZooKeeper leader IP as resolved by Bifrost's active failover logic:
+Query the current ZooKeeper **ensemble** leader. Note that this is no longer what decides who holds the VIP -- that is the `bifrost-vip` candidacy, read from `/helios/leaders/bifrost-vip`:
 ```bash
 # Query leader IP directly using python inside bifrost code context
 python3 -c "import sys; sys.path.append('/usr/local/bin'); import bifrost; print(bifrost.get_zookeeper_leader_ip())"

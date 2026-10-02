@@ -166,8 +166,27 @@ def get_zookeeper_leader_ip():
     return helios_zk.leader_ip(ips)
     return None
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    """One candidacy per job.
+
+    Driving the rolling upgrade used to be `get_zookeeper_leader_ip() == LOCAL_IP`, which is
+    a particularly bad fit here: a rolling upgrade restarts ZooKeeper on every node in turn,
+    so the upgrade itself moved the ensemble leader -- and with it the driver of the upgrade
+    -- while the upgrade was running. The resume path exists because that happened. A
+    candidacy is not immune to the node going away, but the ensemble restarting is no longer
+    a reason for the driver to move.
+    """
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            hosts = [h.get("ip") for h in (get_cluster_hosts() or []) if h.get("ip")]
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP, hosts=hosts)
+            _CANDIDACIES[service] = existing
+        return existing
 
 def log_upgrade(job_id, line):
     print(f"[Hylia] {line}")
@@ -1145,7 +1164,11 @@ def get_catalyst_target_ip():
     this node's own address reaches the same listener and does verify. `spark_endpoint()`
     solves the identical problem one port down.
     """
-    leader_ip = get_zookeeper_leader_ip()
+    published = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    leader_ip = published.decode("utf-8", "replace").strip() if published else None
+    if not leader_ip:
+        # No published answer means an unreachable ensemble, where the probe is all there is.
+        leader_ip = get_zookeeper_leader_ip()
     if not leader_ip or leader_ip in ("127.0.0.1", "::1", "localhost") or leader_ip == LOCAL_IP:
         if LOCAL_IP and LOCAL_IP not in ("127.0.0.1", "::1", "localhost"):
             return LOCAL_IP
@@ -1425,7 +1448,7 @@ def start_upgrade(job_id):
                 print(
                     f"No hylia daemon picked job {job_id} up within {STARTING_GRACE_SEC}s. "
                     f"The upgrade has not started; check that hylia is running on the "
-                    f"ZooKeeper leader.", file=sys.stderr)
+                    f"node holding the hylia-upgrades candidacy.", file=sys.stderr)
                 return 1
             continue
 
@@ -1437,9 +1460,10 @@ def start_upgrade(job_id):
 
 def hylia_loop():
     print("[Hylia] Daemon loop started.")
+    driver = candidacy(helios_zk.SERVICE_HYLIA_UPGRADES)
     while True:
         try:
-            if is_zookeeper_leader():
+            if driver.leading():
                 # Query upgrading jobs
                 rc, stdout, _ = run_cql_query("SELECT JSON job_id, state FROM hydra.hylia_jobs;")
                 if rc == 0 and stdout:

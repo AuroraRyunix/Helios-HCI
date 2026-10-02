@@ -55,8 +55,8 @@ mindmap
 ### `get_zookeeper_leader_ip()`
 - Scans nodes on port `2181` to locate the active ZooKeeper consensus leader.
 
-### `is_zookeeper_leader()`
-- Compares ZooKeeper leader IP with local hypervisor IP.
+### `candidacy(service)`
+- Returns this process's standing candidacy for a job, created once and kept for the life of the daemon. The loop stands for `hylia-upgrades`.
 
 ### `log_upgrade(job_id, line)`
 - Writes log messages to standard out.

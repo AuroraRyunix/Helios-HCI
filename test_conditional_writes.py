@@ -192,6 +192,13 @@ class CatalystScheduleClaimTests(ConditionalWriteTestCase):
         self.assertEqual(SESSION.row(DAGUR_SCHEDULES, "storage_scrub")["last_run_epoch"], 4000)
 
 
+class AlwaysLeading(object):
+    """A candidacy that says this process holds the job. See run_one_pass."""
+
+    def leading(self):
+        return True
+
+
 class CatalystSchedulerLoopTests(ConditionalWriteTestCase):
     """The loop itself, run one pass at a time against the fake database."""
 
@@ -210,11 +217,19 @@ class CatalystSchedulerLoopTests(ConditionalWriteTestCase):
         real_time = catalyst.time
         real_run_cql = catalyst.run_cql_query
         real_submit = catalyst.submit_task_to_memory
-        real_leader = catalyst.is_zookeeper_leader
+        real_candidacy = catalyst.candidacy
+        real_sequence = catalyst.next_sequence_id
         catalyst.time = FakeClock(now)
         catalyst.run_cql_query = fake_run_cql_query
         catalyst.submit_task_to_memory = lambda service, task: submitted.append((service, task))
-        catalyst.is_zookeeper_leader = lambda: True
+        # The scheduler stands for a candidacy of its own now rather than comparing its
+        # address to the ZooKeeper leader's. What the loop does once it believes it leads is
+        # what these tests are about, so the candidacy is a stub that always says yes -- and
+        # the conditional claim on the clock is still what decides, which is the point: a
+        # candidacy answers correctly at the instant it is read and the pass acts later.
+        catalyst.candidacy = lambda _service: AlwaysLeading()
+        # The sequence id is claimed through Daruk, which is not what this file exercises.
+        catalyst.next_sequence_id = lambda _component: 1
         stderr, sys.stderr = sys.stderr, io.StringIO()
         try:
             catalyst.scheduler_thread_loop()
@@ -225,7 +240,8 @@ class CatalystSchedulerLoopTests(ConditionalWriteTestCase):
             catalyst.time = real_time
             catalyst.run_cql_query = real_run_cql
             catalyst.submit_task_to_memory = real_submit
-            catalyst.is_zookeeper_leader = real_leader
+            catalyst.candidacy = real_candidacy
+            catalyst.next_sequence_id = real_sequence
         self.assertEqual(captured.getvalue(), "", "the loop swallowed an exception")
         return submitted, statements
 

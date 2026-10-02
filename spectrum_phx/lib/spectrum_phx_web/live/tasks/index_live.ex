@@ -107,7 +107,17 @@ defmodule SpectrumPhxWeb.Tasks.IndexLive do
   end
 
   defp matches?(task, needle) do
-    [task.id, task.service, task.action, task.status, task.label, task.error, task.payload_raw]
+    [
+      task.id,
+      task.component,
+      task.task_type,
+      task.service,
+      task.action,
+      task.status,
+      task.label,
+      task.error,
+      task.payload_raw
+    ]
     |> Enum.reject(&is_nil/1)
     |> Enum.any?(fn field -> String.contains?(String.downcase(field), needle) end)
   end
@@ -219,6 +229,7 @@ defmodule SpectrumPhxWeb.Tasks.IndexLive do
           <thead>
             <tr>
               <th>Task</th>
+              <th>Component</th>
               <th>Status</th>
               <th>Progress</th>
               <th>Updated</th>
@@ -236,7 +247,7 @@ defmodule SpectrumPhxWeb.Tasks.IndexLive do
                   <div class="min-w-0">
                     <p class="font-medium">{task.label}</p>
                     <p class="text-xs opacity-50 font-mono">
-                      {task.short_id} &middot; {task.service}
+                      {task.short_id} &middot; {task.task_type} &middot; via {task.service}
                     </p>
                     <p
                       :if={task.error}
@@ -247,6 +258,16 @@ defmodule SpectrumPhxWeb.Tasks.IndexLive do
                     </p>
                   </div>
                 </div>
+              </td>
+              <td class="align-top text-xs whitespace-nowrap">
+                <span class="badge badge-sm badge-ghost">{task.component}</span>
+                <%!-- A null sequence is a row written before the column existed, or a
+                      submission whose claim on the counter was refused. Rendering it as
+                      "#0" would make it look like the first thing the component ever
+                      did. --%>
+                <span :if={task.sequence_id} class="opacity-50 font-mono ml-1">
+                  &#35;{task.sequence_id}
+                </span>
               </td>
               <td class="align-top"><.task_badge task={task} /></td>
               <td class="align-top"><.progress_bar task={task} /></td>

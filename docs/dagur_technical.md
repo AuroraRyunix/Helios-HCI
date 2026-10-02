@@ -9,7 +9,7 @@ mindmap
   root((Dagur Daemon))
     Catalyst Task Polling
       main loop long-polls /api/v1/queues/dagur
-      is_zookeeper_leader guard
+      dagur-queue candidacy guard
       call_catalyst_api helper
     Job Execution Thread
       execute_dagur_job_thread
@@ -57,7 +57,7 @@ mindmap
 ### `main()` Loop
 - Main execution entry point.
 - Every iteration:
-  1. Checks `is_zookeeper_leader()`. If not the leader, sleeps for 2 seconds and retries (prevents duplicate cron runs on cluster followers).
+  1. Asks its `dagur-queue` candidacy whether it leads. If not, sleeps for 2 seconds and retries (prevents duplicate cron runs on the other nodes). A candidacy that cannot establish that it leads answers no, so an unreachable ensemble stops the runner rather than duplicating it.
   2. Requests a task from the Catalyst queue `/api/v1/queues/dagur`.
   3. If a task is returned (200 OK), extracts details and spins up a daemonized `execute_dagur_job_thread` to run the task asynchronously.
   4. If queue is empty (204 No Content) or errors occur, sleeps 2 seconds.

@@ -332,8 +332,44 @@ def run_lwt(endpoint, params, timeout=15):
         return False, False, {}, res.get("error", "compare-and-swap failed")
     return True, bool(res.get("applied")), res.get("current") or {}, ""
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+# -- Which node does which leader-only job ------------------------------------------------
+#
+# Two of them in this process, and they are two questions. Draining Catalyst's `vali` queue
+# and running the DRS pass have nothing to do with each other beyond both being things that
+# must happen once in the cluster, and both used to be `get_zookeeper_leader_ip() == LOCAL_IP`
+# -- the node the ZooKeeper ensemble had elected, for ZooKeeper's own reasons. An ensemble
+# election is a restart, a blip, a rolling upgrade, and when one happened both of these moved
+# at once, onto whichever node ZooKeeper picked, along with every other leader-only workload
+# in the cluster.
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            hosts = [h.get("ip") for h in (get_cluster_hosts() or []) if h.get("ip")]
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP, hosts=hosts)
+            _CANDIDACIES[service] = existing
+        return existing
+
+
+def get_catalyst_target_ip():
+    """The address of the Catalyst holding the queues.
+
+    Read from the dispatch election: the winner publishes its own address, so finding it is
+    a znode read rather than a round of `stat` probes. The probe path below is the fallback
+    for an unreachable ensemble, where there is no published answer and a submission still
+    has to go somewhere -- it is the behaviour this had before, kept for exactly that case
+    and not as the normal path.
+    """
+    published = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    if published:
+        address = published.decode("utf-8", "replace").strip()
+        if address:
+            return address
+    return get_zookeeper_leader_ip()
 
 def get_zookeeper_leader_ip():
     """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
@@ -385,7 +421,7 @@ def get_zookeeper_leader_ip():
 def call_catalyst_api(path, payload=None, method="GET"):
     import urllib.request
     import json
-    leader_ip = get_zookeeper_leader_ip()
+    leader_ip = get_catalyst_target_ip()
     # Catalyst requires a cluster-signed certificate: it dispatches VM lifecycle
     # work and used to accept it from anything that could open a socket to 9091.
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
@@ -775,9 +811,10 @@ def run_drs_loop(aggressive=False):
 
 # Background loops running on leader
 def drs_thread_loop():
+    drs = candidacy(helios_zk.SERVICE_VALI_DRS)
     while True:
         try:
-            if is_zookeeper_leader():
+            if drs.leading():
                 run_drs_loop(aggressive=False)
         except Exception as e:
             sys.stderr.write(f"Error in DRS loop thread: {e}\n")
@@ -1938,31 +1975,31 @@ def process_queue_task(task):
 def queue_thread_loop():
     print("Vali Catalyst worker thread started.")
     if LOCAL_IP == "127.0.0.1":
-        # LOCAL_IP is read from LOCAL_HYPERVISOR_IP in /etc/hci/spectrum/spectrum.env,
-        # and this is the fallback for a file that does not name the node. It is never a
-        # working state: the check below compares the ZooKeeper leader's address against
-        # this node's, so an anonymous node can never be the worker -- and the leader is
-        # the *only* worker, so leadership landing here stops VM power tasks for the
-        # entire cluster while every one of them merely looks slow. Said loudly, because
-        # the failure it describes is otherwise completely silent.
+        # LOCAL_IP is read from LOCAL_HYPERVISOR_IP in /etc/hci/spectrum/spectrum.env, and
+        # this is the fallback for a file that does not name the node. It no longer decides
+        # whether this process is the worker -- the ballot does, and a ballot does not need
+        # to know its own address to be the lowest one. What it does decide is whether the
+        # candidacy publishes anything useful: the identity in the ballot is how a submitter
+        # finds the queue holder, so an anonymous winner is a queue nobody can reach.
         sys.stderr.write(
             "[vali] WARNING: this node does not know its own address "
             "(LOCAL_HYPERVISOR_IP is absent from /etc/hci/spectrum/spectrum.env). It can "
-            "never act as the Catalyst queue worker, and if it holds ZooKeeper "
-            "leadership then no VM power task anywhere in this cluster will run.\n")
+            "stand for the queue worker candidacy but publishes no address with it, so "
+            "anything resolving the worker by its published identity cannot reach it.\n")
         sys.stderr.flush()
 
+    worker = candidacy(helios_zk.SERVICE_VALI_QUEUE)
     was_worker = None
     while True:
         try:
-            leading = is_zookeeper_leader()
+            leading = worker.leading()
             if leading != was_worker:
                 # Whether this process drains the queue at all is decided here, so the
                 # transition earns a line. It is the difference an operator needs between
                 # "the worker is busy" and "no worker is running anywhere".
                 print("Vali Catalyst worker: %s" % (
-                    "draining the queue, this node holds ZooKeeper leadership" if leading
-                    else "standing by, another node holds ZooKeeper leadership"))
+                    "draining the queue, this node holds the vali-queue candidacy" if leading
+                    else "standing by, another node holds the vali-queue candidacy"))
                 sys.stdout.flush()
                 was_worker = leading
             if not leading:

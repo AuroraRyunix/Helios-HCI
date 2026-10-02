@@ -8,7 +8,7 @@ Hylia is the rolling upgrade and Life Cycle Management (LCM) daemon for the HCI 
 ## Architecture & Lifecycle
 - **Daemon Service**: Runs as a standalone python service (`/usr/local/bin/hylia`) managed by systemd (`hylia.service`).
 - **Distributed State Persistence**: The upgrade state, target host lists, manifest data, and log runner buffer are stored in ScyllaDB (`hydra.hylia_jobs` and `hydra.hylia_logs`).
-- **High-Availability Resume Hook**: When the ZooKeeper leader node reboots, the Hylia daemon on that node stops. A standby node gains ZooKeeper leadership, initializes its Hylia loop, detects the active upgrade job in the database, and seamlessly resumes orchestrating the upgrade from where it was interrupted.
+- **High-Availability Resume Hook**: When the node driving an upgrade reboots, the Hylia daemon on it stops and its ballot for `hylia-upgrades` disappears with its session. The next candidate becomes the driver, detects the active upgrade job in the database, and resumes orchestrating it from where it was interrupted. This used to be keyed to ZooKeeper ensemble leadership, which fitted the job particularly badly: a rolling upgrade restarts ZooKeeper on every node in turn, so the upgrade itself moved the ensemble leader -- and with it the driver -- while it was running. See [service_leadership.md](./service_leadership.md).
 
 ## Rolling Upgrade Workflow
 For each host in the target update node list, Hylia performs the following steps:

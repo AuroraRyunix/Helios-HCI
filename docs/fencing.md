@@ -195,7 +195,7 @@ two reasons:
   query it, including the web tier. Chassis power-off credentials for the whole cluster
   do not belong there.
 
-Mipha only runs the failover loop on the ZooKeeper leader, and leadership moves, so the
+Mipha only runs the failover loop on the node holding the `mipha-ha` candidacy ([service_leadership.md](./service_leadership.md)), and that moves, so the
 file has to be present and identical on all hosts.
 
 ```json
@@ -363,7 +363,7 @@ peer answering, the outcome here is quarantine rather than fence.
 
 ### Leadership
 
-A self-fenced host that holds ZooKeeper leadership is a problem: the Mipha leader does not
+A self-fenced host that holds ZooKeeper **ensemble** leadership is a problem: the Mipha monitor does not
 monitor itself, so nothing would evacuate it, and Purah would keep running on a host whose
 storage has just been declared unserviceable. The fence therefore stops the local
 `zookeeper` so a healthy node takes over — but **only at three nodes or more**, because

@@ -118,9 +118,18 @@ class TheRolloutRepairsNodesBuiltBeforeTheFix(unittest.TestCase):
 
 class TheFailureCannotBeSilent(unittest.TestCase):
     def test_vali_warns_when_it_does_not_know_its_address(self):
+        """What an anonymous node costs has changed, and the warning says the new thing.
+
+        It used to be unable to be the queue worker at all, because being the worker was
+        `leader_ip(ips) == LOCAL_IP` and an address of 127.0.0.1 never matched. A ballot does
+        not need to know its own address to be the lowest one, so such a node can now win --
+        and what it loses instead is the ability to be *found*, because the address it
+        publishes in its ballot is how a submitter resolves the queue holder. Both are
+        failures worth shouting about; they are not the same failure.
+        """
         source = read("vali.py")
         self.assertIn('if LOCAL_IP == "127.0.0.1":', source)
-        self.assertIn("never act as the Catalyst queue worker", source)
+        self.assertIn("publishes no address with it", source)
 
     def test_vali_reports_whether_it_is_the_worker(self):
         """"The worker is busy" and "no worker is running anywhere" look identical from

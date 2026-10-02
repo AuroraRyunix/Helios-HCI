@@ -101,69 +101,62 @@ def run_remote_spark(ip, command, timeout=DEFAULT_JOB_TIMEOUT):
 
 
 
-def get_zookeeper_leader_ip():
-    """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
-    ips = []
-    try:
-        with open("/etc/hci/cluster.json", "r") as f:
-            cdata = json.load(f)
-            ips = [h["ip"] for h in cdata.get("hosts", [])]
-    except Exception:
-        ips = [LOCAL_IP]
-        
-    leader_ip = None
-    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine
-    # copies of this loop on nine timers had the ensemble answering eleven `stat`
-    # probes a second forever, and ZooKeeper logs two INFO lines for each one.
-    leader_ip = helios_zk.leader_ip(ips)
-            
-    # Check if leader is active on port 9091
-    leader_active = False
-    if leader_ip:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((leader_ip, 9091))
-            s.close()
-            leader_active = True
-        except Exception:
-            leader_active = False
-            
-    if leader_active:
-        return leader_ip
-        
-    # If leader is inactive, find active candidates with port 9091 open
-    candidates = []
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 9091))
-            s.close()
-            candidates.append(ip)
-        except Exception:
-            pass
-            
-    if not candidates:
-        return leader_ip if leader_ip else "127.0.0.1"
-        
-    candidates.sort()
-    return candidates[0]
+# `get_zookeeper_leader_ip` used to live here, as one of nine copies of the same loop. Its
+# only caller was the leadership gate below, and the gate no longer asks who leads the
+# ensemble -- so the copy went with it. The question itself is still answerable, by
+# `helios_zk.leader_ip`, for the callers that genuinely mean it.
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    """One candidacy per job, kept for the life of the process.
+
+    Draining Catalyst's `dagur` queue used to be `get_zookeeper_leader_ip() == LOCAL_IP`:
+    whichever node the ZooKeeper ensemble had elected ran every leader-only workload in the
+    cluster, and an ensemble election -- a restart, a blip, a rolling upgrade -- moved them
+    all at once. Running maintenance jobs has nothing to do with leading ZooKeeper.
+    """
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP)
+            _CANDIDACIES[service] = existing
+        return existing
+
+
+def get_catalyst_target_ip():
+    """The address of the Catalyst holding the queues.
+
+    This used to be loopback unconditionally, which was correct only because the worker and
+    the queues were both pinned to the ZooKeeper leader. They are separately elected now, so
+    the queue this worker drains and the Catalyst it reports results to may be on another
+    node -- and both have to be the *same* node, or a result is reported to a process that
+    is not waiting for it.
+    """
+    published = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    if published:
+        address = published.decode("utf-8", "replace").strip()
+        if address:
+            return address
+    # No published answer means an unreachable ensemble. Loopback is the honest fallback:
+    # this node's own Catalyst is the only one it can be sure of, and the dispatch check on
+    # the queue endpoint refuses the poll rather than serving an empty queue.
+    return "127.0.0.1"
+
 
 def call_catalyst_api(path, payload=None, method="GET"):
-    """Call the local Catalyst API over mutual TLS.
+    """Call the Catalyst holding the queues, over mutual TLS.
 
-    Catalyst dispatches cluster work and now requires a certificate this cluster's CA
-    signed. Loopback is reached by this node's own address because that is what its
-    certificate names -- see spark_endpoint() for the same reasoning applied to
-    spark-daemon.
+    Catalyst dispatches cluster work and requires a certificate this cluster's CA signed.
+    Loopback is reached by this node's own address because that is what its certificate
+    names -- see spark_endpoint() for the same reasoning applied to spark-daemon.
     """
     import urllib.request
     import json
-    address, verify_identity = spark_endpoint("127.0.0.1")
+    address, verify_identity = spark_endpoint(get_catalyst_target_ip())
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
                                          cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt",
@@ -266,9 +259,20 @@ def execute_dagur_job_thread(task_id, job_name, command,
 
 def main():
     print("Dagur Catalyst task runner daemon started.")
+    worker = candidacy(helios_zk.SERVICE_DAGUR_QUEUE)
+    was_worker = None
     while True:
         try:
-            if not is_zookeeper_leader():
+            leading = worker.leading()
+            if leading != was_worker:
+                # The difference between "the job is slow" and "no runner is running
+                # anywhere" is otherwise invisible from the console.
+                print("Dagur Catalyst worker: %s" % (
+                    "draining the queue, this node holds the dagur-queue candidacy" if leading
+                    else "standing by, another node holds the dagur-queue candidacy"))
+                sys.stdout.flush()
+                was_worker = leading
+            if not leading:
                 time.sleep(2)
                 continue
                 

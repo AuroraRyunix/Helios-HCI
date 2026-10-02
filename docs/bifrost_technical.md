@@ -39,14 +39,14 @@ mindmap
 - Parses response for `mode: leader` or `mode: standalone`.
 - Verifies if the elected leader's Spectrum port `8443` is listening. If not, falls back to the candidate running Spectrum with the lowest IP address.
 
-### `is_zookeeper_leader(local_ip=None)`
+### `vip_candidacy(hosts, local_ip)`
 - Resolves the local hypervisor IP (reads `/etc/hci/spectrum/spectrum.env` or resolves via UDP socket to `8.8.8.8`).
-- Compares it with the resolved ZooKeeper leader IP.
+- Returns the process's standing candidacy for `bifrost-vip`, created once and kept for the life of the daemon. `leading()` is the whole interface; `withdraw()` is what the loop calls when the local stack fails its health guard.
 
 ### `is_vip_bound(iface, vip)`
 - Checks if the VIP is currently bound to the specified interface by parsing `ip addr show dev <iface>`.
 
 ### `main()` Loop
 - Standard daemon loop running every 2 seconds.
-- Performs ZooKeeper leadership and local Spectrum checks.
+- Checks the local stack first and stands or withdraws accordingly, then asks the candidacy whether it leads.
 - Binds or releases the VIP and sends gratuitous ARP (GARP) updates using `/usr/sbin/arping`.
