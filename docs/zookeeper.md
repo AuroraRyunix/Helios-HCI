@@ -114,6 +114,20 @@ for whatever the next mistake turns out to be, generous enough for a real electi
 the cache must be honoured, the config must ship, and every writer of the unit must mount
 it and set the limit.
 
+### What watches instead of asking
+
+The leader probe above is a question about the *ensemble*. Questions about cluster **state**
+are not asked on a timer at all any more: `helios_zk` has a real watch implementation, and
+each node's reconcile loop holds a data watch on `/cluster_state` rather than re-reading it
+every five seconds. Zeus on a real Nutanix cluster reports **90 connections watching 319
+paths, 568 watches total** -- their services watch, they do not poll, and that is the shape
+to copy.
+
+How a watch is re-armed after it fires and after a session loss -- which is the part a
+hand-rolled client gets wrong, because the symptom is a watch that quietly stops firing --
+is written up in [cluster_state.md](./cluster_state.md) §8, together with the frame
+demultiplexer that makes it possible. `test_zk_watches.py` holds it.
+
 ### Restarting the ensemble
 
 Never all at once. `deploy_updates.py` reconciles `zookeeper.container` and reloads systemd
