@@ -64,7 +64,7 @@ the socket itself, so a caller cannot name a file at all.
 | `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and DFS endpoints |
 | `/storage` | `Storage.IndexLive` | Sidon's `capacity`, `list` and `peers` per node, plus `lsblk` |
 | `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Sidon vdisks |
-| `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks` |
+| `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks`, read as a tree: `parent_task_id` (column, falling back to the payload key it used to live in), `component` and `sequence_id` |
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
 | `/health` | `Health.IndexLive` | `hydra.mimir_results`, `hydra.dagur_schedules` |
 | `/hardware` | `Hardware.IndexLive` | Spark's `host/cpu`, `host/memory`, `host/disks`, `host/network` per node |
@@ -393,10 +393,20 @@ when it goes wrong. What makes them safe to offer is not the button — it is th
 runs where a worker can report on it.
 
 Everything here goes through one submission path, `SpectrumPhx.Catalyst`. It posts to
-`POST /api/v1/tasks/submit` on the ZooKeeper leader over mutual TLS, because Catalyst's
-queues are `queue.Queue` objects *inside that process*: the `hydra.catalyst_tasks` row it
-also writes is the record, not the queue, so a console that wrote the row itself would
-produce a task that is listed, never runs, and never fails.
+`POST /api/v1/tasks/submit` over mutual TLS, because Catalyst's queues are `queue.Queue`
+objects *inside that process*: the `hydra.catalyst_tasks` row it also writes is the record,
+not the queue, so a console that wrote the row itself would produce a task that is listed,
+never runs, and never fails.
+
+Which Catalyst holds the queues is now the `catalyst-dispatch` candidacy rather than ZooKeeper
+ensemble leadership, and `Catalyst.leader_ip/0` **has not been moved onto it** — it is an
+Elixir process that cannot open a ZooKeeper session with the client in this repo, and it
+already carries a `:catalyst_ip` override and a standing TODO for leader resolution. What
+changed is the consequence of guessing wrong: a submission that lands on a node which does not
+hold the queues is recorded and then replayed by the dispatcher's recovery sweep, where before
+it was queued where nothing drained it and sat `pending` forever. See
+[service_leadership.md](./service_leadership.md) and
+[catalyst.md](./catalyst.md#recovery).
 
 | Control | Service | What actually runs, and where |
 |---|---|---|

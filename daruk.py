@@ -307,6 +307,31 @@ LWT_OPS = {
             "expected_last_run_epoch": {"type": "int", "required": True, "nullable": True},
         },
     },
+    # A task's sequence id. Per component, monotonic, and handed out one at a time: the
+    # row holds the next number and a submitter takes it by writing one more, conditional
+    # on the value it proposed from. Blind, `SET next_sequence_id = n + 1` is a lost update
+    # the moment two components' submitters -- or two nodes submitting for the same
+    # component -- read the row in the same instant, and a lost update here means two tasks
+    # carrying the same sequence id, which is the single property the column exists to
+    # provide.
+    #
+    # `expected_sequence_id` is required and nullable with no default, for the reason
+    # claim-job states: a default would match the component that has never submitted
+    # anything and turn the claim back into the blind write. Null is also how the first
+    # claim for a component works -- there is no row to seed, because `IF col = null`
+    # matches a row that does not exist and creates it.
+    "/v1/catalyst/claim-sequence": {
+        "cql": (
+            "UPDATE hydra.catalyst_task_sequence SET next_sequence_id = ? "
+            "WHERE component = ? IF next_sequence_id = ?"
+        ),
+        "binds": ("next_sequence_id", "component", "expected_sequence_id"),
+        "params": {
+            "component": {"type": "text", "required": True},
+            "next_sequence_id": {"type": "int", "required": True},
+            "expected_sequence_id": {"type": "int", "required": True, "nullable": True},
+        },
+    },
     "/v1/schedule/claim-check": {
         "cql": (
             "UPDATE hydra.mimir_schedules SET last_run_epoch = ? "

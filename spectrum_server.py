@@ -260,7 +260,20 @@ def invalidate_tasks_cache():
     TASKS_CACHE["data"] = None
     TASKS_CACHE["last_fetched"] = 0
 
-def log_catalyst_task(service, action, status, progress, payload_dict, error_msg="", task_id=None, created_at=None):
+def log_catalyst_task(service, action, status, progress, payload_dict,
+                      error_msg="", task_id=None, created_at=None,
+                      component=None, task_type=None, parent_task_id=None):
+    """Record a task the console ran itself, rather than submitted to a queue.
+
+    `component` and `parent_task_id` are optional and default to nothing, which is
+    the truth about a console operation that belongs to no larger workflow. Where
+    one does -- the steps of a rolling upgrade, the children of a Kubernetes deploy
+    -- passing the parent is what puts it in the tree the console draws.
+
+    No sequence id. Claiming one is a compare-and-swap through Daruk, and this is
+    called from request handlers where a contended counter would be latency on a
+    page load; the submissions that go through Catalyst get their number there.
+    """
     try:
         import uuid
         import time
@@ -270,11 +283,21 @@ def log_catalyst_task(service, action, status, progress, payload_dict, error_msg
         if not created_at:
             created_at = now_ms
         payload_str = json.dumps(payload_dict)
-        cql = f"""
-        INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, error_msg, created_at, updated_at)
-        VALUES ({task_id}, '{service}', '{action}', '{status}', '{payload_str.replace("'", "''")}', {progress}, '{error_msg.replace("'", "''")}', {created_at}, {now_ms});
-        """
-        run_cql_query(cql)
+        schema = load_schema_module()
+        # Two statements where there was one, because the two timestamps mean different
+        # things: `created_at` is when the operation started, which a caller resuming a
+        # task passes back in, and `updated_at`/`completed_at` are now. A single INSERT
+        # could carry both only by having a column for each, which is what the insert
+        # builder provides -- and the terminal statuses need `completed_at`, which no
+        # INSERT here ever wrote because the column did not exist.
+        run_cql_query(schema.task_insert_statement(
+            task_id, service, action, payload_str, created_at,
+            component=component or service, task_type=task_type,
+            sequence_id=None, parent_task_id=parent_task_id,
+            status=status, progress=progress))
+        if status in schema.TASK_TERMINAL or error_msg:
+            run_cql_query(schema.task_update_statement(
+                task_id, status, progress, now_ms, error_msg=error_msg))
         invalidate_tasks_cache()
         return task_id, created_at
     except Exception as e:
@@ -3005,21 +3028,25 @@ def lanayru_queue_loop():
     `run_cql_query`, `run_lwt`, `sidon_call`, `get_cluster_nodes` and the log buffer from
     this module. Giving them a home somewhere else means moving all of that first.
 
-    The leadership check is the same one vali and dagur make, and for the same reason:
-    Catalyst's queues are in-memory on the leader, so a worker anywhere else long-polls a
-    queue that nothing is ever put on.
+    The leadership check is the same one vali and dagur make, and for the same reason: one
+    worker, or two nodes deploy the same cluster. It is no longer the *ZooKeeper* leader --
+    that answer moved every leader-only workload in the cluster at once, every time the
+    ensemble re-elected -- but a candidacy of its own. Where the queue lives is a separate
+    question, answered by `get_catalyst_target_ip`, and the two are deliberately not the
+    same node any more.
     """
     print("Lanayru Catalyst worker thread started.")
+    worker = candidacy(helios_zk.SERVICE_LANAYRU_QUEUE)
     was_worker = None
     while True:
-        leading = is_zookeeper_leader()
+        leading = worker.leading()
         if leading != was_worker:
             # Whether this process drains the queue at all is decided here, so the
             # transition earns a line: "the deploy is slow" and "no worker is running
             # anywhere" look identical from the console otherwise.
             print("Lanayru Catalyst worker: %s" % (
-                "draining the queue, this node holds ZooKeeper leadership" if leading
-                else "standing by, another node holds ZooKeeper leadership"))
+                "draining the queue, this node holds the lanayru-queue candidacy" if leading
+                else "standing by, another node holds the lanayru-queue candidacy"))
             sys.stdout.flush()
             was_worker = leading
         if not leading:
@@ -8447,8 +8474,28 @@ def get_zookeeper_leader_ip():
     candidates.sort()
     return candidates[0]
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    """One candidacy per job, kept for the life of the process.
+
+    `is_zookeeper_leader` used to live here, and nothing in this module needs it any more:
+    its only caller decided which node drained Catalyst's `lanayru` queue, which is not a
+    question about the ZooKeeper ensemble. The ensemble's own leader is still a legitimate
+    thing to ask about -- the cluster status page reports it -- and `get_zookeeper_leader_ip`
+    above still answers it.
+    """
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            hosts = [node.get("ip") for node in (get_cluster_nodes() or []) if node.get("ip")]
+            existing = helios_zk.cluster_candidacy(
+                service, globals().get("LOCAL_IP") or "", hosts=hosts)
+            _CANDIDACIES[service] = existing
+        return existing
+
 
 def get_catalyst_target_ip():
     """The active Catalyst's address, chosen so its certificate can be verified.
@@ -8467,7 +8514,14 @@ def get_catalyst_target_ip():
     does verify. `spark_endpoint()` solves the identical problem for spark-daemon; this is
     the same reasoning applied to the one caller that never got it.
     """
-    leader_ip = get_zookeeper_leader_ip()
+    published = candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    leader_ip = published.decode("utf-8", "replace").strip() if published else None
+    if not leader_ip:
+        # Nothing published means an unreachable ensemble, and a submission still has to go
+        # somewhere. The probe below is that fallback and only that: it answers "which node
+        # leads ZooKeeper", which stopped being the same question as "which Catalyst holds
+        # the queues" the moment the queues got an election of their own.
+        leader_ip = get_zookeeper_leader_ip()
     local = globals().get("LOCAL_IP")
     if not leader_ip or leader_ip in ("127.0.0.1", "::1", "localhost") or leader_ip == local:
         if local and local not in ("127.0.0.1", "::1", "localhost"):

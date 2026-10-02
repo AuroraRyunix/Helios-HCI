@@ -650,3 +650,232 @@ class Election(object):
             pass
         finally:
             self.ballot = None
+
+    def standing(self):
+        """True when this candidate's ballot is still in the parent.
+
+        Separate from `is_leader` because the two false answers are different work for the
+        caller. "I am standing and somebody else is first" needs nothing; "my ballot is
+        gone" needs a new one, and a daemon that cannot tell those apart stops leading for
+        the rest of its life the first time its session drops. False when the answer cannot
+        be established, which keeps the caller from tearing down a candidacy it still holds
+        over a momentary read failure.
+        """
+        if self.ballot is None:
+            return False
+        try:
+            return self.ballot in self.client.get_children(self.parent)
+        except (ZKError, OSError):
+            return False
+
+
+# -- A candidacy that outlives its session ------------------------------------------------
+#
+# `Election` is the recipe. This is what a daemon needs wrapped around it, and the reason
+# it is here rather than copied into eight loops.
+#
+# A Helios daemon runs for months. Its ZooKeeper session does not: the ensemble restarts,
+# a rolling upgrade moves the ensemble leader, a link blips, the host pauses long enough
+# to miss its pings. The ballot is ephemeral, so when the session goes the candidacy goes
+# with it -- and a process that does not notice is not merely wrong for a moment, it never
+# leads again for as long as it runs. That is the quiet half of the failure the address
+# comparison had: at least `leader_ip(ips) == LOCAL_IP` started answering True again when
+# ZooKeeper came back.
+#
+# So `leading()` is the whole interface, and it is allowed to do work: connect if it is
+# not connected, stand if it is not standing, and answer the one question the caller has.
+# Three rules make it safe to call from a two-second loop:
+#
+#   * False means "I could not establish that I lead". Never an exception, and never True
+#     on a guess -- the thing on the other side of the answer is a queue being drained,
+#     and two drainers is worse than none.
+#   * A lost ballot is noticed and reported as False *before* a new one is created, so a
+#     stale candidate never acts in the window where it has stopped leading. Standing again
+#     puts it at the back, which is where a returning candidate belongs.
+#   * A reconnect gets a *new* session rather than resuming the old one. Resuming would
+#     bring the old ballot back and leave the daemon holding two, which is harmless for
+#     correctness and a permanent leak.
+#
+# A caller that only wants to know *who* leads a service never calls `leading()`: it reads
+# `leader_identity()`, which needs a session and no ballot. That is how a submitter finds
+# the node holding a queue without standing for the job of draining it.
+
+# A failed connect is retried on a timer rather than on every pass. A down ensemble is the
+# case where every daemon in the cluster is looping, and the last thing it needs is nine
+# processes opening sockets to it as fast as their loops allow.
+CANDIDACY_RETRY_SECONDS = 5.0
+
+# `leader_identity` is read per submission in some callers, where `leading()` is read once
+# per loop. Same reasoning as `leader_ip`'s cache: leadership changes at an election, so a
+# few seconds of staleness is the position every caller is in anyway.
+IDENTITY_CACHE_SECONDS = 3.0
+
+
+class Candidacy(object):
+    """One daemon's standing candidacy for one service, maintained across reconnects.
+
+    `service` is the name of a *job*, not of a daemon: two leader-only loops in one process
+    take two candidacies, because funnelling them through one name rebuilds exactly the
+    coupling this replaces.
+    """
+
+    def __init__(self, service, identity=b"", hosts=("127.0.0.1",), port=2181,
+                 session_timeout_ms=15000, retry_seconds=CANDIDACY_RETRY_SECONDS,
+                 identity_ttl=IDENTITY_CACHE_SECONDS, connect=None, now=None):
+        self.service = service
+        self.identity = identity if isinstance(identity, bytes) else str(identity).encode()
+        self.hosts = [host for host in (hosts or []) if host] or ["127.0.0.1"]
+        self.port = port
+        self.session_timeout_ms = session_timeout_ms
+        self.retry_seconds = retry_seconds
+        self.identity_ttl = identity_ttl
+        self._connect = connect
+        self._now = now or time.time
+        self._client = None
+        self._election = None
+        self._blocked_until = 0.0
+        self._identity_cache = None
+        self._identity_at = 0.0
+        self._lock = threading.RLock()
+
+    # -- the two questions ---------------------------------------------------
+
+    def leading(self):
+        """True only when this process holds the lowest ballot for the service."""
+        with self._lock:
+            if not self._ballot():
+                return False
+            leads = self._election.is_leader()
+            if not leads and not self._election.standing():
+                # The ballot is gone, which means the session is. Report not-leading now
+                # and stand again on the next pass with a fresh session.
+                self._drop()
+            return leads
+
+    def leader_identity(self):
+        """What the current leader of the service published, or None.
+
+        Does not stand, so a process may ask who leads a job it does not do.
+        """
+        with self._lock:
+            moment = self._now()
+            if self._identity_cache is not None and moment - self._identity_at < self.identity_ttl:
+                return self._identity_cache
+            if not self._session():
+                return None
+            found = self._election_view().leader_identity()
+            if found is None:
+                # Nobody standing and an unreachable ensemble are the same answer here, so
+                # neither is cached as though it were known.
+                return None
+            self._identity_cache = found
+            self._identity_at = moment
+            return found
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def withdraw(self):
+        """Give up the ballot but keep the session, so this may stand again later.
+
+        For a candidate whose fitness is conditional on something local -- Bifrost holds
+        the VIP only while this node is actually serving the ingress port -- where the
+        honest move is to stop being a candidate rather than to win and decline.
+        """
+        with self._lock:
+            if self._election is not None:
+                self._election.resign()
+
+    def close(self):
+        with self._lock:
+            self.withdraw()
+            self._drop(block=False)
+
+    # -- internals ----------------------------------------------------------
+
+    def _open(self):
+        if self._connect is not None:
+            return self._connect()
+        return ZKClient(hosts=self.hosts, port=self.port,
+                        session_timeout_ms=self.session_timeout_ms).connect()
+
+    def _session(self):
+        if self._client is not None:
+            return True
+        if self._now() < self._blocked_until:
+            return False
+        try:
+            self._client = self._open()
+        except (ZKError, OSError):
+            self._drop()
+            return False
+        return True
+
+    def _ballot(self):
+        if self._election is not None and self._election.ballot is not None:
+            return True
+        if not self._session():
+            return False
+        try:
+            election = Election(self._client, self.service, identity=self.identity)
+            election.stand()
+        except (ZKError, OSError):
+            self._drop()
+            return False
+        self._election = election
+        return True
+
+    def _election_view(self):
+        """An Election used only to read. It never stands, so it has no ballot and
+        `is_leader` on it would always be False -- which is why nothing calls it."""
+        if self._election is not None:
+            return self._election
+        return Election(self._client, self.service, identity=self.identity)
+
+    def _drop(self, block=True):
+        client, self._client, self._election = self._client, None, None
+        self._identity_cache = None
+        self._identity_at = 0.0
+        if block:
+            self._blocked_until = self._now() + self.retry_seconds
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def cluster_candidacy(service, identity, hosts=None, cluster_file="/etc/hci/cluster.json",
+                      **kwargs):
+    """A Candidacy against the addresses in the cluster document.
+
+    Every daemon that stands for something reads the same file to find the ensemble, and
+    none of them should fail to stand because the read of it was spelled slightly
+    differently. Loopback is the fallback, which is correct for a single node and is the
+    only thing available before the cluster document exists.
+    """
+    addresses = [ip for ip in (hosts or []) if ip]
+    if not addresses:
+        try:
+            import json
+
+            with open(cluster_file, "r") as handle:
+                addresses = [host.get("ip") for host in json.load(handle).get("hosts", [])
+                             if host.get("ip")]
+        except Exception:
+            addresses = []
+    return Candidacy(service, identity=identity, hosts=addresses or ["127.0.0.1"], **kwargs)
+
+
+# The service names in use. Collected here because the string is the contract between the
+# daemon that stands and anyone reading `/helios/leaders` to find out who won, and a typo
+# in one copy is a second election nobody notices.
+SERVICE_CATALYST_DISPATCH = "catalyst-dispatch"
+SERVICE_CATALYST_SCHEDULER = "catalyst-scheduler"
+SERVICE_VALI_QUEUE = "vali-queue"
+SERVICE_VALI_DRS = "vali-drs"
+SERVICE_DAGUR_QUEUE = "dagur-queue"
+SERVICE_LANAYRU_QUEUE = "lanayru-queue"
+SERVICE_MIMIR_SCHEDULES = "mimir-schedules"
+SERVICE_HYLIA_UPGRADES = "hylia-upgrades"
+SERVICE_MIPHA_HA = "mipha-ha"
+SERVICE_BIFROST_VIP = "bifrost-vip"

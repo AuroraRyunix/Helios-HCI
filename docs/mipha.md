@@ -9,11 +9,13 @@
 
 ## 1. System Architecture
 
-Mipha runs as a native systemd daemon (`mipha.service`) on every hypervisor host. It employs ZooKeeper (Odin) to establish active leadership. While Mipha is installed on all hosts, only the active ZooKeeper leader node runs the monitoring and recovery control loop.
+Mipha runs as a native systemd daemon (`mipha.service`) on every hypervisor host. While it is installed on all hosts, only the one holding the `mipha-ha` candidacy runs the monitoring and recovery control loop — an ephemeral sequential ballot under `/helios/leaders/mipha-ha`, lowest counter wins ([service_leadership.md](./service_leadership.md)).
+
+This used to be the node the ZooKeeper ensemble had elected, which is the worst place for it to be decided from: the monitor's job is to notice a host dying, and an ensemble election is itself what happens when a host dies — so the monitor relocated at exactly the moment it was needed, taking every other leader-only workload in the cluster with it onto one node. The ensemble's own leader is still a question Mipha asks, in two places where it genuinely means it: the self-fence hands ensemble leadership off a host that cannot serve storage, and a failover waits for consensus to settle before proceeding.
 
 ```mermaid
 graph TD
-    LeaderCheck{Is ZooKeeper Leader?} -->|No| Follower[Idle Follower Mode]
+    LeaderCheck{Holds mipha-ha candidacy?} -->|No| Follower[Idle Follower Mode]
     LeaderCheck -->|Yes| ActiveLeader[Active Leader Coordinator]
     ActiveLeader -->|Poll every 10s| HealthCheck[Ping & Spark API Node Status]
     HealthCheck -->|3 Consecutive Failures, or host reports FENCED| Fence[Fence ladder: self / spark / BMC / storage]

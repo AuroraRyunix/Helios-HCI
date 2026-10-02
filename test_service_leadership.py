@@ -154,6 +154,177 @@ class TheBallotDecidesIt(unittest.TestCase):
             a.is_leader()
 
 
+class ACandidacyOutlivesItsSession(unittest.TestCase):
+    """The half of the failure that is silent.
+
+    A daemon runs for months; its ZooKeeper session does not. The ballot is ephemeral, so when
+    the session goes the candidacy goes with it -- and a process that does not notice is not
+    merely wrong for a moment, it never leads again for as long as it runs. The address
+    comparison this replaces was at least self-healing in that one respect: it started
+    answering True again when ZooKeeper came back.
+
+    What is asserted is the order of events, not just the end state. A candidate that has lost
+    its ballot must report not-leading *before* it stands again, because the alternative is a
+    stale candidate acting in the window where it has stopped leading.
+    """
+
+    def setUp(self):
+        self.zk = load_helios_zk()
+        self.ensemble = FakeEnsemble()
+        self.opened = []
+        self.clock = [1000.0]
+
+    def candidate(self, who, fail_connect=False):
+        def connect():
+            if fail_connect:
+                raise self.zk.ZKError(-1, "could not connect to any ZooKeeper host")
+            self.opened.append(who)
+            return self.ensemble
+        return self.zk.Candidacy(
+            "catalyst-dispatch", identity=who, connect=connect,
+            now=lambda: self.clock[0])
+
+    def test_it_stands_on_the_first_question_rather_than_needing_to_be_told(self):
+        a = self.candidate(b"a")
+        self.assertTrue(a.leading())
+        self.assertEqual(self.opened, [b"a"])
+
+    def test_exactly_one_candidate_leads(self):
+        a, b = self.candidate(b"a"), self.candidate(b"b")
+        self.assertEqual([a.leading(), b.leading()], [True, False])
+
+    def test_a_lost_ballot_is_reported_as_not_leading_before_a_new_one_is_created(self):
+        a, b = self.candidate(b"a"), self.candidate(b"b")
+        self.assertTrue(a.leading())
+        self.assertTrue(b.leading() is False)
+
+        # What a lost session does: the ephemeral node simply stops existing.
+        self.ensemble.expire("/helios/leaders/catalyst-dispatch/n_0000000000")
+
+        self.assertFalse(a.leading(), "a claimed to lead with no ballot")
+        self.assertTrue(b.leading(), "the survivor did not take over")
+
+    def test_it_stands_again_afterwards_rather_than_never_leading_again(self):
+        a = self.candidate(b"a")
+        self.assertTrue(a.leading())
+        self.ensemble.expire("/helios/leaders/catalyst-dispatch/n_0000000000")
+
+        self.assertFalse(a.leading())
+        # The retry timer has to pass; a down ensemble must not be reconnected to on every
+        # pass of a two-second loop.
+        self.clock[0] += self.zk.CANDIDACY_RETRY_SECONDS + 1
+
+        self.assertTrue(a.leading(), "the only candidate in the cluster never stood again")
+
+    def test_a_reconnect_takes_a_new_session_rather_than_resuming_the_old_one(self):
+        """Resuming would bring the old ballot back and leave one process holding two of
+        them: harmless for correctness, permanent as a leak, and it makes the lowest ballot
+        belong to a candidacy nobody is maintaining."""
+        a = self.candidate(b"a")
+        a.leading()
+        self.ensemble.expire("/helios/leaders/catalyst-dispatch/n_0000000000")
+        a.leading()
+        self.clock[0] += self.zk.CANDIDACY_RETRY_SECONDS + 1
+        a.leading()
+
+        self.assertEqual(self.opened, [b"a", b"a"], "the session was resumed, not replaced")
+        ballots = self.ensemble.get_children("/helios/leaders/catalyst-dispatch")
+        self.assertEqual(len(ballots), 1, "the process is holding two ballots")
+
+    def test_an_ensemble_it_cannot_reach_means_not_leading(self):
+        a = self.candidate(b"a", fail_connect=True)
+        self.assertFalse(a.leading())
+        self.assertIsNone(a.leader_identity())
+
+    def test_a_failed_connect_is_retried_on_a_timer_and_not_on_every_pass(self):
+        """A down ensemble is the moment every daemon in the cluster is looping, and the last
+        thing it needs is nine processes opening sockets as fast as their loops allow."""
+        attempts = []
+
+        def connect():
+            attempts.append(self.clock[0])
+            raise self.zk.ZKError(-1, "connection refused")
+
+        a = self.zk.Candidacy("catalyst-dispatch", identity=b"a", connect=connect,
+                              now=lambda: self.clock[0])
+        for _ in range(10):
+            a.leading()
+        self.assertEqual(len(attempts), 1)
+
+        self.clock[0] += self.zk.CANDIDACY_RETRY_SECONDS + 1
+        a.leading()
+        self.assertEqual(len(attempts), 2)
+
+    def test_a_follower_can_read_who_leads_without_standing_for_the_job(self):
+        """How a submitter finds the node holding a queue: by reading the winner's published
+        address, not by probing for it and not by standing to drain it."""
+        leader = self.candidate(b"10.0.0.1")
+        self.assertTrue(leader.leading())
+
+        observer = self.candidate(b"")
+        self.assertEqual(observer.leader_identity(), b"10.0.0.1")
+        self.assertEqual(
+            self.ensemble.get_children("/helios/leaders/catalyst-dispatch"),
+            ["n_0000000000"],
+            "reading who leads created a ballot")
+
+    def test_withdrawing_hands_it_on_and_allows_standing_again(self):
+        """Bifrost's case: a candidate whose fitness is conditional on something local must
+        stop being a candidate rather than win and decline, or the address sits with a node
+        that cannot serve it."""
+        a, b = self.candidate(b"a"), self.candidate(b"b")
+        self.assertTrue(a.leading())
+
+        a.withdraw()
+        self.assertTrue(b.leading())
+        self.assertFalse(a.leading() and b.leading(), "both nodes hold it")
+
+        self.assertTrue(b.leading())
+
+    def test_the_published_identity_is_cached_rather_than_read_per_submission(self):
+        reads = []
+        real_children = self.ensemble.get_children
+
+        def counting(path):
+            reads.append(path)
+            return real_children(path)
+
+        self.ensemble.get_children = counting
+        leader = self.candidate(b"10.0.0.1")
+        leader.leading()
+
+        observer = self.candidate(b"")
+        observer.leader_identity()
+        before = len(reads)
+        for _ in range(20):
+            observer.leader_identity()
+        self.assertEqual(len(reads), before,
+                         "twenty submissions produced twenty reads of the ballot")
+
+
+class TheServiceNamesAreOnePerJob(unittest.TestCase):
+    """Each distinct leader-only job gets its own name. Funnelling them through one is the
+    coupling this whole change removes, arrived at from the other direction."""
+
+    def setUp(self):
+        self.zk = load_helios_zk()
+
+    def test_no_two_jobs_share_a_name(self):
+        names = [value for key, value in vars(self.zk).items()
+                 if key.startswith("SERVICE_")]
+        self.assertEqual(sorted(names), sorted(set(names)))
+        self.assertGreaterEqual(len(names), 8)
+
+    def test_every_name_is_a_single_path_element(self):
+        """The name becomes a znode under /helios/leaders. A slash in it would put a
+        service's ballots under a parent nobody else looks in."""
+        for key, value in vars(self.zk).items():
+            if not key.startswith("SERVICE_"):
+                continue
+            self.assertNotIn("/", value, key)
+            self.assertTrue(value.strip() == value and value, key)
+
+
 class TheBallotNamesSortNumerically(unittest.TestCase):
     def setUp(self):
         self.zk = load_helios_zk()

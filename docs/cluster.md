@@ -122,7 +122,7 @@ Eleven Python modules and the Phoenix console read that key, and every one of th
 back to `127.0.0.1` when it is missing.
 
 That fallback is not a degraded mode — it is a cluster-wide outage waiting for an
-election. Vali's Catalyst queue worker runs **only** on the ZooKeeper leader, and decides
+election. Vali's Catalyst queue worker runs **only** on the node holding the `vali-queue` candidacy ([service_leadership.md](./service_leadership.md)), and decides
 whether it is the leader by comparing the leader's address against its own. A node that
 believes it is `127.0.0.1` can never match, so it never drains the queue; and because the
 leader is the only worker, leadership landing on such a node stops every VM power,
@@ -215,7 +215,7 @@ cluster destroy
 
 ### A. Virtual IP (VIP) Failover via Bifrost
 * The cluster utilizes a floating Virtual IP (VIP) managed by the **Bifrost** daemon.
-* Bifrost monitors the ZooKeeper leadership. The node elected as the ZooKeeper leader binds the VIP interface locally.
+* Bifrost stands for the `bifrost-vip` candidacy while this node is serving the ingress port, and the node holding it binds the VIP interface locally. See [service_leadership.md](./service_leadership.md).
 * If the active leader goes offline, ZooKeeper consensus automatically triggers a new leader election. Bifrost on the newly elected leader host immediately claims the VIP using Gratuitous ARP (GARP) broadcasts, redirecting Spectrum Web Console traffic without manual intervention.
 
 ### B. VM High Availability (HA) Failover via Mipha

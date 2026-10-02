@@ -149,6 +149,96 @@ defmodule SpectrumPhx.TasksTest do
     end
   end
 
+  describe "the task tree's columns" do
+    test "a parent named in the column is read, and so is one named only in the payload" do
+      # The payload is where the relationship lived before there was a column, because
+      # `mipha.py` had nowhere else to put it. Those rows stay in the table for the length of
+      # the thirty-day retention window, so a cluster that upgrades today reads them for a
+      # month and dropping support for them would flatten a month of history.
+      rows = [
+        row(%{"task_id" => "parent"}),
+        row(%{"task_id" => "by-column", "parent_task_id" => "parent"}),
+        row(%{"task_id" => "by-payload", "payload" => ~s({"parent_task_id":"parent"})})
+      ]
+
+      tasks = Tasks.fetch(rows: rows).tasks
+      by_id = Map.new(tasks, &{&1.id, &1})
+
+      assert by_id["by-column"].parent_id == "parent"
+      assert by_id["by-payload"].parent_id == "parent"
+      assert by_id["by-column"].depth == 1
+      assert by_id["by-payload"].depth == 1
+    end
+
+    test "the column wins over the payload rather than the two being adjudicated" do
+      rows = [
+        row(%{"task_id" => "a"}),
+        row(%{"task_id" => "b"}),
+        row(%{
+          "task_id" => "child",
+          "parent_task_id" => "a",
+          "payload" => ~s({"parent_task_id":"b"})
+        })
+      ]
+
+      child = Enum.find(Tasks.fetch(rows: rows).tasks, &(&1.id == "child"))
+      assert child.parent_id == "a"
+    end
+
+    test "the component is the owner and falls back to the executor, never to nothing" do
+      # `service` is the queue that ran the task. They differ exactly where it matters: a
+      # Hylia upgrade step runs on the `dagur` queue, so reading `service` as the owner
+      # attributes a rolling upgrade to the cron runner.
+      owned = row(%{"service" => "dagur", "component" => "Hylia"})
+      bare = row(%{"service" => "dagur", "component" => nil})
+
+      assert [task] = Tasks.fetch(rows: [owned]).tasks
+      assert task.component == "Hylia"
+      assert task.service == "dagur"
+
+      assert [older] = Tasks.fetch(rows: [bare]).tasks
+      assert older.component == "dagur"
+    end
+
+    test "a missing sequence id stays nil rather than becoming a position" do
+      # Null on every row written before the column existed, and on a submission whose claim
+      # on the per-component counter was refused. Rendered as 0 it would read as "the first
+      # thing this component ever did".
+      assert [numbered] = Tasks.fetch(rows: [row(%{"sequence_id" => 255_227})]).tasks
+      assert numbered.sequence_id == 255_227
+
+      assert [unnumbered] = Tasks.fetch(rows: [row(%{"sequence_id" => nil})]).tasks
+      assert unnumbered.sequence_id == nil
+    end
+
+    test "completion is read from its own column and is nil while a task is running" do
+      # `updated_at` moves on every progress report, so a duration taken from it is the time
+      # since the last report of a task that may still be running.
+      running =
+        row(%{
+          "status" => "processing",
+          "completed_at" => nil,
+          "updated_at" => ~U[2026-08-19 10:00:30Z]
+        })
+
+      done = row(%{"status" => "completed", "completed_at" => ~U[2026-08-19 10:01:00Z]})
+
+      assert [task] = Tasks.fetch(rows: [running]).tasks
+      assert task.completed_at == nil
+
+      assert [finished] = Tasks.fetch(rows: [done]).tasks
+      assert finished.completed_at == ~U[2026-08-19 10:01:00Z]
+    end
+
+    test "the read asks for every column the tree needs" do
+      cql = Tasks.list_cql()
+
+      for column <- ~w(parent_task_id component sequence_id task_type completed_at) do
+        assert cql =~ column, "the read does not ask for #{column}"
+      end
+    end
+  end
+
   describe "parent and child tasks" do
     test "a child is nested under the parent its payload names" do
       rows = [

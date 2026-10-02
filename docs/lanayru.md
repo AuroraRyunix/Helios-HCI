@@ -159,14 +159,14 @@ nearly-full store is a judgement call and it is the operator's.
 ## 5. Deploy and destroy are Catalyst tasks
 
 Both build or tear down a Kubernetes cluster across every node, so both go on Catalyst's
-`lanayru` queue and are drained on the ZooKeeper leader. What drains it is the **console
+`lanayru` queue and are drained on the node holding the `lanayru-queue` candidacy ([service_leadership.md](./service_leadership.md)). What drains it is the **console
 backend** rather than a daemon of its own: `deploy_lanayru_worker` and
 `destroy_lanayru_worker` import `run_cql_query`, `run_lwt`, `sidon_call`,
 `get_cluster_nodes` and the log buffer from `spectrum_server.py`, so a worker anywhere else
 means moving all of that first.
 
 `lanayru_queue_loop()` runs under `supervise()` and long-polls `/api/v1/queues/lanayru`
-only while this node holds ZooKeeper leadership — Catalyst's queues are in-process on the
+only while this node holds the `lanayru-queue` candidacy — Catalyst's queues are in-process on the
 leader, so a worker elsewhere polls a queue nothing is ever put on. It is supervised
 because it is the only thing anywhere that runs a deploy or a teardown: a copy that died
 quietly would leave every such task `pending` with nothing on the console to say why.

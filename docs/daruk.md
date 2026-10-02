@@ -121,6 +121,7 @@ which a caller could easily misread as the new state.
 | `POST /v1/vm/create` | `IF NOT EXISTS` | the name is already registered |
 | `POST /v1/schedule/claim-job` | `IF last_run_epoch = ?` | another scheduler took this tick |
 | `POST /v1/schedule/claim-check` | `IF last_run_epoch = ?` | another scheduler took this tick |
+| `POST /v1/catalyst/claim-sequence` | `IF next_sequence_id = ?` | another submitter took this number |
 | `POST /v1/node/maintenance` | `IF status = ?` | the host is not in the expected state |
 | `POST /v1/lock/acquire` | `IF NOT EXISTS` | another holder has the lock |
 | `POST /v1/lock/renew` | `IF holder_token = ?` | the caller is not this acquisition |
@@ -160,11 +161,16 @@ taking it then would put two networks on the VLAN by way of repairing it.
 the job is due, and writes the current time back — a read-modify-write, and blind it submits
 the job once per scheduler that reaches the row.
 
-Two schedulers is not hypothetical. `is_zookeeper_leader()` probes ZooKeeper's four-letter
-`stat` and, when the leader does not answer on port 9091, falls back to *"lowest node with
-9091 open"*. A ZooKeeper that is slow, restarting or partitioned hands that answer to two
-nodes at once, and both then believe they are the only scheduler. Both submit the same
-backup, the same scrub, the same compaction, against the same volumes at the same moment.
+Two schedulers is not hypothetical, and a real election does not remove it. The
+schedulers stand for per-job candidacies now ([service_leadership.md](./service_leadership.md)),
+which answer correctly when they answer -- but the answer is read at one instant and acted
+on at a later one, so a scheduler that stalls past its session is still inside the pass it
+started. (It used to be worse: `is_zookeeper_leader()` probed ZooKeeper's four-letter
+`stat` and, when the leader did not answer on port 9091, fell back to *"lowest node with
+9091 open"* -- an answer a slow or partitioned ZooKeeper gave to two nodes at once.) Both
+would submit the same backup, the same scrub, the same compaction, against the same volumes
+at the same moment. The condition on the clock is what closes that, and it is the only thing
+that can.
 
 `claim-job` covers `hydra.dagur_schedules` (keyed by `job_name`) and `claim-check` covers
 `hydra.mimir_schedules` (keyed by `schedule_name`). They are two entries rather than one
@@ -188,6 +194,35 @@ schedule inserted without one, and `IF last_run_epoch = 0` does not match a null
 The loser must skip the tick, not retry it — and so must a caller whose claim could not be
 answered at all. A skipped tick runs on the next pass seconds later; a tick run twice
 cannot be taken back.
+
+### Claiming a task's sequence id
+
+Catalyst gives every task a sequence id that is monotonic **per component** -- the n-th thing
+that component did -- because two tasks created in the same millisecond otherwise have no
+defined order at all. `hydra.catalyst_task_sequence` holds one row per component with the next
+number to hand out.
+
+A blind `SET next_sequence_id = n + 1` is a lost update the moment two submitters read the row
+in the same instant, and a lost update here means two tasks carrying the same number, which is
+the single property the column exists to provide. `IF next_sequence_id = ?` makes the read and
+the write one Paxos round, so exactly one submitter gets each number and the loser is handed
+the value that beat it and retries with that.
+
+`expected_sequence_id` is required and nullable, with no default, for the same reason
+`claim-job`'s is: a default would match the component that has never submitted anything and
+turn the claim back into the blind write. Null is also how the **first** claim for a component
+works -- there is no row to seed, because `IF col = null` matches a row that does not exist and
+creates it.
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"component":"Hylia","next_sequence_id":1,"expected_sequence_id":null}' \
+  http://127.0.0.1:9043/v1/catalyst/claim-sequence
+```
+
+A claim that cannot be made at all yields no number, and Catalyst submits the task anyway: the
+number orders a component's history, it does not execute anything, and a task framework that
+refuses work because a counter was contended is worse than a task with no number.
 
 ### Cluster-wide locks
 

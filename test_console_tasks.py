@@ -511,16 +511,25 @@ class LanayruTaskWorkerTests(unittest.TestCase):
     def setUp(self):
         self.source = read("spectrum_server.py")
 
-    def test_the_worker_only_drains_the_queue_on_the_leader(self):
-        # Catalyst's queues are in-process on the ZooKeeper leader. A worker anywhere else
-        # long-polls a queue nothing is ever put on, burning a request every two seconds
-        # and never running anything.
+    def test_only_one_node_drains_the_queue(self):
+        # Two nodes draining this queue is two deployments of the same Kubernetes cluster.
+        #
+        # It used to be gated on holding ZooKeeper leadership, which was one node by
+        # accident of the ensemble's own election -- so the gate was correct and relocated
+        # the worker, along with every other leader-only workload in the cluster, every time
+        # ZooKeeper re-elected. The gate is a candidacy for this job now. What is asserted is
+        # unchanged: the loop decides, before it polls, that it is the one worker.
         tree = ast.parse(self.source)
         loop = next(n for n in tree.body
                     if isinstance(n, ast.FunctionDef) and n.name == "lanayru_queue_loop")
         calls = {n.func.id for n in ast.walk(loop)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-        self.assertIn("is_zookeeper_leader", calls)
+        self.assertIn("candidacy", calls)
+        self.assertIn("lanayru_queue_loop", self.source)
+        body = self.source[self.source.index("def lanayru_queue_loop"):]
+        body = body[:body.index("\nclass ")]
+        self.assertIn("worker.leading()", body,
+                      "the loop no longer asks whether it leads before polling")
 
     def _run_task(self, action, worker):
         reported = []

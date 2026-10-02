@@ -173,11 +173,79 @@ def run_mtls_spark_api_full(ip, path, payload, method="POST"):
 
 
 def is_zookeeper_leader(ip="127.0.0.1"):
+    """Whether a node leads the *ZooKeeper ensemble*.
+
+    Deliberately still here, and deliberately no longer used to place a workload. Its one
+    remaining caller is the self-fence, which stops ZooKeeper on a host that has just
+    admitted it cannot serve storage -- and "should I hand ensemble leadership to a healthy
+    node" is a question about the ensemble, not about which node runs the HA monitor. The
+    monitor's own placement moved to a candidacy; see mipha_candidacy.
+    """
     if ip == "127.0.0.1" or ip == LOCAL_IP:
         return get_zookeeper_leader_ip() == LOCAL_IP
     # A different question from "who leads": this asks about one named server, so it is
     # the uncached `server_mode` rather than `leader_ip`.
     return helios_zk.server_mode(ip, timeout=0.5) in ("leader", "standalone")
+
+
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+_SCHEMA_MODULE = None
+
+
+def schema_module():
+    """The schema module, which owns the task table's columns and the statements that write
+    it. Four writers of this table each kept their own column list, which is how a task's
+    parent came to live inside a JSON payload here and in no other writer."""
+    global _SCHEMA_MODULE
+    if _SCHEMA_MODULE is None:
+        try:
+            import helios_schema
+            _SCHEMA_MODULE = helios_schema
+        except ImportError:
+            import importlib.util
+            path = "/usr/local/bin/helios_schema.py"
+            spec = importlib.util.spec_from_file_location("helios_schema", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _SCHEMA_MODULE = module
+    return _SCHEMA_MODULE
+
+
+def catalyst_target_ip(fallback=None):
+    """The address of the Catalyst holding the queues, read from the dispatch election.
+
+    Not the ZooKeeper leader's address, which is what this used to submit to. The two were
+    the same node only because Catalyst's queues were pinned to the ensemble leader; a
+    submission sent to any other Catalyst lands in a queue nothing drains.
+    """
+    published = mipha_candidacy(helios_zk.SERVICE_CATALYST_DISPATCH).leader_identity()
+    if published:
+        address = published.decode("utf-8", "replace").strip()
+        if address:
+            return address
+    return fallback
+
+
+def mipha_candidacy(service):
+    """One candidacy per job.
+
+    The HA monitor used to run wherever ZooKeeper's leader happened to be. That is the worst
+    place for it to be decided from: the monitor's job is to notice a host dying, and an
+    ensemble election is itself what happens when a host dies -- so the monitor relocated at
+    exactly the moment it was needed, taking every other leader-only workload with it onto
+    one node. A candidacy moves when the holder's session goes, which is the event that
+    actually matters, and moves nothing else.
+    """
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            hosts = [h.get("ip") for h in (get_cluster_hosts() or []) if h.get("ip")]
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP, hosts=hosts)
+            _CANDIDACIES[service] = existing
+        return existing
 
 def get_zookeeper_leader_ip(hosts=None):
     if not hosts:
@@ -289,7 +357,8 @@ def sidon_module():
     _SIDON = False
     return None
 
-def submit_catalyst_task(leader_ip, service, action, payload):
+def submit_catalyst_task(leader_ip, service, action, payload, component=None,
+                         task_type=None, parent_task_id=None):
     # Catalyst requires a cluster-signed certificate: it dispatches VM lifecycle
     # work and used to accept it from anything that could open a socket to 9091.
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH,
@@ -300,7 +369,14 @@ def submit_catalyst_task(leader_ip, service, action, payload):
     data = json.dumps({
         "service": service,
         "action": action,
-        "payload": payload
+        "payload": payload,
+        # The parent is named at the top level as well as inside the payload. The payload is
+        # where it used to live because there was no column for it; the column is the record
+        # now, and a submission that named it in only one place would leave the tree of a
+        # failover readable from exactly one of the two.
+        "component": component,
+        "task_type": task_type,
+        "parent_task_id": parent_task_id,
     }).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
     try:
@@ -1860,10 +1936,12 @@ def run_auto_heal():
 def main():
     print("Mipha High-Availability Host Monitor and VM Failover Coordinator started.")
     
-    # The local subsystem watchdog runs on every host, not only the ZooKeeper leader:
-    # the failure it exists to catch -- storage or libvirt dead while the network keeps
-    # answering -- is invisible from anywhere else in the cluster.
+    # The local subsystem watchdog runs on every host, not only the one monitoring the
+    # others: the failure it exists to catch -- storage or libvirt dead while the network
+    # keeps answering -- is invisible from anywhere else in the cluster.
     threading.Thread(target=self_fence_loop, daemon=True).start()
+
+    monitor = mipha_candidacy(helios_zk.SERVICE_MIPHA_HA)
 
     # Track consecutive failures per host IP
     consecutive_failures = {}
@@ -1874,7 +1952,7 @@ def main():
     while True:
         try:
             # 1. Leadership Check
-            if not is_zookeeper_leader("127.0.0.1"):
+            if not monitor.leading():
                 # I am a follower, reset trackers and idle
                 consecutive_failures.clear()
                 time.sleep(10)
@@ -1964,11 +2042,10 @@ def main():
                         parent_task_id = str(uuid.uuid4())
                         now_ms = int(time.time() * 1000)
                         parent_payload = json.dumps({"hostname": hostname, "ip": ip})
-                        cql_parent = f"""
-                        INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-                        VALUES ({parent_task_id}, 'mipha', 'host_join', 'processing', '{parent_payload.replace("'", "''")}', 10, {now_ms}, {now_ms});
-                        """
-                        run_cql_query(cql_parent)
+                        run_cql_query(schema_module().task_insert_statement(
+                            parent_task_id, "mipha", "host_join", parent_payload, now_ms,
+                            component="Mipha", task_type="host_join",
+                            status="processing", progress=10))
                         
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
@@ -1997,10 +2074,8 @@ def main():
                         # can serve any vdisk it is given the moment it is up, and
                         # under-replicated groups are restored off the hot path.
                         now_ms_end = int(time.time() * 1000)
-                        run_cql_query(
-                            f"UPDATE hydra.catalyst_tasks SET status = 'completed', "
-                            f"progress = 100, updated_at = {now_ms_end} "
-                            f"WHERE task_id = {parent_task_id};")
+                        run_cql_query(schema_module().task_update_statement(
+                            parent_task_id, "completed", 100, now_ms_end))
                         run_cql_query(
                             f"UPDATE hydra.nodes SET status = 'NORMAL' "
                             f"WHERE hostname = '{hostname}';")
@@ -2034,11 +2109,10 @@ def main():
                     parent_task_id = str(uuid.uuid4())
                     now_ms = int(time.time() * 1000)
                     parent_payload = json.dumps({"hostname": hostname})
-                    cql_parent = f"""
-                    INSERT INTO hydra.catalyst_tasks (task_id, service, action, status, payload, progress, created_at, updated_at)
-                    VALUES ({parent_task_id}, 'mipha', 'failover', 'processing', '{parent_payload.replace("'", "''")}', 0, {now_ms}, {now_ms});
-                    """
-                    run_cql_query(cql_parent)
+                    run_cql_query(schema_module().task_insert_statement(
+                        parent_task_id, "mipha", "failover", parent_payload, now_ms,
+                        component="Mipha", task_type="host_failover",
+                        status="processing", progress=0))
 
                     # A0b. Fence, and require proof.
                     #
@@ -2070,13 +2144,9 @@ def main():
                               f"{FENCING_CONFIG_PATH} -- see "
                               "docs/fencing.md -- then this proceeds by itself.")
                         end_ms = int(time.time() * 1000)
-                        run_cql_query(f"""
-                        UPDATE hydra.catalyst_tasks
-                        SET status = 'failed', progress = 100,
-                            error_msg = '{err_msg.replace("'", "''")[:900]}',
-                            updated_at = {end_ms}
-                        WHERE task_id = {parent_task_id};
-                        """)
+                        run_cql_query(schema_module().task_update_statement(
+                            parent_task_id, "failed", 100, end_ms,
+                            error_msg=err_msg[:900]))
                         continue
                     if not fence.confirmed:
                         print(f"[Mipha HA] WARNING: {why}. If the host is still running "
@@ -2232,7 +2302,11 @@ def main():
                         # Submit task to Catalyst queue to start the VM.
                         # target_host is left empty so Vali schedules it on the best surviving node.
                         task_payload = {"vm_name": vm_name, "target_host": "", "parent_task_id": parent_task_id}
-                        sub_task_id = submit_catalyst_task(zk_leader_ip, "vali", "start", task_payload)
+                        sub_task_id = submit_catalyst_task(
+                            catalyst_target_ip(zk_leader_ip), "vali", "start",
+                            task_payload, component="Mipha",
+                            task_type="vm_restart_after_failover",
+                            parent_task_id=parent_task_id)
                         if sub_task_id:
                             print(f"[Mipha HA] Successfully submitted failover task {sub_task_id} for '{vm_name}' to Catalyst.")
                             submitted_tasks.append((vm_name, sub_task_id))

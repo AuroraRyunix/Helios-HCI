@@ -19,9 +19,13 @@ SPECTRUM_PORT = 8443
 SPECTRUM_PHX_PORT = 8444
 ZK_CLIENT_PORT = 2181
 
-# Probes against other nodes cross the network. 0.2s turned a brief latency
-# spike into an apparent consensus loss and flapped the VIP every 2s loop.
-REMOTE_PROBE_TIMEOUT = 1.0
+# Every probe this daemon makes is now a loopback probe: it asks whether *this* node can
+# serve clients and stands or withdraws accordingly, and what the other nodes can do is
+# answered by whether they are standing. The remote probe budget that used to be here
+# existed because a 0.2s `stat` across the network turned a latency spike into an apparent
+# consensus loss and flapped the VIP every two seconds; nothing crosses the network on this
+# path any more, so there is nothing left to tune.
+#
 # Loopback probes never leave the host, so they stay fast.
 LOCAL_PROBE_TIMEOUT = 0.5
 
@@ -78,103 +82,43 @@ def get_local_net_info(hosts):
         sys.stderr.write(f"Error getting network info: {e}\n")
     return "ens192", None, 24
 
-def get_zookeeper_leader_ip():
-    """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
-    ips = []
-    try:
-        with open("/etc/hci/cluster.json", "r") as f:
-            cdata = json.load(f)
-            ips = [h["ip"] for h in cdata.get("hosts", [])]
-    except Exception:
-        ips = ["127.0.0.1"]
-        
-    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine copies of
-    # this loop on nine timers had the ensemble answering eleven `stat` probes a second
-    # forever, and ZooKeeper logs two INFO lines for each one.
-    #
-    # The timeout stays this module's: these probes cross the network, and 0.2s turned a
-    # brief latency spike into an apparent consensus loss and flapped the VIP every 2s.
-    leader_ip = helios_zk.leader_ip(ips, timeout=REMOTE_PROBE_TIMEOUT)
+# -- Who holds the VIP ------------------------------------------------------------------
+#
+# This used to be "the node the ZooKeeper ensemble elected, if that node is also serving
+# the ingress port". Both halves were wrong in the same direction.
+#
+# The ensemble elects a leader for its own reasons -- a restart, a blip, a rolling upgrade
+# -- so the VIP relocated whenever ZooKeeper did, along with every other leader-only
+# workload in the cluster. And when the elected node was *not* serving 443, there was
+# nothing to do but release the VIP everywhere and wait: picking a replacement by sort
+# order is a second, independent election that can disagree with the ensemble's, and in a
+# partition each side would pick the lowest candidate it could see and both would bind the
+# address. So the console went unreachable because one node's Traefik was down, with two
+# healthy nodes watching.
+#
+# A candidacy answers both. A node stands only while it is actually serving -- the health
+# guard is the entry condition, not a veto applied after winning -- so the lowest ballot is
+# by construction a node that can serve clients, and there is exactly one of them because
+# the ensemble assigned the counters. An unhealthy node withdraws rather than winning and
+# declining, which hands the address to a healthy peer instead of to nobody.
+#
+# What has not changed is the direction of the safe answer. A candidacy that cannot
+# establish that it leads reports False, so an unreachable ensemble releases the VIP rather
+# than binding it on a guess -- an address nobody advertises is visible and recoverable, and
+# an address two nodes advertise is neither.
 
-    # Check the leader is actually serving clients on the Slate ingress port.
-    # 8443 (Spectrum) was the wrong signal here: clients reach 443, not 8443.
-    leader_active = False
-    if leader_ip:
-        leader_active = probe_tcp(leader_ip, INGRESS_PORT, REMOTE_PROBE_TIMEOUT)
+_VIP_CANDIDACY = None
 
-    if leader_active:
-        return leader_ip
 
-    # No leader in a multi-node cluster means consensus is lost. Binding the VIP on the
-    # strength of a local guess is how both sides of a partition end up advertising it.
-    if not leader_ip and len(ips) > 1:
-        sys.stdout.write("ZooKeeper consensus lost or unreachable in multi-node cluster. Refusing split-brain candidate fallback.\n")
-        sys.stdout.flush()
-        return None
+def vip_candidacy(hosts, local_ip):
+    """The candidacy for the VIP, created once and kept for the life of the process."""
+    global _VIP_CANDIDACY
+    if _VIP_CANDIDACY is None:
+        _VIP_CANDIDACY = helios_zk.Candidacy(
+            helios_zk.SERVICE_BIFROST_VIP, identity=local_ip,
+            hosts=hosts or ["127.0.0.1"])
+    return _VIP_CANDIDACY
 
-    # Single node: there is no peer to conflict with, so this node may hold the VIP as
-    # long as it is actually serving the ingress port.
-    if not leader_ip:
-        local = ips[0] if ips else "127.0.0.1"
-        return local if probe_tcp(local, INGRESS_PORT, REMOTE_PROBE_TIMEOUT) else None
-
-    # A leader exists but is not serving. Deliberately do NOT pick a replacement by sort
-    # order: that is a second, independent election which can disagree with the
-    # ensemble's, and in a partition each side would choose the lowest candidate it can
-    # see -- so both could bind the VIP and produce an address conflict.
-    #
-    # Releasing is the safe outcome: the WebUI is briefly unreachable, which is visible
-    # and recoverable, rather than duplicated, which is neither.
-    sys.stdout.write(
-        "ZooKeeper leader " + str(leader_ip) + " is not serving the ingress port. "
-        "Refusing to elect a replacement independently; releasing the VIP.\n")
-    sys.stdout.flush()
-    return None
-
-    # If leader is inactive, find active candidates serving the ingress port
-    candidates = []
-    for ip in ips:
-        if probe_tcp(ip, INGRESS_PORT, REMOTE_PROBE_TIMEOUT):
-            candidates.append(ip)
-
-    if not candidates:
-        return leader_ip if leader_ip else "127.0.0.1"
-
-    # Deliberately do NOT fall back to "lowest reachable candidate" here.
-    #
-    # Reaching this point means ZooKeeper named a leader but that leader is not serving.
-    # Picking a different node by sort order is a second, independent election that can
-    # disagree with the ensemble's -- and in a partition each side would pick the lowest
-    # candidate *it* can see, so both could bind the VIP and produce an address conflict.
-    #
-    # Releasing the VIP is the safe outcome: the WebUI is briefly unreachable, which is
-    # visible and recoverable, rather than duplicated, which is neither.
-    sys.stdout.write(
-        "ZooKeeper leader is not serving on the ingress port. Refusing to elect a "
-        "replacement independently; releasing the VIP until consensus resolves.\n")
-    sys.stdout.flush()
-    return None
-
-def is_zookeeper_leader(local_ip=None):
-    if not local_ip:
-        local_ip = "127.0.0.1"
-        try:
-            with open("/etc/hci/spectrum/spectrum.env", "r") as f:
-                for line in f:
-                    if "=" in line:
-                        k, v = line.strip().split("=", 1)
-                        if k == "LOCAL_HYPERVISOR_IP":
-                            local_ip = v
-                            break
-        except Exception:
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                pass
-    return get_zookeeper_leader_ip() == local_ip
 
 def is_vip_bound(iface, vip):
     # Exact element match against the parsed address list, not a substring
@@ -301,13 +245,23 @@ def main():
             current_iface = iface
             current_prefixlen = prefixlen
             
-            # 2. Check ZK leadership
-            leader = is_zookeeper_leader(local_ip)
+            # 2. Stand for the VIP, but only while this node can actually serve clients.
+            #
+            # The order matters. Withdrawing when unhealthy is what lets a healthy peer
+            # win, which is the case the previous version could not handle: it released
+            # the VIP cluster-wide when the elected node's ingress was down, and left it
+            # released.
+            candidate = vip_candidacy(hosts, local_ip)
+            if is_local_stack_healthy():
+                leader = candidate.leading()
+            else:
+                candidate.withdraw()
+                leader = False
             bound = is_vip_bound(iface, vip)
             
-            if leader and is_local_stack_healthy():
+            if leader:
                 if not bound:
-                    print(f"I am the ZooKeeper leader and the local Slate ingress is active. Binding VIP {vip} to {iface}...")
+                    print(f"I hold the VIP candidacy and the local Slate ingress is active. Binding VIP {vip} to {iface}...")
                     cmd_add = f"ip addr add {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_add, shell=True)
                     # Broadcast Gratuitous ARP
@@ -316,7 +270,7 @@ def main():
                     subprocess.run(cmd_arp, shell=True)
             else:
                 if bound:
-                    print(f"Releasing VIP {vip} from {iface} (not leader or local ingress is inactive)...")
+                    print(f"Releasing VIP {vip} from {iface} (this node does not hold the VIP candidacy, or its local ingress is inactive)...")
                     cmd_del = f"ip addr del {vip}/{prefixlen} dev {iface} label {iface}:vip"
                     subprocess.run(cmd_del, shell=True)
                     

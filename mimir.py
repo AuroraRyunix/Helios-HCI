@@ -74,57 +74,30 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
-def get_zookeeper_leader_ip():
-    """Finds the IP of the current ZooKeeper leader, with active designated leader fallback if the leader is in maintenance."""
-    ips = []
-    try:
-        with open("/etc/hci/cluster.json", "r") as f:
-            cdata = json.load(f)
-            ips = [h["ip"] for h in cdata.get("hosts", [])]
-    except Exception:
-        ips = [LOCAL_IP]
-        
-    leader_ip = None
-    # One cached probe, shared by every daemon -- see helios_zk.leader_ip. Nine
-    # copies of this loop on nine timers had the ensemble answering eleven `stat`
-    # probes a second forever, and ZooKeeper logs two INFO lines for each one.
-    leader_ip = helios_zk.leader_ip(ips)
-            
-    # Check if leader is active on port 9091
-    leader_active = False
-    if leader_ip:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((leader_ip, 9091))
-            s.close()
-            leader_active = True
-        except Exception:
-            leader_active = False
-            
-    if leader_active:
-        return leader_ip
-        
-    # If leader is inactive, find active candidates with port 9091 open
-    candidates = []
-    for ip in ips:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect((ip, 9091))
-            s.close()
-            candidates.append(ip)
-        except Exception:
-            pass
-            
-    if not candidates:
-        return leader_ip if leader_ip else "127.0.0.1"
-        
-    candidates.sort()
-    return candidates[0]
+# `get_zookeeper_leader_ip` used to live here, as one of nine copies of the same loop. Its
+# only caller was the leadership gate below, and the gate no longer asks who leads the
+# ensemble -- so the copy went with it. The question itself is still answerable, by
+# `helios_zk.leader_ip`, for the callers that genuinely mean it.
 
-def is_zookeeper_leader():
-    return get_zookeeper_leader_ip() == LOCAL_IP
+
+_CANDIDACIES = {}
+_CANDIDACY_LOCK = threading.Lock()
+
+
+def candidacy(service):
+    """One candidacy per job.
+
+    Triggering the health-check schedule used to be `get_zookeeper_leader_ip() == LOCAL_IP`.
+    Which node runs the checks is not a question about the ZooKeeper ensemble, and tying it
+    to one meant an ensemble election -- a restart, a blip, a rolling upgrade -- relocated
+    the checks along with every other leader-only workload in the cluster, onto one node.
+    """
+    with _CANDIDACY_LOCK:
+        existing = _CANDIDACIES.get(service)
+        if existing is None:
+            existing = helios_zk.cluster_candidacy(service, LOCAL_IP)
+            _CANDIDACIES[service] = existing
+        return existing
 
 # Certificate expiry is the one health check that cannot be left to the leader-only
 # schedule below. The certificates are per-node, they are what the schedule's own
@@ -259,6 +232,7 @@ def main():
     print("Mimir health checker daemon started.")
     local_last_run = {}
     last_cert_survey = 0
+    schedules = candidacy(helios_zk.SERVICE_MIMIR_SCHEDULES)
     while True:
         try:
             if time.time() - last_cert_survey >= CERT_SURVEY_INTERVAL:
@@ -268,7 +242,7 @@ def main():
             sys.stderr.write(f"Error in Mimir certificate survey: {e}\n")
 
         try:
-            if is_zookeeper_leader():
+            if schedules.leading():
                 cql = "SELECT JSON * FROM hydra.mimir_schedules;"
                 rc, stdout, stderr = run_cql_query(cql)
                 if rc == 0:

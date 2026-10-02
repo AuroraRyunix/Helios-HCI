@@ -468,7 +468,226 @@ MIGRATIONS = [
             "ALTER TABLE hydra.vms ADD graphics text;",
         ],
     },
+    {
+        "id": "0011-catalyst-task-tree",
+        "description": (
+            "What a task framework has to record about a task, which Catalyst did not. "
+            "Three gaps, and the table is where all three start. A task has no parent, "
+            "so a rolling upgrade -- which genuinely is a tree, one job per node, each "
+            "with steps -- is reported as a flat list of unrelated rows, and the "
+            "relationship mipha.py does keep lives inside the JSON payload where no "
+            "query can reach it. A task has no component, so 'what has Hylia been "
+            "doing' is answerable only by guessing from the queue name of whoever "
+            "happened to execute it. And a task has no ordering other than its "
+            "millisecond timestamp, so two tasks created in the same millisecond have no "
+            "defined order at all and 'the next task after this one' is not a question "
+            "the table can answer. Ergon, which this follows, carries a parent uuid, a "
+            "component, and a per-component monotonic sequence id on every task."
+        ),
+        "statements": [
+            # ADD IF NOT EXISTS, where 0008 and 0010 used a bare ADD. The difference is
+            # that those were one statement each: a migration with several ALTERs that
+            # fails on its fourth leaves the first three applied and unrecorded, and a
+            # bare ADD raises on the re-run, so the migration could never complete. The
+            # ledger makes a second run unusual, not impossible, which is exactly the case
+            # idempotence is for.
+            #
+            # Every column is nullable and nothing rewrites an existing row. A task
+            # recorded before this migration keeps reading correctly: no parent, no
+            # component, no sequence -- which is the truth about it, and is what the
+            # console already renders for a task whose payload names no parent.
+            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS parent_task_id uuid;",
+            # The component that *owns* the task, which is not `service`. `service` is the
+            # queue a task is dispatched through -- the executor -- and the two differ
+            # exactly where the hierarchy matters: a Hylia upgrade step runs on the
+            # `dagur` queue, and recording it as a Dagur task loses who asked for it.
+            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS component text;",
+            # bigint, and per component. Not a cluster-wide counter: a single sequence
+            # would have to be claimed by every submitter in the cluster for every task,
+            # which is a contended compare-and-swap on the submission path. Per component
+            # the contention is between that component's own submitters, and the number
+            # means what an operator reads it as -- the n-th thing this component did.
+            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS sequence_id bigint;",
+            # The *kind* of task, as distinct from the verb the executor was handed.
+            # `action` is what the worker switches on and must keep its exact spelling;
+            # `task_type` is what the task is, and a parent whose children are all
+            # `action = 'execute'` has nothing else to say what each one did.
+            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS task_type text;",
+            # When it finished, which `updated_at` cannot answer: that column moves on
+            # every progress report, so the duration of a completed task was unknowable
+            # from the row even though both ends of it had been written.
+            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS completed_at timestamp;",
+            # The sequence allocator. One row per component, holding the next number to
+            # hand out, claimed with a compare-and-swap -- see claim_task_sequence. A
+            # blind increment is a lost update, and a lost update here is two tasks
+            # carrying the same sequence id, which is the one thing the column exists to
+            # make impossible.
+            "CREATE TABLE IF NOT EXISTS hydra.catalyst_task_sequence "
+            "( component text PRIMARY KEY, next_sequence_id bigint );",
+        ],
+    },
 ]
+
+
+# -- Catalyst task rows -------------------------------------------------------------------
+#
+# Written from four places: catalyst.py's submit and update handlers, spectrum_server.py's
+# log_catalyst_task, and mipha.py's multi-step workflows. They were four independent column
+# lists, which is how `parent_task_id` came to live inside the JSON payload in one of them
+# and nowhere else. The statements are built here for the same reason claim_vlan_statement
+# is: a row one writer creates has to be a row the others can read and complete.
+
+CATALYST_TASKS_TABLE = "hydra.catalyst_tasks"
+TASK_SEQUENCE_TABLE = "hydra.catalyst_task_sequence"
+
+# What a task may be. `processing` is the one that matters at recovery: it means a worker
+# had picked the task up, so its effect on the cluster is unknown.
+TASK_PENDING = "pending"
+TASK_PROCESSING = "processing"
+TASK_COMPLETED = "completed"
+TASK_FAILED = "failed"
+TASK_TERMINAL = (TASK_COMPLETED, TASK_FAILED)
+TASK_OPEN = (TASK_PENDING, TASK_PROCESSING)
+
+# The columns a reader needs. Here so the console, the CLI and the recovery pass do not
+# each maintain their own list and discover a new column by noticing it is missing.
+TASK_COLUMNS = (
+    "task_id", "parent_task_id", "component", "sequence_id", "service", "action",
+    "task_type", "status", "payload", "progress", "error_msg", "created_at", "updated_at",
+    "completed_at",
+)
+
+
+def _uuid_or_null(value):
+    """A uuid literal, unquoted, or NULL.
+
+    CQL uuids are written bare -- quoting one is a type error, not a string -- so a missing
+    parent has to become the keyword and not an empty literal. Anything that is not a
+    plausible uuid becomes NULL rather than being interpolated: this builds statement text,
+    and a parent id arrives from a request body.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "NULL"
+    stripped = text.replace("-", "")
+    if len(stripped) != 32:
+        return "NULL"
+    try:
+        int(stripped, 16)
+    except ValueError:
+        return "NULL"
+    return text
+
+
+def _int_or_null(value):
+    if value is None:
+        return "NULL"
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "NULL"
+
+
+def _text_or_null(value):
+    if value is None or value == "":
+        return "NULL"
+    return quote(value)
+
+
+def task_insert_statement(task_id, service, action, payload_json, now_ms,
+                          component=None, task_type=None, sequence_id=None,
+                          parent_task_id=None, status=TASK_PENDING, progress=0):
+    """The row a submission writes.
+
+    `component` defaults to the service and `task_type` to the action, so a caller that
+    knows nothing new still produces a row with every column populated with something true
+    rather than with a null that a reader has to interpret.
+    """
+    return (
+        "INSERT INTO %s (task_id, parent_task_id, component, sequence_id, service, action, "
+        "task_type, status, payload, progress, created_at, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %d, %d, %d);"
+        % (CATALYST_TASKS_TABLE, _uuid_or_null(task_id), _uuid_or_null(parent_task_id),
+           _text_or_null(component or service), _int_or_null(sequence_id),
+           _text_or_null(service), _text_or_null(action),
+           _text_or_null(task_type or action), _text_or_null(status),
+           quote(payload_json), int(progress or 0), int(now_ms), int(now_ms)))
+
+
+def task_update_statement(task_id, status, progress, now_ms, error_msg=None):
+    """A progress report or a verdict.
+
+    `completed_at` is written only for a terminal status, and `updated_at` on every call.
+    Collapsing them is what made a completed task's duration unknowable: `updated_at`
+    moves on every progress report, so by the time a task finished its start was the only
+    timestamp still meaning what it said.
+    """
+    sets = ["status = %s" % _text_or_null(status) if status else "status = NULL",
+            "progress = %d" % int(progress or 0),
+            "updated_at = %d" % int(now_ms)]
+    if error_msg:
+        sets.append("error_msg = %s" % quote(error_msg))
+    if status in TASK_TERMINAL:
+        sets.append("completed_at = %d" % int(now_ms))
+    return ("UPDATE %s SET %s WHERE task_id = %s;"
+            % (CATALYST_TASKS_TABLE, ", ".join(sets), _uuid_or_null(task_id)))
+
+
+def task_read_statement(limit=None):
+    """Every column of every task. A full scan, because `task_id` is the whole primary key
+    and there is no clustering order to read in -- the retention window in 0003 bounds what
+    the scan walks, and that is all it can do."""
+    tail = " LIMIT %d" % int(limit) if limit else ""
+    return "SELECT JSON %s FROM %s%s;" % (", ".join(TASK_COLUMNS), CATALYST_TASKS_TABLE, tail)
+
+
+def claim_task_sequence(lwt, component, expected=None, attempts=6):
+    """The next sequence id for `component`, or None if one could not be claimed.
+
+    `lwt` is the caller's own `run_lwt`, returning `(ok, applied, current, error)`. The
+    claim is a compare-and-swap on the counter row: propose one more than the value this
+    caller believes the row holds, and on a refusal take the value that beat it out of the
+    refusal itself rather than spending a read on it. A refused claim is not an error -- it
+    means another submitter got this number -- so it is retried, and only a genuine failure
+    or an exhausted retry budget gives up.
+
+    `expected` is a hint, not a requirement: a caller that allocated for this component
+    before passes what it got, which makes the steady state one round trip. Passing None
+    (or passing it wrong) costs one refusal and is otherwise harmless, because the refusal
+    is what carries the right answer back.
+
+    None is a legitimate answer and must not be fatal. A submission whose sequence could
+    not be claimed is still a task that has to be queued: the number is how an operator
+    orders a component's history, not how the cluster executes it. Refusing the task
+    instead would make the task framework fail whenever the counter is contended.
+
+    Note on the first claim: `IF next_sequence_id = NULL` matches a row that does not exist
+    yet, which is the same property /v1/schedule/claim-job relies on for a schedule whose
+    clock has never been written. So no row has to be seeded, and two nodes reaching a
+    fresh component at once still produce two different numbers.
+    """
+    try:
+        expected = int(expected) if expected is not None else None
+    except (TypeError, ValueError):
+        expected = None
+    for _attempt in range(max(1, int(attempts))):
+        proposed = (expected or 0) + 1
+        ok, applied, current, _error = lwt("/v1/catalyst/claim-sequence", {
+            "component": component,
+            "next_sequence_id": proposed,
+            "expected_sequence_id": expected,
+        })
+        if not ok:
+            return None
+        if applied:
+            return proposed
+        expected = (current or {}).get("next_sequence_id")
+        if expected is not None:
+            try:
+                expected = int(expected)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def checksum(migration):
