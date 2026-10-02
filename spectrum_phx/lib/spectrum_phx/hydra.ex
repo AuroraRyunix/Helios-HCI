@@ -107,6 +107,33 @@ defmodule SpectrumPhx.Hydra do
   used blind `UPDATE`s, so a stale `host_ip` was enough to start a VM twice.
   """
   def apply_lwt(statement, params \\ [], opts \\ []) do
+    case apply_lwt_row(statement, params, opts) do
+      {:ok, applied, _row} -> {:ok, applied}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  A compare-and-swap that also hands back the row a refusal came with.
+
+  Returns `{:ok, applied?, row}`. On refusal Scylla returns the conditioned columns as
+  they stand *now*, which is the only way a caller can say who beat it -- "VLAN 100 is
+  already assigned to production" rather than "the write did not happen". Verified
+  against this cluster's Scylla: a refused `INSERT ... IF NOT EXISTS` comes back carrying
+  the whole existing row, and a refused `DELETE ... IF` against a row that does not exist
+  comes back with every conditioned column null.
+
+  That last shape is why the row is returned rather than swallowed. "Somebody else holds
+  it" and "there was nothing there" are both `applied? == false`, and only the row tells
+  them apart. On success the row is `%{}`: the columns Scylla returns then are the
+  pre-image, and a caller that read them as the new state would be reading the values it
+  just overwrote.
+
+  A statement with no `[applied]` column did not execute as a lightweight transaction at
+  all -- `INSERT ... JSON ? IF NOT EXISTS` is the form that does this, silently, and
+  overwrites the row -- so it is an error rather than a claim that never took place.
+  """
+  def apply_lwt_row(statement, params \\ [], opts \\ []) do
     consistency = Keyword.get(opts, :consistency, :quorum)
 
     with {:ok, prepared} <- Xandra.Cluster.prepare(@pool, statement),
@@ -115,16 +142,17 @@ defmodule SpectrumPhx.Hydra do
              consistency: consistency,
              serial_consistency: :serial
            ) do
-      applied =
-        page
-        |> Enum.to_list()
-        |> List.first()
-        |> case do
-          %{"[applied]" => value} -> value
-          _ -> true
-        end
+      case page |> Enum.to_list() |> List.first() do
+        %{"[applied]" => true} ->
+          {:ok, true, %{}}
 
-      {:ok, applied}
+        %{"[applied]" => false} = row ->
+          {:ok, false, Map.delete(row, "[applied]")}
+
+        _other ->
+          {:error,
+           "statement did not execute as a lightweight transaction: no [applied] column"}
+      end
     else
       {:error, reason} ->
         {:error, reason}

@@ -25,11 +25,18 @@ from the failure rather than starting over.
 ## Using it
 
     import helios_schema
-    helios_schema.ensure_schema(run_cql_query, node_id=LOCAL_IP)
+    helios_schema.ensure_schema(run_conditional_cql_query, node_id=LOCAL_IP)
 
 `execute` is any callable taking one CQL string and returning `(rc, stdout, stderr)` --
 the signature `run_cql_query` already has in every daemon here. Nothing in this module
 imports a driver, opens a socket, or knows whether it is talking to Daruk or cqlsh.
+
+It must be the *unguarded* executor. `run_cql_query` refuses a conditional statement
+because it cannot report whether the condition held, and this module's own schema lock is
+an IF NOT EXISTS insert -- so a daemon that passed the guarded one raised the moment
+anything was actually pending, and only then. Four daemons did, and the failure was
+invisible for as long as no migration was outstanding: on a cluster that had nothing to
+apply, `ensure_schema` returns before it ever reaches the lock.
 """
 
 KEYSPACE = "hydra"
@@ -50,6 +57,144 @@ LOCK_NAME = "hydra-schema"
 # Long enough for the slowest migration, short enough that a crashed holder does not
 # block a cluster restart. Applying the baseline on a fresh cluster is the slow case.
 LOCK_TTL_SECONDS = 300
+
+# The uniqueness constraint hydra.gatoway_networks cannot express, held in its own table
+# so that a VLAN id can be a partition key and therefore the subject of an IF NOT EXISTS.
+VLAN_CLAIMS_TABLE = "hydra.gatoway_vlan_claims"
+NETWORKS_TABLE = "hydra.gatoway_networks"
+
+
+def _json_rows(stdout):
+    """The `SELECT JSON` rows in a result, whichever path produced it.
+
+    Through Daruk each row arrives as one JSON object on its own line; through the cqlsh
+    fallback the same objects are wrapped in a table with a `[json]` header, a rule and a
+    row count. Both reduce to "a line that starts with { and ends with }", which is the
+    test every reader of gatoway_networks in this repo already applies.
+
+    Returns None if a line looked like JSON and did not parse. A partial set is worse than
+    no set here for the same reason it is worse in Gatoway: acting on it would look like
+    the missing rows did not exist.
+    """
+    rows = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{") or not line.endswith("}"):
+            continue
+        import json
+
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            return None
+    return rows
+
+
+def backfill_vlan_claims(execute, report, now_ms):
+    """Give every VLAN a network already carries a claim, and name the ones that clash.
+
+    The claim table is only a constraint on writes made after it exists. A cluster
+    adopting it already has networks, and if nothing claimed their VLANs the first create
+    after the migration would win a claim on a VLAN that is visibly in use -- which is the
+    duplicate this whole exercise exists to prevent, arrived at from the other direction.
+
+    ## Why a duplicate cannot fail the migration
+
+    A cluster that already has two networks on VLAN 100 is *why* this table is being
+    added. Refusing to migrate would leave that cluster with no constraint at all and no
+    way to get one, and it would do it at daemon start, where the failure surfaces as a
+    service that will not come up rather than as an answer to a question anyone asked.
+    So one of the two wins the claim, the rest are reported, and the operator is told
+    what to do about them. Note what is *not* done: nothing is deleted and nothing is
+    re-tagged. Both are configuration changes that take a guest's network away, and a
+    migration running at daemon start is the worst possible place to make one.
+
+    The winner is the lowest `net_id`, which is arbitrary but stable: every node runs this
+    and they must not disagree about who holds VLAN 100.
+
+    ## Re-running
+
+    Each claim is an IF NOT EXISTS, so a second run refuses every claim it already made
+    and reports nothing new. A read that fails, or a claim that fails for a reason other
+    than losing its race, raises instead -- the migration is then not recorded and the
+    next daemon start tries again, which is the behaviour a half-applied migration wants.
+    """
+    rc, stdout, stderr = _run(
+        execute, "SELECT JSON net_id, name, vlan_id FROM %s;" % NETWORKS_TABLE)
+    rows = _json_rows(stdout)
+    if rows is None:
+        raise SchemaError(
+            "a row of %s did not parse, so it is not known which VLANs are in use. "
+            "The claim table is created but empty; this migration is not recorded and "
+            "will run again. (%s)" % (NETWORKS_TABLE, (stderr or "").strip()))
+
+    by_vlan = {}
+    for row in rows:
+        vlan = row.get("vlan_id")
+        # Null for every `direct` network -- verified against the live cluster, where the
+        # seeded Physical-Direct row carries `"vlan_id": null`. Booleans are excluded
+        # because bool is a subclass of int and a claim keyed on True is nonsense.
+        if not isinstance(vlan, int) or isinstance(vlan, bool):
+            continue
+        by_vlan.setdefault(vlan, []).append(row)
+
+    for vlan in sorted(by_vlan):
+        holders = sorted(by_vlan[vlan], key=lambda row: str(row.get("net_id") or ""))
+        winner = holders[0]
+        _rc, claim_stdout, _stderr = _run(execute, claim_vlan_statement(
+            vlan, winner.get("net_id"), winner.get("name"), now_ms))
+        if not lwt_applied(claim_stdout):
+            # Either a re-run, in which case the holder is this same network and there is
+            # nothing to say, or somebody claimed it in between -- which is a network that
+            # carries VLAN 100 without holding it, and is worth saying.
+            winner = _claim_holder(execute, vlan) or winner
+
+        losers = [row for row in holders
+                  if str(row.get("net_id")) != str(winner.get("net_id"))]
+        if not losers:
+            continue
+        report(
+            "VLAN %d is carried by %d networks. The claim is held by %s (%s); %s hold no "
+            "claim and will keep working exactly as they do now, but nothing can be "
+            "created on VLAN %d until they are gone. Re-tag or delete the extras -- "
+            "whichever is safe for the guests attached to them -- and the claim then "
+            "matches reality."
+            % (vlan, len(holders), winner.get("name"), winner.get("net_id"),
+               ", ".join("%s (%s)" % (row.get("name"), row.get("net_id"))
+                         for row in losers),
+               vlan))
+
+
+def claim_vlan_statement(vlan_id, net_id, name, now_ms):
+    """The claim, as CQL text.
+
+    Here rather than at its call sites because the migration and Daruk's typed endpoint
+    have to write the same row: a claim the migration made must be releasable by a delete
+    the console makes, and vice versa. The column list is explicit because
+    `INSERT ... JSON ? IF NOT EXISTS` is accepted by Scylla and then executes
+    unconditionally -- no `[applied]` column, and the existing row overwritten.
+    """
+    return (
+        "INSERT INTO %s (vlan_id, net_id, name, claimed_at_ms) "
+        "VALUES (%d, %s, %s, %d) IF NOT EXISTS;"
+        % (VLAN_CLAIMS_TABLE, int(vlan_id), quote(net_id), quote(name), int(now_ms)))
+
+
+def _claim_holder(execute, vlan_id):
+    """Who holds the claim on `vlan_id`, or None.
+
+    Read back with its own SELECT rather than parsed out of the refused claim's row: a
+    refusal arrives through Daruk as the row's values joined by spaces, and a network
+    named "Marketing VLAN" makes that unsplittable. The extra read costs one round trip
+    on a path that only runs when a claim was refused.
+    """
+    try:
+        _rc, stdout, _stderr = _run(execute, "SELECT JSON net_id, name FROM %s WHERE vlan_id = %d;"
+                                    % (VLAN_CLAIMS_TABLE, int(vlan_id)))
+    except SchemaError:
+        return None
+    rows = _json_rows(stdout)
+    return rows[0] if rows else None
 
 
 MIGRATIONS = [
@@ -273,6 +418,37 @@ MIGRATIONS = [
             "ALTER TABLE hydra.valhalla_images ADD container text;",
         ],
     },
+    {
+        "id": "0009-vlan-claims",
+        "description": (
+            "One row per VLAN id in use, so that 'this VLAN is taken' is a fact the "
+            "database can enforce. hydra.gatoway_networks is keyed by net_id, which "
+            "makes a VLAN id an ordinary column and a duplicate perfectly legal: both "
+            "consoles read the existing networks and refuse a clash, which catches the "
+            "mistake an operator actually makes and cannot serialise against a "
+            "concurrent create -- two creates a millisecond apart both read 'VLAN 100 "
+            "is free' and both write it. A lightweight transaction cannot span "
+            "partitions, so the exclusion has to live in a row whose key *is* the VLAN "
+            "id, taken with IF NOT EXISTS. Two networks on one VLAN put two guests' "
+            "traffic in the same broadcast domain without either operator being told."
+        ),
+        "statements": [
+            # text net_id and an epoch-ms bigint: the convention cluster_locks and
+            # urbosa_transit_pool set, and the shape Daruk's serializer returns without
+            # type negotiation. `net_id` is the claim's holder token -- a release is
+            # conditional on it, so a late cleanup from a create that failed cannot drop
+            # the claim a later create legitimately holds.
+            #
+            # `name` is carried so a refusal can say *which* network holds the VLAN
+            # without a second read. It is a copy and may go stale if the network is
+            # renamed; it is a label in an error message, never a key.
+            "CREATE TABLE IF NOT EXISTS hydra.gatoway_vlan_claims "
+            "( vlan_id int PRIMARY KEY, net_id text, name text, claimed_at_ms bigint );",
+        ],
+        # Runs after the statements, inside the same lock. See the function for why a
+        # cluster that already has duplicates is reported rather than refused.
+        "backfill": backfill_vlan_claims,
+    },
 ]
 
 
@@ -284,13 +460,27 @@ def checksum(migration):
     shipped. The cluster that ran the old text and the cluster that ran the new one now
     have different schemas and both believe they are up to date.
 
-    Only `statements` is hashed. The description is prose and may be improved freely.
+    Only `statements` is hashed, plus the *name* of a backfill step when there is one.
+    The description is prose and may be improved freely.
+
+    Hashing a backfill by name and not by body is deliberate, and it is a constraint on
+    how one may be written rather than an oversight: a backfill derives rows that already
+    exist from rows that already exist, so re-running it must be a no-op and changing what
+    it derives is a new migration, not an edit to this one. Nothing here would notice such
+    an edit, which is why the rule is stated instead of enforced.
+
+    Migrations with no backfill hash exactly as they did before the key existed, so the
+    checksums recorded on every live cluster still match.
     """
     import hashlib
 
     digest = hashlib.sha256()
     for statement in migration["statements"]:
         digest.update(" ".join(statement.split()).encode("utf-8"))
+        digest.update(b"\n")
+    backfill = migration.get("backfill")
+    if backfill is not None:
+        digest.update(("backfill:" + backfill.__name__).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -446,11 +636,21 @@ def quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def ensure_schema(execute, node_id="unknown", now_ms=None):
+def ensure_schema(execute, node_id="unknown", now_ms=None, report=None):
     """Apply every pending migration, once, cluster-wide.
 
     Returns the list of migration ids applied by *this* call, which is empty on every
     node that lost the race and on every restart after the first.
+
+    `execute` must be able to run a *conditional* statement and hand back its stdout: the
+    schema lock is an IF NOT EXISTS insert and a conditional delete, and a backfill step
+    reads the `[applied]` verdict of its own claims. Every daemon's `run_cql_query`
+    refuses conditional statements -- correctly, because it cannot report whether the
+    condition held -- so the executor passed in here is the unguarded one.
+
+    `report` is called with one line of prose whenever a migration finds something an
+    operator has to decide about, which a migration must never decide by itself. It
+    defaults to stderr because that is where a daemon's start-up output already goes.
 
     Raises `SchemaDivergence` if an applied migration's text has changed, and
     `SchemaError` if the database could not be reached or a statement failed.
@@ -459,6 +659,12 @@ def ensure_schema(execute, node_id="unknown", now_ms=None):
         import time
 
         now_ms = int(time.time() * 1000)
+
+    if report is None:
+        def report(message):
+            import sys
+
+            sys.stderr.write(str(message).rstrip("\n") + "\n")
 
     for statement in BOOKKEEPING:
         _run(execute, statement)
@@ -480,6 +686,13 @@ def ensure_schema(execute, node_id="unknown", now_ms=None):
         for migration in outstanding:
             for statement in migration["statements"]:
                 _run(execute, statement)
+            backfill = migration.get("backfill")
+            if backfill is not None:
+                # Before the migration is recorded, so a backfill that raises leaves the
+                # migration pending and the next start repeats it. The statements above
+                # are all IF NOT EXISTS or idempotent property changes, which is what
+                # makes repeating them free.
+                backfill(execute, report, now_ms)
             _run(execute,
                  "INSERT INTO hydra.schema_migrations (id, checksum, applied_at, applied_by) "
                  "VALUES (%s, %s, %d, %s);"

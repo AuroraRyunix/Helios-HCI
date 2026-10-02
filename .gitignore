@@ -20,6 +20,7 @@ spark_daemon_decoded.py.bak
 
 # Rust build artifacts
 agahnim/target/
+sidon/target/
 
 # Phoenix rewrite of Spectrum (spectrum_phx)
 /spectrum_phx/_build/

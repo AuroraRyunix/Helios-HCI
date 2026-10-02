@@ -47,6 +47,14 @@ pub struct DaemonConfig {
     pub peers: Vec<(String, String)>,
     pub peer_timeout: Duration,
     pub fence_timeout: Duration,
+    /// The cluster's `redundancy_factor` from `cluster.json`, when it could be read.
+    ///
+    /// The fallback for a create whose container says nothing, and the reason a vdisk
+    /// gets more than one copy at all. `None` is "the document did not say", which is not
+    /// the same as 0 and must not be treated as it: 0 is a cluster created with `-r 0` and
+    /// meaning it, while `None` is a node that could not read its own configuration, and
+    /// only the first of those is an instruction.
+    pub cluster_ftt: Option<u64>,
 }
 
 struct Attached {
@@ -73,6 +81,28 @@ pub struct Daemon {
     fence_peers: HashMap<String, Arc<PeerClient>>,
     /// What this node stores on behalf of vdisks it does not own.
     replica_store: Arc<ReplicaStore>,
+}
+
+/// How many copies a vdisk should be created with, given a fault tolerance and the number
+/// of nodes that could hold one.
+///
+/// The whole reason this is a named function rather than two characters at the call site
+/// is that the conversion is where the bug was. `ftt` counts *failures survived* --
+/// `cluster.json`'s `redundancy_factor` and a container's `ftt` both mean that, and a
+/// single-node cluster is created with 0 -- while `dfs_vdisks.rf` counts *copies*. They
+/// differ by exactly one, and the column being called rf while the setting is called
+/// redundancy_factor is enough to make reading one straight into the other look correct.
+/// It is not: it turns "survive one host loss" into "keep one copy", which is the
+/// opposite instruction, and it does so without failing anything an operator would see.
+///
+/// Clamped to the nodes available rather than refused. A cluster with fewer hosts than its
+/// ftt asks for is a real and supported state -- one node at ftt=1 is what every
+/// single-node deployment looks like after `cluster.json` is copied from a bigger one --
+/// and refusing every create there would take a cluster that works today and stop it. The
+/// shortfall is visible in the recorded rf, which is the honest place for it.
+fn copies_for_ftt(ftt: u64, nodes: usize) -> usize {
+    let asked = usize::try_from(ftt.saturating_add(1)).unwrap_or(usize::MAX);
+    asked.min(nodes.max(1)).max(1)
 }
 
 impl Daemon {
@@ -120,6 +150,44 @@ impl Daemon {
 
     fn daruk(&self) -> Daruk {
         Daruk::new(&self.cfg.daruk_addr, self.cfg.daruk_timeout)
+    }
+
+    /// Nodes that could hold a copy: this one, plus every peer the cluster document named.
+    ///
+    /// The peer list rather than the peers that are answering. Placement is a durability
+    /// decision and a node being down for ten minutes is not a reason to create every
+    /// vdisk in that window at a lower redundancy than the cluster asked for -- the
+    /// create would succeed, the number would be wrong forever, and nothing afterwards
+    /// re-reads it.
+    fn placement_nodes(&self) -> usize {
+        1 + self.cfg.peers.len()
+    }
+
+    /// The replica count a create should use when the request does not say.
+    ///
+    /// Container first, cluster second, one copy last. The container is first because
+    /// that is what the schema says this number is -- migration 0006 records rf as
+    /// "copied from the container's ftt" -- and because it is the only one of the two
+    /// that can express "these particular disks are scratch". The cluster's
+    /// `redundancy_factor` catches every vdisk whose container says nothing, which today
+    /// is any create that omits the container and lands on Sidon's unmatched "default".
+    ///
+    /// One copy is the last resort and not a policy: it is what this node falls back to
+    /// when it can read neither Hydra nor its own cluster document, and it is deliberately
+    /// the same thing that used to happen unconditionally. Guessing higher would place
+    /// replicas on nodes whose membership we just failed to establish.
+    fn default_copies(&self, container: &str) -> usize {
+        let ftt = crate::vdisk::container_ftt(&self.daruk(), container).or(self.cfg.cluster_ftt);
+        match ftt {
+            Some(ftt) => copies_for_ftt(ftt, self.placement_nodes()),
+            None => {
+                eprintln!(
+                    "sidon: neither container '{container}' nor the cluster document names a \
+                     redundancy factor, so this vdisk is being created with one copy"
+                );
+                1
+            }
+        }
     }
 
     fn vdisk_cfg(&self) -> VdiskConfig {
@@ -227,7 +295,7 @@ impl Daemon {
             "resize" => self.op_resize(req),
             "capacity" => self.op_capacity(),
             "peers" => self.op_peers(),
-            "purah-heal" => self.op_purah_heal(),
+            "purah-heal" => self.op_purah_heal(req),
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
@@ -254,8 +322,30 @@ impl Daemon {
         // peers as `rf` calls for, in the order they were configured. Deliberately simple:
         // a real placement policy (racks, free space, locality) belongs in Vali, which
         // already places VMs, rather than in the daemon serving the bytes.
-        let rf = req.get("rf").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
-        let replicas: Vec<String> = match req.get("replicas").and_then(Value::as_array) {
+        //
+        // `rf` used to default to 1 here, and because no caller has ever sent one, that
+        // default *was* the policy: every vdisk on every cluster was created single-copy
+        // whatever the operator had configured, and nothing said so. The cluster's
+        // redundancy factor was consulted by the console, by the keyspace, and by the
+        // capacity arithmetic -- everywhere except the one place that decides how many
+        // copies of a guest's disk exist. Purah re-replicated correctly the whole time and
+        // had nothing to do, because one copy was the requested count.
+        //
+        // An explicit `rf` still wins. A caller that names a number has a reason, and the
+        // only two callers that ever will are the replication test harness and an operator
+        // overriding policy for one disk.
+        //
+        // So does an explicit `replicas` list, and it carries the count with it: a caller
+        // that names the nodes has already said how many copies it wants, and deriving a
+        // larger number from policy would refuse a request that names a perfectly valid
+        // set. That is not hypothetical -- it is what tools/tls_replication_check.sh does.
+        let explicit_replicas = req.get("replicas").and_then(Value::as_array);
+        let rf = match (req.get("rf").and_then(Value::as_u64), &explicit_replicas) {
+            (Some(rf), _) => rf.max(1) as usize,
+            (None, Some(list)) => list.len().max(1),
+            (None, None) => self.default_copies(container),
+        };
+        let replicas: Vec<String> = match explicit_replicas {
             Some(list) => list.iter().filter_map(Value::as_str).map(str::to_string).collect(),
             None => {
                 let mut chosen = vec![self.cfg.node.clone()];
@@ -675,7 +765,9 @@ impl Daemon {
         let daruk = self.daruk();
 
         let rows = daruk.query(&format!(
-            "SELECT class, size_bytes, container, extent_bytes, egroup_bytes, replicas, rf \
+            // The parent's `rf` is deliberately not read. It records the policy the parent
+            // was created under, and the child is created under the policy in force now.
+            "SELECT class, size_bytes, container, extent_bytes, egroup_bytes, replicas \
              FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(&parent_id)
         ))?;
@@ -717,12 +809,33 @@ impl Daemon {
         let container = parent.get("container").and_then(Value::as_str).unwrap_or("default");
         let extent_bytes = parent.get("extent_bytes").and_then(Value::as_i64).unwrap_or(1 << 20);
         let egroup_bytes = parent.get("egroup_bytes").and_then(Value::as_i64).unwrap_or(4 << 20);
-        let rf = parent.get("rf").and_then(Value::as_i64).unwrap_or(1).max(1);
         let replicas: Vec<String> = parent
             .get("replicas")
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
             .unwrap_or_else(|| vec![self.cfg.node.clone()]);
+
+        // The child is a new vdisk, so it is created under the policy in force now rather
+        // than the one its parent was made under. Inheriting the parent's `rf` is what
+        // this line used to do, and with every parent on the cluster recorded at 1 it
+        // meant a clone could never be more durable than the defect that made its parent
+        // -- the single-copy default propagating itself one generation at a time.
+        //
+        // What the child *does* inherit is the replica set, because the extents are
+        // shared: the copies that exist are exactly where the parent's are, and placing
+        // the child elsewhere would mean copying every byte, which is the one cost a
+        // snapshot exists not to pay.
+        //
+        // So a child can be born naming more copies than it has, which `op_create`
+        // refuses outright for a fresh vdisk. The asymmetry is deliberate. A fresh create
+        // chooses its own nodes and has no excuse for a set that is short; a clone's
+        // placement is decided by where its parent's extents already sit. Recording the
+        // shortfall is the honest option -- it is what `valcli storage.replication` reads,
+        // and nothing anywhere grows the set on the strength of it.
+        let rf = match req.get("rf").and_then(Value::as_u64) {
+            Some(rf) => rf.max(1) as i64,
+            None => self.default_copies(container) as i64,
+        };
 
         // The child row goes in first, as CLASS_FORMING, and the map follows.
         //
@@ -990,6 +1103,11 @@ impl Daemon {
                         "degraded": v.degraded,
                         "class": v.class,
                         "replicas": v.map_replicas(),
+                        // Listed beside the set for the same reason `status` carries it:
+                        // a page that renders the replica count against the cluster's
+                        // redundancy factor is comparing what exists to what policy asks
+                        // for, and neither of those is what this vdisk asked for.
+                        "rf": v.rf,
                         "role": "owner",
                     }));
                 }
@@ -1060,25 +1178,61 @@ impl Daemon {
     /// Purah's re-replication, driven from the owner because the owner is the node that
     /// has the data. Only owned vdisks: a forwarding node has nothing to copy, and a node
     /// that merely holds a replica is not entitled to rewrite the set.
-    fn op_purah_heal(&self) -> Result<Value> {
+    ///
+    /// Two things can make a vdisk short of its copies, and by default this heals only
+    /// one of them. A replica that stopped answering is an *emergency*: the journal is
+    /// write-all, so the guest is taking EIO until the set is restored, and that is what
+    /// the five-second watcher and the timer both call this for. A vdisk that simply
+    /// never asked for enough copies is not an emergency, and until the create-time
+    /// default was fixed that described every vdisk on the cluster -- healing it on the
+    /// timer would have turned a metadata fix into an unannounced full-cluster data copy
+    /// the first time a node restarted.
+    ///
+    /// So `restore_rf` is opt-in and reaches this only from an operator typing it. It
+    /// adds one replica per vdisk per call, the same as the emergency path: growing a set
+    /// by one node is a bounded amount of copying that can be watched, and an operator
+    /// topping up a fleet would rather run this four times than start something they
+    /// cannot see the end of.
+    fn op_purah_heal(&self, req: &Value) -> Result<Value> {
+        let restore_rf = req.get("restore_rf").and_then(Value::as_bool).unwrap_or(false);
+        // Narrows the pass to one vdisk. Without it, an operator asking to top up a single
+        // disk would top up every disk this node owns and be shown a report about one of
+        // them -- which is the opposite of making the copying deliberate. Never used by
+        // the emergency paths: a write failing is a fact about the node, and healing only
+        // the vdisk that happened to notice first would leave its neighbours to discover
+        // the same dead replica one guest at a time.
+        let only = req.get("vdisk_id").and_then(Value::as_str);
         let owned: Vec<(String, Arc<Mutex<Vdisk>>)> = {
             let map = self.attached.lock().expect("attached mutex poisoned");
             map.iter()
+                .filter(|(id, _)| only.map(|want| want == id.as_str()).unwrap_or(true))
                 .filter_map(|(id, a)| a.vdisk.as_ref().map(|v| (id.clone(), Arc::clone(v))))
                 .collect()
         };
+        if owned.is_empty() {
+            if let Some(want) = only {
+                return Err(Error::refused(format!(
+                    "vdisk {want} is not owned by this node, so it has no data here to copy \
+                     from. Re-replication runs on the owner."
+                )));
+            }
+        }
 
         let mut healed = Vec::new();
         let mut degraded = Vec::new();
         for (id, handle) in owned {
-            let (before, down, epoch) = {
+            let (before, down, epoch, want) = {
                 let v = handle.lock().expect("vdisk mutex poisoned");
                 let (_up, down) = v.replica_health();
                 // The map's set, this node included -- the CAS is conditioned on what the
                 // map holds, not on the subset this node happens to dial.
-                (v.map_replicas(), down, v.epoch)
+                (v.map_replicas(), down, v.epoch, v.rf as usize)
             };
-            if down.is_empty() {
+            // Short of what it asked for, counting only the members that answer: a set of
+            // two with one unreachable node is one copy short whichever of the two reasons
+            // put it there, and healing it once should not leave it still short.
+            let short = restore_rf && before.len().saturating_sub(down.len()) < want;
+            if down.is_empty() && !short {
                 continue;
             }
 
@@ -1218,7 +1372,10 @@ impl Daemon {
                 })
             };
             if degraded {
-                if let Err(e) = watcher.op_purah_heal() {
+                // No `restore_rf`: this fires on a write failing, and the answer to that
+                // is to replace what stopped answering, not to start copying disks that
+                // are serving their guests perfectly well.
+                if let Err(e) = watcher.op_purah_heal(&json!({})) {
                     eprintln!("purah: prompt re-replication failed: {e}");
                 }
             }
@@ -1250,7 +1407,7 @@ impl Daemon {
                 // next tick tries again. Reclamation is allowed to be late.
                 Err(e) => eprintln!("purah: sweep failed: {e}"),
             }
-            match me.op_purah_heal() {
+            match me.op_purah_heal(&json!({})) {
                 Ok(r) => {
                     let healed = r.get("healed").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
                     let degraded = r.get("degraded").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
@@ -1332,5 +1489,55 @@ mod tests {
         assert!(str_field(&v, "missing").is_err());
         assert_eq!(u64_field(&v, "size_bytes").unwrap(), 10);
         assert!(u64_field(&v, "vdisk_id").is_err());
+    }
+
+    /// A fault tolerance is not a copy count, and reading one as the other is what made
+    /// every vdisk on the cluster single-copy.
+    ///
+    /// `cluster.json` says `redundancy_factor: 1` and a container says `ftt: 1`, and both
+    /// mean "survive one host loss", which takes two copies. The column that records the
+    /// answer is called `rf` and holds a number of copies. Nothing about either name says
+    /// they differ, and the whole defect fits in the one that got dropped.
+    #[test]
+    fn a_fault_tolerance_of_one_asks_for_two_copies() {
+        assert_eq!(copies_for_ftt(1, 3), 2);
+        assert_eq!(copies_for_ftt(2, 3), 3);
+    }
+
+    /// ftt=0 is an operator's decision, not a missing value.
+    ///
+    /// It is what `cluster create` writes for a single-node cluster, and it means one
+    /// copy. Worth pinning separately because it is the one input where reading the ftt
+    /// straight into rf gives an answer that is wrong in the other direction -- zero
+    /// copies -- and a guard that only ever tested ftt=1 would not have seen it.
+    #[test]
+    fn no_fault_tolerance_still_means_one_copy_rather_than_none() {
+        assert_eq!(copies_for_ftt(0, 1), 1);
+        assert_eq!(copies_for_ftt(0, 3), 1);
+    }
+
+    /// A cluster smaller than its own redundancy factor keeps working.
+    ///
+    /// This is not a corner case: it is any single-node deployment whose `cluster.json`
+    /// was copied from a larger one, and a create that refused there would take a cluster
+    /// that serves guests today and stop it doing so. The clamp is what makes the
+    /// shortfall a recorded number instead of an outage.
+    #[test]
+    fn a_cluster_cannot_be_asked_for_more_copies_than_it_has_nodes() {
+        assert_eq!(copies_for_ftt(1, 1), 1);
+        assert_eq!(copies_for_ftt(5, 2), 2);
+        // Even with the node count nonsensically zero, a vdisk has one copy: itself. A
+        // zero here would be a create that records a durability claim of "no copies".
+        assert_eq!(copies_for_ftt(2, 0), 1);
+    }
+
+    /// An ftt large enough to overflow the `+1` must not wrap to zero copies.
+    ///
+    /// `redundancy_factor` is operator-typed and parsed from a JSON document, so nothing
+    /// upstream bounds it. Saturating rather than wrapping means a preposterous value
+    /// clamps to the node count like any other too-large one.
+    #[test]
+    fn an_absurd_fault_tolerance_clamps_instead_of_wrapping() {
+        assert_eq!(copies_for_ftt(u64::MAX, 3), 3);
     }
 }

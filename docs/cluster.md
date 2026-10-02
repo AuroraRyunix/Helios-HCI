@@ -22,7 +22,7 @@ Bootstrap a new cluster across a set of physical hosts.
 
 #### 1-Node, 2-Node, and 4+ Node Layouts
 - **1-Node / 2-Node**: All hosts are fully provisioned hypervisors and storage nodes.
-- **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members, and additional hosts are automatically configured as observers to scale the cluster cleanly.
+- **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members, and additional hosts are automatically configured as observers to scale the cluster cleanly. That is the starting set, not a fixed one — `cluster zk-promote` / `zk-demote` (section H) move the vote between members afterwards.
 
 #### 3-Node Layout (Witness Node Support)
 In a **3-node cluster layout**, the third host (Node 3, index 2 in the IP list) automatically acts as a low-overhead, diskless **Witness Node**.
@@ -152,8 +152,14 @@ The ensemble shrink is not bookkeeping and is not optional. Until it runs, every
 survivor's `zookeeper.container` still lists the departed node and still counts it
 towards quorum — so a three-entry ensemble with two live members needs *both* of them,
 leaving the cluster less fault-tolerant than the two-node cluster it has actually become.
-`--finalize` restarts the survivors one at a time, so a quorum of the previous ensemble
-stays alive throughout.
+
+Where there is a live observer to take the departing node's vote, `--finalize` hands it
+over deliberately: one `reconfig`, no restart, and no instant at which the members
+disagree about who votes. Where there is not — which on a three-node cluster is always,
+because every node already votes — it falls back to rewriting the units and restarting
+the survivors one at a time, so a quorum of the previous ensemble stays alive throughout.
+That fallback is not a lesser path; removing a node from three genuinely does leave a
+two-voter ensemble, and no reconfiguration can make that untrue.
 
 Surviving members keep the ZooKeeper ids they already hold, and a removal simply leaves a
 gap in the numbering. A member's id is its identity — it must match the `server.<id>`
@@ -164,7 +170,27 @@ than assumed; a node whose unit cannot be read is never given a guessed one, bec
 inventing an id for a node that already has one is how two members come to claim the same
 identity. When that happens the ensemble is left alone and the manual steps are printed.
 
-### H. Node Rejoin (`cluster rejoin`)
+### H. Moving the ZooKeeper vote (`cluster zk-promote` / `zk-demote`)
+Change which nodes form the consensus quorum, without changing which nodes are in the
+cluster. The first three nodes provisioned are the voters and everything above them is an
+observer; these are how that set is changed on purpose rather than as a side effect of a
+removal.
+```bash
+# 10.10.102.43 takes over voting from a node that is never coming back
+cluster zk-promote --node 10.10.102.43 --replacing 10.10.102.223
+```
+`--replacing` makes it one atomic reconfiguration rather than two steps with a weakened
+ensemble in between, and on a three-voter ensemble it is the only legal form. The replaced
+node stays in the ensemble as an observer and stays in the ring — moving the ZooKeeper
+role off a node is not the same operation as removing the node.
+
+Any change that would leave a voter which is not answering, or fewer than three voters, or
+that is asked for while the ensemble has no single leader, is refused rather than
+performed. The reasoning, the refusal table and the `zoo.cfg.dynamic` interaction that
+makes the Quadlet the durable record of membership are in
+[zookeeper.md](./zookeeper.md#changing-which-nodes-vote).
+
+### I. Node Rejoin (`cluster rejoin`)
 Preflight and plan bringing a node back. Checks that a previously decommissioned node has
 had its ScyllaDB data wiped — rejoining with it resurrects rows deleted while the node was
 away — and restores its cluster metadata.
@@ -176,7 +202,7 @@ cluster rejoin --node 10.10.102.223 --finalize
 Both sequences, and the quorum gate that governs maintenance mode, are documented in
 [ring_lifecycle.md](./ring_lifecycle.md).
 
-### I. Cluster Destruction (`cluster destroy`)
+### J. Cluster Destruction (`cluster destroy`)
 Wipe all databases, clear claimed disks, remove configuration parameters, and reset the hypervisor hosts to factory default.
 ```bash
 # WARNING: Wipes all VM disks, metadata tables, and system configurations permanently

@@ -67,8 +67,17 @@ defmodule SpectrumPhxWeb.Networking.IndexLive do
 
   def handle_event("delete", %{"id" => id}, socket) do
     case Networking.delete_network(id) do
-      {:ok, _id} -> {:noreply, socket |> put_flash(:info, "Network removed.") |> load()}
-      {:error, message} -> {:noreply, put_flash(socket, :error, message)}
+      {:ok, _id} ->
+        {:noreply, socket |> put_flash(:info, "Network removed.") |> load()}
+
+      # The network is gone and its VLAN claim is not. Reported as a warning rather than
+      # an error, because the delete did happen -- and reported at all, because a claim
+      # nobody can release is a VLAN nobody can use.
+      {:ok, _id, warning} ->
+        {:noreply, socket |> put_flash(:error, "Network removed. " <> warning) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
     end
   end
 

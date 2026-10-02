@@ -1154,7 +1154,23 @@ CREATE TABLE IF NOT EXISTS hydra.gatoway_networks (
     type text,         -- 'direct' (untagged) or 'vlan' (tagged)
     vlan_id int        -- VLAN ID (e.g. 100, 200, Null for direct)
 );
+
+-- The uniqueness constraint the table above cannot express: it is keyed by net_id, so
+-- nothing there stops two networks claiming VLAN 100 -- and Gatoway builds one
+-- br-vlan-100 either way, putting both networks' guests in one broadcast domain.
+CREATE TABLE IF NOT EXISTS hydra.gatoway_vlan_claims (
+    vlan_id int PRIMARY KEY,  -- the VLAN, and therefore what two creates contend for
+    net_id text,              -- the network holding it; a release is conditional on this
+    name text,                -- so a refusal can name the holder without a second read
+    claimed_at_ms bigint      -- how a claim left behind by a dead create is recognised
+);
 ```
+
+Both consoles read the networks and refuse a clash before writing, which catches the
+mistake an operator actually makes and cannot serialise against a concurrent create: a
+read followed by a write is two operations. The claim, taken with `IF NOT EXISTS` on a
+table keyed by the VLAN id, is what decides a race. See
+[gatoway.md](./gatoway.md#c-vlan-uniqueness).
 
 #### B. Synchronization Loop
 Every 5 seconds, the `gatoway` daemon on each host performs the following steps:
@@ -1200,13 +1216,22 @@ ip -d link show type vlan
 ```
 
 #### C. Adding a VLAN Network to the Cluster Registry
-Administrators can register new VLANs using the database query tools:
+The supported way is the console, or `POST /api/networks/create` on the Python tier: both
+take the VLAN claim before writing the row and give it back if the write fails. A raw
+`INSERT` through `valcli db.query` writes a network with **no claim on its VLAN**, and
+nothing notices. If you have to do it by hand, take the claim in the same sitting -- and
+if the claim answers `[applied] False`, somebody already has the VLAN and the second
+statement must not be run.
 ```bash
 
 valcli db.query "SELECT * FROM hydra.gatoway_networks;"
+valcli db.query "SELECT * FROM hydra.gatoway_vlan_claims;"
 
 
-valcli db.query "INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id) VALUES (uuid(), 'Marketing-VLAN', 'vlan', 150);"
+valcli db.query "INSERT INTO hydra.gatoway_vlan_claims (vlan_id, net_id, name, claimed_at_ms) VALUES (150, '0a1b2c3d-0000-4000-8000-000000000001', 'Marketing-VLAN', 0) IF NOT EXISTS;"
+
+
+valcli db.query "INSERT INTO hydra.gatoway_networks (net_id, name, type, vlan_id) VALUES (0a1b2c3d-0000-4000-8000-000000000001, 'Marketing-VLAN', 'vlan', 150);"
 ```
 Gatoway will detect the new database entry within 5 seconds and automatically bootstrap the required bridge (`br-vlan-150`) and sub-interface (`ens192.150`) on all cluster nodes.
 

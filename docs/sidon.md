@@ -130,7 +130,77 @@ The curator, running inside Sidon. Three jobs, all background, none on the guest
 - **Scrub** — recompute every sealed group's hash against the one recorded at seal time.
   Needs no lock, because sealed means immutable.
 
-## 5. Snapshots and clones
+## 5. How many copies a vdisk gets
+
+A vdisk is created with the number of copies the cluster's redundancy factor asks for.
+That sentence was not true until recently, and the way it was false is worth keeping.
+
+**Where the number lives.** `/etc/hci/cluster.json`, as `redundancy_factor`, written by
+`cluster create -r` and copied to every host. It is not in ZooKeeper — `/cluster_state`
+holds one word, `started` or `stopped` — and it is not
+`hydra.cluster_settings.replication_factor`, which governs how many copies of the
+*metadata* Scylla keeps and says nothing about a guest's disk. A storage container may
+override it for its own vdisks with `hydra.storage_containers.ftt`, and that is what the
+schema means when it records a vdisk's `rf` as copied from its container.
+
+**The unit.** `redundancy_factor` and a container's `ftt` both count **failures
+survived**. `dfs_vdisks.rf` counts **copies**. They differ by one:
+
+| ftt | copies | meaning |
+|-----|--------|---------|
+| 0 | 1 | no replication — what a single-node cluster is created with |
+| 1 | 2 | survive one host loss |
+| 2 | 3 | survive two |
+
+The count is clamped to the number of nodes that could hold a copy, so a single-node
+cluster carrying a multi-node `cluster.json` keeps creating disks instead of refusing
+every create. An explicit `rf` in the create request still wins over all of this, and so
+does an explicit `replicas` list, which carries its own count.
+
+**What went wrong.** `op_create` defaulted `rf` to 1, and no caller has ever sent one —
+not vali, not the console, not the CLI, not the Elixir tier. So the default was the
+policy: every vdisk on every cluster was single-copy whatever the operator had
+configured. Nothing reported it, because every replication view compared a vdisk's
+replica list against the `rf` on its own row, and the same defect had written that as 1
+too. One replica, one requested, healthy. Purah's re-replication worked correctly the
+whole time and had nothing to do, because one copy *was* the requested count.
+
+**Seeing it.**
+
+```bash
+valcli storage.replication
+```
+
+Per vdisk: the copies policy asks for, the `rf` the vdisk itself asked for, and the
+copies that exist. Three numbers rather than two, because the two states they separate
+have different fixes. `degraded` means a disk lost copies it once had, and Purah restores
+those by itself. `under-policy` means a disk never requested them, so there is nothing to
+restore and no amount of healing will change it.
+
+**Fixing an existing fleet.** Creates made before this change stay single-copy, and they
+are not touched automatically. Purah re-replicates on the timer and on a failed write,
+but only to replace a replica that stopped answering — an emergency, since write-all
+means the guest is taking EIO until the set is restored. Topping up a disk that is
+serving its guest perfectly well is not an emergency, and doing it on a timer would have
+turned this change into an unannounced copy of every disk on the cluster at the next node
+restart.
+
+So it is opt-in and typed by hand:
+
+```bash
+valcli storage.replicate <vdisk_id>    # one vdisk, on its owner
+valcli storage.replicate --all         # every vdisk this cluster owns
+```
+
+One copy per vdisk per run, so a disk that needs two more takes two runs. That bound is
+deliberate: it keeps the amount of copying to something you can watch finish. Only
+attached vdisks are eligible — re-replication runs on the owner, because the owner is the
+node that has the data.
+
+Changing the cluster's redundancy factor itself is a separate decision and is not made
+here; these commands only make disks match whatever it is already set to.
+
+## 6. Snapshots and clones
 
 A snapshot copies the block map. It copies no data at all, and the number it reports for
 bytes copied is zero because that is the honest figure.
@@ -169,7 +239,7 @@ map, then the class is set. Nothing attaches a `forming` vdisk, so an interrupte
 leaves a row that says what it is rather than a disk that reads as half zeroes. Delete it
 and take the snapshot again.
 
-## 6. Operating it
+## 7. Operating it
 
 ```bash
 valcli storage.list
@@ -187,7 +257,7 @@ extent groups, replica counts, and control-socket latency. The latency one exist
 every other check asks the daemon a question and believes the answer; this one times the
 question, and a control plane answering in twenty seconds is about to stop answering.
 
-## 7. Ports, and the lack of them
+## 8. Ports, and the lack of them
 
 Sidon adds **no client-facing TCP port**. 9105 is peer-to-peer and mutually
 authenticated; nothing outside the cluster can speak to it.
@@ -220,7 +290,7 @@ The bind address and the peer list are read from `/etc/hci/cluster.json` rather 
 configured into the unit. A one-host cluster binds loopback, because at ftt=0 there is
 nothing to replicate to; a second host appearing in that document is all it takes.
 
-## 8. Compression
+## 9. Compression
 
 Compression is a property of the **container**, not of a vdisk and not of the cluster. A
 container is already the unit an operator reasons about for tier, quota and fault
@@ -271,7 +341,7 @@ existed already contains. Those extents read back unchanged, with no backfill, n
 migration and no version check. A container with no compression column — every container
 that predates the setting — behaves exactly as it did.
 
-## 9. What is not built
+## 10. What is not built
 
 - **Scheduled snapshots.** Taking one is a command; nothing takes them on a timer, prunes
   them by a retention policy, or presents them in the console. The mechanism is done and

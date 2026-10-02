@@ -85,8 +85,25 @@ Hydra stores:
 5. **Cluster locks**: `hydra.cluster_locks` — one row per cluster-wide mutual exclusion,
    taken with `IF NOT EXISTS` and a TTL. A lightweight transaction cannot span partitions,
    so exclusion that holds across hosts has to condition on a single shared row.
+6. **Claimed identifiers**: `hydra.urbosa_transit_pool` and `hydra.gatoway_vlan_claims` —
+   one row per transit `/30` and per VLAN id in use. Both exist for the same reason as the
+   lock table and are read the same way: the thing that must be unique is not the primary
+   key of the table that stores the object using it, so it gets a table where it *is* the
+   key and can therefore be taken with `IF NOT EXISTS`. See
+   [network.md](./network.md#1b-cluster-wide-identifier-spaces).
 
 The schema is declared once, in order, in `helios_schema.py`, and applied behind a lock.
+
+A migration is a list of statements and, where a constraint is being added to a cluster
+that is already running, a **backfill** step that derives the rows the new table needs from
+the rows that already exist. `0009-vlan-claims` is the first: creating the claim table
+constrains nothing until the VLANs already in use are in it. A backfill runs inside the
+same cluster lock and *before* the migration is recorded, so one that fails leaves the
+migration pending and the next daemon start repeats it — the statements ahead of it are
+all `IF NOT EXISTS` or idempotent property changes, which is what makes repeating them
+free. Only its *name* is part of the migration's checksum, which is a rule about how one
+may be written rather than an oversight: a backfill derives what already exists, so
+re-running it must be a no-op, and changing what it derives is a new migration.
 
 ### Backup
 

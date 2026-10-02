@@ -490,8 +490,16 @@ def init_db_schema():
     here; inside a migration, where a failed statement aborts the run, they would break
     every restart after the first. Making them migrations needs an
     add-column-if-absent step that checks system_schema.columns first.
+
+    The unguarded executor is handed over deliberately, as Catalyst already did: the
+    schema lock is an IF NOT EXISTS insert and helios_schema reads the [applied] verdict
+    itself. Passing `run_cql_query` here raised ConditionalStatementError -- but only on a
+    cluster with something actually outstanding, because `ensure_schema` returns before it
+    takes the lock when nothing is pending. That is why it survived: it is invisible until
+    the first day a migration is added, and then it is every daemon at once.
     """
-    applied = load_schema_module().ensure_schema(run_cql_query, node_id=LOCAL_IP)
+    applied = load_schema_module().ensure_schema(
+        run_conditional_cql_query, node_id=LOCAL_IP)
     if applied:
         sys.stderr.write("Applied schema migrations: %s\n" % ", ".join(applied))
 

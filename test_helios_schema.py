@@ -256,5 +256,111 @@ class EnsureSchemaTests(unittest.TestCase):
         self.assertIn("must return (rc, stdout, stderr)", str(caught.exception))
 
 
+class BackfillStepTests(unittest.TestCase):
+    """A migration may carry a step that derives rows from rows that already exist.
+
+    `CREATE TABLE` is not enough for a constraint added to a cluster that is already
+    running: a table keyed by VLAN id constrains nothing until the VLANs already in use
+    are in it. That step has to read, so it cannot be a statement in a list, and it has to
+    be able to find something an operator must decide about -- which a migration running
+    at daemon start must never decide by itself.
+    """
+
+    def with_only(self, migration):
+        saved = schema.MIGRATIONS
+        schema.MIGRATIONS = [migration]
+        self.addCleanup(setattr, schema, "MIGRATIONS", saved)
+
+    def migration(self, backfill):
+        return {
+            "id": "9999-test",
+            "statements": ["CREATE TABLE IF NOT EXISTS hydra.scratch ( a int PRIMARY KEY );"],
+            "backfill": backfill,
+        }
+
+    def test_a_backfill_runs_and_what_it_finds_reaches_the_reporter(self):
+        seen = []
+
+        def backfill(execute, report, now_ms):
+            execute("SELECT JSON * FROM hydra.scratch;")
+            report("two networks carry VLAN 100")
+
+        self.with_only(self.migration(backfill))
+        db = FakeDatabase()
+        applied = schema.ensure_schema(db, node_id="10.0.0.1", now_ms=1, report=seen.append)
+        self.assertEqual(applied, ["9999-test"])
+        self.assertEqual(seen, ["two networks carry VLAN 100"])
+
+    def test_a_backfill_that_raises_leaves_the_migration_unrecorded(self):
+        # So the next daemon start repeats it, rather than recording a migration that did
+        # half its work. The statements before it are idempotent, which is what makes
+        # repeating them free.
+        def backfill(execute, report, now_ms):
+            raise schema.SchemaError("the network table could not be read")
+
+        self.with_only(self.migration(backfill))
+        db = FakeDatabase()
+        with self.assertRaises(schema.SchemaError):
+            schema.ensure_schema(db, node_id="10.0.0.1", now_ms=1)
+        self.assertFalse(
+            any("INSERT INTO hydra.schema_migrations" in s for s in db.statements),
+            "a migration whose backfill failed was recorded as applied")
+        self.assertTrue(any("DELETE FROM hydra.schema_lock" in s for s in db.statements),
+                        "a failed backfill left the cluster lock held")
+
+    def test_a_backfill_does_not_run_again_once_the_migration_is_recorded(self):
+        runs = []
+
+        def backfill(execute, report, now_ms):
+            runs.append(now_ms)
+
+        self.with_only(self.migration(backfill))
+        db = FakeDatabase()
+        schema.ensure_schema(db, node_id="10.0.0.1", now_ms=1)
+        schema.ensure_schema(db, node_id="10.0.0.1", now_ms=2)
+        self.assertEqual(runs, [1])
+
+    def test_a_backfill_changes_the_migration_checksum(self):
+        # Not to protect the backfill's body -- only its name is hashed -- but so that
+        # attaching one to a migration that has already shipped is refused rather than
+        # silently skipped on every cluster that already ran it.
+        plain = {"id": "x", "statements": ["CREATE TABLE a ( b int );"]}
+        with_step = dict(plain, backfill=lambda execute, report, now_ms: None)
+        self.assertNotEqual(schema.checksum(plain), schema.checksum(with_step))
+
+    # The checksums hydra.schema_migrations holds on the test cluster, read out of it on
+    # 2026-09-10. They are frozen: a migration that has been applied anywhere can never
+    # hash differently again, whatever else the runner grows. Changing how `checksum`
+    # works -- adding the backfill key was such a change -- must leave every one of these
+    # exactly as it is, or every daemon raises SchemaDivergence on its next start and the
+    # cluster does not come back.
+    RECORDED = {
+        "0001-baseline":
+            "f5ff9871b3f1c6ba1759a1ce7961d6525658f5935b9a5f9861268447443f36dd",
+        "0002-cluster-locks":
+            "4f9cc45f93b888ceacb9039c1e2ece3a9a63687c918c8a10375e134b80af192f",
+        "0003-bound-task-history":
+            "aec6f8441d6effd20286d9fb26ca1feb0bea216b31493140fba85f5e6bf0387a",
+        "0004-urbosa-transit-pool":
+            "7f7839db97e9b0d25e21d689ae01f242786f6222f341ef954841a71c0c48b9f4",
+        "0005-dfs-extent-store":
+            "fd24e4f0070710b275691f71a343656810ff24900874730ff60f84fd49bbc28d",
+        "0006-dfs-replication":
+            "54f4801fcf38b24c4a6b5dd00263c0d50ce41fe7d2868c449a7fa3457d7530cd",
+        "0007-dfs-snapshots":
+            "11beb5977ba67ac24da62f6a7eeaf846514c93458e53af8b4cc0cb1d20bda195",
+        "0008-container-compression":
+            "d9befd898db1e73fc2eaa71845afff85eaf4b5ddb51772e927315c6fcb3af2fd",
+    }
+
+    def test_every_migration_that_has_shipped_still_hashes_the_way_it_was_recorded(self):
+        by_id = {m["id"]: m for m in schema.MIGRATIONS}
+        for migration_id, recorded in self.RECORDED.items():
+            self.assertIn(migration_id, by_id, "a shipped migration was removed")
+            self.assertEqual(
+                schema.checksum(by_id[migration_id]), recorded,
+                f"{migration_id} no longer hashes to what every cluster recorded")
+
+
 if __name__ == "__main__":
     unittest.main()

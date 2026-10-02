@@ -130,8 +130,8 @@ Helios-HCI/
 | [HydraDB](./docs/hydra.md) | **Medusa** | Podman + ScyllaDB (Cassandra) | Distributed metadata database for cluster configurations, VM state, and networks. |
 | [Daruk](./docs/daruk.md) | **Medusa Proxy** | systemd + Python CQL Proxy | Persistent database query proxy shielding ScyllaDB from connection overhead. |
 | [Aether](./docs/aether.md) | **Stargate** | *removed* | The Linstor + DRBD storage engine, replaced by Sidon. Nothing in the tree speaks to it, and nothing on a node runs it: provisioning and the rollout stop the satellite and controller containers, unmount `/var/lib/linstor`, down every DRBD resource, unload the module and remove `kmod-drbd9x` and `drbd9x-utils`. Unforced at every step, so a resource something still has open leaves the module loaded and prints what to look at. Its document is kept as history. |
-| [Sidon](./docs/sidon.md) | **Stargate** | Native Rust systemd service | The storage data path, and the only one. Serves VM disks to qemu over NBD on a unix socket; a guest write lands in a per-vdisk journal, is replicated write-all to every replica, and is acknowledged after that — nothing on the path touches Hydra. A background drain coalesces the journal into immutable extent groups and commits the block map. Ownership is an `(owner, epoch)` compare-and-swap, and replicas refuse writes from a fenced-out epoch, which is what makes split-brain a rejected request rather than a corrupted disk. Adds no client-facing port. |
-| [Purah](./docs/sidon.md) | **Curator** | Background role inside Sidon | Re-replication after a node is lost — within seconds of a write failing, not on the next timer tick — plus mark-sweep reclamation with no reference counts anywhere, and a scrub of every sealed extent group against the hash taken when it was known good. |
+| [Sidon](./docs/sidon.md) | **Stargate** | Native Rust systemd service | The storage data path, and the only one. Serves VM disks to qemu over NBD on a unix socket; a guest write lands in a per-vdisk journal, is replicated write-all to every replica, and is acknowledged after that — nothing on the path touches Hydra. A background drain coalesces the journal into immutable extent groups and commits the block map. Ownership is an `(owner, epoch)` compare-and-swap, and replicas refuse writes from a fenced-out epoch, which is what makes split-brain a rejected request rather than a corrupted disk. A create takes its replica count from the cluster's redundancy factor, or from the container's `ftt` when it sets one — see [how many copies a vdisk gets](./docs/sidon.md#5-how-many-copies-a-vdisk-gets). Adds no client-facing port. |
+| [Purah](./docs/sidon.md) | **Curator** | Background role inside Sidon | Re-replication after a node is lost — within seconds of a write failing, not on the next timer tick — plus mark-sweep reclamation with no reference counts anywhere, and a scrub of every sealed extent group against the hash taken when it was known good. Restoring a replica that stopped answering is automatic; topping a vdisk up to a redundancy factor it never asked for is `valcli storage.replicate`, because that one is a bulk data copy and should be somebody's decision. |
 | [Ganon](./docs/dfs/ganon.md) | — | Rust test harness | Fault-injection harness. Writes self-describing stamped blocks, keeps an ack journal off the system under test, and asserts every read returned a *legal* value — the newest acknowledged generation, or one that was in flight when the world ended, and nothing else. Speaks to a block device and to an NBD socket through the same adapter trait, so a scenario never knows its substrate. Calibrated against DRBD before it was allowed to judge Sidon — which is how we learned DRBD serves corrupted bytes where Sidon returns EIO. |
 | [Spectrum](./docs/spectrum.md) | **Prism** | Podman + Python Web Server | Web UI console and REST API manager for monitoring, VM operations, and tasks. |
 | [Spectrum (Phoenix)](./docs/spectrum_phx.md) | **Prism** | Podman + Elixir/Phoenix LiveView | The console rewrite, running beside the Python tier on port 8444. **It now serves every page of the console** -- Slate routes the pages to it and everything else (the guest console and the whole HTTP API) to the Python tier, with one sign-in covering both. Its header carries the task ring ported from the Python console. Renders server-side and never touches the data path — its storage page reads Sidon through spark-daemon, and its image upload streams bytes to the host rather than opening a vdisk. Shipped by `deploy_updates.py`. |
@@ -248,6 +248,10 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
 # Deliberately not 'create' with one more address: create claims disks.
 cluster add-node --node 10.10.102.223
 
+# Move the ZooKeeper vote between members without changing cluster membership.
+# One reconfiguration, no restart, and refused outright if it would cost quorum.
+cluster zk-promote --node 10.10.102.43 --replacing 10.10.102.223
+
 # Query cluster-wide status (verbose includes per-node extent store and vdisk info)
 cluster status --verbose
 
@@ -260,7 +264,7 @@ cluster stop
 # Wipe cluster configurations, databases, and formats claimed drives
 cluster destroy
 ```
-For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md). For virtual networking, subnets, and VLAN management, see [network.md](./docs/network.md).
+For detailed creation workflows and HA failover policies, see [cluster.md](./docs/cluster.md). For who votes in the consensus ensemble, how that set is changed, and why the Quadlet rather than ZooKeeper's own dynamic config is the durable record of it, see [zookeeper.md](./docs/zookeeper.md#changing-which-nodes-vote). For virtual networking, subnets, and VLAN management, see [network.md](./docs/network.md).
 
 ---
 

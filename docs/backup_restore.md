@@ -42,7 +42,7 @@ metadata layer is the answer to "which bytes are which":
 | `hydra.vms` | Every VM: vCPU, memory, firmware, boot device, network, host assignment | **No** |
 | `hydra.vm_nvram` | Each UEFI guest's NVRAM variables — boot order, Secure Boot state | **No** |
 | `hydra.storage_containers` | Container name, tier, quota, FTT | **No** |
-| `hydra.gatoway_networks`, `hydra.urbosa_*` | VLANs, overlay segments, routers, firewall rules, transit /30 allocations | **No** |
+| `hydra.gatoway_networks`, `hydra.gatoway_vlan_claims`, `hydra.urbosa_*` | VLANs, the claim on each VLAN id, overlay segments, routers, firewall rules, transit /30 allocations | **No** |
 | `hydra.users` | Console logins and their password hashes | **No** |
 | `hydra.dfs_vdisks`, `hydra.dfs_block_map`, `hydra.dfs_egroups` | Every vdisk, its owner and epoch, and **which extent group holds which extent of it** | **No** |
 | `/etc/hci/cluster.json` | Node identities, redundancy factor, VIP, cluster name | **No** |

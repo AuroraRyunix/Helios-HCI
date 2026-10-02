@@ -39,6 +39,7 @@ def load_schema_module():
 def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_id, created_at):
     from spectrum_server import (
         run_cql_query,
+        run_conditional_cql_query,
         run_lwt,
         run_remote_spark,
         sidon_call,
@@ -63,8 +64,11 @@ def deploy_lanayru_worker(task_id, cluster_name, control_nodes, overlay_segment_
         
         log("Step 1: Creating persistent database schema in ScyllaDB (Hydra)...", "info")
         # The Lanayru tables are part of the cluster schema in helios_schema, not this
-        # script's to define. This applies whatever is outstanding.
-        load_schema_module().ensure_schema(run_cql_query)
+        # script's to define. This applies whatever is outstanding, through the unguarded
+        # executor: the cluster lock helios_schema takes is an IF NOT EXISTS insert, and
+        # `run_cql_query` refuses a conditional statement because it cannot report whether
+        # the condition held.
+        load_schema_module().ensure_schema(run_conditional_cql_query)
         time.sleep(1)
         log("ScyllaDB tables hydra.lanayru_clusters & hydra.lanayru_k8s_state are verified.", "success")
 

@@ -2845,7 +2845,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     "Volume=/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z\n"
                     "Volume=/var/lib/hci/zookeeper/data:/data:Z\n"
                     "Volume=/var/lib/hci/zookeeper/log:/datalog:Z\n"
-                    f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} ZOO_4LW_COMMANDS_WHITELIST=*\n\n"
+                    # reconfigEnabled from the first boot. See zookeeper_quadlet in
+                    # cluster_new.py for why it belongs on every member equally.
+                    f"Environment=ZOO_MY_ID={node_id}{zoo_servers_env}{peer_type_env} "
+                    f"ZOO_4LW_COMMANDS_WHITELIST=* ZOO_CFG_EXTRA=reconfigEnabled=true\n\n"
                     "[Install]\n"
                     "WantedBy=multi-user.target\n"
                 )
