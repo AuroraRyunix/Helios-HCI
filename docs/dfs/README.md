@@ -16,8 +16,13 @@ bytes copied, and no reference counting anywhere -- see D-18 and D-19 in
 Replication is mutually authenticated against the cluster CA -- see D-20 in
 [decisions.md](./decisions.md).
 
-Not built: scheduled snapshots and rollback, compression, erasure coding, and
-`vhost-user-blk`.
+Per-extent-group access data is recorded and ranked -- see D-22 in
+[decisions.md](./decisions.md) and [metadata.md](./metadata.md) section 8. It is the
+prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; the migration
+half is still not built, and nothing moves an extent group on the strength of the ranking.
+
+Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
+and rollback, compression, erasure coding, and `vhost-user-blk`.
 
 The documents remain the specification -- where code and document disagree, that is a bug
 in one of them and the disagreement is the finding.

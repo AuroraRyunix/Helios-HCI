@@ -3783,7 +3783,14 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     DFS_VDISK_OPS = ("create", "attach", "detach", "delete", "status", "flush",
                      "seal", "resize", "snapshot", "clone")
     DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
-                    "purah-sweep", "purah-scrub", "purah-heal")
+                    "purah-sweep", "purah-scrub", "purah-heal",
+                    # Ranks this node's extent groups by how hot they are. A node
+                    # operation and not a vdisk one: an extent group is shared between a
+                    # parent and every snapshot of it, so its temperature belongs to the
+                    # node that holds it rather than to any one disk that reads it -- and
+                    # putting it under the vdisk list would have it refused for the
+                    # missing vdisk id, which is the defect this split exists to prevent.
+                    "purah-heat")
     DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS
 
     def handle_dfs_vdisk(self):

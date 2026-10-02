@@ -129,6 +129,16 @@ The curator, running inside Sidon. Three jobs, all background, none on the guest
   the drain window, where bytes are durable but the map does not point at them yet.
 - **Scrub** — recompute every sealed group's hash against the one recorded at seal time.
   Needs no lock, because sealed means immutable.
+- **Access accounting** — tally how often each extent group is read and written, and flush
+  the totals to `hydra.dfs_egroup_access` on its own, much shorter timer. On a separate
+  thread from the sweep deliberately: a sweep stalled against an unreachable Hydra must not
+  also stop the counters, because the ranking they feed is what an operator reaches for when
+  they are trying to find out why a disk is busy.
+
+The counters are recorded on the data path and are therefore **approximate** — they live in
+the daemon between flushes, so a crash loses everything counted since the last one. They
+decide where a copy of data goes, never whether it exists; the boundary and its reasoning are
+in [dfs/metadata.md §8](./dfs/metadata.md) and D-22.
 
 ## 5. How many copies a vdisk gets
 
@@ -249,6 +259,20 @@ Per-node extent store usage, and every vdisk with its owner, epoch and replica c
 vdisk showing a short replica set is one node-loss from unavailable.
 
 ```bash
+valcli storage.heat        # or storage.heat 25 for a longer ranking
+```
+
+Per node: the hottest extent groups, the coldest ones, and how many have no access data at
+all. Read and write counts with the window they were counted over, so the score can be
+checked by hand rather than taken on trust. It flushes each node's in-memory tally before
+ranking, so what comes back describes the node now and not as of the last timer tick.
+
+Nothing here moves data. Spilling cold extent groups to slower disks is designed in
+[dfs/multi_disk.md](./dfs/multi_disk.md) and not built; this is the input that work was
+missing. `SIDON_ACCESS_FLUSH=0` turns the tally off entirely, counters included, in which
+case this command has nothing to rank and says so.
+
+```bash
 mcli health_checks storage
 ```
 
@@ -350,6 +374,17 @@ that predates the setting — behaves exactly as it did.
   enough to recover data and not the same as putting a VM back. Rolling a vdisk *back* to
   a snapshot in place needs the ownership and epoch story thought through, because it
   changes what an attached guest is reading underneath itself.
+- **Tiering.** The temperature data exists — `hydra.dfs_egroup_access`, ranked by
+  `valcli storage.heat` — and nothing acts on it. Placing an extent group on a disk because
+  it is hot, and migrating a cold one down, is the Purah job described in
+  [dfs/multi_disk.md](./dfs/multi_disk.md). Measuring first and moving later is the order on
+  purpose: a curator that began migrating data the moment it could measure temperature would
+  be acting on a ranking nobody had looked at.
+- **The extent ID map.** Helios has two map levels where Nutanix has three, so a clone shares
+  extent groups wholesale and cannot diverge one extent at a time. The schema and the staged
+  plan are D-23; migration id `0013-extent-id-map` is reserved and the table is deliberately
+  not created, because an empty table with a suggestive shape costs every later design a
+  paragraph establishing that it is not a source of truth.
 - **Erasure coding** as a Purah job over cold
   sealed groups. **Deduplication** is argued against in
   [decisions.md](./dfs/decisions.md): the win on VM disks is identical OS images, which

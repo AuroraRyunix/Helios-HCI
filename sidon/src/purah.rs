@@ -26,13 +26,15 @@
 //!   stale read.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
 use crate::extent::EgroupStore;
-use crate::meta::{cql_str, json_params, Daruk};
+use crate::heat::{heat_score, AccessLog, Counts};
+use crate::meta::{access_batches, cql_str, json_params, Daruk, ACCESS_BATCH};
 
 pub struct Purah {
     daruk: Daruk,
@@ -42,6 +44,14 @@ pub struct Purah {
     /// egroup_id -> when it was first seen unreferenced. Cleared the moment a group is
     /// seen referenced again, so a reused or re-referenced group starts its grace over.
     unreferenced_since: HashMap<String, Instant>,
+    /// The node's extent-group access tally, shared with every attached vdisk.
+    ///
+    /// Purah is both its writer and its reader: it flushes the in-memory counts to Hydra
+    /// and it is the pass that ranks them. That is the same arrangement the sweep already
+    /// has -- the curator is the only thing that reads the whole map -- and it keeps the
+    /// scoring formula in one place, which matters because a ranking that two components
+    /// computed differently would be two different answers to "is this hot".
+    access: Arc<AccessLog>,
 }
 
 #[derive(Debug, Default)]
@@ -78,14 +88,59 @@ pub struct ScrubReport {
     pub mismatched: Vec<String>,
 }
 
+/// What one heat pass found, for whoever is deciding where extent groups should live.
+#[derive(Debug, Default)]
+pub struct HeatReport {
+    /// Extent groups on this node, hottest first.
+    pub hot: Vec<Value>,
+    /// Extent groups on this node that have an access row, coldest first.
+    pub cold: Vec<Value>,
+    /// This node's extent groups with no access row at all.
+    ///
+    /// The coldest class there is, and kept separate from `cold` rather than folded in with
+    /// a score of zero, because the two mean different things. A group with a row and a low
+    /// score has been measured and found cold; a group with no row has not been measured --
+    /// nothing has read or written it since any daemon that holds a replica of it last
+    /// started, or the tally was at capacity when it was first touched. A tiering pass may
+    /// legitimately spill both, but an operator reading this needs to know which it is
+    /// looking at, and `dropped` is what distinguishes the two causes.
+    pub unobserved: Vec<String>,
+    /// How many there were before the list was truncated to the requested limit. A
+    /// truncated list that did not say so would read as "three extent groups have never
+    /// been touched" on a node where three thousand have, which is the difference between a
+    /// quiet corner of a disk and a node whose tally is not working.
+    pub unobserved_count: usize,
+    pub inventory: usize,
+    pub observed: usize,
+    pub tracked_in_memory: usize,
+    pub dropped: u64,
+}
+
+/// What one flush of the in-memory tally wrote.
+#[derive(Debug, Default)]
+pub struct AccessFlushReport {
+    pub rows: usize,
+    pub statements: usize,
+    pub since_ms: i64,
+    pub updated_at_ms: i64,
+    pub dropped: u64,
+}
+
 impl Purah {
-    pub fn new(daruk: Daruk, store: EgroupStore, node: &str, grace: Duration) -> Purah {
+    pub fn new(
+        daruk: Daruk,
+        store: EgroupStore,
+        node: &str,
+        grace: Duration,
+        access: Arc<AccessLog>,
+    ) -> Purah {
         Purah {
             daruk,
             store,
             node: node.to_string(),
             grace,
             unreferenced_since: HashMap::new(),
+            access,
         }
     }
 
@@ -236,7 +291,183 @@ impl Purah {
             "DELETE FROM hydra.dfs_egroups WHERE egroup_id = {}",
             cql_str(id)
         ))?;
+        // The access data is about this extent group, so it dies with it -- the whole
+        // partition, every node's row, because the group is gone everywhere and not only
+        // here. Last, after the row the group is actually described by, and best-effort:
+        // nothing reads these rows except the ranking pass, and a leftover one ranks a
+        // group that no inventory lists, which the pass ignores. Failing the reclaim over
+        // it would be letting a statistic block the reclamation of disk.
+        if let Err(e) = self.daruk.query(&format!(
+            "DELETE FROM hydra.dfs_egroup_access WHERE egroup_id = {}",
+            cql_str(id)
+        )) {
+            eprintln!("purah: access data for reclaimed extent group {id} could not be deleted: {e}");
+        }
+        self.access.forget(id);
         Ok(())
+    }
+
+    /// Write the in-memory access tally to Hydra.
+    ///
+    /// The whole reason the data path can afford to record anything: the counts accumulate
+    /// in this process and reach Hydra on a timer, so no read ever waits on a metadata
+    /// write. What that costs is exactness -- a crash loses everything counted since the
+    /// last flush and reopens the window -- and the trade is stated in
+    /// [heat.rs](./heat.rs) and in `docs/dfs/metadata.md`: this data decides *where* to put
+    /// a copy of bytes that are safe either way, so being wrong about it costs a misplaced
+    /// extent group and a later migration, never data.
+    ///
+    /// Absolute totals, so the write is idempotent and nothing is waiting on it. A flush
+    /// that fails is not retried here; the next tick carries the same numbers plus whatever
+    /// arrived since.
+    pub fn flush_access(&self, now_ms: i64) -> Result<AccessFlushReport> {
+        let sample = self.access.sample(now_ms);
+        let mut report = AccessFlushReport {
+            rows: sample.rows.len(),
+            statements: 0,
+            since_ms: sample.since_ms,
+            updated_at_ms: sample.until_ms,
+            dropped: sample.dropped,
+        };
+        if sample.rows.is_empty() {
+            return Ok(report);
+        }
+        let batches = access_batches(
+            &self.node,
+            sample.since_ms,
+            sample.until_ms,
+            &sample.rows,
+            ACCESS_BATCH,
+        );
+        report.statements = batches.len();
+        for batch in batches {
+            self.daruk.query(&batch)?;
+        }
+        Ok(report)
+    }
+
+    /// Every node's access rows, summed per extent group.
+    ///
+    /// Summed rather than read per node because an extent group is shared -- a golden
+    /// image's groups are read by every clone of it, on whichever node that clone is
+    /// attached -- so one node's view of a template is the view of however many clones
+    /// happen to live there. The window each node reports is its own, so the merged row
+    /// keeps the widest of them: a rate computed over the longest window any observer
+    /// measured is the conservative reading, and under-stating heat spills something busy
+    /// at worst to a slower disk, while over-stating it fills the fast one with cold data.
+    fn access_rows(&self) -> Result<HashMap<String, (Counts, i64, i64)>> {
+        let rows = self.daruk.query(
+            "SELECT egroup_id, reads, writes, bytes_read, bytes_written, last_read_ms, \
+             last_write_ms, since_ms, updated_at_ms FROM hydra.dfs_egroup_access",
+        )?;
+        let mut out: HashMap<String, (Counts, i64, i64)> = HashMap::new();
+        for row in rows {
+            let id = match row.get("egroup_id").and_then(Value::as_str) {
+                Some(v) => v.to_string(),
+                None => continue,
+            };
+            let num = |name: &str| row.get(name).and_then(Value::as_i64).unwrap_or(0);
+            let counts = Counts {
+                reads: num("reads").max(0) as u64,
+                writes: num("writes").max(0) as u64,
+                bytes_read: num("bytes_read").max(0) as u64,
+                bytes_written: num("bytes_written").max(0) as u64,
+                last_read_ms: num("last_read_ms"),
+                last_write_ms: num("last_write_ms"),
+            };
+            let since = num("since_ms");
+            let updated = num("updated_at_ms");
+            match out.get_mut(&id) {
+                Some((acc, acc_since, acc_updated)) => {
+                    acc.merge(&counts);
+                    *acc_since = (*acc_since).min(since);
+                    *acc_updated = (*acc_updated).max(updated);
+                }
+                None => {
+                    out.insert(id, (counts, since, updated));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rank this node's extent groups by how hot they are.
+    ///
+    /// The pass the access data exists for, and the one the tiering design in
+    /// `docs/dfs/multi_disk.md` is blocked on: placing extent groups by temperature needs
+    /// something that says which are hot, and until this there was nothing that did.
+    ///
+    /// **It only reports.** Nothing here moves, copies or deletes a byte, and that is
+    /// deliberate rather than unfinished -- migrating a sealed group between disks is a
+    /// copy, a map repoint and a delete, and the first thing that work needs is a ranking
+    /// an operator has looked at and agreed with. A curator that started moving data on the
+    /// strength of a statistic nobody had read yet is how a tiering pass becomes the reason
+    /// a node is busy.
+    ///
+    /// Scoped to this node's inventory, because placement is a node-local decision
+    /// (`multi_disk.md`, option 3): which disk a group sits on is not in Hydra and should
+    /// not be, so the node that holds a group is the only one that can act on its
+    /// temperature.
+    pub fn heat(&self, limit: usize, now_ms: i64) -> Result<HeatReport> {
+        let access = self.access_rows()?;
+        let inventory = self.my_egroups()?;
+        let mut report = HeatReport {
+            inventory: inventory.len(),
+            tracked_in_memory: self.access.tracked(),
+            ..HeatReport::default()
+        };
+        let mut scored: Vec<(f64, Value)> = Vec::new();
+        for (id, state, _created, size) in inventory {
+            // Copied out of the map before the match, so the arm that records an unobserved
+            // group may take ownership of `id`. Matching on `access.get(&id)` directly keeps
+            // the borrow of `id` alive for the whole match and forbids that.
+            let found = access.get(&id).copied();
+            let (counts, since, updated) = match found {
+                Some(v) => v,
+                None => {
+                    report.unobserved.push(id);
+                    continue;
+                }
+            };
+            let score = heat_score(&counts, since, updated, now_ms);
+            scored.push((
+                score,
+                json!({
+                    "egroup_id": id,
+                    "state": state,
+                    "size": size,
+                    "reads": counts.reads,
+                    "writes": counts.writes,
+                    "bytes_read": counts.bytes_read,
+                    "bytes_written": counts.bytes_written,
+                    "last_access_ms": counts.last_access_ms(),
+                    "idle_ms": now_ms.saturating_sub(counts.last_access_ms()).max(0),
+                    // The window the totals cover, so the score can be recomputed by hand
+                    // from the row. A ranking whose arithmetic cannot be checked is a
+                    // ranking an operator has to take on trust, and this one is going to
+                    // be used to argue for moving data.
+                    "window_ms": updated.saturating_sub(since).max(0),
+                    "heat": score,
+                }),
+            ));
+        }
+        report.observed = scored.len();
+        // Total order, and ties broken by id. A ranking that reordered equal entries
+        // between two calls would make "the coldest ten" a different ten each time it was
+        // read, which is not something to migrate data on.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1["egroup_id"].as_str().cmp(&b.1["egroup_id"].as_str()))
+        });
+        let limit = limit.max(1);
+        report.hot = scored.iter().take(limit).map(|(_, v)| v.clone()).collect();
+        report.cold = scored.iter().rev().take(limit).map(|(_, v)| v.clone()).collect();
+        report.unobserved_count = report.unobserved.len();
+        report.unobserved.sort();
+        report.unobserved.truncate(limit);
+        report.dropped = self.access.dropped();
+        Ok(report)
     }
 
     /// Recompute every sealed group's hash and compare it with the one recorded at seal
@@ -303,6 +534,39 @@ impl SweepReport {
     }
 }
 
+impl HeatReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "hot": self.hot,
+            "cold": self.cold,
+            "unobserved": self.unobserved,
+            "unobserved_count": self.unobserved_count,
+            "inventory": self.inventory,
+            "observed": self.observed,
+            "tracked_in_memory": self.tracked_in_memory,
+            // Non-zero means this node's tally hit its cap and some extent groups were
+            // never counted at all, so part of `unobserved` is a measurement gap rather
+            // than cold data. Reported beside the ranking because the ranking is wrong in a
+            // specific way when it is set, and silently wrong rankings are what get acted
+            // on.
+            "dropped": self.dropped,
+        })
+    }
+}
+
+impl AccessFlushReport {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "rows": self.rows,
+            "statements": self.statements,
+            "since_ms": self.since_ms,
+            "updated_at_ms": self.updated_at_ms,
+            "window_ms": self.updated_at_ms.saturating_sub(self.since_ms).max(0),
+            "dropped": self.dropped,
+        })
+    }
+}
+
 impl ScrubReport {
     pub fn to_json(&self) -> Value {
         json!({
@@ -312,5 +576,76 @@ impl ScrubReport {
             "mismatched": self.mismatched,
             "clean": self.missing.is_empty() && self.mismatched.is_empty(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A truncated list of never-touched extent groups still reports how many there were.
+    ///
+    /// The property, not the formatting: a node where three thousand extent groups have
+    /// never been read must not report the same thing as one where three have. The first is
+    /// a tally that is not working or a disk full of cold data worth spilling; the second is
+    /// a quiet corner. Only the count separates them once the list is cut to a limit.
+    #[test]
+    fn a_truncated_unobserved_list_still_says_how_many_there_were() {
+        let report = HeatReport {
+            unobserved: vec!["eg-a".into(), "eg-b".into()],
+            unobserved_count: 3_000,
+            inventory: 3_010,
+            observed: 10,
+            ..HeatReport::default()
+        };
+        let json = report.to_json();
+        assert_eq!(json["unobserved"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(json["unobserved_count"].as_u64(), Some(3_000));
+    }
+
+    /// A capped tally is reported beside the ranking it makes wrong.
+    ///
+    /// When `dropped` is non-zero the ranking describes part of the node, and part of
+    /// `unobserved` is a measurement gap rather than cold data. A report that carried the
+    /// ranking without the caveat would be acted on as though it were complete.
+    #[test]
+    fn the_ranking_carries_its_own_caveat() {
+        let report = HeatReport { dropped: 42, ..HeatReport::default() };
+        assert_eq!(report.to_json()["dropped"].as_u64(), Some(42));
+    }
+
+    /// The flush reports the window its totals cover, not just the totals.
+    ///
+    /// Without both ends of the window a total is uninterpretable: a hundred reads means
+    /// something different over a minute than over a week, and the two extent groups being
+    /// compared may have been known to the daemon for different lengths of time.
+    #[test]
+    fn a_flush_report_states_the_window_it_counted_over() {
+        let report = AccessFlushReport {
+            rows: 3,
+            statements: 1,
+            since_ms: 1_000,
+            updated_at_ms: 61_000,
+            dropped: 0,
+        };
+        let json = report.to_json();
+        assert_eq!(json["window_ms"].as_i64(), Some(60_000));
+        assert_eq!(json["rows"].as_u64(), Some(3));
+    }
+
+    /// A clock that went backwards reports a window of zero, never a negative one.
+    ///
+    /// NTP stepping a node's clock back between the window opening and a flush is the
+    /// ordinary way this happens, and a negative window divided into a total is a heat score
+    /// with the wrong sign -- which would sort the busiest extent group on the node to the
+    /// coldest end of the ranking.
+    #[test]
+    fn a_backwards_clock_cannot_make_a_negative_window() {
+        let report = AccessFlushReport {
+            since_ms: 10_000,
+            updated_at_ms: 5_000,
+            ..AccessFlushReport::default()
+        };
+        assert_eq!(report.to_json()["window_ms"].as_i64(), Some(0));
     }
 }

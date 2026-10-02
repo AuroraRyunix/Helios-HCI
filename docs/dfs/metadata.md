@@ -144,3 +144,101 @@ one addition: any migration touching `dfs_*` must state in its description which
 invariant from [invariants.md](./invariants.md) it serves or preserves. The checksum
 mechanism already refuses edited-after-shipping migrations; this extends the same
 discipline from "what changed" to "why it is allowed to".
+
+## 8. Per-extent-group access data
+
+`hydra.dfs_egroup_access` records how often each extent group is read and written and when
+it was last touched. It is the Helios counterpart of Nutanix's
+`medusa_extentgroupaccessdatamap`, and it exists for the same reason theirs does: tiering
+has to know what is hot, and a curator has to have something to rank its work by.
+
+```
+dfs_egroup_access
+  egroup_id text, node text,
+  reads bigint, writes bigint,
+  bytes_read bigint, bytes_written bigint,
+  last_read_ms bigint, last_write_ms bigint,
+  since_ms bigint, updated_at_ms bigint,
+  PRIMARY KEY ((egroup_id), node)
+```
+
+Four design points, each of which is a decision:
+
+- **Keyed per observer, `((egroup_id), node)`.** One row per node that saw the accesses,
+  which makes every row single-writer. The flush writes *absolute* totals rather than
+  increments, so a shared row would have each node clobber the others on every flush and
+  an extent group read on three nodes would read as the heat seen by whichever flushed
+  last. Reading one group's temperature stays a single-partition query, and the ranking
+  pass sums the rows. It is also the shape `dfs_egroup_replicas` already set for facts
+  about an extent group, per node.
+
+- **Absolute totals, never increments and never a counter column.** CQL counters are not
+  idempotent under retry — a timed-out write may be applied twice — and a read-modify-write
+  would put a Hydra read in front of a Hydra write for every flush. Writing the whole total
+  makes the flush idempotent, which is what lets it be fired and forgotten: a flush that is
+  lost changes nothing, and one applied twice changes nothing. This is the same objection
+  that forbids a refcount column (§1, D-8), applied to a statistic.
+
+- **`since_ms` makes the totals readable.** They are not lifetime counts. They count from
+  when the observing daemon opened its window, which is when it started. Heat is therefore
+  a *rate* over `updated_at_ms − since_ms`, which is what a tiering decision wants anyway,
+  and a restart resets the window visibly instead of silently losing counts.
+
+- **It holds no references.** Nothing in this table is a pointer to data, so Purah's mark
+  phase does not read it and nothing here can keep a dead extent group alive (I-7) or hide
+  a live one (I-3). A row whose extent group has been reclaimed is a stale label, not a
+  dangling pointer; the sweep deletes the partition when it deletes the group, and a
+  leftover row is ignored by the ranking pass because no inventory lists it.
+
+### What a crash loses
+
+**The counters are approximate, and that is the trade rather than a defect.** Sidon
+accumulates them in memory and a background thread flushes them to Hydra every 60 seconds
+by default (`SIDON_ACCESS_FLUSH`; `0` turns the whole tally off, counters included). A
+crash therefore loses every access counted since the last flush and reopens the window, so
+the surviving row under-states the group by up to one interval and the new window starts
+from zero.
+
+That is acceptable for a specific reason, and the reason is the boundary of what this data
+may ever be used for: **this data may decide where a copy of data goes, never whether it
+exists.** The bytes are safe either way, so being wrong about placement costs a misplaced
+extent group and a later migration, never a byte.
+The moment anything proposes using access data to decide whether a copy *exists* — a
+reclamation input, a replica count, an eviction — this paragraph is the one that says no,
+because an approximate counter cannot carry a durability decision.
+
+The same reasoning sets where recording happens. A read records the access after the bytes
+are in hand: a hash lookup and four integer adds under a mutex that is never held across a
+syscall. There is no metadata round trip on the read path, and there cannot be one — that
+is the inviolable rule from §5 in the direction nobody thinks to check it.
+
+Writes are counted on the drain, not on the guest's write. An extent group never sees a
+guest write at all; the write reaches the journal and is acknowledged there. So a group's
+write count is a count of drained extents landing in it, which is the honest meaning and
+also the useful one: it identifies the groups still being appended to, and those are
+exactly the ones a tiering pass must not move.
+
+### Reading it
+
+`purah-heat` on the control socket, `valcli storage.heat [N]` for an operator. It flushes
+and then ranks, so the answer describes the node now rather than as of the last tick, and
+it reports the window and the raw counters beside the score so the arithmetic can be
+redone by hand.
+
+The score is deliberately arithmetic rather than a tuned decay:
+
+```
+rate = accesses * 3_600_000 / window_ms
+heat = rate / (1 + idle_hours)
+```
+
+A ranking used to argue for moving data has to be answerable when it says something
+surprising, and "why does it think that is cold" must be answerable from the row.
+
+Groups with **no** row are reported separately from cold ones. A group with a row and a low
+score has been measured and found cold; a group with no row has not been measured. Both may
+be fair to spill, and only `dropped` — the number of extent groups whose first access
+arrived while the in-memory tally was at capacity — says which the operator is looking at.
+
+**Nothing moves data on the strength of this.** The migration half of tiering is designed in
+[multi_disk.md](./multi_disk.md) and not built; this is the input it was missing.

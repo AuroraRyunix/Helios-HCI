@@ -224,6 +224,21 @@ def peers(**kw):
     return call("peers", **kw)
 
 
+def heat(limit=20, **kw):
+    """Which extent groups on this node are hot, and which have gone cold.
+
+    The operator-facing half of the per-egroup access data. Sidon counts accesses in memory
+    and flushes them to `hydra.dfs_egroup_access` on a timer; this asks the daemon to flush
+    and then rank, so what comes back describes the node now rather than as of the last
+    tick.
+
+    It reports and nothing more. Moving an extent group between disks is a copy, a map
+    repoint and a delete, and the first thing that work needs is a ranking somebody has
+    looked at -- see docs/dfs/multi_disk.md.
+    """
+    return call("purah-heat", limit=limit, **kw)
+
+
 def list_attached(**kw):
     return call("list", **kw)
 

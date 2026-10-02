@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
 use crate::extent::{vdisk_hash, EgroupStore, OpenEgroup};
+use crate::heat::AccessLog;
 use crate::journal::{Journal, FLAG_COMMIT};
 use crate::meta::{
     block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_IMMUTABLE, CLASS_RW,
@@ -102,6 +103,13 @@ pub struct Vdisk {
     /// acknowledged write. Quorum buys availability during single-replica loss and costs
     /// exactly that proof.
     replicas: Vec<Arc<PeerClient>>,
+    /// Where accesses to extent groups are tallied, shared with every other vdisk on the
+    /// node and with the thread that flushes it.
+    ///
+    /// Node-wide rather than per-vdisk because an extent group is shared: a golden image's
+    /// groups are read by every clone of it, and a per-vdisk tally would have to be summed
+    /// at flush time anyway to say anything true about the group.
+    access: Arc<AccessLog>,
     /// Set when a drain fails after its bytes are durable. Reads stay correct (the
     /// overlay still holds the newest data), but the journal must not be truncated and
     /// the condition has to be visible rather than retried into silence.
@@ -112,6 +120,11 @@ pub struct VdiskConfig {
     pub root: PathBuf,
     pub node: String,
     pub high_water: u64,
+    /// The node's extent-group access tally. Carried in the config rather than passed
+    /// separately so that every path which opens a vdisk gets the same one -- a vdisk
+    /// opened with its own fresh tally would be invisible to the flusher, and the extents
+    /// it is busiest on would read as the coldest on the node.
+    pub access: Arc<AccessLog>,
 }
 
 impl Vdisk {
@@ -179,6 +192,7 @@ impl Vdisk {
             replicas,
             map_replicas,
             compress,
+            access: Arc::clone(&cfg.access),
             degraded: None,
             journal: Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?,
         };
@@ -294,6 +308,11 @@ impl Vdisk {
 
         let first = offset / self.extent_bytes;
         let last = (end - 1) / self.extent_bytes;
+        // One clock read per guest read, not one per extent. The timestamp is what makes a
+        // total readable as a rate and tells a tiering pass how long ago the last access
+        // was; a few hundred microseconds of skew across the extents of one read is far
+        // below the resolution any of that is used at.
+        let seen_at = now_ms();
         for idx in first..=last {
             let loc = match self.map.get(&idx) {
                 Some(l) => l.clone(),
@@ -323,6 +342,15 @@ impl Vdisk {
                     }
                 }
             };
+            // Counted here, after the bytes are in hand and before they are copied out, so
+            // a read that failed on every copy is not recorded as an access to a group
+            // nobody could read. A read served from a replica *is* one: the group was
+            // wanted on this node, which is exactly the fact a placement decision needs.
+            //
+            // Four integer adds under a mutex held across no syscall. That is the entire
+            // cost this adds to the read path, and it is the reason the tally is in memory
+            // rather than in Hydra.
+            self.access.record_read(&loc.egroup_id, extent.len() as u64, seen_at);
             let ext_start = idx * self.extent_bytes;
             let copy_start = offset.max(ext_start);
             let copy_end = end.min(ext_start + extent.len() as u64);
@@ -904,6 +932,12 @@ impl Vdisk {
             // survives a node loss, and draining it would *reduce* its durability. Data
             // that becomes less safe by being tidied up is not a tidy-up.
             self.replicate_extent(&eg_id, offset as u64, &framed)?;
+            // An append into this extent group, which is the only kind of write an extent
+            // group ever takes -- the guest's write reached the journal and was
+            // acknowledged there. So a group's write count is a count of drained extents
+            // landing in it, which is the number that identifies the groups a tiering pass
+            // must leave alone because they are still being appended to.
+            self.access.record_write(&eg_id, stored_len as u64, now_ms());
             // The stored length, not the logical one: a read seeks by this, and a
             // compressed extent is not the size the guest thinks it wrote.
             new_rows.push((idx, eg_id.clone(), offset, stored_len, self.vh));

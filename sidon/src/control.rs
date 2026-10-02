@@ -27,6 +27,7 @@ use crate::meta::{
     block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_FORMING, CLASS_IMMUTABLE,
     CLASS_RW, MAP_BATCH,
 };
+use crate::heat::AccessLog;
 use crate::nbd::{self, Export, LocalVdisk};
 use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
 use crate::extent::vdisk_hash;
@@ -55,6 +56,12 @@ pub struct DaemonConfig {
     /// meaning it, while `None` is a node that could not read its own configuration, and
     /// only the first of those is an instruction.
     pub cluster_ftt: Option<u64>,
+    /// How often the in-memory extent-group access tally is written to Hydra. Zero turns
+    /// the tally off entirely, counters and all.
+    pub access_flush: Duration,
+    /// How many extent groups the tally may track at once. A guard against unbounded
+    /// growth, not a policy -- see `heat.rs`.
+    pub access_capacity: usize,
 }
 
 struct Attached {
@@ -81,6 +88,11 @@ pub struct Daemon {
     fence_peers: HashMap<String, Arc<PeerClient>>,
     /// What this node stores on behalf of vdisks it does not own.
     replica_store: Arc<ReplicaStore>,
+    /// Where every attached vdisk tallies its extent-group accesses, and where the flusher
+    /// thread and the ranking pass read them from. One per node: an extent group is shared
+    /// between a parent and every snapshot of it, so its temperature is the sum of what
+    /// every vdisk on the node does to it.
+    access: Arc<AccessLog>,
 }
 
 /// How many copies a vdisk should be created with, given a fault tolerance and the number
@@ -115,6 +127,11 @@ impl Daemon {
         }
         let store = crate::extent::EgroupStore::open(
             crate::extent::discover_disks(&cfg.root), 0)?;
+        // Built before Purah and before any vdisk, because both hold a handle to it and
+        // there must be exactly one: a second tally would be a set of counters nothing
+        // flushes, and the extent groups counted into it would rank as the coldest on the
+        // node precisely because they are the busiest.
+        let access = Arc::new(AccessLog::new(cfg.access_capacity, crate::meta::now_ms()));
         let purah = Purah::new(
             Daruk::new(&cfg.daruk_addr, cfg.daruk_timeout),
             store,
@@ -124,6 +141,7 @@ impl Daemon {
             // SIDON_PURAH_GRACE=0 do something other than what it says, which is worse
             // than letting an operator who asked for no grace have none.
             cfg.purah_grace,
+            Arc::clone(&access),
         );
         let replica_store = Arc::new(ReplicaStore::new(&cfg.root)?);
         let mut peers = HashMap::new();
@@ -145,6 +163,7 @@ impl Daemon {
             peers,
             fence_peers,
             replica_store,
+            access,
         }))
     }
 
@@ -195,6 +214,7 @@ impl Daemon {
             root: self.cfg.root.clone(),
             node: self.cfg.node.clone(),
             high_water: self.cfg.high_water,
+            access: Arc::clone(&self.access),
         }
     }
 
@@ -298,6 +318,7 @@ impl Daemon {
             "purah-heal" => self.op_purah_heal(req),
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
+            "purah-heat" => self.op_purah_heat(req),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
         }
     }
@@ -1350,6 +1371,40 @@ impl Daemon {
         Ok(purah.scrub()?.to_json())
     }
 
+    /// The hottest and coldest extent groups this node holds.
+    ///
+    /// Flushes first, then ranks. Without that an operator who has just run a workload and
+    /// typed this would be shown the tally as of the last timer tick, concluded the busiest
+    /// extent groups on the node were cold, and been right about the table and wrong about
+    /// the disk. The flush is the cheap half -- one statement per fifty extent groups -- and
+    /// the read it precedes is a full scan either way.
+    ///
+    /// A flush that fails does not fail the pass: the ranking is still the best answer
+    /// available and saying nothing would be worse than saying something slightly stale.
+    /// The report carries `window_ms` per row so the staleness is visible rather than
+    /// implied.
+    fn op_purah_heat(&self, req: &Value) -> Result<Value> {
+        let limit = req
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 1000) as usize;
+        let purah = self.purah_state.lock().expect("purah mutex poisoned");
+        let now = now_ms();
+        let flushed = match purah.flush_access(now) {
+            Ok(r) => r.to_json(),
+            Err(e) => {
+                eprintln!("purah: heat flush before ranking failed: {e}");
+                json!({"error": e.to_string()})
+            }
+        };
+        let mut report = purah.heat(limit, now)?.to_json();
+        if let Some(map) = report.as_object_mut() {
+            map.insert("flushed".to_string(), flushed);
+        }
+        Ok(report)
+    }
+
     /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.
     pub fn start_purah(self: &Arc<Self>) {
         // Heal promptly when a write fails, not only on the timer.
@@ -1380,6 +1435,52 @@ impl Daemon {
                 }
             }
         });
+
+        // The heat tally, on its own timer.
+        //
+        // Separate from the sweep deliberately, and far more often. The sweep is minutes
+        // because reclaiming late costs disk and reclaiming early costs data; the tally is
+        // a statistic nobody waits on, and the only thing a long interval buys is a larger
+        // window of counts to lose in a crash. One statement per fifty extent groups per
+        // minute is not a load worth economising on.
+        //
+        // Its own thread rather than a step in the sweep loop for the same reason: a sweep
+        // that is slow or stalled against an unreachable Hydra must not also stop the
+        // counters reaching it, because the pass that ranks them is the one an operator
+        // runs when they are trying to find out why a disk is busy.
+        let flusher = Arc::clone(self);
+        let flush_every = flusher.cfg.access_flush;
+        if flush_every.is_zero() {
+            println!(
+                "sidon: extent-group access tally disabled (SIDON_ACCESS_FLUSH=0); \
+                 purah-heat will rank nothing and tiering has no input"
+            );
+        } else {
+            thread::spawn(move || loop {
+                thread::sleep(flush_every);
+                let purah = flusher.purah_state.lock().expect("purah mutex poisoned");
+                match purah.flush_access(now_ms()) {
+                    Ok(r) => {
+                        if r.dropped > 0 {
+                            // Said once per flush and not swallowed: a capped tally means
+                            // the ranking is describing part of the node, and a ranking that
+                            // silently describes part of a node is the one that gets acted
+                            // on.
+                            eprintln!(
+                                "purah: the extent-group access tally is at capacity; \
+                                 {} group(s) have gone uncounted",
+                                r.dropped
+                            );
+                        }
+                    }
+                    // Nothing waits on this. Hydra being unreachable costs a statistic, and
+                    // the next tick carries the same totals plus whatever arrived since --
+                    // the flush writes absolute values, so a missed one leaves no hole.
+                    Err(e) => eprintln!("purah: access tally flush failed: {e}"),
+                }
+                drop(purah);
+            });
+        }
 
         let me = Arc::clone(self);
         let interval = me.cfg.purah_interval;

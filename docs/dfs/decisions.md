@@ -204,3 +204,99 @@ the node was built. `SIDON_PEERS` still overrides, because tests need to name pe
 are in no cluster document. A single-host document binds loopback, since at ftt=0 there is
 nothing to replicate to and demanding certificates to serve traffic that will never arrive
 is a provisioning failure waiting to happen.
+
+**D-22 — access data is approximate, aggregated in memory, and about extent groups rather
+than part of them.** Tiering needs to know what is hot, and nothing recorded it:
+`multi_disk.md` could place an extent group by free space, which needs no history, and
+could not place one by temperature. `hydra.dfs_egroup_access` is the Nutanix
+`medusa_extentgroupaccessdatamap` analog, and three alternatives were rejected on the way
+to it.
+
+**Per-access metadata writes** — the straightforward version, where a read records itself.
+Rejected outright: it puts a metadata round trip on the read path, which is the one rule
+the whole design does not bend (metadata.md §5). The counters accumulate in this process
+and reach Hydra on a timer instead, which is why they are approximate: a crash loses
+everything counted since the last flush and reopens the window.
+
+**CQL counter columns** — what the data obviously is. Rejected because counters are not
+idempotent under retry, so a timed-out flush may be applied twice, and because a counter
+table cannot hold the non-counter columns the timestamps need. The flush writes *absolute*
+totals instead, which makes it safe to fire and forget: lost changes nothing, duplicated
+changes nothing. This is D-8's objection to distributed counters applied to a statistic,
+and it is the reason the rows are keyed `((egroup_id), node)` — absolute writes to a shared
+row would have each node clobber the others.
+
+**Storing it in the sealed footer, beside the checksum and the identity.** Rejected on the
+sealing invariant: a sealed extent group is immutable, which is what makes scrub lock-free
+and repair a checksum comparison (D-4), and access data changes constantly. The access data
+is *about* an extent group, not part of one — which is also what made this addable as a
+migration rather than a format change.
+
+What the trade commits to is a boundary, and it is worth stating because exceeding it is
+easy and quiet: **approximate counters may decide where a copy of data goes, never whether
+it exists.** Being wrong about placement costs a misplaced extent group and a later
+migration. Using the same numbers as a reclamation input, an eviction trigger or a replica
+decision would let a lost flush cost data, and that is refused.
+
+Reporting only. The pass ranks and prints; nothing migrates an extent group on the strength
+of a statistic nobody has read yet. A curator that started moving data the moment it could
+measure temperature is how a tiering feature becomes the reason a node is busy.
+
+**D-23 — the extent ID map is designed and reserved, not built.** Helios has two levels
+where Nutanix has three: `dfs_block_map` points `(vdisk, extent_index)` straight at an
+extent group, where their `medusa_vdiskblockmap` points at an *extent* and
+`medusa_extentidmap` then points that extent at a group. The missing middle level is what
+makes an extent an addressable thing several vdisks can reference by name, which is the
+precondition for extent-granular clone divergence and the only thing that makes
+deduplication expressible at all.
+
+The schema is written down below and migration id `0013-extent-id-map` is **reserved for
+it**. The table is deliberately *not* created yet, and that is the decision rather than an
+omission: `multi_disk.md` already records what an empty table with a suggestive shape costs
+— `dfs_egroup_replicas` sat in the schema with nothing writing to it, and every later
+design had to begin by establishing that it was not a source of truth. One of those is
+enough.
+
+```
+dfs_extent_id_map
+  extent_id text PRIMARY KEY,     -- content- or birth-derived; see below
+  egroup_id text, egroup_offset int, length int,
+  vdisk_hash bigint,              -- the identity the footer was stamped with (D-18)
+  created_at_ms bigint
+```
+
+and `dfs_block_map` grows one nullable column, `extent_id text`. **Null means the two-level
+path**, so every vdisk that exists today keeps resolving reads exactly as it does now,
+byte for byte, indefinitely. This is not a migration that rewrites the block map, and it
+must never become one.
+
+Two things make this larger than it looks, and they are the reason it is not being landed
+on the strength of a flag.
+
+*Purah's mark phase reads `egroup_id` off the block map.* With the indirection live, a
+vdisk's rows name extents rather than groups, and a sweep that still marked from
+`egroup_id` would see every one of those groups as unreferenced — and the two-scan grace
+would delay the deletion of live data by ten minutes rather than prevent it. Marking has to
+traverse both levels before the first row can carry an extent id, and that ordering is the
+whole hazard: the flag protects the read path and does nothing for the curator, which runs
+on a timer whether anyone opted in or not.
+
+*Every path that copies or repoints a map row has to understand both shapes* —
+`derive_child`, the drain's commit, resize, delete, and the heal's replica accounting. A
+flag that covered the read path and missed one of those is precisely the half-migrated read
+path this entry exists to avoid.
+
+So the plan, in the order it has to happen: teach Purah to mark through both levels and
+soak that against a cluster where no row has an extent id (a no-op change, fully testable
+before anything depends on it); then the migration and a resolver that treats a null
+`extent_id` as today's path; then writing extent ids behind a per-container opt-in, never a
+cluster switch; then clone divergence, which is the first thing that *gains* anything.
+
+**Dedup is not being built, and the reason is not difficulty.** On top of the extent id map
+it needs a content hash as the extent id, a by-hash index to find candidates, and — this is
+the part that decides it — some way to know when the last reference to a shared extent goes
+away. D-8 forbids reference counts, so that answer has to be mark-sweep across every
+generation, which is what Purah already does for extent groups and would now have to do at
+1 MiB granularity instead of 4 MiB. Against that cost, the win on VM disks is identical OS
+images, which clone-from-image already gets for free as a map copy sharing every extent
+with its parent (D-19). Dedup would be buying back something never spent.
