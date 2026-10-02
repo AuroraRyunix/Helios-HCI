@@ -349,6 +349,15 @@ defmodule SpectrumPhx.Spark do
     "/api/v1/dfs/write?vdisk=" <> URI.encode_www_form(vdisk_id)
   end
 
+  @doc """
+  The path that streams an upgrade package onto the node it is posted to.
+
+  There is no parameter at all, which is the same guard as `vdisk_write_path/1` taken one
+  step further: the daemon writes one fixed staging path, so a caller cannot name a file
+  and a compromised console cannot use this to place bytes anywhere else on a hypervisor.
+  """
+  def package_write_path, do: "/api/v1/lcm/package"
+
   @doc false
   def post_json(ip, path, payload, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 30)

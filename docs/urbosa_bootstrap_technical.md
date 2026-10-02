@@ -22,6 +22,29 @@ mindmap
       Daruk ScyllaDB proxy Port 9043 calls
 ```
 
+## How it is invoked
+
+Both modes are [Catalyst](./catalyst.md) `dagur`/`execute` tasks — `urbosa_bootstrap` and
+`urbosa_cleanup` — submitted by the console when an operator changes `urbosa_enabled`.
+Dagur runs the command on the ZooKeeper leader through its spark-daemon and reports the
+exit code back, so a bootstrap that fails part way through the hosts is a `failed` row
+carrying this script's own output rather than a request that returned success.
+
+Two things about the console side matter here, because this script is what they are
+protecting:
+
+* **The setting and the work are one act.** The row is written, the task submitted, and the
+  row **put back** if the submission failed. A `urbosa_enabled = true` with no bootstrap
+  behind it is a cluster that believes it has an overlay and has not got one — and
+  Lanayru's pre-flight, the SDN page and every Kubernetes deploy read that row.
+* **Cleanup is confirmed separately from bootstrap, and looks different.** It removes
+  namespaces, bridges and VXLAN interfaces from every host while whatever is routing over
+  them still is, so the console refuses it outright while a Kubernetes cluster is live and
+  names that cluster in the refusal.
+
+Run by hand, `python3 /usr/local/bin/urbosa-bootstrap [--cleanup]` behaves identically; the
+task is how the console reaches it, not a mode of its own.
+
 ## Function & Logic Breakdown
 
 ### Cleanup Mode Sequence (`--cleanup` argument)

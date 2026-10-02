@@ -226,10 +226,21 @@ def init_db_schema():
         print(f"[Catalyst] Applied schema migrations: {', '.join(applied)}")
 
 # In-Memory Event Queues & Completion Sync
+#
+# One entry per worker that long-polls /api/v1/queues/<name> on this node while it holds
+# ZooKeeper leadership. A name with no worker behind it is worse than a missing name: the
+# submission succeeds, a row is written, and the task sits `pending` forever, which reads
+# as "slow" rather than "nothing is going to happen". `spark` is exactly that today --
+# nothing drains it -- and it is left in place only because removing a queue is a change
+# to what a submission means, which belongs with whatever finally claims the name.
+#
+# `lanayru` is drained by the console backend rather than by a daemon of its own, because
+# `lanayru.py` is a module that tier imports and the deploy needs everything it imports.
 queues = {
     "vali": queue.Queue(),
     "dagur": queue.Queue(),
-    "spark": queue.Queue()
+    "spark": queue.Queue(),
+    "lanayru": queue.Queue()
 }
 
 task_events = {}

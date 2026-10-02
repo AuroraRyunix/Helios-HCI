@@ -27,6 +27,11 @@ mindmap
       verify_node_storage_health
       Asks sidon for capacity and its vdisk list
       Refuses a node whose store is unmounted, full, or holding a degraded vdisk
+    Console Entry Points
+      main(argv) - no arguments is the daemon
+      --load-package validates, distributes, records the job
+      --start-upgrade marks STARTING and watches to a verdict
+      Progress reported to CATALYST_TASK_ID when run as a task
 ```
 
 ## Function & Logic Breakdown
@@ -84,6 +89,37 @@ mindmap
   10. Clears maintenance mode (`action="leave"`).
   11. Transitions database job state to `COMPLETED` when all nodes finish.
 
-### `main()` Loop
-- Every 2 seconds, if it is the leader, queries `hydra.hylia_jobs`.
-- If an active job is `PENDING`, starts the upgrade thread. If a job is `UPGRADING` and matches its node execution scope, resumes the execution thread (handles standby coordinator resume).
+### `hylia_loop()`
+- Every 5 seconds, if it is the leader, queries `hydra.hylia_jobs`.
+- If an active job is `STARTING`, starts the upgrade thread. If a job is `UPGRADING` and matches its node execution scope, resumes the execution thread (handles standby coordinator resume).
+
+### `call_catalyst_api(path, payload=None, method="GET", address=None)` / `report_task_progress(...)`
+- Mutual-TLS client for Catalyst on port 9091, with the same certificate material every
+  other inter-node call uses. `get_catalyst_target_ip()` addresses the leader by its own
+  IP rather than by loopback, because loopback is in no node's `subjectAltName` and the
+  leader is usually this node.
+- `report_task_progress` is a **no-op without `CATALYST_TASK_ID`** in the environment: run
+  by hand there is no task to report against, and inventing one puts a row in the console's
+  task log that no operator asked for. A failed report is swallowed — the exit code is the
+  verdict that matters, and losing a progress tick must not fail an upgrade.
+
+### `distribute_package(zip_path)`
+- Copies a validated archive to every other node in base64 chunks over spark, then re-runs
+  `validate_and_extract_zip` on the far side so a node never trusts an archive it has not
+  checked itself.
+- Moved here from `spectrum_server.py`, which had it only because that is where the upload
+  landed; every line of it was already hylia's. A node that cannot be reached is collected
+  and the rest continue — stopping at the first would leave the cluster worse off than
+  finishing — and the list of failures is what makes `--load-package` exit non-zero.
+
+### `load_package(zip_path)` / `start_upgrade(job_id)` / `main(argv)`
+- The two Catalyst entry points and the argument dispatch. See
+  [hylia.md](./hylia.md#the-two-console-entry-points) for what each guarantees and why.
+- `main(argv)` with no arguments is `hylia_loop()`, unchanged: that is what
+  `hylia.service` runs. An unknown option exits 2 rather than falling through to the
+  daemon, so a typo in a task's command cannot start a second upgrade daemon on the leader.
+
+### `upgrade_percent(job)`
+- Whole nodes finished, as a percentage of the target list. A `current_node` outside that
+  list contributes nothing: "we do not know where it is" and "it has just begun" are
+  different states, and only one of them should be drawn as a bar that is about to move.

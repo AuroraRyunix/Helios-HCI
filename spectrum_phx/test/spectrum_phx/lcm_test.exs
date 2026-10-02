@@ -33,7 +33,9 @@ defmodule SpectrumPhx.LcmTest do
 
     test "the phase within a node only moves that node's share of the bar" do
       base = Lcm.progress("UPGRADING", @nodes, "10.0.0.2", [])
-      restoring = Lcm.progress("UPGRADING", @nodes, "10.0.0.2", [log("10.0.0.2 restore complete")])
+
+      restoring =
+        Lcm.progress("UPGRADING", @nodes, "10.0.0.2", [log("10.0.0.2 restore complete")])
 
       assert restoring > base
       # One node owns a third of the bar, so the guess can never reach the next node's
@@ -106,7 +108,9 @@ defmodule SpectrumPhx.LcmTest do
     defp inventory_row(nodes, extra \\ %{}) do
       blob =
         nodes
-        |> Map.new(fn {host, versions} -> {host, %{"ip" => "10.0.0.1", "versions" => versions}} end)
+        |> Map.new(fn {host, versions} ->
+          {host, %{"ip" => "10.0.0.1", "versions" => versions}}
+        end)
         |> Map.merge(extra)
 
       [%{"key" => "latest", "inventory_json" => Jason.encode!(blob)}]

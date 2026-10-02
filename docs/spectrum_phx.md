@@ -384,38 +384,102 @@ Two things are this tier's own:
   rather than "the write did not happen". `apply_lwt/3` is now written in terms of it.
 * The `net_id` is minted here rather than by the database's `uuid()`. It is the claim's
   holder token, so this side has to know it before the row it will name exists.
+## 7e. The five long controls
+
+Five controls were held back during the port and are now wired, each as a Catalyst task.
+They were held back for one reason: each is long, cluster-wide and able to fail, and a
+button that returns instantly leaves an operator with nothing to watch and nothing to read
+when it goes wrong. What makes them safe to offer is not the button — it is that the work
+runs where a worker can report on it.
+
+Everything here goes through one submission path, `SpectrumPhx.Catalyst`. It posts to
+`POST /api/v1/tasks/submit` on the ZooKeeper leader over mutual TLS, because Catalyst's
+queues are `queue.Queue` objects *inside that process*: the `hydra.catalyst_tasks` row it
+also writes is the record, not the queue, so a console that wrote the row itself would
+produce a task that is listed, never runs, and never fails.
+
+| Control | Service | What actually runs, and where |
+|---|---|---|
+| Build the overlay | `dagur` | `urbosa-bootstrap` on the leader |
+| Tear the overlay down | `dagur` | `urbosa-bootstrap --cleanup` on the leader |
+| Load an upgrade package | `dagur` | `hylia --load-package /tmp/helios_update.zip` on the leader |
+| Start a rolling upgrade | `dagur` | `hylia --start-upgrade <job-id>` on the leader |
+| Deploy / destroy Kubernetes | `lanayru` | `lanayru.py`'s workers, in the console backend on the leader |
+
+A service name **is** a queue, and a queue only moves if a daemon is long-polling it on the
+leader. Submitting to a name nothing drains writes a row, returns a task id, and then
+nothing happens — which on the task ring is indistinguishable from slow.
+`SpectrumPhx.Catalyst.services/0` is the list that is actually consumed and `submit/3`
+refuses the rest; `test_console_tasks.py` asserts that list against `catalyst.py`'s queue
+dict and against the daemons that poll them, so the three files stay one statement.
+
+**Kubernetes has its own queue rather than a command.** `lanayru.py`'s two workers import
+`run_cql_query`, `run_lwt`, `sidon_call`, `get_cluster_nodes` and the log buffer from
+`spectrum_server.py`, so they cannot be a host CLI without moving all of that first. The
+console backend drains `lanayru` under `supervise()` while it holds ZooKeeper leadership,
+and hands each worker **Catalyst's** task id — the workers already write their own progress
+by that key, so the submitted row and the progress rows are the same row.
+
+**The upgrade task is not the upgrade.** `hylia --start-upgrade` marks the job `STARTING`
+and then watches it; the rolling upgrade is still run by the hylia daemon on the leader,
+with its resume-after-reboot behaviour untouched. What the task adds is a row whose
+lifetime is the upgrade's lifetime, ending in its verdict. It reports real progress —
+nodes finished — through `CATALYST_TASK_ID`, which dagur puts in the command's
+environment.
+
+**Two of them confirm, and the confirmations are not alike.** Tearing the overlay down
+removes namespaces, bridges and VXLAN interfaces from every host while whatever is routing
+over them still is, so its confirmation is in error colours and names the hosts and the
+Kubernetes cluster that would lose its network; building it is the same control in
+information colours. Destroying Kubernetes asks for the cluster's name to be typed back —
+a second click is a reflex. None of this is `data-confirm` or `window.confirm`: those live
+entirely in the browser, so they guard nothing that does not arrive through the browser and
+cannot be tested.
+
+**Refusals happen before the submission, and they say why.** A second Kubernetes cluster
+would overwrite the row describing the first; a deploy onto a disabled overlay produces a
+cluster whose pods cannot reach each other; an upgrade with no package loaded has nothing
+to install. Each of those is otherwise discovered minutes in, on real hosts.
+
+**A failed submission is returned, not logged.** `/api/settings/update` wrote the
+`urbosa_enabled` row, tried to submit the bootstrap, printed the failure to a log nobody
+tails and answered `200` — leaving a cluster that believes it has an overlay and has not
+got one, which Lanayru's pre-flight, the SDN page and every deploy then read.
+`Settings.set_urbosa_enabled/2` puts the row back and reports the failure on the panel.
+
+**The package upload streams, like the image upload.**
+`SpectrumPhx.Lcm.PackageUploadWriter` pushes each chunk onto an open request to the
+*leader's* spark-daemon at `POST /api/v1/lcm/package` — the leader specifically, because
+that is where the loader will run and where it reads a fixed path. The daemon writes
+`/tmp/helios_update.zip.part` and renames it, so a transfer that dies half way leaves
+nothing where the loader looks; a truncated archive there fails validation as "not a zip
+file", which sends an operator looking at the package rather than at the transfer. Nothing
+is staged in this tier. Staging is also not installing: the Catalyst task that validates
+the archive, checks the signature over its manifest and copies it to every node is
+submitted when the operator presses upload, not when the bytes arrive.
 
 ## 8. What is not done yet
 
-No pages are left on the Python tier. What is still there: the whole HTTP API, the guest
-console (`/vnc_auto.html`), and Spectrum's own static assets.
+No pages are left on the Python tier, and no controls. What is still there: the whole HTTP
+API, the guest console (`/vnc_auto.html`), and Spectrum's own static assets.
 
-Three *controls* are deliberately not offered on the rebuilt pages, and each says so on
-the page rather than presenting a button that is not wired:
+The Python tier's `/api/lanayru/deploy` and `/api/lanayru/destroy` still spawn a thread on
+whichever node served the request rather than submitting to the queue. They are the old
+console's path and are left alone; they are also the reason the queue worker takes
+Catalyst's task id rather than minting one, since the two paths write the same table.
 
-* **starting an upgrade** and **uploading a package** (LCM) -- one rolls every node
-  through maintenance and a reboot, the other accepts a signed archive the cluster then
-  installs;
-* **deploying and destroying** a Kubernetes cluster (Lanayru);
-* **toggling `urbosa_enabled`** (Settings) -- it bootstraps or tears down namespaces,
-  bridges and VXLAN interfaces on every host.
+`hylia.py` and `lanayru.py` are still imported as Python modules by Spectrum and have no
+Elixir counterpart. That no longer blocks a page — both are reached through Catalyst now —
+but it is what a full removal of the Python tier still has to answer.
 
-All five are long, cluster-wide and failure-prone, and they belong behind Catalyst tasks
-where the header ring reports their progress -- not behind a request that returns
-instantly and leaves the work happening somewhere. They remain on the previous console
-until they run as tasks.
-
-`hylia.py` and `lanayru.py` are imported as Python modules by Spectrum and have no Elixir
-counterpart, so the routes that use them cannot move until they are reimplemented, shelled
-out to, or kept behind a port.
-
-Three things disappear when the last page moves: the `:legacy` half of the navigation
+Three things disappear when the Python tier goes: the `:legacy` half of the navigation
 table, the `phoenix-ui` router in `slate_config/dynamic.yml` (the catch-all can point here
 instead), and the shared `session_id` cookie in section 4.
 
-Upload does not write a `catalyst_tasks` row, unlike the Python endpoint. LiveView reports
-progress on the page itself, which is better for the operator watching it happen; the cost
-is that an upload is not visible from `/tasks`.
+Image upload does not write a `catalyst_tasks` row, unlike the Python endpoint and unlike
+the package upload's loader task. LiveView reports its progress on the page itself, which
+is better for the operator watching it happen; the cost is that an image upload is not
+visible from `/tasks`.
 
 ## 9. See also
 

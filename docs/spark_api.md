@@ -85,6 +85,7 @@ temp file and calls `virsh define` on that path.
 | GET | `/api/v1/storage/container/mounted` | `?path=` | `{"mounted":bool}` |
 | POST | `/api/v1/storage/container/ensure` | `{"name"}` | `{"path":str,"created":bool}` |
 | POST | `/api/v1/host/fence` | `{"confirm":true}` | 200 with a verification report, or 409 |
+| POST | `/api/v1/lcm/package` | **raw body** (no parameters) | `{"path":str,"written":int}` |
 
 `path` must resolve under `/var/lib/hci/aether/`, `/var/lib/hci/sidon/` or
 `/var/lib/hci/images/`. `owner` is an allowlist (`root:qemu`, `root:root`), `mode` an
@@ -136,6 +137,23 @@ asynchronous, so the delete also has to be retried; see
 `/api/v1/dfs/write` is the same idea as `/storage/device/write` and a smaller thing to
 trust: the device form takes a path and checks it against an allow-list, while this one
 takes a *vdisk name* and derives the socket itself, so a caller cannot name a file at all.
+
+`/api/v1/lcm/package` takes that one step further and has **no parameters at all**. It
+streams the body into one fixed staging path, `/tmp/helios_update.zip`, which is what
+`hylia --load-package` reads; with nothing in the request to point elsewhere, a compromised
+console cannot use it to place bytes anywhere on a hypervisor. It exists for the same
+reason the vdisk write does: the console tier receives the operator's upload and must not
+hold it — it is a container whose disk exists for an application, not for an archive that
+may be hundreds of megabytes — so it proxies the bytes to the daemon that is native to the
+host and that the loader runs on. That has to be the **ZooKeeper leader**, because that is
+where the Catalyst task dispatches.
+
+The body is written to `<path>.part` and renamed at the end, so a request that dies half
+way leaves nothing at the path the loader looks in. A truncated archive there does fail
+validation — as "not a zip file", which sends an operator looking at the package rather
+than at the transfer. A short body is reported with what arrived and what was promised, for
+the same reason the vdisk write is: the caller knows what it sent and is the only one that
+can tell a truncated upload from a client that hung up.
 
 `host/fence` asks a host to take itself out of service and **reads back what it produced**:
 no guest process, no vdisk still attached. It returns that report

@@ -34,12 +34,23 @@ mindmap
 ### `insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, output)`
 - Formats and inserts job run stats into ScyllaDB table `hydra.dagur_runs`. Escapes single quotes and backslashes in task outputs to prevent CQL execution syntax errors.
 
-### `execute_dagur_job_thread(task_id, job_name, command)`
+### `run_remote_spark(ip, command, timeout=DEFAULT_JOB_TIMEOUT)`
+- Sends the command and its time limit to spark-daemon. The limit is passed rather than
+  omitted: spark-daemon defaults an absent `timeout` to 45 seconds and kills the command
+  there, which silently capped every scheduled job.
+- The urllib read timeout is the command's budget plus a margin, so the socket outlives the
+  command it is waiting for and a job that runs to its limit is reported as its own exit
+  code rather than as a transport failure.
+
+### `execute_dagur_job_thread(task_id, job_name, command, timeout, reports_progress)`
 - Coordinates executing a scheduled task:
   1. Generates a unique execution `run_id`.
   2. Inserts a `RUNNING` status record into `hydra.dagur_runs`.
-  3. Spawns `ticker_thread` to periodically increment task progress (5% -> 95%) in Catalyst.
-  4. Runs the actual scheduled command via `run_remote_spark` targeting localhost `127.0.0.1`.
+  3. Spawns `ticker_thread` to periodically increment task progress (5% -> 95%) in Catalyst
+     — **unless** `reports_progress` is set, in which case the command owns that column and
+     the ticker would overwrite real progress with its guess.
+  4. Runs the scheduled command via `run_remote_spark` targeting localhost `127.0.0.1`,
+     prefixed with `CATALYST_TASK_ID=<task_id>` so the command can address its own task.
   5. Joins `ticker_thread` and sends the final `completed` (or `failed`) update to Catalyst with `100` progress.
   6. Updates the final execution record in `hydra.dagur_runs` with start/end time stamps and logs.
 

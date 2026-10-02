@@ -760,17 +760,48 @@ to is still carrying those; what changed is that no page points at the Python ti
 * **The guest console** (`/vnc_auto.html`). Needs the WebAssembly/SPICE work below.
 * **The whole HTTP API.** Nothing in the console calls it any more, but `mcli`, `valcli`
   and the deployment tooling do.
-* **Five controls**, deliberately not wired to buttons in the rebuilt pages, each of which
-  says so where the button would be:
-  * starting an upgrade and uploading a package (LCM);
-  * deploying and destroying a Kubernetes cluster (Lanayru);
-  * toggling `urbosa_enabled` (Settings), which bootstraps or tears down namespaces,
-    bridges and VXLAN interfaces on every host.
 
-  All five are long, cluster-wide and failure-prone. They belong behind Catalyst tasks,
-  where the header's task ring reports their progress and a failure is visible -- not
-  behind a request that returns instantly and leaves the work happening somewhere. That is
-  the remaining work on this migration.
+* ~~**Five controls**, deliberately not wired to buttons in the rebuilt pages.~~
+  **Resolved (2026-09-10): all five are Catalyst tasks.** Starting an upgrade and loading a
+  package (LCM), deploying and destroying Kubernetes (Lanayru), and building or tearing
+  down the overlay (Settings) are wired, and each runs where a worker can report on it.
+
+  Submission is one path, `SpectrumPhx.Catalyst`, posting to the ZooKeeper leader over
+  mutual TLS -- Catalyst's queues are `queue.Queue` objects inside that process, so a
+  console that wrote the `catalyst_tasks` row itself would produce a task that is listed,
+  never runs and never fails. The three files that have to agree on which queues exist and
+  which are drained (`catalyst.py`, the daemons that poll them, and the console's service
+  list) are asserted against each other by `test_console_tasks.py`.
+
+  Four of them are `dagur`/`execute` -- a command on the leader, its exit code the verdict:
+  `urbosa-bootstrap`, `urbosa-bootstrap --cleanup`, `hylia --load-package` and
+  `hylia --start-upgrade`. Kubernetes has its own `lanayru` queue drained by the console
+  backend under `supervise()`, because `lanayru.py`'s workers import half of
+  `spectrum_server.py` and cannot be a host CLI without moving all of it first.
+
+  Three things this turned up on the way:
+
+  * `dagur` sent spark-daemon no `timeout`, and an absent `timeout` is not "no limit" --
+    the daemon applies 45 seconds and kills the command. Every scheduled job the cluster
+    has ever run was capped there, and one that exceeded it was recorded FAILED with a
+    timeout from a daemon the caller never mentioned. The limit now travels with the task.
+  * `Settings.read_only` was merged over a seed that did not contain `urbosa_enabled`, and
+    the reduce only accepts a key the seed already has -- so the settings page reported the
+    overlay as disabled on every render, whatever the row said.
+  * `/api/settings/update` wrote the `urbosa_enabled` row, tried to submit the bootstrap,
+    printed the failure to a log and answered 200. `set_urbosa_enabled/2` puts the row back
+    and reports the failure, because a row saying the overlay is up with no bootstrap
+    behind it is what Lanayru's pre-flight and every deploy then read.
+
+  Documented in [docs/spectrum_phx.md](docs/spectrum_phx.md) §7e, with the per-component
+  halves in [docs/catalyst.md](docs/catalyst.md), [docs/dagur.md](docs/dagur.md),
+  [docs/hylia.md](docs/hylia.md), [docs/lanayru.md](docs/lanayru.md) and
+  [docs/spark_api.md](docs/spark_api.md).
+
+  **Left alone:** the Python tier's `/api/lanayru/deploy` and `/api/lanayru/destroy` still
+  spawn a thread on whichever node served the request. They are the old console's path, and
+  they are why the queue worker reuses Catalyst's task id rather than minting one -- the
+  two paths write the same table.
 
 **A VLAN id now has a uniqueness constraint (2026-09-10).** `hydra.gatoway_networks` is
 keyed by `net_id`, so nothing in that table stopped two networks claiming VLAN 100. Both
