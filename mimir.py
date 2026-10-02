@@ -111,6 +111,28 @@ CERT_SURVEY_INTERVAL = 900
 CERT_CHECK_CATEGORY = "security.mtls.certs"
 CERT_CHECK_NAME = "mtls_cert_expiration"
 
+# Is the extent store actually on the volume it is supposed to be on?
+#
+# The sidon mounts carry `nofail`, which they need: without it a data disk that is slow to
+# appear fails local-fs.target and drops the node into emergency mode with no network, and
+# two nodes did exactly that. But nofail trades a loud failure for a silent one. A node
+# whose volume did not mount boots perfectly and sidon writes extent groups to the *root
+# filesystem* at the same path, where they are smaller, slower, un-replicated, and invisible
+# the moment the real volume mounts underneath them.
+#
+# That happened here: all three nodes came up with /var/lib/hci/sidon unmounted after an
+# emergency-mode boot, 202 extent groups sat unreachable on the LV, and the only symptom was
+# NBD reads failing for one image. Nothing reported it, because from systemd's point of view
+# a nofail mount that did not happen is not a problem.
+#
+# So this is the detector the nofail change owed. FAIL rather than WARN for the main volume,
+# because writing guest data to the wrong filesystem is the kind of thing that looks fine
+# until the mount succeeds and the data disappears.
+STORAGE_SURVEY_INTERVAL = 300
+STORAGE_CHECK_CATEGORY = "storage.sidon.mounts"
+STORAGE_CHECK_NAME = "sidon_volumes_mounted"
+SIDON_ROOT = "/var/lib/hci/sidon"
+
 def cert_expiry_epoch(cert_path):
     """Return (epoch:int|None, detail:str) for a certificate's notAfter date.
 
@@ -208,6 +230,81 @@ def survey_mtls_certs(now=None):
                   f"mTLS certificate expiry could not be verified on this node.")
     return status, output
 
+def sidon_fstab_mounts():
+    """The sidon mount points /etc/fstab declares, in file order.
+
+    Read from fstab rather than from a hardcoded list, because the extra data disks are
+    discovered per host -- a node with two spare disks has two more of these than a node
+    with none, and a check that assumed a fixed set would be wrong on both.
+    """
+    targets = []
+    try:
+        with open("/etc/fstab", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.lstrip().startswith("#"):
+                    continue
+                fields = line.split()
+                if len(fields) >= 2 and fields[1].startswith(SIDON_ROOT):
+                    targets.append(fields[1])
+    except OSError:
+        return []
+    return targets
+
+
+def survey_sidon_mounts():
+    """(status, output) for whether every declared sidon volume is mounted."""
+    declared = sidon_fstab_mounts()
+    if not declared:
+        return ("WARN",
+                "No sidon mounts are declared in /etc/fstab on this node, so the extent "
+                "store is on the root filesystem by configuration rather than by accident. "
+                "That is valid for a single-filesystem host and worth knowing either way.")
+
+    missing = [t for t in declared if not os.path.ismount(t)]
+    if not missing:
+        return ("PASS",
+                "Every declared sidon volume is mounted:\n- " + "\n- ".join(declared))
+
+    # The root of the extent store missing is the serious one: sidon keeps writing, to the
+    # wrong filesystem, and says nothing.
+    root_missing = SIDON_ROOT in missing
+    status = "FAIL" if root_missing else "WARN"
+    detail = [
+        "Declared in /etc/fstab and NOT mounted:",
+        "- " + "\n- ".join(missing),
+        "",
+        "These mounts carry `nofail`, so systemd skipped them without failing the boot. "
+        "sidon will have written extent groups to the root filesystem at the same paths, "
+        "where they are invisible once the real volume mounts.",
+    ]
+    if root_missing:
+        detail.append(
+            "FAIL because %s is the extent store itself. Stop sidon, preserve anything "
+            "under %s on the root filesystem, mount the volume, and start sidon."
+            % (SIDON_ROOT, SIDON_ROOT))
+    else:
+        detail.append(
+            "WARN because the extent store root is mounted; what is missing is additional "
+            "capacity, so the store is smaller than intended rather than misplaced.")
+    return status, "\n".join(detail)
+
+
+def publish_sidon_mount_survey():
+    """Upsert the mount survey into hydra.mimir_results, like the certificate survey."""
+    status, output = survey_sidon_mounts()
+    if status != "PASS":
+        sys.stderr.write(f"[Mimir] {STORAGE_CHECK_NAME}: {status}\n{output}\n")
+    escaped = output.replace("'", "''")
+    cql = (
+        "INSERT INTO hydra.mimir_results "
+        "(category, check_name, node_ip, status, output, execution_id, timestamp) "
+        f"VALUES ('{STORAGE_CHECK_CATEGORY}', '{STORAGE_CHECK_NAME}', '{LOCAL_IP}', "
+        f"'{status}', '{escaped}', {uuid.uuid4()}, toTimestamp(now()));"
+    )
+    run_cql_query(cql)
+    return status
+
+
 def publish_cert_survey():
     """Survey this node's certificates and upsert the result into hydra.mimir_results.
 
@@ -232,12 +329,19 @@ def main():
     print("Mimir health checker daemon started.")
     local_last_run = {}
     last_cert_survey = 0
+    last_mount_survey = 0
     schedules = candidacy(helios_zk.SERVICE_MIMIR_SCHEDULES)
     while True:
         try:
             if time.time() - last_cert_survey >= CERT_SURVEY_INTERVAL:
                 last_cert_survey = time.time()
                 publish_cert_survey()
+            # Runs on every node rather than only on the schedule leader: a volume that
+            # failed to mount is a fact about this host, and asking the leader about it
+            # would miss exactly the node that has the problem.
+            if time.time() - last_mount_survey >= STORAGE_SURVEY_INTERVAL:
+                last_mount_survey = time.time()
+                publish_sidon_mount_survey()
         except Exception as e:
             sys.stderr.write(f"Error in Mimir certificate survey: {e}\n")
 
