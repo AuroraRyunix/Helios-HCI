@@ -927,36 +927,55 @@ mistake it for a source of truth.
 Provisioning must not land first -- claiming both disks before sidon can use the second one
 gains nothing and removes the guard currently keeping `sdc` untouched.
 
-### Not urgent: finish or retire the WebAssembly console
+### The SPICE console, decided and built -- but unverified on hardware
 
-There was a working WebAssembly console at one point -- the goal was ESXi-class console
-performance in a browser, and it carried a network-performance preset the current console has
-no equivalent for. What survives in the tree:
+The goal was ESXi-class console performance in a browser. SPICE had been half-present for a
+long time: the vendored client was in the tree and compiled to WebAssembly on *every*
+rollout, `agahnim` bridged TCP to WebSocket protocol-agnostically, and Spectrum's WebSocket
+proxy was already parameterised by `console_type` and already refused a protocol mismatch
+rather than downgrading. What was missing sat at the two ends -- no domain was ever given a
+SPICE device, and no page loaded the client -- and both were gated on one unmade decision.
 
-* `static/spice-html5/` -- the vendored client, including `src/lz_decompress.c`.
-* `static/vendor/wasm-spice/wasm_spice.wasm` -- built from that C file by **every rollout**;
-  `deploy_updates.py` compiles it with emscripten on each deploy.
-* `agahnim` already bridges TCP to WebSocket protocol-agnostically, and its own authorisation
-  page tells the operator to "click **Reconnect** on the SPICE console".
-* Spectrum's WebSocket proxy is already parameterised by `console_type` and refuses a
-  protocol mismatch rather than silently downgrading.
+**Decided and built 2026-10-02: SPICE is per-VM, VNC stays the default.** The graphics device
+lives in the domain XML and is therefore per-domain by construction, so a cluster-wide switch
+would still have to rewrite every domain and restart every guest before it meant anything --
+a per-VM, restart-requiring change wearing a toggle's clothes. The proxy was already per-VM,
+so the stored column was the only part that did not exist. Reasoning in
+[docs/console.md](docs/console.md).
 
-What is missing is at both ends rather than in the middle, and neither end is a coding
-problem:
+`hydra.vms.graphics` (migration `0010-vm-graphics`; null means VNC, no row rewritten) is read
+by both XML builders, which emit exactly **one** `<graphics>` device -- not both, which
+`docs/vali.md` had claimed for a long time and no builder ever did. `static/spice_auto.html`
+loads the vendored client through the same token exchange and proxy as the VNC page. The
+duplicate console button is gone: there were two in `static/app.js`, and the second --
+labelled for the SPICE client -- opened the VNC page.
 
-1. **No VM is given a SPICE device.** Both XML builders hard-code
-   `<graphics type='vnc' port='-1' autoport='yes'>` (`spectrum_server.py`, `vali.py`), so
-   asking for a SPICE console is correctly refused -- there is nothing to connect to.
-   `docs/vali.md` says both displays are enabled concurrently; that describes an intention
-   rather than the XML, and whoever settles the decision below should correct it.
-2. **No page loads the client.** `vnc_auto.html` is the only console page, and both console
-   buttons in `static/app.js` open it: the "WebGL" button is a copy of the VNC one with the
-   same URL.
+Two choices that look wrong and are not. The SPICE video adapter stays **VirtIO rather than
+QXL**, because `docs/vali.md` records QXL's BIOS ROM files being absent from the EL 10.2
+repositories, and a video model whose ROM is missing is a domain that will not start; the
+client needs the SPICE display *channel*, not QXL hardware. And image compression is **off**,
+because the client decodes LZ while QEMU's default is `auto_glz`, a different format.
 
-Both are gated on the same unmade decision. Whether SPICE becomes the default console or
-sits alongside VNC per-VM decides whether the graphics type is a per-VM field or a global
-switch, and writing either change now would presume the answer. Deleting the vendored client
-and dropping the wasm from every rollout remains the other way to close this out.
+Found on the way and fixed: **the Phoenix VM page had no console button at all.** Every page
+is Phoenix now, so the only console buttons in the tree were the two legacy ones -- an
+operator on the current console had no way to open a guest console.
+
+**Outstanding, and why this is not finished:**
+
+* **No SPICE console has been watched working against a guest.** The cluster was unreachable
+  when this was built. It is verified by `test_vm_graphics.py` (28) and `vm_graphics_test.exs`
+  (10), and by checking every client API used against `main.js`'s exports -- not on hardware.
+  The cursor is the path to watch, since its encoder had never produced valid output.
+* **Whether these hosts can serve SPICE at all is open.** Red Hat deprecated QXL and then
+  removed SPICE from the EL virtualisation stack, and these hosts are built from EL 10.2
+  repositories. libvirt refuses a domain whose graphics type QEMU lacks, so the VM never
+  starts. `/api/v1/host/capabilities` now reports a `graphics` list read from
+  `virsh domcapabilities`; **check it first**, because if it does not contain `spice` then the
+  right answer is to retire the vendored client and stop building the wasm on every rollout,
+  not to finish this.
+* The console ports still take no password and listen on `0.0.0.0` -- unchanged from what VNC
+  has always done here, so SPICE matches it rather than worsening it, but the port is
+  reachable directly on the LAN, bypassing the ticket exchange.
 
 ~~**The cursor encoder in the vendored client is broken.**~~ **Fixed 2026-09-10.**
 `create_rgba_png` in `spice-html5/src/png.js` put BFINAL in bit 7 of the deflate header

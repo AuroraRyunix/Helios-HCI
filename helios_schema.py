@@ -449,6 +449,25 @@ MIGRATIONS = [
         # cluster that already has duplicates is reported rather than refused.
         "backfill": backfill_vlan_claims,
     },
+    {
+        "id": "0010-vm-graphics",
+        "description": (
+            "Which console protocol a VM is given, per VM. The graphics device lives in "
+            "the domain XML, so it is per-domain by construction -- a cluster-wide "
+            "switch would still have to rewrite every domain and restart every guest to "
+            "take effect, which is a per-VM change wearing a toggle's clothes. The "
+            "WebSocket proxy was already per-VM: it reads the graphics type off the live "
+            "domain and refuses a protocol mismatch. This column is the desired state "
+            "the domain is built from; the running domain stays the runtime truth."
+        ),
+        "statements": [
+            # Null means VNC. Every VM that predates this column keeps the console it has
+            # always had, and no existing domain is rewritten by the migration -- the
+            # graphics device is only chosen when a domain is next defined, so switching
+            # a VM needs a redefine, which is a restart.
+            "ALTER TABLE hydra.vms ADD graphics text;",
+        ],
+    },
 ]
 
 

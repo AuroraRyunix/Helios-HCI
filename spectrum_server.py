@@ -2042,7 +2042,23 @@ def get_default_container():
     return "default-pool"
 
 
-def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_device="", audio_enabled=False):
+# The one place that decides what counts as a SPICE console.
+#
+# Anything that is not exactly "spice", case and whitespace aside, is VNC -- including
+# None, which is what every VM row written before the graphics column holds. Returning a
+# value rather than raising is deliberate at the edges that build a domain: an unknown
+# graphics type would make libvirt refuse the define at start time, long after the create
+# that caused it answered 201, so a value that cannot be honoured is narrowed to the one
+# that always can. The API validates separately, where it can still refuse the request.
+GRAPHICS_TYPES = ("vnc", "spice")
+
+
+def normalise_graphics(value):
+    """"spice" or "vnc". Never anything else, never None."""
+    return "spice" if str(value or "").strip().lower() == "spice" else "vnc"
+
+
+def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_device="", audio_enabled=False, graphics="vnc"):
     # Resolve primary container
     primary_container = get_default_container()
     if disks_list:
@@ -2069,9 +2085,49 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         os_boot_xml = f"""<type arch='x86_64' machine='q35'>hvm</type>
     {boot_devices}"""
 
-    video_xml = """<video>
+    # The console device, and the video model that has to match it.
+    #
+    # Chosen per VM rather than cluster-wide, because the graphics device lives in the
+    # domain XML and is therefore per-domain by construction: a global switch would still
+    # have to rewrite every domain and restart every guest before it meant anything. The
+    # WebSocket proxy was already per-VM -- it reads the type off the live domain and
+    # refuses a mismatch -- so the stored column is the only part that was missing.
+    #
+    # Anything that is not exactly "spice" is VNC, including None. A VM whose row predates
+    # the graphics column keeps the console it has always had.
+    graphics_type = normalise_graphics(graphics)
+
+    if graphics_type == "spice":
+        # virtio, the same adapter a VNC guest gets, and deliberately not QXL.
+        #
+        # QXL is the classic SPICE pairing and the first thing to reach for, but
+        # docs/vali.md records that it is avoided here because the BIOS ROM files it needs
+        # are missing from the EL 10.2 repositories the hypervisors are built from -- and a
+        # video model whose ROM is absent is a domain that will not start. The client does
+        # not require it either: spice-html5 decodes the SPICE display channel, which is a
+        # protocol, and QEMU serves that channel whatever adapter is behind it.
+        video_xml = """<video>
       <model type='virtio' vram='65536' heads='1' primary='yes'/>
     </video>"""
+        # Image compression off, deliberately. The client can decode LZ -- that is what
+        # lz_decompress.c is compiled to WebAssembly for -- but QEMU's default is auto_glz,
+        # and GLZ is a different, dictionary-backed format. Off is the setting that is
+        # certain to render; it costs bandwidth on a LAN that has it, and it is the obvious
+        # thing to revisit once a SPICE console has been watched working on hardware.
+        graphics_xml = """<graphics type='spice' port='-1' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+      <image compression='off'/>
+    </graphics>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>"""
+    else:
+        video_xml = """<video>
+      <model type='virtio' vram='65536' heads='1' primary='yes'/>
+    </video>"""
+        graphics_xml = """<graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>"""
 
     # Disks devices XML
     import string
@@ -2151,9 +2207,7 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
       <source bridge='virbr0'/>
       <model type='virtio'/>
     </interface>
-    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
-      <listen type='address' address='0.0.0.0'/>
-    </graphics>
+    {graphics_xml}
     <controller type='virtio-serial' index='0'/>
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
@@ -3391,7 +3445,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "latency_ms": latency_ms,
                     "network_id": vm.get("network_id", ""),
                     "ip_address": vm_ip,
-                    "audio_enabled": vm.get("audio_enabled", False)
+                    "audio_enabled": vm.get("audio_enabled", False),
+                    # The console needs this to know which client to open. Normalised on
+                    # the way out so a null row reads as "vnc" everywhere rather than as
+                    # an empty string the front end has to interpret.
+                    "graphics": normalise_graphics(vm.get("graphics"))
                 })
 
             self.send_json(200, {"vms": vms_list})
@@ -3961,7 +4019,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                     "drs_satisfaction": drs_satisfaction,
                     "network_id": vm.get("network_id", ""),
                     "ip_address": vm_ip,
-                    "audio_enabled": vm.get("audio_enabled", False)
+                    "audio_enabled": vm.get("audio_enabled", False),
+                    # The console needs this to know which client to open. Normalised on
+                    # the way out so a null row reads as "vnc" everywhere rather than as
+                    # an empty string the front end has to interpret.
+                    "graphics": normalise_graphics(vm.get("graphics"))
                 })
 
             # Retrieve cached status values instantly from the background collector thread
@@ -6255,6 +6317,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 network_id = "7a68e0d6-11f8-4e89-9430-b3b44b8bc438"
             cpu_model = payload.get("cpu_model", "")
             audio_enabled = bool(payload.get("audio_enabled", False))
+            # Anything that is not exactly "spice" is VNC. Validated here rather than
+            # trusted, because this value becomes a device in a domain XML: an unknown
+            # graphics type makes libvirt refuse the define, and it would do so at start
+            # time, long after the create that caused it answered 201.
+            graphics = normalise_graphics(payload.get("graphics"))
             # The typed endpoint rejects a null where a string is due, and every one of
             # these fields reaches it straight from the request body, where an explicit
             # null is what a form with a cleared field sends.
@@ -6272,7 +6339,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 "boot_device": boot_device or "",
                 "network_id": network_id,
                 "cpu_model": cpu_model or "",
-                "audio_enabled": audio_enabled
+                "audio_enabled": audio_enabled,
+                "graphics": graphics
             }
             # INSERT is an upsert in CQL, so this used to overwrite whatever row already
             # carried the name -- including a live VM's, whose host_ip it reset to "". The
@@ -6760,9 +6828,25 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if not network_id:
                     network_id = "7a68e0d6-11f8-4e89-9430-b3b44b8bc438"
                 cpu_model = payload.get("cpu_model", vm_data.get("cpu_model", ""))
-                cql_upd = f"UPDATE hydra.vms SET vcpu = {vcpu}, memory = {memory}, firmware = '{firmware}', iso = '{iso}', boot_device = '{boot_device}', disks_list = '{disks_list}', disk_path = '{primary_path}', disk_size = {primary_size_gb}, network_id = '{network_id}', cpu_model = '{cpu_model}', audio_enabled = {audio_enabled_str} WHERE name = '{name}';"
+                # The console protocol is a device in the domain XML, so changing it here
+                # changes the desired state and nothing else: the running domain keeps the
+                # graphics device it was defined with until vali defines it again, which
+                # happens on the next start. Recording it without saying so would leave an
+                # operator clicking a SPICE button at a VNC server and reading the proxy's
+                # protocol-mismatch refusal as a bug.
+                graphics = normalise_graphics(payload.get("graphics", vm_data.get("graphics")))
+                graphics_changed = graphics != normalise_graphics(vm_data.get("graphics"))
+                cql_upd = f"UPDATE hydra.vms SET vcpu = {vcpu}, memory = {memory}, firmware = '{firmware}', iso = '{iso}', boot_device = '{boot_device}', disks_list = '{disks_list}', disk_path = '{primary_path}', disk_size = {primary_size_gb}, network_id = '{network_id}', cpu_model = '{cpu_model}', audio_enabled = {audio_enabled_str}, graphics = '{graphics}' WHERE name = '{name}';"
                 run_cql_query(cql_upd)
-                
+
+                if graphics_changed and vm_data.get("state") == "Running":
+                    EVENT_LOGS.append({
+                        "desc": (f"VM '{name}' will use the {graphics.upper()} console "
+                                 f"after its next restart; the running domain still has "
+                                 f"the one it was defined with."),
+                        "time": "Just now"
+                    })
+
                 # Check if network changed and VM is running -> Hotplug live!
                 try:
                     old_net_id_raw = vm_data.get("network_id", "7a68e0d6-11f8-4e89-9430-b3b44b8bc438")

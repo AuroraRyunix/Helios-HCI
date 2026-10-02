@@ -915,7 +915,23 @@ def get_network_by_id(net_id):
 KVM_CACHE = {}
 VMWARE_CACHE = {}
 
-def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False):
+# The one place that decides what counts as a SPICE console.
+#
+# Anything that is not exactly "spice", case and whitespace aside, is VNC -- including
+# None, which is what every VM row written before the graphics column holds. Returning a
+# value rather than raising is deliberate at the edges that build a domain: an unknown
+# graphics type would make libvirt refuse the define at start time, long after the create
+# that caused it answered 201, so a value that cannot be honoured is narrowed to the one
+# that always can. The API validates separately, where it can still refuse the request.
+GRAPHICS_TYPES = ("vnc", "spice")
+
+
+def normalise_graphics(value):
+    """"spice" or "vnc". Never anything else, never None."""
+    return "spice" if str(value or "").strip().lower() == "spice" else "vnc"
+
+
+def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc"):
     primary_container = get_default_container()
     if disks_list and disks_list != "NONE":
         first_entry = disks_list.split(",")[0]
@@ -945,9 +961,43 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     {boot_devices}
     <bootmenu enable='yes' timeout='3000'/>"""
 
-    video_xml = """<video>
+    # The console device, and the video model that has to match it. Kept byte-identical to
+    # the copy in spectrum_server.generate_vm_xml -- a VM defined by the console and the
+    # same VM redefined by vali after a migration must come back with the same console, and
+    # test_vm_graphics asserts the two agree rather than trusting them to.
+    #
+    # Anything that is not exactly "spice" is VNC, including None, so a VM whose row
+    # predates the graphics column keeps the console it has always had.
+    graphics_type = normalise_graphics(graphics)
+
+    if graphics_type == "spice":
+        # virtio, the same adapter a VNC guest gets, and deliberately not QXL.
+        #
+        # QXL is the classic SPICE pairing and the first thing to reach for, but
+        # docs/vali.md records that it is avoided here because the BIOS ROM files it needs
+        # are missing from the EL 10.2 repositories the hypervisors are built from -- and a
+        # video model whose ROM is absent is a domain that will not start. The client does
+        # not require it either: spice-html5 decodes the SPICE display channel, which is a
+        # protocol, and QEMU serves that channel whatever adapter is behind it.
+        video_xml = """<video>
       <model type='virtio' vram='65536' heads='1' primary='yes'/>
     </video>"""
+        # Image compression off, deliberately -- see the matching comment in
+        # spectrum_server.py for why GLZ is not what this client decodes.
+        graphics_xml = """<graphics type='spice' port='-1' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+      <image compression='off'/>
+    </graphics>
+    <channel type='spicevmc'>
+      <target type='virtio' name='com.redhat.spice.0'/>
+    </channel>"""
+    else:
+        video_xml = """<video>
+      <model type='virtio' vram='65536' heads='1' primary='yes'/>
+    </video>"""
+        graphics_xml = """<graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>"""
 
     import string
     letters = string.ascii_lowercase
@@ -1182,9 +1232,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     {disk_devices_xml}
     <input type='tablet' bus='usb'/>
     {interfaces_xml}
-    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
-      <listen type='address' address='0.0.0.0'/>
-    </graphics>
+    {graphics_xml}
     <controller type='virtio-serial' index='0'/>
     <channel type='unix'>
       <target type='virtio' name='org.qemu.guest_agent.0'/>
@@ -1377,7 +1425,8 @@ def process_queue_task(task):
 
             # 3. Compile XML
             audio_enabled = bool(vm_data.get("audio_enabled", False))
-            vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled)
+            vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled,
+                                     graphics=vm_data.get("graphics"))
             import base64
             b64_xml = base64.b64encode(vm_xml.encode("utf-8")).decode("utf-8")
             

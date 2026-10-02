@@ -5201,12 +5201,20 @@ document.addEventListener('DOMContentLoaded', async () => {
             let actionBtn = '';
             if (isRunning) {
                 actionBtn = `
-                    <button class="table-action-btn console-btn" data-name="${vm.name}" style="margin-right:5px; border-color:var(--color-primary); color:var(--color-primary);">
-                        <svg viewBox="0 0 24 24" class="action-icon" style="fill:var(--color-primary);"><path d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7l-2 3v1h8v-1l-2-3h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z"/></svg> Console
-                    </button>
-                    <button class="table-action-btn webgl-btn" data-name="${vm.name}" style="margin-right:5px; border-color:#0891b2; color:#0891b2;">
-                        <svg viewBox="0 0 24 24" class="action-icon" style="fill:#0891b2;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.53c-.26-.81-1-1.4-1.9-1.4h-1v-3c0-.55-.45-1-1-1h-6v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.4z"/></svg> WebGL Console
-                    </button>
+                    ${(() => {
+                        // One console button, not two. There used to be a second one
+                        // labelled "WebGL" whose click handler opened the same
+                        // vnc_auto.html as the first -- the SPICE client it was named for
+                        // was never wired to it. Which console a VM has is a property of
+                        // the VM, so the button follows the row rather than offering a
+                        // choice the domain cannot honour.
+                        const spice = String(vm.graphics || 'vnc').toLowerCase() === 'spice';
+                        const colour = spice ? '#0891b2' : 'var(--color-primary)';
+                        return `
+                    <button class="table-action-btn console-btn" data-name="${vm.name}" data-graphics="${spice ? 'spice' : 'vnc'}" style="margin-right:5px; border-color:${colour}; color:${colour}; --console-color:${colour};">
+                        <svg viewBox="0 0 24 24" class="action-icon" style="fill:var(--console-color);"><path d="M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7l-2 3v1h8v-1l-2-3h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z"/></svg> ${spice ? 'SPICE Console' : 'Console'}
+                    </button>`;
+                    })()}
                     <button class="table-action-btn edit-btn" data-name="${vm.name}" style="margin-right:5px; border-color:var(--color-primary); color:var(--color-primary);">
                         <svg viewBox="0 0 24 24" class="action-icon" style="fill:var(--color-primary);"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg> Edit
                     </button>
@@ -5378,18 +5386,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             consoleBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 e.preventDefault();
-                const url = `vnc_auto.html?name=${vmName}`;
-                window.open(url, '_blank');
-            });
-        }
-        
-        const webglBtn = row.querySelector('.webgl-btn');
-        if (webglBtn) {
-            webglBtn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                e.preventDefault();
-                const url = `vnc_auto.html?name=${vmName}`;
-                window.open(url, '_blank');
+                // The page follows the VM's graphics device. Opening the SPICE page for a
+                // VNC domain would reach the proxy, which refuses a protocol mismatch
+                // rather than downgrading -- a legible error, but still an avoidable one.
+                const page = consoleBtn.dataset.graphics === 'spice'
+                    ? 'spice_auto.html' : 'vnc_auto.html';
+                window.open(`${page}?name=${vmName}`, '_blank');
             });
         }
         

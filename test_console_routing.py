@@ -147,8 +147,11 @@ class ThePythonTierKeepsEverythingElse(unittest.TestCase):
         # `/vnc_auto.html` especially: the guest console is the one page-shaped thing
         # still served by the Python tier, and routing it to Phoenix would take the VM
         # console away entirely.
+        # `/vnc_auto.html` and `/spice_auto.html` especially: they are the guest consoles,
+        # and which one a VM uses follows its graphics device.
         for path in ("/vms.html", "/images.html", "/health.html", "/storage.html",
-                     "/index.html", "/app.js", "/styles.css", "/vnc_auto.html"):
+                     "/index.html", "/app.js", "/styles.css", "/vnc_auto.html",
+                     "/spice_auto.html"):
             self.assertFalse(
                 self.rule.matches(path),
                 "%s is served by the Python tier but routed to Phoenix" % path)

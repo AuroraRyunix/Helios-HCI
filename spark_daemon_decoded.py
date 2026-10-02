@@ -1991,7 +1991,39 @@ def read_host_capabilities():
     except OSError:
         secure_boot = False
 
-    return {"kvm": kvm, "secure_boot": secure_boot}
+    return {"kvm": kvm, "secure_boot": secure_boot, "graphics": read_graphics_support()}
+
+
+# Which console protocols this hypervisor can actually serve.
+#
+# Worth asking rather than assuming, because Red Hat deprecated QXL and then removed SPICE
+# from the EL virtualisation stack, and these hosts are built from EL 10.2 repositories --
+# docs/vali.md already records QXL's BIOS ROM files being absent for that reason. A
+# `<graphics type='spice'>` on a QEMU without SPICE compiled in is not a degraded console:
+# libvirt refuses the domain outright, so the VM simply never starts.
+#
+# Read from `virsh domcapabilities`, which reports what this binary supports rather than
+# what the distribution usually ships. Failure is reported as an empty list, never as a
+# guess: the caller treats "I could not tell" as "do not offer SPICE", which is wrong in
+# the harmless direction.
+GRAPHICS_PROTOCOLS = ("vnc", "spice")
+
+
+def read_graphics_support():
+    """The graphics types libvirt says this host can serve, e.g. ["vnc"]."""
+    rc, out = run_argv(["virsh", "domcapabilities"], timeout=20)
+    if rc != 0 or not out:
+        return []
+
+    # <graphics supported='yes'><enum name='type'><value>vnc</value>... The enum is the
+    # authoritative list; the `supported` attribute only says the element is present.
+    import re as _re
+
+    block = _re.search(r"<graphics[ >][^>]*?>(.*?)</graphics>", out, _re.S)
+    if not block:
+        return []
+    values = _re.findall(r"<value>([a-z]+)</value>", block.group(1), _re.I)
+    return [v.lower() for v in values if v.lower() in GRAPHICS_PROTOCOLS]
 
 
 DB_REPAIR_LOCK = threading.Lock()

@@ -147,6 +147,28 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
         >
           Reboot
         </.button>
+        <%!--
+          The guest console. A plain link rather than a LiveView action because the console
+          pages are the one page-shaped thing still served by the Python tier, and Slate
+          routes them there by their `.html` suffix.
+
+          Which page depends on the VM, not on a preference: the graphics device is part of
+          the domain definition, and the WebSocket proxy refuses a protocol mismatch rather
+          than downgrading. Until this button existed the Phoenix console offered no way to
+          open a guest console at all, so the only console buttons in the tree were the two
+          in the legacy app.js -- which both opened the VNC page, including the one labelled
+          for the SPICE client.
+        --%>
+        <a
+          :if={Vm.running?(@vm)}
+          id="console"
+          href={"/#{console_page(@vm)}?name=#{URI.encode_www_form(@vm.name)}"}
+          target="_blank"
+          rel="noopener"
+          class="btn"
+        >
+          {console_label(@vm)}
+        </a>
       </div>
 
       <section id="vm-specs" class="mt-8">
@@ -204,4 +226,12 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   defp blank(nil, placeholder), do: placeholder
   defp blank("", placeholder), do: placeholder
   defp blank(value, _placeholder), do: value
+
+  # The console page a VM's graphics device actually has. Vm.decode already narrows the
+  # column to "spice" or "vnc", so there is no third case to carry here.
+  defp console_page(%{graphics: "spice"}), do: "spice_auto.html"
+  defp console_page(_vm), do: "vnc_auto.html"
+
+  defp console_label(%{graphics: "spice"}), do: "SPICE Console"
+  defp console_label(_vm), do: "Console"
 end

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<!--
+    The SPICE console.
+
+    Sibling of vnc_auto.html, and deliberately the same shape: the same session token in
+    the same places, the same /api/vms/console/token exchange, the same single WebSocket
+    through Spectrum's proxy. Only the client differs, and the `type=spice` it asks for.
+
+    A VM reaches this page only when its graphics column says spice, because the proxy
+    reads the graphics type off the live domain and refuses a protocol mismatch -- so a
+    page that guessed would produce a refusal rather than a blank screen, which is the
+    better failure but still a failure. app.js and the Phoenix VM page both route by the
+    VM's recorded console, and this page says so plainly when the handshake is refused.
+-->
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SPICE Console</title>
+    <link rel="stylesheet" type="text/css" href="spice-html5/spice.css" />
+    <style>
+        html, body {
+            margin: 0; padding: 0; height: 100%;
+            background: #0f1115; color: #e6e8eb;
+            font: 13px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif;
+        }
+        #toolbar {
+            display: flex; align-items: center; gap: 10px;
+            padding: 8px 12px; background: #171a21; border-bottom: 1px solid #262b36;
+        }
+        #toolbar .name { font-weight: 600; letter-spacing: .01em; }
+        #toolbar .badge {
+            font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+            padding: 2px 7px; border-radius: 3px;
+            background: #0b3d4a; color: #67e8f9; border: 1px solid #155e6b;
+        }
+        #toolbar .spacer { flex: 1; }
+        #toolbar button {
+            background: #1f2430; color: #cbd2dc; border: 1px solid #2d3443;
+            padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 12px;
+        }
+        #toolbar button:hover { background: #262d3b; color: #fff; }
+        #stage { position: relative; height: calc(100% - 39px); overflow: auto; }
+        #spice-screen { width: 100%; height: 100%; }
+        .overlay {
+            position: absolute; inset: 0; display: none;
+            flex-direction: column; align-items: center; justify-content: center;
+            gap: 14px; background: rgba(15, 17, 21, .94); text-align: center; padding: 24px;
+        }
+        .overlay.show { display: flex; }
+        .spinner {
+            width: 26px; height: 26px; border: 2px solid #2d3443;
+            border-top-color: #67e8f9; border-radius: 50%; animation: spin .8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .overlay h2 { margin: 0; font-size: 15px; font-weight: 600; }
+        .overlay p { margin: 0; max-width: 46ch; color: #9aa4b2; font-size: 12px; }
+        .overlay code {
+            background: #1b2029; border: 1px solid #2d3443; border-radius: 3px;
+            padding: 1px 5px; color: #cbd2dc;
+        }
+        #message-div, #debug-div { display: none; }
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <span class="name" id="vm-name">&mdash;</span>
+        <span class="badge">spice</span>
+        <span class="spacer"></span>
+        <button id="btn-cad" title="Send Ctrl+Alt+Del to the guest">Ctrl+Alt+Del</button>
+        <button id="btn-reconnect">Reconnect</button>
+    </div>
+
+    <div id="stage">
+        <div id="spice-screen" class="spice-screen"></div>
+        <div id="overlay-loading" class="overlay show">
+            <div class="spinner"></div>
+            <h2>Connecting</h2>
+            <p id="loading-detail">Asking for a console ticket&hellip;</p>
+        </div>
+        <div id="overlay-error" class="overlay">
+            <h2 id="error-title">Disconnected</h2>
+            <p id="error-detail"></p>
+            <button id="btn-retry">Reconnect</button>
+        </div>
+    </div>
+
+    <div id="message-div"></div>
+    <div id="debug-div"></div>
+
+    <script type="module">
+        import * as SpiceHtml5 from './spice-html5/src/main.js';
+
+        const qs = (key, dflt) => {
+            const m = new RegExp('[?&]' + key + '=([^&]*)').exec(window.location.search);
+            return m ? decodeURIComponent(m[1].replace(/\+/g, '%20')) : dflt;
+        };
+
+        const vmName = qs('name', '');
+        let sc = null;
+
+        const loading = document.getElementById('overlay-loading');
+        const errorBox = document.getElementById('overlay-error');
+        const loadingDetail = document.getElementById('loading-detail');
+
+        document.getElementById('vm-name').textContent = vmName || 'unknown VM';
+        document.title = vmName ? vmName + ' — SPICE Console' : 'SPICE Console';
+
+        function showError(title, detail) {
+            loading.classList.remove('show');
+            document.getElementById('error-title').textContent = title;
+            document.getElementById('error-detail').innerHTML = detail;
+            errorBox.classList.add('show');
+        }
+
+        // The session token lives where vnc_auto.html puts it. A token in the query string
+        // is promoted to localStorage so a console opened in a new tab keeps working.
+        function sessionToken() {
+            try {
+                const fromQuery = qs('token', '');
+                if (fromQuery) localStorage.setItem('helios_session_token', fromQuery);
+                return sessionStorage.getItem('helios_session_token')
+                    || localStorage.getItem('helios_session_token') || '';
+            } catch (e) { return ''; }
+        }
+
+        function disconnect() {
+            if (sc) { try { sc.stop(); } catch (e) {} sc = null; }
+        }
+
+        async function connect() {
+            disconnect();
+            errorBox.classList.remove('show');
+            loading.classList.add('show');
+            loadingDetail.textContent = 'Asking for a console ticket…';
+
+            if (!vmName) {
+                showError('No VM named', 'This page needs a <code>?name=</code> parameter.');
+                return;
+            }
+
+            let ticket;
+            try {
+                const res = await fetch('/api/vms/console/token?name='
+                    + encodeURIComponent(vmName) + '&type=spice&token='
+                    + encodeURIComponent(sessionToken()));
+                if (!res.ok) {
+                    // The proxy refuses a protocol mismatch rather than downgrading, so
+                    // this is the likely answer for a VM still defined with VNC -- say so
+                    // instead of leaving a spinner running.
+                    const body = await res.text().catch(() => '');
+                    showError('No SPICE console on this VM',
+                        'The console service refused a SPICE ticket (HTTP ' + res.status + ').'
+                        + ' A VM gets a SPICE device only when its console is set to SPICE'
+                        + ' <em>and</em> it has been restarted since, because the graphics'
+                        + ' device is part of the domain definition.'
+                        + (body ? '<br><br><code>' + body.slice(0, 200) + '</code>' : ''));
+                    return;
+                }
+                ticket = await res.json();
+            } catch (e) {
+                showError('Could not reach the console service', String(e));
+                return;
+            }
+
+            loadingDetail.textContent = 'Opening the SPICE channels…';
+
+            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const uri = proto + '//' + window.location.host
+                + '/api/vms/console/ws?token=' + encodeURIComponent(ticket.token);
+
+            document.getElementById('spice-screen').innerHTML = '';
+
+            try {
+                sc = new SpiceHtml5.SpiceMainConn({
+                    uri: uri,
+                    screen_id: 'spice-screen',
+                    message_id: 'message-div',
+                    dump_id: 'debug-div',
+                    password: ticket.password || '',
+                    onerror: (e) => showError('Disconnected',
+                        'The SPICE connection ended: <code>'
+                        + String(e && e.message ? e.message : e) + '</code>'),
+                    onsuccess: () => loading.classList.remove('show'),
+                    onagent: (conn) => SpiceHtml5.resize_helper(conn)
+                });
+            } catch (e) {
+                showError('The SPICE client would not start', String(e));
+                return;
+            }
+
+            // onsuccess is not fired by every path through the client, so the overlay is
+            // also cleared once the display channel has drawn something.
+            setTimeout(() => loading.classList.remove('show'), 4000);
+        }
+
+        document.getElementById('btn-reconnect').addEventListener('click', connect);
+        document.getElementById('btn-retry').addEventListener('click', connect);
+        document.getElementById('btn-cad').addEventListener('click', () => {
+            if (sc) SpiceHtml5.sendCtrlAltDel(sc);
+        });
+        window.addEventListener('beforeunload', disconnect);
+
+        connect();
+    </script>
+</body>
+</html>

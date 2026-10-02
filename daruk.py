@@ -155,6 +155,9 @@ _LOCK_ACQUIRE_CQL = (
 _VM_COLUMNS = (
     "name", "vcpu", "memory", "disk_path", "disk_size", "state", "host_ip", "disks_list",
     "firmware", "iso", "boot_device", "network_id", "cpu_model", "audio_enabled", "status",
+    # Which console protocol the domain is built with. Null means VNC, so every VM
+    # written before this column keeps the console it already had.
+    "graphics",
 )
 _VM_CREATE_CQL = (
     "INSERT INTO hydra.vms (" + ", ".join(_VM_COLUMNS) + ") VALUES ("
@@ -270,6 +273,10 @@ LWT_OPS = {
             "cpu_model": {"type": "text", "default": ""},
             "audio_enabled": {"type": "bool", "default": False},
             "status": {"type": "text", "default": None, "nullable": True},
+            # Defaulted rather than nullable: a create that does not mention a console
+            # should produce a row that says which one it got, so the domain and the row
+            # agree without anyone having to know what null means.
+            "graphics": {"type": "text", "default": "vnc"},
         },
     },
     # Claiming a scheduler tick. `last_run_epoch` is the schedule's clock and its lock at

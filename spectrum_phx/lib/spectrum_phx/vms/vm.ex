@@ -42,6 +42,7 @@ defmodule SpectrumPhx.Vms.Vm do
             network_id: nil,
             cpu_model: nil,
             audio_enabled: false,
+            graphics: "vnc",
             status: nil
 
   @type t :: %__MODULE__{
@@ -59,6 +60,7 @@ defmodule SpectrumPhx.Vms.Vm do
           network_id: String.t() | nil,
           cpu_model: String.t() | nil,
           audio_enabled: boolean(),
+          graphics: String.t(),
           status: String.t() | nil
         }
 
@@ -204,6 +206,8 @@ defmodule SpectrumPhx.Vms.Vm do
       network_id: get(row, "network_id", nil),
       cpu_model: get(row, "cpu_model", nil),
       audio_enabled: get(row, "audio_enabled", false),
+      # Null means VNC: every row written before the graphics column has one.
+      graphics: normalise_graphics(get(row, "graphics", nil)),
       status: get(row, "status", nil)
     }
   end
@@ -453,6 +457,17 @@ defmodule SpectrumPhx.Vms.Vm do
   defp truthy?(true), do: true
   defp truthy?(value) when is_binary(value), do: String.downcase(value) in ~w(true on 1 yes)
   defp truthy?(_other), do: false
+
+  # Anything that is not exactly "spice" is VNC, including nil -- which is what every row
+  # written before the graphics column holds. The same rule as `normalise_graphics` in
+  # spectrum_server.py and vali.py, and `vm_graphics_test.exs` asserts the three agree:
+  # a VM the console calls SPICE and the daemon builds as VNC is a console that opens on
+  # a protocol mismatch, which is the confusing failure rather than the loud one.
+  defp normalise_graphics(value) when is_binary(value) do
+    if String.downcase(String.trim(value)) == "spice", do: "spice", else: "vnc"
+  end
+
+  defp normalise_graphics(_other), do: "vnc"
 
   defp downcase(nil), do: ""
   defp downcase(value) when is_binary(value), do: String.downcase(value)

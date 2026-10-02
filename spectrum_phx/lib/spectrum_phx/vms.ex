@@ -54,7 +54,7 @@ defmodule SpectrumPhx.Vms do
   alias SpectrumPhx.Spark
   alias SpectrumPhx.Vms.Vm
 
-  @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status"
+  @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status, graphics"
 
   @list_cql "SELECT #{@columns} FROM hydra.vms"
   @get_cql "SELECT #{@columns} FROM hydra.vms WHERE name = ?"
@@ -368,7 +368,8 @@ defmodule SpectrumPhx.Vms do
         {"text", vm.network_id},
         {"text", vm.cpu_model},
         {"boolean", vm.audio_enabled},
-        {"text", vm.status}
+        {"text", vm.status},
+        {"text", vm.graphics}
       ]
 
       case source() do
