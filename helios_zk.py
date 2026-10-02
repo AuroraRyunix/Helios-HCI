@@ -227,6 +227,10 @@ ERR_SESSION_EXPIRED = -112
 # CreateMode flags
 PERSISTENT = 0
 EPHEMERAL = 1
+# Create flags are a bitmask, so an ephemeral sequential node is 3. Sequential appends a
+# ten-digit monotonic counter to the name the caller asked for, assigned by the ensemble --
+# which is what makes it usable as a queue ticket or an election ballot.
+SEQUENTIAL = 2
 
 # ACL: world:anyone with all permissions (0x1f). Access control is handled by the
 # network boundary here, exactly as the existing 4lw usage assumes.
@@ -439,15 +443,22 @@ class ZKClient(object):
 
     # -- operations ---------------------------------------------------------
 
-    def create(self, path, data=b"", ephemeral=False, makepath=False):
-        """Create a znode. Returns the created path."""
+    def create(self, path, data=b"", ephemeral=False, makepath=False, sequential=False):
+        """Create a znode. Returns the created path.
+
+        `sequential` makes the ensemble append a ten-digit counter to the name, so the
+        returned path is not the one that was asked for -- callers must use the return
+        value. Combined with `ephemeral` this is the standard election ballot: the node
+        disappears when the session ends, and the counter decides whose turn it was.
+        """
         if makepath:
             self.ensure_path(path.rsplit("/", 1)[0] or "/")
         acl = struct.pack("!i", len(_ACL_OPEN_UNSAFE))
         for perms, scheme, ident in _ACL_OPEN_UNSAFE:
             acl += struct.pack("!i", perms) + _pack_string(scheme) + _pack_string(ident)
         payload = _pack_string(path) + _pack_buffer(data) + acl
-        payload += struct.pack("!i", EPHEMERAL if ephemeral else PERSISTENT)
+        flags = (EPHEMERAL if ephemeral else PERSISTENT) | (SEQUENTIAL if sequential else 0)
+        payload += struct.pack("!i", flags)
         reply, off = self._request(OP_CREATE, payload, path=path)
         created, _ = _unpack_string(reply, off)
         return created
@@ -509,3 +520,133 @@ def connect(hosts=("127.0.0.1",), port=2181, timeout=10.0, session_timeout_ms=15
     """Convenience wrapper returning a connected client."""
     return ZKClient(hosts=hosts, port=port, timeout=timeout,
                     session_timeout_ms=session_timeout_ms).connect()
+
+
+# -- Per-service leadership ---------------------------------------------------------------
+#
+# Which node runs a leader-only job is a question per job, and nothing to do with which
+# node happens to lead the ZooKeeper ensemble.
+#
+# Helios used to answer it by comparing addresses: `vali` decided it was the queue worker
+# when `helios_zk.leader_ip(ips) == LOCAL_IP`. That has three problems, and they are all
+# the same problem. The ensemble elects a leader for its own reasons -- a restart, a
+# network blip, a rolling upgrade -- and every leader-only workload in the cluster moves
+# at once when it does. One node runs all of them, so the busiest node is also the only
+# one doing coordination work. And "am I the leader" is decided by a string comparison
+# against a cached probe, which is true or false some seconds after the fact.
+#
+# This is the standard ZooKeeper recipe instead, and it is what a Nutanix cluster does:
+# a persistent parent per service, and one ephemeral sequential child per candidate. The
+# lowest sequence number is the leader. Nobody announces anything and nobody times anyone
+# out -- the ballot is tied to the session, so a process that dies, hangs long enough to
+# lose its session, or is partitioned away stops being the leader because its node is
+# gone, not because somebody noticed.
+#
+# Correctness here does not depend on watches. The lowest-sequence rule holds whenever it
+# is evaluated, so asking periodically is correct and only costs latency; a watch on the
+# predecessor would make handover prompt rather than eventual. That is a later change and
+# this is written so it can be added underneath without the callers moving.
+LEADERS_ROOT = "/helios/leaders"
+
+# The prefix for a ballot. The ensemble appends ten digits to it.
+_BALLOT_PREFIX = "n_"
+
+
+def _ballot_sequence(name):
+    """The counter out of a ballot name, or None if it does not look like one."""
+    tail = name.rsplit(_BALLOT_PREFIX, 1)[-1]
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def lowest_ballot(children):
+    """The winning ballot name, or None when nobody is standing.
+
+    Sorted by the numeric counter rather than by string, because ZooKeeper's ten-digit
+    zero padding is only reliable until the counter rolls past it.
+    """
+    standing = [(seq, name) for seq, name in
+                ((_ballot_sequence(n), n) for n in children) if seq is not None]
+    if not standing:
+        return None
+    return min(standing)[1]
+
+
+class Election(object):
+    """One candidacy for one service.
+
+    Not a context manager by accident: a daemon holds its candidacy for its whole life, and
+    the thing that ends it is the process ending. `resign` exists for a clean shutdown and
+    for tests; losing the session does the same job without being asked.
+    """
+
+    def __init__(self, client, service, identity=b""):
+        self.client = client
+        self.service = service
+        self.identity = identity if isinstance(identity, bytes) else str(identity).encode()
+        self.parent = "%s/%s" % (LEADERS_ROOT, service)
+        self.ballot = None
+
+    def stand(self):
+        """Create this candidate's ballot. Idempotent per instance."""
+        if self.ballot is not None:
+            return self.ballot
+        self.client.ensure_path(self.parent)
+        created = self.client.create(
+            "%s/%s" % (self.parent, _BALLOT_PREFIX), data=self.identity,
+            ephemeral=True, sequential=True)
+        self.ballot = created.rsplit("/", 1)[-1]
+        return self.ballot
+
+    def is_leader(self):
+        """True when this candidate holds the lowest ballot.
+
+        False -- never an exception -- when the answer cannot be established: no ballot
+        yet, the parent gone, the ensemble unreachable. A daemon that cannot tell whether
+        it leads must not act as though it does, because the alternative is two nodes
+        draining one queue.
+        """
+        if self.ballot is None:
+            return False
+        try:
+            children = self.client.get_children(self.parent)
+        except (ZKError, OSError):
+            # An unreachable ensemble or a missing parent means "cannot tell", which must
+            # read as "not the leader". Deliberately narrow: a blanket catch here returned
+            # False for a mistyped call too, and that is how leader_identity shipped
+            # broken -- it swallowed its own ValueError and looked like an empty ballot.
+            return False
+        if self.ballot not in children:
+            # The session took the ballot with it. Standing again is the caller's business;
+            # pretending to lead is not.
+            return False
+        return lowest_ballot(children) == self.ballot
+
+    def leader_identity(self):
+        """Whatever the current leader wrote in its ballot, or None.
+
+        This is how a follower finds the leader -- by reading it, rather than by inferring
+        it from an address it probed separately.
+        """
+        try:
+            children = self.client.get_children(self.parent)
+            winner = lowest_ballot(children)
+            if winner is None:
+                return None
+            return self.client.get("%s/%s" % (self.parent, winner))
+        except (ZKError, OSError):
+            return None
+
+    def resign(self):
+        if self.ballot is None:
+            return
+        try:
+            self.client.delete("%s/%s" % (self.parent, self.ballot))
+        except (ZKError, OSError):
+            # Already gone, or the ensemble is unreachable. Either way the ballot is not
+            # ours any more: it is ephemeral, so the session ending finishes the job.
+            pass
+        finally:
+            self.ballot = None
