@@ -53,6 +53,40 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
+## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
+
+Reported from using it. The pages exist and render, which is what "every page is Phoenix"
+measured; it did not measure whether each page can still *do* what its predecessor did. The
+instruction for all of these is **port the old one faithfully first**, then improve.
+
+* **Settings is read-only for things that used to be editable**, the VIP among them. A
+  settings page that displays a value it will not let you change is worse than no page,
+  because it looks like the feature was removed rather than the form.
+* **"Policies" is a page nobody can explain.** Work out what it was meant to be against
+  `static/settings.html`, and either port that faithfully or delete it. An unexplainable
+  page is a bug regardless of which way it resolves.
+* **VM create lost most of its options.** The old form carried the full set; the new one
+  carries a fraction, so a VM that needs anything beyond the defaults cannot be created
+  from the console at all.
+* **Disks and CD-ROM are a single text box each.** They used to be repeatable rows you could
+  add to and remove from, which is how a multi-disk VM gets built. A comma-separated string
+  is not a replacement for a list, and the backend already takes a list -- `disks_list` is
+  parsed from one.
+* **The storage page is a regression** on the one it replaced. Treat the old page as the
+  specification.
+* **Front page uses about 55-60% of the window width.** There is screen real estate going
+  spare on a dashboard whose whole job is density.
+
+**And one that is not a regression but a new capability** the storage layer can nearly
+support: **dedup**. Container compression shipped in `0008`; dedup is the obvious next
+property an operator would expect beside it. It is *not* a settings toggle away, and the
+reason is recorded in **D-23**: dedup needs the extent id map, the middle level between the
+block map and extent groups that makes an extent an addressable thing several vdisks can
+reference. Until that exists there is nothing for a dedup flag to act on. So the honest
+ordering is D-23 first, dedup second, and the settings toggle last -- and D-23 itself is
+blocked on Purah's mark phase learning to traverse both levels, because a flag cannot make
+that safe.
+
 **Coordination and tasks (2026-10-02)**
 
 Four changes that came out of reading a running Nutanix cluster rather than guessing at it.
