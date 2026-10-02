@@ -182,6 +182,38 @@ class TheProbesAreNotLoggedAtInfo(unittest.TestCase):
     entirely is ZooKeeper not narrating a health check.
     """
 
+    def test_every_xml_the_toolkit_ships_actually_parses(self):
+        """The assertions below read the file as text, which is true of a file no parser
+        will accept.
+
+        The shipped logback.xml did not parse: two of its comments used the `--` this
+        repository writes prose with, and XML forbids it inside a comment. logback reported
+        a JoranException and then attached no appender at all, so ZooKeeper logged
+        *nothing* -- not the probes this config exists to quieten, and not the elections and
+        quorum changes it deliberately left at INFO. The journal went quiet, which is what
+        the fix was measured by, so the measurement looked like success.
+        """
+        import xml.etree.ElementTree as ET
+
+        found = []
+        for root, dirs, files in os.walk(HERE):
+            dirs[:] = [d for d in dirs
+                       if d not in (".git", ".claude", "node_modules", "_build", "deps",
+                                    "target")]
+            for name in files:
+                if name.endswith(".xml"):
+                    path = os.path.join(root, name)
+                    found.append(path)
+                    try:
+                        ET.parse(path)
+                    except ET.ParseError as problem:
+                        self.fail("%s is not well-formed XML: %s. A config the parser "
+                                  "rejects is a config that does not apply."
+                                  % (os.path.relpath(path, HERE), problem))
+
+        self.assertIn(os.path.join(HERE, "zookeeper_config", "logback.xml"), found,
+                      "the logging config is gone; this test is now checking nothing")
+
     def test_the_quietened_config_is_in_the_toolkit(self):
         config = read(os.path.join("zookeeper_config", "logback.xml"))
 

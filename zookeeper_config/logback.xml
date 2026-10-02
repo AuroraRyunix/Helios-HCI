@@ -28,14 +28,14 @@
 
   What is quietened, and why:
 
-  Every four-letter-word probe -- the `stat` that asks which node leads the ensemble --
+  Every four-letter-word probe (the `stat` that asks which node leads the ensemble)
   logs two INFO lines, one from NIOServerCnxn and one from the command itself. That is
   the right level for a human running `echo stat | nc`, and the wrong one for something
   a cluster asks continuously: with a daemon on every node checking leadership, it was
   ~11 lines a second into the journal on an idle cluster, forever, and 151 MB of journal.
 
   The probing itself is now shared and cached (helios_zk.leader_ip), which took the rate
-  down but cannot take it to zero -- every daemon process keeps its own cache, and there
+  down but cannot take it to zero, because every daemon process keeps its own cache and there
   are two dozen of them across a cluster. The probes are cheap; it is logging them at
   INFO that is not. So they are logged at WARN, which means not at all unless something
   is actually wrong with one.
