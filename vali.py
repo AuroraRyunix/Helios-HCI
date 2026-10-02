@@ -152,6 +152,58 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
+def run_mtls_spark_api_full(ip, path, payload=None, method="POST"):
+    """Like run_mtls_spark_api, but keeps the status code and the 4xx body.
+
+    The typed API answers a refused parameter with 400 and a sentence naming it, and
+    run_mtls_spark_api reduces every HTTPError to "HTTP Error 400: Bad Request" -- which
+    throws away the only part worth reading. A refused parameter means the call site is
+    wrong, so it has to arrive somewhere a person will see it.
+
+    Returns (status, body, error). status is 0 when the request could not be made.
+    """
+    import urllib.error
+    address, verify_identity = spark_endpoint(ip)
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = verify_identity
+
+    url = f"https://{address}:9099{path}"
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8")), ""
+        except Exception:
+            return exc.code, {}, str(exc)
+    except Exception as e:
+        return 0, {}, str(e)
+
+def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
+    """Act on systemd units on a host. Returns (ok, detail).
+
+    Replaces `run_remote_spark(ip, "systemctl <verb> <names>")`: the unit names travel as
+    parameters the far side matches against its own allow-list, so nothing a caller sends
+    can turn into a different command.
+    """
+    payload = {"action": action, "units": list(units)}
+    if detach:
+        payload["detach"] = True
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    status, body, error = run_mtls_spark_api_full(ip, "/api/v1/host/units", payload)
+    if status == 200:
+        return True, ""
+    if error:
+        return False, error
+    return False, str((body or {}).get("error") or "spark-daemon answered %s" % status)
+
 def get_nvram_restore_cmd(vm_name):
     import base64
     py_code = f"""
@@ -1055,14 +1107,17 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         if net:
             if net.get("type") == "direct":
                 uplink_dev = "ens192"
+                # The host's default route names the uplink, and the daemon reads it
+                # from `ip -j route` and answers with the interface. This used to be
+                # two shell strings -- `ip route get 8.8.8.8 | grep -oP 'dev \\K\\S+'`
+                # with `ip route | grep default | awk '{print $5}'` behind it when the
+                # first found no -P support -- both of which reached for a field that
+                # was already a key in a typed response.
                 try:
-                    rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route get 8.8.8.8 | grep -oP 'dev \\K\\S+'")
-                    if rc_dev == 0 and stdout_dev.strip():
-                        uplink_dev = stdout_dev.strip()
-                    else:
-                        rc_dev, stdout_dev, _ = run_remote_spark(host_ip, "ip route | grep default | awk '{print $5}'")
-                        if rc_dev == 0 and stdout_dev.strip():
-                            uplink_dev = stdout_dev.strip().splitlines()[0]
+                    rc_net, res_net, _ = run_mtls_spark_api(
+                        host_ip, "/api/v1/host/network", None, method="GET")
+                    if rc_net == 0 and str(res_net.get("default_interface") or "").strip():
+                        uplink_dev = str(res_net["default_interface"]).strip()
                 except Exception:
                     pass
                 interfaces_xml += f"""
@@ -1714,7 +1769,11 @@ def process_queue_task(task):
 
                 # Write state file and stop all cluster services on the target host (except spark-daemon)
                 run_remote_spark(target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
-                stop_cmd = "sleep 2 && systemctl stop spectrum catalyst bifrost dagur mimir vali sidon hydra-db gatoway urbosa logos mipha daruk agahnim slate"
+                # Every cluster service except spark-daemon, which has to survive to
+                # be told to start them again.
+                maintenance_units = ["spectrum", "catalyst", "bifrost", "dagur", "mimir",
+                                     "vali", "sidon", "hydra-db", "gatoway", "urbosa",
+                                     "logos", "mipha", "daruk", "agahnim", "slate"]
 
                 # Update task progress to 100 before running the stop command, so the task status is marked completed in ScyllaDB
                 call_catalyst_api("/api/v1/tasks/update", {
@@ -1723,8 +1782,14 @@ def process_queue_task(task):
                     "progress": 100
                 }, method="POST")
 
-                # Run the remote service shutdown in the background
-                run_remote_spark(target_ip, f"({stop_cmd}) >/dev/null 2>&1 < /dev/null &")
+                # Detached, the way the shell form was a backgrounded subshell: vali
+                # is in the list, so waiting for the stop to finish means waiting for
+                # a reply from a service the stop has already killed.
+                ok, detail = spark_unit_action(target_ip, "stop", maintenance_units,
+                                               detach=True)
+                if not ok:
+                    print(f"[Maintenance Catalyst Task] Could not stop services on "
+                          f"{hostname}: {detail}")
                 return True, target_ip
             else:
                 # Revert node status to NORMAL
@@ -1752,8 +1817,13 @@ def process_queue_task(task):
             }, method="POST")
             
             print(f"[Maintenance Catalyst Task] Starting services on host {hostname}...")
-            start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway urbosa logos mipha daruk agahnim slate"
-            run_remote_spark(target_ip, start_cmd)
+            start_units = ["zookeeper", "hydra-db", "sidon", "spectrum", "bifrost",
+                           "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa",
+                           "logos", "mipha", "daruk", "agahnim", "slate"]
+            ok, detail = spark_unit_action(target_ip, "start", start_units)
+            if not ok:
+                print(f"[Maintenance Catalyst Task] Could not start services on "
+                      f"{hostname}: {detail}")
             
             # Update task progress
             call_catalyst_api("/api/v1/tasks/update", {

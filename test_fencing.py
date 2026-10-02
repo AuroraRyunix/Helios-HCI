@@ -45,6 +45,11 @@ def load_module(alias, filename):
     return module
 
 
+def read_source(filename):
+    with io.open(os.path.join(HERE, filename), encoding="utf-8") as handle:
+        return handle.read()
+
+
 mipha = load_module("mipha_fencing_under_test", "mipha.py")
 daemon = load_module("spark_daemon_fencing_under_test", "spark_daemon_decoded.py")
 
@@ -202,6 +207,16 @@ class SparkFenceTests(FenceTestCase):
         self.assertTrue(confirmed)
         self.assertIn("serving no vdisk", detail)
         self.assertTrue(any(c.startswith("systemctl stop libvirtd") for c in calls))
+
+    def test_the_fallback_does_not_depend_on_an_endpoint_the_old_daemon_lacks(self):
+        """It is reached only on a 404, so the daemon it talks to predates
+        `/api/v1/host/units` as surely as it predates the typed fence. A unit call here
+        would 404 too, and a 404 reads exactly like a fence that was attempted."""
+        source = read_source("mipha.py")
+        start = source.index("def legacy_spark_fence(")
+        end = source.index("def bmc_entry_for(", start)
+        self.assertNotIn("spark_unit_action", source[start:end])
+        self.assertIn("systemctl stop libvirtd virtqemud", source[start:end])
 
     def test_the_legacy_commands_exit_status_is_not_evidence(self):
         # This is the original bug, written down. `... || true; pkill -9 qemu || true`

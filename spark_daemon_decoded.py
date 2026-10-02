@@ -839,6 +839,58 @@ AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
 HYDRA_DB_CONTAINER = "systemd-hydra-db"
 VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
 
+# The systemd units this daemon will act on, and the only ones.
+#
+# A unit name arrives as a caller value, so it is checked against a list of known names
+# rather than against a shape. A shape is not enough here: `sshd`, `firewalld` and
+# `systemd-journald` are all perfectly well-formed unit names, so a validator that only
+# asked whether a name *looks* like a unit would stop any of them on request. This is
+# every unit the deployment toolkit installs, plus the three host units the stack drives
+# without owning -- chronyd, which the console's time settings reconfigure, and libvirt's
+# two, which fencing stops.
+#
+# `aether` and `spark` are absent on purpose and their absence is load-bearing.
+# `aether.service` went away with DRBD, and the unit behind Spark is `spark-daemon` and
+# never was `spark` -- yet both names were still being handed to systemctl by callers
+# nobody had updated. As shell strings they failed as unknown units and nothing noticed;
+# as parameters they are refused with a message naming them, which is the difference
+# between a stale call site that is invisible and one that reports itself.
+MANAGED_UNITS = frozenset((
+    "agahnim", "bifrost", "catalyst", "chronyd", "dagur", "daruk", "gatoway",
+    "hydra-db", "hylia", "libvirtd", "logos", "mimir", "mipha", "sidon", "slate",
+    "spark-daemon", "spectrum", "urbosa", "vali", "virtqemud", "zookeeper",
+))
+
+# `daemon-reload` is the odd one out: it takes no units at all, being a reload of
+# systemd's own view of the unit files rather than an operation on any unit.
+UNIT_ACTIONS = ("start", "stop", "restart", "enable", "disable", "daemon-reload")
+UNITLESS_UNIT_ACTIONS = ("daemon-reload",)
+
+# A bound on the argv, not a policy. Every element still has to be in MANAGED_UNITS; this
+# only stops a caller building a hundred-thousand-element command line out of duplicates.
+MAX_UNITS_PER_REQUEST = 32
+
+# Long enough for a container unit to stop, and short enough that this daemon answers
+# before the caller's 120s client timeout gives up on it -- a caller that times out
+# retries, and a retried `restart` is a second restart.
+UNIT_ACTION_TIMEOUT = 90
+
+# `systemctl show` is asked for exactly these. It is used rather than `is-active` because
+# it answers for every unit in one call, distinguishes "inactive" from "there is no such
+# unit", and prints KEY=VALUE -- where `is-active` prints a bare word per line and leaves
+# the caller matching answers to units by position, so one missing line shifts every
+# unit's state onto its neighbour.
+UNIT_SHOW_PROPERTIES = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState")
+
+# Interfaces the console has never offered as an uplink. The rule is by name rather than
+# by asking sysfs whether an interface has a backing device, because a name rule is what
+# this replaces -- a `find /sys/class/net` carrying exactly these `-not -name` clauses --
+# and a bridge or a bond has no backing device either, so the sysfs question would answer
+# differently for interfaces that are genuine uplinks.
+VIRTUAL_INTERFACE_PREFIXES = ("virbr", "br-", "vxlan", "veth", "vnet", "macvtap")
+
+SYS_CLASS_NET = "/sys/class/net"
+
 IPV4_RE = re.compile(r"\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z")
 
 DNSMASQ_LEASE_FILES = ("/var/lib/dnsmasq/dnsmasq.leases", "/var/lib/misc/dnsmasq.leases")
@@ -949,6 +1001,69 @@ def validate_mode(value):
     if value in ALLOWED_MODES:
         return value, None
     return None, "mode must be one of " + ", ".join(ALLOWED_MODES)
+
+
+def validate_unit(value):
+    """A systemd unit name, matched against MANAGED_UNITS.
+
+    Rejected rather than normalised. `zookeeper.service` is not accepted as a spelling of
+    `zookeeper`: two spellings for one unit means the allow-list has to be checked in two
+    forms, and the second form is the one a future edit forgets.
+    """
+    if not isinstance(value, str) or not value:
+        return None, "unit must be a non-empty string"
+    if value not in MANAGED_UNITS:
+        return None, "%s is not a unit this cluster manages" % value
+    return value, None
+
+
+def validate_units(value):
+    """The `units` array: a non-empty list of managed unit names, in the caller's order.
+
+    Nothing is dropped. A list with one unknown name is refused whole rather than
+    filtered, because a filtered list turns "restart these five services" into "restart
+    four of them" and says nothing about the fifth -- which is precisely how `aether`
+    stayed in a caller's restart list for months after the unit was deleted.
+    """
+    if isinstance(value, str):
+        return None, "units must be an array of unit names, not a string"
+    if not isinstance(value, list) or not value:
+        return None, "units must be a non-empty array of unit names"
+    if len(value) > MAX_UNITS_PER_REQUEST:
+        return None, "units must name at most %d units" % MAX_UNITS_PER_REQUEST
+    units = []
+    for entry in value:
+        unit, error = validate_unit(entry)
+        if error:
+            return None, error
+        units.append(unit)
+    return units, None
+
+
+def validate_unit_action(value):
+    """The verb, from a fixed list. Never a flag, and never more than one word."""
+    if value in UNIT_ACTIONS:
+        return value, None
+    return None, "action must be one of " + ", ".join(UNIT_ACTIONS)
+
+
+def validate_port(value):
+    """A TCP port number, as an integer or as its decimal spelling.
+
+    The string form is accepted because this one arrives in a query string, where every
+    value is text; nothing else is. A bool is refused explicitly for the same reason
+    volume sizes refuse one -- `isinstance(True, int)` is True, and `True` would
+    otherwise be read as port 1.
+    """
+    if isinstance(value, bool):
+        return None, "port must be a number between 1 and 65535"
+    if isinstance(value, str):
+        if not value.isdigit():
+            return None, "port must be a number between 1 and 65535"
+        value = int(value)
+    if not isinstance(value, int) or value < 1 or value > 65535:
+        return None, "port must be a number between 1 and 65535"
+    return value, None
 
 
 VIRSH = ["virsh", "-c", "qemu:///system"]
@@ -1311,14 +1426,212 @@ def parse_ip_addr_json(text):
         for addr in link.get("addr_info") or []:
             if not isinstance(addr, dict):
                 continue
+            local = addr.get("local")
+            prefixlen = addr.get("prefixlen")
             addresses.append({
                 "interface": ifname,
                 "family": addr.get("family"),
-                "address": addr.get("local"),
-                "prefixlen": addr.get("prefixlen"),
+                "address": local,
+                "prefixlen": prefixlen,
+                # Spelled out because the element shape was never stated and every caller
+                # that wanted a CIDR rebuilt it from the two fields above -- one of them
+                # by running `ip addr show <iface> | grep 'inet '` through a shell to get
+                # the string back, having already been handed the parts here.
+                "cidr": ("%s/%s" % (local, prefixlen)
+                         if local and prefixlen is not None else None),
                 "scope": addr.get("scope"),
             })
     return addresses
+
+
+def parse_systemctl_show(text):
+    """`systemctl show` output into [{"unit","load_state","active_state",...}].
+
+    Blocks are separated by a blank line and each line is KEY=VALUE. The unit is taken
+    from `Id`, never from the request order, so a systemd that reorders or omits a block
+    cannot report one unit's state under another unit's name.
+    """
+    states = []
+    block = {}
+
+    def flush():
+        if not block:
+            return
+        unit = block.get("Id") or ""
+        if unit.endswith(".service"):
+            unit = unit[:-len(".service")]
+        active = block.get("ActiveState") or "unknown"
+        states.append({
+            "unit": unit,
+            "load_state": block.get("LoadState") or "unknown",
+            "active_state": active,
+            "sub_state": block.get("SubState") or "unknown",
+            "unit_file_state": block.get("UnitFileState") or "unknown",
+            # The one derived field. Every caller of the shell form was comparing
+            # `systemctl is-active` output against the literal "active", and sooner or
+            # later one of them compares it against "activating" or forgets to strip.
+            "active": active == "active",
+        })
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush()
+            block = {}
+            continue
+        key, separator, value = line.partition("=")
+        if separator:
+            block[key.strip()] = value.strip()
+    flush()
+    return states
+
+
+SS_USERS_RE = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
+
+
+def parse_ss_listeners(text):
+    """`ss -ltnp` into [{"protocol","address","port","process","pid"}].
+
+    The port is parsed out as a number, and that is the whole point of the endpoint this
+    feeds. Every caller of the shell form piped `ss -tlnp` into `grep <port>` and treated
+    a match as "the service is listening" -- but `grep 9042` also matches a peer address
+    of 10.0.90.42, a Recv-Q of 9042 and a pid of 9042, so the check could pass on a node
+    where nothing had bound the port at all.
+
+    The header line is skipped by the same guard that skips anything else unexpected: a
+    row is only read when its first column is LISTEN.
+    """
+    listeners = []
+    for raw in text.splitlines():
+        parts = raw.split()
+        if len(parts) < 4 or parts[0] != "LISTEN":
+            continue
+        address, separator, port_text = parts[3].rpartition(":")
+        if not separator or not port_text.isdigit():
+            continue
+        process, pid = None, None
+        match = SS_USERS_RE.search(raw)
+        if match:
+            process, pid = match.group(1), int(match.group(2))
+        listeners.append({
+            "protocol": "tcp",
+            # `[::]` and `*` both mean every address; the brackets are IPv6 notation and
+            # carry no information once the port has been split off.
+            "address": address.strip("[]") or "*",
+            "port": int(port_text),
+            "process": process,
+            "pid": pid,
+        })
+    return listeners
+
+
+def read_listeners():
+    """Every TCP socket this host has in LISTEN. Returns (listeners, error)."""
+    rc, stdout, stderr = run_argv(["ss", "-ltnp"], timeout=20)
+    if rc != 0:
+        return None, (stderr or stdout).strip() or "ss -ltnp failed"
+    return parse_ss_listeners(stdout), None
+
+
+def read_sysfs_value(path):
+    """One line out of sysfs, or None. A missing attribute is not an error here."""
+    try:
+        with open(path, "r") as handle:
+            return handle.read().strip()
+    except OSError:
+        return None
+
+
+def is_virtual_interface(name):
+    """True for the interfaces the console has never offered as an uplink."""
+    if name == "lo":
+        return True
+    return any(name.startswith(prefix) for prefix in VIRTUAL_INTERFACE_PREFIXES)
+
+
+def read_host_interfaces():
+    """Every network interface on this host, with its addresses.
+
+    The console used to build this list by running
+    `find /sys/class/net -type l -not -name lo -not -name "virbr*" ...` on every node
+    through /api/v1/execute, and then a second call per node to read the chosen
+    interface's address off `ip addr show <name> | grep 'inet '`. Both facts are here, so
+    the console asks once and parses nothing.
+
+    Every interface is reported, the excluded ones included, with `virtual` saying which
+    side of that filter it falls on. The daemon's job is to answer what is on the host;
+    deciding which of those a user may pick as an uplink is the console's.
+    """
+    addresses = {}
+    rc, stdout, _ = run_argv(["ip", "-j", "addr"], timeout=20)
+    if rc == 0:
+        for entry in parse_ip_addr_json(stdout):
+            addresses.setdefault(entry["interface"], []).append({
+                key: entry[key] for key in ("family", "address", "prefixlen", "cidr")
+            })
+
+    try:
+        names = sorted(os.listdir(SYS_CLASS_NET))
+    except OSError:
+        # sysfs is how the names were enumerated before and it is the more complete
+        # answer -- an interface that is down has no address and would be invisible in
+        # the `ip addr` reading alone -- but the addresses are a usable fallback.
+        names = sorted(addresses)
+
+    interfaces = []
+    for name in names:
+        interfaces.append({
+            "name": name,
+            "mac": read_sysfs_value(os.path.join(SYS_CLASS_NET, name, "address")),
+            "operstate": read_sysfs_value(os.path.join(SYS_CLASS_NET, name, "operstate")),
+            "virtual": is_virtual_interface(name),
+            "addresses": addresses.get(name, []),
+        })
+    return interfaces
+
+
+def run_unit_action(action, units, timeout=UNIT_ACTION_TIMEOUT):
+    """One systemctl invocation for the whole list.
+
+    All the units go in a single call rather than one call each, because systemd orders a
+    transaction by the units' own dependencies -- stopping fifteen services one at a time
+    in the caller's order is a different operation, and a slower one. `--` ends option
+    parsing; nothing in MANAGED_UNITS starts with a dash, so it guards a case that cannot
+    arise today and costs nothing if the list ever grows one.
+    """
+    argv = ["systemctl", action]
+    if units:
+        argv.append("--")
+        argv.extend(units)
+    return run_argv(argv, timeout=timeout)
+
+
+def read_unit_states(units):
+    """The state of each named unit. Returns (states, error)."""
+    argv = ["systemctl", "show", "--property=" + ",".join(UNIT_SHOW_PROPERTIES), "--"]
+    argv.extend(units)
+    rc, stdout, stderr = run_argv(argv, timeout=30)
+    if rc != 0:
+        return None, (stderr or stdout).strip() or "systemctl show failed"
+    return parse_systemctl_show(stdout), None
+
+
+def schedule_unit_action(action, units, delay=1):
+    """Run a unit action after the HTTP response has been written.
+
+    The same shape as schedule_host_reboot() and for the same reason. `spark-daemon` is
+    itself in the unit list, so restarting it inline means systemd kills this process
+    partway through writing the reply and the caller sees a connection reset it cannot
+    tell from a node that has gone away. The shell form of this was
+    `(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &`.
+    """
+    def worker():
+        time.sleep(delay)
+        rc, stdout, stderr = run_unit_action(action, units)
+        if rc != 0:
+            print("[UNITS] %s %s failed: %s"
+                  % (action, " ".join(units), (stderr or stdout).strip()))
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
 
 
 def _unescape_mount_field(field):
@@ -2936,8 +3249,21 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/host/cpu":
             self.handle_host_cpu()
-        elif path == "/api/v1/host/capabilities":
+            # Not `elif`, and not a fall-through. Written as an if/elif pair, /host/cpu
+            # answered and then carried on to return False, so do_GET wrote a 404 onto
+            # the end of a 200 it had already sent.
+            return True
+        if path == "/api/v1/host/capabilities":
             self.handle_host_capabilities()
+            return True
+        if path == "/api/v1/host/units":
+            self.handle_host_units(parsed)
+            return True
+        if path == "/api/v1/host/listeners":
+            self.handle_host_listeners(parsed)
+            return True
+        if path == "/api/v1/host/interfaces":
+            self.handle_host_interfaces()
             return True
         if path == "/api/v1/host/dhcp-leases":
             self.handle_host_dhcp_leases()
@@ -2991,6 +3317,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/dfs/write":
             self.handle_dfs_write(parsed)
+            return True
+        if path == "/api/v1/host/units":
+            self.handle_host_units_action()
             return True
         if path == "/api/v1/host/reboot":
             self.handle_host_reboot()
@@ -3488,6 +3817,126 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject("Could not parse lsblk output", 500)
             return
         self.send_json_response(200, disks)
+
+    def handle_host_interfaces(self):
+        self.send_json_response(200, {"interfaces": read_host_interfaces()})
+
+    def handle_host_listeners(self, parsed):
+        """Which TCP ports this host is listening on, optionally just the one asked for.
+
+        `?port=` answers with a boolean rather than making the caller scan the array,
+        because the caller that scanned it was `grep` and the whole reason this endpoint
+        exists is that `grep <port>` matches far more than a port.
+        """
+        raw = self.query_param(parsed, "port")
+        port = None
+        if raw is not None:
+            port, error = validate_port(raw)
+            if error:
+                self.reject(error)
+                return
+
+        listeners, error = read_listeners()
+        if error:
+            self.reject(error, 500)
+            return
+
+        if port is None:
+            self.send_json_response(200, {"listeners": listeners})
+            return
+        matched = [entry for entry in listeners if entry["port"] == port]
+        self.send_json_response(200, {
+            "port": port,
+            "listening": bool(matched),
+            "listeners": matched,
+        })
+
+    def handle_host_units(self, parsed):
+        """The state of the managed units, or of the ones named in `?units=`."""
+        raw = self.query_param(parsed, "units")
+        if raw is None:
+            units = sorted(MANAGED_UNITS)
+        else:
+            units, error = validate_units([name.strip() for name in raw.split(",")
+                                           if name.strip()])
+            if error:
+                self.reject(error)
+                return
+
+        states, error = read_unit_states(units)
+        if error:
+            self.reject(error, 500)
+            return
+        self.send_json_response(200, {"units": states})
+
+    def handle_host_units_action(self):
+        """start/stop/restart/enable/disable a list of managed units, or daemon-reload.
+
+        The domain operation here really is "act on this service", the way /host/reboot's
+        is "reboot this host" -- so unlike `rm` or `mkdir` it earns an endpoint. What
+        makes it safe is not the shape of the verb but the allow-list behind the unit
+        name: the caller chooses from MANAGED_UNITS or is refused.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        action, error = validate_unit_action(payload.get("action"))
+        if error:
+            self.reject(error)
+            return
+
+        if action in UNITLESS_UNIT_ACTIONS:
+            if payload.get("units"):
+                self.reject("%s takes no units" % action)
+                return
+            units = []
+        else:
+            units, error = validate_units(payload.get("units"))
+            if error:
+                self.reject(error)
+                return
+
+        detach, error = validate_flag(payload.get("detach"), "detach")
+        if error:
+            self.reject(error)
+            return
+        ignore_failed, error = validate_flag(payload.get("ignore_failed"), "ignore_failed")
+        if error:
+            self.reject(error)
+            return
+
+        if detach:
+            # Nothing is read back, because the point of detaching is that the answer
+            # leaves before the action starts. A caller that needs the outcome asks
+            # GET /api/v1/host/units afterwards.
+            schedule_unit_action(action, units)
+            self.send_json_response(200, {
+                "action": action, "units": units, "detached": True,
+            })
+            return
+
+        rc, stdout, stderr = run_unit_action(action, units)
+        if rc == 0:
+            self.send_json_response(200, {"action": action, "units": units, "ok": True})
+            return
+
+        # A 409 carries the state that says the operation did not take, per the typed
+        # API's rule, so the caller learns which unit is in what state rather than only
+        # that something somewhere failed. `ignore_failed` is what the shell spelled
+        # `|| true`: the failure is still reported in the body, it is just not an error.
+        body = {
+            "action": action,
+            "units": units,
+            "ok": False,
+            "error": (stderr or stdout).strip() or ("systemctl %s failed" % action),
+        }
+        if units:
+            states, _ = read_unit_states(units)
+            if states is not None:
+                body["states"] = states
+        self.send_json_response(200 if ignore_failed else 409, body)
 
     def handle_host_cpu(self):
         self.send_json_response(200, read_host_cpu())
