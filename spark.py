@@ -210,16 +210,15 @@ def show_status_json():
     except Exception:
         pass
         
+    # helios_zk.server_mode reads until the server closes. `Mode:` is the last line of
+    # `stat`, after a line per connected client, so a fixed-size single recv truncates
+    # once a cluster is busy enough -- which is how the leader came to report itself as
+    # a follower while clients came and went.
     is_leader = False
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(("127.0.0.1", 2181))
-        s.sendall(b"stat")
-        resp = s.recv(1024).decode('utf-8', errors='ignore')
-        s.close()
-        if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-            is_leader = True
+        import helios_zk
+        is_leader = helios_zk.server_mode("127.0.0.1", timeout=1.0) in (
+            "leader", "standalone")
     except Exception:
         pass
         
@@ -317,16 +316,15 @@ def show_status():
     except Exception:
         pass
         
+    # helios_zk.server_mode reads until the server closes. `Mode:` is the last line of
+    # `stat`, after a line per connected client, so a fixed-size single recv truncates
+    # once a cluster is busy enough -- which is how the leader came to report itself as
+    # a follower while clients came and went.
     is_leader = False
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.5)
-        s.connect(("127.0.0.1", 2181))
-        s.sendall(b"stat")
-        resp = s.recv(1024).decode('utf-8', errors='ignore')
-        s.close()
-        if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-            is_leader = True
+        import helios_zk
+        is_leader = helios_zk.server_mode("127.0.0.1", timeout=1.0) in (
+            "leader", "standalone")
     except Exception:
         pass
         

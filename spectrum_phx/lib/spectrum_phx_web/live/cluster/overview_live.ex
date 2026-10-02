@@ -20,8 +20,20 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   node, and none of them changes meaningfully between two seconds. Refreshing all of it on
   the liveness clock would multiply the cluster's load by an idle browser tab.
 
-  So liveness refreshes on `@status_interval_ms` and the rest on `@detail_interval_ms`.
-  Manual refresh takes everything, because someone pressing it has a reason.
+  So liveness refreshes on `@status_interval_ms`, telemetry on `@telemetry_interval_ms`,
+  and storage and the guest list on `@detail_interval_ms`. Manual refresh takes everything,
+  because someone pressing it has a reason.
+
+  Telemetry gets its own clock because it is the one an operator stares at to see the
+  cluster breathing, and it is the one that can afford it: `hydra.logos_metrics` is written
+  continuously by `logos.py`, so reading it is one query against rows that already exist
+  rather than a fan-out. Storage and the guest list *are* fan-outs and stay slow.
+
+  The ceiling on how live this can look is `logos.py`'s collection interval, not this one.
+  Reading every two seconds from a table written every thirty shows the same number fifteen
+  times, which looks frozen rather than alive -- so that interval came down with this
+  change. Lowering it further is a trade against row volume: one row per node per interval
+  on a 24h TTL.
 
   ## Nothing here blanks on failure
 
@@ -41,6 +53,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   alias SpectrumPhx.Vms
 
   @status_interval_ms 5_000
+  @telemetry_interval_ms 2_000
   @detail_interval_ms 20_000
 
   @impl true
@@ -48,6 +61,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
     if connected?(socket) do
       Status.subscribe()
       :timer.send_interval(@status_interval_ms, self(), :refresh)
+      :timer.send_interval(@telemetry_interval_ms, self(), :refresh_telemetry)
       :timer.send_interval(@detail_interval_ms, self(), :refresh_detail)
     end
 
@@ -63,6 +77,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   @impl true
   def handle_info(:refresh, socket), do: {:noreply, assign_snapshot(socket, Status.fetch())}
 
+  def handle_info(:refresh_telemetry, socket), do: {:noreply, load_telemetry(socket)}
   def handle_info(:refresh_detail, socket), do: {:noreply, load_detail(socket)}
 
   # Pushed by whichever process is watching ZooKeeper, when one exists.
@@ -88,7 +103,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   # Each source is kept independently: one being unreachable must not blank the others.
   defp load_detail(socket) do
     socket
-    |> assign_detail(:metrics, fn -> Metrics.fetch() end)
+    |> load_telemetry()
     |> assign_detail(:storage, fn -> Storage.snapshot() end)
     |> assign_detail(:guests, fn ->
       case Vms.list_vms() do
@@ -96,6 +111,14 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
         {:error, _reason} -> nil
       end
     end)
+  end
+
+  # Telemetry alone, for the fast clock. One read of hydra.logos_metrics, which logos.py is
+  # already filling -- no fan-out, so it can run at two seconds where storage and the guest
+  # list cannot. assign_series/1 is here because the charts are drawn from the same rows.
+  defp load_telemetry(socket) do
+    socket
+    |> assign_detail(:metrics, fn -> Metrics.fetch() end)
     |> assign_series()
   end
 

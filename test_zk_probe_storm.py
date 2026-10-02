@@ -67,6 +67,44 @@ class NobodyRollsTheirOwnProbe(unittest.TestCase):
     # `connect((ip, 2181))` followed by a `stat` write is the probe, however it is spelled.
     PROBE = re.compile(r"connect\(\((?:[^)]*)\s*,\s*(?:2181|ZK_CLIENT_PORT)\)\)")
 
+    def test_nothing_in_the_tree_opens_its_own_probe(self):
+        """LEADER_CALLERS is a list, and a list is only as good as its entries.
+
+        A tenth private copy lived in `spark_daemon_decoded.py`, which is not on that list,
+        and it was the one that was actually wrong: `recv(1024)` with a 100ms timeout, where
+        `Mode:` is the *last* line of `stat`, printed after a line per connected client --
+        1647 bytes with `Mode:` at byte 1578 on this cluster. So the leader published
+        `zk_leader=False` whenever enough clients were connected to push that line past the
+        first kilobyte, and the console's OdinLeader marker appeared and vanished as clients
+        came and went, which reads as the ensemble re-electing itself.
+
+        Scanning the tree rather than a list is the only version of this that cannot go
+        stale.
+        """
+        offenders = []
+        for name in sorted(os.listdir(HERE)):
+            if not name.endswith(".py") or name.startswith("test_"):
+                continue
+            if name == "helios_zk.py":  # the one module allowed to speak to 2181
+                continue
+            if self.PROBE.search(read(name)):
+                offenders.append(name)
+        self.assertEqual(
+            offenders, [],
+            "these open their own connection to ZooKeeper's client port instead of calling "
+            "helios_zk.server_mode or leader_ip: %s" % ", ".join(offenders))
+
+    def test_the_mode_line_is_read_to_completion(self):
+        """`Mode:` is the last thing `stat` prints. One recv is one segment at best, and the
+        size that is "obviously enough" grows with the number of connected clients -- so the
+        shared probe reads until the server closes rather than picking a buffer size."""
+        source = read("helios_zk.py")
+        block = source[source.index("def server_mode("):]
+        block = block[: block.index("\ndef ")]
+        self.assertIn("while True:", block,
+                      "server_mode takes a single recv, which truncates on a busy cluster")
+        self.assertIn("if not chunk:", block, "it never notices the server closing")
+
     def test_the_leader_probe_lives_in_one_module(self):
         for name in LEADER_CALLERS:
             source = read(name)

@@ -274,7 +274,11 @@ def main():
         except Exception as e:
             print(f"Error in telemetry collection loop: {e}", file=sys.stderr)
 
-        time.sleep(30)
+        # 5s rather than 30s: the console's telemetry panel refreshes every 2s, and a
+        # panel reading a table written every 30 seconds shows the same number fifteen
+        # times -- which looks frozen, not live. The cost is row volume, one row per node
+        # per interval against a 24h TTL, so this is a dial and not a free choice.
+        time.sleep(5)
 
 if __name__ == "__main__":
     main()

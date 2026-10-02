@@ -2265,7 +2265,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         leaders = 0
         followers = 0
         for ip in ips:
-            zk_cmd = "python3 -c \"import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 2181)); s.sendall(b'stat'); print(s.recv(1024).decode('utf-8', errors='ignore'))\""
+            zk_cmd = "python3 -c \"import sys; sys.path.insert(0, '/usr/local/bin'); import helios_zk; print('Mode: ' + (helios_zk.server_mode('127.0.0.1', timeout=2.0) or 'unknown'))\""
             rc_zk, out_zk, _ = run_remote_spark(ip, zk_cmd)
             if rc_zk == 0 and "Mode:" in out_zk:
                 mode = "unknown"
@@ -2477,7 +2477,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         followers = 0
         zk_healthy = True
         for ip in ips:
-            zk_cmd = "python3 -c \"import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 2181)); s.sendall(b'stat'); print(s.recv(1024).decode('utf-8', errors='ignore'))\""
+            zk_cmd = "python3 -c \"import sys; sys.path.insert(0, '/usr/local/bin'); import helios_zk; print('Mode: ' + (helios_zk.server_mode('127.0.0.1', timeout=2.0) or 'unknown'))\""
             rc_zk, out_zk, _ = run_remote_spark(ip, zk_cmd)
             if rc_zk == 0 and "Mode:" in out_zk:
                 mode = "unknown"

@@ -104,7 +104,27 @@ def server_mode(ip, port=2181, timeout=0.2):
         sock.settimeout(timeout)
         sock.connect((ip, port))
         sock.sendall(b"stat")
-        reply = sock.recv(4096).decode("utf-8", errors="ignore").lower()
+        # Read until the server closes, rather than taking one recv and hoping.
+        #
+        # `Mode:` is the *last* line of `stat`, printed after a line per connected client.
+        # On this cluster that is 1647 bytes with `Mode:` at byte 1578 behind 22
+        # connections, so a single recv(4096) happens to work and a single recv(1024) can
+        # never see it -- which is exactly how the node status published zk_leader=False on
+        # the actual leader, making the console's OdinLeader marker appear and disappear
+        # as clients connected and disconnected.
+        #
+        # One recv is one TCP segment's worth at best. The size that is "obviously enough"
+        # scales with the cluster, so it is not a size to pick: the server closes the
+        # connection when it has finished answering, and that is the only reliable end.
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if len(chunks) > 64:  # ~256 KiB; a `stat` reply is never this big.
+                break
+        reply = b"".join(chunks).decode("utf-8", errors="ignore").lower()
     except Exception:
         return None
     finally:

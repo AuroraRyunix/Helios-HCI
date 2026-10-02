@@ -1012,16 +1012,26 @@ def build_node_status():
     except Exception:
         pass
         
+    # The tenth private copy of this probe, and the one that was wrong.
+    #
+    # It read `recv(1024)` once, with a 100ms timeout. `Mode:` is the last line of `stat`,
+    # after a line per connected client -- 1647 bytes with Mode: at 1578 on this cluster --
+    # so the leader published zk_leader=False whenever enough clients were connected to
+    # push that line past the first kilobyte. The console's OdinLeader marker appeared and
+    # vanished as clients came and went, which read as the ensemble re-electing.
+    #
+    # helios_zk.server_mode reads until the server closes and is the same question nine
+    # other callers already ask. test_zk_probe_storm asserts nobody rolls their own; this
+    # copy slipped past it by hardcoding the address instead of using a variable.
     is_leader = False
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.1)
-        s.connect(("127.0.0.1", 2181))
-        s.sendall(b"stat")
-        resp = s.recv(1024).decode('utf-8', errors='ignore')
-        s.close()
-        is_leader = "mode: leader" in resp.lower() or "mode: standalone" in resp.lower()
+        # helios_zk is loaded lazily here, the same way every other user of it in this file
+        # does -- there is no module-level import to lean on.
+        is_leader = _load_helios_zk().server_mode(
+            "127.0.0.1", timeout=1.0) in ("leader", "standalone")
     except Exception:
+        # Unreadable means "not the leader", which is the safe direction: the marker going
+        # missing is a cosmetic loss, claiming leadership wrongly is not.
         pass
         
     maint_status = "NORMAL"
@@ -4640,21 +4650,13 @@ def check_cluster_and_autostart():
     
     for _ in range(5):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(2)
-            s.connect(("127.0.0.1", 2181))
-            s.sendall(b"stat")
-            resp = s.recv(2048).decode('utf-8', errors='ignore')
-            s.close()
-            
-            # Check for Mode: follower or Mode: leader in response
-            for line in resp.splitlines():
-                if line.strip().lower().startswith("mode:"):
-                    mode = line.split(":", 1)[1].strip().lower()
-                    if mode in ["follower", "leader", "standalone"]:
-                        print(f"[AUTOSTART] ZooKeeper quorum established (Mode: {mode}).")
-                        quorum_established = True
-                        break
+            # Reads to completion: `Mode:` is the last line of `stat`, after a line per
+            # connected client, so a fixed-size recv stops seeing it on a busy cluster.
+            mode = _load_helios_zk().server_mode("127.0.0.1", timeout=2.0)
+            if mode in ("follower", "leader", "standalone"):
+                print(f"[AUTOSTART] ZooKeeper quorum established (Mode: {mode}).")
+                quorum_established = True
+                break
         except Exception:
             pass
             
@@ -4727,18 +4729,10 @@ def check_cluster_and_autostart():
             # Check Zookeeper quorum
             quorum_established = False
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(2)
-                s.connect(("127.0.0.1", 2181))
-                s.sendall(b"stat")
-                resp = s.recv(2048).decode('utf-8', errors='ignore')
-                s.close()
-                for line in resp.splitlines():
-                    if line.strip().lower().startswith("mode:"):
-                        mode = line.split(":", 1)[1].strip().lower()
-                        if mode in ["follower", "leader", "standalone"]:
-                            quorum_established = True
-                            break
+                # Same reason as above: read to completion, do not size a buffer.
+                mode = _load_helios_zk().server_mode("127.0.0.1", timeout=2.0)
+                if mode in ("follower", "leader", "standalone"):
+                    quorum_established = True
             except Exception:
                 pass
                 
