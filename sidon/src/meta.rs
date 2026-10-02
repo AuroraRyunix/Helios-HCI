@@ -199,6 +199,14 @@ pub const CLASS_FORMING: &str = "forming";
 /// trips, small enough that one statement stays under Scylla's batch warning threshold.
 pub const MAP_BATCH: usize = 100;
 
+/// Rows per `BEGIN UNLOGGED BATCH` when the heat tally is flushed.
+///
+/// Smaller than `MAP_BATCH` because these rows are in different partitions, which is the
+/// case Scylla warns about: a cross-partition batch is a coordinator fan-out rather than a
+/// single-partition write, so the batch is a round-trip saving and nothing more. Fifty
+/// keeps the saving without building a statement that trips the warning.
+pub const ACCESS_BATCH: usize = 50;
+
 /// Rows are `(extent_index, egroup_id, egroup_offset, length, vdisk_hash)`.
 ///
 /// `vdisk_hash` is per row and not per call, because one vdisk's map can legitimately
@@ -229,6 +237,56 @@ pub fn block_map_batches(
                 length,
                 epoch,
                 *vdisk_hash as i64
+            ));
+        }
+        sql.push_str("APPLY BATCH;");
+        out.push(sql);
+    }
+    out
+}
+
+/// The access-data rows for one heat flush, as chunked `BEGIN UNLOGGED BATCH` statements.
+///
+/// Unlogged for a different reason than `block_map_batches`, and the difference is worth
+/// stating because the two look identical. There, the rows are all in one partition and
+/// unlogged batches are already atomic within one, so the batch log would be paid for a
+/// guarantee that already holds. Here the rows are in *different* partitions -- one per
+/// extent group -- and atomicity across them is not wanted at all: each row is an
+/// independent statement of how hot one group is, and a batch that applied half of them
+/// leaves half the table a flush behind, which is a state the next flush corrects on its
+/// own. Paying the batch log to make a heat table briefly self-consistent would be paying
+/// for the wrong property.
+///
+/// Absolute totals, never increments. A flush that is lost changes nothing and a flush
+/// that is applied twice changes nothing, which is what makes it safe to retry a write
+/// nobody is waiting on -- and is why this is not a counter column.
+///
+/// Rows are `(egroup_id, Counts)`.
+pub fn access_batches(
+    node: &str,
+    since_ms: i64,
+    updated_at_ms: i64,
+    rows: &[(String, crate::heat::Counts)],
+    per_batch: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in rows.chunks(per_batch.max(1)) {
+        let mut sql = String::from("BEGIN UNLOGGED BATCH ");
+        for (egroup_id, c) in chunk {
+            sql.push_str(&format!(
+                "INSERT INTO hydra.dfs_egroup_access (egroup_id, node, reads, writes, \
+                 bytes_read, bytes_written, last_read_ms, last_write_ms, since_ms, \
+                 updated_at_ms) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}); ",
+                cql_str(egroup_id),
+                cql_str(node),
+                c.reads as i64,
+                c.writes as i64,
+                c.bytes_read as i64,
+                c.bytes_written as i64,
+                c.last_read_ms,
+                c.last_write_ms,
+                since_ms,
+                updated_at_ms,
             ));
         }
         sql.push_str("APPLY BATCH;");
@@ -302,6 +360,56 @@ mod tests {
             assert!(sql.contains(&(h as i64).to_string()), "{h:#x} missing from {sql}");
             assert_eq!((h as i64) as u64, h);
         }
+    }
+
+    /// The flush writes the node it observed from, because the row is keyed by it.
+    ///
+    /// Leaving it out would make every node write the same row and each clobber the
+    /// others, and the heat of an extent group read on three nodes would read as the heat
+    /// seen by whichever flushed last -- which is the shape of under-counting that makes a
+    /// tiering pass spill something busy.
+    #[test]
+    fn an_access_flush_names_its_observer_in_every_row() {
+        let rows = vec![
+            ("eg-a".to_string(), crate::heat::Counts {
+                reads: 7, writes: 2, bytes_read: 70, bytes_written: 20,
+                last_read_ms: 900, last_write_ms: 950,
+            }),
+            ("eg-b".to_string(), crate::heat::Counts {
+                reads: 1, ..crate::heat::Counts::default()
+            }),
+        ];
+        let batches = access_batches("10.10.102.41", 100, 1_000, &rows, 1);
+        assert_eq!(batches.len(), 2);
+        for b in &batches {
+            assert!(b.starts_with("BEGIN UNLOGGED BATCH "));
+            assert!(b.ends_with("APPLY BATCH;"));
+            assert!(b.contains("'10.10.102.41'"), "{b}");
+            assert!(b.contains("hydra.dfs_egroup_access"));
+            // The window, on every row: without both ends a total cannot be read as a
+            // rate, and a total that cannot be read as a rate cannot be compared between
+            // two extent groups a daemon has known for different lengths of time.
+            assert!(b.contains("since_ms"));
+            assert!(b.contains("updated_at_ms"));
+        }
+        assert!(batches[0].contains("7"));
+    }
+
+    /// Absolute values, never `reads = reads + n`.
+    ///
+    /// The whole reason the flush can be fired and forgotten: applying it twice is the
+    /// same as applying it once. An increment would make a retried flush a double count
+    /// and a lost one a hole, which is the distributed-counter problem D-8 refused for
+    /// reclamation and there is no reason to accept it for a statistic.
+    #[test]
+    fn an_access_flush_is_idempotent_by_construction() {
+        let rows = vec![("eg-a".to_string(), crate::heat::Counts {
+            reads: 5, ..crate::heat::Counts::default()
+        })];
+        let sql = access_batches("n1", 0, 10, &rows, 100).remove(0);
+        assert!(sql.contains("INSERT INTO"), "{sql}");
+        assert!(!sql.contains("reads + "), "{sql}");
+        assert!(!sql.contains("UPDATE"), "{sql}");
     }
 
     #[test]

@@ -122,6 +122,23 @@ The staged version:
 Only (1) is worth doing before there is mixed media to tier *onto*. The test nodes have
 two identical 300 GB disks, so tiering has nothing to decide.
 
+(2) and (3) both need something this design did not have when it was written: a record of
+what is actually hot. Free-space placement needs no history, which is why it could be
+specified above without one, and temperature placement is nothing *but* history. That gap is
+now filled — `hydra.dfs_egroup_access` records per-extent-group read and write counts and
+last-access times, and `valcli storage.heat` ranks them
+([metadata.md §8](./metadata.md), D-22). It is a prerequisite rather than a companion: step
+(3) cannot decide what to spill down without it, and step (2) cannot tell afterwards whether
+it placed anything well.
+
+What that record does **not** do is move anything. The ranking reports and stops there, and
+the migration half of (3) — copy, repoint, delete, with the map repoint conditional on the
+epoch — is still the largest piece of this document and is still not built. Nor should the
+heat data be read as more exact than it is: the counters are aggregated in memory and
+flushed on a timer, so a crash loses a window of them. That is fine for deciding which disk
+a copy should sit on and is explicitly forbidden as an input to anything deciding whether a
+copy exists.
+
 ### Capacity
 
 `op_capacity` sums across disks and reports per-disk. An operator needs to see one disk
@@ -145,6 +162,8 @@ Roughly, in `sidon`:
 * Placement on seal.
 * `op_capacity` summing and reporting per disk.
 * Purah: treat referenced-but-absent as a repair candidate.
+* Placement on seal by tier, once there is mixed media: the temperature input exists
+  ([metadata.md §8](./metadata.md)); the migration job does not.
 * Provisioning: claim *every* qualifying disk, one filesystem each, mounted under
   `disks/`, rather than one PV in a shared VG.
 

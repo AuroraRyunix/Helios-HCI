@@ -468,6 +468,54 @@ MIGRATIONS = [
             "ALTER TABLE hydra.vms ADD graphics text;",
         ],
     },
+    {
+        "id": "0012-egroup-access-data",
+        "description": (
+            "How often each extent group is read and written, and when it was last "
+            "touched. Nothing about where data is -- this table is *about* extent "
+            "groups rather than part of them, which is what makes it addable at all: "
+            "a sealed extent group is immutable and its footer format is fixed, so "
+            "access data has nowhere to live except beside it. "
+            "Preserves I-3 and I-7 by construction: it holds no egroup_id that is a "
+            "reference, so Purah's mark phase does not read it and nothing here can "
+            "keep a dead extent group alive or hide a live one. A row whose extent "
+            "group has been reclaimed is a stale label, not a dangling pointer, and "
+            "the sweep deletes it when it deletes the group. "
+            "Prerequisite for the tiering in docs/dfs/multi_disk.md, which cannot "
+            "decide what to spill down without somewhere to record what is hot."
+        ),
+        "statements": [
+            # Keyed ((egroup_id), node), one row per observer, for three reasons.
+            #
+            # First, it makes every row single-writer. The counters are flushed as
+            # absolute values rather than increments -- there is no read-modify-write
+            # and no counter column -- so two nodes sharing a row would each clobber
+            # the other's totals on every flush, and the heat of a group being read on
+            # two nodes would read as the heat seen by whichever flushed last.
+            #
+            # Second, one extent group's accesses are a single-partition read, which is
+            # what the ranking pass does per candidate.
+            #
+            # Third, it is the shape dfs_egroup_replicas already set for "facts about
+            # an extent group, per node", and consistency beats novelty.
+            #
+            # `since_ms` is what makes the counters readable. They are not lifetime
+            # totals: they count from when the observing daemon opened the window,
+            # which is its start or the first access it saw after a flush of zero. Heat
+            # is therefore a *rate* over (updated_at_ms - since_ms), which is what
+            # tiering wants anyway, and a restart resets the window visibly instead of
+            # silently losing counts.
+            #
+            # bigint epoch-ms and text ids: the convention every other dfs_* table
+            # uses, and the shape Daruk's serializer and the Rust client both handle
+            # without type negotiation.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_egroup_access "
+            "( egroup_id text, node text, reads bigint, writes bigint, "
+            "bytes_read bigint, bytes_written bigint, last_read_ms bigint, "
+            "last_write_ms bigint, since_ms bigint, updated_at_ms bigint, "
+            "PRIMARY KEY ((egroup_id), node) );",
+        ],
+    },
 ]
 
 

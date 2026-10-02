@@ -16,6 +16,7 @@ mod control;
 mod crc;
 mod err;
 mod extent;
+mod heat;
 mod journal;
 mod meta;
 mod nbd;
@@ -221,6 +222,21 @@ fn main() {
         // two together are this node's placement policy, and an operator wondering why a
         // vdisk has one copy should be able to answer it from the log.
         cluster_ftt: cluster_ftt(),
+        // How often the extent-group access tally reaches Hydra, and how many groups it
+        // may hold.
+        //
+        // Sixty seconds, which is two orders of magnitude more often than the sweep and
+        // for the opposite reason: the sweep is slow because reclaiming early costs data,
+        // while the only thing a slow flush buys here is a bigger window of counts to lose
+        // in a crash. Zero turns the tally off, counters included, for an operator who
+        // wants the read path to do nothing it does not have to -- and `purah-heat` then
+        // ranks nothing, which is the honest consequence rather than a silent one.
+        //
+        // 200,000 groups is a generous cap on a node whose disks hold about 75,000 per
+        // 300 GB. It is there so that a bug producing unbounded extent-group ids cannot
+        // make heat accounting the reason a node runs out of memory.
+        access_flush: Duration::from_secs(env_bytes("SIDON_ACCESS_FLUSH", 60)),
+        access_capacity: env_bytes("SIDON_ACCESS_CAPACITY", 200_000) as usize,
     };
 
     println!(

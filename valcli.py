@@ -1056,6 +1056,96 @@ def cmd_storage_replicate(target, everything=False):
         print("asks for, or no spare node was free to take one.")
 
 
+def cmd_storage_heat(limit=10):
+    """Which extent groups each node reads and writes most, and which have gone cold.
+
+    The operator's window onto `hydra.dfs_egroup_access`. Sidon counts every extent read
+    and every extent a drain appends, in memory, and flushes the totals to Hydra on a
+    timer; this asks each node to flush and rank, so the answer describes the cluster now
+    rather than as of the last tick.
+
+    Asked of the daemon rather than computed from the table here, for the same reason
+    `storage.cleanup_orphaned` asks Purah rather than globbing files: a second
+    implementation of the scoring would be a second answer to "is this hot", and the two
+    would disagree in exactly the situation somebody is using them to settle. The formula
+    lives in Purah, and every column it uses is in the report so the arithmetic can be
+    checked by hand.
+
+    **The counters are approximate and they are meant to be.** They live in the daemon
+    between flushes, so a node that crashed lost everything it had counted since its last
+    one and started a fresh window. This data decides which disk a copy of something should
+    sit on, never whether the copy exists, so the cost of being wrong about it is a
+    misplaced extent group -- which is why it is allowed to be cheap enough to record on
+    the read path at all.
+
+    Nothing here moves data. Tiering -- spilling cold extent groups to slower disks -- is
+    the work this ranking exists to feed, and it is designed in docs/dfs/multi_disk.md and
+    not built.
+    """
+    hosts = []
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            hosts = json.load(handle).get("hosts", [])
+    except Exception:
+        pass
+    if not hosts:
+        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
+
+    answered = 0
+    for host in hosts:
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(
+            ip, "/api/v1/dfs/vdisk", {"op": "purah-heat", "limit": limit})
+        if rc != 0 or not isinstance(body, dict) or "hot" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] no access data: %s" % (label, detail))
+            continue
+        answered += 1
+        print()
+        print("%s -- %d extent group(s) held, %d with access data"
+              % (label, body.get("inventory") or 0, body.get("observed") or 0))
+        dropped = body.get("dropped") or 0
+        if dropped:
+            # Said before the ranking, not after it. A capped tally means the ranking
+            # describes part of the node, and a partial ranking read as a complete one is
+            # how a tiering decision spills something busy.
+            print("  WARNING: the tally is at capacity; %d extent group(s) are uncounted,"
+                  % dropped)
+            print("  so some of what follows reads as cold because it was never measured.")
+        _print_heat_rows("hottest", body.get("hot") or [])
+        _print_heat_rows("coldest", body.get("cold") or [])
+        never = body.get("unobserved_count") or 0
+        if never:
+            print("  %d extent group(s) have no access data at all. Nothing has read or"
+                  % never)
+            print("  written them since the daemons holding them last started, which makes")
+            print("  them the coldest thing on the node -- or the least measured.")
+
+    if not answered:
+        print()
+        print("No node reported access data. Either sidon is older than the tally, or it")
+        print("is disabled on these nodes (SIDON_ACCESS_FLUSH=0), in which case nothing is")
+        print("counted and tiering has no input to work from.")
+
+
+def _print_heat_rows(label, rows):
+    """One ranked group per line. Rates rather than raw totals, because a total means
+    nothing without the window it was counted over and the window is per row."""
+    if not rows:
+        return
+    print("  %s:" % label)
+    for row in rows:
+        window_ms = row.get("window_ms") or 0
+        hours = (window_ms / 3600000.0) if window_ms else 0
+        idle_ms = row.get("idle_ms") or 0
+        print("    %-40s %6s r %6s w  over %5.1fh  idle %5.1fh  heat %8.1f  %s"
+              % (row.get("egroup_id"), row.get("reads"), row.get("writes"), hours,
+                 idle_ms / 3600000.0, row.get("heat") or 0.0, row.get("state")))
+
+
 def cmd_storage_cleanup_orphaned():
     """Report reclaimable space, and ask Purah to reclaim it.
 
@@ -2294,6 +2384,7 @@ def print_usage():
     print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
     print("                                          asked for, copies it actually has")
     print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
+    print("  valcli storage.heat [N]                 Hottest and coldest extent groups per node")
     print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
@@ -2429,6 +2520,15 @@ def main():
             print("Usage: valcli storage.children <vdisk_id>")
             sys.exit(1)
         cmd_storage_children(sys.argv[2])
+    elif cmd == "storage.heat":
+        limit = 10
+        if len(sys.argv) > 2:
+            try:
+                limit = max(1, min(1000, int(sys.argv[2])))
+            except ValueError:
+                print("Usage: valcli storage.heat [N]")
+                sys.exit(1)
+        cmd_storage_heat(limit)
     elif cmd == "storage.replication":
         cmd_storage_replication()
     elif cmd == "storage.replicate":
