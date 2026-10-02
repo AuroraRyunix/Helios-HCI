@@ -93,7 +93,7 @@ Measured against a Nutanix cluster's Ergon, read directly with `ecli task.list`:
 | Type (`kVmSetPowerState`) | `task_type` | every scheduled job has the action `execute`; the type is what says what each one did |
 | Creation + completion, UTC | `created_at` + `completed_at` | `updated_at` moves on every progress report, so a completed task's duration was unknowable from the row |
 
-Added by migration `0011-catalyst-task-tree`. Every column is nullable and nothing rewrites an
+Added by migration `0011-catalyst-task-parent through 0016-catalyst-task-sequence`. Every column is nullable and nothing rewrites an
 existing row: a task recorded before the migration keeps reading correctly with all of them
 null, which is the truth about it. Backfilling a component or a sequence id would be inventing
 a fact about work that has already happened.

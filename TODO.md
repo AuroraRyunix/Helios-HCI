@@ -72,7 +72,7 @@ The notes themselves are deliberately not in this repository.
   [docs/service_leadership.md](docs/service_leadership.md).
 * **Tasks outlive the leader.** `recover_stuck_tasks()` aborted every pending task at
   startup, which is data loss written down as recovery. Tasks now carry a parent, an owning
-  component and a per-component sequence (migration `0011-catalyst-task-tree`), and recovery
+  component and a per-component sequence (migrations `0011-catalyst-task-parent` through `0016-catalyst-task-sequence`), and recovery
   re-queues what was pending and fails what was in flight with a reason saying its progress
   is unrecorded. `component` is not `service`: a Hylia upgrade step runs on the `dagur`
   queue, and recording it as a Dagur task loses who asked for it.
@@ -91,7 +91,7 @@ The notes themselves are deliberately not in this repository.
   what each requires, and readiness meaning *answering* rather than `active`. systemd keeps
   lifecycle; no supervisor was built, because systemd already is one -- the one place this
   deliberately diverges from how Nutanix does it.
-* **Extent groups record how hot they are** (migration `0012-egroup-access-data`), which
+* **Extent groups record how hot they are** (migration `0017-egroup-access-data`), which
   `docs/dfs/multi_disk.md` needs before tiering can decide what to spill down. Counters are
   absolute totals per observer, so a flush is safe to fire and forget. The data may decide
   *where a copy of bytes goes, never whether it exists*.

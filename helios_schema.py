@@ -469,65 +469,91 @@ MIGRATIONS = [
         ],
     },
     {
-        "id": "0011-catalyst-task-tree",
+        "id": "0011-catalyst-task-parent",
         "description": (
-            "What a task framework has to record about a task, which Catalyst did not. "
-            "Three gaps, and the table is where all three start. A task has no parent, "
-            "so a rolling upgrade -- which genuinely is a tree, one job per node, each "
-            "with steps -- is reported as a flat list of unrelated rows, and the "
-            "relationship mipha.py does keep lives inside the JSON payload where no "
-            "query can reach it. A task has no component, so 'what has Hylia been "
-            "doing' is answerable only by guessing from the queue name of whoever "
-            "happened to execute it. And a task has no ordering other than its "
-            "millisecond timestamp, so two tasks created in the same millisecond have no "
-            "defined order at all and 'the next task after this one' is not a question "
-            "the table can answer. Ergon, which this follows, carries a parent uuid, a "
-            "component, and a per-component monotonic sequence id on every task."
+            "What a task framework has to record about a task, which Catalyst did not, "
+            "split across one migration per column. "
+            "A task had no parent, so a rolling upgrade -- which genuinely is a tree, one "
+            "job per node, each with steps -- was reported as a flat list of unrelated "
+            "rows, and the relationship mipha.py does keep lived inside the JSON payload "
+            "where no query could reach it. "
+            "One ALTER per migration, and a bare ADD. This was first written as six "
+            "statements in one migration using ADD IF NOT EXISTS, on the reasoning that a "
+            "failure on the fourth would leave three applied and unrecorded and a bare ADD "
+            "could never survive the re-run. The reasoning was right and the syntax does "
+            "not exist here: ScyllaDB rejects `ADD IF NOT EXISTS` outright "
+            "(`no viable alternative at input 'IF'`), which crash-looped Catalyst on every "
+            "node until it was split. One statement per migration gets the same property "
+            "from the ledger instead of from the dialect -- a failure loses exactly one "
+            "column and the re-run starts at it."
         ),
         "statements": [
-            # ADD IF NOT EXISTS, where 0008 and 0010 used a bare ADD. The difference is
-            # that those were one statement each: a migration with several ALTERs that
-            # fails on its fourth leaves the first three applied and unrecorded, and a
-            # bare ADD raises on the re-run, so the migration could never complete. The
-            # ledger makes a second run unusual, not impossible, which is exactly the case
-            # idempotence is for.
-            #
-            # Every column is nullable and nothing rewrites an existing row. A task
-            # recorded before this migration keeps reading correctly: no parent, no
-            # component, no sequence -- which is the truth about it, and is what the
-            # console already renders for a task whose payload names no parent.
-            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS parent_task_id uuid;",
-            # The component that *owns* the task, which is not `service`. `service` is the
-            # queue a task is dispatched through -- the executor -- and the two differ
-            # exactly where the hierarchy matters: a Hylia upgrade step runs on the
-            # `dagur` queue, and recording it as a Dagur task loses who asked for it.
-            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS component text;",
-            # bigint, and per component. Not a cluster-wide counter: a single sequence
-            # would have to be claimed by every submitter in the cluster for every task,
-            # which is a contended compare-and-swap on the submission path. Per component
-            # the contention is between that component's own submitters, and the number
-            # means what an operator reads it as -- the n-th thing this component did.
-            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS sequence_id bigint;",
-            # The *kind* of task, as distinct from the verb the executor was handed.
-            # `action` is what the worker switches on and must keep its exact spelling;
-            # `task_type` is what the task is, and a parent whose children are all
-            # `action = 'execute'` has nothing else to say what each one did.
-            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS task_type text;",
-            # When it finished, which `updated_at` cannot answer: that column moves on
-            # every progress report, so the duration of a completed task was unknowable
-            # from the row even though both ends of it had been written.
-            "ALTER TABLE hydra.catalyst_tasks ADD IF NOT EXISTS completed_at timestamp;",
-            # The sequence allocator. One row per component, holding the next number to
-            # hand out, claimed with a compare-and-swap -- see claim_task_sequence. A
-            # blind increment is a lost update, and a lost update here is two tasks
-            # carrying the same sequence id, which is the one thing the column exists to
-            # make impossible.
+            "ALTER TABLE hydra.catalyst_tasks ADD parent_task_id uuid;",
+        ],
+    },
+    {
+        "id": "0012-catalyst-task-component",
+        "description": (
+            "The component that *owns* the task, which is not `service`. `service` is the "
+            "queue a task is dispatched through -- the executor -- and the two differ "
+            "exactly where the hierarchy matters: a Hylia upgrade step runs on the `dagur` "
+            "queue, and recording it as a Dagur task loses who asked for it."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.catalyst_tasks ADD component text;",
+        ],
+    },
+    {
+        "id": "0013-catalyst-task-sequence-id",
+        "description": (
+            "A per-component monotonic sequence. Not a cluster-wide counter: a single "
+            "sequence would have to be claimed by every submitter for every task, which is "
+            "a contended compare-and-swap on the submission path. Per component the "
+            "contention is between that component's own submitters, and the number means "
+            "what an operator reads it as -- the n-th thing this component did."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.catalyst_tasks ADD sequence_id bigint;",
+        ],
+    },
+    {
+        "id": "0014-catalyst-task-type",
+        "description": (
+            "The *kind* of task, as distinct from the verb the executor was handed. "
+            "`action` is what the worker switches on and must keep its exact spelling; "
+            "`task_type` is what the task is, and a parent whose children are all "
+            "`action = 'execute'` has nothing else to say what each one did."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.catalyst_tasks ADD task_type text;",
+        ],
+    },
+    {
+        "id": "0015-catalyst-task-completed-at",
+        "description": (
+            "When it finished, which `updated_at` cannot answer: that column moves on every "
+            "progress report, so the duration of a completed task was unknowable from the "
+            "row even though both ends of it had been written."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.catalyst_tasks ADD completed_at timestamp;",
+        ],
+    },
+    {
+        "id": "0016-catalyst-task-sequence",
+        "description": (
+            "The sequence allocator. One row per component holding the next number to hand "
+            "out, claimed with a compare-and-swap -- see claim_task_sequence. A blind "
+            "increment is a lost update, and a lost update here is two tasks carrying the "
+            "same sequence id, which is the one thing the column exists to make impossible."
+        ),
+        "statements": [
             "CREATE TABLE IF NOT EXISTS hydra.catalyst_task_sequence "
             "( component text PRIMARY KEY, next_sequence_id bigint );",
         ],
     },
     {
-        "id": "0012-egroup-access-data",
+        "id": "0017-egroup-access-data",
         "description": (
             "How often each extent group is read and written, and when it was last "
             "touched. Nothing about where data is -- this table is *about* extent "

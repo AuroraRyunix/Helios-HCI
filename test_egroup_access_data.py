@@ -53,7 +53,7 @@ METADATA_MD = os.path.join(HERE, "docs", "dfs", "metadata.md")
 DECISIONS_MD = os.path.join(HERE, "docs", "dfs", "decisions.md")
 MULTI_DISK_MD = os.path.join(HERE, "docs", "dfs", "multi_disk.md")
 
-MIGRATION_ID = "0012-egroup-access-data"
+MIGRATION_ID = "0017-egroup-access-data"
 
 
 def read(path):

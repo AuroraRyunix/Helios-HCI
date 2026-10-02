@@ -48,28 +48,51 @@ class TheMigrationIsSafeToRerun(unittest.TestCase):
     """A migration is recorded once, which makes a re-run unusual rather than impossible.
 
     0008 and 0010 each added one column with a bare `ALTER TABLE ... ADD`, and got away with
-    it because one statement either applies or does not. This one adds five columns and a
-    table. If the fourth statement fails, the first three are applied and the migration is
-    not recorded -- so the next start runs it again, and a bare ADD raises on a column that
-    now exists. The migration could never complete, and the failure would look like a
-    database problem rather than like the migration having no way forward.
+    it because one statement either applies or does not. These six columns first shipped as
+    one migration that used `ADD IF NOT EXISTS` to get the same safety -- correct reasoning,
+    and a syntax this ScyllaDB does not have. It answered `no viable alternative at input
+    'IF'`, and because `ensure_schema` runs before Catalyst serves, every node crash-looped.
+
+    So the safety comes from the ledger instead: one statement per migration, which is what
+    `test_a_migration_that_alters_does_so_once` pins. A failure loses exactly one column, it
+    is not recorded, and the re-run starts at it.
     """
+
+    COLUMN_MIGRATIONS = (
+        "0011-catalyst-task-parent",
+        "0012-catalyst-task-component",
+        "0013-catalyst-task-sequence-id",
+        "0014-catalyst-task-type",
+        "0015-catalyst-task-completed-at",
+        "0016-catalyst-task-sequence",
+    )
 
     def setUp(self):
         self.schema = load("helios_schema.py", "helios_schema_tasks")
-        self.migration = next(m for m in self.schema.MIGRATIONS
-                              if m["id"] == "0011-catalyst-task-tree")
+        by_id = {m["id"]: m for m in self.schema.MIGRATIONS}
+        for name in self.COLUMN_MIGRATIONS:
+            self.assertIn(name, by_id, "%s is gone from the migration list" % name)
+        self.migrations = [by_id[name] for name in self.COLUMN_MIGRATIONS]
+        # Kept so the per-statement assertions below read over the whole change.
+        self.migration = {"statements": [st for m in self.migrations
+                                         for st in m["statements"]]}
 
-    def test_every_column_is_added_conditionally(self):
-        for statement in self.migration["statements"]:
-            if "ALTER TABLE" not in statement:
-                continue
-            self.assertIn("ADD IF NOT EXISTS", statement,
-                          "a bare ADD cannot survive the re-run that a partial apply "
-                          "forces: %s" % statement)
+    def test_each_column_arrives_in_its_own_migration(self):
+        """The property that replaced ADD IF NOT EXISTS. One ALTER per migration means a
+        partial apply is recorded as far as it got."""
+        for migration in self.migrations:
+            alters = [st for st in migration["statements"]
+                      if st.strip().upper().startswith("ALTER")]
+            self.assertLessEqual(len(alters), 1, migration["id"])
+            for statement in alters:
+                self.assertNotIn(
+                    "IF NOT EXISTS", statement.upper(),
+                    "%s would not parse on the deployed ScyllaDB" % migration["id"])
 
     def test_the_sequence_table_is_created_conditionally(self):
-        creates = [s for s in self.migration["statements"] if "CREATE TABLE" in s]
+        """CREATE TABLE IF NOT EXISTS *is* supported -- it is only the column form that is
+        not -- so the allocator keeps its guard."""
+        creates = [st for st in self.migration["statements"] if "CREATE TABLE" in st]
         self.assertTrue(creates, "the sequence allocator has no table")
         for statement in creates:
             self.assertIn("IF NOT EXISTS", statement)
@@ -94,21 +117,58 @@ class TheMigrationIsSafeToRerun(unittest.TestCase):
                        "task_type text", "completed_at timestamp"):
             self.assertIn(column, statements)
 
+    def test_no_migration_uses_a_column_guard_this_dialect_does_not_have(self):
+        """`ALTER TABLE ... ADD IF NOT EXISTS` does not parse on the deployed ScyllaDB.
+
+        These columns first shipped as one migration using exactly that, on the correct
+        reasoning that a six-statement migration failing on its fourth leaves three applied
+        and unrecorded. The reasoning survived; the syntax did not -- the server answered
+        `no viable alternative at input 'IF'` and Catalyst crash-looped on every node, 171
+        failures in two minutes, because `ensure_schema` runs before it serves. A rollout
+        found it and no test could have, which is why this one exists.
+        """
+        for migration in self.schema.MIGRATIONS:
+            for statement in migration["statements"]:
+                if statement.strip().upper().startswith("ALTER"):
+                    self.assertNotIn(
+                        "IF NOT EXISTS", statement.upper(),
+                        "%s uses ALTER ... IF NOT EXISTS, which this ScyllaDB rejects"
+                        % migration["id"])
+
+    def test_a_migration_that_alters_does_so_once(self):
+        """Re-runnability comes from the ledger, not from the dialect.
+
+        One ALTER per migration means a failure loses exactly one column and the re-run
+        starts at it. Asserted only for migrations added after this was understood: 0006 and
+        0008 carry several and are already applied everywhere, and editing a shipped
+        migration changes its checksum, which is the thing the checksum exists to catch.
+        """
+        grandfathered = {"0006-dfs-replication", "0008-container-compression"}
+        for migration in self.schema.MIGRATIONS:
+            if migration["id"] in grandfathered:
+                continue
+            alters = [st for st in migration["statements"]
+                      if st.strip().upper().startswith("ALTER")]
+            self.assertLessEqual(
+                len(alters), 1,
+                "%s has %d ALTERs; split it so a partial failure is recoverable"
+                % (migration["id"], len(alters)))
+
     def test_nothing_before_it_moved(self):
         """Editing a shipped migration gives two clusters different schemas and both the
         belief that they are up to date. The checksum catches that; this catches reordering.
 
         Deliberately not asserting this is the *last* migration. It was when it was written,
-        and `0012-egroup-access-data` landed beside it the same day -- an assertion that
+        and `0017-egroup-access-data` landed beside it the same day -- an assertion that
         breaks whenever someone appends a migration is testing the calendar, not the
         property. What has to hold is that the order is stable and the ids are unique.
         """
         ids = [m["id"] for m in self.schema.MIGRATIONS]
-        self.assertIn("0011-catalyst-task-tree", ids)
+        self.assertIn("0011-catalyst-task-parent", ids)
         self.assertEqual(sorted(ids), ids, "the migrations are no longer in order")
         self.assertEqual(len(set(ids)), len(ids), "two migrations share an id")
         # And it still sits after everything that shipped before it.
-        self.assertGreater(ids.index("0011-catalyst-task-tree"), ids.index("0010-vm-graphics"))
+        self.assertGreater(ids.index("0011-catalyst-task-parent"), ids.index("0010-vm-graphics"))
 
 
 class TheTaskRowCarriesItsPlaceInTheTree(unittest.TestCase):
