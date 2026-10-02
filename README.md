@@ -256,10 +256,10 @@ cluster zk-promote --node 10.10.102.43 --replacing 10.10.102.223
 # Query cluster-wide status (verbose includes per-node extent store and vdisk info)
 cluster status --verbose
 
-# Start all containerized and native services across the cluster
+# Declare the cluster started: each node converges toward it and reports what it achieved
 cluster start
 
-# Stop all services, drain every journal, and unmount the extent store
+# Shut guests down, declare the cluster stopped, then quiesce the state store last
 cluster stop
 
 # Wipe cluster configurations, databases, and formats claimed drives
@@ -363,7 +363,11 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.
+<<<<<<< HEAD
 * [docs/cluster_state.md](./docs/cluster_state.md) - ZooKeeper-backed cluster state: desired state, ephemeral per-node liveness, convergence driven by a watch rather than a poll, how `helios_zk` re-arms a watch across a reconnect, and the probe fallback.
+=======
+* [docs/cluster_state.md](./docs/cluster_state.md) - ZooKeeper-backed cluster state: desired state, the declared service table and dependency ordering the reconcile loop walks, ephemeral per-node liveness, published per-service errors, and the probe fallback.
+>>>>>>> worktree-agent-a2eef5f06721ba794
 * [docs/deployment.md](./docs/deployment.md) - The Podman Quadlet deployment model and the update-rollout pipeline.
 * [docs/setup-guide.md](./docs/setup-guide.md) - Local dev prerequisites and workflow.
 * [docs/hci_master_architecture_guide.md](./docs/hci_master_architecture_guide.md) - The deepest existing architecture reference (1500+ lines).

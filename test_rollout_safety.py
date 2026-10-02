@@ -241,6 +241,8 @@ class TheReconcilerDoesNotFightAStopInProgress(unittest.TestCase):
         class FakeCompleted:
             def __init__(self, out):
                 self.stdout = out
+                self.stderr = b""
+                self.returncode = 0
 
         class FakeSubprocess:
             DEVNULL = -3
@@ -254,8 +256,15 @@ class TheReconcilerDoesNotFightAStopInProgress(unittest.TestCase):
                 return FakeCompleted(b"")
 
         scope = load_functions(
-            SPARK, {"converge_to_desired_state"},
+            SPARK, {"converge_to_desired_state", "unit_active_states", "service_entry",
+                    "service_is_disabled", "service_is_ready", "listening_ports",
+                    "convergence_gate",
+                    "drain_local_storage"},
             {"MANAGED_SERVICE_ORDER": list(self.ORDER),
+             # Two services with nothing to wait on, so what is asserted below is the
+             # in-flight handling and not the dependency gates.
+             "MANAGED_SERVICES": tuple({"unit": unit, "requires": ()} for unit in self.ORDER),
+             "SERVICE_SETTING_PROBES": {},
              "subprocess": FakeSubprocess,
              "print": lambda *a, **k: None})
         scope["converge_to_desired_state"](desired)

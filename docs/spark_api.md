@@ -274,6 +274,23 @@ joined string back.
 `repair` runs asynchronously and returns immediately; it can take a long time on a large
 keyspace and must not block an HTTP request.
 
+### Cluster lifecycle
+
+| Method | Path | Body | Returns |
+| :-- | :-- | :-- | :-- |
+| POST | `/api/v1/cluster/state` | `{"desired":"started"\|"stopped","stop_state_store":bool}` | `{"desired","state_store_stopped"}` |
+
+The endpoint `cluster start` and `cluster stop` are built out of, and it takes **no service
+list** -- deliberately, because a caller that could name a service would be a second place
+the start ordering lives, and the copy nobody reads is the one that goes stale. It starts
+the store the desired state lives in, writes the state, and returns; each node's reconcile
+loop decides what to start or stop, in what order, and when it is finished. See
+[cluster_state.md](./cluster_state.md#3-one-actor-per-service).
+
+`stop_state_store` is the one thing a reconcile loop cannot do for itself: stop the store
+it reads its instructions from. It is accepted only alongside `desired: "stopped"`, and
+`cluster stop` sends it after every node reports it has nothing left running.
+
 ## Migration
 
 Each call site moves from `run_remote_spark(ip, "<shell string>")` to

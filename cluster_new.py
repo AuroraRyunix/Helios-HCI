@@ -143,30 +143,93 @@ def render_node_block(ip, data, use_color=True):
         pids = svc.get("pids", [])
         restarts = svc.get("restarts", 0)
         pid_str = f"{gr}[{', '.join(map(str, pids))}]{x}" if pids else ""
+        # The node publishes why a service is not where it was asked to be, so the reason
+        # is printed next to the service rather than left in a journal on that host.
+        error = str(svc.get("last_error") or "").strip().splitlines()
+        err_str = f" {r}{error[0][:160]}{x}" if error else ""
         if status == "UP":
             note = f" {y}({restarts} restarts){x}" if restarts else ""
-            lines.append(f"                    {name:<16}   {g}UP{x}       {pid_str}{note}")
+            lines.append(f"                    {name:<16}   {g}UP{x}       {pid_str}{note}{err_str}")
         elif status == "FLAPPING":
-            lines.append(f"                    {name:<16}   {y}FLAPPING{x} {gr}restarting, {restarts} restarts{x}")
+            lines.append(f"                    {name:<16}   {y}FLAPPING{x} {gr}restarting, {restarts} restarts{x}{err_str}")
         else:
             note = f" {gr}({restarts} restarts){x}" if restarts else ""
-            lines.append(f"                    {name:<16}   {r}DOWN{x}{note}")
+            lines.append(f"                    {name:<16}   {r}DOWN{x}{note}{err_str}")
+    # A service that is declared but switched off is reported as such. Omitting it would
+    # leave an operator unable to tell "disabled" from "nobody ever deployed it".
+    for name in data.get("disabled_services") or []:
+        lines.append(f"                    {name:<16}   {gr}DISABLED{x}")
     return "\n".join(lines)
 
 
-# Services expected to be running on a healthy node once the cluster is started.
-# Urbosa is excluded: it is gated behind the urbosa_enabled cluster setting.
-EXPECTED_SERVICES = [s for s in SERVICE_DISPLAY_ORDER if s != "Urbosa"]
+# The reported services a start or a stop is waiting on.
+#
+# ZooKeeper and Spark are reported by every node but are deliberately not waited on: the
+# store that holds the desired state and the daemon that converges toward it are both
+# running throughout, so a stop that waited for their PIDs to go away would wait forever.
+# Urbosa stays in the list -- a node that has it switched off reports it as disabled
+# instead of reporting it here, and a disabled service is not something to wait for.
+EXPECTED_SERVICES = [s for s in SERVICE_DISPLAY_ORDER if s not in ("ZooKeeper", "Spark")]
+
+# How many consecutive passes a node may report nothing before the wait stops counting on
+# it. A node that is down is not a reason to abandon an operation the rest of the cluster
+# is completing: it converges when it returns, because the desired state outlives it.
+UNREPORTED_NODE_ATTEMPTS = 10
 
 
-def wait_for_cluster_convergence(expected_ips, timeout=300, poll=3):
-    """Poll ZooKeeper until every node reports every expected service up.
+def service_is_compliant(svc, op):
+    """Compliance is PIDs, and it is symmetric.
 
-    The cluster reports its own convergence rather than the CLI declaring success the
-    moment it has finished issuing start commands. Each node's spark-daemon republishes
-    its state every few seconds, so this reflects what actually came up.
+    A started service has processes; a stopped one does not. Not `status`: `active` is
+    what a unit reports during each restart window of a crash loop, so a service that has
+    never once stayed up answers "started" as often as not. A PID list is a fact.
+    """
+    pids = svc.get("pids") or []
+    return bool(pids) if op == "start" else not pids
+
+
+def published_service_errors(nodes, ips):
+    """Every (node, service, error) the cluster is currently publishing."""
+    found = []
+    for ip in sorted(ips):
+        services = (nodes.get(ip) or {}).get("services", {})
+        for name in SERVICE_DISPLAY_ORDER:
+            error = str((services.get(name) or {}).get("last_error") or "").strip()
+            if error:
+                found.append((ip, name, error.splitlines()[0]))
+    return found
+
+
+def print_cluster_table(nodes, ips):
+    """The published state of every node, rendered the way `cluster status` renders it."""
+    for ip in sorted(ips):
+        if ip in nodes:
+            print(render_node_block(ip, nodes[ip]))
+        else:
+            print(f"\n        Host: {BOLD}{ip}{RESET} {RED}Down{RESET} {GRAY}(no ZooKeeper registration){RESET}")
+
+
+def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
+    """Watch the cluster converge toward the state that was declared, or stop at an error.
+
+    The CLI issues no service commands: it declared an intent, and each node's reconcile
+    loop decides what to start or stop, in what order, and when it is finished. So this is
+    the whole of `cluster start` after the declaration -- it observes, it does not drive.
+
+    Three things it does not do:
+
+      * it does not decide convergence for itself. Each node publishes `retry`, its own
+        answer to "am I done?", and this loops on that as well as on compliance;
+      * it does not read a journal. A service that will not come up publishes
+        `last_error`, and one of those **aborts the wait immediately** and prints the full
+        table -- waiting out a timeout to then say nothing useful is the failure mode this
+        replaces;
+      * it does not give up on an unreachable node. That node is retried a bounded number
+        of times and then reported, because the desired state outlives it.
     """
     deadline = time.time() + timeout
+    attempts = {ip: 0 for ip in expected_ips}
+    waiting = set(expected_ips)
     last_line = None
     while time.time() < deadline:
         state = zk_read_cluster_state()
@@ -179,31 +242,55 @@ def wait_for_cluster_convergence(expected_ips, timeout=300, poll=3):
             continue
 
         nodes = state["nodes"]
-        missing = [ip for ip in expected_ips if ip not in nodes]
+        failures = published_service_errors(nodes, waiting)
+        if failures:
+            print(f"  {RED}Convergence stopped: a node is reporting a service error.{RESET}")
+            for ip, name, error in failures:
+                print(f"  {RED}[{ip}] {name}: {error}{RESET}")
+            print_cluster_table(nodes, expected_ips)
+            return False
+
         pending = {}
-        for ip in expected_ips:
+        unreported = []
+        node_retry = False
+        for ip in sorted(waiting):
             data = nodes.get(ip)
             if not data:
+                attempts[ip] += 1
+                if attempts[ip] >= UNREPORTED_NODE_ATTEMPTS:
+                    print(f"  {YELLOW}{ip} has not reported in {attempts[ip]} attempts; "
+                          f"continuing without it.{RESET}")
+                    waiting.discard(ip)
+                else:
+                    unreported.append(ip)
+                continue
+            # A host in maintenance is published as such and its reconcile loop refuses to
+            # act on the desired state, so waiting for it to converge would wait forever.
+            # The CLI used to ask every node for /etc/hci/maintenance.state over mTLS
+            # before starting anything; the node already says so in what it publishes.
+            if data.get("maintenance_status", "NORMAL") != "NORMAL":
+                print(f"  {YELLOW}{ip} is in maintenance; its services are left as they "
+                      f"are.{RESET}")
+                waiting.discard(ip)
                 continue
             services = data.get("services", {})
-            not_up = [n for n in EXPECTED_SERVICES
-                      if n in services and services[n].get("status") != "UP"]
-            if not_up:
-                pending[ip] = not_up
+            not_compliant = [n for n in EXPECTED_SERVICES
+                             if n in services and not service_is_compliant(services[n], op)]
+            if not_compliant:
+                pending[ip] = not_compliant
+            if data.get("retry"):
+                node_retry = True
 
-        if not missing and not pending:
-            elapsed = int(timeout - (deadline - time.time()))
-            print(f"  {GREEN}All nodes converged.{RESET}")
+        if not unreported and not pending and not node_retry:
+            print(f"  {GREEN}All nodes report the cluster {'started' if op == 'start' else 'stopped'}.{RESET}")
             return True
 
         parts = []
-        if missing:
-            parts.append("nodes not reporting: " + ", ".join(sorted(missing)))
+        if unreported:
+            parts.append("nodes not reporting: " + ", ".join(sorted(unreported)))
         for ip in sorted(pending):
-            shown = pending[ip][:6]
-            more = f" (+{len(pending[ip]) - len(shown)} more)" if len(pending[ip]) > len(shown) else ""
-            parts.append(f"{ip}: {', '.join(shown)}{more}")
-        line = "Waiting for " + "; ".join(parts)
+            parts.append(f"{ip}: {', '.join(pending[ip])}")
+        line = "Waiting for " + ("; ".join(parts) or "nodes to finish converging")
         if line != last_line:
             print(f"  {line}")
             last_line = line
@@ -211,6 +298,30 @@ def wait_for_cluster_convergence(expected_ips, timeout=300, poll=3):
 
     print(f"  {YELLOW}Timed out after {timeout}s waiting for convergence.{RESET}")
     return False
+
+
+def declare_cluster_state(ips, desired, stop_state_store=False):
+    """Declare the desired cluster state on every reachable node. Returns the ones that
+    took it.
+
+    One call per node and no service list: the node starts the store the state lives in,
+    writes the state, and its reconcile loop does the rest. A node that cannot be reached
+    is reported and skipped rather than failing the operation -- the state is cluster-wide,
+    so one node recording it is enough for every node to read it.
+    """
+    payload = {"desired": desired}
+    if stop_state_store:
+        payload["stop_state_store"] = True
+    declared = []
+    for ip in ips:
+        status, body, error = run_mtls_spark_api_full(
+            ip, "/api/v1/cluster/state", payload, timeout=120)
+        if status == 200:
+            declared.append(ip)
+        else:
+            print(f"  {YELLOW}[{ip}] did not record the desired state: "
+                  f"{spark_api_error(status, body, error)}{RESET}")
+    return declared
 
 
 def get_cluster_ips():
@@ -2307,6 +2418,19 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             sys.exit(1)
 
     elif args.command == "start":
+        # `cluster start` names no service, and that is the property worth keeping.
+        #
+        # It used to start ZooKeeper, then ScyllaDB, then Daruk, then thirteen more units
+        # by hand, waiting on each -- and then wait again for the reconcile loop to
+        # converge the same services toward the state recorded in its first phase. Two
+        # actors drove every service on a cold start, which is what the visible flapping
+        # was, and the CLI's copy of the ordering was free to rot: it went on restarting
+        # `aether` for months after the unit was deleted, failing every start on a service
+        # that does not exist, because nothing read that list but the CLI itself.
+        #
+        # What is left is what a declaration is: record the intent on each node, then watch
+        # what the nodes publish. The ordering lives in the reconcile loop, next to the
+        # thing that acts on it.
         print("==========================================================")
         print("                 Starting HCI Cluster                     ")
         print("==========================================================")
@@ -2317,204 +2441,37 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         import atexit
         atexit.register(release_cluster_lock, ips)
 
-        
-        # 1. Verify spark-daemon is running on all hosts
-        spark_online = {}
-        for ip in ips:
-            print(f"[{ip}] Contacting spark-daemon on port 9099...")
-            rc, stdout, stderr = run_remote_spark(ip, "echo 'online'")
-            if rc == 0 and "online" in stdout.lower():
-                print(f"[{ip}] spark-daemon is online.")
-                spark_online[ip] = True
-            else:
-                print(f"[{ip}] ERROR: spark-daemon is offline or unreachable: {stderr or 'Connection timeout'}")
-                spark_online[ip] = False
-                
-        if not all(spark_online.values()):
-            print("[ERROR] Cannot start cluster: spark-daemon must be online on all nodes.")
+        print("\n--- Declaring the desired cluster state ---")
+        declared = declare_cluster_state(ips, "started")
+        if not declared:
+            print("[ERROR] No node accepted the desired cluster state; nothing was started.")
             sys.exit(1)
+        print(f"Desired state 'started' recorded via {', '.join(declared)}.")
 
-        # Identify nodes in maintenance mode
-        maintenance_ips = []
-        for ip in ips:
-            rc, _, _ = run_remote_spark(ip, "test -f /etc/hci/maintenance.state")
-            if rc == 0:
-                maintenance_ips.append(ip)
-                print(f"[{ip}] Note: Host is currently in maintenance mode.")
-
-        # 2. Start ZooKeeper Service
-        print("\n--- Phase 1: Starting ZooKeeper Service ---")
-        for ip in ips:
-            print(f"[{ip}] Starting ZooKeeper service...")
-            unit_action_checked([ip], "restart", ["zookeeper"])
-            
-        # Poll ZooKeeper active state
-        for ip in ips:
-            print(f"[{ip}] Waiting for ZooKeeper service to become active...")
-            for _ in range(30):
-                if unit_is_active(ip, "zookeeper"):
-                    print(f"[{ip}] ZooKeeper service is active.")
-                    break
-                time.sleep(1)
-            else:
-                print(f"[{ip}] ERROR: ZooKeeper failed to start.")
-                sys.exit(1)
-                
-        # Wait for consensus quorum
-        print("Waiting for ZooKeeper quorum consensus to form...")
-        time.sleep(4)
-        
-        leader_found = False
-        for ip in ips:
-            cmd_stat = "echo stat | nc 127.0.0.1 2181"
-            rc_s, out_s, _ = run_remote_spark(ip, cmd_stat)
-            if rc_s == 0 and ("mode: leader" in out_s.lower() or "mode: standalone" in out_s.lower()):
-                print(f"[{ip}] Found ZooKeeper Leader node.")
-                leader_found = True
-        if not leader_found:
-            print("[WARNING] ZooKeeper leader node could not be identified, continuing anyway.")
-
-        # 3. Set cluster state in ZooKeeper
-        print("Writing cluster state 'started' to ZooKeeper consensus...")
-        zk_set = False
-        for ip in ips:
-            rc_state, _, _ = run_checked_cmd(ip, "podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 set /cluster_state started || podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 create /cluster_state started")
-            if rc_state == 0:
-                zk_set = True
-                break
-        if zk_set:
-            print("Cluster state successfully set to 'started' in ZooKeeper.")
-        else:
-            print("[WARNING] Could not write cluster state to ZooKeeper.")
-
-        # 4. Start ScyllaDB (hydra-db)
-        print("\n--- Phase 2: Starting ScyllaDB Database Service ---")
-        for ip in ips:
-            print(f"[{ip}] Starting hydra-db systemd service...")
-            unit_action_checked([ip], "restart", ["hydra-db"])
-            
-        for ip in ips:
-            print(f"[{ip}] Waiting for hydra-db service to become active...")
-            for _ in range(35):
-                if unit_is_active(ip, "hydra-db"):
-                    break
-                time.sleep(1)
-            else:
-                print(f"[{ip}] ERROR: hydra-db service failed to start.")
-                sys.exit(1)
-                
-        for ip in ips:
-            print(f"[{ip}] Waiting for ScyllaDB to start listening on port 9042...")
-            last_progress = None
-            for i in range(300):
-                if port_listening(ip, 9042):
-                    print(f"[{ip}] ScyllaDB is accepting database connections on port 9042.")
-                    break
-                
-                # Check and print bootstrap/repair progress every 10 seconds
-                if i % 10 == 0:
-                    progress = get_scylla_bootstrap_progress(ip)
-                    if progress and progress != last_progress:
-                        print(f"[{ip}] ScyllaDB Bootstrap Status: {progress}")
-                        last_progress = progress
-                time.sleep(1)
-            else:
-                print(f"[{ip}] ERROR: ScyllaDB database connection port 9042 timeout.")
-                sys.exit(1)
-
-        # 4.5 Start Daruk Query Proxy
-        for ip in ips:
-            print(f"[{ip}] Starting Daruk ScyllaDB query proxy...")
-            unit_action_checked([ip], "restart", ["daruk"])
-
-        print("Waiting for Daruk query proxy to listen on port 9043 on all nodes...")
-        for ip in ips:
-            daruk_ready = False
-            for _ in range(30):
-                if port_listening(ip, 9043):
-                    daruk_ready = True
-                    break
-                time.sleep(1)
-            if not daruk_ready:
-                print(f"[ERROR] Daruk query proxy failed to listen on port 9043 on {ip}")
-                sys.exit(1)
-        print("Daruk query proxy is ready on all nodes.")
-
-        # There is no aether phase. `cluster start` restarted `aether` here and then
-        # waited thirty seconds for it to report active, exiting when it never did --
-        # which it never could, because the unit went away with DRBD. `cluster create`
-        # lost its copy of this phase when the unit was deleted and this one was
-        # missed, so every `cluster start` since has failed on a service that does not
-        # exist. Sidon starts with the rest of the services below.
-
-        # 5. Start remaining services
-        print("\n--- Phase 3: Starting Core Workload & Coordination Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
-        if check_urbosa_enabled():
-            services.append("urbosa")
-        service_ports = {
-            "spectrum": 8443,
-            "vali": 9095,
-            "catalyst": 9091,
-            "agahnim": 8081,
-            "slate": 443
-        }
-        
-        for svc in services:
-            for ip in ips:
-                if ip in maintenance_ips:
-                    continue
-                print(f"[{ip}] Starting systemd service: {svc}...")
-                unit_action_checked([ip], "restart", [svc])
-                
-        for svc in services:
-            for ip in ips:
-                if ip in maintenance_ips:
-                    continue
-                print(f"[{ip}] Verifying service {svc} is active...")
-                for _ in range(30):
-                    if unit_is_active(ip, svc):
-                        break
-                    time.sleep(1)
-                else:
-                    print(f"[{ip}] ERROR: Service '{svc}' failed to enter active state.")
-                    sys.exit(1)
-                    
-                if svc in service_ports:
-                    port = service_ports[svc]
-                    print(f"[{ip}] Waiting for service {svc} to listen on port {port}...")
-                    for _ in range(45):
-                        if port_listening(ip, port):
-                            print(f"[{ip}] Service {svc} is listening on port {port}.")
-                            break
-                        time.sleep(1)
-                    else:
-                        print(f"[{ip}] ERROR: Service {svc} failed to listen on port {port}.")
-                        sys.exit(1)
-                        
-        # 7. Wait for every node to report convergence through ZooKeeper. The desired
-        # state was recorded in Phase 1; each node's spark-daemon converges toward it and
-        # republishes what it actually achieved, so this observes the cluster rather than
-        # assuming the start commands above were sufficient.
-        print("\n--- Phase 5: Waiting for Cluster Convergence ---")
-        converged = wait_for_cluster_convergence(ips)
+        print("\n--- Waiting for the cluster to converge ---")
+        converged = wait_until_error_or_done(ips, op="start")
 
         print("\n--- Cluster Services Status ---")
         final_state = zk_read_cluster_state()
         if final_state and final_state["nodes"]:
-            for ip in sorted(final_state["nodes"]):
-                print(render_node_block(ip, final_state["nodes"][ip]))
+            print_cluster_table(final_state["nodes"], ips)
         else:
             print("  (ZooKeeper unreachable; run 'cluster status' for a direct probe)")
         print("==========================================================")
 
         if not converged:
-            print(f"{YELLOW}Cluster started but did not fully converge. See the table above.{RESET}")
+            print(f"{RED}The cluster did not converge. The table above says which service "
+                  f"on which node, and why.{RESET}")
+            sys.exit(1)
 
-        # 8. Post-Start Health Verification Checks
-        print("\n--- Phase 6: Cluster Health Verification ---")
-        
-        # A. ZooKeeper Consensus Check
+        # Post-start verification of the things no single node can see about itself.
+        #
+        # Per-service liveness is not checked here any more: a node publishes its own
+        # services and the wait above already refused to finish until every one of them
+        # reported a PID. What is left is the cluster-level properties -- one ensemble
+        # leader, peers that can reach each other, and the diagnostic suite.
+        print("\n--- Cluster Health Verification ---")
+
         print("Checking ZooKeeper consensus quorum...")
         leaders = 0
         followers = 0
@@ -2538,19 +2495,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             sys.exit(1)
         print("  ZooKeeper quorum is healthy.")
 
-        # B. Every node's data path is up.
+        # Peers can reach each other.
         #
         # This used to wait up to 45 seconds for Mipha to promote the linstor-db DRBD
         # volume and bring a controller up on one node, then confirm it was listening on
         # 3370. There is no controller and no election: each node runs its own daemon and
-        # answers for itself, so the check is per node and there is nothing to elect.
-        for ip in ips:
-            if not unit_is_active(ip, "sidon"):
-                print(f"[ERROR] Cluster start verification failed: sidon is not active on {ip}.")
-                sys.exit(1)
-        print("  The storage data path is running on every node.")
-
-        # C. Peers can reach each other
+        # answers for itself, so the question is reachability rather than leadership.
         print("Verifying every node's storage daemon is reachable from its peers...")
         for ip in ips:
             rc_p, out_p, _ = run_remote_spark(ip, SIDON_PEERS_CMD)
@@ -2565,10 +2515,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             unreachable = [peer.get("node") for peer in (body.get("peers") or [])
                            if not peer.get("reachable")]
             if unreachable:
-                # Not fatal to cluster creation: writes are only refused when a node in a
-                # vdisk's own replica set is down, and no vdisk exists yet. But a peer
-                # that cannot be reached now will not be reachable when one does, so it
-                # is said out loud rather than discovered by the first failed write.
+                # Not fatal: writes are only refused when a node in a vdisk's own replica
+                # set is down. But a peer that cannot be reached now will not be reachable
+                # when one is, so it is said out loud rather than discovered by the first
+                # failed write.
                 print(f"[WARNING] [{ip}] cannot reach: {', '.join(str(u) for u in unreachable)}")
             else:
                 print(f"[{ip}] all peers reachable.")
@@ -2592,18 +2542,27 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("==========================================================")
 
     elif args.command == "stop":
+        # The same shape as `cluster start`, inverted, and it names no service either.
+        #
+        # It used to stop twelve workload units, then drain the storage journals, then
+        # unmount, then stop the storage and database units, then ZooKeeper -- an ordering
+        # that only ran when an operator typed this command, and a second copy of the one
+        # the reconcile loop already walks in reverse. The draining moved into the loop,
+        # next to the stop it has to precede.
         print("==========================================================")
         print("                 Stopping HCI Cluster                     ")
         print("==========================================================")
-        
+
         ips = get_cluster_ips()
         acquire_cluster_lock(ips)
         import atexit
         atexit.register(release_cluster_lock, ips)
 
-        
-        # 1. Stop running VMs step-by-step
-        print("--- Step 1: Stopping running VMs step-by-step ---")
+        # Guests first, and from the CLI rather than the loop: a VM is cluster state, not
+        # node state. Which host a guest is on is a scheduling decision recorded in the
+        # database, so shutting guests down is one decision taken once, not fifteen nodes
+        # each deciding about whatever they happen to be running.
+        print("--- Stopping running VMs ---")
         rc, stdout, err = run_cql_query("SELECT JSON name, host_ip, state FROM hydra.vms;")
         vms = []
         if rc == 0:
@@ -2614,7 +2573,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                         vms.append(json.loads(line))
                     except:
                         pass
-        
+
         running_vms = [v for v in vms if v.get("state") in ["Running", "start", "on"]]
         if running_vms:
             for vm in running_vms:
@@ -2624,7 +2583,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     continue
                 print(f"Stopping VM '{name}' on host {host_ip}...")
                 run_remote_spark(host_ip, f"virsh shutdown {name}")
-                
+
                 # Poll up to 5 seconds
                 stopped = False
                 for _ in range(5):
@@ -2636,91 +2595,46 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 if not stopped:
                     print(f"VM '{name}' did not shut down gracefully. Forcing power off (destroy)...")
                     run_remote_spark(host_ip, f"virsh destroy {name}")
-                
+
                 # Update ScyllaDB
                 run_cql_query(f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';")
         else:
             print("No running VMs detected.")
-            
-        # 2. Set cluster state to stopped in ZooKeeper
-        print("\n--- Step 2: Setting cluster state in ZooKeeper ---")
-        zk_set = False
-        for ip in get_cluster_ips():
-            rc_zk, _, _ = run_remote_spark(ip, "podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 set /cluster_state stopped")
-            if rc_zk == 0:
-                zk_set = True
-                break
-        if zk_set:
-            print("Cluster state set to 'stopped' in ZooKeeper.")
-        else:
-            print("Warning: Failed to set cluster state to stopped in ZooKeeper.")
-            
-        # 3. Stop workload and HA services in parallel
-        print("\n--- Step 3: Stopping workload and HA services in parallel across all nodes ---")
-        workload_services = ["hylia", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate"]
-        for svc in workload_services:
-            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            unit_action_parallel(ips, "stop", [svc])
-            
-        # 3.5. Drain the journals, then unmount.
-        #
-        # This used to wait up to two minutes for DRBD resyncs to finish before shutting
-        # down, because a node stopped mid-resync came back with a stale replica that had
-        # to catch up block by block. There is no resync: extent groups are immutable, so
-        # a returning node's copies are correct or absent, and Purah restores absent ones.
-        #
-        # What is worth doing before stopping is draining. Every acknowledged write is
-        # already durable in the journal, so stopping right now would lose nothing -- but
-        # a full journal is one the next start has to replay, and draining here turns a
-        # slow startup into a slightly slower shutdown. Detach does it, because a clean
-        # detach drains before it releases.
-        print("\n--- Step 3.5: Draining journals before shutdown ---")
-        for ip in ips:
-            rc_l, out_l, _ = run_remote_spark(ip, SIDON_LIST_CMD)
-            if rc_l != 0 or not out_l.strip():
-                continue
-            try:
-                attached = json.loads(out_l.strip().splitlines()[0]).get("attached") or []
-            except Exception:
-                continue
-            for vdisk in attached:
-                vdisk_id = vdisk.get("vdisk_id")
-                # A forwarded vdisk has nothing local to drain: the owner holds the
-                # journal and draining it is the owner's business.
-                if not vdisk_id or vdisk.get("role") == "forwarding":
-                    continue
-                run_remote_spark(ip, sidon_detach_cmd(vdisk_id))
-        print("Journals drained.")
 
-        # 4. Unmount the extent store in parallel
-        print("\n--- Step 4: Unmounting the extent store across all nodes ---")
-        run_parallel(ips, "umount -l /var/lib/hci/sidon || true")
+        print("\n--- Declaring the desired cluster state ---")
+        declared = declare_cluster_state(ips, "stopped")
+        if not declared:
+            print("[ERROR] No node accepted the desired cluster state; nothing was stopped.")
+            sys.exit(1)
+        print(f"Desired state 'stopped' recorded via {', '.join(declared)}.")
 
-        # 5. Stop storage and controller services in parallel
-        print("\n--- Step 5: Stopping storage services in parallel across all nodes ---")
-        storage_services = ["sidon", "daruk"]
-        if check_urbosa_enabled():
-            storage_services.insert(0, "urbosa")
-        for svc in storage_services:
-            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            unit_action_parallel(ips, "stop", [svc])
+        print("\n--- Waiting for the cluster to converge ---")
+        converged = wait_until_error_or_done(ips, op="stop")
 
-        # Nothing to bring down at the block layer. `drbdadm down all` detached every
-        # resource from its device; a vdisk was never attached to one.
+        if not converged:
+            print("\n--- Cluster Services Status ---")
+            final_state = zk_read_cluster_state()
+            if final_state and final_state["nodes"]:
+                print_cluster_table(final_state["nodes"], ips)
+            print("==========================================================")
+            # The state store stays up on purpose. Taking it down now would leave the
+            # services that are still running with no desired state to read, and a node
+            # that cannot read intent changes nothing -- services up, no way to converge
+            # them, and nothing to say why.
+            print(f"{RED}The cluster did not converge; the state store was left running "
+                  f"so the stop can be retried.{RESET}")
+            sys.exit(1)
 
-        # 7. Stop database and coordination services in parallel
-        print("\n--- Step 7: Stopping database and coordination services in parallel across all nodes ---")
-        db_services = ["hydra-db", "zookeeper"]
-        for svc in db_services:
-            print(f"Stopping systemd service '{svc}' in parallel across all nodes...")
-            unit_action_parallel(ips, "stop", [svc])
-            
-        # 8. Restart spark-daemon asynchronously in parallel
-        print("\n--- Step 8: Restarting spark-daemon asynchronously in parallel ---")
-        # Detached, because spark-daemon is the daemon answering the request:
-        # restarting it inline kills the connection the reply travels back on.
-        unit_action_parallel(ips, "restart", ["spark-daemon"], detach=True)
-            
+        # Last, and only once everything that reads it has gone: the store the desired
+        # state lives in. This is an explicit operator instruction to quiesce, which is why
+        # it is a separate call and not something the reconcile loop could ever do -- a loop
+        # cannot stop the thing it reads its instructions from.
+        print("\n--- Quiescing the state store ---")
+        quiesced = declare_cluster_state(ips, "stopped", stop_state_store=True)
+        if len(quiesced) != len(ips):
+            print(f"{YELLOW}The state store is still running on: "
+                  f"{', '.join(sorted(set(ips) - set(quiesced)))}{RESET}")
+
         print("Stop command execution completed.")
 
     elif args.command == "destroy":

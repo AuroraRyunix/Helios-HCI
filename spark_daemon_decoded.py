@@ -385,12 +385,60 @@ FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as 
 # those fails and yields no PID at all.
 CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
 
-# Services this node manages when converging toward the desired cluster state, in start
-# order. Stop order is the reverse. ZooKeeper is deliberately absent: it is the store the
-# desired state lives in, so it is started before convergence begins and stopped last.
-MANAGED_SERVICE_ORDER = ["hydra-db", "daruk", "sidon", "spectrum",
-                         "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
-                         "mimir", "logos", "mipha", "gatoway", "urbosa", "hylia"]
+# The declared inventory this node manages when converging toward the desired cluster
+# state, in start order. Stop order is the reverse.
+#
+# This table is the single place that knows what a node runs and what has to be answering
+# before the next thing is started. `cluster start` used to carry a second copy of that
+# ordering -- start ZooKeeper, start ScyllaDB, wait for 9042, start Daruk, wait for 9043,
+# start the rest -- while this loop carried the first, so a cold start had two actors
+# driving every service and the CLI's copy was free to rot unnoticed. It did: it went on
+# restarting `aether` for months after the unit was deleted with DRBD, failing every
+# `cluster start` on a service that does not exist, and the loop never objected because
+# the loop never read it.
+#
+# `requires` is a gate, not documentation: a service is not started until everything it
+# requires is *ready*, and ready means answering on its port where one is declared rather
+# than merely `active`. hydra-db reports active long before ScyllaDB accepts a query on
+# 9042, and everything that stores anything was being started into that window.
+#
+# `setting` marks a service that is declared but may be switched off. A disabled service
+# stays in the table rather than disappearing from it, so "off" is a state the cluster can
+# report instead of an absence an operator has to infer -- the mistake that removing
+# `aether` from the units but not from the inventory made in the other direction.
+#
+# ZooKeeper is deliberately absent: it is the store the desired state lives in, so it is
+# started before convergence can begin and stopped after it has finished. `spark-daemon`
+# is absent for a similar reason -- it is the process running this loop.
+MANAGED_SERVICES = (
+    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042},
+    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043},
+    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True},
+    {"unit": "spectrum", "display": "Spectrum", "requires": ("daruk",)},
+    {"unit": "slate", "display": "Slate", "requires": ("daruk",)},
+    {"unit": "agahnim", "display": "Agahnim", "requires": ("daruk",)},
+    {"unit": "catalyst", "display": "Catalyst", "requires": ("daruk",)},
+    {"unit": "vali", "display": "Vali", "requires": ("daruk", "sidon")},
+    {"unit": "bifrost", "display": "Bifrost", "requires": ("daruk",)},
+    {"unit": "dagur", "display": "Dagur", "requires": ("daruk",)},
+    {"unit": "mimir", "display": "Mimir", "requires": ("daruk",)},
+    {"unit": "logos", "display": "Logos", "requires": ("daruk",)},
+    {"unit": "mipha", "display": "Mipha", "requires": ("daruk",)},
+    {"unit": "gatoway", "display": "Gatoway", "requires": ("daruk",)},
+    {"unit": "urbosa", "display": "Urbosa", "requires": ("daruk",), "setting": "urbosa_enabled"},
+    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",)},
+)
+MANAGED_SERVICE_ORDER = [entry["unit"] for entry in MANAGED_SERVICES]
+
+# Cluster settings that gate a declared service, and how to read them.
+SERVICE_SETTING_PROBES = {"urbosa_enabled": "check_urbosa_enabled"}
+
+# Why each managed service is not in the state it was asked to be in, keyed by unit name,
+# and whether this node still believes it can make progress. Both are published in the
+# node status: a caller learns *why* from the same document it learns *what* from, and
+# never has to be told to go and read a journal on three hosts.
+SERVICE_ERRORS = {}
+CONVERGE_RETRY = False
 
 
 def _load_helios_zk():
@@ -473,63 +521,310 @@ def read_desired_cluster_state(client):
         return None
 
 
+def service_entry(unit):
+    """The declared table row for a unit, or an empty one for a unit not in the table."""
+    for entry in MANAGED_SERVICES:
+        if entry.get("unit") == unit:
+            return entry
+    return {}
+
+
+def service_is_disabled(unit):
+    """True for a service that is declared in the table but switched off by a setting.
+
+    A setting that cannot be read is not an answer, so it is not taken as one: an
+    unreadable `urbosa_enabled` leaves Urbosa managed exactly as before rather than
+    quietly dropping it out of the inventory the moment the database is slow.
+    """
+    setting = service_entry(unit).get("setting")
+    if not setting:
+        return False
+    probe = globals().get(SERVICE_SETTING_PROBES.get(setting, ""))
+    if probe is None:
+        return False
+    try:
+        return not probe()
+    except Exception:
+        return False
+
+
+def listening_ports():
+    """Every TCP port this host has in LISTEN.
+
+    A port, not a grep: every caller of the shell form piped `ss -tln` into
+    `grep <port>`, which also matches a peer address of 10.0.90.42 and a queue depth.
+    """
+    ports = set()
+    res = subprocess.run("ss -ltn", shell=True, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL)
+    for raw in res.stdout.decode().splitlines():
+        parts = raw.split()
+        if len(parts) < 4 or parts[0] != "LISTEN":
+            continue
+        _, separator, port = parts[3].rpartition(":")
+        if separator and port.isdigit():
+            ports.add(int(port))
+    return ports
+
+
+def service_is_ready(unit, states, ports):
+    """True when a required service is not merely active but answering.
+
+    `systemctl is-active hydra-db` goes true as soon as the container is up, which is
+    tens of seconds before ScyllaDB accepts a connection on 9042. Gating on `active`
+    therefore gates on nothing, which is why the CLI's old Phase 2 waited on the port
+    itself -- that wait is what this replaces.
+    """
+    if states.get(unit) != "active":
+        return False
+    port = service_entry(unit).get("ready_port")
+    if not port:
+        return True
+    return port in ports
+
+
+def convergence_gate(unit, order, running):
+    """What has to have happened before this unit is acted on, in the given direction.
+
+    Starting, that is what the unit requires. Stopping, it is the units that require *it*:
+    a service is not taken out from under the services using it, which is the same
+    ordering read backwards rather than a second list that can disagree with the first.
+
+    Only members of `order` count. A requirement outside the set being converged --
+    ZooKeeper, say -- is somebody else's precondition, and treating it as a gate here
+    would wedge the loop waiting on a service it does not manage.
+    """
+    if running:
+        return [req for req in service_entry(unit).get("requires", ()) if req in order]
+    return [other for other in order
+            if unit in service_entry(other).get("requires", ())]
+
+
+def unit_active_states(units):
+    """One batched `systemctl is-active` over the units, keyed by unit name."""
+    res = subprocess.run("systemctl is-active " + " ".join(units),
+                         shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    lines = res.stdout.decode().splitlines()
+    states = {}
+    for idx, unit in enumerate(units):
+        states[unit] = lines[idx].strip() if idx < len(lines) else ""
+    return states
+
+
+def drain_local_storage():
+    """Detach every locally-owned vdisk before the storage daemon is stopped.
+
+    Every acknowledged write is already durable in the journal, so stopping without this
+    would lose nothing -- but a full journal is one the next start has to replay, and a
+    clean detach drains before it releases, which turns a slow startup into a slightly
+    slower shutdown. A forwarded vdisk has nothing local to drain: the owner holds the
+    journal, and draining it is the owner's business.
+
+    This ran from `cluster stop`, which meant it happened only when an operator typed that
+    command -- and not when the desired state was set to `stopped` by anything else.
+    """
+    try:
+        sidon = load_sidon_module()
+        attached = sidon.list_attached(timeout=15).get("attached") or []
+    except Exception as exc:
+        print(f"[ZK] Could not drain local storage before stopping it: {exc}", flush=True)
+        return
+    for vdisk in attached:
+        vdisk_id = vdisk.get("vdisk_id")
+        if not vdisk_id or vdisk.get("role") == "forwarding":
+            continue
+        try:
+            sidon.detach(vdisk_id, timeout=60)
+        except Exception as exc:
+            print(f"[ZK] Could not detach {vdisk_id}: {exc}", flush=True)
+    subprocess.run("umount -l /var/lib/hci/sidon", shell=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_desired_cluster_state(desired):
+    """Record the desired cluster state in ZooKeeper. Returns (ok, detail).
+
+    Through the wire-protocol client rather than `podman exec ... zkCli.sh set || create`,
+    which only worked on a node whose ZooKeeper happened to be the container it was
+    exec'ing into, and reported a failed write the same way as a successful one.
+    """
+    try:
+        zkmod = _load_helios_zk()
+    except ImportError as exc:
+        return False, "helios_zk is unavailable: %s" % exc
+    client = None
+    try:
+        client = zkmod.connect(get_zk_hosts(), session_timeout_ms=ZK_SESSION_TIMEOUT_MS)
+        payload = desired.encode("utf-8")
+        try:
+            client.set(ZK_CLUSTER_STATE, payload)
+        except zkmod.ZKNoNode:
+            client.create(ZK_CLUSTER_STATE, payload)
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+# The unit holding the desired state. It is named here and nowhere in the CLI, because it
+# is the one service whose lifecycle cannot be delegated to the loop that reads it.
+STATE_STORE_UNIT = "zookeeper"
+STATE_STORE_PORT = 2181
+STATE_STORE_WAIT_SECONDS = 45
+
+
+def apply_desired_cluster_state(desired, stop_state_store=False):
+    """This node's whole part in `cluster start` / `cluster stop`. Returns (ok, detail).
+
+    One call per node, and the only service it names is the state store itself: starting
+    it, because the desired state cannot be written to a store that is down, and stopping
+    it at the end of a shutdown, because the loop that reads it cannot be the thing that
+    takes it away. Everything in between is the reconcile loop's business, which is why
+    this does not take a service list and cannot grow one.
+    """
+    if stop_state_store:
+        rc, stdout, stderr = run_unit_action("stop", [STATE_STORE_UNIT])
+        if rc != 0:
+            return False, (stderr or stdout).strip() or "could not stop the state store"
+        # Detached: spark-daemon is the process answering this request, so restarting it
+        # inline kills the connection the reply travels back on.
+        schedule_unit_action("restart", ["spark-daemon"])
+        return True, ""
+
+    if desired.startswith("start"):
+        rc, stdout, stderr = run_unit_action("start", [STATE_STORE_UNIT])
+        if rc != 0:
+            return False, (stderr or stdout).strip() or "could not start the state store"
+        deadline = time.time() + STATE_STORE_WAIT_SECONDS
+        while STATE_STORE_PORT not in listening_ports():
+            if time.time() >= deadline:
+                return False, ("the state store did not accept connections on %d within %ds"
+                               % (STATE_STORE_PORT, STATE_STORE_WAIT_SECONDS))
+            time.sleep(1)
+
+    return write_desired_cluster_state(desired)
+
+
 def converge_to_desired_state(desired, full=False):
-    """Bring local services into line with the desired cluster state.
+    """Bring local services into line with the desired cluster state, in order.
 
-    `full=True` (the desired state just changed) walks the whole set in dependency order.
-    Otherwise this is a periodic drift check: it only touches units that are not already
-    in the intended state, so the common case costs one `systemctl is-active` batch and
-    issues no commands at all.
+    One batched `systemctl is-active` over the declared inventory, and then only the units
+    that are not already in the intended state are touched -- so the common case issues no
+    commands at all. `full=True` means the desired state just changed, and says so; the
+    work either way is driven by the mismatches, because a service already in the intended
+    state does not need to be told to be in it.
 
-    The drift check exists because acting only on state *changes* leaves a hole: a service
-    that dies later, while the desired state is unchanged, is left to systemd's
+    This runs on every pass rather than converging in one shot, because the ordering gates
+    below are not waits: a service whose requirements are not ready yet is left for the
+    next pass and the node reports that it is not done. That is what makes the loop, and
+    not the CLI, the thing that knows when a start has finished.
+
+    The periodic pass exists because acting only on state *changes* leaves a hole: a
+    service that dies later, while the desired state is unchanged, is left to systemd's
     Restart=always -- and a unit that exhausts its restart limit stays down until someone
     rewrites the desired state.
     """
     running = desired.startswith("start")
     order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
     action = "start" if running else "stop"
+    errors = globals().setdefault("SERVICE_ERRORS", {})
 
     if full:
         print(f"[ZK] Converging local services toward '{desired}'.", flush=True)
-        targets = order
-    else:
-        # Batch one query for all managed units and act only on the mismatches.
-        res = subprocess.run("systemctl is-active " + " ".join(order),
-                             shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        states = res.stdout.decode().splitlines()
-        targets = []
-        for idx, svc in enumerate(order):
-            state = states[idx].strip() if idx < len(states) else ""
-            is_active = state == "active"
-            # "activating" and "deactivating" are both in-flight, not drift: the unit is
-            # already on its way somewhere and the next poll sees where it landed.
-            #
-            # Skipping "deactivating" is what keeps this reconciler from fighting whoever
-            # is doing the stopping. A unit being stopped reports not-active for as long
-            # as the stop takes -- ten seconds for spectrum, which does not go down on
-            # SIGTERM and has to be killed -- and starting it inside that window makes
-            # systemd cancel the pending stop job. The stop then fails with "Job for
-            # spectrum.service canceled", which is how the rollout's restart of the
-            # console was being turned into a no-op: its `stop && rm && start` chain
-            # short-circuited on the cancelled stop, and the console came back only
-            # because this reconciler had already started it.
-            #
-            # Nothing is lost by waiting. If the stop was not wanted, the unit is inactive
-            # at the next poll and gets started then.
-            if state in ("activating", "deactivating"):
-                continue
-            if running and not is_active:
-                targets.append(svc)
-            elif not running and is_active:
-                targets.append(svc)
-        if not targets:
-            return
+
+    states = unit_active_states(order)
+    targets = []
+    for svc in order:
+        # A disabled service is not drift. It is declared, reported, and left alone.
+        if service_is_disabled(svc):
+            errors.pop(svc, None)
+            continue
+        state = states.get(svc, "")
+        is_active = state == "active"
+        # "activating" and "deactivating" are both in-flight, not drift: the unit is
+        # already on its way somewhere and the next poll sees where it landed.
+        #
+        # Skipping "deactivating" is what keeps this reconciler from fighting whoever
+        # is doing the stopping. A unit being stopped reports not-active for as long
+        # as the stop takes -- ten seconds for spectrum, which does not go down on
+        # SIGTERM and has to be killed -- and starting it inside that window makes
+        # systemd cancel the pending stop job. The stop then fails with "Job for
+        # spectrum.service canceled", which is how the rollout's restart of the
+        # console was being turned into a no-op: its `stop && rm && start` chain
+        # short-circuited on the cancelled stop, and the console came back only
+        # because this reconciler had already started it.
+        #
+        # Nothing is lost by waiting. If the stop was not wanted, the unit is inactive
+        # at the next poll and gets started then.
+        if state in ("activating", "deactivating"):
+            continue
+        if running and not is_active:
+            targets.append(svc)
+        elif not running and is_active:
+            targets.append(svc)
+        else:
+            # It is where it was asked to be, however it got there -- systemd's own
+            # Restart=always counts. A latched reason would otherwise outlive the problem
+            # it described and stop every later start on a cluster that is perfectly well.
+            errors.pop(svc, None)
+
+    if not targets:
+        globals()["CONVERGE_RETRY"] = False
+        return
+
+    if not full:
         print(f"[ZK] Drift detected against '{desired}': {', '.join(targets)}", flush=True)
 
+    ports = None
+    waiting = {}
     for svc in targets:
-        subprocess.run(f"systemctl {action} {svc}", shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        gate = convergence_gate(svc, order, running)
+        if running and gate:
+            if ports is None:
+                ports = listening_ports()
+            unready = [req for req in gate if not service_is_ready(req, states, ports)]
+            if unready:
+                waiting[svc] = unready
+                continue
+        if not running:
+            # Inverted for a stop: a service is not taken away from the services that
+            # require it while they are still running.
+            holding = [other for other in gate if states.get(other) == "active"]
+            if holding:
+                waiting[svc] = holding
+                continue
+            if service_entry(svc).get("drain_before_stop"):
+                drain_local_storage()
+        res = subprocess.run(f"systemctl {action} {svc}", shell=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        detail = (res.stderr or b"").decode("utf-8", "replace").strip()
+        if res.returncode:
+            # The error is latched where the status publisher will find it. A caller
+            # watching a start learns that a unit refused to come up, and why, without
+            # reading a journal on three hosts.
+            errors[svc] = detail or f"systemctl {action} {svc} failed"
+        else:
+            errors.pop(svc, None)
+
+    for svc, blockers in sorted(waiting.items()):
+        print(f"[ZK] {svc} is waiting on {', '.join(blockers)}.", flush=True)
+
+    # The node's own judgement about whether it is done, published for the CLI to loop on
+    # rather than re-derived there. A latched error is not something to retry: it is
+    # reported, and the operator decides. Neither is a service waiting behind one -- what
+    # it is waiting for is not coming, so claiming progress on it would keep a caller
+    # watching a start that has already failed. `order` runs gates-first in both
+    # directions, so one pass propagates this.
+    tainted = set(errors)
+    for svc in order:
+        if any(blocker in tainted for blocker in convergence_gate(svc, order, running)):
+            tainted.add(svc)
+    globals()["CONVERGE_RETRY"] = any(svc not in tainted for svc in targets)
 
 
 def zk_reconcile_loop():
@@ -657,6 +952,28 @@ def _decode_desired_state(raw):
     return raw.strip() or None
 
 
+def service_last_error(latched, state, result, converging):
+    """Why a service is not where it was asked to be, as one sentence or an empty string.
+
+    The reconcile loop's own latched reason first: it is the only one that describes an
+    attempt somebody actually made. Failing that, systemd's verdict -- but only for a unit
+    that is `failed` right now rather than merely stopped, and only once this node has
+    finished converging.
+
+    Both of those conditions matter, and for the same reason. `Result` outlives the failure
+    it describes: it keeps saying `exit-code` until the unit is started again. A watcher
+    that aborts a cluster start at the first published error would otherwise abort it on a
+    unit that failed hours before the start began, and never on anything the start did.
+    """
+    if latched:
+        return str(latched)[:500]
+    if converging or state != "failed":
+        return ""
+    if result and result != "success":
+        return "systemd reports result '%s'" % result
+    return ""
+
+
 def build_node_status():
     """Collect this node's service and liveness state.
 
@@ -776,11 +1093,11 @@ def build_node_status():
     lines = res.stdout.decode().splitlines()
     
     services_active = {}
+    unit_states = {}
     for idx, svc in enumerate(services):
-        is_active = False
-        if idx < len(lines):
-            is_active = (lines[idx].strip() == "active")
-        services_active[svc] = is_active
+        state = lines[idx].strip() if idx < len(lines) else ""
+        unit_states[svc] = state
+        services_active[svc] = (state == "active")
 
     # Refresh PIDs cache if 10 seconds elapsed
     now = time.time()
@@ -860,6 +1177,33 @@ def build_node_status():
     except Exception:
         pass
 
+    # Why a unit is not where it was asked to be. The reconcile loop latches what
+    # systemctl said when it refused; systemd's own Result fills in the units that failed
+    # without anybody asking them to do anything, so a service that died on its own still
+    # explains itself. This is the difference between a start that fails and a start that
+    # fails legibly: the agent reports *why* as part of reporting *what*, and no caller is
+    # sent to read a journal on three hosts.
+    converge_errors = globals().get("SERVICE_ERRORS") or {}
+    results = {}
+    try:
+        res_rs = subprocess.run(
+            "systemctl show -p Result --value " + " ".join(services),
+            shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        rs_lines = res_rs.stdout.decode().splitlines()
+        for idx, svc in enumerate(services):
+            if idx < len(rs_lines):
+                results[svc] = rs_lines[idx].strip()
+    except Exception:
+        pass
+
+    converging = bool(globals().get("CONVERGE_RETRY", False))
+
+    def service_error(svc, active):
+        return service_last_error(latched=converge_errors.get(svc),
+                                  state=unit_states.get(svc, ""),
+                                  result=results.get(svc, ""),
+                                  converging=converging)
+
     for svc in services:
         n_restarts = restarts.get(svc, 0)
         if services_active[svc]:
@@ -870,14 +1214,30 @@ def build_node_status():
             result["services"][svc_map[svc]] = {
                 "status": "FLAPPING" if flapping else "UP",
                 "pids": svc_pids,
-                "restarts": n_restarts
+                "restarts": n_restarts,
+                "last_error": service_error(svc, True)
             }
         else:
             result["services"][svc_map[svc]] = {
                 "status": "DOWN",
                 "pids": [],
-                "restarts": n_restarts
+                "restarts": n_restarts,
+                "last_error": service_error(svc, False)
             }
+
+    # This node's own answer to "are you done?", for a caller to loop on instead of
+    # re-deriving convergence from the service rows it can already see.
+    result["retry"] = bool(globals().get("CONVERGE_RETRY", False))
+
+    # Declared but switched off, reported separately rather than mixed into `services`.
+    # `services` is what vali.select_best_start_host() reads, and it requires every entry
+    # there to be UP -- a service reported in it as disabled would make every host
+    # ineligible and no VM could ever start, which is exactly how the stale `aether` entry
+    # broke placement. Reported, not omitted: an operator who cannot see Urbosa in the
+    # inventory cannot tell "switched off" from "forgotten".
+    result["disabled_services"] = sorted(
+        entry.get("display", entry["unit"])
+        for entry in MANAGED_SERVICES if service_is_disabled(entry["unit"]))
 
     return result
 
@@ -2634,116 +2994,56 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     })
         self.send_json_response(200, {"tunnels": tunnel_stats})
 
-    def handle_cluster_start(self):
+    def declare_cluster_state(self, desired, message):
+        """Declare `desired` on every configured node, and answer with what each said.
+
+        The console's start and stop buttons went through two long imperative handlers
+        that started or stopped a hardcoded list of units on every host over mTLS -- a
+        third copy of an ordering that already lived in the reconcile loop, and the one
+        that still mounted container volumes that no longer exist. They now declare the
+        same intent the CLI declares, and every node converges toward it.
+        """
         hosts = []
         try:
             with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = [h["ip"] for h in cdata.get("hosts", [])]
+                hosts = [h["ip"] for h in json.load(f).get("hosts", []) if h.get("ip")]
         except Exception:
             pass
-            
         if not hosts:
             self.send_json_response(400, {"error": "No hosts configured. Please run cluster create first."})
             return
 
-        try:
-            # Start zookeeper on all nodes
-            run_parallel_checked(hosts, "systemctl start zookeeper")
-            time.sleep(3)
-            
-            # Set cluster state to started in ZooKeeper
-            execute_checked("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 create /cluster_state started || podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 set /cluster_state started", allow_already_exists=True)
-            
-            # Start hydra-db on all hosts
-            print("[handle_cluster_start] Starting hydra-db on all nodes...")
-            run_parallel_checked(hosts, "systemctl start hydra-db")
-            
-            # Wait for ScyllaDB to listen on port 9042
-            for ip in hosts:
-                for _ in range(60):
-                    rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9042")
-                    if rc == 0 and "9042" in out:
-                        break
-                    time.sleep(1)
-                else:
-                    raise Exception(f"ScyllaDB failed to listen on port 9042 on {ip}")
-            
-            # Copy Daruk proxy script to ScyllaDB volume directory (in case it was wiped or needs sync)
-            run_parallel_checked(hosts, "mkdir -p /var/lib/hci/hydra/data && cp /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py && chmod 644 /var/lib/hci/hydra/data/daruk.py")
- 
-            # Start and verify Daruk query proxy
-            print("[handle_cluster_start] Starting and verifying Daruk on all nodes...")
-            run_parallel_checked(hosts, "systemctl start daruk")
-            for ip in hosts:
-                for _ in range(30):
-                    rc, out, _ = run_remote_spark(ip, "ss -tlnp | grep 9043")
-                    if rc == 0 and "9043" in out:
-                        break
-                    time.sleep(1)
-                else:
-                    raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
- 
-            # No storage controller to start. Sidon is a per-node daemon with no
-            # leader and no API port to wait on, so what used to be "start the
-            # controller on host[0], stop it everywhere else, then poll for 3370"
-            # is simply the service list below.
+        declared, failed = [], {}
+        for ip in hosts:
+            rc, body, error = run_mtls_spark_api(
+                ip, "/api/v1/cluster/state", {"desired": desired})
+            if rc == 0 and isinstance(body, dict) and not body.get("error"):
+                declared.append(ip)
+            else:
+                failed[ip] = error or (body or {}).get("error") or "unknown error"
 
-            # Start other workloads
-            services = ["sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
-            if check_urbosa_enabled():
-                services.append("urbosa")
-            for svc in services:
-                run_parallel_checked(hosts, f"systemctl start {svc}")
-                
-            # Sync cluster settings from ScyllaDB to resolv.conf/chrony.conf/timezone on all nodes
-            print("[handle_cluster_start] Syncing cluster settings on all hosts...")
-            for ip in hosts:
-                run_mtls_spark_api(ip, "/api/v1/cluster/sync-settings", None, method="POST")
-                
-            # Storage is a mounted filesystem; there are no container volumes to mount.
-            pass
-                
-            self.send_json_response(200, {"message": "Cluster start command completed successfully."})
-        except Exception as ex:
-            import traceback
-            traceback.print_exc()
-            self.send_json_response(500, {"error": f"Cluster start failed: {str(ex)}"})
+        # One node is enough to record the intent: the state is cluster-wide and every
+        # node reads it from the ensemble. A node that could not be reached is reported
+        # rather than fatal, because it will converge when it comes back.
+        if not declared:
+            self.send_json_response(500, {"error": "Could not record the desired cluster "
+                                                   "state on any node: %s" % failed})
             return
+        self.send_json_response(200, {"message": message, "declared": declared,
+                                      "unreachable": failed})
+
+    def handle_cluster_start(self):
+        self.declare_cluster_state(
+            "started", "Cluster state set to 'started'; nodes are converging.")
 
     def handle_cluster_stop(self):
-        hosts = []
-        try:
-            with open("/etc/hci/cluster.json", "r") as f:
-                cdata = json.load(f)
-                hosts = [h["ip"] for h in cdata.get("hosts", [])]
-        except Exception:
-            pass
-            
-        if not hosts:
-            self.send_json_response(400, {"error": "No hosts configured."})
-            return
-
-        # Set ZooKeeper cluster_state to stopped
-        subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 set /cluster_state stopped", shell=True)
-        
-        run_parallel(hosts, "umount -f /var/lib/hci/aether/volumes/default-vm-container || true")
-        run_parallel(hosts, "umount -f /var/lib/hci/aether/volumes/default-image-container || true")
-        
-        # Stop services
-        services = ["logos", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "hydra-db", "zookeeper"]
-        for svc in services:
-            run_parallel(hosts, f"systemctl stop {svc}")
-            
-        # Restart spark-daemons asynchronously
-        def restart_worker(ip):
-            run_remote_spark(ip, "(sleep 1 && systemctl restart spark-daemon) >/dev/null 2>&1 < /dev/null &")
-            
-        for ip in hosts:
-            t = threading.Thread(target=restart_worker, args=(ip,))
-            t.start()
-            
-        self.send_json_response(200, {"message": "Cluster stop command completed."})
+        # The state store is left running on purpose. It holds the desired state, so a
+        # stop that took it down could not be undone by anything that has to read that
+        # state first -- the latch that deadlocked the old autostart path. `cluster stop`
+        # quiesces it explicitly at the end, as an operator instruction rather than an
+        # inference.
+        self.declare_cluster_state(
+            "stopped", "Cluster state set to 'stopped'; nodes are converging.")
 
     def handle_cluster_create(self):
         content_length = int(self.headers.get('Content-Length', 0))
@@ -3440,6 +3740,9 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             return True
         if path == "/api/v1/db/repair":
             self.handle_db_repair()
+            return True
+        if path == "/api/v1/cluster/state":
+            self.handle_cluster_state_action()
             return True
 
         segments = [segment for segment in path.split("/") if segment]
@@ -4208,6 +4511,38 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
             self.reject("A repair is already running on this node", 409)
             return
         self.send_json_response(200, {"started": True})
+
+    def handle_cluster_state_action(self):
+        """Declare the cluster's desired state. The whole of `cluster start` per node.
+
+        This endpoint takes an intent and no service list, which is the point: the CLI
+        says what the cluster should be doing and the reconcile loop on each node decides
+        what to start, in what order, and when it is finished.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        desired = str(payload.get("desired") or "").strip()
+        if desired not in ("started", "stopped"):
+            self.reject("desired must be 'started' or 'stopped'")
+            return
+        stop_state_store, error = validate_flag(payload.get("stop_state_store"),
+                                                "stop_state_store")
+        if error:
+            self.reject(error)
+            return
+        if stop_state_store and desired != "stopped":
+            self.reject("the state store is only stopped as part of a cluster stop")
+            return
+
+        ok, detail = apply_desired_cluster_state(desired, stop_state_store=stop_state_store)
+        if not ok:
+            self.reject(detail or "could not record the desired cluster state", 500)
+            return
+        self.send_json_response(200, {"desired": desired,
+                                      "state_store_stopped": bool(stop_state_store)})
+
 
 class SecureHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, ssl_context):

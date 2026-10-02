@@ -61,16 +61,25 @@ cluster status --verbose
 ### C. Cluster Startup (`cluster start`)
 Resume cluster operations after the nodes have been powered on or stopped.
 ```bash
-# Start all containerized workloads and host-level coordinators across all nodes
+# Record the desired state on every node and watch them converge
 cluster start
 ```
+This names no service. It records `started` on each node, and each node's reconcile loop
+starts what it manages in dependency order and publishes what it achieved, including why
+anything refused. The ordering lives with the loop, in one place —
+[cluster_state.md](./cluster_state.md#3-one-actor-per-service).
 
 ### D. Cluster Stop (`cluster stop`)
-Safely quiesce active virtual machines, unmount the filesystems, and put the services to rest.
+Safely quiesce active virtual machines and put the services to rest.
 ```bash
-# Stop all cluster services and unmount Aether storage volumes
+# Shut guests down, declare 'stopped', then quiesce the state store last
 cluster stop
 ```
+The same shape inverted: guests first (which host a guest runs on is cluster state, not
+node state), then `stopped` is declared and each node stops what it manages in reverse
+order, draining its storage journals before the storage daemon goes. ZooKeeper is stopped
+afterwards, by an explicit call, because the loop cannot take away the store it reads its
+instructions from.
 
 ### E. Ring Inspection (`cluster ring`)
 Print the ScyllaDB (Hydra) ring beside the cluster's own membership. The two are separate
