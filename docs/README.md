@@ -63,6 +63,9 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Aether (Linstor/DRBD) — *removed* | [aether.md](./aether.md) | — |
 | Slate (Traefik) | [slate.md](./slate.md) | — |
 | Agahnim (Rust console proxy) | [agahnim.md](./agahnim.md) | — |
+| Guest console (VNC / SPICE) | [console.md](./console.md) | — |
+| VM fencing | [fencing.md](./fencing.md) | — |
+| Ring lifecycle (add / remove a node) | [ring_lifecycle.md](./ring_lifecycle.md) | — |
 
 ## Storage design (Sidon, Purah, Ganon)
 

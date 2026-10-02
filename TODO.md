@@ -53,6 +53,57 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
+**Coordination and tasks (2026-10-02)**
+
+Four changes that came out of reading a running Nutanix cluster rather than guessing at it.
+The notes themselves are deliberately not in this repository.
+
+* **Leadership is per job, not per ensemble.** Ten leader-only jobs decided they were the
+  one by comparing their own address to the ZooKeeper *ensemble* leader's
+  (`vali.py` was literally `get_zookeeper_leader_ip() == LOCAL_IP`). The ensemble elects for
+  its own reasons, so every one of them relocated together whenever it did, onto a single
+  node. Each now holds its own candidacy under `/helios/leaders/<service>` -- a persistent
+  parent, one ephemeral sequential ballot per candidate, lowest counter leads -- so failover
+  is a property of the session rather than of anyone noticing. One election per *job*:
+  `vali`'s DRS loop and its queue worker are not the same question. Four of the nine private
+  `stat` probe loops were deleted outright, their only caller having been the placement gate.
+  `helios_zk.leader_ip` stays, because "which node leads the ensemble" is still a real
+  question that `mipha` and `cluster status` ask. See
+  [docs/service_leadership.md](docs/service_leadership.md).
+* **Tasks outlive the leader.** `recover_stuck_tasks()` aborted every pending task at
+  startup, which is data loss written down as recovery. Tasks now carry a parent, an owning
+  component and a per-component sequence (migration `0011-catalyst-task-tree`), and recovery
+  re-queues what was pending and fails what was in flight with a reason saying its progress
+  is unrecorded. `component` is not `service`: a Hylia upgrade step runs on the `dagur`
+  queue, and recording it as a Dagur task loses who asked for it.
+* **The reconcile loop is told rather than asking.** `helios_zk` discarded the only frames a
+  watch could arrive on, so the loop re-read `/cluster_state` on a timer -- a declaration
+  nobody hears for half a minute, which is why `cluster start` drove services by hand. There
+  is now a frame demultiplexer, watches that re-arm across a reconnect, and a loop that
+  blocks on an event. Confirmed against the live ensemble on 3.9.2, including the case that
+  matters: a `getData` on a missing path registers no watch, and `/cluster_state` does not
+  exist on a cluster that has never been started.
+* **`cluster start` names no services.** It drove ScyllaDB and the core services through
+  numbered phases and then waited for convergence anyway -- two actors per service, which is
+  the flapping a cold start shows, and the hand-written list is what kept restarting `aether`
+  after the unit was deleted with DRBD. From 43 occurrences of 18 distinct service names to
+  none, asserted by a test. What moved into the loop is a declared service table with units,
+  what each requires, and readiness meaning *answering* rather than `active`. systemd keeps
+  lifecycle; no supervisor was built, because systemd already is one -- the one place this
+  deliberately diverges from how Nutanix does it.
+* **Extent groups record how hot they are** (migration `0012-egroup-access-data`), which
+  `docs/dfs/multi_disk.md` needs before tiering can decide what to spill down. Counters are
+  absolute totals per observer, so a flush is safe to fire and forget. The data may decide
+  *where a copy of bytes goes, never whether it exists*.
+
+  **Outstanding**: the extent id map -- the middle level Nutanix has and Helios does not,
+  which is what makes dedup and extent-granular clone sharing possible -- is recorded as
+  **D-23** and deliberately not built. It cannot be landed behind a read-path flag, because
+  Purah's mark phase derives liveness from `dfs_block_map.egroup_id`: the first row naming an
+  extent instead makes a sweep see every live group as unreferenced, and the two-scan grace
+  delays that by ten minutes rather than preventing it. The mark phase has to traverse both
+  levels first.
+
 **Cluster state (2026-08-17, later session)**
 * **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;
   each node's spark-daemon publishes an ephemeral `/helios/nodes/<ip>` znode every 5s and
