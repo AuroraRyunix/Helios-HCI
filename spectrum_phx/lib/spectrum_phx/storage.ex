@@ -143,7 +143,7 @@ defmodule SpectrumPhx.Storage do
 
     unreachable =
       for {node, {:error, reason}} <- results,
-          do: Map.put(node, :error, describe(reason))
+          do: node |> Map.put(:error, describe(reason)) |> Map.put(:status, node_status(reason))
 
     entries =
       for {node, {:ok, document}} <- results,
@@ -151,6 +151,14 @@ defmodule SpectrumPhx.Storage do
 
     %{state: section_state(nodes, unreachable), entries: entries, unreachable: unreachable}
   end
+
+  # What a node that gave no capacity is doing, as far as the answer says. Spark answers 503
+  # when the node is up but Sidon's control socket is not: the daemon is restarting, or its
+  # disks are not mounted yet, and the capacity is not zero -- it is not known. That is a
+  # different statement from a node that does not answer at all, so it is kept apart and the
+  # page can say "starting" instead of leaving the operator to guess from a transport error.
+  defp node_status({503, _message}), do: :starting
+  defp node_status(_reason), do: :unreachable
 
   defp store_view(node, document) when is_map(document) do
     total = integer(Map.get(document, "total_bytes"))

@@ -189,7 +189,10 @@ differently from one that answered with nothing; an extent store reporting no ca
 no usage bar rather than a reassuring 0%, and says the likely reason (it is not mounted); a
 node with no telemetry says "unknown, not zero"; a vdisk on a partially-readable cluster is
 `:unknown` rather than `:ok`, and its `under_replicated?` is `nil` rather than `false`; an
-empty `mimir_results` says diagnostics have not run rather than showing green.
+empty `mimir_results` says diagnostics have not run rather than showing green. A node whose
+spark answers 503 for the capacity read (Sidon's control socket is not there: the daemon is
+restarting or its disks are not mounted yet) is kept apart from one that answered nothing at
+all: the stores banner says Sidon is starting on it and that its capacity is unknown, not zero.
 
 One distinction is new and worth stating on its own: a replication link that is down is
 reported as **writes being refused**, not as reduced redundancy. The journal is write-all,

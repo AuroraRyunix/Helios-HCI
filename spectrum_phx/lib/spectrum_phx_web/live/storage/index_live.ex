@@ -705,6 +705,15 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
             Some nodes did not answer, so the capacity below is a partial view of the
             cluster and not its total.
           </p>
+          <p
+            :if={starting_hosts(@stores.unreachable) != ""}
+            class="text-sm mt-1"
+            id="stores-starting"
+          >
+            Sidon is starting or its disks are not mounted yet on {starting_hosts(
+              @stores.unreachable
+            )}. That capacity is unknown, not zero.
+          </p>
           <p class="text-xs opacity-70 mt-1 font-mono break-all">
             {format_unreachable(@stores.unreachable)}
           </p>
@@ -838,7 +847,17 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   defp format_unreachable([]), do: nil
 
   defp format_unreachable(nodes) do
-    Enum.map_join(nodes, "; ", fn node -> node.hostname <> " (" <> node.error <> ")" end)
+    Enum.map_join(nodes, "; ", fn node ->
+      state = if Map.get(node, :status) == :starting, do: "starting: ", else: ""
+      node.hostname <> " (" <> state <> node.error <> ")"
+    end)
+  end
+
+  # Nodes whose Sidon is up-but-not-ready (spark answered 503), as a comma list.
+  defp starting_hosts(nodes) do
+    nodes
+    |> Enum.filter(&(Map.get(&1, :status) == :starting))
+    |> Enum.map_join(", ", & &1.hostname)
   end
 
   defp media(%{rotational?: true}), do: "HDD"

@@ -372,6 +372,13 @@ valcli storage.list
 Per-node extent store usage, and every vdisk with its owner, epoch and replica count. A
 vdisk showing a short replica set is one node-loss from unavailable.
 
+The Extent Store table has four states and none of them is "online with zero": `online`
+(a real capacity), `not ready` (spark answered 503 or a capacity of zero: sidon is starting,
+stopped, or has no mounted disk -- it binds its control socket only after its disks are
+mounted, so during a restart the capacity is unknown, not zero), `unreachable` (nothing
+answered) and `error` (any other refusal, with what it said). The Phoenix storage page says
+the same in its stores banner.
+
 ```bash
 valcli storage.heat        # or storage.heat 25 for a longer ranking
 ```
