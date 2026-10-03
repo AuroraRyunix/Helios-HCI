@@ -17,6 +17,7 @@ mod crc;
 mod err;
 mod extent;
 mod extent_id_map;
+mod extent_resolve;
 mod heat;
 mod journal;
 mod meta;

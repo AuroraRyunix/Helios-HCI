@@ -226,13 +226,18 @@ impl Vdisk {
              WHERE vdisk_id = {}",
             cql_str(&self.id)
         ))?;
+        // Rows that name an extent instead of a group (D-23). None exist until something
+        // writes one, and a vdisk with none issues no statement beyond the one above.
+        let mut by_extent: Vec<u64> = Vec::new();
         for row in rows {
             let idx = field_u64(&row, "extent_index")?;
-            let egroup_id = row
-                .get("egroup_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::meta("block map row without egroup_id".to_string()))?
-                .to_string();
+            let egroup_id = match row.get("egroup_id").and_then(Value::as_str) {
+                Some(g) => g.to_string(),
+                None => {
+                    by_extent.push(idx);
+                    continue;
+                }
+            };
             let offset = field_u64(&row, "egroup_offset")? as u32;
             let length = field_u64(&row, "length")? as u32;
             // Absent on rows written before the column existed. Those extents were
@@ -245,6 +250,19 @@ impl Vdisk {
                 .map(|v| v as u64)
                 .unwrap_or(self.vh);
             self.map.insert(idx, ExtentLoc { egroup_id, offset, length, vdisk_hash: vh });
+        }
+        if !by_extent.is_empty() {
+            for (idx, r) in crate::extent_resolve::resolve(&self.daruk, &self.id, &by_extent)? {
+                self.map.insert(
+                    idx,
+                    ExtentLoc {
+                        egroup_id: r.egroup_id,
+                        offset: r.offset,
+                        length: r.length,
+                        vdisk_hash: r.vdisk_hash.unwrap_or(self.vh),
+                    },
+                );
+            }
         }
         Ok(())
     }
