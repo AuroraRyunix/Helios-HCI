@@ -314,6 +314,7 @@ impl ReplicaStore {
     }
 
     /// Append a replicated journal record, refusing anything from a fenced-out epoch.
+    #[cfg(test)]
     pub fn append(&self, vdisk: &str, epoch: u64, record: &[u8]) -> Result<()> {
         self.append_deferring(vdisk, epoch, record, false)
     }
@@ -469,6 +470,7 @@ impl ReplicaStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn put_egroup(&self, egroup: &str, offset: u64, data: &[u8]) -> Result<()> {
         self.put_egroup_deferring(egroup, offset, data, false)
     }
