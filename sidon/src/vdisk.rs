@@ -3037,24 +3037,24 @@ mod tests {
 
     #[test]
     fn a_slow_replica_costs_the_write_its_own_time_and_no_more() {
-        // A replica that takes 300 ms per record and a local sync that takes 300 ms: serial
-        // would be over 600 ms for a single record; overlapped is about 300.
+        // A replica that takes 500 ms per record and a local sync that takes 500 ms: serial
+        // would be over 1000 ms for a single record; overlapped is about 500.
         let r = rig("slow-replica", 1, 64 * MIB as u64, 128 * MIB as u64);
         r.replicas[0].set_hook(Some(Arc::new(|req| {
             if req.opcode == peer::OP_APPEND {
-                std::thread::sleep(Duration::from_millis(300));
+                std::thread::sleep(Duration::from_millis(500));
             }
             None
         })));
         journal::testhook::set(&jpath(&r), Some(Arc::new(|| {
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(500));
             Ok(())
         })));
         let t = Instant::now();
         r.write(0, &fill(1, 4096)).unwrap();
         let took = t.elapsed();
-        assert!(took >= Duration::from_millis(300), "{took:?}");
-        assert!(took < Duration::from_millis(550), "serial would be 600ms+, took {took:?}");
+        assert!(took >= Duration::from_millis(500), "{took:?}");
+        assert!(took < Duration::from_millis(850), "serial would be 1000ms+, took {took:?}");
         journal::testhook::set(&jpath(&r), None);
     }
 
