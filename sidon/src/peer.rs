@@ -70,6 +70,12 @@ pub const OP_FORWARD_WRITE: u16 = 9;
 /// writes made while the drain ran.
 pub const OP_TRUNCATE_TO: u16 = 10;
 
+/// Request flag on OP_APPEND: the record is not the last of its group, so the replica need
+/// not fsync it -- the group's last record, sent without the flag, is synced and takes every
+/// earlier write to the file with it. A replica from before this flag ignores it and syncs
+/// every record, which is slower and no less safe.
+pub const APPEND_DEFER_SYNC: u16 = 1;
+
 pub const ST_OK: u16 = 0;
 /// The caller's epoch is below the highest this replica has been fenced at. The response
 /// carries the fenced epoch so the caller learns it has been deposed rather than merely
@@ -308,6 +314,25 @@ impl ReplicaStore {
 
     /// Append a replicated journal record, refusing anything from a fenced-out epoch.
     pub fn append(&self, vdisk: &str, epoch: u64, record: &[u8]) -> Result<()> {
+        self.append_deferring(vdisk, epoch, record, false)
+    }
+
+    /// `append`, optionally leaving the fsync to a later record.
+    ///
+    /// With `defer_sync` the record is written and *not* made durable, and the reply says
+    /// nothing about durability. The owner only does this for a record that is not the last
+    /// of its group, and sends the last without the flag: that record's `sync_data` flushes
+    /// every earlier write to the file, so by the time the owner hears an OK it needs --
+    /// the one it acknowledges the guest on -- the whole group is on this disk. A replica
+    /// that never sees the last record (the owner died) holds records that were never
+    /// acknowledged and, with no commit marker, never applied.
+    pub fn append_deferring(
+        &self,
+        vdisk: &str,
+        epoch: u64,
+        record: &[u8],
+        defer_sync: bool,
+    ) -> Result<()> {
         let fenced = self.fenced_epoch(vdisk);
         if epoch < fenced {
             return Err(Error::refused(format!(
@@ -318,8 +343,11 @@ impl ReplicaStore {
         let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
         file.write_all(record)?;
         // The guest's write is acknowledged only after every replica has synced, so this
-        // is on the critical path by design -- it is what "durable on RF nodes" means.
-        file.sync_data()?;
+        // is on the critical path by design -- it is what "durable on RF nodes" means. For
+        // a record the owner marked deferred, the sync that matters is the last record's.
+        if !defer_sync {
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -490,7 +518,12 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
                 Response::err(ST_IO, 0)
             }
         },
-        OP_APPEND => match store.append(&req.vdisk, req.epoch, &req.data) {
+        OP_APPEND => match store.append_deferring(
+            &req.vdisk,
+            req.epoch,
+            &req.data,
+            req.flags & APPEND_DEFER_SYNC != 0,
+        ) {
             Ok(()) => Response::ok(Vec::new()),
             Err(Error::Refused(_)) => {
                 Response::err(ST_STALE_EPOCH, store.fenced_epoch(&req.vdisk))

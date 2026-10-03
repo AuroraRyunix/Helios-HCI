@@ -4,7 +4,10 @@
 //! The ordering rules enforced here are the ones that make the whole design defensible,
 //! so they are stated once and never departed from:
 //!
-//! 1. **A write is acknowledged when its journal record is durable, and not before.**
+//! 1. **A write is acknowledged when its journal records are durable -- here and on every
+//!    replica -- and not before.** The local sync and the replicas run concurrently, and
+//!    the whole group is synced once; what is acknowledged is unchanged. See
+//!    `append_group`.
 //! 2. **Extent bytes are durable before any map row points at them.** A crash between
 //!    the two leaves orphaned bytes, which Purah sweeps. The reverse ordering
 //!    leaves a map pointing at bytes that do not exist, which is data loss.
@@ -40,6 +43,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -469,24 +473,11 @@ impl Vdisk {
             chunks.push((offset + pos as u64, &data[pos..pos + n]));
             pos += n;
         }
-        let last = chunks.len() - 1;
-        let mut written: Vec<(u64, u32, u64)> = Vec::with_capacity(chunks.len());
-        for (i, (off, chunk)) in chunks.into_iter().enumerate() {
-            let flags = if i == last { FLAG_COMMIT } else { 0 };
-            let rec = self.journal.append(self.epoch, off, flags, chunk)?;
-            // Every replica, before the guest hears anything. A partial write-all is not
-            // an acknowledged write: if any replica refuses or cannot be reached, this
-            // returns an error and the guest sees EIO, which is the honest outcome --
-            // acknowledging on a subset would mean the takeover proof's "read one replica
-            // sees every acknowledged write" is false.
-            if let Err(e) = self.replicate(&rec.framed) {
-                // Flag it before returning, so the curator's watcher can act while the
-                // guest is still seeing errors rather than after the timer notices.
-                self.mark_degraded(e.to_string());
-                return Err(e);
-            }
-            written.push((off, rec.data_len, rec.data_pos));
-        }
+        // Durable here and on every replica, or an error. A partial write-all is not an
+        // acknowledged write: if any replica refuses or cannot be reached, the guest sees
+        // EIO, which is the honest outcome -- acknowledging on a subset would mean the
+        // takeover proof's "read one replica sees every acknowledged write" is false.
+        let written = self.append_group(&chunks)?;
         // Overlay updates only after every record is durable, so a partially written
         // group never becomes visible to a read.
         for (off, len, pos) in written {
@@ -742,42 +733,146 @@ impl Vdisk {
         None
     }
 
-    /// Ship one framed journal record to every replica and wait for all of them.
-    fn replicate(&mut self, framed: &[u8]) -> Result<()> {
+    /// Append a group of records -- one guest write, split at the record cap, only the last
+    /// carrying the commit marker -- and return once it is durable here **and** on every
+    /// replica, or with the error that says it is not.
+    ///
+    /// The local journal and the replicas work at the same time rather than one after the
+    /// other. Each replica has a thread that sends it the group's records in order, one
+    /// round trip each; this thread writes record `i + 1` to its own journal while record
+    /// `i` is on the wire, and makes the journal durable with a single `fdatasync` after the
+    /// last record, while the replicas are still finishing theirs. What the guest waits for
+    /// is therefore the slower of "this disk" and "the slowest replica", where it used to be
+    /// the sum of every record's disk time and every record's round trip.
+    ///
+    /// Nothing about *what is acknowledged* changes, and each piece is why:
+    ///
+    /// - **Acknowledged means durable everywhere.** This returns `Ok` only after the local
+    ///   sync succeeded and every replica has answered OK to the last record, which it
+    ///   sends without the "defer sync" flag, so it is made durable before it is answered
+    ///   and takes every earlier record of the file with it. An earlier record's reply, by
+    ///   contrast, promises nothing: it is never what a guest is told.
+    /// - **One sync per group is as safe as one per record.** Replay applies a group only
+    ///   if its commit marker survived, the marker is the last record, and it is made
+    ///   durable after the records before it. A crash before the sync leaves a group with no
+    ///   marker, which replay discards -- the same outcome as a crash between two records,
+    ///   which was already possible and already correct.
+    /// - **Order on the replica is the order here.** One thread per replica, one
+    ///   connection, records sent in sequence: the replica's journal is the owner's journal
+    ///   byte for byte.
+    /// - **A partial write-all is an error.** Any replica's failure fails the group, and
+    ///   stops this thread appending further records of it. A deposed owner learns it from
+    ///   whichever replica says so first and says so, rather than reporting an I/O error.
+    ///
+    /// When more than one thing went wrong the report is: deposed first (it is the one that
+    /// matters), then a replica failure (which flags the vdisk degraded, as it always did),
+    /// then a local failure.
+    fn append_group(&mut self, chunks: &[(u64, &[u8])]) -> Result<Vec<(u64, u32, u64)>> {
+        let epoch = self.epoch;
+        let last = chunks.len() - 1;
+        let flags_for = |i: usize| if i == last { FLAG_COMMIT } else { 0 };
+        let mut written: Vec<(u64, u32, u64)> = Vec::with_capacity(chunks.len());
+
         if self.replicas.is_empty() {
-            return Ok(());
+            for (i, (off, chunk)) in chunks.iter().enumerate() {
+                let rec = self.journal.append_unsynced(epoch, *off, flags_for(i), chunk)?;
+                written.push((*off, rec.data_len, rec.data_pos));
+            }
+            self.journal.sync()?;
+            return Ok(written);
         }
-        for replica in &self.replicas {
-            let resp = replica.call(&Request {
-                opcode: peer::OP_APPEND,
-                vdisk: self.id.clone(),
-                epoch: self.epoch,
-                seq: 0,
-                offset: 0,
-                flags: 0,
-                data: framed.to_vec(),
-            })?;
-            if resp.status == peer::ST_STALE_EPOCH {
+
+        let id = self.id.as_str();
+        let replicas = &self.replicas;
+        let journal = &mut self.journal;
+        let failed = AtomicBool::new(false);
+
+        let (local, remote) = std::thread::scope(|scope| {
+            let mut senders = Vec::with_capacity(replicas.len());
+            let mut workers = Vec::with_capacity(replicas.len());
+            for replica in replicas.iter() {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<Streamed>(PIPELINE_DEPTH);
+                senders.push(tx);
+                let failed = &failed;
+                workers.push(scope.spawn(move || stream_to_replica(replica, id, epoch, rx, failed)));
+            }
+
+            let mut local: Result<()> = Ok(());
+            for (i, (off, chunk)) in chunks.iter().enumerate() {
+                if failed.load(Ordering::SeqCst) {
+                    // A replica has already failed, so this group cannot be acknowledged;
+                    // appending the rest would only grow the journal with a write nobody
+                    // will be told succeeded.
+                    break;
+                }
+                match journal.append_unsynced(epoch, *off, flags_for(i), chunk) {
+                    Ok(rec) => {
+                        written.push((*off, rec.data_len, rec.data_pos));
+                        let framed = Arc::new(rec.framed);
+                        for tx in &senders {
+                            // A closed channel is a worker that already gave up; its error
+                            // is collected below, so the send failing adds nothing.
+                            let _ = tx.send(Streamed { framed: Arc::clone(&framed), defer: i != last });
+                        }
+                    }
+                    Err(e) => {
+                        local = Err(e);
+                        break;
+                    }
+                }
+            }
+            // The local fsync, with the replicas still working through the tail of the group.
+            if local.is_ok() && written.len() == chunks.len() {
+                local = journal.sync();
+            }
+            drop(senders);
+            let remote: Vec<std::result::Result<(), ReplicaFault>> = workers
+                .into_iter()
+                .map(|w| w.join().unwrap_or(Err(ReplicaFault::Panicked)))
+                .collect();
+            (local, remote)
+        });
+
+        let mut failure: Option<Error> = None;
+        for outcome in &remote {
+            if let Err(ReplicaFault::Stale { node, fenced }) = outcome {
                 // Deposed. Not an I/O problem to retry -- somebody else owns this disk
                 // now, and the correct behaviour is to stop, loudly and immediately.
                 self.degraded = Some(format!(
-                    "deposed: replica {} is fenced at epoch {}, this owner holds {}",
-                    replica.node, resp.epoch, self.epoch
+                    "deposed: replica {node} is fenced at epoch {fenced}, this owner holds {epoch}"
                 ));
                 return Err(Error::refused(format!(
-                    "vdisk {} is no longer owned by this node: replica {} is fenced at \
-                     epoch {} and refused a write at epoch {}",
-                    self.id, replica.node, resp.epoch, self.epoch
-                )));
-            }
-            if !resp.is_ok() {
-                return Err(Error::io(format!(
-                    "replica {} refused a journal append for {} with status {}",
-                    replica.node, self.id, resp.status
+                    "vdisk {} is no longer owned by this node: replica {node} is fenced at \
+                     epoch {fenced} and refused a write at epoch {epoch}",
+                    self.id
                 )));
             }
         }
-        Ok(())
+        for outcome in remote {
+            match outcome {
+                Err(ReplicaFault::Failed(e)) if failure.is_none() => failure = Some(e),
+                Err(ReplicaFault::Panicked) if failure.is_none() => {
+                    failure = Some(Error::io("a replication thread panicked".to_string()))
+                }
+                _ => {}
+            }
+        }
+        if let Some(e) = failure {
+            // Flag it before returning, so the curator's watcher can act while the guest is
+            // still seeing errors rather than after the timer notices.
+            self.mark_degraded(e.to_string());
+            return Err(e);
+        }
+        local?;
+        if written.len() != chunks.len() {
+            return Err(Error::io(format!(
+                "vdisk {}: a write group stopped after {} of {} records with no error to report",
+                self.id,
+                written.len(),
+                chunks.len()
+            )));
+        }
+        Ok(written)
     }
 
     /// Note that this vdisk cannot currently satisfy write-all, and why.
@@ -1136,6 +1231,71 @@ impl Vdisk {
 // ---------------------------------------------------------------------------------
 // The drain, and who waits for it.
 // ---------------------------------------------------------------------------------
+
+/// How many records of one guest write may be queued for a replica's thread at once. Bounds
+/// the memory a large write holds in flight (four 1 MiB records per replica) while leaving
+/// room for the local append to run ahead of the wire.
+const PIPELINE_DEPTH: usize = 4;
+
+/// One record on its way to a replica.
+struct Streamed {
+    framed: Arc<Vec<u8>>,
+    /// Whether the replica may skip its fsync for this record because a later record of the
+    /// same group will be synced, which makes this one durable with it. False for the last.
+    defer: bool,
+}
+
+/// Why a replica did not take a group.
+enum ReplicaFault {
+    /// Fenced at a higher epoch: this owner has been deposed.
+    Stale { node: String, fenced: u64 },
+    Failed(Error),
+    Panicked,
+}
+
+/// The thread that feeds one replica: the group's records, in order, each answered before
+/// the next is sent. Keeps consuming after a failure so the producer is never blocked on a
+/// consumer that has stopped, and sets `failed` so the producer stops appending.
+fn stream_to_replica(
+    replica: &PeerClient,
+    vdisk: &str,
+    epoch: u64,
+    rx: std::sync::mpsc::Receiver<Streamed>,
+    failed: &AtomicBool,
+) -> std::result::Result<(), ReplicaFault> {
+    let mut outcome = Ok(());
+    for item in rx {
+        if outcome.is_err() {
+            continue;
+        }
+        let resp = replica.call(&Request {
+            opcode: peer::OP_APPEND,
+            vdisk: vdisk.to_string(),
+            epoch,
+            seq: 0,
+            offset: 0,
+            flags: if item.defer { peer::APPEND_DEFER_SYNC } else { 0 },
+            data: item.framed.to_vec(),
+        });
+        match resp {
+            Err(e) => outcome = Err(ReplicaFault::Failed(e)),
+            Ok(r) if r.status == peer::ST_STALE_EPOCH => {
+                outcome = Err(ReplicaFault::Stale { node: replica.node.clone(), fenced: r.epoch })
+            }
+            Ok(r) if !r.is_ok() => {
+                outcome = Err(ReplicaFault::Failed(Error::io(format!(
+                    "replica {} refused a journal append for {vdisk} with status {}",
+                    replica.node, r.status
+                ))))
+            }
+            Ok(_) => {}
+        }
+        if outcome.is_err() {
+            failed.store(true, Ordering::SeqCst);
+        }
+    }
+    outcome
+}
 
 /// How long a write waits at the hard ceiling for a drain to make room before it gives up
 /// and fails. Long enough to ride out a slow drain (a 128 MiB journal is seconds), short
@@ -2434,5 +2594,278 @@ mod tests {
         assert_eq!(r.hydra.st.arrived.load(Ordering::SeqCst), 0, "no commit");
         assert!(r.sealed_exists());
         assert_eq!(r.read(0, 3 * MIB as u32), data);
+    }
+
+    // ================================================================================
+    // The local sync and the replicas work together
+    // ================================================================================
+
+    fn jpath(r: &Rig) -> PathBuf {
+        r.dir.join("journal").join("vd.jrn")
+    }
+
+    /// Count the local journal's syncs.
+    fn count_syncs(r: &Rig) -> Arc<AtomicUsize> {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = Arc::clone(&n);
+        journal::testhook::set(&jpath(r), Some(Arc::new(move || {
+            n2.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })));
+        n
+    }
+
+    /// Record (flags) of every journal append a replica is sent.
+    fn record_append_flags(replica: &TestReplica) -> Arc<Mutex<Vec<u16>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = Arc::clone(&seen);
+        replica.set_hook(Some(Arc::new(move |req| {
+            if req.opcode == peer::OP_APPEND {
+                s2.lock().unwrap().push(req.flags);
+            }
+            None
+        })));
+        seen
+    }
+
+    #[test]
+    fn the_local_sync_runs_while_the_replica_is_being_written_not_before_it() {
+        // The local sync is made to wait until the replica has been contacted. If the
+        // owner synced first and only then went to the replica, the sync would wait out its
+        // deadline and fail the write: the only way through is both being in flight at once.
+        let r = rig("overlap-sync", 1, 64 * MIB as u64, 128 * MIB as u64);
+        let contacted = Arc::new(AtomicBool::new(false));
+        let c2 = Arc::clone(&contacted);
+        r.replicas[0].set_hook(Some(Arc::new(move |req| {
+            if req.opcode == peer::OP_APPEND {
+                c2.store(true, Ordering::SeqCst);
+            }
+            None
+        })));
+        journal::testhook::set(&jpath(&r), Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !contacted.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    return Err(Error::io(
+                        "the replica was not contacted while the local sync was pending".to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        })));
+
+        r.write(0, &fill(1, 4096)).expect("the sync and the round trip ran together");
+        assert_eq!(r.read(0, 4096), fill(1, 4096));
+        assert_eq!(records_in(&r.replicas[0].journal()), vec![(0, FLAG_COMMIT)]);
+        journal::testhook::set(&jpath(&r), None);
+    }
+
+    #[test]
+    fn the_next_record_is_written_locally_while_the_previous_one_is_still_with_the_replica() {
+        // The replica holds its answer to the first record until the owner's own journal
+        // already contains the second. A strictly serial owner -- record, replicate,
+        // record -- never gets there, and the replica gives up and refuses.
+        let r = rig("pipeline", 1, 64 * MIB as u64, 128 * MIB as u64);
+        let jp = jpath(&r);
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        r.replicas[0].set_hook(Some(Arc::new(move |req| {
+            if req.opcode != peer::OP_APPEND || arrivals.fetch_add(1, Ordering::SeqCst) != 0 {
+                return None;
+            }
+            let two_records = 2 * (journal::HEADER_LEN + MIB) as u64;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::metadata(&jp).map(|m| m.len()).unwrap_or(0) < two_records {
+                if Instant::now() > deadline {
+                    return Some(Response::err(peer::ST_IO, 0));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            None
+        })));
+
+        let data = fill(2, 3 * MIB);
+        r.write(0, &data).expect("the local append ran ahead of the replica's answer");
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
+    }
+
+    #[test]
+    fn every_replica_gets_the_owners_journal_byte_for_byte_and_the_commit_marker_comes_last() {
+        let r = rig("replica-bytes", 2, 64 * MIB as u64, 128 * MIB as u64);
+        r.write(0, &fill(1, 5 * MIB)).unwrap();
+        let local = std::fs::read(jpath(&r)).unwrap();
+        for replica in &r.replicas {
+            let theirs = replica.journal();
+            assert_eq!(theirs, local, "a replica's journal is the owner's");
+            let recs = records_in(&theirs);
+            assert_eq!(
+                recs,
+                vec![(0, 0), (1, 0), (2, 0), (3, 0), (4, FLAG_COMMIT)],
+                "in sequence, and only the last record commits the group"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_is_synced_once_locally_and_only_its_last_record_is_synced_on_the_replica() {
+        let r = rig("one-sync", 1, 64 * MIB as u64, 128 * MIB as u64);
+        let syncs = count_syncs(&r);
+        let flags = record_append_flags(&r.replicas[0]);
+
+        r.write(0, &fill(1, 5 * MIB)).unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 1, "one fsync for five records");
+        assert_eq!(
+            *flags.lock().unwrap(),
+            vec![peer::APPEND_DEFER_SYNC; 4].into_iter().chain([0]).collect::<Vec<u16>>(),
+            "the replica may defer all but the last, which it must make durable before answering"
+        );
+
+        // A single-record write has nothing to defer.
+        flags.lock().unwrap().clear();
+        r.write(8 * MIB as u64, &fill(2, 4096)).unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 2);
+        assert_eq!(*flags.lock().unwrap(), vec![0]);
+        journal::testhook::set(&jpath(&r), None);
+    }
+
+    #[test]
+    fn without_replicas_a_group_is_still_synced_once_after_its_last_record() {
+        let r = rig("one-sync-local", 0, 64 * MIB as u64, 128 * MIB as u64);
+        let syncs = count_syncs(&r);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        assert_eq!(syncs.load(Ordering::SeqCst), 1);
+        journal::testhook::set(&jpath(&r), None);
+
+        // And what is on disk replays as one complete group.
+        let mut j = Journal::open(&jpath(&r)).unwrap();
+        let (recs, _) = j.replay().unwrap();
+        assert_eq!(recs.iter().map(|x| x.flags).collect::<Vec<_>>(), vec![0, 0, FLAG_COMMIT]);
+    }
+
+    #[test]
+    fn a_group_missing_its_commit_marker_is_not_applied_on_replay() {
+        // The crash the one-sync policy trades on: records on disk, marker not. Replay must
+        // discard the lot -- never expose a prefix of a guest write.
+        let r = rig("no-marker", 1, 64 * MIB as u64, 128 * MIB as u64);
+        let data = fill(4, 3 * MIB);
+        r.write(0, &data).unwrap();
+        let whole = r.replicas[0].journal();
+        let rec_len = journal::HEADER_LEN + MIB;
+
+        let hydra = Hydra::start();
+        let dir2 = tmpdir("no-marker-replay");
+        let mut torn = build(&dir2, &hydra, Vec::new(), 64 * MIB as u64, 128 * MIB as u64);
+        torn.journal.replace(&whole[..2 * rec_len]).unwrap();
+        assert_eq!(torn.replay_journal().unwrap(), 0);
+        assert!(!torn.needs_drain(), "two records of a three-record group are not a write");
+        assert_eq!(torn.read(0, 3 * MIB as u32).unwrap(), vec![0u8; 3 * MIB]);
+
+        let mut whole_vd = build(&tmpdir("no-marker-whole"), &hydra, Vec::new(), 64 * MIB as u64, 128 * MIB as u64);
+        whole_vd.journal.replace(&whole).unwrap();
+        whole_vd.replay_journal().unwrap();
+        assert_eq!(whole_vd.read(0, 3 * MIB as u32).unwrap(), data);
+    }
+
+    #[test]
+    fn a_replica_failure_fails_the_write_flags_the_vdisk_and_shows_nothing_to_readers() {
+        let r = rig("replica-fails", 1, 64 * MIB as u64, 128 * MIB as u64);
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        r.replicas[0].set_hook(Some(Arc::new(move |req| {
+            (req.opcode == peer::OP_APPEND && arrivals.fetch_add(1, Ordering::SeqCst) == 1)
+                .then(|| Response::err(peer::ST_IO, 0))
+        })));
+
+        let err = r.write(0, &fill(1, 3 * MIB)).expect_err("write-all: one replica failing fails it");
+        assert!(err.to_string().contains("refused a journal append"), "{err}");
+        assert!(r.degraded().unwrap().contains("refused a journal append"));
+        // The records that did go in are not a write the guest was told about.
+        assert!(!r.vd.lock().unwrap().needs_drain());
+        assert_eq!(r.read(0, 3 * MIB as u32), vec![0u8; 3 * MIB]);
+    }
+
+    #[test]
+    fn with_two_replicas_either_one_failing_fails_the_write() {
+        for bad in 0..2 {
+            let r = rig(&format!("one-of-two-{bad}"), 2, 64 * MIB as u64, 128 * MIB as u64);
+            r.replicas[bad].set_hook(Some(Arc::new(|req| {
+                (req.opcode == peer::OP_APPEND).then(|| Response::err(peer::ST_IO, 0))
+            })));
+            let err = r.write(0, &fill(1, 2 * MIB)).expect_err("a partial write-all is an error");
+            assert!(err.to_string().contains(&format!("replica r{bad}")), "{err}");
+            assert!(r.degraded().is_some());
+            assert_eq!(r.read(0, 2 * MIB as u32), vec![0u8; 2 * MIB]);
+        }
+    }
+
+    #[test]
+    fn a_replica_that_cannot_be_reached_fails_the_write_too() {
+        let r = rig("unreachable", 0, 64 * MIB as u64, 128 * MIB as u64);
+        r.vd.lock().unwrap().replicas.push(Arc::new(PeerClient::new(
+            "dead",
+            "127.0.0.1:1",
+            Duration::from_secs(2),
+        )));
+        let err = r.write(0, &fill(1, 4096)).expect_err("no replica, no acknowledgement");
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        assert!(r.degraded().is_some());
+        assert_eq!(r.read(0, 4096), vec![0u8; 4096]);
+    }
+
+    #[test]
+    fn a_fenced_replica_deposes_the_owner_and_the_write_says_so() {
+        // The vdisk writes at epoch 3; the replica has been fenced at 9 by a new owner.
+        let r = rig("deposed", 1, 64 * MIB as u64, 128 * MIB as u64);
+        r.replicas[0].store.fence("vd", 9).unwrap();
+        let err = r.write(0, &fill(1, 2 * MIB)).expect_err("a deposed owner acknowledges nothing");
+        assert!(matches!(err, Error::Refused(_)), "{err:?}");
+        assert!(err.to_string().contains("no longer owned"), "{err}");
+        let why = r.degraded().unwrap();
+        assert!(why.contains("deposed") && why.contains("fenced at epoch 9"), "{why}");
+        assert_eq!(r.read(0, 2 * MIB as u32), vec![0u8; 2 * MIB]);
+        // And it did not reach the new owner's journal.
+        assert!(r.replicas[0].journal().is_empty());
+    }
+
+    #[test]
+    fn a_local_sync_failure_is_an_error_even_though_the_replicas_took_the_records() {
+        let r = rig("local-sync-fails", 1, 64 * MIB as u64, 128 * MIB as u64);
+        journal::testhook::set(&jpath(&r), Some(Arc::new(|| {
+            Err(Error::io("injected local sync failure".to_string()))
+        })));
+        let err = r.write(0, &fill(1, 2 * MIB)).expect_err("not durable here, so not acknowledged");
+        assert!(err.to_string().contains("injected local sync failure"), "{err}");
+        // Not durable here means not visible here, whatever the replicas hold.
+        assert!(!r.vd.lock().unwrap().needs_drain());
+        assert_eq!(r.read(0, 2 * MIB as u32), vec![0u8; 2 * MIB]);
+        // A local disk fault is not a replica fault, and is not reported as one.
+        assert!(r.degraded().is_none());
+        journal::testhook::set(&jpath(&r), None);
+
+        // And the vdisk recovers: the next write goes through.
+        r.write(0, &fill(2, 4096)).expect("the fault was transient");
+        assert_eq!(r.read(0, 4096), fill(2, 4096));
+    }
+
+    #[test]
+    fn a_slow_replica_costs_the_write_its_own_time_and_no_more() {
+        // A replica that takes 300 ms per record and a local sync that takes 300 ms: serial
+        // would be over 600 ms for a single record; overlapped is about 300.
+        let r = rig("slow-replica", 1, 64 * MIB as u64, 128 * MIB as u64);
+        r.replicas[0].set_hook(Some(Arc::new(|req| {
+            if req.opcode == peer::OP_APPEND {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            None
+        })));
+        journal::testhook::set(&jpath(&r), Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(())
+        })));
+        let t = Instant::now();
+        r.write(0, &fill(1, 4096)).unwrap();
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        assert!(took < Duration::from_millis(550), "serial would be 600ms+, took {took:?}");
+        journal::testhook::set(&jpath(&r), None);
     }
 }

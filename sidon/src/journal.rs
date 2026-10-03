@@ -266,6 +266,7 @@ impl Journal {
     }
 
     /// Append one record and make it durable. Returns the payload's position.
+    #[cfg(test)]
     pub fn append(&mut self, epoch: u64, offset: u64, flags: u32, data: &[u8]) -> Result<Record> {
         let rec = self.append_unsynced(epoch, offset, flags, data)?;
         self.sync()?;

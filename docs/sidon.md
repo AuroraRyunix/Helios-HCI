@@ -30,6 +30,19 @@ journal append + fdatasync          ← on every other replica
 acknowledged to the guest
 ```
 
+The two journal appends really are concurrent (`vdisk::append_group`): a replica has its own
+thread, fed the write's records in order, while the owner writes record *i+1* to its own
+journal and, after the last record, issues a single `fdatasync`. A guest write bigger than
+1 MiB is several records and one commit marker, and only the last record of the group is
+made durable on the replica before it answers (the earlier ones carry `APPEND_DEFER_SYNC`; the
+last record's `fdatasync` takes them with it). The guest is told nothing until the local sync
+has succeeded *and* every replica has answered OK to the last record, so what is acknowledged
+is exactly what it always was: durable on every copy. A crash after some records but before
+the commit marker leaves a group replay discards, the same as a crash between two records
+always did. Before 2026-10 the appends were serial — a local `fdatasync` and then a round trip
+to each replica, per 1 MiB record — and this section's diagram described what it was meant to
+do rather than what it did.
+
 Nothing on that path touches Hydra. That is the design's one inviolable performance rule:
 acknowledgement never waits on the metadata layer.
 
