@@ -14,7 +14,12 @@ defmodule SpectrumPhx.UploadStubs do
   defmodule Uploader do
     @moduledoc "Stands in for `SpectrumPhx.Images.SparkUploader`."
 
-    def create(ip, vdisk, size_bytes) do
+    def create(ip, vdisk, size_bytes, container) do
+      # Its own message tag, so the ordered call sequence other tests assert on is
+      # unchanged: which container a create named is a separate fact from when it ran.
+      if owner = Application.get_env(:spectrum_phx, :upload_stub_owner),
+        do: send(owner, {:upload_stub_container, vdisk, container})
+
       report({:create, ip, vdisk, size_bytes})
       answer(:create, {:ok, %{"vdisk_id" => vdisk, "created" => true}})
     end
@@ -89,6 +94,12 @@ defmodule SpectrumPhx.UploadStubs do
   def install(answers \\ %{}) do
     Application.put_env(:spectrum_phx, :images_uploader, Uploader)
     Application.put_env(:spectrum_phx, :images_upload_transport, Transport)
+    # An upload creates its vdisk in a container that has to exist, so there is one.
+    Application.put_env(
+      :spectrum_phx,
+      :containers_source,
+      {:static, [%{"name" => "default-pool", "tier" => "SSD", "ftt" => 1, "quota_bytes" => 0}]}
+    )
     Application.put_env(:spectrum_phx, :upload_stub_owner, self())
     Application.put_env(:spectrum_phx, :upload_stub_answers, answers)
     # The real rollback retries for six seconds because the vdisk is released
@@ -99,6 +110,7 @@ defmodule SpectrumPhx.UploadStubs do
     ExUnit.Callbacks.on_exit(fn ->
       Application.delete_env(:spectrum_phx, :images_uploader)
       Application.delete_env(:spectrum_phx, :images_upload_transport)
+      Application.delete_env(:spectrum_phx, :containers_source)
       Application.delete_env(:spectrum_phx, :upload_stub_owner)
       Application.delete_env(:spectrum_phx, :upload_stub_answers)
       Application.delete_env(:spectrum_phx, :images_rollback_attempts)

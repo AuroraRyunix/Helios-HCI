@@ -687,6 +687,32 @@ MIGRATIONS = [
             "WITH CLUSTERING ORDER BY (created_at_ms DESC, snapshot_id ASC);",
         ],
     },
+    {
+        "id": "0025-drop-dfs-egroup-replicas",
+        "description": (
+            "Removes hydra.dfs_egroup_replicas, which migration 0006 created and nothing "
+            "has ever written to or read from. "
+            "It was meant to say which nodes hold a copy of an extent group. The "
+            "placement the system actually uses is per vdisk, in dfs_vdisks.replicas, "
+            "and the one per-group fact that is recorded -- which node created the group, "
+            "and in what state -- is dfs_egroups. A second table answering the same "
+            "question per group would have to be kept in step with the files on every "
+            "replica through every crash between 'file written' and 'row written', and "
+            "would lie the first time one landed in that window. Invariants I-3 and I-7 "
+            "forbid Purah's mark phase from deriving liveness from anything that can lie, "
+            "so such a table would be scrub-checked advice at best and a hazard at worst, "
+            "for the price of a metadata write per replica per extent group. An empty "
+            "table with a suggestive shape also costs every later design a paragraph "
+            "establishing that it is not a source of truth (docs/dfs/multi_disk.md). "
+            "Nothing reads it, so the mark phase and every sweep are unaffected. "
+            "0006 is unedited: an applied migration's text is its checksum, and a fresh "
+            "cluster that creates the table and then drops it in order ends in the same "
+            "place as one that applied 0006 long ago."
+        ),
+        "statements": [
+            "DROP TABLE IF EXISTS hydra.dfs_egroup_replicas;",
+        ],
+    },
 ]
 
 

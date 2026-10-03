@@ -35,7 +35,12 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       "class" => Keyword.get(opts, :class, "rw"),
       "replicas" => Keyword.get(opts, :replicas, ["hci-01", "hci-02"])
     }
+    |> put_rf(Keyword.get(opts, :rf))
   end
+
+  # Absent unless asked for, like a daemon that predates the field.
+  defp put_rf(entry, nil), do: entry
+  defp put_rf(entry, rf), do: Map.put(entry, "rf", rf)
 
   defp attached(entries), do: {:ok, %{"attached" => entries}}
 
@@ -321,6 +326,62 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       assert view
              |> element("#snapshots-link-vm-web-01-disk0")
              |> render() =~ "/storage/vdisks/vm-web-01-disk0/snapshots"
+    end
+  end
+
+  describe "what a vdisk asked for, against what it holds and what the cluster asks" do
+    # The cluster here keeps two copies (healthy/0 sets redundancy_factor 1 across two
+    # nodes), so a vdisk that asked for one is below policy however correct its own count.
+    defp put_vdisk(entry) do
+      put_source(%{
+        healthy()
+        | vdisks: %{@a => attached([entry]), @b => attached([])}
+      })
+    end
+
+    test "a vdisk that asked for one copy and holds one is not drawn as healthy", %{conn: conn} do
+      put_vdisk(owned("vm-web-01-disk0", replicas: ["hci-01"], rf: 1))
+      {:ok, view, _html} = mount_view(conn)
+
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      # 1 held, 1 asked, 2 wanted: the badge compares against the larger, so it reads 1/2
+      # and says why. Reading 1/1 here is the defect this exists to catch.
+      assert card =~ "1/2"
+      assert card =~ "asked 1, policy 2"
+      assert card =~ "under-replicated"
+      assert card =~ "never topped up"
+      refute card =~ ">healthy<"
+      assert view |> element("#stat-under-replicated") |> render() =~ "1 under-replicated"
+    end
+
+    test "a vdisk that lost a copy it asked for says so in those terms", %{conn: conn} do
+      put_vdisk(owned("vm-web-01-disk0", replicas: ["hci-01"], rf: 2))
+      {:ok, view, _html} = mount_view(conn)
+
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert card =~ "1/2"
+      assert card =~ "under-replicated"
+      assert card =~ "1 of the 2 replicas it asked for present"
+      refute card =~ "asked 2, policy"
+    end
+
+    test "a vdisk that holds what it asked for and what policy asks is healthy", %{conn: conn} do
+      put_vdisk(owned("vm-web-01-disk0", rf: 2))
+      {:ok, view, _html} = mount_view(conn)
+
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert card =~ "2/2"
+      refute card =~ "under-replicated"
+      refute card =~ "asked"
+    end
+
+    test "a daemon that records no rf is compared against policy alone", %{conn: conn} do
+      put_vdisk(owned("vm-web-01-disk0", replicas: ["hci-01"]))
+      {:ok, view, _html} = mount_view(conn)
+
+      card = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert card =~ "1/2"
+      refute card =~ "asked"
     end
   end
 

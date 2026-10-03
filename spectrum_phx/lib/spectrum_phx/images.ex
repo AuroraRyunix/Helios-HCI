@@ -50,6 +50,7 @@ defmodule SpectrumPhx.Images do
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Spark
+  alias SpectrumPhx.Storage.Containers
 
   @pubsub SpectrumPhx.PubSub
   @topic "images"
@@ -318,14 +319,25 @@ defmodule SpectrumPhx.Images do
   Returns `{:ok, %{vdisk: ..., socket: ..., node: ..., size_bytes: ...}}` or
   `{:error, reason}`. On failure nothing is left behind.
   """
-  @spec prepare_upload(String.t(), non_neg_integer()) :: {:ok, map()} | {:error, term()}
-  def prepare_upload(name, size_bytes) when is_integer(size_bytes) and size_bytes > 0 do
+  @spec prepare_upload(String.t(), non_neg_integer(), String.t() | nil) ::
+          {:ok, map()} | {:error, term()}
+  def prepare_upload(name, size_bytes, container \\ nil)
+
+  def prepare_upload(name, size_bytes, container)
+      when is_integer(size_bytes) and size_bytes > 0 do
+    # The image's vdisk is created in a container that exists, like every other vdisk: an
+    # image is the one disk read by every VM cloned from it, so a copy count that silently
+    # fell to one is the worst place to lose it. No container named means the cluster's
+    # default.
+    container = if container in [nil, ""], do: Containers.default_name(), else: container
+
     with {:ok, name} <- validate_name(name),
+         :ok <- ensure_container(container),
          :ok <- refuse_if_catalogued(name) do
       vdisk = resource_name(name)
       ip = local_ip()
 
-      with {:ok, _created} <- allocate(ip, vdisk, size_bytes),
+      with {:ok, _created} <- allocate(ip, vdisk, size_bytes, container),
            {:ok, socket} <- claim(ip, vdisk) do
         {:ok, %{vdisk: vdisk, socket: socket, node: ip, size_bytes: size_bytes}}
       else
@@ -339,7 +351,15 @@ defmodule SpectrumPhx.Images do
     end
   end
 
-  def prepare_upload(_name, _size_bytes), do: {:error, {:upload, "The image size is unknown."}}
+  def prepare_upload(_name, _size_bytes, _container),
+    do: {:error, {:upload, "The image size is unknown."}}
+
+  defp ensure_container(container) do
+    case Containers.ensure_exists(container) do
+      :ok -> :ok
+      {:error, message} -> {:error, {:container, message}}
+    end
+  end
 
   defp refuse_if_catalogued(name) do
     case get_image(name) do
@@ -352,8 +372,8 @@ defmodule SpectrumPhx.Images do
     end
   end
 
-  defp allocate(ip, vdisk, size_bytes) do
-    case uploader().create(ip, vdisk, size_bytes) do
+  defp allocate(ip, vdisk, size_bytes, container) do
+    case uploader().create(ip, vdisk, size_bytes, container) do
       {:ok, info} -> {:ok, info}
       {:error, {409, message}} -> {:error, {:size_conflict, message}}
       {:error, reason} -> {:error, {:allocate, describe(reason)}}
@@ -535,6 +555,9 @@ defmodule SpectrumPhx.Images do
   def describe_upload_error({:allocate, detail}),
     do: "The cluster could not allocate storage for this image: #{detail}"
 
+  def describe_upload_error({:container, detail}),
+    do: "The image cannot be stored there: #{detail}."
+
   def describe_upload_error({:claim, detail}), do: detail
   def describe_upload_error({:seal, detail}), do: detail
   def describe_upload_error({:truncated, detail}), do: detail
@@ -575,7 +598,9 @@ defmodule SpectrumPhx.Images do
     """
     alias SpectrumPhx.Spark
 
-    def create(ip, vdisk, size_bytes), do: Spark.dfs_create(ip, vdisk, size_bytes)
+    def create(ip, vdisk, size_bytes, container),
+      do: Spark.dfs_create(ip, vdisk, size_bytes, container: container)
+
     def attach(ip, vdisk), do: Spark.dfs_attach(ip, vdisk)
     def detach(ip, vdisk), do: Spark.dfs_detach(ip, vdisk)
     def seal(ip, vdisk), do: Spark.dfs_seal(ip, vdisk)

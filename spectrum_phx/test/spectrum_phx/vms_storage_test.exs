@@ -56,8 +56,20 @@ defmodule SpectrumPhx.VmsStorageTest do
   setup do
     Application.put_env(:spectrum_phx, :vms_source, {:static, []})
 
+    # A disk's container has to exist, so two do.
+    Application.put_env(
+      :spectrum_phx,
+      :containers_source,
+      {:static,
+       [
+         %{"name" => "default-pool", "tier" => "SSD", "ftt" => 1, "quota_bytes" => 0},
+         %{"name" => "fast", "tier" => "NVME", "ftt" => 1, "quota_bytes" => 0}
+       ]}
+    )
+
     on_exit(fn ->
       Application.delete_env(:spectrum_phx, :vms_source)
+      Application.delete_env(:spectrum_phx, :containers_source)
       Application.delete_env(:spectrum_phx, :vms_storage_client)
     end)
 
@@ -122,6 +134,42 @@ defmodule SpectrumPhx.VmsStorageTest do
       assert {:error, errors} = Vms.create_vm(params(%{"disks" => "512M"}))
       assert Keyword.has_key?(errors, :disks)
       refute_received {:storage, _, _, _}
+    end
+  end
+
+  describe "every disk is created in a container that exists" do
+    test "a disk that names no container is created in the cluster default" do
+      # This is the defect, not a convenience: a create that omitted the container reached
+      # Sidon as "default", which matches no container row, so the vdisk inherited no ftt
+      # and was created with one copy on a cluster whose container asks for two.
+      stub_storage()
+
+      assert {:ok, _vm} = Vms.create_vm(params(%{"disks" => "10G"}))
+
+      assert_received {:storage, :create, "web-01-disk0", %{container: "default-pool"}}
+    end
+
+    test "a disk that names a container is created in that one" do
+      stub_storage()
+
+      assert {:ok, _vm} = Vms.create_vm(params(%{"disks" => "10G:fast,20G"}))
+
+      assert_received {:storage, :create, "web-01-disk0", %{container: "fast"}}
+      assert_received {:storage, :create, "web-01-disk1", %{container: "default-pool"}}
+    end
+
+    test "a container nothing matches is refused before any disk is created" do
+      # A name that matches no row is not an error further down -- it reads as "not
+      # configured" -- so the only place it can be caught is before the create. Checking
+      # every disk first also means a typo on the last one leaves nothing to roll back.
+      stub_storage()
+
+      assert {:error, {:storage, message}} =
+               capture_and_create(params(%{"disks" => "10G,20G:nope"}))
+
+      assert message =~ "nope"
+      refute_received {:storage, :create, _, _}
+      refute_received {:storage, :delete, _, _}
     end
   end
 

@@ -97,6 +97,13 @@ pub struct Daemon {
     access: Arc<AccessLog>,
 }
 
+/// The container a create lands in when its request names none. It is the container the
+/// installer makes (`helios_sidon.DEFAULT_CONTAINER`), which is the point: this used to be
+/// the literal "default", which matches no row in `hydra.storage_containers`, so a vdisk
+/// whose caller forgot to name a container inherited no tier, no compression and no
+/// replication policy -- silently.
+const DEFAULT_CONTAINER: &str = "default-pool";
+
 /// How many copies a vdisk should be created with, given a fault tolerance and the number
 /// of nodes that could hold one.
 ///
@@ -145,7 +152,9 @@ impl Daemon {
             cfg.purah_grace,
             Arc::clone(&access),
         );
-        let replica_store = Arc::new(ReplicaStore::new(&cfg.root)?);
+        // Shares the tally, so the reads this node serves to another node's vdisk count.
+        let replica_store =
+            Arc::new(ReplicaStore::new(&cfg.root)?.with_access(Arc::clone(&access)));
         let mut peers = HashMap::new();
         let mut fence_peers = HashMap::new();
         for (node, addr) in &cfg.peers {
@@ -191,7 +200,7 @@ impl Daemon {
     /// "copied from the container's ftt" -- and because it is the only one of the two
     /// that can express "these particular disks are scratch". The cluster's
     /// `redundancy_factor` catches every vdisk whose container says nothing, which today
-    /// is any create that omits the container and lands on Sidon's unmatched "default".
+    /// is any create whose container matches no row.
     ///
     /// One copy is the last resort and not a policy: it is what this node falls back to
     /// when it can read neither Hydra nor its own cluster document, and it is deliberately
@@ -335,7 +344,7 @@ impl Daemon {
         if size == 0 {
             return Err(Error::refused("size_bytes must be greater than zero".to_string()));
         }
-        let container = req.get("container").and_then(Value::as_str).unwrap_or("default");
+        let container = req.get("container").and_then(Value::as_str).unwrap_or(DEFAULT_CONTAINER);
         let class = req.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
         if class != CLASS_RW && class != CLASS_IMMUTABLE {
             return Err(Error::refused(format!(

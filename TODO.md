@@ -545,6 +545,32 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 
 ## P2 — Storage / DFS
 
+* **The single-copy vdisks, and what is still owed on the live cluster (2026-10-03).** The code
+  paths are closed; the cluster is not, because nothing was deployed. Both live vdisks are in a
+  container called `default` (not a row) and hold one copy, and `cluster.json` says
+  `redundancy_factor: 0` on three nodes. In this order, by hand: `cluster add-node --node <member>
+  -r 1` (writes the factor; see [docs/cluster.md](docs/cluster.md)), restart sidon on each node
+  one at a time (it reads `cluster.json` at start, and the binary change below needs the restart
+  anyway), then `valcli storage.replicate --all`. Closed in code: every create names a container
+  that exists (`Spark.dfs_create/4` raises without one; `/api/vms/update` add-disk passes one;
+  Sidon's own fallback is now `default-pool`), `add-node` warns and takes `-r`, the replica
+  store tallies the reads it serves, the console shows requested against held against policy,
+  and `dfs_egroup_replicas` is dropped (migration `0025`).
+* **A replica's `replica-egroups/` files are never reclaimed.** Purah sweeps the groups
+  `dfs_egroups` records for *this* node, in `egroups/`. A copy pushed to a peer lands in that
+  peer's `replica-egroups/`, which nothing lists, so when the owner reclaims a group the peers
+  keep their copies for good. Found while deciding what to do with `dfs_egroup_replicas`; not
+  fixed because the right sweep is a replica-side one that marks from `dfs_block_map` (I-7),
+  which wants a design, not a patch.
+* **`purah-heat` ranks only groups this node created.** The reads a replica now serves are
+  tallied and flushed to `dfs_egroup_access`, but the ranking is scoped to the node's own
+  `dfs_egroups` inventory, so a group held only as a replica does not appear in that node's
+  ranking; it surfaces through the owner's merged rows. Fine until tiering acts per node.
+* **The default container is spelled in more places than the three a test holds equal.**
+  `vali.py` and `valcli.py` each carry their own `"default-pool"` fallback instead of reading
+  `helios_sidon.DEFAULT_CONTAINER`, and Daruk's `vdisk-create` allow-list still defaults the
+  column to `"default"` (Sidon always sends one now, so it is unreachable from Sidon).
+
 * ~~191 replicated volumes, cluster-wide, whatever the node count.~~ **Resolved
   (2026-08-22)**: the ceiling was LINSTOR's `TcpPortAutoRange` default of `7700-7890` -- one
   port per DRBD resource, so about nine VMs per host at twenty nodes, surfacing as a confusing
@@ -1058,9 +1084,9 @@ reports per disk, and Purah treats referenced-but-absent as a repair candidate. 
 change: which disk holds an egroup is a node-local fact, and `referenced_egroups()` already
 produces the set that identifies a dead disk's losses.
 
-`hydra.dfs_egroup_replicas` is in the schema, has `egroup_id`/`node`/`path`/`state`, and is
-written by nothing. It suggests a per-egroup placement model that was never built; do not
-mistake it for a source of truth.
+`hydra.dfs_egroup_replicas` was in the schema, with `egroup_id`/`node`/`path`/`state`, and was
+written by nothing. It was dropped by migration `0025`; see
+[docs/dfs/multi_disk.md](docs/dfs/multi_disk.md) for why it was removed rather than made true.
 
 Provisioning must not land first -- claiming both disks before sidon can use the second one
 gains nothing and removes the guard currently keeping `sdc` untouched.

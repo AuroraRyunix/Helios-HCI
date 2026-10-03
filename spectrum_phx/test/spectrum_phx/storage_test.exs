@@ -37,6 +37,13 @@ defmodule SpectrumPhx.StorageTest do
       "class" => Keyword.get(opts, :class, "rw"),
       "replicas" => Keyword.get(opts, :replicas, ["hci-01", "hci-02"])
     }
+    |> then(fn entry ->
+      # Absent unless asked for, like a daemon that predates the field.
+      case Keyword.get(opts, :rf) do
+        nil -> entry
+        rf -> Map.put(entry, "rf", rf)
+      end
+    end)
   end
 
   defp forwarding(id, to) do
@@ -284,6 +291,33 @@ defmodule SpectrumPhx.StorageTest do
       assert disk.health == :degraded
       assert "1 of 2 replicas present" in disk.issues
       assert snapshot.summary.vdisks_under_replicated == 1
+    end
+
+    test "a vdisk that holds exactly what it asked for is still short of the policy" do
+      # rf 1 recorded, one copy held, cluster policy two. Comparing the count only with the
+      # vdisk's own request calls this healthy, and it is the state a node loss destroys.
+      static = healthy(vdisks: [owned("vm1-disk0", replicas: ["hci-01"], rf: 1)])
+      snapshot = snap(static)
+
+      disk = vdisk(snapshot, "vm1-disk0")
+      assert disk.requested_replicas == 1
+      assert disk.expected_replicas == 2
+      assert disk.under_replicated? == true
+      assert disk.health == :degraded
+      assert Enum.any?(disk.issues, &(&1 =~ "asked for 1 copy" and &1 =~ "asks for 2"))
+    end
+
+    test "a vdisk that lost a copy it asked for is told apart from one that never had it" do
+      static = healthy(vdisks: [owned("vm1-disk0", replicas: ["hci-01"], rf: 2)])
+
+      disk = vdisk(snap(static), "vm1-disk0")
+      assert disk.requested_replicas == 2
+      assert "1 of the 2 replicas it asked for present" in disk.issues
+    end
+
+    test "a daemon that does not report rf leaves it unknown rather than assumed" do
+      disk = vdisk(snap(healthy(vdisks: [owned("vm1-disk0")])), "vm1-disk0")
+      assert disk.requested_replicas == nil
     end
 
     test "a sealed vdisk is reported as such and is not a fault" do

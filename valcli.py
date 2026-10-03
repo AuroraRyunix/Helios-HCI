@@ -1214,6 +1214,12 @@ def cmd_storage_replication():
     else:
         print("Cluster redundancy factor %d (survive %d host loss%s) across %d node(s)."
               % (cluster_ftt, cluster_ftt, "" if cluster_ftt == 1 else "es", nodes))
+        if cluster_ftt == 0 and nodes >= 2:
+            # `cluster create` sets 0 for one node and nothing raised it when the cluster
+            # grew, so this is usually an inheritance and not a choice.
+            print("That is probably left over from creating the cluster on one node. Every")
+            print("new vdisk in a container with no ftt of its own gets ONE copy. To change")
+            print("it:  cluster add-node --node <a member ip> -r 1")
     print()
     print_table(["Vdisk", "Container", "Policy", "Asked (rf)", "Copies", "State"],
                 sorted(rows))

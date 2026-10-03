@@ -44,6 +44,7 @@ use std::time::Duration;
 
 use crate::crc::crc32c;
 use crate::err::{Error, Result};
+use crate::heat::AccessLog;
 use crate::tls::{self, TlsMaterial, Wire};
 
 pub const MAGIC: u32 = 0x5344_5052; // "SDPR"
@@ -212,13 +213,33 @@ pub struct ReplicaStore {
     root: PathBuf,
     /// vdisk -> highest fenced epoch. Cached, but the file is the truth.
     fenced: Mutex<HashMap<String, u64>>,
+    /// The node's extent-group access tally, when the daemon has one to share.
+    ///
+    /// A read served from here never goes through `Vdisk::read`, which is where the tally
+    /// is otherwise fed: the vdisk belongs to another node and this node only holds a copy.
+    /// So the replica store feeds it itself. In memory and flushed on Purah's timer, like
+    /// every other count in it, which is what makes this free -- an access is a hash lookup
+    /// and four adds, with no round trip to Hydra on the read.
+    access: Option<Arc<AccessLog>>,
 }
 
 impl ReplicaStore {
     pub fn new(root: &Path) -> Result<ReplicaStore> {
         std::fs::create_dir_all(root.join("replica"))?;
         std::fs::create_dir_all(root.join("replica-egroups"))?;
-        Ok(ReplicaStore { root: root.to_path_buf(), fenced: Mutex::new(HashMap::new()) })
+        Ok(ReplicaStore {
+            root: root.to_path_buf(),
+            fenced: Mutex::new(HashMap::new()),
+            access: None,
+        })
+    }
+
+    /// Share the node's access tally, so the reads this replica serves count toward the
+    /// heat of the extent groups it holds. Without it a group read mostly through its
+    /// replicas ranks as cold on the node that serves it.
+    pub fn with_access(mut self, access: Arc<AccessLog>) -> ReplicaStore {
+        self.access = Some(access);
+        self
     }
 
     fn journal_path(&self, vdisk: &str) -> PathBuf {
@@ -342,6 +363,11 @@ impl ReplicaStore {
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(&mut buf)
             .map_err(|e| Error::corrupt(format!("replica extent group {egroup} short: {e}")))?;
+        // Counted after the bytes are in hand, so a read that failed is not recorded as an
+        // access to a group nobody could read -- the same rule `Vdisk::read` follows.
+        if let Some(access) = &self.access {
+            access.record_read(egroup, len as u64, crate::meta::now_ms());
+        }
         Ok(buf)
     }
 }
@@ -816,6 +842,60 @@ mod tests {
         let store = ReplicaStore::new(&dir).unwrap();
         store.fence("vd", 6).unwrap();
         store.append("vd", 6, b"the owner at the fenced epoch").unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The property: a read this node serves to another node's vdisk is counted.
+    ///
+    /// Such a read reaches `ReplicaStore::get_egroup` and never `Vdisk::read`, which is the
+    /// only other place the tally is fed -- so before the replica store shared the tally, a
+    /// group read mostly through its replicas ranked as cold on the node that was serving
+    /// it, which is the node a placement decision would be made on.
+    #[test]
+    fn a_read_served_to_another_nodes_vdisk_is_tallied() {
+        let dir = tmpdir("replica-read-tally");
+        let access = Arc::new(AccessLog::new(16, 0));
+        let store = ReplicaStore::new(&dir).unwrap().with_access(Arc::clone(&access));
+        store.put_egroup("eg-a", 0, &[7u8; 4096]).unwrap();
+
+        // Through the serve layer, as a peer's request arrives.
+        let resp = serve_request(&store, &Request {
+            opcode: OP_EGROUP_GET,
+            vdisk: "eg-a".to_string(),
+            epoch: 1,
+            seq: 4096,
+            offset: 0,
+            flags: 0,
+            data: Vec::new(),
+        });
+        assert!(resp.is_ok());
+
+        let sample = access.sample(10);
+        assert_eq!(sample.rows.len(), 1);
+        let (id, counts) = &sample.rows[0];
+        assert_eq!(id, "eg-a");
+        assert_eq!((counts.reads, counts.bytes_read), (1, 4096));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_replica_read_that_failed_is_not_an_access() {
+        // The same rule Vdisk::read follows: a group nobody could read is not wanted-here
+        // evidence, and counting it would rank a missing file as warm.
+        let dir = tmpdir("replica-read-miss");
+        let access = Arc::new(AccessLog::new(16, 0));
+        let store = ReplicaStore::new(&dir).unwrap().with_access(Arc::clone(&access));
+        assert!(store.get_egroup("absent", 0, 4096).is_err());
+        assert!(access.sample(10).rows.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_replica_store_with_no_tally_still_serves_reads() {
+        let dir = tmpdir("replica-read-untallied");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.put_egroup("eg-a", 0, b"bytes").unwrap();
+        assert_eq!(store.get_egroup("eg-a", 0, 5).unwrap(), b"bytes");
         std::fs::remove_dir_all(&dir).ok();
     }
 

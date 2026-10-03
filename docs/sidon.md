@@ -130,7 +130,10 @@ The curator, running inside Sidon. Three jobs, all background, none on the guest
 - **Scrub** — recompute every sealed group's hash against the one recorded at seal time.
   Needs no lock, because sealed means immutable.
 - **Access accounting** — tally how often each extent group is read and written, and flush
-  the totals to `hydra.dfs_egroup_access` on its own, much shorter timer. On a separate
+  the totals to `hydra.dfs_egroup_access` on its own, much shorter timer. Reads a node
+  serves from its replica store to *another node's* vdisk are counted too: they never pass
+  through `Vdisk::read`, so the replica store shares the same in-memory tally, with no
+  metadata round trip on the read. On a separate
   thread from the sweep deliberately: a sweep stalled against an unreachable Hydra must not
   also stop the counters, because the ranking they feed is what an operator reaches for when
   they are trying to find out why a disk is busy.
@@ -214,7 +217,37 @@ attached vdisks are eligible — re-replication runs on the owner, because the o
 node that has the data.
 
 Changing the cluster's redundancy factor itself is a separate decision and is not made
-here; these commands only make disks match whatever it is already set to.
+here; these commands only make disks match whatever it is already set to. It is made with
+`cluster add-node --node <ip> -r N`, see [cluster.md §F](./cluster.md); a cluster that was
+created on one node carries 0 until someone does.
+
+**A create always names a container.** The copy count comes from the container's `ftt`
+before the cluster's factor, so a create that names no container, or one that matches no
+row in `hydra.storage_containers`, gets no container policy at all and falls through to the
+cluster factor — 0 on a cluster that was grown from one node. That is how both live vdisks
+came to hold one copy on a cluster whose `default-pool` has `ftt=1`: they were in a
+container called `default`, which is not a row, because the Phoenix tier's
+`Spark.dfs_create/4` had no container parameter and `/api/vms/update`'s add-disk path
+omitted it. Now:
+
+* every create path names a container — `Spark.dfs_create/4` raises without one, VM disks
+  and image uploads default to `default-pool` (`Containers.default_name/0`, equal to
+  `helios_sidon.DEFAULT_CONTAINER` and to Sidon's own fallback, and a test holds the three
+  together), and a disk added to a VM carries the container its entry names;
+* each of them checks the container exists before creating anything, so a typo is refused
+  with nothing to roll back;
+* `test_vdisk_creates_name_a_container.py` finds the creates itself — it parses every Python
+  module and Elixir source for a create — instead of listing known callers, which is how
+  the old guard missed the add-disk path.
+
+**The console shows all three numbers.** A vdisk holds some copies, was created asking for
+`rf`, and the cluster policy asks for a third. The storage page's replica badge draws the
+copies it holds against the larger of the last two, and says "asked 1, policy 2" when the
+vdisk asked for less than policy. A vdisk that asked for one copy and holds one is
+therefore **under-replicated**, not healthy: that match is the one every vdisk showed while
+the defect was live, and one copy is what a node loss destroys. A vdisk that lost a copy it
+asked for is told apart from one that never had it, because the first heals itself and the
+second needs `valcli storage.replicate`.
 
 ## 6. Snapshots and clones
 

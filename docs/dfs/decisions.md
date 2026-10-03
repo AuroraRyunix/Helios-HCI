@@ -257,6 +257,9 @@ the next version said "the next free id" and so named no number at all, which le
 with nothing to be built against. A number held for a table that does not exist yet is a
 collision waiting for the first migration that needs one, so ids are assigned when the work
 is scheduled, and recorded here when they are.
+The precedent this entry keeps citing, `dfs_egroup_replicas` -- a table that sat in the
+schema with nothing writing to it -- has since been dropped (migration `0025`), so the
+cost it describes is no longer a live example, only a recorded one.
 
 ```
 dfs_extent_id_map                  -- 0020

@@ -30,25 +30,53 @@ defmodule SpectrumPhxWeb.Storage.Components do
   end
 
   @doc """
-  A vdisk's replica count against what the cluster's redundancy factor asks for.
+  A vdisk's replica count: what it holds, what it asked for, and what the cluster asks for.
+
+  Three numbers, because they come apart and each coming apart is a different problem. A
+  vdisk holds `have` copies, was created asking for `asked` (its recorded `rf`), and the
+  cluster's redundancy factor asks for `want` today. A badge that compared only `have`
+  with `asked` drew a vdisk that had asked for one copy and held one as `1/1`, healthy,
+  on a cluster that keeps two -- which is exactly the state every vdisk was in while the
+  create path did not name a container. Healthy means it holds *at least* both.
 
   `nil` for `have` means a node did not answer, so the count is unknown rather than
-  short -- drawn as a warning, never as a satisfied count.
+  short -- drawn as a warning, never as a satisfied count. `nil` for `asked` is a daemon
+  that predates the field, and falls back to comparing against the policy alone.
   """
   attr :have, :integer, default: nil
   attr :want, :integer, required: true
+  attr :asked, :integer, default: nil
 
   def replica_badge(assigns) do
+    assigns = assign(assigns, :target, max(assigns.asked || 0, assigns.want))
+
     ~H"""
-    <span class={[
-      "badge badge-sm gap-1 font-mono text-xs",
-      replica_class(@have, @want)
-    ]}>
+    <span
+      class={[
+        "badge badge-sm gap-1 font-mono text-xs",
+        replica_class(@have, @target)
+      ]}
+      title={replica_title(@have, @asked, @want)}
+    >
       <span class="opacity-70">replicas</span>
-      {if is_nil(@have), do: "?", else: @have}/{@want}
+      {if is_nil(@have), do: "?", else: @have}/{@target}
+      <span :if={@asked && @asked < @want} class="opacity-80">
+        (asked {@asked}, policy {@want})
+      </span>
+      <span :if={is_integer(@have) and @have < @target} class="font-sans">under-replicated</span>
     </span>
     """
   end
+
+  defp replica_title(nil, _asked, _want), do: "A node did not answer, so the copy count is unknown."
+
+  defp replica_title(have, nil, want),
+    do: "#{have} copies held; the cluster's redundancy factor asks for #{want}."
+
+  defp replica_title(have, asked, want),
+    do:
+      "#{have} copies held; created asking for #{asked}; the cluster's redundancy factor " <>
+        "asks for #{want}."
 
   @doc """
   Which node serves a vdisk, and in what role.

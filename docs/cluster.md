@@ -125,6 +125,36 @@ silently rather than loudly:
 and out of the ring, and re-running finishes from there rather than refusing because the
 address is already in the config.
 
+#### Adding a node does not change the redundancy factor
+`cluster create` defaults `redundancy_factor` to 1 and forces it to 0 for a one-node
+cluster, which is right at the time: there is nowhere to put a second copy. Nothing
+revisited it as the cluster grew, so a cluster created on one node and grown to three kept
+`redundancy_factor: 0` for as long as it lived, every new vdisk was created with **one
+copy**, and `valcli storage.replication` read the 0 back as the operator's decision.
+
+The factor is a replication policy, so `add-node` does not change it on its own. What it
+does instead:
+
+* **Warns, loudly, at the end of every join** (including a resumed one) when the cluster
+  now has two or more nodes and the factor is 0 or missing, and prints the command that
+  settles it:
+  ```bash
+  cluster add-node --node 10.10.102.43 -r 1
+  ```
+* **Takes `-r N` explicitly.** On a join it writes `redundancy_factor` into `cluster.json`
+  with the new membership, in the same write to every node; the factor is checked against
+  the grown cluster's size *before* anything is changed, and refused rather than clamped.
+* **Settles an existing cluster.** Given a node that is already a live member, `-r N`
+  joins nothing and changes only the factor. That is the way out for a cluster grown
+  before this existed. It is idempotent.
+
+Two things it deliberately does not do. Sidon reads `cluster.json` when it starts, so the
+new factor reaches *creates* only after sidon is restarted on each node, one at a time;
+the command says so. And disks that already exist keep the `rf` they were created with —
+`valcli storage.replication` lists them and `valcli storage.replicate --all` tops them up,
+one copy per run. `valcli storage.replication` also prints a note when it sees factor 0 on
+a multi-node cluster.
+
 #### Why identity comes first
 A node reads its own IP from `LOCAL_HYPERVISOR_IP` in `/etc/hci/spectrum/spectrum.env`.
 Eleven Python modules and the Phoenix console read that key, and every one of them falls

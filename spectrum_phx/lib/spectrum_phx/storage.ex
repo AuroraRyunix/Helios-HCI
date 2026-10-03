@@ -343,6 +343,9 @@ defmodule SpectrumPhx.Storage do
       class: string(Map.get(attachment, "class")),
       degraded?: Map.get(attachment, "degraded") == true,
       replicas: replica_names(Map.get(attachment, "replicas")),
+      # What the vdisk was created asking for, which is neither the copies it holds nor what
+      # the cluster policy asks today. `nil` from a daemon that predates the field.
+      rf: integer(Map.get(attachment, "rf")),
       forwarding_to: string(Map.get(attachment, "forwarding_to"))
     }
   end
@@ -363,11 +366,12 @@ defmodule SpectrumPhx.Storage do
 
     replicas = (owner && owner.replicas) || []
     replica_count = length(replicas)
+    requested = owner && owner.rf
     stranded = Enum.filter(replicas, &MapSet.member?(down, &1))
 
     issues =
       owner_issues(id, owner, attachments) ++
-        replica_issues(owner, replica_count, expected, unreachable) ++
+        replica_issues(owner, replica_count, expected, requested, unreachable) ++
         stranded_issues(stranded)
 
     %{
@@ -383,6 +387,7 @@ defmodule SpectrumPhx.Storage do
       replicas: replicas,
       replica_count: replica_count,
       expected_replicas: expected,
+      requested_replicas: requested,
       forwarders: Enum.sort(forwarders),
       attachments: Enum.sort_by(attachments, & &1.hostname),
       # `nil`, not `false`: a node we could not read might be the owner, and the replica
@@ -446,11 +451,41 @@ defmodule SpectrumPhx.Storage do
   end
 
   # Every node answered, so the replica set the owner reports is the replica set.
-  defp replica_issues(owner, count, expected, []) when not is_nil(owner) and count < expected do
-    ["#{count} of #{expected} replicas present"]
+  #
+  # Three different states hide behind "fewer copies than the cluster asks for", and they
+  # want different responses, so they are told apart when the vdisk recorded what it asked
+  # for:
+  #
+  #   * it holds fewer copies than it asked for -- something was lost, and Purah heals it;
+  #   * it holds what it asked for, which is less than the policy asks *now* -- nothing is
+  #     lost, it was created under a weaker policy (or, until the create path named a
+  #     container, under none), and nothing will grow it unless an operator tops it up;
+  #   * it recorded nothing, a daemon that predates the field -- the old message.
+  #
+  # Reading the second as healthy because it matches its own request is the mistake this
+  # exists to avoid: a vdisk that asked for one copy has one copy, and one copy is exactly
+  # what a node loss destroys.
+  defp replica_issues(owner, count, expected, requested, [])
+       when not is_nil(owner) and count < expected do
+    cond do
+      is_nil(requested) ->
+        ["#{count} of #{expected} replicas present"]
+
+      count < requested ->
+        ["#{count} of the #{requested} replicas it asked for present"]
+
+      true ->
+        [
+          "asked for #{requested} #{copies(requested)} when it was created and the cluster now " <>
+            "asks for #{expected}; it was never topped up"
+        ]
+    end
   end
 
-  defp replica_issues(_owner, _count, _expected, _unreachable), do: []
+  defp replica_issues(_owner, _count, _expected, _requested, _unreachable), do: []
+
+  defp copies(1), do: "copy"
+  defp copies(_n), do: "copies"
 
   defp stranded_issues([]), do: []
 
