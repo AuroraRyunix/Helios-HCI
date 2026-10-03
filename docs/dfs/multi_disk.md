@@ -42,11 +42,21 @@ extent groups that lived on it.
 Redundancy today is **per vdisk, across nodes**: `dfs_vdisks.replicas` names the nodes an
 append must reach, and write-all means an append that misses one is not acknowledged.
 
-`hydra.dfs_egroup_replicas` exists in the schema, with an `egroup_id`, `node`, `path` and
-`state` — and **nothing writes to it**. There are no references to it anywhere in
-`sidon/src`. It is a table designed for a per-egroup placement model that was never built.
-Worth knowing before designing around it: it is not a source of truth, it is an empty
-table with a suggestive shape.
+`hydra.dfs_egroup_replicas` existed in the schema, with an `egroup_id`, `node`, `path` and
+`state` — and **nothing wrote to it**. It was a table designed for a per-egroup placement
+model that was never built, and every design that touched this layer had to begin by
+establishing that it was not a source of truth. **It has been dropped (migration
+`0025-drop-dfs-egroup-replicas`).**
+
+It was removed rather than made true. Making it true means a metadata write per replica
+per extent group, kept in step with the files on every node through every crash between
+"file written" and "row written", and checked by a scrub against what is on disk. A table
+that can lie is exactly what I-3 and I-7 keep out of Purah's mark phase, so the best it
+could ever be is advice. The placement the system uses is per vdisk
+(`dfs_vdisks.replicas`), and which node created a group, and in what state, is
+`dfs_egroups`. Nothing read the table, so the mark phase — which reads `dfs_block_map` and
+nothing else, and is tested to — is unaffected. If per-group placement is ever needed it
+should arrive with the thing that writes it, in the same change.
 
 ## The design
 

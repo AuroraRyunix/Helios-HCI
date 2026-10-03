@@ -1372,6 +1372,89 @@ def wait_for_ring_member(ips, target, attempts=60, delay=5):
     return False, last
 
 
+def redundancy_factor_refusal(factor, node_count):
+    """Why `factor` cannot be this cluster's redundancy factor, or None if it can.
+
+    The factor counts host losses survived, so it needs one more host than it names: ftt 1
+    keeps two copies and there must be two hosts to hold them. Refused rather than
+    clamped, because a clamped value is written to cluster.json and read back later as
+    the operator's decision.
+    """
+    if factor < 0:
+        return "a redundancy factor cannot be negative"
+    if factor + 1 > node_count:
+        return ("a redundancy factor of %d keeps %d copies and this cluster has %d node(s)"
+                % (factor, factor + 1, node_count))
+    return None
+
+
+def redundancy_factor_warning(config, node_count, node):
+    """Lines telling the operator the cluster's replication policy is stale, or [].
+
+    `cluster create` forces the factor to 0 for a one-node cluster, which is correct then:
+    there is nowhere to put a second copy. Nothing revisits it when the cluster grows, so a
+    cluster created on one node and grown to three keeps asking for one copy of every disk
+    for as long as it lives, and every tool reads that as the operator's choice.
+
+    This only ever *says* so. The factor is a replication policy: raising it changes how
+    many copies every new vdisk gets and what Purah heals toward, and that is a decision
+    for the operator and not a side effect of adding a machine. Hence a warning that
+    carries the exact command, and a flag (`-r`) that makes the decision explicit.
+
+    A document with no factor at all is treated the same way: Sidon falls back to one copy
+    for it, so the cluster is in the same state without anyone having chosen it.
+    """
+    factor = config.get("redundancy_factor")
+    if node_count < 2 or (isinstance(factor, int) and not isinstance(factor, bool)
+                          and factor >= 1):
+        return []
+    shown = "0" if factor is None or factor == 0 else str(factor)
+    return [
+        "[WARNING] cluster.json says redundancy_factor %s, and this cluster now has %d "
+        "nodes." % (shown, node_count),
+        "[WARNING] Every new vdisk is created with ONE copy, whatever the hosts could "
+        "hold. 'cluster create' sets 0 for a single-node cluster and nothing raised it "
+        "when this one grew.",
+        "[WARNING] This is a replication policy, so it has not been changed. To keep two "
+        "copies of new vdisks:",
+        "    cluster add-node --node %s -r 1" % node,
+        "[WARNING] That rewrites cluster.json on every node. Sidon reads it at start, so "
+        "restart sidon on each node afterwards (one at a time) for creates to see it. "
+        "Existing vdisks keep the rf they were created with; "
+        "'valcli storage.replication' lists them and 'valcli storage.replicate --all' "
+        "tops them up.",
+    ]
+
+
+def set_redundancy_factor(target, factor, existing):
+    """Change the cluster's redundancy factor and nothing else.
+
+    What `add-node -r N` does when the node is already a live member, so a cluster that was
+    grown before this existed has a way to make the decision without re-adding anything.
+    """
+    config = cluster_hosts_config()
+    if config is None:
+        print("[ERROR] /etc/hci/cluster.json could not be read.")
+        return 1
+    refusal = redundancy_factor_refusal(factor, len(existing))
+    if refusal:
+        print("[ERROR] %s." % refusal)
+        return 1
+    before = config.get("redundancy_factor")
+    config["redundancy_factor"] = factor
+    failed = write_cluster_config(existing, config)
+    if failed:
+        print("[ERROR] Could not write /etc/hci/cluster.json on: %s" % ", ".join(failed))
+        return 1
+    print("[config] redundancy_factor %s -> %d on all %d node(s)."
+          % ("unset" if before is None else before, factor, len(existing)))
+    print("Sidon reads this at start. Restart it on each node, one at a time, for new "
+          "vdisks to be created with %d cop%s." % (factor + 1, "y" if factor == 0 else "ies"))
+    print("Existing vdisks keep the rf they were created with: 'valcli storage.replication' "
+          "shows them, 'valcli storage.replicate --all' tops them up.")
+    return 0
+
+
 def cmd_add_node(args):
     """Bring a provisioned, enrolled machine into this cluster.
 
@@ -1413,6 +1496,10 @@ def cmd_add_node(args):
         members, _ = read_ring([ip for ip in existing if ip != target] or existing)
         live = next((m for m in members if m["address"] == target and m["available"]), None)
         if live is not None:
+            if args.redundancy_factor is not None:
+                # Nothing to join: the node is in, and the operator is using the one
+                # command that exists to settle the replication policy.
+                return set_redundancy_factor(target, args.redundancy_factor, existing)
             print("[ERROR] %s is already a live member of this cluster." % target)
             return 1
         print("[NOTE] %s is already in cluster.json but not serving in the ring; "
@@ -1456,6 +1543,14 @@ def cmd_add_node(args):
 
     ips = existing + [target]
 
+    # Checked here, with nothing changed yet: a factor the grown cluster cannot satisfy
+    # must not be discovered after the ZooKeeper ensemble has been rewritten.
+    if args.redundancy_factor is not None:
+        refusal = redundancy_factor_refusal(args.redundancy_factor, len(ips))
+        if refusal:
+            print("[ERROR] %s." % refusal)
+            return 1
+
     # 1. Identity, before membership. Eleven modules and the Phoenix console read
     # LOCAL_HYPERVISOR_IP out of spectrum.env and fall back to 127.0.0.1 without it, and
     # a node that cannot recognise itself as the ZooKeeper leader never drains the
@@ -1492,11 +1587,18 @@ def cmd_add_node(args):
     if not any(h.get("ip") == target for h in hosts):
         hosts.append({"node_id": len(hosts) + 1, "ip": target, "hostname": hostname})
     config["hosts"] = hosts
+    # Only when asked. The factor is a replication policy and adding a machine does not
+    # change it; see redundancy_factor_warning for what happens when it goes unrevisited.
+    if args.redundancy_factor is not None:
+        config["redundancy_factor"] = args.redundancy_factor
     failed = write_cluster_config(ips, config)
     if failed:
         print("[ERROR] Could not write /etc/hci/cluster.json on: %s" % ", ".join(failed))
         return 1
     print("[config] %s (%s) is in cluster.json on all %d node(s)." % (target, hostname, len(ips)))
+    if args.redundancy_factor is not None:
+        print("[config] redundancy_factor is %d. Sidon reads it at start, so restart it on "
+              "each node for new vdisks to see it." % args.redundancy_factor)
 
     # 3. Consensus.
     #
@@ -1578,6 +1680,12 @@ def cmd_add_node(args):
         "INSERT INTO hydra.nodes (hostname, ip, status, maintenance_mode) "
         "VALUES ('%s', '%s', 'NORMAL', false);" % (hostname, target))
     print("[hydra] registered %s (%s) as a schedulable host." % (hostname, target))
+
+    stale = redundancy_factor_warning(config, len(ips), target)
+    if stale:
+        print()
+        for line in stale:
+            print(line)
 
     print()
     print("Still to do, and deliberately not automatic:")
@@ -1791,7 +1899,9 @@ def make_request(path, method="GET", payload=None):
 def main():
     parser = argparse.ArgumentParser(description="HCI Cluster Management Utility")
     parser.add_argument("-s", "--servers", required=False, help="Comma-separated list of host IPs")
-    parser.add_argument("-r", "--redundancy_factor", type=int, default=None, help="Fault Tolerance to Tolerate (FTT) / Redundancy Factor (e.g. 0, 1, or 2)")
+    parser.add_argument("-r", "--redundancy_factor", type=int, default=None, help="Fault Tolerance to Tolerate (FTT) / Redundancy Factor (e.g. 0, 1, or 2). "
+                             "With 'add-node' it sets the factor explicitly; on a node that is "
+                             "already a member it changes only the factor")
     parser.add_argument("-v", "--vip", required=False, help="Floating Cluster Virtual IP (VIP)")
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
@@ -1840,7 +1950,7 @@ def main():
         rf = args.redundancy_factor if args.redundancy_factor is not None else 1
         if len(ips) == 1:
             if rf > 0:
-                print(f"[WARNING] Single-node cluster detected. Forcing redundancy factor (FTT) from {rf} to 0 (no replication).")
+                print(f"[WARNING] Single-node cluster detected. Forcing redundancy factor (FTT) from {rf} to 0 (no replication). Adding nodes later will not raise it: 'cluster add-node --node <ip> -r N' does.")
             rf = 0
         vip = args.vip if args.vip else ""
 

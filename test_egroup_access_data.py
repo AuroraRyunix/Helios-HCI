@@ -367,8 +367,9 @@ class TheExtentIdMapIsReservedRatherThanHalfBuilt(unittest.TestCase):
 
     The table is not created, and that is the decision rather than the unfinished part.
     `multi_disk.md` already records what an empty table with a suggestive shape costs: the
-    one that exists, `dfs_egroup_replicas`, has nothing writing to it, and every design that
-    came afterwards had to open by establishing that it is not a source of truth.
+    one that existed, `dfs_egroup_replicas` (dropped since, migration 0025), had nothing
+    writing to it, and every design that came afterwards had to open by establishing that it
+    is not a source of truth.
 
     The hazard the flag would not have covered is the reason this is not landed behind one:
     Purah marks from `dfs_block_map.egroup_id`, and the moment any row names an extent

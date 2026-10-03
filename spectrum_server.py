@@ -2065,6 +2065,24 @@ def get_default_container():
     return "default-pool"
 
 
+def require_container(name):
+    """Raise unless `name` is a container that exists, for a path that has no response to send.
+
+    A vdisk created in a container nothing matches is not an error anywhere downstream: the
+    policy lookup returns "not configured" and the disk silently gets no tier, no
+    compression and no replication policy from its container. Naming one is not enough,
+    so a create path checks that the row is there.
+    """
+    if not is_valid_container_name(name):
+        raise Exception(CONTAINER_NAME_ERROR)
+    rc, stdout, _ = run_cql_query(
+        f"SELECT JSON name FROM hydra.storage_containers WHERE name = '{name}';")
+    if rc != 0:
+        raise Exception("The container catalogue could not be read, so a disk cannot be placed.")
+    if not parse_json_rows(stdout):
+        raise Exception(f"No storage container named '{name}'.")
+
+
 # The one place that decides what counts as a SPICE console.
 #
 # Anything that is not exactly "spice", case and whitespace aside, is VNC -- including
@@ -6787,9 +6805,16 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             # per-host resource to place and no split-brain policy to
                             # set, because a vdisk has one owner rather than a role on
                             # every node.
+                            # The container this disk was added to. Left out, Sidon
+                            # falls back to "default", which names no container, so the
+                            # disk gets no tier, no compression and -- the part that
+                            # costs data -- no replication policy: it was created with
+                            # one copy on a cluster whose container asks for two.
+                            require_container(new_container)
                             ok_c, body_c = sidon_call(
                                 "create", vdisk_id=res_name,
-                                size_bytes=int(size_val) * 1024 * 1024 * 1024)
+                                size_bytes=int(size_val) * 1024 * 1024 * 1024,
+                                container=new_container)
                             if not ok_c and "already exists" not in str(body_c):
                                 raise Exception(f"Failed to create vdisk {res_name}: {body_c}")
                             ok_a, body_a = sidon_call("attach", vdisk_id=res_name)

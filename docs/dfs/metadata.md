@@ -169,8 +169,8 @@ Four design points, each of which is a decision:
   increments, so a shared row would have each node clobber the others on every flush and
   an extent group read on three nodes would read as the heat seen by whichever flushed
   last. Reading one group's temperature stays a single-partition query, and the ranking
-  pass sums the rows. It is also the shape `dfs_egroup_replicas` already set for facts
-  about an extent group, per node.
+  pass sums the rows. It is also the shape the since-removed `dfs_egroup_replicas` had for
+  facts about an extent group, per node.
 
 - **Absolute totals, never increments and never a counter column.** CQL counters are not
   idempotent under retry — a timed-out write may be applied twice — and a read-modify-write

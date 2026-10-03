@@ -619,7 +619,11 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
             </div>
             <div class="flex flex-wrap items-center gap-1.5">
               <.health_badge health={vdisk.health} />
-              <.replica_badge have={vdisk.replica_count} want={vdisk.expected_replicas} />
+              <.replica_badge
+                have={if vdisk.owner_ip, do: vdisk.replica_count}
+                want={vdisk.expected_replicas}
+                asked={vdisk.requested_replicas}
+              />
               <.epoch_badge epoch={vdisk.epoch} />
               <span :if={vdisk.sealed?} class="badge badge-sm badge-ghost gap-1">
                 <.icon name="hero-lock-closed" class="size-3" /> sealed

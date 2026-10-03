@@ -257,8 +257,8 @@ the reservation named an id that belonged to something else. A number held for a
 does not exist yet is a collision waiting for the first migration that needs one. The table is deliberately *not* created yet, and that is the decision rather than an
 omission: `multi_disk.md` already records what an empty table with a suggestive shape costs
 — `dfs_egroup_replicas` sat in the schema with nothing writing to it, and every later
-design had to begin by establishing that it was not a source of truth. One of those is
-enough.
+design had to begin by establishing that it was not a source of truth (it has since been
+dropped, migration 0025). One of those is enough.
 
 ```
 dfs_extent_id_map

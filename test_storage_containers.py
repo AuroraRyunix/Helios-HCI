@@ -269,6 +269,10 @@ class EveryVdiskLandsInARealContainer(unittest.TestCase):
         for path, marker in (
             (os.path.join(HERE, "lanayru.py"), "sidon_module().DEFAULT_CONTAINER"),
             (VALCLI, '"container": default_container()'),
+            # Not a list to keep current: test_vdisk_creates_name_a_container finds every
+            # create itself. This one is kept because it was the add-disk path of
+            # /api/vms/update that this guard used to miss.
+            (SPECTRUM, "container=new_container"),
         ):
             self.assertIn(marker, read(path), os.path.basename(path))
 

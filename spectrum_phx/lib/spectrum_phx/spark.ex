@@ -171,13 +171,41 @@ defmodule SpectrumPhx.Spark do
 
   An existing vdisk of the same name is an error rather than a silent adoption. That is
   precisely how a new VM ends up attached to a deleted VM's disk.
+
+  `:container` is required, and a create without one raises. The container is where a
+  vdisk's replica count, tier and compression come from, so a create that leaves it out
+  is not a create with defaults -- it is a create with *no policy*, which was how every
+  vdisk this tier ever made got one copy on a cluster configured for two. Raising makes
+  the omission a failure in the developer's first test instead of a quiet property of
+  every disk in production. Callers that have no operator-chosen container pass
+  `SpectrumPhx.Storage.Containers.default_name/0`.
   """
   def dfs_create(ip, vdisk_id, size_bytes, opts \\ []) do
-    params =
-      %{"vdisk_id" => vdisk_id, "size_bytes" => size_bytes}
-      |> put_present("rf", Keyword.get(opts, :rf))
+    dfs(ip, "create", dfs_create_params(vdisk_id, size_bytes, opts),
+      timeout: Keyword.get(opts, :timeout, 60)
+    )
+  end
 
-    dfs(ip, "create", params, timeout: Keyword.get(opts, :timeout, 60))
+  @doc """
+  The request body `dfs_create/4` sends, built without sending it.
+
+  Public so the one rule that matters -- a create names its container -- can be tested
+  without a cluster to answer.
+  """
+  def dfs_create_params(vdisk_id, size_bytes, opts) do
+    container =
+      case Keyword.get(opts, :container) do
+        name when is_binary(name) and name != "" ->
+          name
+
+        other ->
+          raise ArgumentError,
+                "dfs_create/4 needs a :container naming the storage container " <>
+                  "#{inspect(vdisk_id)} is created in, got #{inspect(other)}"
+      end
+
+    %{"vdisk_id" => vdisk_id, "size_bytes" => size_bytes, "container" => container}
+    |> put_present("rf", Keyword.get(opts, :rf))
   end
 
   @doc """

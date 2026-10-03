@@ -81,6 +81,31 @@ defmodule SpectrumPhx.Storage.Containers do
 
   @name_re ~r/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
 
+  @doc """
+  The container a disk is created in when nobody chose one.
+
+  The same string as `helios_sidon.DEFAULT_CONTAINER` in the Python tier, and a test holds
+  the two equal. It has to be a container that exists, because a vdisk naming one that does
+  not inherits nothing -- no ftt, so no second copy -- and nothing reports it.
+  """
+  def default_name, do: "default-pool"
+
+  @doc """
+  `:ok` when `name` is a container that exists, or `{:error, message}` saying why not.
+
+  A create path calls this before it allocates anything. Naming a container is not enough:
+  `get/1` is the only thing that knows the row is there, and a name that matches nothing
+  reads downstream as "not configured" rather than as an error.
+  """
+  def ensure_exists(name) do
+    case get(name) do
+      {:ok, _container} -> :ok
+      {:error, :invalid_name} -> {:error, "#{inspect(name)} is not a valid container name"}
+      {:error, :not_found} -> {:error, "no storage container named #{inspect(name)}"}
+      {:error, reason} -> {:error, "the container catalogue could not be read: #{inspect(reason)}"}
+    end
+  end
+
   @doc "True only for names that are safe to bind into CQL and compare against vdisk rows."
   def valid_name?(name) when is_binary(name), do: Regex.match?(@name_re, name)
   def valid_name?(_), do: false

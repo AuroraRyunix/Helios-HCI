@@ -271,6 +271,19 @@ defmodule SpectrumPhx.ImagesUploadTest do
       assert Enum.any?(drain(), &match?({:create, _ip, "img-rocky", 1025}, &1))
     end
 
+    test "the vdisk is created in a container, the cluster default when none is named" do
+      # The image disk is read by every VM cloned from it. Created without a container it
+      # reached Sidon as "default", which names nothing, and had one copy.
+      assert {:ok, _allocation} = Images.prepare_upload("rocky.iso", 10)
+      assert_received {:upload_stub_container, "img-rocky", "default-pool"}
+    end
+
+    test "a container nothing matches is refused before anything is created" do
+      assert {:error, {:container, message}} = Images.prepare_upload("rocky.iso", 10, "nope")
+      assert message =~ "nope"
+      refute Enum.any?(drain(), &match?({:create, _, _, _}, &1))
+    end
+
     test "refuses a size it cannot create a vdisk for" do
       assert {:error, {:upload, _message}} = Images.prepare_upload("rocky.iso", 0)
     end

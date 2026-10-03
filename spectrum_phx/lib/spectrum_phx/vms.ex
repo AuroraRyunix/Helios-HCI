@@ -52,6 +52,7 @@ defmodule SpectrumPhx.Vms do
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Spark
+  alias SpectrumPhx.Storage.Containers
   alias SpectrumPhx.Vms.Vm
 
   @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status, graphics"
@@ -424,9 +425,39 @@ defmodule SpectrumPhx.Vms do
     end
   end
 
+  # Every disk is given a container that exists before any of them is created. A disk
+  # with no `:container` in its `disks_list` entry used to be created with none, which
+  # Sidon read as a container named "default" -- matching no row, so the vdisk got no
+  # replication policy and one copy. Checking all of them first also means a typo in the
+  # third disk's container is refused with nothing to roll back.
   defp allocate_storage(%Vm{} = vm) do
-    vm
-    |> Vm.disks()
+    disks = vm |> Vm.disks() |> Enum.map(&name_a_container/1)
+
+    case check_containers(disks) do
+      :ok -> allocate_disks(vm, disks)
+      {:error, message} -> {:error, message}
+    end
+  end
+
+  defp name_a_container(%{container: container} = disk) when container in [nil, ""],
+    do: %{disk | container: Containers.default_name()}
+
+  defp name_a_container(disk), do: disk
+
+  defp check_containers(disks) do
+    disks
+    |> Enum.map(& &1.container)
+    |> Enum.uniq()
+    |> Enum.reduce_while(:ok, fn name, :ok ->
+      case Containers.ensure_exists(name) do
+        :ok -> {:cont, :ok}
+        {:error, message} -> {:halt, {:error, "disk container: " <> message}}
+      end
+    end)
+  end
+
+  defp allocate_disks(%Vm{} = vm, disks) do
+    disks
     |> Enum.reduce_while({:ok, []}, fn disk, {:ok, created} ->
       case allocate_disk(disk) do
         # Adopted, not created: it was already there, so this call does not own it and
@@ -466,15 +497,15 @@ defmodule SpectrumPhx.Vms do
     {:error, "disk #{index} has no usable size"}
   end
 
-  defp allocate_disk(%{resource: resource, size_gib: size_gib}) do
+  defp allocate_disk(%{resource: resource, size_gib: size_gib, container: container}) do
     case storage_client() do
       nil ->
         on_a_spark_node(fn ip ->
-          Spark.dfs_create(ip, resource, size_gib * 1024 * 1024 * 1024)
+          Spark.dfs_create(ip, resource, size_gib * 1024 * 1024 * 1024, container: container)
         end)
 
       fun when is_function(fun, 3) ->
-        fun.(:create, resource, %{size_gib: size_gib})
+        fun.(:create, resource, %{size_gib: size_gib, container: container})
     end
   end
 
