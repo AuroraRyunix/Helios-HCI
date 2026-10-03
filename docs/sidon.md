@@ -382,7 +382,7 @@ that predates the setting — behaves exactly as it did.
   be acting on a ranking nobody had looked at.
 - **The extent ID map.** Helios has two map levels where Nutanix has three, so a clone shares
   extent groups wholesale and cannot diverge one extent at a time. The schema and the staged
-  plan are D-23; migration id `0013-extent-id-map` is reserved and the table is deliberately
+  plan are D-23; it takes the next free migration id when it is built, and the table is deliberately
   not created, because an empty table with a suggestive shape costs every later design a
   paragraph establishing that it is not a source of truth.
 - **Erasure coding** as a Purah job over cold

@@ -250,8 +250,11 @@ makes an extent an addressable thing several vdisks can reference by name, which
 precondition for extent-granular clone divergence and the only thing that makes
 deduplication expressible at all.
 
-The schema is written down below and migration id `0013-extent-id-map` is **reserved for
-it**. The table is deliberately *not* created yet, and that is the decision rather than an
+The schema is written down below. It takes **the next free migration id when it is built**
+-- deliberately not a number reserved in advance. This was first written as `0013`, and the
+task-tree and access-data migrations landed the same week and took 0011 through 0017, so
+the reservation named an id that belonged to something else. A number held for a table that
+does not exist yet is a collision waiting for the first migration that needs one. The table is deliberately *not* created yet, and that is the decision rather than an
 omission: `multi_disk.md` already records what an empty table with a suggestive shape costs
 — `dfs_egroup_replicas` sat in the schema with nothing writing to it, and every later
 design had to begin by establishing that it was not a source of truth. One of those is

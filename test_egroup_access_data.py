@@ -381,7 +381,8 @@ class TheExtentIdMapIsReservedRatherThanHalfBuilt(unittest.TestCase):
         import helios_schema
 
         ids = [m["id"] for m in helios_schema.MIGRATIONS]
-        self.assertNotIn("0013-extent-id-map", ids)
+        self.assertFalse([i for i in ids if "extent-id-map" in i],
+                         "the extent id map migration exists before its mark phase does")
         statements = " ".join(
             " ".join(m["statements"]) for m in helios_schema.MIGRATIONS)
         self.assertNotIn("dfs_extent_id_map", statements)
@@ -397,7 +398,8 @@ class TheExtentIdMapIsReservedRatherThanHalfBuilt(unittest.TestCase):
     def test_the_design_and_the_reason_it_waits_are_recorded(self):
         decisions = read(DECISIONS_MD)
         self.assertIn("**D-23", decisions)
-        self.assertIn("0013-extent-id-map", decisions)
+        self.assertIn("next free migration id", decisions,
+                      "D-23 reserves a number again; the last one was taken by something else")
         self.assertIn("dfs_extent_id_map", decisions)
         # The two things the next person has to know before touching it: that existing
         # vdisks keep the two-level path, and that the curator is the part a read-path flag

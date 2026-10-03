@@ -22,7 +22,8 @@ prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; t
 half is still not built, and nothing moves an extent group on the strength of the ranking.
 
 Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
-and rollback, compression, erasure coding, and `vhost-user-blk`.
+and rollback, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
+built -- migration `0008` -- and this line used to list it as missing.)
 
 The documents remain the specification -- where code and document disagree, that is a bug
 in one of them and the disagreement is the finding.
