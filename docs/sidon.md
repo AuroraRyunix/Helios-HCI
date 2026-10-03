@@ -380,6 +380,31 @@ Nothing here moves data; this is the input the tiering job reads.
 command has nothing to rank and says so.
 
 ```bash
+valcli storage.benchmark default-pool
+```
+
+Creates a throwaway 256 MiB vdisk in the container, attaches it, measures it through the NBD
+socket a guest would use, and detaches and deletes it (also on failure). **Before 2026-10 it
+wrote 64 MiB in one request into a new 100 MiB vdisk and printed that single timing.** One
+request is not a rate: it landed exactly on the journal's high-water mark, so the drain ran
+inside that write and the printed ~14 MiB/s was a drain divided into 64 MiB. It now warms up,
+then prints one labelled line per workload with MiB/s, IOPS and the per-request time:
+1 MiB sequential writes at queue depth 1, 4 KiB synchronous writes at queue depth 1 (the
+latency a guest's fsync sees), 1 MiB sequential reads, 1 MiB writes at queue depths 4 and 16,
+and 16 MiB writes. The vdisk is four times the journal high-water mark so drains happen during
+the run. Because a write is acknowledged before the drain it triggered has finished, a write
+line also shows the **sustained** rate (bytes over the time until those drains are done)
+whenever a drain outlived it; that is the figure that stays true over a long stream, and the
+acknowledged rate is the one a guest sees in a burst. A final line reads the sequential range
+back and checks every byte, because a benchmark that is fast by losing data is worse than a
+slow one. Queue depth above 1 does not currently help much: a connection is served one request
+at a time ([dfs/group_commit.md](./dfs/group_commit.md)). It uses `qemu-img bench` (queue depth,
+millisecond timing) and `qemu-io` (the read-back).
+
+Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURAH_INTERVAL=0`
+(the test cluster) repeated runs accumulate garbage until a sweep is run.
+
+```bash
 valcli storage.placement [N]          # which disk of each node holds which extent groups
 valcli storage.tier [--apply]         # plan, or with --apply make, disk-to-disk moves
 valcli storage.move <egroup> <disk> <node>

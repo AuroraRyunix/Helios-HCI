@@ -200,7 +200,7 @@ valcli host.maintenance.leave <IP> # Exit maintenance mode
 
 # Storage & Cleanup
 valcli storage.list                # Storage containers, per-node extent stores and vdisks
-valcli storage.benchmark <name>    # Run a raw write/read performance benchmark
+valcli storage.benchmark <name>    # Steady-state write/read benchmark on a throwaway vdisk (1M/4k writes, reads, queue depths)
 valcli storage.cleanup_orphaned    # Prune orphaned VM disk raw files and NVRAM files
 
 # Scheduling & Diagnostics

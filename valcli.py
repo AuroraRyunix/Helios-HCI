@@ -678,6 +678,116 @@ def cmd_db_query():
     if rc != 0:
         sys.exit(rc)
 
+# The vdisk the benchmark runs on is deliberately several times Sidon's journal high-water
+# mark (64 MiB by default). A benchmark that fits inside the journal measures the journal and
+# nothing else; one that overruns it forces the drain -- the journal's move into extent
+# groups -- to happen *during* the run, and what it reports is the rate Sidon can sustain
+# with that cost amortised into it rather than the burst rate before the first drain.
+BENCH_VDISK_BYTES = 256 * 1024 * 1024
+MIB = 1024 * 1024
+
+# (label, direction, block size, request count, queue depth, start offset). Offsets are
+# disjoint so no phase overwrites another's range, and the read phase re-reads exactly what
+# the sequential-write phase wrote.
+BENCH_WARMUP = ("warm-up", "write", MIB, 16, 1, 0)
+BENCH_PHASES = [
+    ("sequential write 1M qd1", "write", MIB, 96, 1, 16 * MIB),
+    ("sync write 4k qd1", "write", 4096, 400, 1, 112 * MIB),
+    ("sequential read 1M qd1", "read", MIB, 96, 1, 16 * MIB),
+    ("write 1M qd4", "write", MIB, 32, 4, 120 * MIB),
+    ("write 1M qd16", "write", MIB, 32, 16, 152 * MIB),
+    # A guest that issues big requests (a copy, a restore) rather than one per block: each
+    # is several journal records and one commit marker, which is the path that pipelining
+    # between records is for.
+    ("large write 16M qd1", "write", 16 * MIB, 4, 1, 192 * MIB),
+]
+BENCH_PATTERN = 0xAB
+
+
+def _bench_run(nbd_url, direction, block, count, depth, offset):
+    """One `qemu-img bench` run against an NBD export; returns elapsed seconds or None.
+
+    qemu-img rather than qemu-io because it takes a real queue depth (`-d`) and times the
+    run itself to the millisecond. qemu-io reports whole hundredths of a second, which is
+    more than the whole of a 4 KiB write's latency, and its aio commands cannot hold a
+    depth steady.
+    """
+    cmd = ["qemu-img", "bench", "-f", "raw", "-s", str(block), "-S", str(block),
+           "-c", str(count), "-d", str(depth), "-o", str(offset)]
+    if direction == "write":
+        cmd += ["-w", "--pattern", str(BENCH_PATTERN)]
+    cmd.append(nbd_url)
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True, check=False)
+    except OSError as ex:
+        print("    could not run qemu-img: %s" % ex)
+        return None
+    m = re.search(r"Run completed in ([0-9.]+) seconds", out.stdout)
+    if out.returncode != 0 or not m:
+        print("    qemu-img bench failed: %s" % ((out.stderr or out.stdout).strip() or out.returncode))
+        return None
+    return float(m.group(1))
+
+
+def _bench_settle(vdisk_id, timeout=60.0):
+    """Wait until Sidon is not draining this vdisk; returns the seconds waited.
+
+    A write is acknowledged before the drain it triggered has finished, so the guest-visible
+    rate of a write phase leaves the drain's tail uncounted, and that tail would then run
+    underneath the next phase. Waiting for it here does two things: the next phase starts
+    from a quiet vdisk, and the wait is what lets a write phase also report its *sustained*
+    rate -- bytes over the time until every drain it caused has finished.
+
+    A daemon from before the drain moved to its own thread reports no `draining` field and
+    drains inside the write, so there is never anything to wait for and the two rates agree.
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        rc, body, _ = run_mtls_spark_api(
+            "127.0.0.1", "/api/v1/dfs/vdisk", {"op": "status", "vdisk_id": vdisk_id})
+        if rc != 0 or not isinstance(body, dict) or not body.get("draining"):
+            break
+        time.sleep(0.05)
+    return time.monotonic() - start
+
+
+def _bench_line(label, block, count, depth, seconds, settle=0.0):
+    """Format one result: throughput, request rate and the per-request time.
+
+    For a write, `settle` is the time Sidon then spent finishing the drains the write caused;
+    when it is not negligible the sustained rate (counting it) is printed beside the rate the
+    guest saw.
+    """
+    if seconds is None or seconds <= 0:
+        return "  %-26s no result" % label
+    total = float(block) * count
+    mibs = total / MIB / seconds
+    iops = count / seconds
+    if depth == 1:
+        tail = "%.2f ms/op latency" % (seconds / count * 1000.0)
+    else:
+        # With several requests in flight there is no single latency; what is meaningful
+        # is how far apart completions land, which is the inverse of the rate.
+        tail = "%.2f ms/op completion interval" % (seconds / count * 1000.0)
+    size = ("%d KiB" % (block // 1024)) if block < MIB else ("%d MiB" % (block // MIB))
+    line = "  %-26s %8.1f MiB/s  %9.1f IOPS  %s  [%d x %s in %.2fs]" % (
+        label, mibs, iops, tail, count, size, seconds)
+    if settle >= 0.1:
+        line += "  sustained incl. drain tail: %.1f MiB/s (+%.2fs)" % (
+            total / MIB / (seconds + settle), settle)
+    return line
+
+
+def _bench_verify(nbd_url, offset, length):
+    """Read back a range the benchmark wrote and check every byte is the pattern."""
+    out = subprocess.run(
+        ["qemu-io", "-f", "raw", "-c", "read -P 0x%X %d %d" % (BENCH_PATTERN, offset, length),
+         nbd_url],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, check=False)
+    return out.returncode == 0 and "verification failed" not in out.stdout.lower()
+
+
 def cmd_storage_benchmark(container_name):
     # Resolve controller IPs
     controllers_str = "127.0.0.1"
@@ -703,10 +813,16 @@ def cmd_storage_benchmark(container_name):
     # with its own cleanup path. What it measured also included DRBD's replication, which
     # is the right thing to measure but was indistinguishable from the local disk's
     # contribution.
-    print("Creating temporary vdisk '%s' (100 MiB)..." % vdisk_id)
+    #
+    # The version after that wrote 64 MiB in one request into a brand-new 100 MiB vdisk and
+    # printed qemu-io's own line. One request is not a rate: it landed exactly on the
+    # journal's high-water mark, so the drain ran inside that single write and the number it
+    # printed was a drain divided into 64 MiB, not what a guest streaming data would see.
+    # This one warms up first, then reports each workload on its own line, steady-state.
+    print("Creating temporary vdisk '%s' (%d MiB)..." % (vdisk_id, BENCH_VDISK_BYTES // MIB))
     rc_c, body_c, err_c = run_mtls_spark_api(
         "127.0.0.1", "/api/v1/dfs/vdisk",
-        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": 100 * 1024 * 1024,
+        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": BENCH_VDISK_BYTES,
          "container": default_container()})
     if rc_c != 0:
         detail = body_c.get("error") if isinstance(body_c, dict) else err_c
@@ -724,12 +840,22 @@ def cmd_storage_benchmark(container_name):
         socket_path = body_a.get("socket")
         nbd_url = "nbd+unix:///%s?socket=%s" % (vdisk_id, socket_path)
 
-        print("[1/2] Sequential write...")
-        subprocess.run(
-            ["qemu-io", "-f", "raw", "-c", "write -P 0xAB 0 64M", nbd_url], check=False)
-        print("[2/2] Sequential read...")
-        subprocess.run(
-            ["qemu-io", "-f", "raw", "-c", "read -P 0xAB 0 64M", nbd_url], check=False)
+        label, direction, block, count, depth, offset = BENCH_WARMUP
+        print("Warming up (%d x %d MiB, not reported)..." % (count, block // MIB))
+        _bench_run(nbd_url, direction, block, count, depth, offset)
+
+        print("Results (the vdisk is larger than the journal high-water mark, so drains happen "
+              "during the run; a write line also shows the sustained rate when a drain "
+              "outlived it):")
+        for label, direction, block, count, depth, offset in BENCH_PHASES:
+            seconds = _bench_run(nbd_url, direction, block, count, depth, offset)
+            settle = _bench_settle(vdisk_id) if direction == "write" else 0.0
+            print(_bench_line(label, block, count, depth, seconds, settle))
+
+        # Not timed: a check that what was written reads back, after the drains the write
+        # phases forced. A benchmark that is fast because it lost data is worse than a slow one.
+        ok = _bench_verify(nbd_url, 16 * MIB, 96 * MIB)
+        print("  %-26s %s" % ("read-back verify", "ok" if ok else "FAILED -- data did not read back"))
     except Exception as ex:
         print("Error during benchmark: %s" % ex)
     finally:
