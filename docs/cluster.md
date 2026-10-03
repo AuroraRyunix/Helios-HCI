@@ -61,12 +61,15 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
    volume group, so a create that stopped at the pool would leave sidon nothing to journal to. None
    of it is mounted and nothing is written to `/etc/fstab`: sidon mounts what the file names when it
    starts ([D-27](./dfs/decisions.md)).
-4. **The storage data path, and the coordination layer.** Starts sidon, which mounts the disks, and
-   verifies each node's extent store answers with capacity (a disk it could not mount is printed
-   as a warning; a node whose journal volume is missing never answers, because sidon refuses to
-   start without it), writes the per-host configuration, then starts ZooKeeper and records the
-   desired state `started`, starts ScyllaDB (waiting for it to listen on 9042) and starts Daruk
-   (waiting for 9043). Despite its heading this phase brings up the database as well as storage.
+4. **Coordination, metadata and storage.** Writes the per-host configuration, starts ZooKeeper and
+   records the desired state `started`, starts ScyllaDB (waiting for it to listen on 9042) and
+   starts Daruk (waiting for 9043). Only then does it start sidon, which mounts the disks, and
+   verify that each node's extent store answers with capacity, waiting up to 90 seconds because
+   `systemctl restart` returns before the control socket exists. A disk it could not mount is
+   printed as a warning; a node where sidon never answers is shown what sidon itself reports
+   (unit state, journal tail, mounts). The order is the one `cluster start` follows: sidon keeps
+   vdisk ownership in Hydra, so it comes up behind it. Long steps print what they are doing and,
+   every ten seconds, which nodes they are still waiting on.
 6. **Core services.** Starts the application daemons. This phase still starts services by hand,
    which `cluster start` no longer does; converting it is recorded in [TODO.md](../TODO.md).
 7. **Liveness and health.** Verifies that every Sidon peer is reachable and that Spectrum

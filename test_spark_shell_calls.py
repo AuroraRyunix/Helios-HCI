@@ -85,6 +85,13 @@ KNOWN_SHELL_COMMANDS = {
     ("cluster_new.py", "systemctl start zookeeper hydra-db"):
         "Printed advice. It is the instruction an operator is given when a cluster "
         "cannot be recovered automatically, not a command this file runs.",
+    ("cluster_new.py", "systemctl is-active sidon 2>&1"):
+        "Part of `describe_sidon_failure`, a read-only probe that runs only after sidon has "
+        "failed to answer and prints the node's own account (unit state, restart count, "
+        "journal tail, mounts) instead of a guess. It is one multi-command evidence string, "
+        "not unit control, so the units endpoint does not fit it.",
+    ("cluster_new.py", "systemctl show -p NRestarts --value sidon 2>&1"):
+        "The restart count in the same evidence probe; see the entry above.",
     ("hylia.py", "nohup sh -c 'sleep 2 && systemctl restart hylia' > /dev/null 2>&1 &"):
         "Hylia restarting itself, locally, with a constant command -- not a call into "
         "spark-daemon at all. The nohup and the ampersand are what let the replacement "

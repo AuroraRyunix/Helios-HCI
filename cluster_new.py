@@ -176,18 +176,50 @@ def shell_script_command(script):
     return "echo " + base64.b64encode(script.encode("utf-8")).decode("ascii") + " | base64 -d | bash"
 
 
-def run_parallel(ips, cmd, timeout=None):
+def run_parallel(ips, cmd, timeout=None, label=None, heartbeat=10, now=time.time):
+    """Run `cmd` on every host at once and return {ip: (rc, stdout, stderr)}.
+
+    With a `label` it also says what it is doing while it does it: the label up front, a line as
+    each host finishes with how long that host took, and -- every `heartbeat` seconds, for as long
+    as anything is still running -- which hosts it is still waiting on. Without a label it is
+    silent, as it always was, so quick commands do not chatter.
+
+    The silence is the reason this exists. A step like preparing a disk takes a minute or more,
+    and a console that prints "Scanning and setting up storage pools..." and then nothing for a
+    minute is indistinguishable from a hung one; an operator in that position cannot tell whether
+    to wait or to interrupt, and the honest answer is rarely "interrupt".
+    """
     results = {}
     threads = []
+    started = now()
+    printing = threading.Lock()
+
     def worker(ip):
         rc, stdout, stderr = run_remote_spark(ip, cmd, timeout=timeout)
         results[ip] = (rc, stdout, stderr)
+        if label:
+            with printing:
+                print(f"[{ip}] {label}: {'done' if rc == 0 else 'FAILED'} in "
+                      f"{int(now() - started)}s", flush=True)
+
+    if label:
+        print(f"{label} on {len(ips)} node(s)...", flush=True)
     for ip in ips:
         t = threading.Thread(target=worker, args=(ip,))
         threads.append(t)
         t.start()
-    for t in threads:
-        t.join()
+
+    next_beat = started + heartbeat
+    while any(t.is_alive() for t in threads):
+        for t in threads:
+            t.join(timeout=0.2)
+        if label and now() >= next_beat:
+            waiting = [ip for ip in ips if ip not in results]
+            if waiting:
+                with printing:
+                    print(f"  ... {label}: still working on {', '.join(waiting)} "
+                          f"({int(now() - started)}s elapsed)", flush=True)
+            next_beat += heartbeat
     return results
 
 
@@ -520,6 +552,53 @@ def print_no_cluster(as_json=False):
     print("==========================================================")
 
 
+def describe_sidon_failure(ip, runner=None):
+    """What sidon on `ip` actually says, for a failure message that reports evidence.
+
+    The check this serves used to print "sidon refuses to start while its journal volume is not
+    mounted" whenever the control socket did not answer. That is one possible cause stated as the
+    only one, and on the run that prompted this change it was wrong: sidon was up, both of its
+    volumes mounted, and the socket simply was not there yet. A message that guesses sends an
+    operator after the wrong fault. This asks the node.
+    """
+    runner = runner or run_remote_spark
+    probe = ("echo \"unit: $(systemctl is-active sidon 2>&1)  restarts: "
+             "$(systemctl show -p NRestarts --value sidon 2>&1)\"; "
+             "echo '--- journal ---'; journalctl -u sidon --no-pager -n 8 2>&1 | cut -c1-200; "
+             "echo '--- sidon mounts ---'; /usr/local/bin/sidon mounts 2>&1 | head -12")
+    rc, out, err = runner(ip, probe)
+    text = (out or err or "no answer from the node").strip()
+    return "\n".join("        " + line for line in text.splitlines())
+
+
+def wait_for_sidon_capacity(ip, runner=None, timeout=90, interval=2, sleep=time.sleep,
+                            now=time.time, say=print):
+    """Ask sidon for its capacity, waiting for it to come up. Returns (rc, stdout, stderr).
+
+    `systemctl restart` returns once the process has been started, not once it is serving, and
+    sidon creates its control socket only after it has mounted its disks and read its peer list.
+    Probing the instant the restart returns is a race that the daemon usually loses by a moment,
+    so a single probe reported "No such file or directory" for a sidon that was fine. This keeps
+    asking, says so now and then so the wait does not look like a hang, and gives up only after
+    `timeout` seconds -- long enough for a slow mount, short enough that a real failure is not
+    left to sit.
+    """
+    runner = runner or run_remote_spark
+    started = now()
+    last_said = started
+    while True:
+        rc, out, err = runner(ip, SIDON_CAPACITY_CMD)
+        if rc == 0 and (out or "").strip():
+            return rc, out, err
+        waited = now() - started
+        if waited >= timeout:
+            return rc, out, err
+        if now() - last_said >= 10:
+            say(f"[{ip}] still waiting for sidon to answer ({int(waited)}s)...")
+            last_said = now()
+        sleep(interval)
+
+
 # Control-socket one-liners, defined once.
 #
 # Every one of these is a shell command carrying a JSON document with quotes and a
@@ -832,9 +911,12 @@ def run_checked_cmd(ip, command, allow_already_exists=False):
             sys.exit(1)
     return rc, stdout, stderr
 
-def run_parallel_checked(ips, command, allow_already_exists=False, timeout=None):
-    print(f"Running parallel command on {ips}: {command}")
-    results = run_parallel(ips, command, timeout=timeout)
+def run_parallel_checked(ips, command, allow_already_exists=False, timeout=None, label=None):
+    if label is None:
+        print(f"Running parallel command on {ips}: {command}")
+    # With a label the command is not echoed: a script is sent as a base64 blob, and a screenful of
+    # `echo CnNldCAtZQ... | base64 -d | bash` tells an operator nothing about what is happening.
+    results = run_parallel(ips, command, timeout=timeout, label=label)
     for ip, (rc, stdout, stderr) in results.items():
         stdout = stdout.strip() if stdout else ""
         stderr = stderr.strip() if stderr else ""
@@ -2378,8 +2460,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         claim_script_b64 = base64.b64encode(disk_claim_script.strip().encode()).decode()
         cmd_claim = f"python3 -c \"import base64; exec(base64.b64decode('{claim_script_b64}').decode())\""
         
-        print("Scanning and setting up storage pools on remote hosts in parallel...")
-        claim_results = run_parallel(ips, cmd_claim, timeout=STORAGE_PREP_TIMEOUT)
+        claim_results = run_parallel(
+            ips, cmd_claim, timeout=STORAGE_PREP_TIMEOUT,
+            label="Preparing the extent-store disk (clearing it, then a volume group and thin pool; "
+                  "about a minute)")
         
         host_claimed_disks = {}
         for ip, (rc, stdout, stderr) in claim_results.items():
@@ -2407,11 +2491,14 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # filesystem UUID, when it starts, and refuses any path whose disk is not there.
         print("Preparing each node's extent store: volume, further disks, and the disk record...")
         run_parallel_checked(ips, shell_script_command(CARVE_SIDON_VOLUME),
-                             timeout=STORAGE_PREP_TIMEOUT)
+                             timeout=STORAGE_PREP_TIMEOUT,
+                             label="Carving sidon's journal volume")
         run_parallel_checked(ips, shell_script_command(CLAIM_EXTRA_DISKS),
-                             timeout=STORAGE_PREP_TIMEOUT)
+                             timeout=STORAGE_PREP_TIMEOUT,
+                             label="Registering any further disks for the extent store")
         run_parallel_checked(ips, shell_script_command(STAGE_SIDON_DISKS),
-                             timeout=STORAGE_PREP_TIMEOUT)
+                             timeout=STORAGE_PREP_TIMEOUT,
+                             label="Writing the record of which disks are sidon's")
 
         # 4. Storage engine setup.
         #
@@ -2430,38 +2517,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # its own. Its map lives in Hydra, which is already replicated and already backed
         # up. The step above prepares the volumes; this starts the daemon, which mounts them
         # by filesystem UUID, and checks that they actually came up.
-        print("\n--- Phase 4: Starting the storage data path ---")
-        unit_action_checked(ips, "enable", ["sidon"])
-        unit_action_checked(ips, "restart", ["sidon"])
-
-        print("Verifying each node's extent store is mounted and answering...")
-        for ip in ips:
-            rc_cap, out_cap, err_cap = run_remote_spark(ip, SIDON_CAPACITY_CMD)
-            if rc_cap != 0 or not out_cap.strip():
-                print(f"[ERROR] [{ip}] sidon did not answer on its control socket: "
-                      f"{(err_cap or 'no output').strip()[:200]}")
-                print(f"        sidon refuses to start while its journal volume is not mounted. "
-                      f"On {ip}: /usr/local/bin/sidon mounts, and journalctl -u sidon.")
-                return
-            try:
-                cap = json.loads(out_cap.strip().splitlines()[0])
-            except Exception:
-                print(f"[ERROR] [{ip}] sidon answered with something unparseable.")
-                return
-            total = int(cap.get("total_bytes") or 0)
-            if total <= 0:
-                # Almost always an unmounted store. Sidon would write extent groups onto
-                # the root filesystem instead, silently, until the root filesystem filled
-                # and took the host with it -- so this refuses to continue rather than
-                # building a cluster that works until it suddenly does not.
-                print(f"[ERROR] [{ip}] the extent store reports no capacity, which means "
-                      f"none of its disks is mounted. Check /etc/hci/sidon-disks against "
-                      f"`/usr/local/bin/sidon mounts` and vg_aether/sidon.")
-                return
-            for gone in cap.get("absent_disks") or []:
-                print(f"[WARN] [{ip}] disk {gone.get('uuid')} ({gone.get('role')}) is not "
-                      f"available: {gone.get('reason')}")
-            print(f"[{ip}] extent store ready: {total / (1024 ** 3):.1f} GiB.")
+        print("\n--- Phase 4: Starting the coordination, metadata and storage services ---")
 
         print("Writing storage pools config and spectrum configuration on all hosts...")
         for ip in ips:
@@ -2601,6 +2657,42 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 print(f"[ERROR] Daruk query proxy failed to listen on port 9043 on {ip}")
                 sys.exit(1)
         print("Daruk query proxy is ready on all nodes.")
+
+        # The extent store starts last, after Hydra and Daruk. Sidon keeps vdisk ownership
+        # as an (owner, epoch) record in Hydra, and MANAGED_SERVICES declares it behind daruk;
+        # create used to start it first, the reverse of the order `cluster start` follows.
+        print("\nStarting the extent store (sidon) on all nodes...")
+        unit_action_checked(ips, "enable", ["sidon"])
+        unit_action_checked(ips, "restart", ["sidon"])
+
+        print("Verifying each node's extent store is mounted and answering...")
+        for ip in ips:
+            rc_cap, out_cap, err_cap = wait_for_sidon_capacity(ip)
+            if rc_cap != 0 or not out_cap.strip():
+                print(f"[ERROR] [{ip}] sidon did not answer on its control socket within 90s: "
+                      f"{(err_cap or 'no output').strip()[:200]}")
+                print(f"        What the node says:")
+                print(describe_sidon_failure(ip))
+                return
+            try:
+                cap = json.loads(out_cap.strip().splitlines()[0])
+            except Exception:
+                print(f"[ERROR] [{ip}] sidon answered with something unparseable.")
+                return
+            total = int(cap.get("total_bytes") or 0)
+            if total <= 0:
+                # Almost always an unmounted store. Sidon would write extent groups onto
+                # the root filesystem instead, silently, until the root filesystem filled
+                # and took the host with it -- so this refuses to continue rather than
+                # building a cluster that works until it suddenly does not.
+                print(f"[ERROR] [{ip}] the extent store reports no capacity, which means "
+                      f"none of its disks is mounted. Check /etc/hci/sidon-disks against "
+                      f"`/usr/local/bin/sidon mounts` and vg_aether/sidon.")
+                return
+            for gone in cap.get("absent_disks") or []:
+                print(f"[WARN] [{ip}] disk {gone.get('uuid')} ({gone.get('role')}) is not "
+                      f"available: {gone.get('reason')}")
+            print(f"[{ip}] extent store ready: {total / (1024 ** 3):.1f} GiB.")
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
