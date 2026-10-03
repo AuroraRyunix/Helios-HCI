@@ -777,6 +777,24 @@ def unit_action_parallel(ip_list, action, units=None, detach=False, ignore_faile
     return results
 
 
+def peer_host_key_command(ips):
+    """Shell that makes this node trust every peer's SSH host key, and only adds what is missing.
+
+    Provisioning seeds /root/.ssh/known_hosts, but a node that was not provisioned that way (or
+    one whose file is gone) ends up with nodes that cannot ssh to each other under
+    StrictHostKeyChecking=yes, which Mimir's inter-node trust check reports as a failure on a
+    cluster that was just created. The cluster knows every member's address when it is created, so
+    it makes sure of this itself. `ssh-keygen -F` makes it idempotent: a host already listed is not
+    scanned again, so re-running never duplicates entries or replaces one that is already pinned.
+    """
+    targets = " ".join(ips)
+    return ("mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/known_hosts && "
+            "chmod 600 /root/.ssh/known_hosts && "
+            "for peer in " + targets + "; do "
+            "ssh-keygen -F $peer -f /root/.ssh/known_hosts >/dev/null 2>&1 || "
+            "ssh-keyscan -H $peer >> /root/.ssh/known_hosts 2>/dev/null; done")
+
+
 def unit_action_checked(ip_list, action, units=None, ignore_failed=False):
     """`unit_action_parallel`, exiting on the first node that refuses.
 
@@ -2388,6 +2406,10 @@ def main():
         for ip, (rc, _, err) in selinux_results.items():
             if rc != 0:
                 print(f"[WARNING] Failed to configure SELinux on {ip}: {err}")
+
+        # Nodes must trust each other's SSH host keys; see peer_host_key_command.
+        run_parallel_checked(ips, peer_host_key_command(ips),
+                             label="Making each node trust its peers' SSH host keys")
 
         # 3. Dynamic Disk Setup (Non-boot disks >= 100GB)
         print("\n--- Phase 3: Dynamic Disk Scan & LVM Setup ---")

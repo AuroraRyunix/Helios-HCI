@@ -4790,18 +4790,31 @@ def check_cluster_and_autostart():
     subprocess.run("systemctl start zookeeper", shell=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if os.path.exists("/run/hci/cluster_operation.lock"):
-        print("[AUTOSTART] Cluster operation is in progress. Bypassing autostart checks.")
-        return
-
-    
-    # Check if cluster configuration exists
-    if not os.path.exists("/etc/hci/cluster.json"):
-        print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
-        for svc in services_to_stop:
-            subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return
+    # Wait for a cluster to exist rather than returning. This used to `return` from both of the
+    # cases below, which ended this thread -- and the service watchdog is the tail of this thread.
+    # A daemon restarted while no cluster existed (every `cluster destroy` restarts it) therefore
+    # never supervised anything once `cluster create` made one: Mimir reported the watchdog as not
+    # running on a freshly created cluster until something restarted the daemon again. Waiting
+    # keeps the thread alive, and it then proceeds exactly as it would after a normal start.
+    _stopped_for_no_cluster = False
+    _said_operation = False
+    while True:
+        if os.path.exists("/run/hci/cluster_operation.lock"):
+            if not _said_operation:
+                print("[AUTOSTART] Cluster operation is in progress. Bypassing autostart checks.")
+                _said_operation = True
+            time.sleep(10)
+            continue
+        if not os.path.exists("/etc/hci/cluster.json"):
+            if not _stopped_for_no_cluster:
+                print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
+                services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+                for svc in services_to_stop:
+                    subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                _stopped_for_no_cluster = True
+            time.sleep(10)
+            continue
+        break
         
     if os.path.exists("/etc/hci/maintenance.state"):
         print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")

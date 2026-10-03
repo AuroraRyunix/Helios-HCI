@@ -1348,8 +1348,12 @@ def check_services(category):
             pass
         cql = "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = 'hydra';"
         rc, out, err = run_cmd("podman exec -i systemd-hydra-db cqlsh " + local_ip + " -e \"" + cql + "\"")
-        if rc == 0 and "replication_factor" in out:
-            if "'replication_factor': '3'" in out or "replication_factor': '3'" in out or "'3'" in out:
+        # The keyspace is NetworkTopologyStrategy, which spells its factor as {'datacenter1': '3'};
+        # SimpleStrategy spells it {'replication_factor': '3'}. This used to look only for the
+        # second, so a correctly replicated hydra keyspace reported a failure to query it.
+        factors = [int(n) for n in re.findall(r"'[\w.-]+': '(\d+)'", out)]
+        if rc == 0 and factors:
+            if 3 in factors:
                 status = "PASS"
                 msg = f"Keyspace 'hydra' is configured with replication factor 3.\n{out}"
             else:

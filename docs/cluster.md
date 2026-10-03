@@ -52,7 +52,9 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
    are reported, and any running cluster services are stopped so the bootstrap starts clean.
    There is no Secure Boot check: Sidon loads no kernel module.
 2. **Hostnames and cluster setup.** Resolves each hostname and writes `/etc/hci/cluster.json`
-   (hosts, node ids, redundancy factor, VIP) on every node.
+   (hosts, node ids, redundancy factor, VIP) on every node, and makes sure each node trusts its
+   peers' SSH host keys (provisioning seeds these too; create adds any that are missing and never
+   replaces one that is already pinned, so the inter-node trust check passes on a new cluster).
 3. **Disk scan, and the extent store's volumes.** Finds an empty disk of at least 100 GB on each
    host and builds the thin-provisioned LVM pool (the volume group is still named `vg_aether`, a
    name left over from the DRBD design). Then, on every host and in this order, it carves the

@@ -76,6 +76,15 @@ same duplication, and the same risk -- it is how `cluster start` came to restart
 months after the unit was deleted. And the volume group is still named `vg_aether`, a name left over
 from the DRBD design that nothing but history explains.
 
+## P1 — A freshly created cluster has no Phoenix console until the rollout runs (2026-10-03, not started)
+
+Found by running `cluster create` on the test cluster. Create finishes with Spectrum on 8443 but
+nothing on 8444, because the console Quadlet is deployed by `deploy_updates.py`, not by
+provisioning or create. Bifrost's local health guard (rightly) refuses to bind the VIP while
+Slate's console backend is down, so Mimir's `vip_binding_status` fails on a brand-new cluster until
+a rollout is run. Create should bring the console up itself, or provisioning should install it, so
+that a created cluster passes its own health check without a second tool.
+
 ## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
 
 Reported from using it. The pages exist and render, which is what "every page is Phoenix"
