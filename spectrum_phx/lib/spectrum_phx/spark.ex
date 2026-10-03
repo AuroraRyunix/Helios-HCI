@@ -36,11 +36,17 @@ defmodule SpectrumPhx.Spark do
   @doc "GET a JSON endpoint on a node's Spark daemon."
   def get_json(ip, path, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 15)
+    # Req retries a transport error with back-off (about 1s, 2s, 4s) unless told not to. That is
+    # right for a call whose answer is needed; it is wrong for a probe made while a page loads,
+    # where one host that closes its socket turns into several seconds of waiting. Callers that
+    # can do without an answer pass `retry: false`.
+    retry = Keyword.get(opts, :retry, :safe_transient)
     url = "https://" <> ip <> ":" <> Integer.to_string(@port) <> path
 
     case Req.get(url,
            connect_options: [transport_opts: tls_opts()],
-           receive_timeout: timeout * 1000
+           receive_timeout: timeout * 1000,
+           retry: retry
          ) do
       {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
       {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
@@ -319,7 +325,7 @@ defmodule SpectrumPhx.Spark do
   DRBD was an out-of-tree module the kernel refuses to load unenrolled and a host with
   Secure Boot on therefore had no storage at all. Sidon is a userspace daemon.
   """
-  def host_capabilities(ip), do: get_json(ip, "/api/v1/host/capabilities")
+  def host_capabilities(ip), do: get_json(ip, "/api/v1/host/capabilities", retry: false, timeout: 4)
 
   @doc """
   Per-segment tunnel throughput across the cluster.

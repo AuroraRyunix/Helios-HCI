@@ -82,7 +82,12 @@ defmodule SpectrumPhx.Vms do
 
   # `IF NOT EXISTS` so a duplicate create cannot silently overwrite a live VM's row --
   # `INSERT` in CQL is an upsert, and the Python create path relies on that.
-  @insert_cql "INSERT INTO hydra.vms (#{@columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) IF NOT EXISTS"
+  #
+  # The placeholders are counted from the column list rather than typed out. They were typed out,
+  # and when `graphics` joined the columns the list grew to sixteen while the placeholders stayed
+  # at fifteen, so every create failed with "Unmatched column names/values".
+  @insert_placeholders @columns |> String.split(",") |> Enum.map_join(", ", fn _ -> "?" end)
+  @insert_cql "INSERT INTO hydra.vms (#{@columns}) VALUES (#{@insert_placeholders}) IF NOT EXISTS"
 
   # Undo for a create whose storage allocation failed. Conditional on the row still being
   # the one this call inserted: an unconditional `DELETE` would also remove a VM that

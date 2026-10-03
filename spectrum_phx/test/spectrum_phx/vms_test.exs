@@ -465,8 +465,14 @@ defmodule SpectrumPhx.VmsTest do
     end
 
     test "every value in a write statement is a bound placeholder" do
-      # 15 columns plus nothing else: if a value were interpolated, this count would drop.
-      assert Vms.insert_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 15
+      # One placeholder per column and nothing else: if a value were interpolated, this count
+      # would drop; if a column were added without one, the statement is refused by the database
+      # ("Unmatched column names/values") and no test that never reaches a database notices.
+      insert = Vms.insert_cql()
+      [_, column_list] = Regex.run(~r/\(([^)]*)\) VALUES/, insert)
+      columns = column_list |> String.split(",") |> length()
+      assert columns == 16
+      assert insert |> String.graphemes() |> Enum.count(&(&1 == "?")) == columns
       assert Vms.claim_host_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 4
       assert Vms.set_migration_lock_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 3
       assert Vms.clear_migration_lock_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 3

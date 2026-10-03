@@ -2690,7 +2690,7 @@ GRAPHICS_PROTOCOLS = ("vnc", "spice")
 
 def read_graphics_support():
     """The graphics types libvirt says this host can serve, e.g. ["vnc"]."""
-    rc, out = run_argv(["virsh", "domcapabilities"], timeout=20)
+    rc, out, _ = run_argv(["virsh", "domcapabilities"], timeout=20)
     if rc != 0 or not out:
         return []
 
