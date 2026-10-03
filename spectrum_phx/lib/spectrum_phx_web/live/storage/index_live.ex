@@ -37,6 +37,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   use SpectrumPhxWeb, :live_view
 
   import SpectrumPhxWeb.Storage.Components
+  import SpectrumPhxWeb.Cluster.Components, only: [panel: 1]
 
   alias SpectrumPhx.Storage
   alias SpectrumPhx.Storage.Containers
@@ -285,80 +286,113 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         </div>
       </div>
 
-      <div
-        :if={@snapshot.configured?}
-        class="stats stats-vertical sm:stats-horizontal w-full shadow"
-      >
-        <div class="stat">
-          <div class="stat-title">Vdisks</div>
-          <div class="stat-value text-2xl" id="stat-vdisks">
-            {@summary.vdisks_ok}/{@summary.vdisks_total}
+      <.panel :if={@snapshot.configured?} id="fabric-summary">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          <div class="min-w-0">
+            <p class="panel-title truncate">Vdisks</p>
+            <p class="text-2xl font-semibold tabular-nums leading-tight mt-1" id="stat-vdisks">
+              {@summary.vdisks_ok}/{@summary.vdisks_total}
+            </p>
+            <p class="text-xs opacity-55 truncate">owned and fully replicated</p>
           </div>
-          <div class="stat-desc">owned and fully replicated</div>
-        </div>
 
-        <div class="stat">
-          <div class="stat-title">Degraded</div>
-          <div
-            class={["stat-value text-2xl", @summary.vdisks_degraded > 0 && "text-error"]}
-            id="stat-degraded"
-          >
-            {@summary.vdisks_degraded}
-          </div>
-          <div class="stat-desc">
-            <span
-              :if={@summary.vdisks_under_replicated > 0}
-              id="stat-under-replicated"
-              class="text-error font-semibold"
+          <div class="min-w-0">
+            <p class="panel-title truncate">Degraded</p>
+            <p
+              class={[
+                "text-2xl font-semibold tabular-nums leading-tight mt-1",
+                @summary.vdisks_degraded > 0 && "text-error"
+              ]}
+              id="stat-degraded"
             >
-              {@summary.vdisks_under_replicated} under-replicated
-            </span>
-            <span :if={@summary.vdisks_under_replicated == 0}>vdisks</span>
+              {@summary.vdisks_degraded}
+            </p>
+            <p class="text-xs opacity-55 truncate">
+              <span
+                :if={@summary.vdisks_under_replicated > 0}
+                id="stat-under-replicated"
+                class="text-error font-semibold"
+              >
+                {@summary.vdisks_under_replicated} under-replicated
+              </span>
+              <span :if={@summary.vdisks_under_replicated == 0}>vdisks</span>
+            </p>
           </div>
-        </div>
 
-        <div class="stat">
-          <div class="stat-title">Unknown</div>
-          <div
-            class={["stat-value text-2xl", @summary.vdisks_unknown > 0 && "text-warning"]}
-            id="stat-unknown"
-          >
-            {@summary.vdisks_unknown}
-          </div>
-          <div class="stat-desc">state could not be read</div>
-        </div>
-
-        <div class="stat">
-          <div class="stat-title">Extent stores</div>
-          <div class="stat-value text-2xl" id="stat-stores">{@summary.stores_total}</div>
-          <div class="stat-desc">
-            <span :if={@summary.stores_full > 0} class="text-error font-semibold">
-              {@summary.stores_full} full
-            </span>
-            <span
-              :if={@summary.stores_full == 0 and @summary.stores_warn > 0}
-              class="text-warning font-semibold"
+          <div class="min-w-0">
+            <p class="panel-title truncate">Unknown</p>
+            <p
+              class={[
+                "text-2xl font-semibold tabular-nums leading-tight mt-1",
+                @summary.vdisks_unknown > 0 && "text-warning"
+              ]}
+              id="stat-unknown"
             >
-              {@summary.stores_warn} filling up
-            </span>
-            <span :if={@summary.stores_full == 0 and @summary.stores_warn == 0}>
-              one per node
-            </span>
+              {@summary.vdisks_unknown}
+            </p>
+            <p class="text-xs opacity-55 truncate">state could not be read</p>
+          </div>
+
+          <div class="min-w-0">
+            <p class="panel-title truncate">Extent stores</p>
+            <p class="text-2xl font-semibold tabular-nums leading-tight mt-1" id="stat-stores">
+              {@summary.stores_total}
+            </p>
+            <p class="text-xs opacity-55 truncate">
+              <span :if={@summary.stores_full > 0} class="text-error font-semibold">
+                {@summary.stores_full} full
+              </span>
+              <span
+                :if={@summary.stores_full == 0 and @summary.stores_warn > 0}
+                class="text-warning font-semibold"
+              >
+                {@summary.stores_warn} filling up
+              </span>
+              <span :if={@summary.stores_full == 0 and @summary.stores_warn == 0}>
+                one per node
+              </span>
+            </p>
           </div>
         </div>
+
+        <div class="mt-4 pt-4 border-t border-base-300" id="capacity">
+          <p :if={not @snapshot.capacity.known?} class="text-sm text-warning" id="capacity-unknown">
+            No node reported an extent store capacity, so the fabric's size is unknown.
+            Nothing here is a claim that it is empty.
+          </p>
+
+          <div :if={@snapshot.capacity.known?} class="space-y-2">
+            <.usage_bar
+              used={@snapshot.capacity.raw_used_bytes}
+              total={@snapshot.capacity.raw_total_bytes}
+              percent={@snapshot.capacity.used_percent}
+            />
+            <p class="text-xs opacity-70">
+              Raw across every node's extent store. With {copies(@snapshot.expected_replicas)} kept, usable is about
+              <span class="font-semibold">{bytes(@snapshot.capacity.usable_total_bytes)}</span>
+              of which <span class="font-semibold">{bytes(@snapshot.capacity.usable_used_bytes)}</span>
+              is allocated.
+            </p>
+          </div>
+        </div>
+      </.panel>
+
+      <div class="grid gap-4 xl:grid-cols-5">
+        <.stores_section
+          stores={@snapshot.stores}
+          configured?={@snapshot.configured?}
+          class="xl:col-span-2"
+        />
+
+        <.containers_section
+          containers={@containers}
+          error={@containers_error}
+          form={@container_form}
+          class="xl:col-span-3"
+        />
       </div>
 
-      <.capacity_card :if={@snapshot.configured?} capacity={@snapshot.capacity} snapshot={@snapshot} />
-
       <.vdisks_section vdisks={@snapshot.vdisks} configured?={@snapshot.configured?} />
-
-      <.stores_section stores={@snapshot.stores} configured?={@snapshot.configured?} />
-
-      <.containers_section
-        containers={@containers}
-        error={@containers_error}
-        form={@container_form}
-      />
 
       <.disks_section disks={@snapshot.disks} configured?={@snapshot.configured?} />
 
@@ -375,146 +409,139 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   attr :containers, :list, required: true
   attr :error, :string, default: nil
   attr :form, :map, required: true
+  attr :class, :any, default: nil
 
   defp containers_section(assigns) do
     ~H"""
-    <section class="card bg-base-100 shadow-sm">
-      <div class="card-body gap-4">
-        <div>
-          <h2 class="card-title text-base">Containers</h2>
-          <p class="text-xs opacity-70">
-            A container is policy, not an allocation: nothing is carved out when you make one.
-            It names the tier, the quota, the fault tolerance and the compression that every
-            vdisk in it inherits.
-          </p>
-        </div>
-
-        <div :if={@error} class="alert alert-warning text-sm" id="containers-error">
-          <.icon name="hero-exclamation-triangle" class="size-4" />
-          <span>The container catalogue could not be read: {@error}</span>
-        </div>
-
-        <div class="overflow-x-auto">
-          <table class="table table-sm" id="containers-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Tier</th>
-                <th>Quota</th>
-                <th>FTT</th>
-                <th>Compression</th>
-                <th class="text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr :for={container <- @containers} id={"container-" <> container.name}>
-                <td class="font-medium">{container.name}</td>
-                <td>{container.tier}</td>
-                <td>{quota_label(container.quota_bytes)}</td>
-                <td>{container.ftt}</td>
-                <td>
-                  <span class={[
-                    "badge badge-sm",
-                    if(container.compression == "none", do: "badge-ghost", else: "badge-info")
-                  ]}>
-                    {container.compression}
-                  </span>
-                </td>
-                <td class="text-right whitespace-nowrap">
-                  <button
-                    class="btn btn-xs"
-                    phx-click="set_compression"
-                    phx-value-name={container.name}
-                    phx-value-compression={
-                      if container.compression == "none", do: "lz4", else: "none"
-                    }
-                  >
-                    {if container.compression == "none", do: "Compress", else: "Stop compressing"}
-                  </button>
-                  <button
-                    class="btn btn-xs btn-error btn-outline"
-                    phx-click="delete_container"
-                    phx-value-name={container.name}
-                    data-confirm={"Delete container " <> container.name <> "?"}
-                  >
-                    Delete
-                  </button>
-                </td>
-              </tr>
-              <tr :if={@containers == [] and is_nil(@error)}>
-                <td colspan="6" class="text-sm opacity-60">No containers defined.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <form
-          id="create-container-form"
-          phx-submit="create_container"
-          phx-change="container_form"
-          class="flex flex-wrap gap-2 items-end"
-        >
-          <label class="form-control">
-            <span class="label-text text-xs">Name</span>
-            <input
-              type="text"
-              name="name"
-              value={@form["name"]}
-              placeholder="templates"
-              class="input input-sm input-bordered"
-              required
-            />
-          </label>
-          <label class="form-control">
-            <span class="label-text text-xs">Tier</span>
-            <select name="tier" class="select select-sm select-bordered">
-              <option :for={tier <- Containers.tiers()} value={tier} selected={@form["tier"] == tier}>
-                {tier}
-              </option>
-            </select>
-          </label>
-          <label class="form-control">
-            <span class="label-text text-xs">Quota (GB, 0 = unlimited)</span>
-            <input
-              type="number"
-              name="quota_gb"
-              min="0"
-              value={@form["quota_gb"]}
-              class="input input-sm input-bordered w-32"
-            />
-          </label>
-          <label class="form-control">
-            <span class="label-text text-xs">FTT</span>
-            <input
-              type="number"
-              name="ftt"
-              min="0"
-              value={@form["ftt"]}
-              class="input input-sm input-bordered w-20"
-            />
-          </label>
-          <label class="form-control">
-            <span class="label-text text-xs">Compression</span>
-            <select name="compression" class="select select-sm select-bordered">
-              <option
-                :for={mode <- Containers.compression_modes()}
-                value={mode}
-                selected={@form["compression"] == mode}
-              >
-                {mode}
-              </option>
-            </select>
-          </label>
-          <button type="submit" class="btn btn-sm btn-primary">Create container</button>
-        </form>
-
-        <p class="text-xs opacity-50">
-          Compression applies to extents sealed from then on. Existing data is never
-          rewritten, and a change takes effect the next time a vdisk is attached — which is
-          what makes it safe to change while guests are running.
-        </p>
+    <.panel
+      id="containers-section"
+      class={@class}
+      title="Containers"
+      subtitle="Policy, not allocation: tier, quota, fault tolerance and compression that every vdisk in a container inherits."
+    >
+      <div :if={@error} class="alert alert-warning text-sm mb-3" id="containers-error">
+        <.icon name="hero-exclamation-triangle" class="size-4" />
+        <span>The container catalogue could not be read: {@error}</span>
       </div>
-    </section>
+
+      <div class="overflow-x-auto">
+        <table class="table table-sm" id="containers-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Tier</th>
+              <th>Quota</th>
+              <th>FTT</th>
+              <th>Compression</th>
+              <th class="text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr :for={container <- @containers} id={"container-" <> container.name}>
+              <td class="font-medium">{container.name}</td>
+              <td>{container.tier}</td>
+              <td>{quota_label(container.quota_bytes)}</td>
+              <td>{container.ftt}</td>
+              <td>
+                <span class={[
+                  "badge badge-sm",
+                  if(container.compression == "none", do: "badge-ghost", else: "badge-info")
+                ]}>
+                  {container.compression}
+                </span>
+              </td>
+              <td class="text-right whitespace-nowrap">
+                <button
+                  class="btn btn-xs"
+                  phx-click="set_compression"
+                  phx-value-name={container.name}
+                  phx-value-compression={if container.compression == "none", do: "lz4", else: "none"}
+                >
+                  {if container.compression == "none", do: "Compress", else: "Stop compressing"}
+                </button>
+                <button
+                  class="btn btn-xs btn-error btn-outline"
+                  phx-click="delete_container"
+                  phx-value-name={container.name}
+                  data-confirm={"Delete container " <> container.name <> "?"}
+                >
+                  Delete
+                </button>
+              </td>
+            </tr>
+            <tr :if={@containers == [] and is_nil(@error)}>
+              <td colspan="6" class="text-sm opacity-60">No containers defined.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <form
+        id="create-container-form"
+        phx-submit="create_container"
+        phx-change="container_form"
+        class="flex flex-wrap gap-2 items-end mt-4 pt-4 border-t border-base-300"
+      >
+        <label class="form-control">
+          <span class="label-text text-xs">Name</span>
+          <input
+            type="text"
+            name="name"
+            value={@form["name"]}
+            placeholder="templates"
+            class="input input-sm input-bordered"
+            required
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Tier</span>
+          <select name="tier" class="select select-sm select-bordered">
+            <option :for={tier <- Containers.tiers()} value={tier} selected={@form["tier"] == tier}>
+              {tier}
+            </option>
+          </select>
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Quota (GB, 0 = unlimited)</span>
+          <input
+            type="number"
+            name="quota_gb"
+            min="0"
+            value={@form["quota_gb"]}
+            class="input input-sm input-bordered w-32"
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">FTT</span>
+          <input
+            type="number"
+            name="ftt"
+            min="0"
+            value={@form["ftt"]}
+            class="input input-sm input-bordered w-20"
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Compression</span>
+          <select name="compression" class="select select-sm select-bordered">
+            <option
+              :for={mode <- Containers.compression_modes()}
+              value={mode}
+              selected={@form["compression"] == mode}
+            >
+              {mode}
+            </option>
+          </select>
+        </label>
+        <button type="submit" class="btn btn-sm btn-primary">Create container</button>
+      </form>
+
+      <p class="text-xs opacity-50 mt-3">
+        Compression applies to extents sealed from then on. Existing data is never
+        rewritten, and a change takes effect the next time a vdisk is attached — which is
+        what makes it safe to change while guests are running.
+      </p>
+    </.panel>
     """
   end
 
@@ -527,46 +554,19 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     |> Kernel.<>(" GB")
   end
 
-  attr :capacity, :map, required: true
-  attr :snapshot, :map, required: true
-
-  defp capacity_card(assigns) do
-    ~H"""
-    <div class="card card-border bg-base-100" id="capacity">
-      <div class="card-body gap-3 p-4">
-        <h2 class="font-semibold">Capacity</h2>
-
-        <p :if={not @capacity.known?} class="text-sm text-warning" id="capacity-unknown">
-          No node reported an extent store capacity, so the fabric's size is unknown.
-          Nothing here is a claim that it is empty.
-        </p>
-
-        <div :if={@capacity.known?} class="space-y-2">
-          <.usage_bar
-            used={@capacity.raw_used_bytes}
-            total={@capacity.raw_total_bytes}
-            percent={@capacity.used_percent}
-          />
-          <p class="text-xs opacity-70">
-            Raw across every node's extent store. With {copies(@snapshot.expected_replicas)} kept, usable is about
-            <span class="font-semibold">{bytes(@capacity.usable_total_bytes)}</span>
-            of which <span class="font-semibold">{bytes(@capacity.usable_used_bytes)}</span>
-            is allocated.
-          </p>
-        </div>
-      </div>
-    </div>
-    """
-  end
-
   attr :vdisks, :map, required: true
   attr :configured?, :boolean, required: true
 
+  # One table, one body per vdisk. The body is what carries the vdisk's id, because a vdisk
+  # can take a second row for what is wrong with it, and an issue has to stay inside the
+  # thing it is an issue of.
   defp vdisks_section(assigns) do
     ~H"""
-    <section class="space-y-3">
-      <h2 class="font-semibold text-lg">Vdisks</h2>
-
+    <.panel
+      id="vdisks-section"
+      title="Vdisks"
+      subtitle="Every disk being served, by the node that owns it"
+    >
       <.unavailable
         :if={@configured? and @vdisks.state == :unavailable}
         id="vdisks-unavailable"
@@ -576,7 +576,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
       <div
         :if={@vdisks.state == :partial}
-        class="alert alert-warning alert-soft items-start"
+        class="alert alert-warning alert-soft items-start mb-3"
         id="vdisks-partial"
       >
         <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
@@ -600,76 +600,93 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         on this cluster yet.
       </p>
 
-      <div
-        :for={vdisk <- @vdisks.entries}
-        id={"vdisk-" <> slug(vdisk.id)}
-        class={[
-          "card card-border bg-base-100",
-          vdisk.health == :degraded && "border-error/60",
-          vdisk.health == :unknown && "border-warning/60"
-        ]}
-      >
-        <div class="card-body gap-3 p-4">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <div class="min-w-0">
-              <p class="font-mono font-semibold truncate">{vdisk.id}</p>
-              <p class="text-xs opacity-60">
-                {bytes(vdisk.size_bytes)} &middot; {owner_summary(vdisk)}
-              </p>
-            </div>
-            <div class="flex flex-wrap items-center gap-1.5">
-              <.health_badge health={vdisk.health} />
-              <.replica_badge
-                have={if vdisk.owner_ip, do: vdisk.replica_count}
-                want={vdisk.expected_replicas}
-                asked={vdisk.requested_replicas}
-              />
-              <.epoch_badge epoch={vdisk.epoch} />
-              <span :if={vdisk.sealed?} class="badge badge-sm badge-ghost gap-1">
-                <.icon name="hero-lock-closed" class="size-3" /> sealed
-              </span>
-              <.link
-                :if={!vdisk.sealed?}
-                navigate={~p"/storage/vdisks/#{vdisk.id}/snapshots"}
-                id={"snapshots-link-" <> slug(vdisk.id)}
-                class="badge badge-sm badge-ghost gap-1 hover:badge-outline"
-              >
-                <.icon name="hero-camera" class="size-3" /> snapshots
-              </.link>
-            </div>
-          </div>
-
-          <ul :if={vdisk.issues != []} class="text-sm text-error space-y-0.5">
-            <li :for={issue <- vdisk.issues}>&bull; {issue}</li>
-          </ul>
-
-          <div class="space-y-2 border-t border-base-300 pt-2">
-            <div class="flex flex-wrap gap-1.5">
-              <.role_badge :for={attachment <- vdisk.attachments} attachment={attachment} current_epoch={vdisk.epoch} />
-            </div>
-
-            <p :if={vdisk.replicas != []} class="text-xs opacity-70">
-              Replicated to <span class="font-mono">{Enum.join(vdisk.replicas, ", ")}</span>.
-            </p>
-
-            <p :if={vdisk.socket} class="text-xs opacity-60 font-mono truncate">
-              {vdisk.socket}
-            </p>
-          </div>
-        </div>
+      <div :if={@vdisks.entries != []} class="overflow-x-auto">
+        <table class="table table-sm" id="vdisks-table">
+          <thead>
+            <tr>
+              <th>Vdisk</th>
+              <th>Size</th>
+              <th>Served by</th>
+              <th>Replicas</th>
+              <th>Health</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody
+            :for={vdisk <- @vdisks.entries}
+            id={"vdisk-" <> slug(vdisk.id)}
+            class={[
+              vdisk.health == :degraded && "bg-error/5",
+              vdisk.health == :unknown && "bg-warning/5"
+            ]}
+          >
+            <tr>
+              <td class="font-mono font-semibold whitespace-nowrap">
+                {vdisk.id}
+                <span :if={vdisk.sealed?} class="badge badge-sm badge-ghost gap-1 ml-1 font-sans">
+                  <.icon name="hero-lock-closed" class="size-3" /> sealed
+                </span>
+              </td>
+              <td class="tabular-nums whitespace-nowrap">{bytes(vdisk.size_bytes)}</td>
+              <td>
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <.role_badge
+                    :for={attachment <- vdisk.attachments}
+                    attachment={attachment}
+                    current_epoch={vdisk.epoch}
+                  />
+                  <.epoch_badge epoch={vdisk.epoch} />
+                </div>
+                <p :if={vdisk.owner == nil} class="text-xs text-warning">{owner_summary(vdisk)}</p>
+              </td>
+              <td>
+                <.replica_badge
+                  have={if vdisk.owner_ip, do: vdisk.replica_count}
+                  want={vdisk.expected_replicas}
+                  asked={vdisk.requested_replicas}
+                />
+                <p :if={vdisk.replicas != []} class="text-xs opacity-60 font-mono mt-1">
+                  {Enum.join(vdisk.replicas, ", ")}
+                </p>
+              </td>
+              <td><.health_badge health={vdisk.health} /></td>
+              <td class="text-right whitespace-nowrap">
+                <.link
+                  :if={!vdisk.sealed?}
+                  navigate={~p"/storage/vdisks/#{vdisk.id}/snapshots"}
+                  id={"snapshots-link-" <> slug(vdisk.id)}
+                  class="btn btn-ghost btn-xs gap-1"
+                >
+                  <.icon name="hero-camera" class="size-3" /> snapshots
+                </.link>
+              </td>
+            </tr>
+            <tr :if={vdisk.issues != []}>
+              <td colspan="6" class="pt-0 border-t-0">
+                <ul class="text-sm text-error space-y-0.5">
+                  <li :for={issue <- vdisk.issues}>&bull; {issue}</li>
+                </ul>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-    </section>
+    </.panel>
     """
   end
 
   attr :stores, :map, required: true
   attr :configured?, :boolean, required: true
+  attr :class, :any, default: nil
 
   defp stores_section(assigns) do
     ~H"""
-    <section class="space-y-3">
-      <h2 class="font-semibold text-lg">Extent stores</h2>
-
+    <.panel
+      id="stores-section"
+      class={@class}
+      title="Extent stores"
+      subtitle="One per node: where sealed extent groups and journals live"
+    >
       <.unavailable
         :if={@configured? and @stores.state == :unavailable}
         id="stores-unavailable"
@@ -679,7 +696,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
       <div
         :if={@stores.state == :partial}
-        class="alert alert-warning alert-soft items-start"
+        class="alert alert-warning alert-soft items-start mb-3"
         id="stores-partial"
       >
         <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
@@ -694,17 +711,18 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         </div>
       </div>
 
-      <div
-        :for={store <- @stores.entries}
-        id={"store-" <> slug(store.ip)}
-        class={[
-          "card card-border bg-base-100",
-          store.state == :full && "border-error/60",
-          store.state in [:warn, :unknown] && "border-warning/60"
-        ]}
-      >
-        <div class="card-body gap-2 p-4">
-          <div class="flex flex-wrap items-center justify-between gap-2">
+      <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+        <div
+          :for={store <- @stores.entries}
+          id={"store-" <> slug(store.ip)}
+          class={[
+            "rounded-lg border p-3 space-y-2",
+            store.state == :ok && "border-base-300",
+            store.state == :full && "border-error/60",
+            store.state in [:warn, :unknown] && "border-warning/60"
+          ]}
+        >
+          <div class="flex items-start justify-between gap-2">
             <div class="min-w-0">
               <p class="font-semibold truncate">{store.hostname}</p>
               <p class="text-xs opacity-60 font-mono truncate">
@@ -731,7 +749,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
           </ul>
         </div>
       </div>
-    </section>
+    </.panel>
     """
   end
 
@@ -740,19 +758,24 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
   defp disks_section(assigns) do
     ~H"""
-    <section class="space-y-3">
-      <h2 class="font-semibold text-lg">Disks by node</h2>
-
+    <.panel
+      id="disks-section"
+      title="Physical disks"
+      subtitle="Block devices on each node, as lsblk sees them"
+    >
       <p :if={@configured? and @disks == []} class="text-sm opacity-70 italic" id="disks-empty">
         No nodes to inventory.
       </p>
 
-      <div
-        :for={node <- @disks}
-        id={"disks-" <> slug(node.ip)}
-        class={["card card-border bg-base-100", node.state == :unavailable && "border-error/60"]}
-      >
-        <div class="card-body gap-2 p-4">
+      <div class="grid gap-4 xl:grid-cols-2 2xl:grid-cols-3">
+        <div
+          :for={node <- @disks}
+          id={"disks-" <> slug(node.ip)}
+          class={[
+            "rounded-lg border p-3 space-y-2",
+            if(node.state == :unavailable, do: "border-error/60", else: "border-base-300")
+          ]}
+        >
           <div class="flex flex-wrap items-center justify-between gap-2">
             <div class="min-w-0">
               <p class="font-semibold truncate">{node.hostname}</p>
@@ -768,40 +791,37 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
             absent. <span class="font-mono text-xs opacity-70 break-all">{node.error}</span>
           </p>
 
-          <p
-            :if={node.state == :ok and node.devices == []}
-            class="text-sm opacity-70 italic"
-          >
+          <p :if={node.state == :ok and node.devices == []} class="text-sm opacity-70 italic">
             The node answered and reported no block devices.
           </p>
 
           <div :if={node.devices != []} class="overflow-x-auto">
-            <table class="table table-zebra table-sm">
+            <table class="table table-zebra table-xs">
               <thead>
                 <tr>
                   <th>Device</th>
                   <th>Type</th>
-                  <th>Size</th>
+                  <th class="text-right">Size</th>
                   <th>Media</th>
                   <th>Mounted at</th>
                 </tr>
               </thead>
               <tbody>
                 <tr :for={device <- node.devices} id={"disk-" <> slug(node.ip <> "-" <> device.name)}>
-                  <td class="font-mono text-xs">
+                  <td class="font-mono">
                     <span style={"padding-left: #{device.depth * 12}px"}>{device.name}</span>
                   </td>
-                  <td class="text-xs">{device.type}</td>
-                  <td class="text-xs tabular-nums">{bytes(device.size_bytes)}</td>
-                  <td class="text-xs">{media(device)}</td>
-                  <td class="text-xs font-mono truncate">{device.mountpoint || "-"}</td>
+                  <td>{device.type}</td>
+                  <td class="tabular-nums text-right whitespace-nowrap">{bytes(device.size_bytes)}</td>
+                  <td>{media(device)}</td>
+                  <td class="font-mono truncate max-w-48">{device.mountpoint || "-"}</td>
                 </tr>
               </tbody>
             </table>
           </div>
         </div>
       </div>
-    </section>
+    </.panel>
     """
   end
 
@@ -811,7 +831,6 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   # no owner means every node holding this vdisk is relaying to somewhere that did not
   # answer.
   defp owner_summary(%{owner: nil}), do: "no owner on any node that answered"
-  defp owner_summary(%{owner: host}), do: "served by " <> host
 
   defp copies(1), do: "1 copy"
   defp copies(count), do: Integer.to_string(count) <> " copies"

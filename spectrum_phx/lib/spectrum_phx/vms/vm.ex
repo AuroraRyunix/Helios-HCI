@@ -77,6 +77,17 @@ defmodule SpectrumPhx.Vms.Vm do
 
   @firmwares ~w(uefi bios)
 
+  # What the old console's create form offered, and what Vali actually does with each.
+  # `network` is deliberately absent from the boot devices: the old form listed "Network
+  # (PXE)", but `generate_vm_xml` only distinguishes `cdrom` from everything else, so
+  # choosing it booted the disk. A control that does nothing is not offered.
+  @boot_devices ~w(hd cdrom)
+  @cpu_models ~w(host-model host-passthrough Haswell-noTSX Denverton)
+  @buses ~w(virtio sata scsi)
+  @nic_models ~w(virtio e1000 e1000e vmxnet3 rtl8139)
+  @graphics ~w(vnc spice)
+  @max_nics 16
+
   # 128 MiB is the floor below which no supported guest boots; the ceiling is a
   # sanity bound, not a capacity check (the real capacity gate lives in Vali's scheduler).
   @min_memory_mib 128
@@ -100,6 +111,21 @@ defmodule SpectrumPhx.Vms.Vm do
 
   @doc "Firmware values the hypervisor can actually build a domain for."
   def firmwares, do: @firmwares
+
+  @doc "Boot device overrides Vali honours. Empty means its own default."
+  def boot_devices, do: @boot_devices
+
+  @doc "CPU model overrides. Empty means Vali picks host-model or host-passthrough."
+  def cpu_models, do: @cpu_models
+
+  @doc "Disk buses Vali builds a `<target>` for."
+  def buses, do: @buses
+
+  @doc "NIC models the domain XML accepts."
+  def nic_models, do: @nic_models
+
+  @doc "Graphics devices a VM can have."
+  def graphics_types, do: @graphics
 
   @doc "The network assigned when a creation request does not name one."
   def default_network_id, do: @default_network_id
@@ -149,7 +175,12 @@ defmodule SpectrumPhx.Vms.Vm do
       vcpu: validate_vcpu(vcpu),
       memory: validate_memory(memory),
       firmware: validate_firmware(firmware),
-      disks: validate_disks(disks)
+      disks: validate_disks(disks),
+      iso: validate_iso(fetch(params, :iso)),
+      boot_device: validate_boot_device(fetch(params, :boot_device)),
+      network_id: validate_networks(fetch(params, :network_id)),
+      cpu_model: validate_cpu_model(fetch(params, :cpu_model)),
+      graphics: validate_graphics(fetch(params, :graphics))
     ]
 
     errors = for {field, {:error, message}} <- results, do: {field, message}
@@ -170,10 +201,11 @@ defmodule SpectrumPhx.Vms.Vm do
          state: "Stopped",
          host_ip: "",
          status: nil,
-         iso: to_string_or_empty(fetch(params, :iso)),
-         boot_device: to_string_or_empty(fetch(params, :boot_device)),
-         cpu_model: to_string_or_empty(fetch(params, :cpu_model)),
-         network_id: network_id(fetch(params, :network_id)),
+         iso: values.iso,
+         boot_device: values.boot_device,
+         cpu_model: values.cpu_model,
+         network_id: values.network_id,
+         graphics: values.graphics,
          audio_enabled: truthy?(fetch(params, :audio_enabled))
        }}
     else
@@ -242,11 +274,7 @@ defmodule SpectrumPhx.Vms.Vm do
     |> split_disks()
     |> Enum.with_index()
     |> Enum.map(fn {entry, index} ->
-      {size, container} =
-        case String.split(entry, ":", parts: 2) do
-          [size, container] -> {String.trim(size), String.trim(container)}
-          [size] -> {String.trim(size), nil}
-        end
+      {size, container, bus} = split_entry(entry)
 
       resource = "#{name}-disk#{index}"
 
@@ -255,6 +283,7 @@ defmodule SpectrumPhx.Vms.Vm do
         size: size,
         size_gib: size_gib_or_nil(size),
         container: container,
+        bus: bus || "virtio",
         resource: resource,
         path: "/var/lib/hci/sidon/nbd/#{resource}.sock"
       }
@@ -360,18 +389,136 @@ defmodule SpectrumPhx.Vms.Vm do
     end
   end
 
-  defp parse_disk_entry(entry) do
-    {size, container} =
-      case String.split(entry, ":", parts: 2) do
-        [size, container] -> {String.trim(size), String.trim(container)}
-        [size] -> {String.trim(size), nil}
-      end
-
-    with {:ok, gib} <- validate_disk_size(size),
-         :ok <- validate_container(container) do
-      {:ok, %{raw: entry, size: size, size_gib: gib, container: container}}
+  # `size`, `size:container` or `size:container:bus`. The third part is what the old console
+  # wrote for every disk (`20GB:default-vm-container:virtio`) and what Vali reads to pick
+  # `vd` or `sd` for the device name. Splitting on the first colon only, as this used to,
+  # made the container `default-vm-container:virtio` -- which is not a name, so every disk
+  # the old form could describe was refused.
+  defp split_entry(entry) do
+    case String.split(entry, ":") do
+      [size] -> {String.trim(size), nil, nil}
+      [size, container] -> {String.trim(size), blank_to_nil(container), nil}
+      [size, container, bus | _] -> {String.trim(size), blank_to_nil(container), blank_to_nil(bus)}
     end
   end
+
+  defp blank_to_nil(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp parse_disk_entry(entry) do
+    {size, container, bus} = split_entry(entry)
+
+    with {:ok, gib} <- validate_disk_size(size),
+         :ok <- validate_container(container),
+         :ok <- validate_bus(bus) do
+      {:ok, %{raw: entry, size: size, size_gib: gib, container: container, bus: bus}}
+    end
+  end
+
+  defp validate_bus(nil), do: :ok
+
+  defp validate_bus(bus) do
+    if bus in @buses, do: :ok, else: {:error, "disk bus must be one of: #{Enum.join(@buses, ", ")}"}
+  end
+
+  # -- the optional fields --------------------------------------------------------------
+
+  # One image name per CD-ROM, comma separated, which is what Vali splits. A name that
+  # contains the separator would silently become two drives.
+  defp validate_iso(value) do
+    names =
+      case value do
+        list when is_list(list) -> Enum.map(list, &to_string_or_empty/1)
+        other -> other |> to_string_or_empty() |> String.split(",")
+      end
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+
+    cond do
+      Enum.any?(names, &String.match?(&1, ~r/[\x00-\x1f\x7f,:]/)) ->
+        {:error, "an image name cannot contain ',' ':' or control characters"}
+
+      length(names) > 8 ->
+        {:error, "at most 8 CD-ROM drives are supported"}
+
+      true ->
+        {:ok, Enum.join(names, ",")}
+    end
+  end
+
+  defp validate_boot_device(value) do
+    case to_string_or_empty(value) do
+      "" -> {:ok, ""}
+      device when device in @boot_devices -> {:ok, device}
+      _ -> {:error, "must be one of: #{Enum.join(@boot_devices, ", ")}"}
+    end
+  end
+
+  defp validate_cpu_model(value) do
+    case to_string_or_empty(value) do
+      "" -> {:ok, ""}
+      model when model in @cpu_models -> {:ok, model}
+      _ -> {:error, "must be one of: #{Enum.join(@cpu_models, ", ")}"}
+    end
+  end
+
+  # Anything that is not exactly "spice" is VNC, the same rule `normalise_graphics/1`
+  # applies to a stored row -- but a *form* value that is neither is a mistake worth
+  # reporting rather than quietly turning into VNC.
+  defp validate_graphics(value) do
+    case value |> to_string_or_empty() |> String.downcase() do
+      "" -> {:ok, "vnc"}
+      type when type in @graphics -> {:ok, type}
+      _ -> {:error, "must be one of: #{Enum.join(@graphics, ", ")}"}
+    end
+  end
+
+  # One network id, or the JSON list the old console wrote (`["<id>:virtio", ...]`), which
+  # is what Vali parses -- one NIC per entry. An empty list is a VM with no NIC, which is
+  # not the same as a VM that was not asked: blank means the default network.
+  defp validate_networks(value) when is_list(value) do
+    validate_networks(Jason.encode!(Enum.map(value, &to_string_or_empty/1)))
+  end
+
+  defp validate_networks(value) do
+    case String.trim(to_string_or_empty(value)) do
+      "" ->
+        {:ok, @default_network_id}
+
+      "[" <> _ = json ->
+        case Jason.decode(json) do
+          {:ok, entries} when is_list(entries) -> check_nics(entries, json)
+          _ -> {:error, "is not a list of networks"}
+        end
+
+      single ->
+        {:ok, single}
+    end
+  end
+
+  defp check_nics(entries, json) do
+    parsed = Enum.map(entries, &nic_entry/1)
+
+    cond do
+      length(entries) > @max_nics -> {:error, "at most #{@max_nics} network interfaces are supported"}
+      Enum.any?(parsed, &(&1 == :error)) -> {:error, "every interface needs a network, and a known NIC model"}
+      true -> {:ok, json}
+    end
+  end
+
+  defp nic_entry(entry) when is_binary(entry) do
+    case String.split(entry, ":") do
+      [network] when network != "" -> network
+      [network, model] when network != "" and model in @nic_models -> network
+      _ -> :error
+    end
+  end
+
+  defp nic_entry(_other), do: :error
 
   # The container name is appended to a storage argument, so it gets the
   # same treatment as a VM name rather than being passed through.
@@ -440,13 +587,6 @@ defmodule SpectrumPhx.Vms.Vm do
     case Map.get(row, key, default) do
       nil -> default
       value -> value
-    end
-  end
-
-  defp network_id(value) do
-    case to_string_or_empty(value) do
-      "" -> @default_network_id
-      id -> id
     end
   end
 

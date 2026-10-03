@@ -32,6 +32,7 @@ defmodule SpectrumPhxWeb.Layouts do
     {:hosts, "Hosts", "/hosts", :live},
     {:vms, "VMs", "/vms", :live},
     {:storage, "Storage", "/storage", :live},
+    {:policies, "Policies", "/policies", :live},
     {:images, "Images", "/images", :live},
     {:tasks, "Tasks", "/tasks", :live},
     {:metrics, "Metrics", "/metrics", :live},
@@ -132,7 +133,9 @@ defmodule SpectrumPhxWeb.Layouts do
     </header>
 
     <main class="px-4 py-8 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-7xl space-y-4">
+      <%!-- Full width. This used to be `mx-auto max-w-7xl`, a 1280px column that left a 1920px
+          window about a third empty; a console whose job is density has no use for margins. --%>
+      <div class="w-full space-y-4">
         {render_slot(@inner_block)}
       </div>
     </main>

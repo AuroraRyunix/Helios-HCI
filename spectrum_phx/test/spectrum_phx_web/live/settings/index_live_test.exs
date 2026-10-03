@@ -177,4 +177,139 @@ defmodule SpectrumPhxWeb.Settings.IndexLiveTest do
       assert view |> element("#urbosa-error") |> render() =~ "left as it was"
     end
   end
+
+  describe "editing" do
+    # The page used to display the VIP, the cluster name and the replication factor and
+    # offer no way to change any of them, which looks like the feature was removed.
+
+    defp capture_effects do
+      test = self()
+      static = Application.get_env(:spectrum_phx, :settings_source) |> elem(1)
+
+      effects = fn tag ->
+        send(test, {:effect, tag})
+        :ok
+      end
+
+      Application.put_env(
+        :spectrum_phx,
+        :settings_source,
+        {:static,
+         static
+         |> Map.put(:effects, effects)
+         |> Map.put(:hosts, ["10.0.0.1", "10.0.0.2"])
+         |> Map.put(:replication, [
+           %{"replication" => %{"class" => "NetworkTopologyStrategy", "datacenter1" => "3"}}
+         ])}
+      )
+    end
+
+    defp submit(view, fields) do
+      view |> form("#settings-form", fields) |> render_submit()
+    end
+
+    test "the VIP, name, subnet and replication factor are inputs, not figures", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      for field <- ~w(vip cluster_name cluster_subnet replication_factor) do
+        assert has_element?(view, "#settings-form input[name='#{field}']"), "#{field} is read-only"
+      end
+
+      assert view |> element("#setting-vip") |> render() =~ ~s(value="10.10.102.45")
+      assert view |> element("#setting-cluster_name") |> render() =~ ~s(value="hci-01")
+    end
+
+    test "changing the VIP rewrites cluster.json on every host and restarts bifrost", %{conn: conn} do
+      capture_effects()
+      {:ok, view, _html} = mount_view(conn)
+
+      html = submit(view, %{"vip" => "10.10.102.99"})
+
+      assert_received {:effect, {:host, "10.0.0.1", command}}
+      assert command =~ "cluster.json"
+      assert_received {:effect, {:host, "10.0.0.2", _}}
+      assert_received {:effect, {:units, "10.0.0.1", "restart", ["bifrost"]}}
+      assert html =~ "saved"
+    end
+
+    test "an invalid VIP is refused with the reason and nothing is applied", %{conn: conn} do
+      capture_effects()
+      {:ok, view, _html} = mount_view(conn)
+
+      html = submit(view, %{"vip" => "banana"})
+
+      assert html =~ "VIP: must be an IPv4 address"
+      refute_received {:effect, _}
+    end
+
+    test "a host that did not take the change is named on the page", %{conn: conn} do
+      static = Application.get_env(:spectrum_phx, :settings_source) |> elem(1)
+
+      Application.put_env(
+        :spectrum_phx,
+        :settings_source,
+        {:static,
+         static
+         |> Map.put(:hosts, ["10.0.0.1", "10.0.0.2"])
+         |> Map.put(:effects, fn
+           {:host, "10.0.0.2", _} -> {:error, "exit 1: unreachable"}
+           _ -> :ok
+         end)}
+      )
+
+      {:ok, view, _html} = mount_view(conn)
+      submit(view, %{"vip" => "10.10.102.99"})
+
+      failures = view |> element("#apply-failures") |> render()
+      assert failures =~ "10.0.0.2"
+      assert failures =~ "unreachable"
+    end
+
+    test "re-saving the page unchanged touches nothing", %{conn: conn} do
+      capture_effects()
+      {:ok, view, _html} = mount_view(conn)
+
+      html = view |> form("#settings-form") |> render_submit()
+
+      refute_received {:effect, {:host, _, _}}
+      assert html =~ "Nothing changed"
+    end
+
+    test "there is no panel called Policies on the settings page", %{conn: conn} do
+      # Six unrelated fields under a name that promised something none of them was. The
+      # real policies are on /policies; the security ones are under Security here.
+      {:ok, view, html} = mount_view(conn)
+
+      refute has_element?(view, "#policy-settings")
+      refute html =~ ">Policies<"
+      assert has_element?(view, "#security-settings")
+    end
+
+    test "password policy and scrub interval are selects with the values the backend tests for", %{conn: conn} do
+      {:ok, _view, html} = mount_view(conn)
+
+      assert html =~ ~s(<option value="enabled")
+      refute html =~ "strict"
+      assert html =~ ~s(<option value="monthly")
+    end
+
+    test "an operator can be created and a password changed from the page", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("#create-user-form", %{"username" => "ops_1", "password" => "hunter22"})
+        |> render_submit()
+
+      assert html =~ "ops_1 created"
+
+      html =
+        view
+        |> form("#set-password-form", %{"username" => "helios", "password" => "newpass1", "confirm" => "different"})
+        |> render_submit()
+
+      assert html =~ "do not match"
+    end
+  end
+
 end

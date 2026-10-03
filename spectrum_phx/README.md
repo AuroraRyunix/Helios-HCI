@@ -314,6 +314,7 @@ Ported so far (this list moves fast — check `lib/spectrum_phx_web/router.ex`):
 | `/vms` | `SpectrumPhxWeb.Vms.IndexLive` | VM list |
 | `/vms/new` | `SpectrumPhxWeb.Vms.NewLive` | VM creation |
 | `/vms/:name` | `SpectrumPhxWeb.Vms.ShowLive` | VM detail |
+| `/policies` | `SpectrumPhxWeb.Policies.IndexLive` | snapshot, protection-domain, container and security policies (read-only) |
 
 Supporting layers: `SpectrumPhx.Cluster.Config` (`/etc/hci/cluster.json`),
 `SpectrumPhx.Hydra` (ScyllaDB via Xandra, prepared statements only),

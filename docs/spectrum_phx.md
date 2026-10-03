@@ -61,8 +61,9 @@ the socket itself, so a caller cannot name a file at all.
 |---|---|---|
 | `/` | `Cluster.OverviewLive` | ZooKeeper desired state + per-node ephemeral znodes ([cluster_state.md](./cluster_state.md)) |
 | `/hosts` | `Cluster.HostsLive` | ZooKeeper + `Spark.host_disks/1` |
-| `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and DFS endpoints |
-| `/storage` | `Storage.IndexLive` | Sidon's `capacity`, `list` and `peers` per node, plus `lsblk` |
+| `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and DFS endpoints; the create form's drop-downs read `hydra.storage_containers`, `hydra.valhalla_images`, the networks and each host's `host/capabilities` |
+| `/storage` | `Storage.IndexLive` | Sidon's `capacity`, `list` and `peers` per node, plus `lsblk`; `hydra.storage_containers` |
+| `/policies` | `Policies.IndexLive` | `hydra.dfs_snapshot_policies`, `hydra.dfs_protection_domains` (+ members, latest set), `hydra.storage_containers`, the security rows of `hydra.cluster_settings`; read-only |
 | `/storage/vdisks/:vdisk_id/snapshots` | `Storage.SnapshotsLive` | `hydra.dfs_vdisks` (lineage), `hydra.dfs_snapshot_index`, `hydra.dfs_snapshot_policies`; read-only ([dfs/snapshots.md](./dfs/snapshots.md)) |
 | `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Sidon vdisks |
 | `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks`, read as a tree: `parent_task_id` (column, falling back to the payload key it used to live in), `component` and `sequence_id` |
@@ -71,7 +72,7 @@ the socket itself, so a caller cannot name a file at all.
 | `/hardware` | `Hardware.IndexLive` | Spark's `host/cpu`, `host/memory`, `host/disks`, `host/network` per node |
 | `/sdn` | `Sdn.IndexLive` | the five `hydra.urbosa_*` tables, plus Spark's tunnel status |
 | `/networking` | `Networking.IndexLive` | `hydra.gatoway_networks` + `hydra.urbosa_segments`, and the host adapter reads; writes take the VLAN claim in `hydra.gatoway_vlan_claims` |
-| `/settings` | `Settings.IndexLive` | `hydra.cluster_settings` over defaults, `cluster.json`, `system_schema.keyspaces` |
+| `/settings` | `Settings.IndexLive` | `hydra.cluster_settings` over defaults, `cluster.json`, `system_schema.keyspaces`; saving is applied to every host, see [console.md](./console.md) |
 | `/lcm` | `Lcm.IndexLive` | `hydra.lcm_inventory`, `hydra.lcm_update_state`, `hydra.hylia_jobs` + `hylia_logs` |
 | `/lanayru` | `Lanayru.IndexLive` | `hydra.lanayru_clusters`, plus live ring / capacity / memory reads |
 

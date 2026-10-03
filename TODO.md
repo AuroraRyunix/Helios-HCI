@@ -85,31 +85,31 @@ Slate's console backend is down, so Mimir's `vip_binding_status` fails on a bran
 a rollout is run. Create should bring the console up itself, or provisioning should install it, so
 that a created cluster passes its own health check without a second tool.
 
-## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
+## P1 — The Phoenix console lost function in the port (2026-10-02, restored 2026-10-03; needs a pass in a real browser)
 
 Reported from using it. The pages exist and render, which is what "every page is Phoenix"
 measured; it did not measure whether each page can still *do* what its predecessor did. The
 instruction for all of these is **port the old one faithfully first**, then improve.
 
-* **Settings is read-only for things that used to be editable**, the VIP among them. A
+* [x] **Settings is read-only for things that used to be editable**, the VIP among them. *Done: cluster name, VIP, subnet and replication factor are inputs, and saving applies to every host as the old save did (resolv.conf, chrony, timezone, cluster.json, bifrost restart, ALTER KEYSPACE + repair, scrub schedule). Operator accounts can be created and re-passworded. SSL upload, node add/remove, maintenance operations and language/theme from the old Settings page are still not ported.* A
   settings page that displays a value it will not let you change is worse than no page,
   because it looks like the feature was removed rather than the form.
-* **"Policies" is a page nobody can explain.** Work out what it was meant to be against
+* [x] **"Policies" is a page nobody can explain.** *Done: it was a panel on Settings, now removed; `/policies` shows snapshot policies, protection domains, container policies and the security policy, read-only. What it should be was inferred from the schema, not specified.* Work out what it was meant to be against
   `static/settings.html`, and either port that faithfully or delete it. An unexplainable
   page is a bug regardless of which way it resolves.
-* **VM create lost most of its options.** The old form carried the full set; the new one
+* [x] **VM create lost most of its options.** *Done, except Secure Boot and PXE boot, which Vali does not implement and so are not offered (see docs/console.md).* The old form carried the full set; the new one
   carries a fraction, so a VM that needs anything beyond the defaults cannot be created
   from the console at all.
-* **Disks and CD-ROM are a single text box each.** They used to be repeatable rows you could
+* [x] **Disks and CD-ROM are a single text box each.** *Done: repeatable rows for disks, CD-ROMs and NICs.* They used to be repeatable rows you could
   add to and remove from, which is how a multi-disk VM gets built. A comma-separated string
   is not a replacement for a list, and the backend already takes a list -- `disks_list` is
   parsed from one.
-* **The storage page is a regression** on the one it replaced. Treat the old page as the
+* [x] **The storage page is a regression** on the one it replaced. *Done: re-laid-out; the data was already all there.* Treat the old page as the
   specification.
-* **Front page uses about 55-60% of the window width.** There is screen real estate going
+* [x] **Front page uses about 55-60% of the window width.** *Done: the 1280px column is gone on every page.* There is screen real estate going
   spare on a dashboard whose whole job is density.
 
-**And one that is not a regression but a new capability** the storage layer can nearly
+**And one that is not a regression but a new capability (still open, blocked on D-23; deliberately not built here)** the storage layer can nearly
 support: **dedup**. Container compression shipped in `0008`; dedup is the obvious next
 property an operator would expect beside it. It is *not* a settings toggle away, and the
 reason is recorded in **D-23**: dedup needs the extent id map, the middle level between the
