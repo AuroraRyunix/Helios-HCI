@@ -438,7 +438,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":

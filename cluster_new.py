@@ -2094,7 +2094,7 @@ def main():
 
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         # `ignore_failed` is the `|| true` this used to carry: a service that is not
         # running cannot be stopped, and on a clean host none of them are.
         unit_action_parallel(ips, "stop", cleanup_services, ignore_failed=True)
@@ -2888,7 +2888,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
             ok, detail = unit_action(ip, "stop", services, ignore_failed=True)

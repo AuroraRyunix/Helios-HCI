@@ -5915,7 +5915,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'zookeeper_status',
             'hydra-db_status',
             'daruk_status',
-            'aether_status',
+            'sidon_status',
             'spectrum_status',
             'catalyst_status',
             'bifrost_status',
@@ -5928,6 +5928,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'mipha_status',
             'agahnim_status',
             'slate_status',
+            'hylia_status',
             'libvirtd_status'
         ];
         
@@ -5936,7 +5937,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'zookeeper_status': 'ZooKeeper',
             'hydra-db_status': 'Hydra DB',
             'daruk_status': 'Daruk DB Proxy',
-            'aether_status': 'Sidon Engine',
+            'sidon_status': 'Sidon Engine',
             'spectrum_status': 'Spectrum Web',
             'catalyst_status': 'Catalyst Task',
             'bifrost_status': 'Bifrost VIP',
@@ -5949,6 +5950,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'mipha_status': 'Mipha HA',
             'agahnim_status': 'Agahnim Proxy',
             'slate_status': 'Slate Ingress',
+            'hylia_status': 'Hylia Upgrades',
             'libvirtd_status': 'Libvirtd'
         };
         

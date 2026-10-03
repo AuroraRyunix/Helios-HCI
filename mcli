@@ -568,6 +568,20 @@ def show_list():
         ("service.vali.drs_storage_gate", "drs_storage_capacity_check", "Verify the DRS/migration storage capacity gate reads real free space and the pool has headroom"),
         ("service.vali.migration_locks", "migration_lock_status", "Audit VM migration locks against the migrations that are actually running"),
         ("storage.sidon.latency", "sidon_latency_check", "Measure the storage control socket's response time and detect a blocking daemon"),
+        ("database.daruk", "daruk_status", "Check systemd Daruk query proxy state"),
+        ("storage.sidon", "sidon_status", "Check systemd Sidon storage daemon state"),
+        ("service.catalyst", "catalyst_status", "Check systemd Catalyst task gateway state"),
+        ("service.bifrost", "bifrost_status", "Check systemd Bifrost VIP and VM lifecycle state"),
+        ("service.dagur", "dagur_status", "Check systemd Dagur scheduler state"),
+        ("service.mimir", "mimir_status", "Check systemd Mimir health-check daemon state"),
+        ("service.vali", "vali_status", "Check systemd Vali placement and compliance daemon state"),
+        ("service.gatoway", "gatoway_status", "Check systemd Gatoway network sync state"),
+        ("service.urbosa", "urbosa_status", "Check systemd Urbosa SDN state (when enabled)"),
+        ("service.logos", "logos_status", "Check systemd Logos metrics daemon state"),
+        ("service.mipha", "mipha_status", "Check systemd Mipha HA monitor state"),
+        ("service.hylia", "hylia_status", "Check systemd Hylia upgrade manager state"),
+        ("service.agahnim", "agahnim_status", "Check systemd Agahnim console proxy state"),
+        ("service.slate", "slate_status", "Check systemd Slate ingress state"),
     ]
     
     for func, check_id, desc in checks:

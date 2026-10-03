@@ -3299,7 +3299,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
             
             # Start spectrum and other services
-            services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+            services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
             for svc in services:
                 run_parallel_checked(servers, f"systemctl start {svc}")
                 for ip in servers:
@@ -3378,7 +3378,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop services on all hosts in parallel
         # 2. Stop services on all hosts in parallel
-        services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         run_parallel(hosts, f"systemctl stop {svc_list} || true")
         
@@ -4617,7 +4617,7 @@ def check_cluster_and_autostart():
     # Check if cluster configuration exists
     if not os.path.exists("/etc/hci/cluster.json"):
         print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return
@@ -4690,7 +4690,7 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
