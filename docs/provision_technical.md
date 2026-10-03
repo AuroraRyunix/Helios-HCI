@@ -38,7 +38,7 @@ mindmap
 - Generates systemd Quadlet files under `/etc/containers/systemd/` on all target hosts:
   - **`zookeeper.container`**: Consensus service running library Zookeeper on host network.
   - **`hydra-db.container`**: ScyllaDB container mapping `/var/lib/scylla` storage.
-  - Storage is **not** a container. `sidon.service` is a native systemd unit running a Rust binary built from source, and provisioning carves it a thin LV, makes an XFS filesystem on it and mounts it at `/var/lib/hci/sidon` by UUID with `nofail`. There is no kernel module and so no reason to disable Secure Boot; a node upgraded from a DRBD cluster has the old packages and Quadlets removed.
+  - Storage is **not** a container. `sidon.service` is a native systemd unit running a Rust binary built from source, and provisioning carves it a thin LV, makes an XFS filesystem on it and records it, and every further empty disk, in `/etc/hci/sidon-disks` (`CARVE_SIDON_VOLUME`, `CLAIM_EXTRA_DISKS`, `STAGE_SIDON_DISKS`). Nothing is mounted and nothing is written to fstab: sidon mounts the filesystems by UUID when it starts (D-27). There is no kernel module and so no reason to disable Secure Boot; a node upgraded from a DRBD cluster has the old packages and Quadlets removed.
   - **`spectrum.container`**: Local UI admin portal mapping host libvirt socket and certificate stores.
   - **`slate.container`**: Traefik Edge proxy mapping certificate stores.
   - **All Python services (`spark-daemon`, `bifrost`, `dagur`, `mimir`, `vali`, `gatoway`, `urbosa`, `logos`, `mipha`, `catalyst`, `hylia`)**: Executed inside `localhost/helios-base` containers mounting host `/usr/local/bin` and configuration directories.

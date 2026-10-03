@@ -66,7 +66,7 @@ holds one connection per node pair, whatever the disk count. See
 
 *   **LVM-Thin Pools**: Non-boot storage drives on each node are unified under an LVM
     volume group `vg_aether` and thin-provisioned pool `thin_pool_aether`. Sidon takes one
-    thin volume from it, formatted XFS and mounted at `/var/lib/hci/sidon` -- its own
+    thin volume from it, formatted XFS and mounted by sidon under `/var/lib/hci/sidon/disks/` -- its own
     filesystem, so filling the extent store cannot stop the host.
 *   **Extents and extent groups**: a vdisk is cut into 1 MiB extents, which live in 4 MiB
     append-only extent groups -- ordinary files. Sealed groups are **immutable**,
@@ -468,8 +468,9 @@ seconds of a write failing, so the exposure is an interruption rather than an ou
   are scanned and claimed on each node during cluster creation, then configured as an
   LVM-Thin Pool (`thin_pool_aether` inside `vg_aether`).
 * **The extent store**: one thin volume from that pool, XFS, mounted at
-  `/var/lib/hci/sidon` by UUID with `nofail` -- so a node whose storage volume is missing
-  still boots to a shell rather than stopping at an emergency prompt.
+  `/var/lib/hci/sidon/disks/<uuid>` by sidon itself, from `/etc/hci/sidon-disks`, with nothing
+  in `/etc/fstab` -- so a node whose storage volume is missing still boots to a shell, and sidon
+  refuses to use a path whose disk is absent rather than writing to the root filesystem.
 * **No containers, no kernel module**: `sidon.service` is a native systemd unit running a
   Rust binary. The Linstor satellite and controller containers are gone, and provisioning
   removes them from nodes upgraded from a DRBD cluster.
@@ -1635,7 +1636,7 @@ Instead of linking complex ZooKeeper client libraries into every single componen
 2. The CLI performs connection checks and templates hostnames using MD5 hashes.
 3. Overwrites `/etc/hci/cluster.json` on all nodes.
 4. Scans local disks and configures `vg_aether/thin_pool_aether` thin-provisioning pools.
-5. Carves the extent store's thin volume from that pool, makes an XFS filesystem on it, and mounts it at `/var/lib/hci/sidon` by UUID with `nofail`.
+5. Carves the extent store's thin volume from that pool, makes an XFS filesystem on it, and records it in `/etc/hci/sidon-disks`; sidon mounts it by UUID when it starts.
 6. Defines and formats storage containers (`default-vm-container` and `default-image-container`).
 7. Distributes configuration files, starts consensus (ZooKeeper), databases (ScyllaDB), hypervisor agents (Vali), and orchestration engines (Bifrost, Dagur, Mimir, etc.).
 8. Executes secure SSH key seeding via `ssh-keyscan` and distributes public keys to `/root/.ssh/known_hosts` on all cluster nodes.

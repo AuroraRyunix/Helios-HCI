@@ -21,7 +21,7 @@ use crate::crc::crc32c;
 use crate::err::{Error, Result};
 
 mod placement;
-pub use placement::{container_tier, Tier};
+pub use placement::{container_tier, identify, Tier, UID_FILE};
 
 /// What the kernel says backs the filesystem holding a disk's extent groups.
 pub fn mount_source_of(egroups_dir: &Path) -> Option<String> {
@@ -177,6 +177,9 @@ pub struct Disk {
     pub uid_persisted: bool,
     /// The class of media, from an operator's `disk.tier` file or the kernel.
     pub tier: Tier,
+    /// What proves, at the moment of a write, that this disk's mount is still there. `None`
+    /// for a disk on an unmanaged node, where the mount test at discovery is all there is.
+    pub guard: Option<crate::mounts::MountGuard>,
 }
 
 impl Disk {
@@ -187,7 +190,21 @@ impl Disk {
             .parent()
             .map(placement::detect_tier)
             .unwrap_or(Tier::Unknown);
-        Disk { id, root, uid, uid_persisted, tier }
+        Disk { id, root, uid, uid_persisted, tier, guard: None }
+    }
+
+    /// A disk whose mount sidon owns, labelled by its filesystem uuid.
+    pub fn mounted(uuid: String, root: PathBuf, guard: crate::mounts::MountGuard) -> Disk {
+        let mut disk = Disk::identified(uuid, root);
+        disk.guard = Some(guard);
+        disk
+    }
+
+    /// Whether this disk is still where it was found. Asked again before anything is written
+    /// to it, because a disk can leave while sidon runs and a directory whose mount went
+    /// away is an ordinary directory on the root filesystem.
+    pub fn present(&self) -> bool {
+        self.guard.as_ref().map(|g| g.present()).unwrap_or(true)
     }
 }
 
@@ -250,7 +267,63 @@ fn is_separate_filesystem(path: &Path) -> bool {
 }
 
 pub fn discover_disks(root: &Path) -> Vec<Disk> {
-    discover_disks_with(root, &is_separate_filesystem)
+    match crate::mounts::load_manifest() {
+        Ok(Some(manifest)) => discover_managed(root, &manifest, crate::mounts::real_host()),
+        Ok(None) => discover_disks_with(root, &is_separate_filesystem),
+        Err(e) => {
+            // A node that was told what its disks are and cannot read it has none.
+            warn_once("manifest", &e.to_string());
+            Vec::new()
+        }
+    }
+}
+
+fn warn_once(key: &str, message: &str) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut seen) = seen.lock() {
+        if seen.insert(format!("{key}|{message}")) {
+            eprintln!("sidon: {message}");
+        }
+    }
+}
+
+/// The disks of a node whose filesystems are named in `/etc/hci/sidon-disks`: exactly
+/// those, each only while it is provably mounted where it belongs.
+///
+/// A directory under `disks/` that the manifest does not name is not a disk, whatever it
+/// holds. A named disk that is absent is *left out and said so*, never replaced by the
+/// plain directory it leaves behind -- that directory is on the root filesystem. There is
+/// no legacy `<root>/egroups` disk and no fallback to one: the old rule that counted it
+/// when it held data is what let a node write to the root filesystem and carry on.
+pub fn discover_managed(
+    root: &Path,
+    manifest: &crate::mounts::Manifest,
+    host: std::sync::Arc<dyn crate::mounts::Host>,
+) -> Vec<Disk> {
+    let mut disks = Vec::new();
+    for entry in &manifest.entries {
+        let dir = crate::mounts::mount_dir(root, &entry.uuid);
+        match crate::mounts::probe(host.as_ref(), &dir, &entry.uuid) {
+            Ok(_) => {
+                let guard = crate::mounts::MountGuard::new(
+                    std::sync::Arc::clone(&host), dir.clone(), entry.uuid.clone());
+                disks.push(Disk::mounted(entry.uuid.clone(), dir.join("egroups"), guard));
+            }
+            Err(why) => warn_once(
+                &entry.uuid,
+                &format!(
+                    "disk {} ({}) at {} is not available and will not be used: {why}",
+                    entry.uuid,
+                    entry.role.name(),
+                    dir.display()
+                ),
+            ),
+        }
+    }
+    distinct_identities(&mut disks);
+    disks
 }
 
 /// `discover_disks`, with the "is this really its own disk" test injected.
@@ -372,6 +445,7 @@ impl EgroupStore {
             uid: "test-0".to_string(),
             uid_persisted: false,
             tier: Tier::Unknown,
+            guard: None,
         }], egroup_bytes)
     }
 
@@ -386,6 +460,13 @@ impl EgroupStore {
         let mut usable = Vec::new();
         let mut index = HashMap::new();
         for disk in disks {
+            // create_dir_all below would otherwise make `egroups` on whatever is at the
+            // path, and for a disk that left between discovery and now that is the root
+            // filesystem.
+            if !disk.present() {
+                eprintln!("sidon: disk {} is no longer mounted and will be skipped", disk.id);
+                continue;
+            }
             if let Err(e) = std::fs::create_dir_all(&disk.root) {
                 eprintln!(
                     "sidon: disk {} at {} is unusable and will be skipped: {e}",
@@ -446,6 +527,17 @@ impl EgroupStore {
 
     pub fn create(&self, id: &str) -> Result<OpenEgroup> {
         let slot = self.placement();
+        // The invariant this node exists to keep: nothing is written under a disk's path
+        // unless that disk is mounted there. Checked here, at the write, and not only when
+        // the disk was discovered, because a disk can go while sidon runs.
+        if !self.disks[slot].present() {
+            return Err(Error::refused(format!(
+                "disk {} is no longer mounted at {}; refusing to create an extent group on \
+                 the filesystem underneath it",
+                self.disks[slot].id,
+                self.disks[slot].root.display()
+            )));
+        }
         let dir = &self.disks[slot].root;
         let path = dir.join(format!("{id}.eg"));
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
@@ -663,6 +755,121 @@ mod tests {
         });
         assert_eq!(found.len(), 1, "an unmounted disk directory was used");
         assert_eq!(found[0].id, "d1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A host whose one disk can be pulled while the store is open, which is the case a
+    /// check made only at discovery cannot see.
+    struct Pullable {
+        mount: PathBuf,
+        attached: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::mounts::Host for Pullable {
+        fn dev_of(&self, path: &Path) -> Option<u64> {
+            let up = self.attached.load(std::sync::atomic::Ordering::SeqCst);
+            Some(if up && path.starts_with(&self.mount) { 7 } else { 1 })
+        }
+        fn rdev_of_uuid(&self, _: &str) -> Option<u64> {
+            Some(7)
+        }
+        fn uuid_of_dev(&self, _: u64) -> Option<String> {
+            None
+        }
+        fn read_uid(&self, _: &Path) -> Option<String> {
+            Some("uid-x".to_string())
+        }
+        fn claim_uid(&self, _: &Path) -> Option<String> {
+            None
+        }
+        fn mounts_under(&self, _: &Path) -> Vec<(PathBuf, u64)> {
+            Vec::new()
+        }
+        fn mkdir(&self, _: &Path) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn mount(&self, _: &str, _: &Path) -> std::result::Result<(), String> {
+            Err("not in a test".to_string())
+        }
+        fn umount(&self, _: &Path) -> std::result::Result<(), String> {
+            Err("not in a test".to_string())
+        }
+        fn reload_units(&self) {}
+    }
+
+    #[test]
+    fn nothing_is_written_to_a_disk_whose_mount_has_gone() {
+        // The failure this exists for: the mount goes, the directory stays, and a write
+        // lands on the root filesystem under the same path. The check is made at the
+        // write, so a disk that leaves while sidon runs is refused, not written around.
+        let dir = tmpdir("pulled");
+        let mount = dir.join("disks").join("uuid-a");
+        std::fs::create_dir_all(mount.join("egroups")).unwrap();
+        let host = std::sync::Arc::new(Pullable {
+            mount: mount.clone(),
+            attached: std::sync::atomic::AtomicBool::new(true),
+        });
+        let guard = crate::mounts::MountGuard::new(host.clone(), mount.clone(), "uuid-a".to_string());
+        let disk = Disk::mounted("uuid-a".to_string(), mount.join("egroups"), guard);
+        let store = EgroupStore::open(vec![disk], 1 << 20).unwrap();
+
+        assert!(store.create("eg-while-present").is_ok());
+
+        host.attached.store(false, std::sync::atomic::Ordering::SeqCst);
+        match store.create("eg-after-it-left") {
+            Err(Error::Refused(m)) => assert!(m.contains("no longer mounted"), "{m}"),
+            Ok(_) => panic!("a group was created under a mount that is gone"),
+            Err(other) => panic!("wrong refusal: {other:?}"),
+        }
+        assert!(
+            !mount.join("egroups").join("eg-after-it-left.eg").exists(),
+            "an extent group was written to the filesystem underneath the mount"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_store_will_not_open_a_disk_that_is_not_mounted() {
+        // create_dir_all on a disk's root would make it on the root filesystem.
+        let dir = tmpdir("pulled-open");
+        let mount = dir.join("disks").join("uuid-b");
+        std::fs::create_dir_all(&mount).unwrap();
+        let host = std::sync::Arc::new(Pullable {
+            mount: mount.clone(),
+            attached: std::sync::atomic::AtomicBool::new(false),
+        });
+        let guard = crate::mounts::MountGuard::new(host, mount.clone(), "uuid-b".to_string());
+        let disk = Disk::mounted("uuid-b".to_string(), mount.join("egroups"), guard);
+        assert!(EgroupStore::open(vec![disk], 1 << 20).is_err(), "a store opened over an absent disk");
+        assert!(!mount.join("egroups").exists(), "egroups was created on the root filesystem");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_managed_node_uses_only_the_disks_its_manifest_names_and_only_while_present() {
+        let dir = tmpdir("managed");
+        let mount = dir.join("disks").join("uuid-c");
+        std::fs::create_dir_all(&mount).unwrap();
+        // A directory the manifest does not name, holding extent groups, as an old `sdc`
+        // would: not a disk.
+        std::fs::create_dir_all(dir.join("disks").join("sdc").join("egroups")).unwrap();
+        std::fs::create_dir_all(dir.join("egroups")).unwrap();
+        std::fs::write(dir.join("egroups").join("eg-on-root.eg"), b"x").unwrap();
+        let manifest = crate::mounts::parse_manifest("uuid-c extent\n").unwrap();
+
+        let host = std::sync::Arc::new(Pullable {
+            mount: mount.clone(),
+            attached: std::sync::atomic::AtomicBool::new(true),
+        });
+        let found = discover_managed(&dir, &manifest, host.clone());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "uuid-c");
+
+        host.attached.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            discover_managed(&dir, &manifest, host).is_empty(),
+            "the legacy egroups directory on the root filesystem was counted as a disk"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

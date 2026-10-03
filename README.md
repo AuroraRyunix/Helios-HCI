@@ -278,7 +278,7 @@ All configuration parameters and certificates reside under standardized director
 * `/etc/hci/spectrum/spectrum.env` - Node IP and API configuration.
 * `/etc/hci/spark/certs/` - Mutual TLS node certificates (`node.crt`, `node.key`, `ca.crt`) used by `spark-daemon` on port `9099`.
 * `/root/.certs/` - Client Mutual TLS certificates used by administrative utilities (`client.crt`, `client.key`).
-* `/var/lib/hci/sidon/` - The extent store: one XFS filesystem on a thin LV in `vg_aether`, holding `journal/`, `egroups/` and the per-vdisk NBD sockets under `nbd/`. Mounted by UUID with `nofail`, so a missing volume degrades storage rather than stopping the host at an emergency shell.
+* `/var/lib/hci/sidon/` - A plain directory. The extent store's disks are mounted by sidon itself, by filesystem UUID, as siblings under `disks/<uuid>/` (the journal volume, a thin LV in `vg_aether`, plus one filesystem per further disk), named in `/etc/hci/sidon-disks`. Nothing sidon owns is in `/etc/fstab`, so a missing disk cannot stop the host at an emergency shell, and sidon refuses a path whose disk is absent. The per-vdisk NBD sockets stay under `nbd/`.
 
 ---
 

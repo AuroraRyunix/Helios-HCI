@@ -53,11 +53,18 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
    There is no Secure Boot check: Sidon loads no kernel module.
 2. **Hostnames and cluster setup.** Resolves each hostname and writes `/etc/hci/cluster.json`
    (hosts, node ids, redundancy factor, VIP) on every node.
-3. **Disk scan.** Finds an empty disk of at least 100 GB on each host and builds the thin-provisioned
-   LVM pool for the extent store (the volume group is still named `vg_aether`, a name left over
-   from the DRBD design).
-4. **The storage data path, and the coordination layer.** Verifies each node's extent store is
-   mounted and answering, writes the per-host configuration, then starts ZooKeeper and records the
+3. **Disk scan, and the extent store's volumes.** Finds an empty disk of at least 100 GB on each
+   host and builds the thin-provisioned LVM pool (the volume group is still named `vg_aether`, a
+   name left over from the DRBD design). Then, on every host and in this order, it carves the
+   `vg_aether/sidon` volume and gives it a filesystem, registers every further empty disk, and
+   writes `/etc/hci/sidon-disks`, which names each filesystem by UUID. `cluster destroy` removes the
+   volume group, so a create that stopped at the pool would leave sidon nothing to journal to. None
+   of it is mounted and nothing is written to `/etc/fstab`: sidon mounts what the file names when it
+   starts ([D-27](./dfs/decisions.md)).
+4. **The storage data path, and the coordination layer.** Starts sidon, which mounts the disks, and
+   verifies each node's extent store answers with capacity (a disk it could not mount is printed
+   as a warning; a node whose journal volume is missing never answers, because sidon refuses to
+   start without it), writes the per-host configuration, then starts ZooKeeper and records the
    desired state `started`, starts ScyllaDB (waiting for it to listen on 9042) and starts Daruk
    (waiting for 9043). Despite its heading this phase brings up the database as well as storage.
 6. **Core services.** Starts the application daemons. This phase still starts services by hand,
@@ -269,8 +276,9 @@ cluster destroy --yes    # skips the prompt, for a script that really means it
 ```
 
 It asks because there is nothing to undo afterwards: every VM is stopped and undefined, the
-LVM pool and disk signatures are wiped, the ZooKeeper and Hydra data and the sidon extent
-store are deleted, and `/etc/hci/cluster.json` is removed -- which is why `cluster create`
+LVM pool and disk signatures are wiped, every mount under `/var/lib/hci/sidon` is taken off
+(deepest first) and `/etc/hci/sidon-disks` is removed, the ZooKeeper and Hydra data and the sidon
+extent store are deleted, and `/etc/hci/cluster.json` is removed -- which is why `cluster create`
 needs `-s` again afterwards. The prompt wants the word `destroy` rather than `y`, because
 `y` is what a finger types when it is expecting a different question.
 

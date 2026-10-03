@@ -172,7 +172,10 @@ impl Vdisk {
         let store = EgroupStore::open(
             crate::extent::discover_disks(&cfg.root), egroup_bytes)?
             .preferring(crate::extent::container_tier(&daruk, &container));
-        let mut journal = Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?;
+        // Proven present each time: attaching onto a journal directory that is really on
+        // the root filesystem would acknowledge writes into a file the next mount hides.
+        let journal_path = crate::mounts::journal_dir(&cfg.root)?.join(format!("{id}.jrn"));
+        let mut journal = Journal::open(&journal_path)?;
 
         let mut v = Vdisk {
             id: id.to_string(),
@@ -195,7 +198,7 @@ impl Vdisk {
             compress,
             access: Arc::clone(&cfg.access),
             degraded: None,
-            journal: Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?,
+            journal: Journal::open(&journal_path)?,
         };
         // `journal` above was opened twice during construction; keep the first handle and
         // drop the duplicate so there is exactly one writer to the file.

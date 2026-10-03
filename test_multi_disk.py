@@ -78,22 +78,48 @@ class TheClaimGuardsHold(unittest.TestCase):
         """Re-running a rollout must not wipe a disk that is already an extent store."""
         self.assertIn('if ! blkid "$dev"', self.script)
 
-    def test_it_mounts_by_uuid(self):
-        """Device names are not stable across reboots; a disk mounted by /dev/sdc can come
-        back as something else and take another disk's place in the store."""
+    def test_it_names_a_disk_by_uuid_and_mounts_nothing(self):
+        """Device names are not stable across reboots; a disk named /dev/sdc can come back
+        as something else and take another disk's place in the store. The disk is recorded
+        by filesystem UUID and sidon mounts it -- the claim step mounts nothing and writes
+        nothing to fstab (test_sidon_owns_its_mounts.py runs it to prove so)."""
         self.assertIn("blkid -s UUID -o value", self.script)
-        self.assertIn("UUID=$uuid", self.script)
+        self.assertIn("/etc/hci/sidon-disks", self.script)
+        self.assertNotIn("UUID=$uuid", self.script)
 
 
-class BothDeploymentPathsClaimIdentically(unittest.TestCase):
-    def test_the_two_copies_are_the_same_script(self):
-        """One claims disks for a new node, the other reaches nodes that already exist. A
-        difference means a disk laid out one way on some nodes and another way on the
-        rest."""
-        self.assertEqual(
-            claim_script("provision.py", "CLAIM_EXTRA_DISKS"),
-            claim_script("deploy_updates.py", "CLAIM_EXTRA_DISKS"),
-            "the claim script has drifted between provisioning and the rollout")
+class EveryDeploymentPathClaimsIdentically(unittest.TestCase):
+    """Provisioning claims disks for a new node, the rollout reaches nodes that already
+    exist, and `cluster create` rebuilds the volume after a destroy. A difference between any
+    two means a disk laid out one way on some nodes and another way on the rest."""
+
+    COPIES = {
+        "CLAIM_EXTRA_DISKS": ("provision.py", "deploy_updates.py", "cluster_new.py",
+                              "spark_daemon_decoded.py"),
+        "STAGE_SIDON_DISKS": ("provision.py", "deploy_updates.py", "cluster_new.py",
+                              "spark_daemon_decoded.py"),
+        "CARVE_SIDON_VOLUME": ("provision.py", "cluster_new.py", "spark_daemon_decoded.py"),
+    }
+
+    def test_the_copies_are_the_same_script(self):
+        for const, files in self.COPIES.items():
+            first = claim_script(files[0], const)
+            for other in files[1:]:
+                self.assertEqual(
+                    first, claim_script(other, const),
+                    "%s has drifted between %s and %s" % (const, files[0], other))
+
+    def test_the_create_path_prepares_storage_before_it_starts_sidon(self):
+        """`cluster destroy` removes the volume group, and a create that only re-claimed the
+        first disk left a thin pool and no volume for sidon -- and the `mount` that followed
+        had no fstab line to resolve."""
+        for name in ("cluster_new.py", "spark_daemon_decoded.py"):
+            source = read(name)
+            carve = source.index("shell_script_command(CARVE_SIDON_VOLUME)")
+            claim = source.index("shell_script_command(CLAIM_EXTRA_DISKS)")
+            stage = source.index("shell_script_command(STAGE_SIDON_DISKS)")
+            self.assertLess(carve, claim, name)
+            self.assertLess(claim, stage, name)
 
 
 class SidonSpansThemInSoftware(unittest.TestCase):

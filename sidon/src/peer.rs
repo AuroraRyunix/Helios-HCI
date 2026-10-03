@@ -210,7 +210,9 @@ fn decode_response<R: Read>(r: &mut R) -> Result<Response> {
 
 /// Where a replica keeps another node's journal, and the fence it is holding for it.
 pub struct ReplicaStore {
-    root: PathBuf,
+    /// The journal volume, not the sidon root: replica state is as durable as a journal and
+    /// lives beside it, on the same mount.
+    volume: PathBuf,
     /// vdisk -> highest fenced epoch. Cached, but the file is the truth.
     fenced: Mutex<HashMap<String, u64>>,
     /// The node's extent-group access tally, when the daemon has one to share.
@@ -224,11 +226,11 @@ pub struct ReplicaStore {
 }
 
 impl ReplicaStore {
-    pub fn new(root: &Path) -> Result<ReplicaStore> {
-        std::fs::create_dir_all(root.join("replica"))?;
-        std::fs::create_dir_all(root.join("replica-egroups"))?;
+    pub fn new(volume: &Path) -> Result<ReplicaStore> {
+        std::fs::create_dir_all(volume.join("replica"))?;
+        std::fs::create_dir_all(volume.join("replica-egroups"))?;
         Ok(ReplicaStore {
-            root: root.to_path_buf(),
+            volume: volume.to_path_buf(),
             fenced: Mutex::new(HashMap::new()),
             access: None,
         })
@@ -243,15 +245,15 @@ impl ReplicaStore {
     }
 
     fn journal_path(&self, vdisk: &str) -> PathBuf {
-        self.root.join("replica").join(format!("{vdisk}.jrn"))
+        self.volume.join("replica").join(format!("{vdisk}.jrn"))
     }
 
     fn epoch_path(&self, vdisk: &str) -> PathBuf {
-        self.root.join("replica").join(format!("{vdisk}.epoch"))
+        self.volume.join("replica").join(format!("{vdisk}.epoch"))
     }
 
     fn egroup_path(&self, egroup: &str) -> PathBuf {
-        self.root.join("replica-egroups").join(format!("{egroup}.eg"))
+        self.volume.join("replica-egroups").join(format!("{egroup}.eg"))
     }
 
     /// The highest epoch this replica has been fenced at, read from disk on first use.

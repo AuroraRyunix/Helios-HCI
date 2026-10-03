@@ -54,8 +54,10 @@ cluster is a supported topology, not a stepping stone — see
 ## 2. Where the bytes live
 
 A vdisk is cut into 1 MiB **extents**. Extents live in 4 MiB append-only **extent groups**,
-which are ordinary files on `/var/lib/hci/sidon` — one XFS filesystem on a thin LV in
-`vg_aether`.
+which are ordinary files on XFS filesystems that sidon mounts itself under
+`/var/lib/hci/sidon/disks/<filesystem-uuid>` — one on a thin LV in `vg_aether` (the journal
+volume) and one per further disk. Nothing sidon owns is in `/etc/fstab`; see
+[D-27](./dfs/decisions.md) and [multi_disk.md](./dfs/multi_disk.md).
 
 When the journal reaches its high-water mark (64 MiB by default) a **drain** runs: each
 touched extent is read, patched with the journal's newer bytes, and appended somewhere
@@ -331,11 +333,25 @@ surplus copy. `storage.tier` plans by default; **on the test nodes, whose two di
 identical, it will say there is nothing to decide**, and `storage.move` is how the mechanism
 is exercised there. Neither is a performance result.
 
+### Mounts
+
+```bash
+sidon mounts            # read only: is each disk in /etc/hci/sidon-disks mounted and proven?
+sidon mounts apply      # sidon stopped: move an old layout, mount what is missing
+```
+
+A disk is trusted only when its directory is a mount, is the device carrying the recorded UUID,
+and holds `disk.uid`. With the **journal volume** absent sidon does not start and retries; with an
+**extent disk** absent it starts without it, and `valcli storage.list` lists the disk and why.
+`apply` refuses while the control socket answers. A node still in the old layout (the volume
+mounted at the root) is moved the next time sidon starts.
+
 ```bash
 mcli health_checks storage
 ```
 
-Seven checks: replica health, mount options, writability, fstab safety, unreferenced
+Seven checks: replica health, mount options, writability (aimed at the journal volume, never at
+the root filesystem), fstab safety (now: no sidon mount in fstab at all), unreferenced
 extent groups, replica counts, and control-socket latency. The latency one exists because
 every other check asks the daemon a question and believes the answer; this one times the
 question, and a control plane answering in twenty seconds is about to stop answering.
