@@ -150,17 +150,12 @@ impl Purah {
     /// and it is paid deliberately -- see the module header. It must be read *before* the
     /// egroup inventory, so that a group created between the two reads appears in the
     /// inventory as unreferenced-and-young rather than being missed entirely.
+    ///
+    /// Through **both** map levels (D-23): a row naming an extent keeps alive the group that
+    /// extent's row names. On a cluster where nothing names an extent this is the scan it
+    /// always was; see `extent_id_map::referenced_egroups`.
     fn referenced_egroups(&self) -> Result<HashSet<String>> {
-        let rows = self
-            .daruk
-            .query("SELECT egroup_id FROM hydra.dfs_block_map")?;
-        let mut out = HashSet::new();
-        for row in rows {
-            if let Some(id) = row.get("egroup_id").and_then(Value::as_str) {
-                out.insert(id.to_string());
-            }
-        }
-        Ok(out)
+        crate::extent_id_map::referenced_egroups(&self.daruk)
     }
 
     fn my_egroups(&self) -> Result<Vec<(String, String, i64, i64)>> {
