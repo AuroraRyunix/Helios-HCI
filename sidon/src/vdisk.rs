@@ -170,7 +170,8 @@ impl Vdisk {
         let rf = field_u64(row, "rf").unwrap_or(1).max(1);
 
         let store = EgroupStore::open(
-            crate::extent::discover_disks(&cfg.root), egroup_bytes)?;
+            crate::extent::discover_disks(&cfg.root), egroup_bytes)?
+            .preferring(crate::extent::container_tier(&daruk, &container));
         let mut journal = Journal::open(&cfg.root.join("journal").join(format!("{id}.jrn")))?;
 
         let mut v = Vdisk {

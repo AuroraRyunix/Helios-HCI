@@ -4103,7 +4103,12 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
                     # node that holds it rather than to any one disk that reads it -- and
                     # putting it under the vdisk list would have it refused for the
                     # missing vdisk id, which is the defect this split exists to prevent.
-                    "purah-heat")
+                    "purah-heat",
+                    # Disk-to-disk placement within this node. Node operations for the
+                    # same reason as heat: which disk a group sits on is a fact about the
+                    # node, not about any one vdisk that reads it. `purah-tier` plans
+                    # unless told to apply; `purah-move` relocates one named group.
+                    "purah-tier", "purah-move", "purah-placement")
     DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS
 
     def handle_dfs_vdisk(self):

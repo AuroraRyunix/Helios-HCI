@@ -36,6 +36,8 @@ use crate::extent::EgroupStore;
 use crate::heat::{heat_score, AccessLog, Counts};
 use crate::meta::{access_batches, cql_str, json_params, Daruk, ACCESS_BATCH};
 
+pub mod tier;
+
 pub struct Purah {
     daruk: Daruk,
     store: EgroupStore,
@@ -52,6 +54,9 @@ pub struct Purah {
     /// scoring formula in one place, which matters because a ranking that two components
     /// computed differently would be two different answers to "is this hot".
     access: Arc<AccessLog>,
+    /// Surplus copies a disk-to-disk move left behind, and when each was first seen. Swept
+    /// under the same two-scan grace as an unreferenced group; see `tier.rs`.
+    strays: tier::StrayLedger,
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +146,7 @@ impl Purah {
             grace,
             unreferenced_since: HashMap::new(),
             access,
+            strays: tier::StrayLedger::default(),
         }
     }
 
@@ -253,6 +259,10 @@ impl Purah {
         }
 
         self.unreferenced_since = still_unreferenced;
+        // The copy a move left behind is surplus bytes, not garbage: it is removed by the
+        // same two-scan rule, on the same cadence, so there is one answer in this daemon to
+        // "when may bytes be deleted".
+        self.reap_strays();
         Ok(report)
     }
 
@@ -276,12 +286,8 @@ impl Purah {
                 cas.current_str("state")
             )));
         }
-        let path = self.store.path_for(id);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::io(format!("removing {}: {e}", path.display()))),
-        }
+        // Every copy on this node, including a surplus one a disk-to-disk move left behind.
+        self.store.remove_all(id)?;
         self.daruk.query(&format!(
             "DELETE FROM hydra.dfs_egroups WHERE egroup_id = {}",
             cql_str(id)

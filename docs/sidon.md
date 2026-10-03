@@ -135,6 +135,12 @@ The curator, running inside Sidon. Three jobs, all background, none on the guest
   also stop the counters, because the ranking they feed is what an operator reaches for when
   they are trying to find out why a disk is busy.
 
+- **Tiering** — move a sealed extent group between two disks of the same node on the
+  strength of the heat ranking: copy, verify the copy against the group's seal hash, publish
+  it by rename, switch, and leave the old copy for the sweep, which removes it after seeing
+  it surplus on two passes with the grace between them. Operator-invoked and bounded; nothing
+  runs it on a timer. See [dfs/multi_disk.md](./dfs/multi_disk.md).
+
 The counters are recorded on the data path and are therefore **approximate** — they live in
 the daemon between flushes, so a crash loses everything counted since the last one. They
 decide where a copy of data goes, never whether it exists; the boundary and its reasoning are
@@ -267,10 +273,24 @@ all. Read and write counts with the window they were counted over, so the score 
 checked by hand rather than taken on trust. It flushes each node's in-memory tally before
 ranking, so what comes back describes the node now and not as of the last timer tick.
 
-Nothing here moves data. Spilling cold extent groups to slower disks is designed in
-[dfs/multi_disk.md](./dfs/multi_disk.md) and not built; this is the input that work was
-missing. `SIDON_ACCESS_FLUSH=0` turns the tally off entirely, counters included, in which
-case this command has nothing to rank and says so.
+Nothing here moves data; this is the input the tiering job reads.
+`SIDON_ACCESS_FLUSH=0` turns the tally off entirely, counters included, in which case this
+command has nothing to rank and says so.
+
+```bash
+valcli storage.placement [N]          # which disk of each node holds which extent groups
+valcli storage.tier [--apply]         # plan, or with --apply make, disk-to-disk moves
+valcli storage.move <egroup> <disk> <node>
+```
+
+`storage.list` also prints one row per extent-store disk: its identity, the directory it is
+mounted at, the device the kernel says backs it, its class, and how full it is. The identity
+is what the disk carries on its own filesystem; the directory is only a label, and on one
+node the two have already disagreed. `storage.placement` is read from the disks' directories
+rather than from the daemon's index, and lists a group held twice on one node separately as a
+surplus copy. `storage.tier` plans by default; **on the test nodes, whose two disks are
+identical, it will say there is nothing to decide**, and `storage.move` is how the mechanism
+is exercised there. Neither is a performance result.
 
 ```bash
 mcli health_checks storage
@@ -374,12 +394,14 @@ that predates the setting — behaves exactly as it did.
   enough to recover data and not the same as putting a VM back. Rolling a vdisk *back* to
   a snapshot in place needs the ownership and epoch story thought through, because it
   changes what an attached guest is reading underneath itself.
-- **Tiering.** The temperature data exists — `hydra.dfs_egroup_access`, ranked by
-  `valcli storage.heat` — and nothing acts on it. Placing an extent group on a disk because
-  it is hot, and migrating a cold one down, is the Purah job described in
-  [dfs/multi_disk.md](./dfs/multi_disk.md). Measuring first and moving later is the order on
-  purpose: a curator that began migrating data the moment it could measure temperature would
-  be acting on a ranking nobody had looked at.
+- **Tiering, on a timer and on mixed media.** The disk-to-disk move and the pass that plans
+  it from the heat ranking are built and operator-invoked
+  ([dfs/multi_disk.md](./dfs/multi_disk.md)); what is not built is anything running that pass
+  unattended, and any evidence it improves anything, because the test disks are identical.
+  Putting the write-ahead journal on the fastest disk is designed and not built.
+  Measuring first and moving later is the order on purpose: a curator that began migrating
+  data the moment it could measure temperature would be acting on a ranking nobody had
+  looked at.
 - **The extent ID map, stage 3.** Helios has two map levels where Nutanix has three. Stages 1
   and 2 of D-23 are built: Purah's mark phase follows both levels, and migrations `0020` and
   `0021` add the table and the column, with a read path that stays dormant because nothing

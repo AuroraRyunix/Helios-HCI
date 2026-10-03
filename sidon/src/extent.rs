@@ -20,6 +20,14 @@ use std::sync::Mutex;
 use crate::crc::crc32c;
 use crate::err::{Error, Result};
 
+mod placement;
+pub use placement::{container_tier, Tier};
+
+/// What the kernel says backs the filesystem holding a disk's extent groups.
+pub fn mount_source_of(egroups_dir: &Path) -> Option<String> {
+    placement::mount_source(egroups_dir.parent()?)
+}
+
 /// Each extent stored in an egroup is followed by a footer, so a read can tell that it
 /// got the bytes it asked for and not a neighbour's.
 ///
@@ -154,9 +162,33 @@ pub fn vdisk_hash(id: &str) -> u64 {
 /// docs/dfs/multi_disk.md.
 pub struct Disk {
     /// Directory name under `disks/`, or "0" for a node that predates this.
+    ///
+    /// A **label**, not an identity. It is the kernel device name the claim script saw, and
+    /// on one node it is already wrong (the disk under `disks/sdc` is `/dev/sdb`). Shown to
+    /// an operator and accepted when naming a disk, never keyed on: see `uid`.
     pub id: String,
     /// Where this disk's extent groups live.
     pub root: PathBuf,
+    /// What is written on the disk's own filesystem to say which disk it is, and so what
+    /// everything that has to stay true across a reboot refers to. See `placement.rs`.
+    pub uid: String,
+    /// Whether `uid` is actually stored on the disk. False means it was derived from the
+    /// label because the disk would not take a file, and is no more stable than the label.
+    pub uid_persisted: bool,
+    /// The class of media, from an operator's `disk.tier` file or the kernel.
+    pub tier: Tier,
+}
+
+impl Disk {
+    /// A disk with its identity and class established from what is on it.
+    pub fn identified(id: String, root: PathBuf) -> Disk {
+        let (uid, uid_persisted) = placement::identify(&root, &id);
+        let tier = root
+            .parent()
+            .map(placement::detect_tier)
+            .unwrap_or(Tier::Unknown);
+        Disk { id, root, uid, uid_persisted, tier }
+    }
 }
 
 /// Total and available bytes of the filesystem holding `path`.
@@ -251,10 +283,7 @@ pub fn discover_disks_with(root: &Path, is_own_filesystem: &dyn Fn(&Path) -> boo
                 );
                 continue;
             }
-            disks.push(Disk {
-                id: name.clone(),
-                root: mount.join("egroups"),
-            });
+            disks.push(Disk::identified(name.clone(), mount.join("egroups")));
         }
     }
 
@@ -279,12 +308,31 @@ pub fn discover_disks_with(root: &Path, is_own_filesystem: &dyn Fn(&Path) -> boo
         .unwrap_or(false);
     if is_own_filesystem(root) || legacy_holds_data {
         // First, so a node that predates `disks/` keeps serving from where its data is.
-        disks.insert(0, Disk { id: "0".to_string(), root: legacy });
+        disks.insert(0, Disk::identified("0".to_string(), legacy));
     } else if disks.is_empty() {
         // Nothing else to use. A dev box with no dedicated disk still needs somewhere.
-        disks.push(Disk { id: "0".to_string(), root: legacy });
+        disks.push(Disk::identified("0".to_string(), legacy));
     }
+    distinct_identities(&mut disks);
     disks
+}
+
+/// Two disks claiming one identity are a cloned disk image, and keying anything on that
+/// identity would address both at once. The later one is renamed in memory and reported
+/// as not persisted, so nothing treats the collision as stable.
+fn distinct_identities(disks: &mut [Disk]) {
+    let mut seen = std::collections::HashSet::new();
+    for disk in disks.iter_mut() {
+        if !seen.insert(disk.uid.clone()) {
+            eprintln!(
+                "sidon: disk {} carries the identity {} that another disk on this node already                  has (a cloned disk?); it will be addressed by its label until one is reset",
+                disk.id, disk.uid
+            );
+            disk.uid = format!("{}#{}", disk.uid, disk.id);
+            disk.uid_persisted = false;
+            seen.insert(disk.uid.clone());
+        }
+    }
 }
 
 pub struct EgroupStore {
@@ -297,6 +345,9 @@ pub struct EgroupStore {
     /// Hydra would turn every local placement decision into a cluster write and stop a
     /// group from ever being moved between disks.
     index: Mutex<HashMap<String, usize>>,
+    /// The class of disk new groups should prefer, from the container the owning vdisk
+    /// belongs to. `None` leaves placement as plain most-free-first.
+    prefer: Option<Tier>,
 }
 
 pub struct OpenEgroup {
@@ -313,7 +364,15 @@ impl EgroupStore {
     #[cfg(test)]
     pub fn new(dir: &Path, egroup_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Self::open(vec![Disk { id: "0".to_string(), root: dir.to_path_buf() }], egroup_bytes)
+        Self::open(vec![Disk {
+            id: "0".to_string(),
+            root: dir.to_path_buf(),
+            // Not `identified`: that writes an identity file beside `dir`, which for a
+            // scratch directory is the shared temp directory itself.
+            uid: "test-0".to_string(),
+            uid_persisted: false,
+            tier: Tier::Unknown,
+        }], egroup_bytes)
     }
 
     /// A store over every disk this node has.
@@ -349,7 +408,7 @@ impl EgroupStore {
         if usable.is_empty() {
             return Err(Error::io("no usable disk for the extent store".to_string()));
         }
-        Ok(EgroupStore { disks: usable, egroup_bytes, index: Mutex::new(index) })
+        Ok(EgroupStore { disks: usable, egroup_bytes, index: Mutex::new(index), prefer: None })
     }
 
     /// The disk a new extent group should go on: the one with the most room.
@@ -359,16 +418,7 @@ impl EgroupStore {
     /// others; this fills it preferentially until it catches up, which is what an operator
     /// expects to happen after adding a disk.
     fn placement(&self) -> usize {
-        let mut best = 0usize;
-        let mut best_free = 0u64;
-        for (i, disk) in self.disks.iter().enumerate() {
-            let free = disk_space(&disk.root).map(|(_, avail)| avail).unwrap_or(0);
-            if free > best_free {
-                best_free = free;
-                best = i;
-            }
-        }
-        best
+        self.pick_slot()
     }
 
     pub fn path_for(&self, id: &str) -> PathBuf {
@@ -457,9 +507,11 @@ impl EgroupStore {
         vdisk_hash: u64,
         extent_index: u64,
     ) -> Result<Vec<u8>> {
-        let path = self.path_for(egroup_id);
-        let mut file = File::open(&path).map_err(|e| {
-            Error::io(format!("extent group {} unreadable: {e}", path.display()))
+        let (mut file, _) = self.open_group(egroup_id).map_err(|e| {
+            Error::io(format!(
+                "extent group {} unreadable: {e}",
+                self.path_for(egroup_id).display()
+            ))
         })?;
         let mut buf = vec![0u8; length as usize + FOOTER_LEN];
         file.seek(SeekFrom::Start(offset as u64))?;
@@ -482,9 +534,12 @@ impl EgroupStore {
     /// verified where it is *used* -- every read checks the footer, on the local copy and
     /// on a replica's alike.
     pub fn read_extent_framed(&self, egroup_id: &str, offset: u32, length: u32) -> Result<Vec<u8>> {
-        let path = self.path_for(egroup_id);
-        let mut file = File::open(&path)
-            .map_err(|e| Error::io(format!("extent group {} unreadable: {e}", path.display())))?;
+        let (mut file, _) = self.open_group(egroup_id).map_err(|e| {
+            Error::io(format!(
+                "extent group {} unreadable: {e}",
+                self.path_for(egroup_id).display()
+            ))
+        })?;
         let mut buf = vec![0u8; length as usize + FOOTER_LEN];
         file.seek(SeekFrom::Start(offset as u64))?;
         file.read_exact(&mut buf).map_err(|e| {
@@ -496,7 +551,7 @@ impl EgroupStore {
     /// The seal hash over a whole egroup file, recorded at seal time so scrub has
     /// something to compare against that was computed when the data was known good.
     pub fn seal_hash(&self, id: &str) -> Result<String> {
-        let mut file = File::open(self.path_for(id))?;
+        let (mut file, _) = self.open_group(id)?;
         let mut crc = 0u32;
         let mut buf = vec![0u8; 1 << 16];
         loop {
@@ -524,7 +579,7 @@ mod tests {
     fn disk_at(parent: &PathBuf, name: &str) -> Disk {
         let root = parent.join("disks").join(name).join("egroups");
         std::fs::create_dir_all(&root).unwrap();
-        Disk { id: name.to_string(), root }
+        Disk::identified(name.to_string(), root)
     }
 
     #[test]
@@ -659,7 +714,7 @@ mod tests {
         std::fs::write(&bad_root, b"not a directory").unwrap();
 
         let store = EgroupStore::open(
-            vec![good, Disk { id: "d1".to_string(), root: bad_root }], 1 << 20).unwrap();
+            vec![good, Disk::identified("d1".to_string(), bad_root)], 1 << 20).unwrap();
         // Still usable: the surviving disk takes the write.
         assert!(store.create("eg-survives").is_ok());
         std::fs::remove_dir_all(&dir).ok();
@@ -671,7 +726,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let bad = dir.join("nope");
         std::fs::write(&bad, b"file").unwrap();
-        match EgroupStore::open(vec![Disk { id: "d0".to_string(), root: bad }], 1 << 20) {
+        match EgroupStore::open(vec![Disk::identified("d0".to_string(), bad)], 1 << 20) {
             Err(Error::Io(_)) => {}
             Err(other) => panic!("expected an io error, got {other:?}"),
             Ok(_) => panic!("a store with no usable disk was accepted"),

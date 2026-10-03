@@ -54,10 +54,19 @@ def upload_crate(sftp, ssh, local_root, crate):
     local_crate = os.path.join(local_root, crate)
     put_text_file(sftp, os.path.join(local_crate, "Cargo.toml"), build_dir + "/Cargo.toml")
 
+    # Recursively. A module that is a directory -- `extent/placement.rs`, `purah/tier.rs` --
+    # is a file this loop used to skip, and the node's `cargo build` then failed on a missing
+    # module long after this script had reported success. The packager
+    # (create_upgrade_zip.py) and provisioning both already walk the tree; only this did not.
     local_src = os.path.join(local_crate, "src")
-    for name in sorted(os.listdir(local_src)):
-        if name.endswith(".rs"):
-            put_text_file(sftp, os.path.join(local_src, name), build_dir + "/src/" + name)
+    for root, dirs, files in os.walk(local_src):
+        dirs.sort()
+        relative = os.path.relpath(root, local_src).replace("\\", "/")
+        remote_dir = build_dir + "/src" + ("" if relative == "." else "/" + relative)
+        mkdir_p(sftp, remote_dir)
+        for name in sorted(files):
+            if name.endswith(".rs"):
+                put_text_file(sftp, os.path.join(root, name), remote_dir + "/" + name)
     return build_dir
 
 # Blindly accepting unknown host keys (paramiko.AutoAddPolicy) means every rollout

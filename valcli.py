@@ -520,6 +520,7 @@ def cmd_storage_list():
 
     print("=== Extent Store ===")
     store_rows = []
+    disk_rows = []
     for host in hosts:
         ip = host.get("ip")
         if not ip:
@@ -541,8 +542,19 @@ def cmd_storage_list():
             str(body.get("egroup_count", 0)),
             "%.2f GiB" % (int(body.get("journal_bytes") or 0) / gib),
         ])
+        for disk in body.get("disks") or []:
+            disk_rows.append(_disk_row(body.get("node") or host.get("hostname") or ip, disk))
     print_table(["Node", "State", "Total", "Used", "Extent groups", "Journal"], store_rows)
     print()
+    if disk_rows:
+        print("=== Extent Store Disks ===")
+        print_table(["Node", "Disk", "Mount", "Device", "Class", "Total", "Used", "Groups"],
+                    disk_rows)
+        print("  Disk is the identity written on the disk's own filesystem. Mount is the")
+        print("  directory it is mounted at, which is only a label; Device is what the kernel")
+        print("  says backs it now. The two can disagree, and the identity is the one that")
+        print("  stays true across a reboot.")
+        print()
 
     print("=== Vdisks ===")
     rc_v, out_v, err_v = run_cql_query(
@@ -1056,6 +1068,158 @@ def cmd_storage_replicate(target, everything=False):
         print("asks for, or no spare node was free to take one.")
 
 
+def _disk_row(node, disk):
+    """One extent-store disk as a table row, from a `capacity` entry."""
+    gib = 1024 ** 3
+    total = disk.get("total_bytes")
+    avail = disk.get("available_bytes")
+    uid = disk.get("uid") or "?"
+    if not disk.get("uid_persisted", True):
+        # Derived from the label rather than stored on the disk, so no more stable than the
+        # label is. Marked so it is not mistaken for an identity.
+        uid += " (not persisted)"
+    return [
+        node,
+        uid,
+        disk.get("label") or "?",
+        disk.get("device") or "-",
+        disk.get("tier") or "unknown",
+        "-" if total is None else "%.1f GiB" % (int(total) / gib),
+        "-" if total is None or avail is None else "%.1f GiB" % ((int(total) - int(avail)) / gib),
+        str(disk.get("egroup_count", 0)),
+    ]
+
+
+def _storage_hosts():
+    hosts = []
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            hosts = json.load(handle).get("hosts", [])
+    except Exception:
+        pass
+    if not hosts:
+        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
+    return hosts
+
+
+def cmd_storage_placement(limit=10):
+    """Which disk of each node holds which extent groups.
+
+    Read by the daemon from the disks' own directories and not from its bookkeeping, so
+    that it is still an answer when the bookkeeping is what is in doubt. A group listed
+    under two disks of one node is a surplus copy a move left behind, and is named
+    separately below the disks rather than hidden inside them.
+    """
+    answered = 0
+    for host in _storage_hosts():
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(
+            ip, "/api/v1/dfs/vdisk", {"op": "purah-placement", "limit": limit})
+        if rc != 0 or not isinstance(body, dict) or "disks" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] no placement data: %s" % (label, detail))
+            continue
+        answered += 1
+        print()
+        print("%s" % label)
+        for disk in body.get("disks") or []:
+            print("  disk %s  (mounted at %s, device %s, class %s)  %d group(s)"
+                  % (disk.get("uid"), disk.get("label"), disk.get("device") or "-",
+                     disk.get("tier"), disk.get("egroup_count") or 0))
+            for group in disk.get("groups") or []:
+                print("      %-48s %10d bytes" % (group.get("egroup_id"), group.get("size") or 0))
+            if disk.get("groups_truncated"):
+                print("      ... and %d more" % ((disk.get("egroup_count") or 0)
+                                                 - len(disk.get("groups") or [])))
+            if disk.get("in_flight_copies"):
+                print("      %d copy in progress or abandoned" % disk["in_flight_copies"])
+        for extra in body.get("surplus_copies") or []:
+            print("  surplus copy: %s on disk %s (a move left it; the sweep removes it)"
+                  % (extra.get("egroup_id"), extra.get("disk")))
+    if not answered:
+        print()
+        print("No node answered. Either sidon is older than disk placement or it is down.")
+
+
+def cmd_storage_tier(apply=False):
+    """Plan the disk-to-disk moves the heat ranking argues for, or carry them out.
+
+    Plans only unless --apply is given, and nothing runs it on a timer. The ranking behind
+    it was shipped as reporting precisely so that somebody would read it before anything
+    acted on it.
+
+    Heat decides where a copy of an extent group sits. It never decides whether one exists:
+    the counters are approximate and a crash loses a window of them, so nothing here
+    deletes, shortens a replica set or reclaims on their strength. A move copies the group,
+    proves the copy, switches to it, and leaves the old one for the sweep.
+
+    On a node whose disks are all the same class there is nothing to decide, and the plan
+    says so rather than printing an empty list.
+    """
+    for host in _storage_hosts():
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(
+            ip, "/api/v1/dfs/vdisk", {"op": "purah-tier", "apply": bool(apply)})
+        if rc != 0 or not isinstance(body, dict) or "planned" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] tiering failed: %s" % (label, detail))
+            continue
+        print()
+        print("%s -- %d sealed group(s) considered" % (label, body.get("considered") or 0))
+        for disk in body.get("disks") or []:
+            print("  disk %s (%s) class %s" % (disk.get("uid"), disk.get("label"), disk.get("tier")))
+        if body.get("dropped"):
+            print("  WARNING: the tally is at capacity; unmeasured groups are not offered as cold.")
+        for move in body.get("planned") or []:
+            print("  %s %s  %s -> %s  %d bytes  heat %s"
+                  % ("would" if not apply else "plan:", move.get("direction"),
+                     move.get("from_label"), move.get("to_label"), move.get("bytes") or 0,
+                     "unmeasured" if move.get("heat") is None else "%.2f" % move["heat"]))
+            print("      %s" % move.get("egroup_id"))
+        for note in body.get("notes") or []:
+            print("  note: %s" % note)
+        for done in body.get("executed") or []:
+            print("  moved %s to %s (%s)" % (done.get("egroup_id"), done.get("to"), done.get("hash")))
+        for bad in body.get("failed") or []:
+            print("  FAILED %s: %s" % (bad.get("egroup_id"), bad.get("error")))
+    if not apply:
+        print()
+        print("Nothing was moved. Re-run with --apply to carry the plan out.")
+
+
+def cmd_storage_move(egroup_id, disk, node):
+    """Move one sealed extent group to another disk of one node.
+
+    The mechanism with no policy in front of it: how a group is rebalanced by hand, and the
+    way to exercise a move on nodes whose disks are identical and so give the policy
+    nothing to decide. The node is named because a disk label such as sdc exists on every
+    node and would otherwise be ambiguous.
+    """
+    target = None
+    for host in _storage_hosts():
+        if node in (host.get("ip"), host.get("hostname")):
+            target = host.get("ip")
+    if not target:
+        print("Error: no node %r in the cluster." % node)
+        sys.exit(1)
+    rc, body, err = run_mtls_spark_api(
+        target, "/api/v1/dfs/vdisk",
+        {"op": "purah-move", "egroup_id": egroup_id, "disk": disk})
+    if rc != 0 or not isinstance(body, dict) or "to" not in body:
+        detail = body.get("error") if isinstance(body, dict) else err
+        print("Error: %s" % detail)
+        sys.exit(1)
+    print("Moved %s to disk %s (%d bytes, %s)." % (
+        body.get("egroup_id"), body.get("to"), body.get("bytes") or 0, body.get("hash")))
+    print("The old copy stays until the sweep has seen it surplus on two passes.")
+
+
 def cmd_storage_heat(limit=10):
     """Which extent groups each node reads and writes most, and which have gone cold.
 
@@ -1079,8 +1243,8 @@ def cmd_storage_heat(limit=10):
     the read path at all.
 
     Nothing here moves data. Tiering -- spilling cold extent groups to slower disks -- is
-    the work this ranking exists to feed, and it is designed in docs/dfs/multi_disk.md and
-    not built.
+    the work this ranking exists to feed, and `storage.tier` is the command that reads it;
+    see docs/dfs/multi_disk.md.
     """
     hosts = []
     try:
@@ -2385,6 +2549,9 @@ def print_usage():
     print("                                          asked for, copies it actually has")
     print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
     print("  valcli storage.heat [N]                 Hottest and coldest extent groups per node")
+    print("  valcli storage.placement [N]            Which disk of each node holds which extent groups")
+    print("  valcli storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
+    print("  valcli storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
     print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
@@ -2529,6 +2696,26 @@ def main():
                 print("Usage: valcli storage.heat [N]")
                 sys.exit(1)
         cmd_storage_heat(limit)
+    elif cmd == "storage.placement":
+        limit = 10
+        if len(sys.argv) > 2:
+            try:
+                limit = max(1, min(100000, int(sys.argv[2])))
+            except ValueError:
+                print("Usage: valcli storage.placement [N]")
+                sys.exit(1)
+        cmd_storage_placement(limit)
+    elif cmd == "storage.tier":
+        extra = sys.argv[2:]
+        if extra not in ([], ["--apply"]):
+            print("Usage: valcli storage.tier [--apply]")
+            sys.exit(1)
+        cmd_storage_tier(apply=bool(extra))
+    elif cmd == "storage.move":
+        if len(sys.argv) != 5:
+            print("Usage: valcli storage.move <egroup_id> <disk> <node>")
+            sys.exit(1)
+        cmd_storage_move(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == "storage.replication":
         cmd_storage_replication()
     elif cmd == "storage.replicate":

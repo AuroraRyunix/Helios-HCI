@@ -319,6 +319,9 @@ impl Daemon {
             "purah-sweep" => self.op_purah_sweep(),
             "purah-scrub" => self.op_purah_scrub(),
             "purah-heat" => self.op_purah_heat(req),
+            "purah-tier" => self.op_purah_tier(req),
+            "purah-move" => self.op_purah_move(req),
+            "purah-placement" => self.op_purah_placement(req),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
         }
     }
@@ -1057,6 +1060,21 @@ impl Daemon {
             }
         }
 
+        // Who each disk is, beside how full it is. `uid` is what the disk carries on its own
+        // filesystem and is what anything that must stay true refers to; `label` is the
+        // directory it is mounted at, and `device` is what the kernel says backs that mount
+        // right now -- the two can disagree, and showing both is how an operator sees that a
+        // directory called sdc is really /dev/sdb.
+        for (entry, disk) in per_disk.iter_mut().zip(&disks) {
+            if let Some(map) = entry.as_object_mut() {
+                map.insert("uid".to_string(), json!(disk.uid));
+                map.insert("uid_persisted".to_string(), json!(disk.uid_persisted));
+                map.insert("label".to_string(), json!(disk.id));
+                map.insert("tier".to_string(), json!(disk.tier.name()));
+                map.insert("device".to_string(), json!(crate::extent::mount_source_of(&disk.root)));
+            }
+        }
+
         if readable == 0 {
             return Err(Error::io(
                 "no disk in the extent store would report its capacity".to_string()));
@@ -1403,6 +1421,46 @@ impl Daemon {
             map.insert("flushed".to_string(), flushed);
         }
         Ok(report)
+    }
+
+    /// Which disk holds which extent groups, read from the disks.
+    fn op_purah_placement(&self, req: &Value) -> Result<Value> {
+        let limit = req.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100_000) as usize;
+        let purah = self.purah_state.lock().expect("purah mutex poisoned");
+        Ok(purah.placement(limit))
+    }
+
+    /// Plan, and when `apply` is true carry out, the disk-to-disk moves the heat ranking
+    /// argues for. Plans only by default: see `purah/tier.rs` for why this does not run on
+    /// a timer.
+    fn op_purah_tier(&self, req: &Value) -> Result<Value> {
+        use crate::purah::tier::TierOptions;
+        let defaults = TierOptions::default();
+        let opts = TierOptions {
+            apply: req.get("apply").and_then(Value::as_bool).unwrap_or(false),
+            max_moves: req
+                .get("max_moves")
+                .and_then(Value::as_u64)
+                .map(|n| n.clamp(1, 1000) as usize)
+                .unwrap_or(defaults.max_moves),
+            max_bytes: req.get("max_bytes").and_then(Value::as_u64).unwrap_or(defaults.max_bytes),
+        };
+        let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
+        let now = now_ms();
+        // Flush first, as `purah-heat` does, so the plan is made from the tally as it is and
+        // not as of the last timer tick.
+        if let Err(e) = purah.flush_access(now) {
+            eprintln!("purah: heat flush before tiering failed: {e}");
+        }
+        purah.tier(&opts, now)
+    }
+
+    /// Move one sealed extent group to one named disk of this node.
+    fn op_purah_move(&self, req: &Value) -> Result<Value> {
+        let id = str_field(req, "egroup_id")?;
+        let disk = str_field(req, "disk")?;
+        let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
+        purah.move_one(&id, &disk)
     }
 
     /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.

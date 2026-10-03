@@ -18,16 +18,20 @@ Replication is mutually authenticated against the cluster CA -- see D-20 in
 
 Per-extent-group access data is recorded and ranked -- see D-22 in
 [decisions.md](./decisions.md) and [metadata.md](./metadata.md) section 8. It is the
-prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; the migration
-half is still not built, and nothing moves an extent group on the strength of the ranking.
+prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing. Extent groups
+are placed across a node's disks by identity-keyed, free-space (and tier-preferring)
+placement, and Purah can move a sealed group between two disks of one node
+(`valcli storage.tier`, `storage.move`; D-26). The pass is operator-invoked and nothing runs
+it unattended; on the test cluster's identical disks it has nothing to decide.
 
 The extent ID map (D-23) is staged: Purah's mark phase traverses both map levels and the
 table and column exist (migrations `0020`, `0021`) with a dormant read path; writing extent ids
 is designed and not built. The rollout procedure is [extent_id_map.md](./extent_id_map.md).
 
-Not built: tiering, writing extent ids (D-23 stage 3), dedup, scheduled snapshots
-and rollback, erasure coding (decided against on three nodes, D-24), and `vhost-user-blk`
-(designed, gated on a benchmark, D-25 and [vhost_user_blk.md](./vhost_user_blk.md)). (Per-container compression *is*
+Not built: tiering on a timer or on mixed media, the journal on the fastest disk, writing
+extent ids (D-23 stage 3), dedup, scheduled snapshots and rollback, erasure coding (decided
+against on three nodes, D-24), and `vhost-user-blk` (designed, gated on a benchmark, D-25 and
+[vhost_user_blk.md](./vhost_user_blk.md)). (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
 
 The documents remain the specification -- where code and document disagree, that is a bug
