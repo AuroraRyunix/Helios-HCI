@@ -60,7 +60,16 @@ def load_deploy():
     return _Constants(read("deploy_updates.py"))
 
 
-class TheGuardDecidesOnTheClusterConfig(unittest.TestCase):
+class TheGuardDecidesOnTheNodesState(unittest.TestCase):
+    """Three states, because the first version of the guard knew only two of them.
+
+    It asked for cluster.json alone. `cluster create` writes that file in its second phase,
+    before the disk phase, so a create that failed in phase 3 left a config on every node and
+    no volume group on two of them -- and a rollout before the retry would have claimed those
+    blank disks and broken the retry in the same way. The state in which a further disk is
+    genuinely "additional" is a cluster *and* a prepared extent store.
+    """
+
     def setUp(self):
         self.bash = shutil.which("bash")
         if not self.bash:
@@ -69,32 +78,46 @@ class TheGuardDecidesOnTheClusterConfig(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.dir, True)
 
-    def run_guard(self, config_exists):
+    def run_guard(self, config_exists, volume_group_exists):
         config = os.path.join(self.dir, "cluster.json")
         if config_exists:
             with io.open(config, "w", encoding="utf-8") as handle:
                 handle.write("{}")
-        # Substitute the path so the real guard text runs against a temp file. Nothing else
-        # about the string is altered: this is the text that ships.
+        # The real guard text, with only the config path substituted and `vgs` supplied as a
+        # function: this machine has no LVM, and what is being tested is the decision.
         guard = self.deploy.ONLY_WITH_A_CLUSTER.replace(
             "/etc/hci/cluster.json", config.replace("\\", "/"))
-        script = guard + 'echo "CLAIM RAN"\n'
+        vgs = "vgs() { return %d; }\n" % (0 if volume_group_exists else 5)
+        script = vgs + guard + 'echo "CLAIM RAN"\n'
         done = subprocess.run([self.bash, "-c", script], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE)
         return done.returncode, done.stdout.decode("utf-8", "replace")
 
-    def test_with_no_cluster_the_script_never_runs(self):
-        rc, out = self.run_guard(config_exists=False)
+    def test_a_destroyed_node_is_left_alone(self):
+        """No config, no volume group: what `cluster destroy` leaves."""
+        rc, out = self.run_guard(config_exists=False, volume_group_exists=False)
         self.assertEqual(rc, 0, "leaving the disks alone must not look like a failure")
-        self.assertNotIn("CLAIM RAN", out,
-                         "a node with no cluster.json had its disks claimed")
+        self.assertNotIn("CLAIM RAN", out)
         self.assertIn("left alone", out, "it should say why nothing happened")
 
-    def test_with_a_cluster_the_script_runs(self):
-        rc, out = self.run_guard(config_exists=True)
+    def test_a_node_whose_create_failed_before_its_disks_is_left_alone(self):
+        """A config and no volume group: exactly what a create that died in its disk phase
+        leaves. This is the case the first version of the guard got wrong."""
+        rc, out = self.run_guard(config_exists=True, volume_group_exists=False)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("CLAIM RAN", out,
+                         "a node with a config but no extent store had its blank disks claimed")
+
+    def test_a_volume_group_without_a_config_is_left_alone(self):
+        rc, out = self.run_guard(config_exists=False, volume_group_exists=True)
+        self.assertNotIn("CLAIM RAN", out)
+
+    def test_a_node_with_a_cluster_and_an_extent_store_is_reached(self):
+        """The case the claim step exists for: a further disk on an established node."""
+        rc, out = self.run_guard(config_exists=True, volume_group_exists=True)
         self.assertEqual(rc, 0)
         self.assertIn("CLAIM RAN", out,
-                      "the guard blocks a node that really does belong to a cluster")
+                      "the guard blocks a node that really does have a cluster and an extent store")
 
 
 class BothDiskStepsAreGuarded(unittest.TestCase):

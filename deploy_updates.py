@@ -355,12 +355,22 @@ PY
 # Prefixed to the disk steps below, and deliberately NOT part of the shared scripts: those
 # are asserted byte-identical across four files, and this is a fact about the rollout alone.
 #
-# The rollout reaches nodes that already have a cluster. On one that does not -- destroyed,
-# or provisioned and not yet created -- there is nothing for a disk to be "additional" to,
-# and the blank disks it would claim are the ones `cluster create` carves the journal volume
-# from.
+# The rollout reaches nodes that already have a cluster and an extent store. On one that does
+# not -- destroyed, or provisioned and not yet created -- there is nothing for a disk to be
+# "additional" to, and the blank disks it would claim are the ones `cluster create` carves the
+# journal volume from.
+#
+# The condition is the volume group, not just cluster.json. The first version of this guard
+# asked only for the config file, and `cluster create` writes that in its second phase, before
+# the disk phase: a create that failed in phase 3 left cluster.json on every node and no volume
+# group on two of them, so a rollout before the retry would have claimed those blank disks and
+# broken the retry the same way. "A cluster exists and its extent store has been prepared" is the
+# state in which a further disk is genuinely additional.
 ONLY_WITH_A_CLUSTER = """\
-[ -f /etc/hci/cluster.json ] || { echo "no cluster is configured on this node; its disks are left alone"; exit 0; }
+if ! { [ -f /etc/hci/cluster.json ] && vgs vg_aether >/dev/null 2>&1; }; then
+    echo "no extent store is prepared on this node; its disks are left alone"
+    exit 0
+fi
 """
 
 # Give sidon every empty disk, one filesystem each. Kept identical to the copy in

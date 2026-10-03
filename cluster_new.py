@@ -176,11 +176,11 @@ def shell_script_command(script):
     return "echo " + base64.b64encode(script.encode("utf-8")).decode("ascii") + " | base64 -d | bash"
 
 
-def run_parallel(ips, cmd):
+def run_parallel(ips, cmd, timeout=None):
     results = {}
     threads = []
     def worker(ip):
-        rc, stdout, stderr = run_remote_spark(ip, cmd)
+        rc, stdout, stderr = run_remote_spark(ip, cmd, timeout=timeout)
         results[ip] = (rc, stdout, stderr)
     for ip in ips:
         t = threading.Thread(target=worker, args=(ip,))
@@ -559,7 +559,19 @@ def get_dfs_engine():
     return value if value in ("linstor", "sidon") else "sidon"
 
 
-def run_remote_spark(ip, command):
+# How long a storage-preparation command may run on a node.
+#
+# spark-daemon's /api/v1/execute applies 45 seconds when the caller names no timeout, and every
+# command here used to go through that default. Preparing a disk is not a 45 second job: the
+# claim zeroes a gigabyte at each end of the disk, then builds a physical volume, a volume group
+# and a thin pool, and formatting a volume comes after. On this cluster's virtual disks that is
+# right at the limit -- one node finished in time, the daemon killed the command on the other
+# two -- and `cluster create` stopped with "Command timed out after 45 seconds" on a node whose
+# work had in fact completed. A timeout is a ceiling on a hung command, not a budget for a
+# healthy one, so it is generous.
+STORAGE_PREP_TIMEOUT = 900
+
+def run_remote_spark(ip, command, timeout=None):
     cert_paths = [
         ("C:/Users/AuraFlight/.hci_temp_certs/ca.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.key"),
         ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
@@ -575,10 +587,18 @@ def run_remote_spark(ip, command):
         context.load_cert_chain(certfile=cert_path, keyfile=key_path)
     
     url = f"https://{ip}:9099/api/v1/execute"
-    data = json.dumps({"command": command}).encode("utf-8")
+    body = {"command": command}
+    wait = 120
+    if timeout is not None:
+        # The daemon runs the command under this limit; without one it applies 45 seconds,
+        # which is why a long command used to be killed whatever the client was prepared to
+        # wait for. The client waits a little longer than the command is allowed to run.
+        body["timeout"] = timeout
+        wait = max(wait, timeout + 30)
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=wait) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res["returncode"], res["stdout"], res["stderr"]
     except Exception as e:
@@ -812,9 +832,9 @@ def run_checked_cmd(ip, command, allow_already_exists=False):
             sys.exit(1)
     return rc, stdout, stderr
 
-def run_parallel_checked(ips, command, allow_already_exists=False):
+def run_parallel_checked(ips, command, allow_already_exists=False, timeout=None):
     print(f"Running parallel command on {ips}: {command}")
-    results = run_parallel(ips, command)
+    results = run_parallel(ips, command, timeout=timeout)
     for ip, (rc, stdout, stderr) in results.items():
         stdout = stdout.strip() if stdout else ""
         stderr = stderr.strip() if stderr else ""
@@ -2359,7 +2379,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         cmd_claim = f"python3 -c \"import base64; exec(base64.b64decode('{claim_script_b64}').decode())\""
         
         print("Scanning and setting up storage pools on remote hosts in parallel...")
-        claim_results = run_parallel(ips, cmd_claim)
+        claim_results = run_parallel(ips, cmd_claim, timeout=STORAGE_PREP_TIMEOUT)
         
         host_claimed_disks = {}
         for ip, (rc, stdout, stderr) in claim_results.items():
@@ -2386,9 +2406,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # and /etc/fstab is not touched: sidon mounts what /etc/hci/sidon-disks names, by
         # filesystem UUID, when it starts, and refuses any path whose disk is not there.
         print("Preparing each node's extent store: volume, further disks, and the disk record...")
-        run_parallel_checked(ips, shell_script_command(CARVE_SIDON_VOLUME))
-        run_parallel_checked(ips, shell_script_command(CLAIM_EXTRA_DISKS))
-        run_parallel_checked(ips, shell_script_command(STAGE_SIDON_DISKS))
+        run_parallel_checked(ips, shell_script_command(CARVE_SIDON_VOLUME),
+                             timeout=STORAGE_PREP_TIMEOUT)
+        run_parallel_checked(ips, shell_script_command(CLAIM_EXTRA_DISKS),
+                             timeout=STORAGE_PREP_TIMEOUT)
+        run_parallel_checked(ips, shell_script_command(STAGE_SIDON_DISKS),
+                             timeout=STORAGE_PREP_TIMEOUT)
 
         # 4. Storage engine setup.
         #

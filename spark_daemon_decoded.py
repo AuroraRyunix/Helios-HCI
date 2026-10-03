@@ -257,18 +257,30 @@ def spark_endpoint(ip):
         return ip, False
     return ip, True
 
-def run_remote_spark(ip, command):
+# How long a storage-preparation command may run on a node. The same constant, for the same
+# reason, as in cluster_new.py: /api/v1/execute applies 45 seconds when a caller names no
+# timeout, and zeroing, partitioning and formatting a disk is not a 45 second job. A timeout is a
+# ceiling on a hung command, not a budget for a healthy one.
+STORAGE_PREP_TIMEOUT = 900
+
+def run_remote_spark(ip, command, timeout=None):
     ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
     context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
     context.check_hostname = verify_identity
 
     url = f"https://{ip}:9099/api/v1/execute"
-    data = json.dumps({"command": command}).encode("utf-8")
+    body = {"command": command}
+    wait = 120
+    if timeout is not None:
+        # The daemon runs the command under this limit; without one it applies 45 seconds.
+        # The client waits a little longer than the command is allowed to run.
+        body["timeout"] = timeout
+        wait = max(wait, timeout + 30)
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        # Use a longer timeout for orchestration tasks
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=wait) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res["returncode"], res["stdout"], res["stderr"]
     except Exception as e:
@@ -323,11 +335,11 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
-def run_parallel(ips, cmd):
+def run_parallel(ips, cmd, timeout=None):
     results = {}
     threads = []
     def worker(ip):
-        rc, stdout, stderr = run_remote_spark(ip, cmd)
+        rc, stdout, stderr = run_remote_spark(ip, cmd, timeout=timeout)
         results[ip] = (rc, stdout, stderr)
     for ip in ips:
         t = threading.Thread(target=worker, args=(ip,))
@@ -365,7 +377,7 @@ def execute_checked(command, allow_already_exists=False):
             raise Exception(f"Command failed with exit code {res.returncode}.\nCommand: {command}\nStdout: {stdout}\nStderr: {stderr}")
     return res.returncode, stdout, stderr
 
-def run_parallel_checked(ips, command, allow_already_exists=False):
+def run_parallel_checked(ips, command, allow_already_exists=False, timeout=None):
     print(f"Running parallel command on {ips}: {command}")
     results = run_parallel(ips, command)
     for ip, (rc, stdout, stderr) in results.items():
@@ -3340,7 +3352,8 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 """
             claim_script_b64 = base64.b64encode(disk_claim_script.strip().encode()).decode()
             cmd_claim = f"python3 -c \"import base64; exec(base64.b64decode('{claim_script_b64}').decode())\""
-            claim_results = run_parallel_checked(servers, cmd_claim)
+            claim_results = run_parallel_checked(servers, cmd_claim,
+                                                 timeout=STORAGE_PREP_TIMEOUT)
             
             host_claimed_disks = {}
             for ip, (rc, stdout, stderr) in claim_results.items():
@@ -3375,9 +3388,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             # the record is written. Nothing is mounted and /etc/fstab is not touched. There
             # is no storage-pools.json describing a pool name, a media type and a brick path
             # to a controller that no longer exists, and no linstor-client.conf either.
-            run_parallel_checked(servers, shell_script_command(CARVE_SIDON_VOLUME))
-            run_parallel_checked(servers, shell_script_command(CLAIM_EXTRA_DISKS))
-            run_parallel_checked(servers, shell_script_command(STAGE_SIDON_DISKS))
+            run_parallel_checked(servers, shell_script_command(CARVE_SIDON_VOLUME),
+                                 timeout=STORAGE_PREP_TIMEOUT)
+            run_parallel_checked(servers, shell_script_command(CLAIM_EXTRA_DISKS),
+                                 timeout=STORAGE_PREP_TIMEOUT)
+            run_parallel_checked(servers, shell_script_command(STAGE_SIDON_DISKS),
+                                 timeout=STORAGE_PREP_TIMEOUT)
 
             # Write spectrum.env. Only the address, because only the address was ever
             # read -- see the note in provision.py.
