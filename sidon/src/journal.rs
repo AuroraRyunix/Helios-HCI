@@ -28,7 +28,6 @@
 //! sealed one first and then the live one, which is exactly the order they were written.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,6 +88,15 @@ pub struct Record {
     pub framed: Vec<u8>,
 }
 
+/// Where the live segment ended before a ticket's records were appended: enough to take
+/// them back out. Only ever used for records that have been written locally and sent to
+/// nobody.
+#[derive(Clone, Copy, Debug)]
+pub struct Mark {
+    len: u64,
+    next_seq: u64,
+}
+
 /// A segment that has been closed to new records and is waiting for its drain to commit.
 struct Sealed {
     file: Arc<File>,
@@ -98,8 +106,9 @@ struct Sealed {
 
 pub struct Journal {
     path: PathBuf,
-    /// The live segment: the only one anything is appended to.
-    file: File,
+    /// The live segment: the only one anything is appended to. Shared (`live_file`) so the
+    /// commit pipeline can `fdatasync` it without holding the vdisk lock.
+    file: Arc<File>,
     len: u64,
     gen: u64,
     /// At most one. A drain that has not committed holds its segment here, and a second
@@ -160,7 +169,15 @@ impl Journal {
         let file = OpenOptions::new().read(true).write(true).create(true).open(path)?;
         let len = file.metadata()?.len();
         let gen = if old.is_some() { 1 } else { 0 };
-        Ok(Journal { path: path.to_path_buf(), file, len, gen, old, next_seq: 0, live_first_seq: 0 })
+        Ok(Journal {
+            path: path.to_path_buf(),
+            file: Arc::new(file),
+            len,
+            gen,
+            old,
+            next_seq: 0,
+            live_first_seq: 0,
+        })
     }
 
     /// Bytes the journal is holding that no drain has yet taken into extent groups: the
@@ -258,10 +275,56 @@ impl Journal {
     /// survive, and the journal's directory entry was created and synced at open or at
     /// rotation. This is the one fsync on the guest's critical path, and adding a second
     /// one would double every write's latency for a guarantee already held.
+    #[cfg(test)]
     pub fn sync(&self) -> Result<()> {
+        Journal::sync_file(&self.file, &self.path)
+    }
+
+    /// `sync`, for a holder of `live_file` that does not hold the journal.
+    pub fn sync_file(file: &File, path: &Path) -> Result<()> {
         #[cfg(test)]
-        testhook::before_sync(&self.path)?;
-        self.file.sync_data()?;
+        testhook::before_sync(path)?;
+        #[cfg(not(test))]
+        let _ = path;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// The live segment's file and the path it is known by (which is what test hooks key on).
+    ///
+    /// The commit pipeline syncs this from a thread that does not hold the vdisk lock. That
+    /// is the right file for every record it is asked to make durable: the journal rotates
+    /// only when no record is waiting for its commit (`vdisk::lock_quiet`), so the live
+    /// segment cannot change between an append and the sync that covers it.
+    pub fn live_file(&self) -> (Arc<File>, PathBuf) {
+        (Arc::clone(&self.file), self.path.clone())
+    }
+
+    /// Where the live segment ends now.
+    pub fn mark(&self) -> Mark {
+        Mark { len: self.len, next_seq: self.next_seq }
+    }
+
+    /// Take back everything appended since `mark`: truncate the live segment and give the
+    /// sequence numbers back.
+    ///
+    /// For records that were written locally and never sent to a replica -- a write that
+    /// failed before it was queued, or one queued behind a batch that failed. A record a
+    /// replica may hold is never taken back: the replica could not be told, and reusing its
+    /// sequence number for a different record is how a journal gets a duplicate.
+    pub fn rollback(&mut self, mark: Mark) -> Result<()> {
+        if mark.len > self.len || mark.next_seq > self.next_seq {
+            return Err(Error::corrupt(format!(
+                "journal {}: rollback to {} bytes / seq {} is past the tail ({} / {})",
+                self.path.display(), mark.len, mark.next_seq, self.len, self.next_seq
+            )));
+        }
+        if mark.len == self.len {
+            return Ok(());
+        }
+        self.file.set_len(mark.len)?;
+        self.len = mark.len;
+        self.next_seq = mark.next_seq;
         Ok(())
     }
 
@@ -319,8 +382,8 @@ impl Journal {
             }
         };
         sync_dir(&self.path)?;
-        let sealed_file = std::mem::replace(&mut self.file, fresh);
-        self.old = Some(Sealed { file: Arc::new(sealed_file), len: self.len, gen: self.gen });
+        let sealed_file = std::mem::replace(&mut self.file, Arc::new(fresh));
+        self.old = Some(Sealed { file: sealed_file, len: self.len, gen: self.gen });
         self.len = 0;
         self.gen = (self.gen + 1) & GEN_MASK;
         self.live_first_seq = self.next_seq;
@@ -388,8 +451,7 @@ impl Journal {
         }
         if self.len > 0 {
             let mut part = vec![0u8; self.len as usize];
-            self.file.seek(SeekFrom::Start(0))?;
-            self.file.read_exact(&mut part)?;
+            self.file.read_exact_at(&mut part, 0)?;
             buf.extend_from_slice(&part);
         }
         Ok(buf)
@@ -525,12 +587,63 @@ pub mod testhook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("sidon-jrn-{}-{}", std::process::id(), name));
         let _ = remove_files(&p);
         p
+    }
+
+    #[test]
+    fn a_rollback_takes_back_a_group_and_its_sequence_numbers() {
+        let p = tmp("rollback");
+        let mut j = Journal::open(&p).unwrap();
+        j.append(1, 0, FLAG_COMMIT, b"kept").unwrap();
+        let mark = j.mark();
+        j.append_unsynced(1, 10, 0, b"first of a group").unwrap();
+        j.append_unsynced(1, 30, FLAG_COMMIT, b"last of it").unwrap();
+        assert_eq!(j.next_seq(), 3);
+
+        j.rollback(mark).unwrap();
+        assert_eq!(j.next_seq(), 1, "the sequence numbers are given back");
+        assert_eq!(j.len(), (HEADER_LEN + 4) as u64);
+        // The next record takes the place of the ones taken back, and the file is a clean
+        // stream: nothing of the group is left to be replayed.
+        j.append(1, 50, FLAG_COMMIT, b"next").unwrap();
+        drop(j);
+        let mut j = Journal::open(&p).unwrap();
+        let (records, discarded) = j.replay().unwrap();
+        assert_eq!(discarded, 0);
+        assert_eq!(records.iter().map(|r| (r.seq, r.offset)).collect::<Vec<_>>(), vec![(0, 0), (1, 50)]);
+        remove_files(&p).ok();
+    }
+
+    #[test]
+    fn a_rollback_to_a_point_that_is_not_behind_the_tail_is_refused() {
+        let p = tmp("rollback-ahead");
+        let mut j = Journal::open(&p).unwrap();
+        j.append(1, 0, FLAG_COMMIT, b"a").unwrap();
+        let later = j.mark();
+        let q = tmp("rollback-other");
+        let mut other = Journal::open(&q).unwrap();
+        assert!(other.rollback(later).is_err(), "a mark from further on is not a place in this journal");
+        remove_files(&p).ok();
+        remove_files(&q).ok();
+    }
+
+    #[test]
+    fn the_live_file_handle_syncs_the_segment_records_were_appended_to() {
+        let p = tmp("live-file");
+        let mut j = Journal::open(&p).unwrap();
+        let (file, path) = j.live_file();
+        j.append_unsynced(1, 0, FLAG_COMMIT, b"x").unwrap();
+        // The handle is the same open file the journal appends to: syncing through it is
+        // syncing the journal, from a thread that does not hold it.
+        Journal::sync_file(&file, &path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), (HEADER_LEN + 1) as u64);
+        remove_files(&p).ok();
     }
 
     #[test]

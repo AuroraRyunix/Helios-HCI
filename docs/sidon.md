@@ -30,18 +30,24 @@ journal append + fdatasync          ← on every other replica
 acknowledged to the guest
 ```
 
-The two journal appends really are concurrent (`vdisk::append_group`): a replica has its own
-thread, fed the write's records in order, while the owner writes record *i+1* to its own
-journal and, after the last record, issues a single `fdatasync`. A guest write bigger than
-1 MiB is several records and one commit marker, and only the last record of the group is
-made durable on the replica before it answers (the earlier ones carry `APPEND_DEFER_SYNC`; the
-last record's `fdatasync` takes them with it). The guest is told nothing until the local sync
-has succeeded *and* every replica has answered OK to the last record, so what is acknowledged
-is exactly what it always was: durable on every copy. A crash after some records but before
-the commit marker leaves a group replay discards, the same as a crash between two records
-always did. Before 2026-10 the appends were serial — a local `fdatasync` and then a round trip
-to each replica, per 1 MiB record — and this section's diagram described what it was meant to
-do rather than what it did.
+The two journal appends really are concurrent, and so are the guest's writes. A write is
+appended to the journal at once (its records are in the file, in the order writes arrived, and
+nothing reads them yet), and then waits to be *committed* with whatever else is waiting: the
+first waiting writer takes everything queued as one batch, issues one `fdatasync` of the journal
+while one request per replica carries the batch's bytes in parallel, and only when this node and
+every replica have it durable are the batch's writes made visible and acknowledged
+(`sidon/src/vdisk/commit.rs`, [dfs/group_commit.md](./dfs/group_commit.md)). At queue depth one a
+batch is one write and costs what a write always cost; at depth sixteen a batch is about sixteen,
+so the sync and the round trip are shared. A guest write bigger than 1 MiB is several records and
+one commit marker, kept together; only the last request of a batch is made durable before the
+replica answers (the earlier ones carry `APPEND_DEFER_SYNC`; the last one's `fdatasync` takes them
+with it). The guest is told nothing until the local sync has succeeded *and* every replica has
+answered OK, so what is acknowledged is exactly what it always was: durable on every copy, and
+visible to reads only from then on. A crash after some records but before the commit marker
+leaves a group replay discards, the same as a crash between two records always did. Before 2026-10
+the appends were serial -- a local `fdatasync` and then a round trip to each replica, per 1 MiB
+record -- and, until the commit pipeline, a connection served one request at a time under the
+vdisk lock, so a guest's queue depth bought nothing.
 
 Nothing on that path touches Hydra. That is the design's one inviolable performance rule:
 acknowledgement never waits on the metadata layer.
@@ -389,17 +395,19 @@ wrote 64 MiB in one request into a new 100 MiB vdisk and printed that single tim
 request is not a rate: it landed exactly on the journal's high-water mark, so the drain ran
 inside that write and the printed ~14 MiB/s was a drain divided into 64 MiB. It now warms up,
 then prints one labelled line per workload with MiB/s, IOPS and the per-request time:
-1 MiB sequential writes at queue depth 1, 4 KiB synchronous writes at queue depth 1 (the
-latency a guest's fsync sees), 1 MiB sequential reads, 1 MiB writes at queue depths 4 and 16,
-and 16 MiB writes. The vdisk is four times the journal high-water mark so drains happen during
+1 MiB sequential writes at queue depth 1, 4 KiB synchronous writes at queue depths 1 (the
+latency a guest's fsync sees) and 16, 1 MiB sequential reads, 1 MiB writes at queue depths 4 and
+16, and 16 MiB writes. The vdisk is four times the journal high-water mark so drains happen during
 the run. Because a write is acknowledged before the drain it triggered has finished, a write
 line also shows the **sustained** rate (bytes over the time until those drains are done)
 whenever a drain outlived it; that is the figure that stays true over a long stream, and the
 acknowledged rate is the one a guest sees in a burst. A final line reads the sequential range
 back and checks every byte, because a benchmark that is fast by losing data is worse than a
-slow one. Queue depth above 1 does not currently help much: a connection is served one request
-at a time ([dfs/group_commit.md](./dfs/group_commit.md)). It uses `qemu-img bench` (queue depth,
-millisecond timing) and `qemu-io` (the read-back).
+slow one. The 4 KiB writes are measured at queue depth 1 and at queue depth 16: the pair is the
+measure of group commit ([dfs/group_commit.md](./dfs/group_commit.md)), the first being what one
+synchronous writer sees and the second what a database or a guest filesystem journal gets when it
+keeps writes in flight. It uses `qemu-img bench` (queue depth, millisecond timing) and `qemu-io`
+(the read-back).
 
 Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURAH_INTERVAL=0`
 (the test cluster) repeated runs accumulate garbage until a sweep is run.
@@ -565,7 +573,8 @@ that predates the setting — behaves exactly as it did.
   recommends a read-only estimator before anything is built.
 - **`vhost-user-blk`** beside NBD, deliberately last. Performance work reorders
   operations, and reordering is where invariants go to die. Designed, not built: the NBD
-  transport is a small part of a request, and Sidon serves one request at a time per
-  connection whatever the guest's queue depth, which no transport changes. D-25 and
+  transport is a small part of a request. (Sidon used to serve one request at a time per
+  connection whatever the guest's queue depth; since the commit pipeline it serves up to 32 and
+  shares their syncs, which was the prerequisite the transport could not supply.) D-25 and
   [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) carry the design and the benchmark that
   would justify it.

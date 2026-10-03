@@ -79,6 +79,8 @@ class Layout(unittest.TestCase):
             "sync-heavy 4k writes": lambda p: p[1] == "write" and p[2] == 4096 and p[4] == 1,
             "sequential read": lambda p: p[1] == "read",
             "writes at a queue depth above 1": lambda p: p[1] == "write" and p[4] > 1,
+            "small synchronous writes at a queue depth above 1 (group commit)":
+                lambda p: p[1] == "write" and p[2] == 4096 and p[4] > 1,
         }
         for what, test in wanted.items():
             self.assertTrue(any(test(p) for p in self.b["BENCH_PHASES"]), what)

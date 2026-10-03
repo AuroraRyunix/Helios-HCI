@@ -694,6 +694,13 @@ BENCH_PHASES = [
     ("sequential write 1M qd1", "write", MIB, 96, 1, 16 * MIB),
     ("sync write 4k qd1", "write", 4096, 400, 1, 112 * MIB),
     ("sequential read 1M qd1", "read", MIB, 96, 1, 16 * MIB),
+    # The same small synchronous write with sixteen in flight, which is what a database or a
+    # guest filesystem journal does: Sidon commits the writes that are waiting together, one
+    # sync and one round trip for the lot, so this line is several times the qd1 one while
+    # the qd1 line does not move. The pair is the measure of group commit. It runs after the
+    # read so that the read line stays comparable with earlier runs: a read straight after
+    # these 1,600 small writes measured about half as fast, for a reason that was not run down.
+    ("sync write 4k qd16", "write", 4096, 1600, 16, 184 * MIB),
     ("write 1M qd4", "write", MIB, 32, 4, 120 * MIB),
     ("write 1M qd16", "write", MIB, 32, 16, 152 * MIB),
     # A guest that issues big requests (a copy, a restore) rather than one per block: each

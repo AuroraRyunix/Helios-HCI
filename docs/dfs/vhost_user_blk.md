@@ -14,6 +14,14 @@ the work that would -- concurrent requests into one vdisk -- is the work that to
 journal's ordering rules, and it is needed *with or without* vhost-user. Do that first, over
 NBD, which already pipelines. Then measure.
 
+**Update.** The concurrency prerequisite named here is built, over NBD:
+[group_commit.md](./group_commit.md). A connection now runs up to 32 requests at once and writes
+that are in flight together share one journal sync and one replica round trip, so the "effective
+queue depth is 1" and "no pipelining" findings below describe the code as it was when this was
+written. What remains of the argument -- that the transport is a small part of a request, and that
+a benchmark of NBD against a null backend should come before any vhost-user code -- is unchanged,
+and is now answerable, because queue depth finally reaches the data path.
+
 Everything numeric below that is not a measurement from this repository is labelled an
 estimate. There are no benchmark results in the tree, and this document does not invent
 any.

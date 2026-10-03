@@ -557,11 +557,30 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
 * **Sidon write path, what the 2026-10-03 change did not do.** The drain now runs on its own
   thread, a write's local sync overlaps its replicas, and the drain ships extents through a
   pipeline ([docs/sidon.md](docs/sidon.md) section 2). Left, in order of value:
-  * **Concurrent NBD requests and group commit** -- designed in
-    [docs/dfs/group_commit.md](docs/dfs/group_commit.md), not built, because it replaces the
-    vdisk lock's role and changes failure semantics. It is the only remaining lever on small
-    synchronous writes (170 IOPS at queue depth 1 on the test cluster, with queue depth no
-    help), and `valcli storage.benchmark` should gain a 4 KiB queue-depth-16 line when it lands.
+  * **Concurrent NBD requests and group commit -- built (2026-10-04)**, see
+    [docs/dfs/group_commit.md](docs/dfs/group_commit.md). Up to 32 requests in flight per
+    connection; writes in flight together share one journal sync and one replica round trip; a
+    failed batch fails every write in it and the vdisk fails closed until the heal re-synchronises
+    the replicas. 4 KiB writes at queue depth 16 went from 157 to about 2,275 IOPS on the test
+    cluster, queue depth 1 unchanged (171 IOPS); large blocks did not move much because the lab's
+    shared store is the limit there. `valcli storage.benchmark` gained the 4 KiB queue-depth-16
+    line. What it left, in order of value:
+    * **Overlapped commits.** One batch commits at a time. A second batch's sync overlapping the
+      first's replies could roughly double depth-16 again, but needs the replica protocol to
+      pipeline requests and a rule for a failure of the earlier batch while the later one is
+      half-sent. The 300 microsecond wait for a burst already recovers most of it.
+    * **Reads outside the vdisk lock.** They run on workers now but still one at a time per
+      vdisk, because `Vdisk::read` holds the lock across the extent read. A guest at depth 16 on a
+      read-heavy workload is bounded by that, not by the transport.
+    * **Forwarded writes are still one at a time** (`Forwarder` and `serve_connection` are
+      serial), so a guest on a node that does not yet own its vdisk sees queue depth 1.
+    * **`PeerClient::call` retries once on a transport failure, including for an append.** A retry
+      after a reply timeout whose first attempt had reached the replica leaves a duplicate record
+      in the replica's journal, which replay refuses on takeover. Pre-existing, rare (it needs a
+      reply to be lost, not a connection to be refused), unchanged by group commit; the fix is an
+      append that is idempotent (a sequence the replica checks) or a no-retry append with the
+      repair path as the answer.
+    * **Several NBD connections to one export** are still served one at a time.
   * **The test cluster is at its storage ceiling for large blocks.** Its three virtual disks
     share one backing store (a bare 64 MiB fsynced write is about 110 MB/s, and the owner's and
     a replica's flushes contend), and each guest MiB costs four physical MiB (journal and
@@ -579,12 +598,14 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
     Found while reading it, pre-existing and unchanged: the file's `sync_data` does not
     promise the directory entry, so the first acknowledged append after a power cut relies on
     the filesystem persisting it with the data. XFS and ext4 do; POSIX does not say they must.
-  * **Failed writes still leave their records in the journal.** A write whose replica failed
-    leaves its records in the owner's and the replicas' journals, unacknowledged, and the next
-    write's commit marker would carry them into replay. The invariants permit it (an
-    unacknowledged write may be applied or not) but the overlay and a restart disagree about
-    it until the next drain. Unchanged by this work; group commit's failure design (section
-    3.3) is where it gets fixed properly.
+  * **A failed batch's own records still stay in the journals, and replay may apply them.** The
+    commit pipeline now fails closed (no write is appended after a failed batch until the heal has
+    made the replicas' journals the owner's again), so the hazard this bullet used to describe --
+    a next write carrying a failed one into replay, or a replica gaining a hole -- is gone, and the
+    writes queued behind a failed batch are taken back out of the journal. What remains is
+    permitted by I-2 and visible only across a restart: a write the guest was told failed can
+    appear after a crash if its records and marker reached a journal. Cleaning that up would need
+    a "truncate to here" request on the replica protocol.
   * **`storage.benchmark` leaves garbage on a node with Purah's sweep off** (the test cluster
     runs `SIDON_PURAH_INTERVAL=0`). Each run leaves roughly 250 MiB of extent groups per copy
     until `purah-sweep` has seen them unreferenced twice.

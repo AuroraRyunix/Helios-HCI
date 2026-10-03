@@ -517,7 +517,11 @@ claim was checked against the code. Three findings, in order of consequence:
    iothread='1'` feeds N queues into one serial loop and one `Mutex<Vdisk>`. A faster
    transport does not change that. Concurrent requests do, and concurrent requests are the
    journal-ordering change the "deliberately last" warning is about, needed over NBD
-   exactly as much as over vhost-user.
+   exactly as much as over vhost-user. *(Since built, over NBD: up to 32 requests in flight
+   per connection and group commit of their syncs, [group_commit.md](./group_commit.md). On
+   the test cluster 4 KiB writes at queue depth 16 went from 157 to about 2,275 IOPS with the
+   queue-depth-1 figure unchanged -- so the "measure NBD first" step now has a fair baseline
+   to measure against.)*
 2. **The transport is a small part of the request.** An estimated ten microseconds of socket
    work sits beside a journal `fdatasync` and a sequential round trip to each replica on a
    write, and beside a 1 MiB read and checksum to serve 4 KiB on a read.
