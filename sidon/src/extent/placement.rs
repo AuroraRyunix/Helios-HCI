@@ -434,6 +434,15 @@ impl EgroupStore {
 
     /// The disk to create a new group on.
     pub(super) fn pick_slot(&self) -> usize {
+        self.slot_preferring(self.prefer)
+    }
+
+    /// The disk a new group should go on, given the class a container asks for.
+    ///
+    /// `pick_slot` with the preference passed in rather than read from the store, for the one
+    /// caller whose store belongs to no vdisk: Purah, writing a group on behalf of whichever
+    /// container the extents it is rewriting belong to.
+    pub fn slot_preferring(&self, prefer: Option<Tier>) -> usize {
         let rooms: Vec<Room> = self
             .disks
             .iter()
@@ -447,7 +456,7 @@ impl EgroupStore {
                 Room { tier: d.tier, total, avail }
             })
             .collect();
-        pick_disk(&rooms, self.prefer)
+        pick_disk(&rooms, prefer)
     }
 
     /// A disk named by its identity, or failing that by its label.
@@ -619,6 +628,87 @@ impl EgroupStore {
         std::fs::rename(temp, &final_path)?;
         File::open(dir).and_then(|d| d.sync_all())?;
         Ok(())
+    }
+
+    /// Phase one of making a *new* group out of bytes already in hand: write them to a
+    /// temporary name on `slot` and prove what reached the disk.
+    ///
+    /// The sibling of [`stage_copy`](Self::stage_copy) for compaction, which builds a group
+    /// from the live extents of several others and so has no source file to copy. Everything
+    /// that makes a copy trustworthy is the same: the temporary does not end in `.eg`, so no
+    /// directory scan can mistake it for a group; it is fsynced; the kernel is told to drop
+    /// what it cached of it; and it is read back from the disk and has to hash as what was
+    /// written. Publication is `stage_publish`, a rename, exactly as for a move.
+    ///
+    /// Refuses an id that already names a group on any disk, so a compaction can never put a
+    /// second, different file under a name something may already be reading.
+    pub fn stage_new(&self, id: &str, slot: usize, bytes: &[u8]) -> Result<(PathBuf, u32)> {
+        if slot >= self.disks.len() {
+            return Err(Error::refused(format!("extent group {id}: this node has no disk slot {slot}")));
+        }
+        if !self.disks[slot].present() {
+            return Err(Error::refused(format!(
+                "extent group {id}: disk {} is not mounted at {}, so nothing is written to the filesystem underneath it",
+                self.disks[slot].uid,
+                self.disks[slot].root.display()
+            )));
+        }
+        if !self.copies(id).is_empty() {
+            return Err(Error::refused(format!("extent group {id} already exists on this node")));
+        }
+        let dir = &self.disks[slot].root;
+        if let Some((_, avail)) = disk_space(dir) {
+            if avail < (bytes.len() as u64).saturating_mul(2) {
+                return Err(Error::refused(format!(
+                    "extent group {id}: disk {} has {avail} bytes free for a {} byte group",
+                    self.disks[slot].uid,
+                    bytes.len()
+                )));
+            }
+        }
+        let temp = dir.join(format!("{id}{MOVING_SUFFIX}"));
+        let _ = std::fs::remove_file(&temp);
+        let crc = crc32c(0, bytes);
+        let written = (|| -> Result<()> {
+            let mut dst = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+            dst.write_all(bytes)?;
+            dst.sync_all()?;
+            drop_cache(&dst);
+            let (back_crc, back_len) = file_crc(&temp)?;
+            if back_crc != crc || back_len != bytes.len() as u64 {
+                return Err(Error::corrupt(format!(
+                    "extent group {id}: the staged file reads back as {} ({back_len} bytes), not the {} ({} bytes) that was written",
+                    hash_string(back_crc),
+                    hash_string(crc),
+                    bytes.len()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&temp);
+            return Err(e);
+        }
+        Ok((temp, crc))
+    }
+
+    /// Whole-file checksum of a published group, in the spelling `seal_hash` records.
+    pub fn group_len_and_hash(&self, id: &str) -> Result<(u64, String)> {
+        let (mut file, _) = self
+            .open_group(id)
+            .map_err(|e| Error::io(format!("extent group {id} unreadable: {e}")))?;
+        let mut crc = 0u32;
+        let mut len = 0u64;
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            crc = crc32c(crc, &buf[..n]);
+            len += n as u64;
+        }
+        Ok((len, hash_string(crc)))
     }
 
     /// Phase three: point this store's readers at the new copy.

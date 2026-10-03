@@ -56,6 +56,8 @@ Design points that are decisions, not defaults:
 | `/v1/dfs/claim` | UPDATE owner, epoch=epoch+1 IF owner=? AND epoch=? | LWT |
 | `/v1/dfs/drain-commit` | UPDATE drain_seq=? IF drain_seq=? AND epoch=? | LWT |
 | `/v1/dfs/egroup-state` | UPDATE state IF state=? (open→sealed, open→dead, sealed→dead) | LWT |
+| `/v1/dfs/block-map-repoint` | UPDATE egroup_id, egroup_offset IF egroup_id=? AND egroup_offset=? AND length=? (compaction, D-32) | LWT |
+| `/v1/dfs/extent-repoint` | UPDATE egroup_id, egroup_offset IF egroup_id=? AND egroup_offset=? (compaction, D-32) | LWT |
 | block-map row batches | plain writes at QUORUM | see §3 |
 
 Refused CAS returns `{"applied": false, "current": {...}}` at 200 — the established
@@ -76,6 +78,12 @@ construction:
 Single-writer-per-partition is the one arrangement under which LWW is not a euphemism
 for data loss. The moment anyone proposes a second concurrent writer of a vdisk's map,
 this section is the document that says the price is Paxos per row.
+
+Compaction ([compaction.md](./compaction.md), D-32) is a second writer of these rows and does not
+pay that price, because it does not run concurrently with the first: it rewrites a writable vdisk's
+rows only while this node owns the vdisk, has it attached and holds its drain gate, so no drain is
+running or can start. Its swaps are conditional anyway, as the defence against a drain that committed
+first. Rows of immutable vdisks have no other writer.
 
 ## 4. Exactly-once drain across ownership transfer
 

@@ -665,6 +665,49 @@ LWT_OPS = {
             "expected_state": {"type": "text", "required": True},
         },
     },
+    # Compaction's repoint of one block-map row (D-32). The only writer of a block-map row
+    # other than the owner's drain, which is why it is conditional on all three things that
+    # say "this is still the extent the scan saw": group, offset and length. A guest overwrite
+    # that a drain has already committed changes the row, the condition fails, and the newer
+    # row is left alone. The condition cannot see a drain whose write is still in flight --
+    # that interleaving is excluded by the caller, which holds the vdisk's drain gate.
+    # Only the location changes: the footer was copied with the extent, so the identity
+    # (`vdisk_hash`), the stored length and the epoch of the row stay exactly as they were.
+    "/v1/dfs/block-map-repoint": {
+        "cql": (
+            "UPDATE hydra.dfs_block_map SET egroup_id = ?, egroup_offset = ? "
+            "WHERE vdisk_id = ? AND extent_index = ? "
+            "IF egroup_id = ? AND egroup_offset = ? AND length = ?"
+        ),
+        "binds": ("egroup_id", "egroup_offset", "vdisk_id", "extent_index",
+                  "expected_egroup_id", "expected_egroup_offset", "expected_length"),
+        "params": {
+            "vdisk_id": {"type": "text", "required": True},
+            "extent_index": {"type": "int", "required": True},
+            "egroup_id": {"type": "text", "required": True},
+            "egroup_offset": {"type": "int", "required": True},
+            "expected_egroup_id": {"type": "text", "required": True},
+            "expected_egroup_offset": {"type": "int", "required": True},
+            "expected_length": {"type": "int", "required": True},
+        },
+    },
+    # The same repoint one level up (D-23): an extent named by block-map rows moves with one
+    # row, whoever points at it.
+    "/v1/dfs/extent-repoint": {
+        "cql": (
+            "UPDATE hydra.dfs_extent_id_map SET egroup_id = ?, egroup_offset = ? "
+            "WHERE extent_id = ? IF egroup_id = ? AND egroup_offset = ?"
+        ),
+        "binds": ("egroup_id", "egroup_offset", "extent_id",
+                  "expected_egroup_id", "expected_egroup_offset"),
+        "params": {
+            "extent_id": {"type": "text", "required": True},
+            "egroup_id": {"type": "text", "required": True},
+            "egroup_offset": {"type": "int", "required": True},
+            "expected_egroup_id": {"type": "text", "required": True},
+            "expected_egroup_offset": {"type": "int", "required": True},
+        },
+    },
 }
 
 _APPLIED_COLUMN = "[applied]"

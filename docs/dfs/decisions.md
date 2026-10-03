@@ -423,6 +423,10 @@ already owns the grace logic. As a working threshold, a result under roughly 10-
 clone sharing does not justify a new failure class; that number is judgement, and the
 estimator exists so that it can be replaced with a measurement.
 
+*Built (D-32).* Steps (1) and (2) of that order exist: `valcli storage.dedup.estimate` and
+`valcli storage.compact`, both operator-invoked. Step (3) is still not built, and the estimator is
+what decides whether it should be.
+
 **D-24 — erasure coding is not built, and on three nodes it should not be.** The question
 that decides it is what a 2+1 stripe actually buys on the cluster Helios runs, so the
 arithmetic comes first and the recommendation follows from it.
@@ -685,3 +689,73 @@ the sender, one transfer per node at a time; the target slows a sender by readin
 of the replicated members plus a VM definition that is not yet replicated, and failback is the
 same replication reversed; neither can be exercised without a second site, and code written
 against fakes would be fiction. [replication.md](./replication.md) sections 5, 7 and 8.
+
+**D-32 — compaction rewrites live extents into a new group and repoints rows while the owner's
+drains are held; the dedup estimator only reads; neither runs unattended.** D-23's addendum
+asked for two things in order, a read-only estimator and compaction, and said the second is
+needed "anyway". Both are built; the mechanism is [compaction.md](./compaction.md). What was
+decided, with the alternative each choice beat:
+
+*What a batch is.* Copy, verify, publish, then repoint -- `storage.move`'s discipline (D-26),
+generalised from "copy a file" to "build a file from extents", and **never delete**: the old
+group is left for the sweep's two-scan grace. That one rule is why a stop at any step needs no
+recovery: once rows start moving, each names a location holding exactly its bytes, so every
+prefix of the swaps is a valid map. **Rejected: a journal of the batch** (a second source of
+truth about which rows moved, which every crash must keep in step; the map already says). One
+ordering differs from a move on purpose: the new group is **registered in Hydra, already sealed,
+before the rename**, so a crash between leaves a row the sweep reclaims and not a file nothing
+names.
+
+*The second writer.* [metadata.md](./metadata.md) section 3 says block-map rows are plain
+writes because a partition has one writer, and prices a second at Paxos per row. Compaction is
+the second writer, and a compare-and-swap does not remove the hazard: it protects against a
+drain that has written, not one that has read the row and is about to. **Rejected: swaps with
+no exclusion** (loses a guest write, or reverts one, in a window of milliseconds that no test
+without a timing hook can find); **making compaction a drain run by the owner** (serialises
+for free but handles neither the snapshots and images that share the extents nor any group whose
+vdisks are not all one owner's); **claiming a detached vdisk before rewriting it** (a claim does
+not stop another node attaching during the rewrite); **Paxos per row for the drain** (the
+thirty-fold load D-23's addendum already costed). **Taken:** a row of a writable vdisk is
+rewritten only while this node owns and has attached the vdisk and holds its **drain gate** (the
+flag every drain sets, so no drain runs or starts; guest writes are not held); rows of an
+immutable vdisk are rewritten freely; a group any other writable vdisk points into is skipped
+whole. That makes the pass narrower than it could be -- a clone running on another node pins
+its parent's groups -- and the narrowness is the price of not adding a writer the design cannot
+exclude. The swap is conditional on group, offset and length anyway, so a drain that committed
+first wins.
+
+*All or nothing per group, and no partial credit.* A source group is moved whole or not at all:
+the sweep frees a group only when all of it is dead, so moving some extents of a group frees
+nothing and costs a copy. Sources are packed together only if they share a container and a
+replica set. A shared extent (clone, snapshot) is copied once and every referrer's row is
+swapped; an extent named through the middle level moves with **one** extent-map row, which is
+the "relocation costs one row" D-23 promised. Missing a referrer is safe -- the pass never
+frees, the mark phase still decides what is referenced -- so the live set may be incomplete and
+the cost is space.
+
+*No state.* No table, no migration, no id: the plan is recomputed from the map every run, and
+convergence is structural (a new group is all live; a half-moved group is a smaller candidate).
+Ids `0018`/`0019`/`0024`/`0026`-`0029`/`0033`/`0034` are untouched and `0035` is not taken.
+
+*The cost it does not remove.* A replica's copy of a group sits in its replica store and nothing
+in Sidon removes one, whether the group was swept, compacted or deleted. Compaction adds the live
+extents to each replica and frees nothing there, so at ftt>=1 it moves space from the creator to
+its replicas until a replica-side reclaim exists (an opcode, sent by the node that swept a group,
+to drop that group). **Not built**, and not hidden: the plan prints the growth beside the saving.
+Pre-existing, found while reading, and the reason this is opt-in rather than a default.
+
+*Opt-in.* `storage.compact` plans unless `--apply`; a pass is bounded by groups, bytes, rate and
+wall clock and says which bound it hit; nothing runs it on a timer, D-22's reason unchanged.
+
+*The estimator.* Read-only by type (it is handed a reader and a store it only reads) and by
+test (the production code contains no write). It hashes SHA-256 of each stored extent *as the
+guest wrote it*, so a compressed and a plain copy match, and reports per container the bytes
+already shared by clone (rows minus distinct stored extents), the bytes dedup would add (stored
+extents whose content another holds), and the latter without all-zero extents, which a sparse
+map handles without a hash index. **Rejected: a content-derived extent id or a by-hash table**
+(that is dedup, which the addendum says to earn); **a setting** (none exists to toggle).
+Sampling orders extents by a hash of their location and takes a prefix, so a pass cut short by
+its time budget is still a uniform sample and says what it covered; a sample undercounts content
+that exists twice and is fair for content that exists many times, which is the content that could
+clear D-23's 10-15% bar. Duplicates that straddle two nodes are found by merging short digests
+across nodes in `valcli`; one node alone cannot see them.

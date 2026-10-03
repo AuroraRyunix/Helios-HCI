@@ -362,6 +362,8 @@ impl Daemon {
             "purah-tier" => self.op_purah_tier(req),
             "purah-move" => self.op_purah_move(req),
             "purah-placement" => self.op_purah_placement(req),
+            "purah-compact" => self.op_purah_compact(req),
+            "purah-dedup" => self.op_purah_dedup(req),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
         }
     }
@@ -1521,6 +1523,58 @@ impl Daemon {
         purah.move_one(&id, &disk)
     }
 
+    /// Plan, and when `apply` is true carry out, one compaction pass over this node's sparse
+    /// sealed extent groups. Plans only by default, and nothing runs it on a timer: see
+    /// `purah/compact.rs` and D-32 for why this is an operator's decision.
+    fn op_purah_compact(&self, req: &Value) -> Result<Value> {
+        use crate::purah::compact::{Options, MAX_THRESHOLD, MIN_THRESHOLD};
+        let d = Options::default();
+        let opts = Options {
+            apply: req.get("apply").and_then(Value::as_bool).unwrap_or(false),
+            threshold: req
+                .get("threshold")
+                .and_then(Value::as_f64)
+                .map(|t| t.clamp(MIN_THRESHOLD, MAX_THRESHOLD))
+                .unwrap_or(d.threshold),
+            max_groups: req
+                .get("max_groups")
+                .and_then(Value::as_u64)
+                .map(|n| n.clamp(1, 1000) as usize)
+                .unwrap_or(d.max_groups),
+            max_bytes: req.get("max_bytes").and_then(Value::as_u64).unwrap_or(d.max_bytes),
+            rate: req.get("rate_bytes_per_second").and_then(Value::as_u64).unwrap_or(d.rate),
+            seconds: req
+                .get("seconds")
+                .and_then(Value::as_u64)
+                .map(|n| n.clamp(1, 3600))
+                .unwrap_or(d.seconds),
+            target_bytes: d.target_bytes,
+        };
+        let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
+        purah.compact(&opts, &DaemonEnv(self), now_ms())
+    }
+
+    /// Estimate how much dedup would share beyond clone-from-image. Reads only, and does not
+    /// take the curator's lock: it can run for the better part of a minute and nothing about
+    /// it needs to hold the sweep or the access flush off.
+    fn op_purah_dedup(&self, req: &Value) -> Result<Value> {
+        use crate::purah::dedup::{self, Options};
+        let d = Options::default();
+        let opts = Options {
+            sample: req.get("sample").and_then(Value::as_f64).unwrap_or(d.sample),
+            seconds: req
+                .get("seconds")
+                .and_then(Value::as_u64)
+                .map(|n| n.clamp(1, 3600))
+                .unwrap_or(d.seconds),
+            rate: req.get("rate_bytes_per_second").and_then(Value::as_u64).unwrap_or(d.rate),
+            digests: req.get("digests").and_then(Value::as_bool).unwrap_or(false),
+        };
+        let store = crate::extent::EgroupStore::open(crate::extent::discover_disks(&self.cfg.root), 0)?;
+        let clock = crate::replicate::throttle::SystemClock::new();
+        dedup::run(&self.daruk(), &store, &self.cfg.node, &clock, &opts)
+    }
+
     /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.
     pub fn start_purah(self: &Arc<Self>) {
         // Heal promptly when a write fails, not only on the timer.
@@ -1643,6 +1697,116 @@ impl Daemon {
                 Err(e) => eprintln!("purah: scrub failed: {e}"),
             }
         });
+    }
+}
+
+/// The daemon as compaction sees it: its peers and its attached vdisks.
+struct DaemonEnv<'a>(&'a Daemon);
+
+/// An attached vdisk whose drains are held off. The hold is released when this is dropped.
+struct HeldVdisk {
+    handle: Arc<Mutex<Vdisk>>,
+    _hold: crate::vdisk::DrainHold,
+}
+
+impl crate::purah::compact::Hold for HeldVdisk {
+    fn has(&self, idx: u64, egroup: &str, offset: u32, length: u32) -> bool {
+        let v = self.handle.lock().expect("vdisk mutex poisoned");
+        v.map_entry(idx)
+            .map(|l| l.egroup_id == egroup && l.offset == offset && l.length == length)
+            .unwrap_or(false)
+    }
+
+    fn repoint(
+        &self,
+        idx: u64,
+        egroup: &str,
+        offset: u32,
+        length: u32,
+        to_group: &str,
+        to_offset: u32,
+    ) -> bool {
+        let mut v = self.handle.lock().expect("vdisk mutex poisoned");
+        v.repoint_extent(idx, (egroup, offset, length), to_group, to_offset)
+    }
+}
+
+impl crate::purah::compact::Env for DaemonEnv<'_> {
+    fn put(&self, node: &str, group: &str, offset: u64, data: &[u8], defer_sync: bool) -> Result<()> {
+        let client = self
+            .0
+            .peers
+            .get(node)
+            .ok_or_else(|| Error::refused(format!("this daemon has no address for {node}")))?;
+        let resp = client.call(&peer::Request {
+            opcode: peer::OP_EGROUP_PUT,
+            vdisk: group.to_string(),
+            epoch: 0,
+            seq: 0,
+            offset,
+            flags: if defer_sync { peer::APPEND_DEFER_SYNC } else { 0 },
+            data: data.to_vec(),
+        })?;
+        if !resp.is_ok() {
+            return Err(Error::io(format!("{node} refused extent group {group} with status {}", resp.status)));
+        }
+        Ok(())
+    }
+
+    fn get(&self, node: &str, group: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let client = self
+            .0
+            .peers
+            .get(node)
+            .ok_or_else(|| Error::refused(format!("this daemon has no address for {node}")))?;
+        let resp = client.call(&peer::Request {
+            opcode: peer::OP_EGROUP_GET,
+            vdisk: group.to_string(),
+            epoch: 0,
+            seq: len as u64,
+            offset,
+            flags: 0,
+            data: Vec::new(),
+        })?;
+        if !resp.is_ok() {
+            return Err(Error::io(format!("{node} could not return extent group {group}: status {}", resp.status)));
+        }
+        Ok(resp.data)
+    }
+
+    fn attached_here(&self, vdisk: &str) -> bool {
+        self.0
+            .attached
+            .lock()
+            .expect("attached mutex poisoned")
+            .get(vdisk)
+            .map(|a| a.vdisk.is_some())
+            .unwrap_or(false)
+    }
+
+    fn hold(&self, vdisk: &str) -> Result<Box<dyn crate::purah::compact::Hold + '_>> {
+        let handle = {
+            let map = self.0.attached.lock().expect("attached mutex poisoned");
+            map.get(vdisk).and_then(|a| a.vdisk.clone())
+        }
+        .ok_or_else(|| Error::refused(format!("vdisk {vdisk} is not attached here")))?;
+        let hold = {
+            let v = handle.lock().expect("vdisk mutex poisoned");
+            v.try_hold_drains()
+        }
+        .ok_or_else(|| Error::refused(format!("vdisk {vdisk} has a drain running")))?;
+        Ok(Box::new(HeldVdisk { handle, _hold: hold }))
+    }
+
+    fn drain_groups(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let map = self.0.attached.lock().expect("attached mutex poisoned");
+        for a in map.values() {
+            if let Some(handle) = &a.vdisk {
+                out.extend(handle.lock().expect("vdisk mutex poisoned").drain_groups());
+            }
+        }
+        out
     }
 }
 

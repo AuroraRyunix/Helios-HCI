@@ -113,6 +113,10 @@ compaction pass that does not exist. The owner wants dedup; the addendum's recom
 a **read-only estimator first** (a Purah pass that hashes sealed extents and reports how many
 would be shared beyond what clone-from-image already shares), then compaction, then a
 background post-process pass, each only if the last earned it. The settings toggle stays last.
+**Update (D-32):** the estimator and compaction now exist -- `valcli storage.dedup.estimate` and
+`valcli storage.compact` -- both operator-invoked, neither on a timer, and neither enables dedup or adds
+a setting. The next step is to *run the estimator on real data* and compare it with D-23's 10-15% bar;
+the background post-process pass stays unbuilt until that number says it should exist.
 
 **Coordination and tasks (2026-10-02)**
 
@@ -199,6 +203,31 @@ The notes themselves are deliberately not in this repository.
   **Known gap**: `capacity` counts a copy in progress and a surplus copy as extent groups,
   which is true of the bytes and misleading as a count until the sweep clears them.
 
+
+* **Extent-group compaction and a read-only dedup estimator** (D-32,
+  [docs/dfs/compaction.md](./docs/dfs/compaction.md)). `valcli storage.compact` finds sealed groups
+  below a live fraction (default 50%), copies their live extents into a new group (verified against the
+  seal hash and every referrer's footer, replicated and read back, registered, published by rename),
+  repoints the rows by compare-and-swap and leaves the old group to the sweep. Plans unless `--apply`;
+  bounded by groups, bytes, rate and time; never on a timer. A writable vdisk's rows are rewritten only
+  while this node owns the vdisk, has it attached and holds its drain gate; a group a writable vdisk not
+  attached here points into is skipped whole. `valcli storage.dedup.estimate` hashes a sample of sealed
+  extents and reports per container what dedup would share beyond clone sharing; it writes nothing. Two
+  new Daruk swaps (`/v1/dfs/block-map-repoint`, `/v1/dfs/extent-repoint`); **no migration**. Rust tests
+  stop a batch at every step, overwrite mid-pass, share extents across clones and snapshots, refuse at
+  a replica, and run random maps to a fixed point; `test_compaction.py` pins the wiring and the rules.
+  **Not built / known:**
+  * **Replica copies of a dead group are never reclaimed** -- not by the sweep, not by compaction, not
+    when a vdisk is deleted -- as far as the code shows (`replica-egroups/` has no remover). Compaction
+    therefore *adds* its live bytes on every replica and frees nothing there; the plan prints both
+    numbers. A replica-side drop (an opcode sent by the node that swept a group) is the fix and is the
+    thing to build before recommending `--apply` at ftt>=1.
+  * Groups a writable vdisk not attached on the creating node still points into (a clone on another
+    node, a detached VM) are skipped; a safe way to exclude that vdisk's drain from here does not exist.
+  * Nothing has run on the test cluster: the passes are proved against a model of Hydra and real extent
+    files, not against live nodes, and the lead integrates the live check.
+  * Found while reading, not fixed: the sweep skips every `open` group (`skipped_open`), so an open group
+    a crashed drain abandoned, and which no row references, appears never to be reclaimed.
 
 **Cluster state (2026-08-17, later session)**
 * **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;

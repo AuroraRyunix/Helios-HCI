@@ -1203,6 +1203,76 @@ impl Vdisk {
         held
     }
 
+    /// The extent groups an in-flight drain is making: the open group and any it created.
+    ///
+    /// Narrower than [`held_egroups`](Self::held_egroups), which also names everything the
+    /// map points at. Compaction wants exactly these and not the others: a group a drain is
+    /// still filling has bytes that no map row names *yet*, and the extents in it that look
+    /// dead are about to be live.
+    pub fn drain_groups(&self) -> HashSet<String> {
+        let mut out: HashSet<String> =
+            self.drain_held.lock().expect("held mutex poisoned").iter().cloned().collect();
+        if let Some(eg) = &self.open_eg {
+            out.insert(eg.id.clone());
+        }
+        out
+    }
+
+    /// Keep any drain of this vdisk from starting, without taking the vdisk lock.
+    ///
+    /// Compaction rewrites map rows of a vdisk that is attached and being written, and a
+    /// drain writes the same rows with plain, unconditional statements. A compare-and-swap
+    /// that lands between a drain's read of a row and its write of that row is the one
+    /// interleaving the map's single-writer rule (`metadata.md` section 3) does not survive,
+    /// so while the rows are rewritten there must be no drain of this vdisk in flight and
+    /// none able to begin. This is the existing drain gate used as that exclusion: the same
+    /// flag every drain sets, so `kick` and the background drain see a drain "running" and
+    /// stand aside, and `drain_all` waits for it exactly as it waits for a real one.
+    ///
+    /// `None` when a drain is already running, in which case the caller leaves the vdisk
+    /// alone and tries again another day. Guest writes are *not* held: they go to the
+    /// journal as ever, and at the hard ceiling they wait for the gate to open, which is
+    /// seconds at most because a hold covers a handful of metadata writes.
+    pub fn try_hold_drains(&self) -> Option<DrainHold> {
+        if self.gate.try_begin() {
+            Some(DrainHold { gate: Arc::clone(&self.gate) })
+        } else {
+            None
+        }
+    }
+
+    /// What this vdisk's in-memory map says about one extent.
+    pub fn map_entry(&self, idx: u64) -> Option<ExtentLoc> {
+        self.map.get(&idx).cloned()
+    }
+
+    /// Point one extent at a new copy of the same bytes, if it still points where the
+    /// caller believes.
+    ///
+    /// The in-memory half of a compaction repoint, made after Hydra has accepted the row.
+    /// Compare-and-set: an entry that no longer matches `expect` is left alone and `false`
+    /// comes back, because a map entry that moved on is newer than anything the caller knew.
+    /// Only the location changes. The footer was copied with the extent, so the identity it
+    /// is read against (`vdisk_hash`) and the stored length are the same.
+    pub fn repoint_extent(
+        &mut self,
+        idx: u64,
+        expect: (&str, u32, u32),
+        to_group: &str,
+        to_offset: u32,
+    ) -> bool {
+        match self.map.get_mut(&idx) {
+            Some(loc)
+                if loc.egroup_id == expect.0 && loc.offset == expect.1 && loc.length == expect.2 =>
+            {
+                loc.egroup_id = to_group.to_string();
+                loc.offset = to_offset;
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn stats(&self) -> Value {
         json!({
             "vdisk_id": self.id,
@@ -1370,6 +1440,18 @@ impl DrainGate {
             return;
         }
         let _ = self.cv.wait_timeout(s, timeout).expect("gate mutex poisoned");
+    }
+}
+
+/// A reservation of a vdisk's drain gate, released when it is dropped. See
+/// [`Vdisk::try_hold_drains`].
+pub struct DrainHold {
+    gate: Arc<DrainGate>,
+}
+
+impl Drop for DrainHold {
+    fn drop(&mut self) {
+        self.gate.finish();
     }
 }
 
@@ -2709,6 +2791,63 @@ mod tests {
         // Afterwards it is the open group, still held, and now also in the map.
         let held_after = r.vd.lock().unwrap().held_egroups();
         assert_eq!(held, held_after);
+    }
+
+    // ---- compaction's hooks into the vdisk --------------------------------------------
+
+    #[test]
+    fn a_hold_keeps_drains_off_without_stopping_the_guest_and_lets_them_resume() {
+        let r = rig("compaction-hold", 0, 2 * MIB as u64, 64 * MIB as u64);
+        let hold = r.vd.lock().unwrap().try_hold_drains().expect("no drain was running");
+        assert!(
+            r.vd.lock().unwrap().try_hold_drains().is_none(),
+            "two holds, or a hold beside a drain, would be two writers of the block map"
+        );
+        // Well past the high-water mark, and still acknowledged: only the drain is held off.
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        assert!(r.running(), "a hold is a drain in the gate's eyes");
+        assert!(r.journal_len() >= 3 * MIB as u64, "a drain ran while the gate was held");
+        assert_eq!(r.read(0, 16), fill(1, 16));
+        drop(hold);
+        assert!(!r.running());
+        // The next write finds the journal over the mark and starts the drain again.
+        r.write(3 * MIB as u64, &fill(2, 4096)).unwrap();
+        r.settle();
+        assert!(r.journal_len() < 3 * MIB as u64, "drains did not resume after the hold");
+    }
+
+    #[test]
+    fn an_extent_is_repointed_only_if_it_still_points_where_the_caller_believes() {
+        let r = rig("compaction-repoint", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.settle();
+        let mut v = r.vd.lock().unwrap();
+        let loc = v.map_entry(0).expect("extent 0 was drained");
+        assert!(!v.repoint_extent(0, ("eg-elsewhere", loc.offset, loc.length), "eg-new", 0));
+        assert!(!v.repoint_extent(0, (&loc.egroup_id, loc.offset + 1, loc.length), "eg-new", 0));
+        assert_eq!(v.map_entry(0).unwrap().egroup_id, loc.egroup_id, "a refused repoint moved the entry");
+        assert!(v.repoint_extent(0, (&loc.egroup_id, loc.offset, loc.length), "eg-new", 64));
+        let after = v.map_entry(0).unwrap();
+        assert_eq!((after.egroup_id.as_str(), after.offset), ("eg-new", 64));
+        // The footer travelled with the bytes, so identity and stored length are unchanged.
+        assert_eq!((after.length, after.vdisk_hash), (loc.length, loc.vdisk_hash));
+        assert!(!v.repoint_extent(99, ("x", 0, 0), "y", 0), "an extent that is not mapped cannot be repointed");
+    }
+
+    #[test]
+    fn the_groups_a_drain_is_making_are_named_apart_from_everything_the_map_points_at() {
+        let r = rig("compaction-drain-groups", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.hydra.wait_for_commits(1);
+        let (making, held) = {
+            let v = r.vd.lock().unwrap();
+            (v.drain_groups(), v.held_egroups())
+        };
+        assert_eq!(making.len(), 1, "{making:?}");
+        assert!(held.is_superset(&making));
+        r.hydra.hold(false);
+        r.settle();
     }
 
     // ---- replicas see the drain by sequence, not wholesale ----------------------------

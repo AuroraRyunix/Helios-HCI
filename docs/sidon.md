@@ -408,6 +408,8 @@ Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURA
 valcli storage.placement [N]          # which disk of each node holds which extent groups
 valcli storage.tier [--apply]         # plan, or with --apply make, disk-to-disk moves
 valcli storage.move <egroup> <disk> <node>
+valcli storage.compact [--apply]       # plan, or with --apply compact sparse sealed groups
+valcli storage.dedup.estimate          # read-only: bytes dedup would share beyond clones
 ```
 
 `storage.list` also prints one row per extent-store disk: its identity, the directory it is
@@ -418,6 +420,16 @@ rather than from the daemon's index, and lists a group held twice on one node se
 surplus copy. `storage.tier` plans by default; **on the test nodes, whose two disks are
 identical, it will say there is nothing to decide**, and `storage.move` is how the mechanism
 is exercised there. Neither is a performance result.
+
+`storage.compact` finds sealed groups that are mostly garbage (default: under 50% live) because a guest
+rewrote what they held, copies the live extents into a new group, verifies and replicates it, repoints
+the map by compare-and-swap, and leaves the old groups to the sweep. It plans unless `--apply`, is
+bounded by groups, bytes, rate and time, and never runs on a timer. It leaves alone any group a writable
+vdisk not attached on that node still points into, and it does not free a replica's copy of the old
+group (nothing does yet), so the plan prints what it would add on replicas beside what it would free.
+`storage.dedup.estimate` hashes a sample of sealed extents and reports, per container, what dedup would
+share beyond what clones and snapshots already share; it writes nothing. Both are described in
+[dfs/compaction.md](./dfs/compaction.md).
 
 ### Mounts
 

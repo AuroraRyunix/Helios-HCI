@@ -4368,7 +4368,11 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                     # same reason as heat: which disk a group sits on is a fact about the
                     # node, not about any one vdisk that reads it. `purah-tier` plans
                     # unless told to apply; `purah-move` relocates one named group.
-                    "purah-tier", "purah-move", "purah-placement")
+                    "purah-tier", "purah-move", "purah-placement",
+                    # Compaction of this node's sparse sealed groups, and the read-only dedup
+                    # estimate. Node operations: which groups a node created is a fact about
+                    # the node. `purah-compact` plans unless told to apply.
+                    "purah-compact", "purah-dedup")
     DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS
 
     def handle_dfs_vdisk(self):

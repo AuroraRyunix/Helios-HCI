@@ -28,6 +28,12 @@ The extent ID map (D-23) is staged: Purah's mark phase traverses both map levels
 table and column exist (migrations `0020`, `0021`) with a dormant read path; writing extent ids
 is designed and not built. The rollout procedure is [extent_id_map.md](./extent_id_map.md).
 
+Extent-group **compaction** (copy the live extents of sparse sealed groups into a new group,
+repoint by compare-and-swap, leave the old group to the sweep) and a read-only **dedup
+estimator** are built and operator-invoked (`valcli storage.compact`,
+`valcli storage.dedup.estimate`; D-32, [compaction.md](./compaction.md)). Neither runs on a
+timer, and neither reclaims space on replicas.
+
 Scheduled snapshots with a retention policy, and in-place rollback of a detached vdisk, are
 built -- see [snapshots.md](./snapshots.md). Rolling back an *attached* vdisk is designed and
 deliberately refused: [rollback_attached.md](./rollback_attached.md).
@@ -42,7 +48,7 @@ Several guest requests in flight per NBD connection, and group commit of their j
 are designed and deliberately not built: [group_commit.md](./group_commit.md).
 
 Not built: tiering on a timer or on mixed media, the journal on the fastest disk, writing
-extent ids (D-23 stage 3), dedup, rollback of an attached vdisk, erasure coding (decided
+extent ids (D-23 stage 3), dedup itself (only its estimator exists), compaction on a timer or of groups a drain cannot be excluded from, rollback of an attached vdisk, erasure coding (decided
 against on three nodes, D-24), and `vhost-user-blk` (designed, gated on a benchmark, D-25 and
 [vhost_user_blk.md](./vhost_user_blk.md)). (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
@@ -106,6 +112,8 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 14. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
     `vhost-user-blk` would and would not remove, the invariants it endangers, and the
     benchmark that decides whether to build it.
+15. [compaction.md](./compaction.md) — reclaiming dead extents inside sealed groups, the read-only
+    dedup estimator, what each refuses to touch and why.
 
 ## The one-paragraph version
 
