@@ -114,13 +114,23 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(status, "FAIL", message)
         self.assertIn("systemctl start spark-daemon", message)
 
-    def test_a_lock_held_since_before_startup_fails(self):
-        # The autostart thread returns immediately when the lock exists at startup and
-        # never retries, so the watchdog loop is dead for the life of the process.
+    def test_a_stale_lock_from_before_startup_fails_and_names_the_fix(self):
+        # A lock that has outlived any operation is stale whenever it was taken; the message
+        # tells the operator how to clear it.
         status, message = runner.classify_watchdog(healthy_watchdog_facts(
             lock_present=True, lock_age=200000.0, lock_predates_start=True))
         self.assertEqual(status, "FAIL", message)
-        self.assertIn("systemctl restart spark-daemon", message)
+        self.assertIn(runner.CLUSTER_OP_LOCK, message)
+
+    def test_an_operation_that_began_before_the_daemon_restarted_is_not_a_fault(self):
+        # The startup thread now waits for the operation to finish instead of returning, so a
+        # young lock that predates the process is just an operation in progress -- and without
+        # the watchdog's announcement yet, which is expected while it waits.
+        status, message = runner.classify_watchdog(healthy_watchdog_facts(
+            lock_present=True, lock_age=30.0, lock_predates_start=True,
+            journal_covers_start=True, watchdog_announced=False))
+        self.assertNotEqual(status, "FAIL", message)
+        self.assertIn("cluster operation", message)
 
     def test_a_lock_taken_after_startup_is_not_a_fault(self):
         status, message = runner.classify_watchdog(healthy_watchdog_facts(

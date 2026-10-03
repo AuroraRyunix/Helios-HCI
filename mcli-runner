@@ -750,17 +750,7 @@ def classify_watchdog(facts):
 
     if facts.get("lock_present"):
         age = facts.get("lock_age")
-        if facts.get("lock_predates_start"):
-            fails.append(
-                "%s was already held when spark-daemon started (lock taken %s ago, "
-                "daemon started %s ago). The autostart thread returns immediately in "
-                "that case and the watchdog loop is never entered for the life of the "
-                "process, so nothing has restarted a failed service since. Release the "
-                "lock once the cluster operation has finished ('rm -f %s') and run "
-                "'systemctl restart spark-daemon'."
-                % (CLUSTER_OP_LOCK, human_duration(age),
-                   human_duration(started_ago), CLUSTER_OP_LOCK))
-        elif age is not None and age > CLUSTER_OP_LOCK_FAIL:
+        if age is not None and age > CLUSTER_OP_LOCK_FAIL:
             fails.append(
                 "a cluster operation lock has been held for %s. The watchdog skips every "
                 "pass while %s exists, so nothing has restarted a failed service for "
@@ -779,7 +769,15 @@ def classify_watchdog(facts):
                 % (CLUSTER_OP_LOCK, human_duration(age)))
 
     covers = facts.get("journal_covers_start")
-    if covers is True and not facts.get("watchdog_announced"):
+    held_now = bool(facts.get("lock_present"))
+    if covers is True and not facts.get("watchdog_announced") and held_now:
+        # spark-daemon's startup thread waits for a cluster operation to finish before it begins
+        # supervising, so while one is running the missing announcement is expected -- this is
+        # what a cluster looks like while `cluster create` is still verifying itself. A lock that
+        # outlives the operation is caught above by its age.
+        notes.append("the watchdog has not announced itself yet because a cluster operation "
+                     "holds the lock; spark-daemon starts supervising when it finishes.")
+    elif covers is True and not facts.get("watchdog_announced"):
         fails.append(
             "the journal still holds spark-daemon's startup output for the current run, "
             "and it contains no '[WATCHDOG] Starting service health watchdog' line. The "

@@ -870,6 +870,31 @@ def start_scylla_in_order(ips, restart=None, is_active=None, listening=None, pro
     return None
 
 
+def run_health_checks_settled(ip, runner=None, attempts=4, interval=20, sleep=time.sleep, say=print):
+    """Run Mimir's checks on `ip`, giving a just-created cluster a few chances to settle.
+    Returns (ran_ok, output, failing_lines).
+
+    Some checks are only true a little after the last service starts: bifrost binds the VIP once
+    its health guard sees the console answer, and elections settle. Reporting the first run as
+    "Cluster is not healthy" told an operator a fresh cluster was broken when it was seconds from
+    fine. A check that is still failing after `attempts` runs is reported as it always was.
+    """
+    runner = runner or (lambda: run_remote_spark(ip, "/usr/local/bin/mcli health_checks run_all"))
+    output = ""
+    failing = []
+    for attempt in range(1, attempts + 1):
+        rc, output, _ = runner()
+        if rc != 0:
+            return False, output, []
+        failing = [line for line in output.splitlines() if "[ FAIL ]" in line]
+        if not failing or attempt == attempts:
+            break
+        say(f"{len(failing)} check(s) not passing yet; waiting {interval}s and running them again "
+            f"({attempt}/{attempts - 1})...")
+        sleep(interval)
+    return True, output, failing
+
+
 def unit_action_checked(ip_list, action, units=None, ignore_failed=False):
     """`unit_action_parallel`, exiting on the first node that refuses.
 
@@ -2961,14 +2986,11 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             sys.exit(1)
 
         print("Running diagnostic verification checks using Mimir...")
-        rc_m, out_m, _ = run_remote_spark(ips[0], "/usr/local/bin/mcli health_checks run_all")
-        if rc_m != 0:
+        ran_ok, out_m, failing_lines = run_health_checks_settled(ips[0])
+        if not ran_ok:
             print(f"[ERROR] Mimir health check execution failed.")
             sys.exit(1)
-        fail_count = 0
-        for line in out_m.splitlines():
-            if "[ FAIL ]" in line:
-                fail_count += 1
+        fail_count = len(failing_lines)
         if fail_count > 0:
             print(f"[ERROR] Mimir diagnostic checks found {fail_count} failures! Cluster is not healthy.")
             for line in out_m.splitlines():

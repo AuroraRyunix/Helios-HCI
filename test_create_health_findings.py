@@ -250,5 +250,50 @@ class TheDaemonLogIsLineBuffered(unittest.TestCase):
         self.assertIn("sys.stderr", head)
 
 
+class CreateGivesTheChecksTimeToSettle(unittest.TestCase):
+    def load(self):
+        spec = importlib.util.spec_from_file_location("cn_settle", os.path.join(HERE, "cluster_new.py"))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m
+        spec.loader.exec_module(m)
+        return m
+
+    def run_it(self, outputs, attempts=4):
+        m = self.load()
+        queue = list(outputs)
+        sleeps = []
+        result = m.run_health_checks_settled(
+            "10.0.0.1", runner=lambda: (0, queue.pop(0) if len(queue) > 1 else queue[0], ""),
+            attempts=attempts, interval=20, sleep=sleeps.append, say=lambda *_: None)
+        return result, sleeps
+
+    def test_a_check_that_settles_is_not_reported(self):
+        (ok, out, failing), sleeps = self.run_it(["[ FAIL ] vip", "[ PASS ] vip"])
+        self.assertTrue(ok)
+        self.assertEqual(failing, [])
+        self.assertEqual(sleeps, [20])
+
+    def test_a_check_that_never_settles_is_reported_after_the_last_attempt(self):
+        (ok, out, failing), sleeps = self.run_it(["[ FAIL ] vip"], attempts=3)
+        self.assertEqual(len(failing), 1)
+        self.assertEqual(sleeps, [20, 20], "it should wait between attempts and not after the last")
+
+    def test_a_clean_first_run_does_not_wait(self):
+        (ok, out, failing), sleeps = self.run_it(["[ PASS ] all"])
+        self.assertEqual((failing, sleeps), ([], []))
+
+    def test_a_run_that_cannot_execute_is_not_retried(self):
+        m = self.load()
+        calls = []
+        ok, _, _ = m.run_health_checks_settled(
+            "10.0.0.1", runner=lambda: calls.append(1) or (1, "", "boom"),
+            sleep=lambda s: None, say=lambda *_: None)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), 1)
+
+    def test_create_uses_it(self):
+        self.assertIn("run_health_checks_settled(ips[0])", read("cluster_new.py"))
+
+
 if __name__ == "__main__":
     unittest.main()
