@@ -757,11 +757,15 @@ def cmd_storage_derive(parent, child, kind):
     rc, body, err = run_mtls_spark_api(
         target, "/api/v1/dfs/vdisk",
         {"op": kind, "vdisk_id": parent, "child_id": child})
-    if rc != 0:
-        detail = body.get("error") if isinstance(body, dict) else err
+    # A refusal comes back as rc 0 with the daemon's explanation in the body, so testing rc
+    # alone reported "Snapshot created" for a snapshot Sidon had declined to take.
+    if rc != 0 or (isinstance(body, dict) and body.get("error")):
+        detail = body.get("error") if isinstance(body, dict) and body.get("error") else err
         print("Error: %s of '%s' failed: %s" % (kind, parent, detail))
         sys.exit(1)
 
+    if kind == "snapshot":
+        _index_manual_snapshot(parent, child)
     print("%s '%s' created from '%s'." % (kind.capitalize(), child, parent))
     print("  class    : %s" % body.get("class"))
     print("  size     : %.1f GiB" % ((body.get("size_bytes") or 0) / (1024.0 ** 3)))
@@ -822,6 +826,251 @@ def cmd_storage_children(parent):
           % parent)
     print("mark-sweep reads the whole block map, so an extent group is live while any")
     print("vdisk references it.")
+
+
+def _snapshots_module():
+    """helios_snapshots and helios_schema, or an explanation of which is missing."""
+    try:
+        import helios_snapshots
+        import helios_schema
+        return helios_snapshots, helios_schema
+    except ImportError as exc:
+        print("Error: %s. The snapshot policy needs helios_snapshots.py and "
+              "helios_schema.py installed beside valcli." % exc)
+        sys.exit(1)
+
+
+def _dfs_call(ip, payload):
+    """One `/api/v1/dfs/vdisk` call whose refusal is a failure.
+
+    `run_mtls_spark_api` answers an HTTP 409 with `rc == 0` and the daemon's explanation in
+    the body, so a caller that tests only `rc` reads a refused operation as a successful
+    one. Callers here want a refusal to be an error with the daemon's words attached.
+    """
+    rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", payload)
+    if rc == 0 and isinstance(body, dict) and body.get("error"):
+        return -1, body, body["error"]
+    return rc, body, err
+
+
+def _snapshots_env(say=None):
+    snapshots, _schema = _snapshots_module()
+    return snapshots.Env(
+        run_cql_query, _dfs_call, say=say or print,
+        # Set by Dagur when it runs this as a job, absent from a shell. Absent means the
+        # tasks written here have no parent, which is the truth for a manual run.
+        parent_task_id=os.environ.get("CATALYST_TASK_ID"))
+
+
+def _index_manual_snapshot(parent, child):
+    """Record a snapshot an operator took, so listings can tell it from a policy's.
+
+    Best effort and silent: the snapshot exists whether or not this row does, and an
+    unindexed snapshot is one retention never touches, which is the safe direction.
+    """
+    try:
+        snapshots, _schema = _snapshots_module()
+        runner = snapshots.Runner(_snapshots_env(say=lambda line: None), _schema)
+        runner.record(parent, child, snapshots.ORIGIN_MANUAL, int(time.time() * 1000))
+    except SystemExit:
+        pass
+    except Exception:
+        pass
+
+
+def _age(now_ms, then_ms):
+    try:
+        seconds = max(0, int((now_ms - int(then_ms)) / 1000))
+    except (TypeError, ValueError):
+        return "?"
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+def cmd_storage_snapshots(vdisk_id):
+    """Every snapshot of a vdisk, who took it, and whether anything depends on it.
+
+    Read from `dfs_vdisks` (the lineage, which is always right) and joined with the index
+    (who took it, which is only there for snapshots made since it existed). A snapshot the
+    index has not heard of is shown as `unindexed`, and is never pruned.
+    """
+    snapshots, schema = _snapshots_module()
+    runner = snapshots.Runner(_snapshots_env(), schema)
+    try:
+        vdisks = runner.vdisks()
+        index = dict((r.get("snapshot_id"), r) for r in runner.index(vdisk_id))
+    except RuntimeError as exc:
+        print("Error: %s" % exc)
+        sys.exit(1)
+    referenced = set(v.get("parent_vdisk") for v in vdisks if v.get("parent_vdisk"))
+    now_ms = int(time.time() * 1000)
+    rows = []
+    for v in vdisks:
+        if v.get("parent_vdisk") != vdisk_id or v.get("class") != "immutable":
+            continue
+        sid = v.get("vdisk_id")
+        meta = index.get(sid) or {}
+        rows.append([
+            sid, meta.get("origin") or "unindexed", _age(now_ms, v.get("created_at_ms")),
+            "%.1f" % ((v.get("size_bytes") or 0) / (1024.0 ** 3)),
+            "yes" if sid in referenced else "no",
+        ])
+    if not rows:
+        print("No snapshots of '%s'." % vdisk_id)
+        return
+    print_table(["Snapshot", "Taken by", "Age", "Size (GiB)", "Has children"], sorted(rows))
+    print("")
+    print("'Has children' snapshots are never pruned by retention: a vdisk was derived from them.")
+
+
+def _parse_policy_target(text):
+    """`cluster`, `container:<name>` or `vdisk:<id>` as (scope, target)."""
+    if text == "cluster":
+        return "cluster", "*"
+    scope, _sep, target = text.partition(":")
+    if scope in ("container", "vdisk") and target:
+        return scope, target
+    return None, None
+
+
+def cmd_storage_snapshot_policy():
+    """The policies, narrowest scope first, and what each currently covers."""
+    snapshots, schema = _snapshots_module()
+    runner = snapshots.Runner(_snapshots_env(), schema)
+    try:
+        policies = runner.policies()
+        vdisks = runner.vdisks()
+    except RuntimeError as exc:
+        print("Error: %s" % exc)
+        sys.exit(1)
+    if not policies:
+        print("No snapshot policy is set, so nothing is snapshotted on a schedule.")
+        print("Set one:  valcli storage.snapshot-policy.set cluster --every-hours 24 --keep 7")
+        return
+    rank = dict((s, i) for i, s in enumerate(snapshots.SCOPE_PRECEDENCE))
+    rows = []
+    for p in sorted(policies, key=lambda r: (rank.get(r.get("scope"), 9), r.get("target", ""))):
+        covers = sum(
+            1 for v in vdisks
+            if (v.get("class") or "rw") == "rw"
+            and snapshots.effective_policy(policies, v.get("vdisk_id"), v.get("container")) is p)
+        rows.append([
+            p.get("scope"), p.get("target"),
+            "yes" if p.get("enabled") else "no (exempts)",
+            "%gh" % ((p.get("interval_seconds") or 0) / 3600.0),
+            p.get("keep_last"), covers,
+        ])
+    print_table(["Scope", "Target", "Enabled", "Every", "Keep", "Vdisks covered"], rows)
+    print("")
+    print("The narrowest policy for a vdisk wins. The job runs every %dh, so that is the"
+          % (snapshots.RUN_INTERVAL_SECONDS // 3600))
+    print("shortest interval a policy can keep. Only attached vdisks are snapshotted.")
+
+
+def cmd_storage_snapshot_policy_set(argv):
+    snapshots, schema = _snapshots_module()
+    usage = ("Usage: valcli storage.snapshot-policy.set cluster|container:<name>|vdisk:<id> "
+             "--every-hours N --keep N [--disable]")
+    if len(argv) < 3:
+        print(usage)
+        sys.exit(1)
+    scope, target = _parse_policy_target(argv[2])
+    if scope is None:
+        print(usage)
+        sys.exit(1)
+    options = {"--every-hours": None, "--keep": None}
+    enabled = True
+    i = 3
+    while i < len(argv):
+        if argv[i] == "--disable":
+            enabled = False
+            i += 1
+        elif argv[i] in options and i + 1 < len(argv):
+            options[argv[i]] = argv[i + 1]
+            i += 2
+        else:
+            print(usage)
+            sys.exit(1)
+    try:
+        hours = float(options["--every-hours"]) if options["--every-hours"] else 24.0
+        keep = int(options["--keep"]) if options["--keep"] else 7
+        statement = snapshots.policy_insert_statement(
+            scope, target, enabled, int(hours * 3600), keep, int(time.time() * 1000))
+    except (snapshots.PolicyError, ValueError) as exc:
+        print("Error: %s" % exc)
+        sys.exit(1)
+    rc, _out, err = run_cql_query(statement)
+    if rc != 0:
+        print("Error: could not write the policy: %s" % err)
+        sys.exit(1)
+    print("%s policy for %s: %s, every %gh, keep %d." % (
+        scope, target, "enabled" if enabled else "disabled (an exemption)", hours, keep))
+
+
+def cmd_storage_snapshot_policy_delete(argv):
+    snapshots, _schema = _snapshots_module()
+    if len(argv) < 3:
+        print("Usage: valcli storage.snapshot-policy.delete cluster|container:<name>|vdisk:<id>")
+        sys.exit(1)
+    scope, target = _parse_policy_target(argv[2])
+    if scope is None:
+        print("Usage: valcli storage.snapshot-policy.delete cluster|container:<name>|vdisk:<id>")
+        sys.exit(1)
+    rc, _out, err = run_cql_query(snapshots.policy_delete_statement(scope, target))
+    if rc != 0:
+        print("Error: could not delete the policy: %s" % err)
+        sys.exit(1)
+    print("Deleted the %s policy for %s. Snapshots it already took are kept; "
+          "nothing prunes them any more." % (scope, target))
+
+
+def cmd_storage_snapshot_run(argv):
+    """One pass of the snapshot policy. What the `snapshot_policy` Dagur job executes.
+
+    The exit status is the verdict: non-zero when any snapshot or prune failed, which is what
+    makes Dagur record the run as failed and the console show it. A vdisk skipped because it
+    is not attached is not a failure -- nothing is writing to it, so the newest snapshot is
+    still a true picture of it -- but it is printed, never silent.
+    """
+    snapshots, schema = _snapshots_module()
+    runner = snapshots.Runner(_snapshots_env(), schema, dry_run="--dry-run" in argv)
+    try:
+        summary = runner.run()
+    except RuntimeError as exc:
+        print("Error: %s" % exc)
+        sys.exit(1)
+    print("snapshots taken: %d, pruned: %d, skipped: %d, kept past retention: %d, failed: %d" % (
+        len(summary.taken), len(summary.pruned), len(summary.skipped),
+        len(summary.spared), len(summary.failures)))
+    if not summary.ok:
+        sys.exit(1)
+
+
+def cmd_storage_rollback(argv):
+    snapshots, schema = _snapshots_module()
+    if len(argv) < 4:
+        print("Usage: valcli storage.rollback <vdisk> <snapshot> [--no-keep]")
+        sys.exit(1)
+    vdisk_id, snapshot_id = argv[2], argv[3]
+    runner = snapshots.Runner(_snapshots_env(), schema)
+    try:
+        body = runner.rollback(vdisk_id, snapshot_id, keep="--no-keep" not in argv)
+    except snapshots.RollbackRefused as exc:
+        print("Refused: %s" % exc)
+        sys.exit(1)
+    except (RuntimeError, snapshots.PolicyError) as exc:
+        print("Error: rollback of '%s' to '%s' failed: %s" % (vdisk_id, snapshot_id, exc))
+        sys.exit(1)
+    print("Rolled '%s' back to '%s'." % (vdisk_id, snapshot_id))
+    print("  epoch    : %s -> %s" % (body.get("previous_epoch"), body.get("epoch")))
+    print("  extents  : %s restored from the snapshot, 0 bytes copied" % body.get("extents"))
+    if body.get("kept_as"):
+        print("  kept as  : %s (what the disk held before; roll back to it to undo)"
+              % body.get("kept_as"))
+    print("Start the VM when ready.")
 
 
 def _replication_policy():
@@ -2381,6 +2630,12 @@ def print_usage():
     print("  valcli storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
     print("  valcli storage.clone <vdisk> <name>     Writable copy of a vdisk or snapshot")
     print("  valcli storage.children <vdisk>         Snapshots and clones taken from a vdisk")
+    print("  valcli storage.snapshots <vdisk>        Snapshots of a vdisk, who took them, what depends on them")
+    print("  valcli storage.snapshot-policy          Scheduled snapshot policies and what each covers")
+    print("  valcli storage.snapshot-policy.set cluster|container:<n>|vdisk:<id> --every-hours N --keep N [--disable]")
+    print("  valcli storage.snapshot-policy.delete cluster|container:<n>|vdisk:<id>")
+    print("  valcli storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (the Dagur job)")
+    print("  valcli storage.rollback <vdisk> <snapshot> [--no-keep]  Put a stopped VM's disk back to a snapshot")
     print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
     print("                                          asked for, copies it actually has")
     print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
@@ -2520,6 +2775,21 @@ def main():
             print("Usage: valcli storage.children <vdisk_id>")
             sys.exit(1)
         cmd_storage_children(sys.argv[2])
+    elif cmd == "storage.snapshots":
+        if len(sys.argv) < 3:
+            print("Usage: valcli storage.snapshots <vdisk_id>")
+            sys.exit(1)
+        cmd_storage_snapshots(sys.argv[2])
+    elif cmd == "storage.snapshot-policy":
+        cmd_storage_snapshot_policy()
+    elif cmd == "storage.snapshot-policy.set":
+        cmd_storage_snapshot_policy_set(sys.argv)
+    elif cmd == "storage.snapshot-policy.delete":
+        cmd_storage_snapshot_policy_delete(sys.argv)
+    elif cmd == "storage.snapshot-run":
+        cmd_storage_snapshot_run(sys.argv)
+    elif cmd == "storage.rollback":
+        cmd_storage_rollback(sys.argv)
     elif cmd == "storage.heat":
         limit = 10
         if len(sys.argv) > 2:

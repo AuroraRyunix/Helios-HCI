@@ -46,6 +46,15 @@ mindmap
 - **`backup.*`**: Pass-throughs to `/usr/local/bin/saga` via `run_saga()`, which `exec`s
   the tool with the remaining `sys.argv` and exits with its return code.
 
+- **`storage.snapshots` / `storage.snapshot-policy[.set|.delete]` / `storage.snapshot-run` /
+  `storage.rollback`**: thin handlers over `helios_snapshots.py`, which holds every decision
+  (which policy applies, whether a snapshot is due, what retention may delete, whether a
+  rollback is allowed). `storage.snapshot-run` is the command the `snapshot_policy` Dagur job
+  executes and its exit status is the run's verdict. `_dfs_call` exists because
+  `run_mtls_spark_api` answers a refused operation (HTTP 409) with `rc == 0` and the reason in
+  the body; the snapshot command used to test only `rc` and reported a refusal as "created".
+  See [dfs/snapshots.md](./dfs/snapshots.md).
+
 ### Why `backup.*` shells out instead of calling the API
 
 Every other command here reaches the cluster through Daruk, Spectrum or spark-daemon.

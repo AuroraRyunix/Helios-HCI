@@ -57,6 +57,7 @@ defmodule SpectrumPhxWeb.Router do
       live "/health", Health.IndexLive, :index
 
       live "/storage", Storage.IndexLive, :index
+      live "/storage/vdisks/:vdisk_id/snapshots", Storage.SnapshotsLive, :snapshots
       live "/images", Images.IndexLive, :index
 
       live "/hardware", Hardware.IndexLive, :index

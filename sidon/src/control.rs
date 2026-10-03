@@ -35,6 +35,8 @@ use crate::vdisk::field_u64;
 use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
+mod rollback;
+
 pub struct DaemonConfig {
     pub root: PathBuf,
     pub control_socket: PathBuf,
@@ -312,6 +314,7 @@ impl Daemon {
             "seal" => self.op_seal(req),
             "snapshot" => self.op_snapshot(req),
             "clone" => self.op_clone(req),
+            "rollback" => self.op_rollback(req),
             "resize" => self.op_resize(req),
             "capacity" => self.op_capacity(),
             "peers" => self.op_peers(),
@@ -443,6 +446,12 @@ impl Daemon {
         // says so. Attaching one would present a disk whose extents are half copied --
         // which reads as zeroes where the copy has not reached, and is indistinguishable
         // from a disk that was legitimately never written.
+        if row.get("class").and_then(Value::as_str) == Some(rollback::CLASS_ROLLING_BACK) {
+            return Err(Error::refused(format!(
+                "vdisk {id} is being rolled back to a snapshot and cannot be attached until \
+                 that finishes. Run the rollback again to complete an interrupted one."
+            )));
+        }
         if row.get("class").and_then(Value::as_str) == Some(CLASS_FORMING) {
             return Err(Error::refused(format!(
                 "vdisk {id} is still being formed from its parent and cannot be attached. \

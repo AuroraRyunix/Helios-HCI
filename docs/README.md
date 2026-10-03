@@ -82,6 +82,8 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/ganon.md](./dfs/ganon.md) | The fault-injection harness — built first, calibrated against DRBD. |
 | [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
+| [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (a Dagur job), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
+| [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
 
 Status: **designed, not building** — implementation begins with the harness, not the filesystem.
 

@@ -161,6 +161,7 @@ components_map = {
     # it keeps its .py suffix like the other importable modules here.
     "helios-sig": {"src": "helios_sig.py", "target": "/usr/local/bin/helios_sig.py"},
     "helios-sidon": {"src": "helios_sidon.py", "target": "/usr/local/bin/helios_sidon.py"},
+    "helios-snapshots": {"src": "helios_snapshots.py", "target": "/usr/local/bin/helios_snapshots.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 

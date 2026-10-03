@@ -191,6 +191,20 @@ def clone(vdisk_id, child_id, **kw):
     return call("clone", vdisk_id=vdisk_id, child_id=child_id, **kw)
 
 
+def rollback(vdisk_id, snapshot_id, keep_as=None, **kw):
+    """Replace a detached vdisk's contents with one of its own snapshots, in place.
+
+    Refused unless nothing is serving the vdisk, because a guest cannot be left reading
+    underneath a map swap. The epoch is bumped and every replica's journal discarded, so
+    no copy holding pre-rollback state can be mistaken for current. `keep_as` names an
+    immutable copy of the current state, taken first.
+    """
+    params = dict(kw)
+    if keep_as:
+        params["keep_as"] = keep_as
+    return call("rollback", vdisk_id=vdisk_id, snapshot_id=snapshot_id, **params)
+
+
 def seal(vdisk_id, **kw):
     """Freeze a vdisk to the immutable class, permanently.
 

@@ -314,6 +314,16 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
     end
   end
 
+  describe "snapshots" do
+    test "a writable vdisk links to its snapshots", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      assert view
+             |> element("#snapshots-link-vm-web-01-disk0")
+             |> render() =~ "/storage/vdisks/vm-web-01-disk0/snapshots"
+    end
+  end
+
   describe "a replication link that is down" do
     setup do
       put_source(%{

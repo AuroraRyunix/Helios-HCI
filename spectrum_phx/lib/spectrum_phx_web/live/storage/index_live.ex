@@ -624,6 +624,14 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
               <span :if={vdisk.sealed?} class="badge badge-sm badge-ghost gap-1">
                 <.icon name="hero-lock-closed" class="size-3" /> sealed
               </span>
+              <.link
+                :if={!vdisk.sealed?}
+                navigate={~p"/storage/vdisks/#{vdisk.id}/snapshots"}
+                id={"snapshots-link-" <> slug(vdisk.id)}
+                class="badge badge-sm badge-ghost gap-1 hover:badge-outline"
+              >
+                <.icon name="hero-camera" class="size-3" /> snapshots
+              </.link>
             </div>
           </div>
 

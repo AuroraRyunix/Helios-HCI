@@ -38,6 +38,7 @@ mapping = {
     "HELIOS_SIG_B64": "helios_sig.py",
     "HELIOS_SIDON_B64": "helios_sidon.py",
     "HELIOS_CQL_B64": "helios_cql.py",
+    "HELIOS_SNAPSHOTS_B64": "helios_snapshots.py",
     "IMPA_B64": "impa.py",
     "HELIOS_SCHEMA_B64": "helios_schema.py",
     "SAGA_B64": "saga.py",

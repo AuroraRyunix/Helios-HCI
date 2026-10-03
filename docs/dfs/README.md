@@ -21,8 +21,12 @@ Per-extent-group access data is recorded and ranked -- see D-22 in
 prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; the migration
 half is still not built, and nothing moves an extent group on the strength of the ranking.
 
-Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
-and rollback, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
+Scheduled snapshots with a retention policy, and in-place rollback of a detached vdisk, are
+built -- see [snapshots.md](./snapshots.md). Rolling back an *attached* vdisk is designed and
+deliberately refused: [rollback_attached.md](./rollback_attached.md).
+
+Not built: tiering, the extent ID map (designed and reserved as D-23), rollback of an attached
+vdisk, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
 
 The documents remain the specification -- where code and document disagree, that is a bug
@@ -73,6 +77,10 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 8. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
 9. [multi_disk.md](./multi_disk.md) — using more than one disk per node, and why pooling
    them into one volume group is the wrong answer.
+10. [snapshots.md](./snapshots.md) — scheduled snapshots, retention that never prunes what
+    something depends on, and rollback of a detached vdisk.
+11. [rollback_attached.md](./rollback_attached.md) — the ownership and epoch reasoning for
+    rolling back a vdisk a guest is reading. A design; nothing in it is built.
 
 ## The one-paragraph version
 

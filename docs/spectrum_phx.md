@@ -63,6 +63,7 @@ the socket itself, so a caller cannot name a file at all.
 | `/hosts` | `Cluster.HostsLive` | ZooKeeper + `Spark.host_disks/1` |
 | `/vms`, `/vms/new`, `/vms/:name` | `Vms.*Live` | `hydra.vms`, Spark VM and DFS endpoints |
 | `/storage` | `Storage.IndexLive` | Sidon's `capacity`, `list` and `peers` per node, plus `lsblk` |
+| `/storage/vdisks/:vdisk_id/snapshots` | `Storage.SnapshotsLive` | `hydra.dfs_vdisks` (lineage), `hydra.dfs_snapshot_index`, `hydra.dfs_snapshot_policies`; read-only ([dfs/snapshots.md](./dfs/snapshots.md)) |
 | `/images` | `Images.IndexLive` | `hydra.valhalla_images`, Sidon vdisks |
 | `/tasks` | `Tasks.IndexLive` | `hydra.catalyst_tasks`, read as a tree: `parent_task_id` (column, falling back to the payload key it used to live in), `component` and `sequence_id` |
 | `/metrics` | `Metrics.IndexLive` | `hydra.logos_metrics` |
