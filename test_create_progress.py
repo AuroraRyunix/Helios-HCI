@@ -161,7 +161,7 @@ def phase4_calls():
     body = text[start:end]
     return {
         "zookeeper": body.index("Starting ZooKeeper service"),
-        "scylla": body.index("Starting ScyllaDB Database Service"),
+        "scylla": body.index("start_scylla_in_order(ips)"),
         "daruk": body.index("Daruk query proxy is ready"),
         "sidon": body.index('unit_action_checked(ips, "restart", ["sidon"])'),
         "verify": body.index("wait_for_sidon_capacity(ip)"),

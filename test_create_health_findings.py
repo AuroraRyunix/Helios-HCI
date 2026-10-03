@@ -123,5 +123,123 @@ class AutostartNeverEndsBeforeTheWatchdog(unittest.TestCase):
         self.assertLess(body.index("time.sleep(10)"), body.index("Starting service health watchdog..."))
 
 
+class DestroyWaitsForTheDaemonItRestarted(unittest.TestCase):
+    """`cluster create` straight after `cluster destroy` failed on two nodes with "Remote end
+    closed connection", because destroy returned while the detached spark-daemon restart was
+    still in flight."""
+
+    def load(self):
+        spec = importlib.util.spec_from_file_location("cn_wait", os.path.join(HERE, "cluster_new.py"))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m
+        spec.loader.exec_module(m)
+        return m
+
+    def clock(self):
+        state = {"t": 0.0}
+        return state, (lambda s: state.__setitem__("t", state["t"] + s)), (lambda: state["t"])
+
+    def test_a_daemon_that_drops_out_and_returns_is_waited_for(self):
+        m = self.load()
+        state, sleep, now = self.clock()
+        # After the grace period the daemon is mid-restart: not answering, one stray answer
+        # (a connection accepted just before the process exits), not answering, then back.
+        script = {"10.0.0.1": [False, False, True, False, True, True, True]}
+
+        def probe(ip):
+            seq = script[ip]
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        missing = m.wait_for_spark_daemons(["10.0.0.1"], probe=probe, sleep=sleep, now=now,
+                                           say=lambda *_: None)
+        self.assertEqual(missing, [])
+        self.assertLessEqual(len(script["10.0.0.1"]), 1, "it stopped probing before the daemon was back")
+
+    def test_one_answer_is_not_enough(self):
+        m = self.load()
+        state, sleep, now = self.clock()
+        answers = iter([True, False, True, True])
+        missing = m.wait_for_spark_daemons(["10.0.0.1"], probe=lambda ip: next(answers),
+                                           sleep=sleep, now=now, say=lambda *_: None)
+        self.assertEqual(missing, [])
+
+    def test_a_daemon_that_never_returns_is_reported(self):
+        m = self.load()
+        state, sleep, now = self.clock()
+        missing = m.wait_for_spark_daemons(["10.0.0.1", "10.0.0.2"],
+                                           probe=lambda ip: ip == "10.0.0.1",
+                                           timeout=20, sleep=sleep, now=now, say=lambda *_: None)
+        self.assertEqual(missing, ["10.0.0.2"])
+
+    def test_destroy_uses_it_after_launching_the_restarts(self):
+        text = read("cluster_new.py")
+        phase = text.index("--- Phase 7: Restarting spark-daemon Services")
+        self.assertLess(text.index('["spark-daemon"], detach=True', phase),
+                        text.index("wait_for_spark_daemons(ips)", phase))
+
+
+class ScyllaStartsOneNodeAtATimeSeedFirst(unittest.TestCase):
+    """Starting all three at once left two nodes stuck in Raft group 0 on some runs: the seed could
+    not translate their Raft ids to addresses, and they never listened."""
+
+    def load(self):
+        spec = importlib.util.spec_from_file_location("cn_scylla", os.path.join(HERE, "cluster_new.py"))
+        m = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = m
+        spec.loader.exec_module(m)
+        return m
+
+    def run_it(self, ips, listening_after=None, active=True):
+        m = self.load()
+        events = []
+        listening_after = listening_after or {}
+        started = set()
+
+        def restart(ip):
+            events.append(("restart", ip))
+            started.add(ip)
+
+        def listening(ip):
+            if ip not in started:
+                return False
+            events.append(("listening?", ip))
+            return True
+
+        result = m.start_scylla_in_order(
+            ips, restart=restart, is_active=lambda ip: active, listening=listening,
+            progress=lambda ip: None, sleep=lambda s: None, say=lambda *_: None, listen_seconds=5)
+        return result, events
+
+    def test_each_node_is_listening_before_the_next_is_started(self):
+        result, events = self.run_it(["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertIsNone(result)
+        restarts = [e for e in events if e[0] == "restart"]
+        self.assertEqual([ip for _, ip in restarts], ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
+                         "the seed (first address) must be started first")
+        for ip, nxt in (("10.0.0.1", "10.0.0.2"), ("10.0.0.2", "10.0.0.3")):
+            self.assertLess(events.index(("listening?", ip)), events.index(("restart", nxt)),
+                            "%s was started before %s was listening" % (nxt, ip))
+
+    def test_a_node_that_never_listens_stops_the_sequence_and_is_named(self):
+        m = self.load()
+        restarted = []
+        result = m.start_scylla_in_order(
+            ["10.0.0.1", "10.0.0.2"], restart=restarted.append, is_active=lambda ip: True,
+            listening=lambda ip: ip == "10.0.0.1", progress=lambda ip: None,
+            sleep=lambda s: None, say=lambda *_: None, listen_seconds=3)
+        self.assertIn("10.0.0.2", result)
+        self.assertEqual(restarted, ["10.0.0.1", "10.0.0.2"])
+
+    def test_a_unit_that_does_not_become_active_is_named(self):
+        result, _ = self.run_it(["10.0.0.1"], active=False)
+        self.assertIn("hydra-db failed to start on 10.0.0.1", result)
+
+    def test_create_no_longer_restarts_it_everywhere_at_once(self):
+        text = read("cluster_new.py")
+        body = text[text.index("--- Phase 4: Starting the coordination"):text.index("--- Phase 6: Starting Core")]
+        self.assertNotIn('unit_action_checked(ips, "restart", ["hydra-db"])', body)
+        self.assertIn("start_scylla_in_order(ips)", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -795,6 +795,81 @@ def peer_host_key_command(ips):
             "ssh-keyscan -H $peer >> /root/.ssh/known_hosts 2>/dev/null; done")
 
 
+def wait_for_spark_daemons(ips, probe=None, grace=3, timeout=60, interval=1,
+                           sleep=time.sleep, now=time.time, say=print):
+    """Wait until spark-daemon answers on every host after a detached restart. Returns the hosts
+    that never did.
+
+    `cluster destroy` ends by restarting the daemon on each node, detached, which fires about a
+    second later and takes a few more to complete. It used to return without waiting, so a
+    `cluster create` started straight afterwards could land on a daemon mid-restart and fail its
+    first parallel command with "Remote end closed connection". The grace period is there because
+    the daemon still answers for a moment before the restart takes it down; answering twice in a
+    row after that is what is taken as "back".
+    """
+    probe = probe or (lambda ip: run_remote_spark(ip, "true")[0] == 0)
+    say("Waiting for spark-daemon to come back on %s..." % ", ".join(ips))
+    sleep(grace)
+    started = now()
+    pending = {ip: 0 for ip in ips}
+    while pending and now() - started < timeout:
+        for ip in list(pending):
+            if probe(ip):
+                pending[ip] += 1
+                if pending[ip] >= 2:
+                    del pending[ip]
+            else:
+                pending[ip] = 0
+        if pending:
+            sleep(interval)
+    return sorted(pending)
+
+
+def start_scylla_in_order(ips, restart=None, is_active=None, listening=None, progress=None,
+                          sleep=time.sleep, say=print, listen_seconds=600):
+    """Start ScyllaDB on one node at a time, seed first, each listening before the next starts.
+    Returns None on success, or a sentence saying which node failed and how.
+
+    This used to restart hydra-db on every node at once and then wait. ScyllaDB forms its Raft
+    group 0 as the nodes come up, and nodes that start together can join the group before the
+    first one's gossip has learned who they are: the seed then logs "Raft server id ... cannot be
+    translated to an IP address" thousands of times and the others sit in "ensuring that the
+    cluster has fully upgraded to use Raft" for ever, never listening. It worked on some runs and
+    not others, which is how it was found. Bringing nodes in one at a time is ScyllaDB's own
+    procedure for a new cluster; the first address in the list is the one every node is told to
+    contact, so it goes first.
+    """
+    restart = restart or (lambda ip: unit_action_checked([ip], "restart", ["hydra-db"]))
+    is_active = is_active or (lambda ip: unit_is_active(ip, "hydra-db"))
+    listening = listening or (lambda ip: port_listening(ip, 9042))
+    progress = progress or get_scylla_bootstrap_progress
+    for position, ip in enumerate(ips):
+        role = "the seed" if position == 0 else "joining"
+        say(f"[{ip}] Starting ScyllaDB ({role}; node {position + 1} of {len(ips)})...")
+        restart(ip)
+        for _ in range(40):
+            if is_active(ip):
+                break
+            sleep(1)
+        else:
+            return f"hydra-db failed to start on {ip}"
+        say(f"[{ip}] Waiting for ScyllaDB to listen on port 9042...")
+        last_progress = None
+        for i in range(listen_seconds):
+            if listening(ip):
+                say(f"[{ip}] ScyllaDB is listening.")
+                break
+            if i % 10 == 0:
+                latest = progress(ip)
+                if latest and latest != last_progress:
+                    say(f"[{ip}] ScyllaDB Bootstrap Status: {latest}")
+                    last_progress = latest
+            sleep(1)
+        else:
+            return f"ScyllaDB port 9042 timeout on {ip}"
+    return None
+
+
 def unit_action_checked(ip_list, action, units=None, ignore_failed=False):
     """`unit_action_parallel`, exiting on the first node that refuses.
 
@@ -2635,35 +2710,11 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         if not zk_set:
             print("[WARNING] Could not write cluster state to ZooKeeper.")
 
-        print("Starting ScyllaDB Database Service in parallel...")
-        unit_action_checked(ips, "restart", ["hydra-db"])
-        for ip in ips:
-            for _ in range(40):
-                if unit_is_active(ip, "hydra-db"):
-                    break
-                time.sleep(1)
-            else:
-                print(f"[ERROR] hydra-db failed to start on {ip}")
-                sys.exit(1)
-
-        print("Waiting for ScyllaDB to listen on port 9042 on all nodes...")
-        for ip in ips:
-            print(f"[{ip}] Waiting for ScyllaDB to listen on port 9042...")
-            last_progress = None
-            for i in range(600):
-                if port_listening(ip, 9042):
-                    break
-                
-                # Check and print bootstrap/repair progress every 10 seconds
-                if i % 10 == 0:
-                    progress = get_scylla_bootstrap_progress(ip)
-                    if progress and progress != last_progress:
-                        print(f"[{ip}] ScyllaDB Bootstrap Status: {progress}")
-                        last_progress = progress
-                time.sleep(1)
-            else:
-                print(f"[ERROR] ScyllaDB port 9042 timeout on {ip}")
-                sys.exit(1)
+        print("Starting ScyllaDB one node at a time, seed first...")
+        scylla_error = start_scylla_in_order(ips)
+        if scylla_error:
+            print(f"[ERROR] {scylla_error}")
+            sys.exit(1)
 
         print("Starting Daruk query proxy service on all hosts...")
         unit_action_checked(ips, "restart", ["daruk"])
@@ -3478,6 +3529,9 @@ print("--- Local wipe completed ---", flush=True)
             ok, detail = unit_action(ip, "restart", ["spark-daemon"], detach=True)
             if not ok:
                 print(f"[{ip}] [WARNING] Failed to launch background spark-daemon restart: {detail}")
+        missing = wait_for_spark_daemons(ips)
+        if missing:
+            print(f"[WARNING] spark-daemon did not answer again within 60s on: {', '.join(missing)}")
 
         print("\n==========================================================")
         print("      HCI Cluster Destroyed & Cleaned Successfully!        ")

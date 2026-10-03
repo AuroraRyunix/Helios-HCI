@@ -64,8 +64,9 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
    of it is mounted and nothing is written to `/etc/fstab`: sidon mounts what the file names when it
    starts ([D-27](./dfs/decisions.md)).
 4. **Coordination, metadata and storage.** Writes the per-host configuration, starts ZooKeeper and
-   records the desired state `started`, starts ScyllaDB (waiting for it to listen on 9042) and
-   starts Daruk (waiting for 9043). Only then does it start sidon, which mounts the disks, and
+   records the desired state `started`, starts ScyllaDB one node at a time, seed first, each listening on 9042 before the
+   next starts (all at once, nodes could join Raft group 0 before the seed knew them and never
+   come up), and starts Daruk (waiting for 9043). Only then does it start sidon, which mounts the disks, and
    verify that each node's extent store answers with capacity, waiting up to 90 seconds because
    `systemctl restart` returns before the control socket exists. A disk it could not mount is
    printed as a warning; a node where sidon never answers is shown what sidon itself reports
