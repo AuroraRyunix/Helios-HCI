@@ -1827,6 +1827,15 @@ def init_db():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('helios_update_check', 'update_check', '0 */4 * * *', 14400, true, 0, 'python3 /usr/local/bin/check-updates') IF NOT EXISTS;
     """
+    # Seeded enabled although it does nothing until a policy exists: with no row in
+    # hydra.dfs_snapshot_policies a run reads the table, finds nothing to do and exits 0. An
+    # operator who sets a policy then needs no second step, and a cluster that never does
+    # pays one table read an hour. Hourly because that is the shortest interval a policy can
+    # promise (helios_snapshots.RUN_INTERVAL_SECONDS).
+    insert_snapshot_policy = """
+    INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
+    VALUES ('snapshot_policy', 'snapshot_policy', '0 * * * *', 3600, true, 0, '/usr/local/bin/valcli storage.snapshot-run') IF NOT EXISTS;
+    """
     
     # Define valhalla_images table
 
@@ -1919,6 +1928,7 @@ def init_db():
                 run_conditional_cql_query(insert_orphaned_disks_cleanup)
                 run_conditional_cql_query(insert_metadata_backup)
                 run_conditional_cql_query(insert_helios_update_check)
+                run_conditional_cql_query(insert_snapshot_policy)
                 run_conditional_cql_query(insert_default_network)
                 # Attempt to alter vms table to add network_id
                 run_cql_query("ALTER TABLE hydra.vms ADD network_id text;")

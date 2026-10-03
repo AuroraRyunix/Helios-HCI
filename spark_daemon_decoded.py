@@ -4094,7 +4094,7 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
     # migration capacity gate read unknown and refused every migration, and the console
     # rendered a cluster with no storage in it.
     DFS_VDISK_OPS = ("create", "attach", "detach", "delete", "status", "flush",
-                     "seal", "resize", "snapshot", "clone")
+                     "seal", "resize", "snapshot", "clone", "rollback")
     DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
                     "purah-sweep", "purah-scrub", "purah-heal",
                     # Ranks this node's extent groups by how hot they are. A node
@@ -4128,6 +4128,13 @@ subprocess.run("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /va
         if op in self.DFS_VDISK_OPS and not valid_name(payload.get("vdisk_id")):
             self.reject("Invalid vdisk id")
             return
+
+        # The other vdisk names a rollback carries. They end up in Sidon's SQL as quoted
+        # literals, but a name that could not be a vdisk id has no business reaching it.
+        for extra in ("snapshot_id", "keep_as"):
+            if extra in payload and not valid_name(payload.get(extra)):
+                self.reject("Invalid %s" % extra)
+                return
 
         try:
             sidon = load_sidon_module()

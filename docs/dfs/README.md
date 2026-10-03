@@ -28,8 +28,12 @@ The extent ID map (D-23) is staged: Purah's mark phase traverses both map levels
 table and column exist (migrations `0020`, `0021`) with a dormant read path; writing extent ids
 is designed and not built. The rollout procedure is [extent_id_map.md](./extent_id_map.md).
 
+Scheduled snapshots with a retention policy, and in-place rollback of a detached vdisk, are
+built -- see [snapshots.md](./snapshots.md). Rolling back an *attached* vdisk is designed and
+deliberately refused: [rollback_attached.md](./rollback_attached.md).
+
 Not built: tiering on a timer or on mixed media, the journal on the fastest disk, writing
-extent ids (D-23 stage 3), dedup, scheduled snapshots and rollback, erasure coding (decided
+extent ids (D-23 stage 3), dedup, rollback of an attached vdisk, erasure coding (decided
 against on three nodes, D-24), and `vhost-user-blk` (designed, gated on a benchmark, D-25 and
 [vhost_user_blk.md](./vhost_user_blk.md)). (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
@@ -82,7 +86,11 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 8. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
 9. [multi_disk.md](./multi_disk.md) — using more than one disk per node, and why pooling
    them into one volume group is the wrong answer.
-10. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
+10. [snapshots.md](./snapshots.md) — scheduled snapshots, retention that never prunes what
+    something depends on, and rollback of a detached vdisk.
+11. [rollback_attached.md](./rollback_attached.md) — the ownership and epoch reasoning for
+    rolling back a vdisk a guest is reading. A design; nothing in it is built.
+12. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
     `vhost-user-blk` would and would not remove, the invariants it endangers, and the
     benchmark that decides whether to build it.
 

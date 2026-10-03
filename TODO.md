@@ -1217,8 +1217,42 @@ as data* by DRBD and refused with EIO by Sidon.
   Python keywords -- so *every* sealed image had been loading as writable and the
   immutability check had never once run.
 
-  Still open around it: scheduled snapshots with a retention policy, rollback in place
-  (a clone recovers data; it is not the same as putting a VM back), and a console view.
+  Scheduled snapshots with a retention policy, in-place rollback of a detached vdisk and a
+  read-only console view are built since -- see the next entry.
+* **Scheduled snapshots, retention and rollback.** Built; [docs/dfs/snapshots.md](docs/dfs/snapshots.md).
+  A Dagur job (`snapshot_policy`) runs `valcli storage.snapshot-run`; policy is in
+  `hydra.dfs_snapshot_policies` (migration `0022`) and provenance in `hydra.dfs_snapshot_index`
+  (`0023`); each snapshot, prune and rollback is a child Catalyst task. Rollback is Sidon's new
+  `rollback` op and is refused unless the vdisk is detached. Open around it:
+  * **Rollback of an attached vdisk** is a design, not a feature
+    ([docs/dfs/rollback_attached.md](docs/dfs/rollback_attached.md)): stop the VM, roll back,
+    start it, as one task tree in Vali. Needs a shutdown-deadline policy first.
+  * **The rollback path has no live test.** The refusals are unit-tested (`plan` in
+    `sidon/src/control/rollback.rs`) and the control-plane half is tested against a fake, but
+    nothing has claimed, fenced replicas and swapped a real map on a cluster. Run it on the test
+    cluster, including killing Sidon between the class flip and the map write, before trusting
+    the resume path.
+  * **Pruning has a millisecond window.** Retention re-reads `dfs_vdisks` immediately before each
+    delete, but Sidon's `delete` does not itself refuse a snapshot that has children, so a clone
+    made between that read and the delete orphans its `parent_vdisk` (the data is safe; the
+    lineage record is lost). Closing it wants a conditional delete in Sidon.
+  * **A snapshot is not atomic across a drain.** `derive_child` (`sidon/src/control.rs`) drains the
+    owner's journal and then reads the block map *after* releasing the vdisk lock, so a
+    write-triggered drain at the high-water mark can land its batches between the two and the
+    copy can contain part of a drain. Each extent is individually valid; the set is not
+    necessarily prefix-closed. Holding the lock across the map read fixes it. Found while
+    writing this, not fixed: it is in a function other work is editing, and it predates the
+    schedule, which only makes it likelier to matter.
+  * **No consistency group.** A VM with several disks is snapshotted per vdisk, minutes apart, so
+    a rollback of all of them lands on different moments. See the open questions in
+    `rollback_attached.md`.
+  * **The `<vm>-disk<n>` convention is the only link from a vdisk to its VM**, and the rollback
+    VM-state check depends on it; a vdisk named otherwise is checked by attachment alone.
+  * **The console is read-only** and policy is set only with `valcli`.
+  * **Policy interval is hourly at best**, because the Dagur job is. A finer one needs the job
+    interval lowered, not the policy table changed.
+  * **Task rows carry component `Catalyst`**, matching the scheduled job that parents them. If
+    these should have a component of their own, that is the owner's naming call.
 * **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
   already carries an algorithm byte, so it is off the write path entirely.
 * **Erasure coding**, as a Purah job over cold sealed groups — **decided against on three

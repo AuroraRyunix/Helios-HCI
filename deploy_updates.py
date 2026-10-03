@@ -1146,6 +1146,11 @@ def deploy_to_node(ip):
             print(f"[{ip}] Uploading helios_cql to /usr/local/bin/helios_cql.py...")
             put_text_file(sftp, "helios_cql.py", "/usr/local/bin/helios_cql.py")
 
+            # Imported by valcli for the snapshot policy; has to land before the next
+            # scheduled run of the Dagur job that executes it.
+            print(f"[{ip}] Uploading helios_snapshots to /usr/local/bin/helios_snapshots.py...")
+            put_text_file(sftp, "helios_snapshots.py", "/usr/local/bin/helios_snapshots.py")
+
             # Imported by spectrum_server at runtime, so it needs to be on the host as
             # well as inside the console image.
             print(f"[{ip}] Uploading lanayru to /usr/local/bin/lanayru.py...")

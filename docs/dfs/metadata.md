@@ -242,3 +242,29 @@ arrived while the in-memory tally was at capacity — says which the operator is
 
 **Nothing moves data on the strength of this.** The migration half of tiering is designed in
 [multi_disk.md](./multi_disk.md) and not built; this is the input it was missing.
+
+## 9. Snapshot policy and index
+
+Two tables, migrations `0022` and `0023`, both `CREATE TABLE IF NOT EXISTS`:
+
+```
+dfs_snapshot_policies
+  scope text, target text,            -- cluster/* | container/<name> | vdisk/<id>
+  enabled boolean, interval_seconds int, keep_last int, updated_at_ms bigint,
+  PRIMARY KEY ((scope), target)
+
+dfs_snapshot_index
+  vdisk_id text, created_at_ms bigint, snapshot_id text,
+  origin text,                        -- policy | manual | pre-rollback
+  PRIMARY KEY ((vdisk_id), created_at_ms, snapshot_id)   -- newest first
+```
+
+The policy table is read whole on every run (three partitions, a handful of rows). The index
+exists because `dfs_vdisks.parent_vdisk` records lineage and cannot record *who* took a
+snapshot, and because retention may only delete the policy's own; a snapshot with no index
+row is never pruned. Neither table holds an extent group reference, so Purah's mark phase does
+not read them and nothing in them can keep a dead group alive or hide a live one.
+
+A vdisk may also hold the class `rolling-back` (alongside `rw`, `immutable` and `forming`):
+the state of a vdisk whose map is being replaced by a rollback. Attach refuses it by name, and
+re-running the same rollback completes an interrupted one. See [snapshots.md](./snapshots.md).

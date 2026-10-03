@@ -643,6 +643,50 @@ MIGRATIONS = [
             "ALTER TABLE hydra.dfs_block_map ADD extent_id text;",
         ],
     },
+    {
+        "id": "0022-snapshot-policies",
+        "description": (
+            "When a vdisk is snapshotted on a timer and how many of those snapshots are "
+            "kept. One row per (scope, target): `cluster`/`*` is the default, "
+            "`container`/<name> overrides it for a container and `vdisk`/<id> for one disk, "
+            "narrowest wins. A narrower row with enabled = false is an exemption, which is "
+            "why `enabled` exists at all rather than deleting the row. "
+            "No policy rows means no scheduled snapshots: it is opt-in, because a snapshot "
+            "pins extent groups and a cluster that begins keeping history nobody asked for "
+            "fills its extent stores with it. "
+            "The run itself is a Dagur job (`snapshot_policy`, seeded by the console's "
+            "bootstrap), not a daemon: see docs/dfs/snapshots.md."
+        ),
+        "statements": [
+            # Partitioned by scope: three values, and the whole table is read in one pass
+            # per run. `interval_seconds` is a floor between snapshots, not a clock -- the
+            # job runs hourly and takes one when the newest is at least this old.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_snapshot_policies "
+            "( scope text, target text, enabled boolean, interval_seconds int, "
+            "keep_last int, updated_at_ms bigint, PRIMARY KEY ((scope), target) );",
+        ],
+    },
+    {
+        "id": "0023-snapshot-index",
+        "description": (
+            "Which snapshots of a vdisk exist, when each was taken and who took it. "
+            "`dfs_vdisks.parent_vdisk` already records lineage, but it cannot say whether a "
+            "policy or a person made the snapshot -- and retention must prune only the "
+            "former, because deleting a snapshot an operator took by hand is deleting "
+            "something nobody scheduled. It is also one partition read per vdisk instead of "
+            "a scan of every vdisk in the cluster. "
+            "origin is `policy`, `manual` or `pre-rollback`. A snapshot with no row here "
+            "(taken before this existed, or by a writer that crashed between creating it "
+            "and recording it) is unindexed and therefore never pruned: the failure mode of "
+            "a missing row is a snapshot kept, not one lost."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_snapshot_index "
+            "( vdisk_id text, created_at_ms bigint, snapshot_id text, origin text, "
+            "PRIMARY KEY ((vdisk_id), created_at_ms, snapshot_id) ) "
+            "WITH CLUSTERING ORDER BY (created_at_ms DESC, snapshot_id ASC);",
+        ],
+    },
 ]
 
 

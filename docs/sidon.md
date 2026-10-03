@@ -225,7 +225,13 @@ bytes copied is zero because that is the honest figure.
 valcli storage.snapshot <vdisk> <name>   # point-in-time, read-only
 valcli storage.clone    <vdisk> <name>   # writable
 valcli storage.children <vdisk>          # what was taken from it
+valcli storage.snapshots <vdisk>         # the snapshots, who took each, what depends on it
+valcli storage.rollback <vdisk> <snap>   # put a STOPPED VM's disk back, in place
 ```
+
+Snapshots on a timer, with a retention policy, and rollback of a detached vdisk are built:
+see [dfs/snapshots.md](./dfs/snapshots.md). Rolling back an attached one is a design, not
+a feature: [dfs/rollback_attached.md](./dfs/rollback_attached.md).
 
 Sealed extent groups are immutable, so parent and child share every one of them and
 neither can disturb the other: a write to either is redirect-on-write, appending
@@ -387,13 +393,14 @@ that predates the setting — behaves exactly as it did.
 
 ## 10. What is not built
 
-- **Scheduled snapshots.** Taking one is a command; nothing takes them on a timer, prunes
-  them by a retention policy, or presents them in the console. The mechanism is done and
-  the policy around it is not.
-- **Snapshot rollback.** A clone gives you the old contents under a new name, which is
-  enough to recover data and not the same as putting a VM back. Rolling a vdisk *back* to
-  a snapshot in place needs the ownership and epoch story thought through, because it
-  changes what an attached guest is reading underneath itself.
+- **Rollback of an attached vdisk.** Scheduled snapshots with a retention policy, a read-only
+  console view, and in-place rollback of a *detached* vdisk are built
+  ([dfs/snapshots.md](./dfs/snapshots.md)); a clone still gives the old contents under a new
+  name, and rollback puts the VM's own disk back. What is not built is rolling back a vdisk a
+  guest is reading, because that changes the bytes under the guest's filesystem and no
+  operation in Sidon can make the guest's caches true again. It is refused, and the design for
+  doing it properly (stop the VM, roll back, start it, as one task tree) is
+  [dfs/rollback_attached.md](./dfs/rollback_attached.md).
 - **Tiering, on a timer and on mixed media.** The disk-to-disk move and the pass that plans
   it from the heat ranking are built and operator-invoked
   ([dfs/multi_disk.md](./dfs/multi_disk.md)); what is not built is anything running that pass
