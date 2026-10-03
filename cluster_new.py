@@ -26,6 +26,156 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     run_cql_query,
 )
 
+# Carve the extent store's first volume out of the thin pool, give it a filesystem, register
+# every empty disk and record which filesystems are sidon's. Provisioning does the same for a
+# node being built; this is the copy `cluster create` runs, because `cluster destroy` removes
+# the volume group and a create that only re-claimed the first disk left a node with a thin
+# pool and no volume for sidon to use. Nothing here mounts anything or writes /etc/fstab:
+# sidon mounts what /etc/hci/sidon-disks names, when it starts (D-27). The three scripts are
+# identical in every file that has them; test_multi_disk.py asserts so.
+CARVE_SIDON_VOLUME = r"""
+set -e
+lvs vg_aether/sidon >/dev/null 2>&1 || lvcreate -y -V 150G --thinpool thin_pool_aether -n sidon vg_aether
+blkid /dev/vg_aether/sidon >/dev/null 2>&1 || mkfs.xfs -q /dev/vg_aether/sidon
+"""
+
+CLAIM_EXTRA_DISKS = r"""
+set -e
+MANIFEST=/etc/hci/sidon-disks
+mkdir -p /etc/hci
+claimed_pvs="$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | tr '\n' ' ')"
+added=0
+while read -r name size type _rest; do
+    [ "$type" = "disk" ] || continue
+    dev="/dev/$name"
+    case " $claimed_pvs " in *" $dev "*) continue ;; esac
+    if lsblk -n -o MOUNTPOINT "$dev" | grep -qE '[^[:space:]-]'; then continue; fi
+    if lsblk -n -o TYPE "$dev" | grep -qx part; then continue; fi
+    [ "$size" -ge 100000000000 ] || continue
+
+    if ! blkid "$dev" >/dev/null 2>&1; then
+        mkfs.xfs -q "$dev"
+        echo "formatted $dev"
+    fi
+    # Only an XFS filesystem is an extent store. Anything else already on the disk is
+    # somebody's data and is left exactly as it is.
+    fstype="$(blkid -s TYPE -o value "$dev")"
+    if [ "$fstype" != "xfs" ]; then
+        echo "skipped $dev: it carries a $fstype signature, which is not an extent store"
+        continue
+    fi
+
+    # Registered, and nothing more. The disk is not mounted from here and nothing is
+    # written to /etc/fstab: a line there is what let one late disk fail local-fs.target
+    # and take a node to a console with no network. Sidon mounts what the manifest names,
+    # by filesystem UUID, at its next start, under /var/lib/hci/sidon/disks/<uuid>, and
+    # refuses any path whose disk is not there.
+    uuid="$(blkid -s UUID -o value "$dev")"
+    if ! grep -qs "^$uuid[[:space:]]" "$MANIFEST"; then
+        echo "$uuid extent" >> "$MANIFEST"
+    fi
+    echo "extent store disk: $dev ($uuid) registered in $MANIFEST; sidon mounts it at its next start"
+    added=$((added + 1))
+done <<EOF
+$(lsblk -b -n -o NAME,SIZE,TYPE)
+EOF
+if [ "$added" -eq 0 ]; then
+    echo "no additional empty disk to claim"
+fi
+"""
+
+STAGE_SIDON_DISKS = r"""
+set -e
+MANIFEST=/etc/hci/sidon-disks
+FSTAB=/etc/fstab
+ROOT=/var/lib/hci/sidon
+mkdir -p /etc/hci
+raw="$(mktemp)"
+want="$(mktemp)"
+trap 'rm -f "$raw" "$want"' EXIT
+
+# What sidon is to mount, in priority order: the volume this toolkit carves, what the
+# manifest already says, and what a node built before the manifest declared in fstab. The
+# fstab is only read here, never edited: removing a mount's line is safe, but the mount
+# itself is moved by sidon when it next starts and not by a rollout, because moving a
+# mount under a running sidon is the thing this must never do.
+lv="$(blkid -s UUID -o value /dev/vg_aether/sidon 2>/dev/null || true)"
+[ -z "$lv" ] || echo "$lv journal" >> "$raw"
+[ ! -f "$MANIFEST" ] || awk '!/^[[:space:]]*#/ && NF >= 2 { print $1, $2 }' "$MANIFEST" >> "$raw"
+if [ -f "$FSTAB" ]; then
+    awk -v root="$ROOT" '
+        /^[[:space:]]*#/ { next }
+        NF < 2 { next }
+        $2 == root { print $1, "journal"; next }
+        index($2, root "/") == 1 { print $1, "extent" }
+    ' "$FSTAB" | while read -r spec role; do
+        case "$spec" in
+            UUID=*) uuid="${spec#UUID=}" ;;
+            /dev/*) uuid="$(blkid -s UUID -o value "$spec" 2>/dev/null || true)" ;;
+            *) uuid="" ;;
+        esac
+        [ -z "$uuid" ] || echo "$uuid $role"
+    done >> "$raw"
+fi
+
+# One line per filesystem, the journal volume first. Two sources disagreeing about which is
+# the journal volume are settled in the priority order above, and the loser is kept as an
+# extent disk rather than dropped, so a disagreement shows up as a disk that is absent and
+# reported instead of one that silently stopped being part of the store.
+{
+    echo "# <filesystem-uuid> <journal|extent>: the filesystems sidon mounts itself, under"
+    echo "# $ROOT/disks/<uuid>. Nothing sidon owns is in /etc/fstab. See docs/dfs/multi_disk.md."
+    awk '
+        $1 !~ /^[A-Za-z0-9-]+$/ { next }
+        $2 != "journal" && $2 != "extent" { next }
+        !($1 in seen) { seen[$1] = ++n; order[n] = $1 }
+        $2 == "journal" { claims[$1] = 1 }
+        END {
+            for (i = 1; i <= n; i++) if (claims[order[i]]) { j = order[i]; break }
+            if (j != "") print j, "journal"
+            for (i = 1; i <= n; i++) if (order[i] != j) print order[i], "extent"
+        }
+    ' "$raw"
+} > "$want"
+
+if ! grep -q ' journal$' "$want"; then
+    echo "sidon disks: no journal volume found on this node; manifest left alone"
+elif [ -f "$MANIFEST" ] && cmp -s "$want" "$MANIFEST"; then
+    echo "sidon disks: ok"
+else
+    cat "$want" > "$MANIFEST"
+    chmod 0644 "$MANIFEST"
+    echo "sidon disks: manifest written ($(grep -vc '^#' "$MANIFEST") filesystems); sidon mounts them at its next start"
+fi
+
+# The socket directory libvirt's domain XML names. A plain directory on the root filesystem
+# in the new layout, and already present inside the volume in the old one.
+mkdir -p "$ROOT/nbd"
+if chgrp qemu "$ROOT/nbd" 2>/dev/null; then chmod 0750 "$ROOT/nbd"; fi
+"""
+
+# Take off every mount under the sidon root and forget which filesystems are sidon's. For
+# `cluster destroy`, with sidon already stopped: lazy, because a destroy is meant to leave
+# the disks free to be wiped whatever still has them open. Repeated, because a mount that a
+# later mount covered is only revealed once the cover is gone. Deepest first. A sidon line in
+# an older node's fstab goes too, and the old file is only replaced by a non-empty one.
+SIDON_TEARDOWN = (
+    "for i in 1 2 3 4 5; do "
+    "awk -v r=/var/lib/hci/sidon '$5 == r || index($5, r \"/\") == 1 { print $5 }' /proc/self/mountinfo "
+    "| sort -r | while read -r m; do umount -l \"$m\" 2>/dev/null; done; "
+    "done; "
+    "rm -f /etc/hci/sidon-disks; "
+    "if [ -f /etc/fstab ] && awk -v r=/var/lib/hci/sidon '$2 != r && index($2, r \"/\") != 1' /etc/fstab > /etc/fstab.hci-new "
+    "&& [ -s /etc/fstab.hci-new ]; then cat /etc/fstab.hci-new > /etc/fstab; fi; "
+    "rm -f /etc/fstab.hci-new"
+)
+
+
+def shell_script_command(script):
+    """A multi-line script as one command, so no transport has to quote it."""
+    return "echo " + base64.b64encode(script.encode("utf-8")).decode("ascii") + " | base64 -d | bash"
+
+
 def run_parallel(ips, cmd):
     results = {}
     threads = []
@@ -2228,6 +2378,18 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 print(f"[ERROR] Host {ip} failed disk claiming: {stderr}")
                 sys.exit(1)
 
+        # 3b. The extent store's own volumes.
+        #
+        # `cluster destroy` removes the volume group, so the claim above leaves a node with a
+        # thin pool and nothing for sidon to journal to. Carve the volume, register every
+        # further empty disk and record which filesystems are sidon's. Nothing is mounted
+        # and /etc/fstab is not touched: sidon mounts what /etc/hci/sidon-disks names, by
+        # filesystem UUID, when it starts, and refuses any path whose disk is not there.
+        print("Preparing each node's extent store: volume, further disks, and the disk record...")
+        run_parallel_checked(ips, shell_script_command(CARVE_SIDON_VOLUME))
+        run_parallel_checked(ips, shell_script_command(CLAIM_EXTRA_DISKS))
+        run_parallel_checked(ips, shell_script_command(STAGE_SIDON_DISKS))
+
         # 4. Storage engine setup.
         #
         # What this replaces, in order: create /var/lib/linstor and /etc/linstor on every
@@ -2243,8 +2405,8 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         #
         # Sidon has no controller, no node registry, no storage pools and no database of
         # its own. Its map lives in Hydra, which is already replicated and already backed
-        # up. Provisioning creates the thin LV and the mount; this starts the daemon and
-        # checks that the mount actually took.
+        # up. The step above prepares the volumes; this starts the daemon, which mounts them
+        # by filesystem UUID, and checks that they actually came up.
         print("\n--- Phase 4: Starting the storage data path ---")
         unit_action_checked(ips, "enable", ["sidon"])
         unit_action_checked(ips, "restart", ["sidon"])
@@ -2255,6 +2417,8 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             if rc_cap != 0 or not out_cap.strip():
                 print(f"[ERROR] [{ip}] sidon did not answer on its control socket: "
                       f"{(err_cap or 'no output').strip()[:200]}")
+                print(f"        sidon refuses to start while its journal volume is not mounted. "
+                      f"On {ip}: /usr/local/bin/sidon mounts, and journalctl -u sidon.")
                 return
             try:
                 cap = json.loads(out_cap.strip().splitlines()[0])
@@ -2268,8 +2432,12 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 # and took the host with it -- so this refuses to continue rather than
                 # building a cluster that works until it suddenly does not.
                 print(f"[ERROR] [{ip}] the extent store reports no capacity, which means "
-                      f"it is not mounted. Check vg_aether/sidon and the fstab entry.")
+                      f"none of its disks is mounted. Check /etc/hci/sidon-disks against "
+                      f"`/usr/local/bin/sidon mounts` and vg_aether/sidon.")
                 return
+            for gone in cap.get("absent_disks") or []:
+                print(f"[WARN] [{ip}] disk {gone.get('uuid')} ({gone.get('role')}) is not "
+                      f"available: {gone.get('reason')}")
             print(f"[{ip}] extent store ready: {total / (1024 ** 3):.1f} GiB.")
 
         print("Writing storage pools config and spectrum configuration on all hosts...")
@@ -2915,7 +3083,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("\n--- Phase 4: Stopping the storage data path ---")
         for ip in ips:
             unit_action(ip, "stop", ["sidon"], ignore_failed=True)
-            run_remote_spark(ip, "umount -l /var/lib/hci/sidon || true")
+            run_remote_spark(ip, SIDON_TEARDOWN)
             print(f"[{ip}] storage stopped and unmounted.")
 
         # 5. Wipe LVM vg/thin-pool and disk signatures dynamically
@@ -3143,16 +3311,19 @@ for dev, mount in claimed:
 
 print("Stopping the storage data path...", flush=True)
 run_with_timeout("systemctl stop sidon || true", timeout=15)
-run_with_timeout("umount -l /var/lib/hci/sidon || true", timeout=10)
+run_with_timeout(__SIDON_TEARDOWN__, timeout=30)
 
 print("Removing system containers...", flush=True)
 run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum || true", timeout=15)
 
 print("Removing storage directories...", flush=True)
 run_with_timeout("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", timeout=10)
-run_with_timeout("rm -rf /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", timeout=10)
+run_with_timeout("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", timeout=10)
 print("--- Local wipe completed ---", flush=True)
 """
+        # The teardown is one shell command shared with the unmount above, so the wipe
+        # cannot disagree with it about what sidon's mounts are.
+        wipe_script = wipe_script.replace("__SIDON_TEARDOWN__", repr(SIDON_TEARDOWN))
         wipe_b64 = base64.b64encode(wipe_script.encode()).decode()
         cmd_wipe = f"python3 -c \"import base64; exec(base64.b64decode('{wipe_b64}').decode())\""
         for ip in ips:

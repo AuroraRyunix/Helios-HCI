@@ -404,7 +404,8 @@ impl Daemon {
         // earlier ownership by another node.
         self.replica_store.fence(id, epoch)?;
         self.replica_store.truncate(id, epoch)?;
-        match std::fs::remove_file(self.cfg.root.join("journal").join(format!("{id}.jrn"))) {
+        let journal = crate::mounts::journal_dir(&self.cfg.root)?.join(format!("{id}.jrn"));
+        match std::fs::remove_file(journal) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::io(format!("could not remove the local journal of {id}: {e}"))),

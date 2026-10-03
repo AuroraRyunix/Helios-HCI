@@ -554,7 +554,7 @@ def show_list():
         ("hardware.disk", "disk_space", "Check root OS filesystem usage limits"),
         ("hardware.ntp", "ntp_sync", "Verify chronyd synchronization status and clock offset limit"),
         ("service.spectrum.privileges", "spectrum_privilege_check", "Verify Spectrum container is unprivileged with no host libvirt socket mount"),
-        ("storage.fstab.safety", "fstab_safety_check", "Verify /etc/fstab storage mounts use UUIDs and contain safe timeout flags"),
+        ("storage.fstab.safety", "fstab_safety_check", "Verify /etc/fstab holds no sidon mount (sidon mounts its own disks)"),
         ("storage.broken_disks", "broken_disks_check", "Verify vdisks hold their full replica set and check for stale temporary uploads"),
         ("security.auth.seeding", "auth_seeding_check", "Verify ScyllaDB authentication users table is seeded"),
         ("hardware.dns_ntp.sync", "dns_ntp_sync_check", "Verify DNS and NTP configurations are synchronized with cluster database"),

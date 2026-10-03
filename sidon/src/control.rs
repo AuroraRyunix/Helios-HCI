@@ -128,8 +128,35 @@ fn copies_for_ftt(ftt: u64, nodes: usize) -> usize {
 
 impl Daemon {
     pub fn new(cfg: DaemonConfig) -> Result<Arc<Daemon>> {
-        std::fs::create_dir_all(cfg.root.join("journal"))?;
-        std::fs::create_dir_all(cfg.root.join("egroups"))?;
+        // Before anything is opened. On a node whose filesystems are named in the manifest
+        // this leaves the old layout if the node is in it (nothing of ours is running yet,
+        // which is the only time that is safe) and mounts every disk it can. A node that
+        // cannot say what it has acknowledged does not start: with the journal volume
+        // absent the alternative is journalling onto the root filesystem.
+        if let Some(report) = crate::mounts::prepare(&cfg.root)? {
+            for line in crate::mounts::describe(&report) {
+                println!("sidon: {line}");
+            }
+            for stray in crate::mounts::strays_on_root(&cfg.root) {
+                eprintln!(
+                    "sidon: extent group {} is on the root filesystem. It was written while a \
+                     volume was not mounted; it is left where it is.",
+                    stray.display()
+                );
+            }
+            if !report.journal_present() {
+                return Err(Error::refused(
+                    "the journal volume is not available, so sidon cannot say what it has \
+                     acknowledged and will not start. It retries; see `sidon mounts`."
+                        .to_string(),
+                ));
+            }
+        }
+        // The journal volume on a managed node, the root on an unmanaged one.
+        let volume = crate::mounts::volume_dir(&cfg.root)?;
+        std::fs::create_dir_all(volume.join("journal"))?;
+        std::fs::create_dir_all(volume.join("egroups"))?;
+        // Stays at <root>/nbd on a plain directory: libvirt domain XML names these sockets.
         std::fs::create_dir_all(cfg.root.join("nbd"))?;
         if let Some(parent) = cfg.control_socket.parent() {
             std::fs::create_dir_all(parent)?;
@@ -154,7 +181,7 @@ impl Daemon {
         );
         // Shares the tally, so the reads this node serves to another node's vdisk count.
         let replica_store =
-            Arc::new(ReplicaStore::new(&cfg.root)?.with_access(Arc::clone(&access)));
+            Arc::new(ReplicaStore::new(&volume)?.with_access(Arc::clone(&access)));
         let mut peers = HashMap::new();
         let mut fence_peers = HashMap::new();
         for (node, addr) in &cfg.peers {
@@ -713,6 +740,9 @@ impl Daemon {
                 "vdisk {id} is attached; detach it before deleting"
             )));
         }
+        // Asked before any row is deleted: a deletion that cannot reach the journal volume
+        // must not have half happened.
+        let journal = crate::mounts::journal_dir(&self.cfg.root)?.join(format!("{id}.jrn"));
         let daruk = self.daruk();
         // Map rows first, then the vdisk row. The reverse order would leave orphaned map
         // rows pointing into egroups with no vdisk to explain them, which is exactly the
@@ -725,7 +755,6 @@ impl Daemon {
             "DELETE FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(&id)
         ))?;
-        let journal = self.cfg.root.join("journal").join(format!("{id}.jrn"));
         let _ = std::fs::remove_file(&journal);
         // Extent groups are left for Purah: they may be shared with snapshots, and
         // deleting shared data because one referrer went away is the bug refcounts exist
@@ -1099,7 +1128,12 @@ impl Daemon {
         }
 
         let mut journal = 0u64;
-        if let Ok(entries) = std::fs::read_dir(self.cfg.root.join("journal")) {
+        // Counted only from a journal volume that is there. Asked of the mount layer so that
+        // an absent one reads as no journal bytes and not as the root filesystem's.
+        let journal_entries = crate::mounts::journal_dir(&self.cfg.root)
+            .ok()
+            .and_then(|dir| std::fs::read_dir(dir).ok());
+        if let Some(entries) = journal_entries {
             for entry in entries.flatten() {
                 if let Ok(meta) = entry.metadata() {
                     journal += meta.len();
@@ -1119,6 +1153,9 @@ impl Daemon {
             "journal_bytes": journal,
             "disks": per_disk,
             "disk_count": disks.len(),
+            // Disks the node is configured to have and cannot use now. A missing disk is a
+            // fact about the storage layer, so the storage layer says it, with the reason.
+            "absent_disks": crate::mounts::absent_report(&self.cfg.root),
         }))
     }
 

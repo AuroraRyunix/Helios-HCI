@@ -111,27 +111,30 @@ CERT_SURVEY_INTERVAL = 900
 CERT_CHECK_CATEGORY = "security.mtls.certs"
 CERT_CHECK_NAME = "mtls_cert_expiration"
 
-# Is the extent store actually on the volume it is supposed to be on?
+# Is every disk sidon is meant to use actually there?
 #
-# The sidon mounts carry `nofail`, which they need: without it a data disk that is slow to
-# appear fails local-fs.target and drops the node into emergency mode with no network, and
-# two nodes did exactly that. But nofail trades a loud failure for a silent one. A node
-# whose volume did not mount boots perfectly and sidon writes extent groups to the *root
-# filesystem* at the same path, where they are smaller, slower, un-replicated, and invisible
-# the moment the real volume mounts underneath them.
+# Sidon owns its disks' mounts: /etc/hci/sidon-disks names the filesystems by UUID, sidon
+# mounts them under /var/lib/hci/sidon/disks/<uuid> when it starts, and nothing sidon-related
+# is in /etc/fstab, so a late or missing disk cannot fail the boot and `nofail` is not needed.
+# What is left to survey is the thing that went wrong when it *was* in fstab: a volume that
+# did not mount while sidon carried on and wrote extent groups to the root filesystem at the
+# same path, where they are invisible once the real volume mounts underneath them.
 #
-# That happened here: all three nodes came up with /var/lib/hci/sidon unmounted after an
-# emergency-mode boot, 202 extent groups sat unreachable on the LV, and the only symptom was
-# NBD reads failing for one image. Nothing reported it, because from systemd's point of view
-# a nofail mount that did not happen is not a problem.
+# Sidon now refuses that itself -- no journal volume, no start; no extent disk, no writes to
+# it -- so this is the independent witness rather than the only guard. It judges presence by
+# `stat`, never by a mount table: the directory must be a mount point, must be the device
+# carrying the filesystem UUID the manifest names, and must hold the disk.uid sentinel. A
+# sentinel alone proves nothing (one left on the root filesystem during an unmounted period is
+# exactly what a mount later covers) and `findmnt` listed a shadowed mount as mounted.
 #
-# So this is the detector the nofail change owed. FAIL rather than WARN for the main volume,
-# because writing guest data to the wrong filesystem is the kind of thing that looks fine
-# until the mount succeeds and the data disappears.
+# FAIL rather than WARN for the journal volume: without it sidon cannot say what it has
+# acknowledged. Extra capacity missing is a WARN: the store is smaller than intended, not
+# misplaced.
 STORAGE_SURVEY_INTERVAL = 300
 STORAGE_CHECK_CATEGORY = "storage.sidon.mounts"
 STORAGE_CHECK_NAME = "sidon_volumes_mounted"
 SIDON_ROOT = "/var/lib/hci/sidon"
+SIDON_DISKS_MANIFEST = "/etc/hci/sidon-disks"
 
 def cert_expiry_epoch(cert_path):
     """Return (epoch:int|None, detail:str) for a certificate's notAfter date.
@@ -230,12 +233,56 @@ def survey_mtls_certs(now=None):
                   f"mTLS certificate expiry could not be verified on this node.")
     return status, output
 
+def sidon_declared_disks():
+    """[(filesystem uuid, role)] from /etc/hci/sidon-disks, journal volume first.
+
+    None when the node has no manifest, which is a node the rollout has not reached (or a
+    development host) and not a node with no disks. Read from the file rather than from a
+    fixed list because the extra disks are discovered per host: a node with two spare disks
+    has two more of these than a node with none.
+    """
+    try:
+        with open(SIDON_DISKS_MANIFEST, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    disks = []
+    for raw in text.splitlines():
+        fields = raw.split("#", 1)[0].split()
+        if len(fields) >= 2 and fields[1] in ("journal", "extent"):
+            disks.append((fields[0], fields[1]))
+    disks.sort(key=lambda d: 0 if d[1] == "journal" else 1)
+    return disks
+
+
+def sidon_disk_absence(uuid, root=SIDON_ROOT):
+    """None when the disk is provably mounted where it belongs, otherwise why it is not.
+
+    Three proofs, all by stat (see the comment above): a mount point, the right device, the
+    sentinel. The order matters for the message and not for the verdict.
+    """
+    mount = os.path.join(root, "disks", uuid)
+    by_uuid = os.path.join("/dev/disk/by-uuid", uuid)
+    if not os.path.ismount(mount):
+        if not os.path.exists(by_uuid):
+            return "its device is not attached"
+        return "not mounted (a plain directory on the root filesystem)"
+    try:
+        wanted = os.stat(by_uuid).st_rdev
+    except OSError:
+        return "mounted, but its device is not attached to prove it is the right one"
+    if os.stat(mount).st_dev != wanted:
+        return "something else is mounted there"
+    if not os.path.isfile(os.path.join(mount, "disk.uid")):
+        return "mounted but carries no disk.uid"
+    return None
+
+
 def sidon_fstab_mounts():
     """The sidon mount points /etc/fstab declares, in file order.
 
-    Read from fstab rather than from a hardcoded list, because the extra data disks are
-    discovered per host -- a node with two spare disks has two more of these than a node
-    with none, and a check that assumed a fixed set would be wrong on both.
+    Only for a node that has no manifest yet and so still mounts through fstab; a node the
+    rollout has reached declares nothing here, and a line that is still here is reported.
     """
     targets = []
     try:
@@ -244,36 +291,27 @@ def sidon_fstab_mounts():
                 if line.lstrip().startswith("#"):
                     continue
                 fields = line.split()
-                if len(fields) >= 2 and fields[1].startswith(SIDON_ROOT):
+                if len(fields) >= 2 and (fields[1] == SIDON_ROOT
+                                         or fields[1].startswith(SIDON_ROOT + "/")):
                     targets.append(fields[1])
     except OSError:
         return []
     return targets
 
 
-def survey_sidon_mounts():
-    """(status, output) for whether every declared sidon volume is mounted."""
-    declared = sidon_fstab_mounts()
-    if not declared:
-        return ("WARN",
-                "No sidon mounts are declared in /etc/fstab on this node, so the extent "
-                "store is on the root filesystem by configuration rather than by accident. "
-                "That is valid for a single-filesystem host and worth knowing either way.")
-
+def survey_sidon_fstab_mounts(declared):
+    """The survey for a node that still mounts the extent store through fstab."""
     missing = [t for t in declared if not os.path.ismount(t)]
     if not missing:
         return ("PASS",
-                "Every declared sidon volume is mounted:\n- " + "\n- ".join(declared))
-
-    # The root of the extent store missing is the serious one: sidon keeps writing, to the
-    # wrong filesystem, and says nothing.
+                "Every sidon volume declared in /etc/fstab is mounted (this node has not yet "
+                "moved to the layout where sidon owns its mounts):\n- " + "\n- ".join(declared))
     root_missing = SIDON_ROOT in missing
     status = "FAIL" if root_missing else "WARN"
     detail = [
         "Declared in /etc/fstab and NOT mounted:",
         "- " + "\n- ".join(missing),
         "",
-        "These mounts carry `nofail`, so systemd skipped them without failing the boot. "
         "sidon will have written extent groups to the root filesystem at the same paths, "
         "where they are invisible once the real volume mounts.",
     ]
@@ -285,6 +323,66 @@ def survey_sidon_mounts():
     else:
         detail.append(
             "WARN because the extent store root is mounted; what is missing is additional "
+            "capacity, so the store is smaller than intended rather than misplaced.")
+    return status, "\n".join(detail)
+
+
+def survey_sidon_mounts():
+    """(status, output) for whether every disk sidon is meant to use is there."""
+    disks = sidon_declared_disks()
+    if disks is None:
+        declared = sidon_fstab_mounts()
+        if declared:
+            return survey_sidon_fstab_mounts(declared)
+        return ("WARN",
+                "No %s and no sidon mounts in /etc/fstab, so this node declares no disks "
+                "for sidon and the extent store is on the root filesystem by configuration "
+                "rather than by accident. That is valid for a single-filesystem host and "
+                "worth knowing either way." % SIDON_DISKS_MANIFEST)
+
+    # The old layout, mounted at the root with a disk nested inside it, waiting for sidon's
+    # next start to move it. Its disks are not at the new paths yet, so judging them there
+    # would report a working node as failed.
+    if os.path.ismount(SIDON_ROOT):
+        return ("WARN",
+                "%s is itself a mount: this node is still in the layout where the volume is "
+                "mounted at the sidon root with a disk nested inside it, which a later mount "
+                "of the parent can shadow. The record of its disks is written; sidon moves "
+                "the node to the layout where every disk is a sibling the next time it "
+                "starts (nothing is moved under a running sidon)." % SIDON_ROOT)
+
+    entries = []
+    for uuid, role in disks:
+        entries.append((uuid, role, sidon_disk_absence(uuid)))
+    if not any(role == "journal" for _, role, _ in entries):
+        return ("FAIL",
+                "%s names no journal volume, so sidon will not start: it cannot say what it "
+                "has acknowledged." % SIDON_DISKS_MANIFEST)
+
+    absent = [(u, r, why) for u, r, why in entries if why]
+    if not absent:
+        return ("PASS",
+                "Every sidon disk is mounted and proven to be the filesystem it should be:\n- "
+                + "\n- ".join("%s %s at %s/disks/%s" % (r, u, SIDON_ROOT, u)
+                               for u, r, _ in entries))
+
+    journal_gone = any(role == "journal" for _, role, _ in absent)
+    status = "FAIL" if journal_gone else "WARN"
+    detail = [
+        "Named in %s and NOT usable:" % SIDON_DISKS_MANIFEST,
+        "- " + "\n- ".join("%s %s: %s" % (r, u, why) for u, r, why in absent),
+        "",
+        "Nothing sidon owns is in /etc/fstab, so this did not fail the boot, and sidon "
+        "refuses these paths rather than writing to the root filesystem in their place.",
+    ]
+    if journal_gone:
+        detail.append(
+            "FAIL because the journal volume holds the write-ahead journals and the replica "
+            "state: sidon does not start without it, and retries until it appears. Check "
+            "`/usr/local/bin/sidon mounts` and the device.")
+    else:
+        detail.append(
+            "WARN because the journal volume is mounted; what is missing is additional "
             "capacity, so the store is smaller than intended rather than misplaced.")
     return status, "\n".join(detail)
 

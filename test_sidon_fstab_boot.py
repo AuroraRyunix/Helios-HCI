@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""No extra data disk can cost a node its boot.
+"""No data disk can cost a node its boot, because nothing sidon owns is in /etc/fstab.
 
 Two of three nodes came up in systemd's emergency mode after a power cycle. Emergency mode
-is `local-fs.target` failing, and the entry that failed was the one the toolkit writes for
+is `local-fs.target` failing, and the entry that failed was the one the toolkit wrote for
 each extra extent-store disk:
 
     UUID=5c9e756d-... /var/lib/hci/sidon/disks/sdc xfs defaults,noatime 0 0
@@ -13,16 +13,23 @@ needs two, losing two nodes leaves the survivor's ZooKeeper running and answerin
 That reads as ZooKeeper having failed, which is the expensive part of this bug: the symptom
 appears three layers away from the cause.
 
-The same repository already knew the answer. `provision.py` writes the *parent* sidon volume
-with `nofail,x-systemd.device-timeout=5s` and a comment saying why, and then writes the
-child mounts without either -- in two separate files.
+The first fix was `nofail,x-systemd.device-timeout=5s` on every sidon line, and it bought the
+boot at the price of silence: the parent volume then failed to mount, nothing complained, and
+sidon wrote extent groups to the root filesystem. The property that closes both is stronger
+than either option: **the boot does not know about sidon's disks at all.** A real Nutanix CVM
+mounts none of its storage from fstab, so a missing or late disk cannot fail
+`local-fs.target`, `nofail` has nothing to qualify, and the detector it forced is not needed.
+Mounting is the storage layer's job (D-27).
 
-Two properties are asserted, because fixing one leaves the failure available:
+Three things are asserted, because fixing one leaves the failure available:
 
-  * **every writer** marks sidon mounts non-fatal, so a new node cannot be built broken;
-  * **the rollout repairs what is already written**, because the writers only ever append
-    (`grep -q "$uuid" /etc/fstab` never rewrites an existing line), so the writer fix alone
-    would leave every existing node exactly as breakable as before.
+  * **no writer puts a sidon mount in fstab**, so a node cannot be built able to fail its
+    boot -- the claim step registers a disk in /etc/hci/sidon-disks and mounts nothing;
+  * **staging never edits fstab or mounts anything**, so a rollout reaches a node that already
+    exists without moving a mount under a running sidon;
+  * **a node that has not yet moved still cannot fail its boot**: until sidon next starts,
+    its old fstab lines are what the boot is made of, and the rollout repairs the ones that
+    would. The writers only ever appended, and a repair is not an append.
 
 Run with:  python -m unittest test_sidon_fstab_boot
 """
@@ -37,8 +44,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# Every file that appends a sidon mount to /etc/fstab.
-FSTAB_WRITERS = ("provision.py", "deploy_updates.py")
+# Every file that used to put a sidon mount in /etc/fstab, and the scripts that replaced it.
+FSTAB_WRITERS = ("provision.py", "deploy_updates.py", "cluster_new.py", "spark_daemon_decoded.py")
 
 # The fstab as the broken nodes actually had it, read off 10.10.102.41. The last line is
 # the one that boots a host into emergency mode when its disk is late.
@@ -97,38 +104,75 @@ def sidon_lines(fstab_text):
             and line.split()[1].startswith("/var/lib/hci/sidon")]
 
 
+def script(name, const):
+    match = re.search(r'%s = r"""(.*?)"""' % const, read(name), re.S)
+    assert match, "%s does not define %s" % (name, const)
+    return match.group(1)
+
+
 class NoWriterCanBuildABrokenNode(unittest.TestCase):
-    def test_every_sidon_fstab_line_a_writer_emits_is_non_fatal(self):
+    """The boot must not know about sidon's disks, so no writer may tell it."""
+
+    def test_no_writer_appends_to_or_rewrites_fstab_with_a_sidon_mount(self):
         for name in FSTAB_WRITERS:
             source = read(name)
-            emitted = re.findall(
-                r'echo "UUID=\$uuid \$target xfs ([^"]+)" >> /etc/fstab', source)
-            self.assertTrue(
-                emitted, "%s no longer appends a sidon mount; has the block moved?" % name)
-            for options in emitted:
-                self.assertIn(
-                    "nofail", options,
-                    "%s writes a sidon mount without nofail, so one late disk boots the "
-                    "node into emergency mode" % name)
-                self.assertIn("x-systemd.device-timeout=", options, name)
+            for match in re.finditer(r'>>\s*/etc/fstab', source):
+                line = source[source.rfind("\n", 0, match.start()) + 1:
+                              source.find("\n", match.end())]
+                self.fail("%s still appends to /etc/fstab: %s" % (name, line.strip()))
 
-    def test_the_parent_volume_is_still_non_fatal_too(self):
-        """It always was. This is the line the fix was copied *from*, and a regression here
-        would be the same outage from the other direction."""
-        provision = read("provision.py")
-        self.assertIn("defaults,noatime,nofail,x-systemd.device-timeout=5s", provision)
+    def test_the_claim_and_stage_scripts_only_read_fstab(self):
+        """STAGE reads it, to learn what an older node declared, and must never write it."""
+        for const in ("CLAIM_EXTRA_DISKS", "STAGE_SIDON_DISKS"):
+            text = script("provision.py" if const == "CLAIM_EXTRA_DISKS" else "deploy_updates.py", const)
+            for line in text.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                self.assertNotRegex(
+                    line, r'>\s*"?\$?\{?(FSTAB|/etc/fstab)',
+                    "%s writes fstab: %s" % (const, line.strip()))
+                self.assertNotRegex(
+                    line, r'sed\s+-i.*fstab|mount\s+"?\$|mount\s+--',
+                    "%s edits fstab or mounts something: %s" % (const, line.strip()))
 
-    def test_the_writers_agree_with_each_other(self):
-        """The options existed in three places and disagreed in two of them. Divergence is
-        the bug, not the spelling."""
-        option_sets = set()
+    def test_nothing_the_toolkit_writes_carries_nofail_any_more(self):
+        """`nofail` qualified a line that is no longer written. Leaving it in a writer is a
+        dead option, and a reader of it would conclude fstab is still where sidon mounts."""
+        # deploy_updates.py is exempt: its transitional repair adds the option to the lines an
+        # unmoved node still has.
+        for name in ("provision.py", "cluster_new.py", "spark_daemon_decoded.py"):
+            for line in read(name).splitlines():
+                if "nofail" in line and not line.lstrip().startswith("#"):
+                    self.fail("%s writes or tests `nofail` in code: %s" % (name, line.strip()))
+
+    def test_the_toolkit_no_longer_mounts_the_sidon_root_by_name(self):
+        """`mount /var/lib/hci/sidon` has no fstab line to resolve against, so a create that
+        still ran it would fail on every node built this way."""
         for name in FSTAB_WRITERS:
-            for options in re.findall(
-                    r'echo "UUID=\$uuid \$target xfs ([^"]+)" >> /etc/fstab', read(name)):
-                option_sets.add(options)
-        self.assertEqual(
-            len(option_sets), 1,
-            "the writers emit different mount options: %s" % sorted(option_sets))
+            self.assertNotRegex(
+                read(name), r'mount /var/lib/hci/sidon(?!/)\s*["\'\)]',
+                "%s still mounts the sidon root by name" % name)
+
+
+class StagingNeverMovesAMount(unittest.TestCase):
+    """A rollout reaches nodes that are serving guests."""
+
+    def setUp(self):
+        self.script = script("deploy_updates.py", "STAGE_SIDON_DISKS")
+
+    def test_it_neither_mounts_unmounts_nor_edits_fstab(self):
+        code = "\n".join(l for l in self.script.splitlines() if not l.lstrip().startswith("#"))
+        for forbidden in ("umount", "mount ", "sed -i", "> \"$FSTAB\"", ">> \"$FSTAB\"",
+                          "systemctl"):
+            self.assertNotIn(forbidden, code, "staging does %r" % forbidden)
+
+    def test_the_rollout_stages_after_claiming_and_before_it_repairs(self):
+        deploy = read("deploy_updates.py")
+        claim = deploy.index("ssh.exec_command(CLAIM_EXTRA_DISKS)")
+        stage = deploy.index("ssh.exec_command(STAGE_SIDON_DISKS)")
+        repair = deploy.index("ssh.exec_command(RECONCILE_SIDON_FSTAB)")
+        self.assertLess(claim, stage, "the record is staged before the disks are registered")
+        self.assertLess(stage, repair)
 
 
 class TheRolloutRepairsWhatIsAlreadyThere(unittest.TestCase):

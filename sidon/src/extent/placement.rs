@@ -438,6 +438,11 @@ impl EgroupStore {
             .disks
             .iter()
             .map(|d| {
+                // A disk that is not mounted offers no room. `statvfs` on its path would
+                // answer for the root filesystem underneath it, which has plenty.
+                if !d.present() {
+                    return Room { tier: d.tier, total: 0, avail: 0 };
+                }
                 let (total, avail) = disk_space(&d.root).unwrap_or((0, 0));
                 Room { tier: d.tier, total, avail }
             })
@@ -514,6 +519,16 @@ impl EgroupStore {
         if from == to || from >= self.disks.len() || to >= self.disks.len() {
             return Err(Error::refused(format!("extent group {id}: no move between disk slots {from} and {to}")));
         }
+        for slot in [from, to] {
+            if !self.disks[slot].present() {
+                return Err(Error::refused(format!(
+                    "extent group {id}: disk {} is not mounted at {}, so nothing is copied to or \
+                     from the filesystem underneath it",
+                    self.disks[slot].uid,
+                    self.disks[slot].root.display()
+                )));
+            }
+        }
         let name = Self::file_name(id);
         let src_path = self.disks[from].root.join(&name);
         let dst_dir = &self.disks[to].root;
@@ -583,6 +598,12 @@ impl EgroupStore {
     /// directory is fsynced so the name survives a power cut. After this there are two
     /// valid copies, and any crash from here on leaves a surplus, never a shortage.
     pub fn stage_publish(&self, id: &str, to: usize, temp: &Path) -> Result<()> {
+        if !self.disks[to].present() {
+            return Err(Error::refused(format!(
+                "extent group {id}: disk {} is no longer mounted; the copy is not published",
+                self.disks[to].uid
+            )));
+        }
         let dir = &self.disks[to].root;
         let final_path = dir.join(Self::file_name(id));
         if final_path.exists() {
@@ -824,7 +845,7 @@ mod tests {
         let root = parent.join("disks").join(label).join("egroups");
         std::fs::create_dir_all(&root).unwrap();
         let (uid, persisted) = identify(&root, label);
-        Disk { id: label.to_string(), root, uid, uid_persisted: persisted, tier }
+        Disk { id: label.to_string(), root, uid, uid_persisted: persisted, tier, guard: None }
     }
 
     /// A sealed group of `n` extents on the given disk, as the drain would have left it.
@@ -1028,7 +1049,7 @@ mod tests {
         let roots: Vec<Disk> = ["d0", "d1"].iter().map(|l| {
             let root = dir.join("disks").join(l).join("egroups");
             let (uid, p) = identify(&root, l);
-            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown }
+            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown, guard: None }
         }).collect();
         let reopened = EgroupStore::open(roots, 1 << 20).unwrap();
         assert_eq!(reopened.copies("eg-c1"), vec![from],
@@ -1052,7 +1073,7 @@ mod tests {
         let roots: Vec<Disk> = ["d0", "d1"].iter().map(|l| {
             let root = dir.join("disks").join(l).join("egroups");
             let (uid, p) = identify(&root, l);
-            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown }
+            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown, guard: None }
         }).collect();
         let reopened = EgroupStore::open(roots, 1 << 20).unwrap();
         assert_eq!(reopened.copies("eg-c2").len(), 2);
@@ -1105,7 +1126,7 @@ mod tests {
         let roots: Vec<Disk> = ["d0", "d1"].iter().map(|l| {
             let root = dir.join("disks").join(l).join("egroups");
             let (uid, p) = identify(&root, l);
-            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown }
+            Disk { id: l.to_string(), root, uid, uid_persisted: p, tier: Tier::Unknown, guard: None }
         }).collect();
         let reader = EgroupStore::open(roots, 1 << 20).unwrap();
         assert_eq!(reader.read_extent("eg-s", off, stored, vh, 7).unwrap().len(), 8192);

@@ -222,22 +222,18 @@ PY
 # restarting the consensus layer on all of them at once is how a rollout takes quorum
 # away. The unit is reloaded so the change is staged, and the operator is told it needs a
 # rolling restart -- which `cluster add-node` already knows how to do one node at a time.
-# Make an existing node's sidon mounts survive a disk that is not there.
+# Make a not-yet-moved node's sidon mounts survive a disk that is not there.
 #
-# A node whose extra data disk is slow to appear, or whose UUID moved, fails
-# local-fs.target and boots into emergency mode: no network, no SSH, console only. Two of
-# three nodes did exactly that, which takes quorum with them and leaves the survivor's
-# ZooKeeper running but answering nothing -- correct behaviour that reads as a ZooKeeper
-# fault.
+# Transitional. A node built before D-27 declares its sidon mounts in /etc/fstab, and until
+# sidon next starts and moves it to the layout where sidon owns them, those lines are what
+# the boot is made of. A node whose extra data disk is slow to appear, or whose UUID moved,
+# fails local-fs.target and boots into emergency mode: no network, no SSH, console only.
+# Two of three nodes did exactly that, which takes quorum with them and leaves the
+# survivor's ZooKeeper running but answering nothing.
 #
-# The writers are fixed, but they only ever *append*: `grep -q "$uuid" /etc/fstab` means a
-# line already present is never rewritten, so every node provisioned before the fix keeps
-# the fstab that breaks it. This is the repair, and it is why the fix is not just the two
-# one-line changes to the writers.
-#
-# Additive and idempotent: it adds only the options that are missing, to sidon mounts only,
-# and leaves every other line byte-identical. A reflowed root filesystem entry is not worth
-# the tidiness.
+# It only *adds options to lines that are there*; it never writes a sidon line. Once a node
+# has moved, fstab holds none and this reports ok. Additive and idempotent, and it leaves
+# every other line byte-identical.
 RECONCILE_SIDON_FSTAB = r"""
 set -e
 FSTAB=/etc/fstab
@@ -362,8 +358,8 @@ PY
 # nodes and another way on the rest. test_multi_disk.py asserts they match.
 CLAIM_EXTRA_DISKS = r"""
 set -e
-SIDON_DISKS=/var/lib/hci/sidon/disks
-mkdir -p "$SIDON_DISKS"
+MANIFEST=/etc/hci/sidon-disks
+mkdir -p /etc/hci
 claimed_pvs="$(pvs --noheadings -o pv_name 2>/dev/null | tr -d ' ' | tr '\n' ' ')"
 added=0
 while read -r name size type _rest; do
@@ -374,33 +370,28 @@ while read -r name size type _rest; do
     if lsblk -n -o TYPE "$dev" | grep -qx part; then continue; fi
     [ "$size" -ge 100000000000 ] || continue
 
-    target="$SIDON_DISKS/$name"
-    mkdir -p "$target"
     if ! blkid "$dev" >/dev/null 2>&1; then
         mkfs.xfs -q "$dev"
         echo "formatted $dev"
     fi
-    uuid="$(blkid -s UUID -o value "$dev")"
-    if ! grep -q "$uuid" /etc/fstab 2>/dev/null; then
-        # nofail and a device timeout, the same as the sidon volume this sits inside.
-        #
-        # Without them a data disk that is slow to appear, or whose UUID moved, fails
-        # local-fs.target and drops the whole node into emergency mode at boot -- no
-        # network, no SSH, console only. Two of three nodes did exactly that, and because
-        # a three-node ensemble needs two, the survivor's ZooKeeper then ran and answered
-        # nothing, which reads as a ZooKeeper fault three layers from the cause.
-        #
-        # The nesting matters too. This path is inside /var/lib/hci/sidon, which is itself
-        # a nofail mount, so systemd orders this after it and refuses it if the parent was
-        # skipped. Without nofail here, that refusal is what reaches emergency mode.
-        #
-        # One extra disk is not worth a node: sidon copes with a store that is not there.
-        echo "UUID=$uuid $target xfs defaults,noatime,nofail,x-systemd.device-timeout=5s 0 0" >> /etc/fstab
+    # Only an XFS filesystem is an extent store. Anything else already on the disk is
+    # somebody's data and is left exactly as it is.
+    fstype="$(blkid -s TYPE -o value "$dev")"
+    if [ "$fstype" != "xfs" ]; then
+        echo "skipped $dev: it carries a $fstype signature, which is not an extent store"
+        continue
     fi
-    mountpoint -q "$target" || mount "$target"
-    mkdir -p "$target/egroups"
-    chown root:qemu "$target/egroups" 2>/dev/null || true
-    echo "extent store disk: $dev at $target"
+
+    # Registered, and nothing more. The disk is not mounted from here and nothing is
+    # written to /etc/fstab: a line there is what let one late disk fail local-fs.target
+    # and take a node to a console with no network. Sidon mounts what the manifest names,
+    # by filesystem UUID, at its next start, under /var/lib/hci/sidon/disks/<uuid>, and
+    # refuses any path whose disk is not there.
+    uuid="$(blkid -s UUID -o value "$dev")"
+    if ! grep -qs "^$uuid[[:space:]]" "$MANIFEST"; then
+        echo "$uuid extent" >> "$MANIFEST"
+    fi
+    echo "extent store disk: $dev ($uuid) registered in $MANIFEST; sidon mounts it at its next start"
     added=$((added + 1))
 done <<EOF
 $(lsblk -b -n -o NAME,SIZE,TYPE)
@@ -409,6 +400,84 @@ if [ "$added" -eq 0 ]; then
     echo "no additional empty disk to claim"
 fi
 """
+
+# Record which filesystems are sidon's, in /etc/hci/sidon-disks, keyed by filesystem UUID.
+# This is the one source of truth for "which devices are mine": sidon mounts what it names
+# and the Mimir survey reads it. It converges rather than appends -- it rebuilds the list
+# from the volume this toolkit carves, what is already recorded and what an older node still
+# declares in fstab, and rewrites the file when that differs -- because a writer that only
+# appends never repairs a node that already has the old state. Identical in every file that
+# has it; test_multi_disk.py asserts so.
+STAGE_SIDON_DISKS = r"""
+set -e
+MANIFEST=/etc/hci/sidon-disks
+FSTAB=/etc/fstab
+ROOT=/var/lib/hci/sidon
+mkdir -p /etc/hci
+raw="$(mktemp)"
+want="$(mktemp)"
+trap 'rm -f "$raw" "$want"' EXIT
+
+# What sidon is to mount, in priority order: the volume this toolkit carves, what the
+# manifest already says, and what a node built before the manifest declared in fstab. The
+# fstab is only read here, never edited: removing a mount's line is safe, but the mount
+# itself is moved by sidon when it next starts and not by a rollout, because moving a
+# mount under a running sidon is the thing this must never do.
+lv="$(blkid -s UUID -o value /dev/vg_aether/sidon 2>/dev/null || true)"
+[ -z "$lv" ] || echo "$lv journal" >> "$raw"
+[ ! -f "$MANIFEST" ] || awk '!/^[[:space:]]*#/ && NF >= 2 { print $1, $2 }' "$MANIFEST" >> "$raw"
+if [ -f "$FSTAB" ]; then
+    awk -v root="$ROOT" '
+        /^[[:space:]]*#/ { next }
+        NF < 2 { next }
+        $2 == root { print $1, "journal"; next }
+        index($2, root "/") == 1 { print $1, "extent" }
+    ' "$FSTAB" | while read -r spec role; do
+        case "$spec" in
+            UUID=*) uuid="${spec#UUID=}" ;;
+            /dev/*) uuid="$(blkid -s UUID -o value "$spec" 2>/dev/null || true)" ;;
+            *) uuid="" ;;
+        esac
+        [ -z "$uuid" ] || echo "$uuid $role"
+    done >> "$raw"
+fi
+
+# One line per filesystem, the journal volume first. Two sources disagreeing about which is
+# the journal volume are settled in the priority order above, and the loser is kept as an
+# extent disk rather than dropped, so a disagreement shows up as a disk that is absent and
+# reported instead of one that silently stopped being part of the store.
+{
+    echo "# <filesystem-uuid> <journal|extent>: the filesystems sidon mounts itself, under"
+    echo "# $ROOT/disks/<uuid>. Nothing sidon owns is in /etc/fstab. See docs/dfs/multi_disk.md."
+    awk '
+        $1 !~ /^[A-Za-z0-9-]+$/ { next }
+        $2 != "journal" && $2 != "extent" { next }
+        !($1 in seen) { seen[$1] = ++n; order[n] = $1 }
+        $2 == "journal" { claims[$1] = 1 }
+        END {
+            for (i = 1; i <= n; i++) if (claims[order[i]]) { j = order[i]; break }
+            if (j != "") print j, "journal"
+            for (i = 1; i <= n; i++) if (order[i] != j) print order[i], "extent"
+        }
+    ' "$raw"
+} > "$want"
+
+if ! grep -q ' journal$' "$want"; then
+    echo "sidon disks: no journal volume found on this node; manifest left alone"
+elif [ -f "$MANIFEST" ] && cmp -s "$want" "$MANIFEST"; then
+    echo "sidon disks: ok"
+else
+    cat "$want" > "$MANIFEST"
+    chmod 0644 "$MANIFEST"
+    echo "sidon disks: manifest written ($(grep -vc '^#' "$MANIFEST") filesystems); sidon mounts them at its next start"
+fi
+
+# The socket directory libvirt's domain XML names. A plain directory on the root filesystem
+# in the new layout, and already present inside the volume in the old one.
+mkdir -p "$ROOT/nbd"
+if chgrp qemu "$ROOT/nbd" 2>/dev/null; then chmod 0750 "$ROOT/nbd"; fi
+"""
+
 
 DRBD_TEARDOWN = """# Tear down what is left of DRBD on a node upgraded from a DRBD cluster.
 #
@@ -1402,6 +1471,18 @@ def deploy_to_node(ip):
                 if line.strip():
                     print(f"[{ip}] {line.strip()}")
 
+            # Stage the record of which filesystems are sidon's: /etc/hci/sidon-disks, from
+            # the volume the toolkit carved and from the fstab lines an older node still
+            # carries. This only *writes the record*. It mounts nothing, unmounts nothing
+            # and edits no fstab line, so it is safe under a running sidon. The node moves
+            # to the new layout when sidon next starts, which is the first moment nothing
+            # of sidon's is holding a mount; see docs/dfs/multi_disk.md.
+            _, stdout_sg, _ = ssh.exec_command(STAGE_SIDON_DISKS)
+            sg_said = stdout_sg.read().decode("utf-8", "replace").strip()
+            stdout_sg.channel.recv_exit_status()
+            if sg_said and not sg_said.endswith("ok"):
+                print(f"[{ip}] {sg_said}")
+
             print(f"[{ip}] Writing the ScyllaDB rack/datacenter properties...")
             _, stdout_rk, _ = ssh.exec_command(
                 "mkdir -p /etc/hci/hydra && "
@@ -1493,10 +1574,13 @@ def deploy_to_node(ip):
             if zk_said and not zk_said.endswith("ok"):
                 print(f"[{ip}] {zk_said}")
 
-            # Repair the fstab the writers used to produce. Safe to run on every node every
-            # time, and it has to be here rather than only in the writers, because those
-            # only append: a line already in the file is never rewritten, so a node
-            # provisioned before the fix keeps the fstab that boots it into emergency mode.
+            # Repair the fstab the writers used to produce, for a node that has not yet
+            # moved to the layout where sidon owns its mounts and fstab has no sidon line.
+            # Until sidon next starts such a node still boots from these lines, so they must
+            # not be able to fail the boot. Safe to run on every node every time, and it
+            # has to be here rather than only in the writers: a line already in the file was
+            # never rewritten, so a node provisioned before the fix kept the fstab that
+            # boots it into emergency mode. On a node already moved there is nothing to do.
             _, stdout_fs, _ = ssh.exec_command(RECONCILE_SIDON_FSTAB)
             fs_said = stdout_fs.read().decode("utf-8", "replace").strip()
             stdout_fs.channel.recv_exit_status()

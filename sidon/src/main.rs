@@ -21,6 +21,7 @@ mod extent_resolve;
 mod heat;
 mod journal;
 mod meta;
+mod mounts;
 mod nbd;
 mod overlay;
 mod peer;
@@ -181,6 +182,13 @@ fn node_name() -> String {
 }
 
 fn main() {
+    // `sidon mounts [apply]`: what is mounted and what is expected, and the one way to move
+    // an old node's layout without starting the daemon. It never starts one.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("mounts") {
+        std::process::exit(mounts::command(&args[1..]));
+    }
+
     // Resolved before the config, because the bind address and the peer list are both
     // "everyone in the cluster document except me" and need to know which one is me.
     let node = node_name();

@@ -521,6 +521,7 @@ def cmd_storage_list():
     print("=== Extent Store ===")
     store_rows = []
     disk_rows = []
+    absent_rows = []
     for host in hosts:
         ip = host.get("ip")
         if not ip:
@@ -544,6 +545,10 @@ def cmd_storage_list():
         ])
         for disk in body.get("disks") or []:
             disk_rows.append(_disk_row(body.get("node") or host.get("hostname") or ip, disk))
+        for gone in body.get("absent_disks") or []:
+            absent_rows.append([body.get("node") or host.get("hostname") or ip,
+                                gone.get("uuid") or "?", gone.get("role") or "?",
+                                gone.get("reason") or "?"])
     print_table(["Node", "State", "Total", "Used", "Extent groups", "Journal"], store_rows)
     print()
     if disk_rows:
@@ -554,6 +559,14 @@ def cmd_storage_list():
         print("  directory it is mounted at, which is only a label; Device is what the kernel")
         print("  says backs it now. The two can disagree, and the identity is the one that")
         print("  stays true across a reboot.")
+        print()
+    if absent_rows:
+        # Reported by the storage layer, which is the only thing that knows what a missing
+        # disk means. Sidon refuses these paths; it does not write to the root filesystem
+        # in their place.
+        print("=== Disks a node is configured to have and cannot use ===")
+        print_table(["Node", "Filesystem", "Role", "Why"], absent_rows)
+        print("  Named in /etc/hci/sidon-disks. `sidon mounts` on the node says the same.")
         print()
 
     print("=== Vdisks ===")

@@ -62,26 +62,74 @@ should arrive with the thing that writes it, in the same change.
 
 ### One disk, one store
 
-Each disk gets its own filesystem and its own directory under the sidon root:
+Each disk gets its own filesystem, and **every one is a sibling**: `/var/lib/hci/sidon` is a plain
+directory on the root filesystem and nothing is mounted inside another mount, so no parent can
+shadow a child. A real Nutanix CVM lays its disks out the same way. Mounts are named by filesystem
+UUID and made by sidon, not by fstab ([D-27](./decisions.md)):
 
 ```
-/var/lib/hci/sidon/
-├── disks/
-│   ├── d0/          ← /dev/sdb, own XFS
-│   │   └── egroups/
-│   └── d1/          ← /dev/sdc, own XFS
-│       └── egroups/
-├── journal/         ← on the fastest disk (see tiering)
-└── nbd/             ← sockets, not data
+/var/lib/hci/sidon/                  plain directory, root filesystem
+├── nbd/                             plain directory; sockets, not data (libvirt names these paths)
+└── disks/                           plain directory
+    ├── dfa470d5-.../                mount: the journal volume (vg_aether/sidon, XFS)
+    │   ├── journal/  replica/  replica-egroups/
+    │   └── egroups/  disk.uid
+    └── 5c9e756d-.../                mount: an extent disk, own XFS
+        └── egroups/  disk.uid
 ```
+
+`/etc/hci/sidon-disks` is the one record of which filesystems are sidon's:
+
+```
+# <filesystem-uuid> <journal|extent>
+dfa470d5-2350-4077-a8ed-7b942eb0cff0 journal
+5c9e756d-a035-4de7-9dc0-11afcc82f0fe extent
+```
+
+Nothing in it, or anywhere sidon owns, is in `/etc/fstab`, so a late or missing disk cannot fail
+`local-fs.target` and `nofail` has nothing to qualify.
+
+**A path is used only while its disk is provably there.** The directory must be a mount point,
+must be the device carrying the manifest's UUID, and must hold `disk.uid`; all by `stat`, never
+by `findmnt` or `mountpoint(1)`, which still list a child covered by a later mount of its parent
+as mounted. A `disk.uid` left on the root filesystem during an unmounted period proves nothing,
+and the real disk mounted over it reads as itself. The check is repeated at each journal attach
+and each extent-group create or move.
+
+| Absent | Sidon |
+|---|---|
+| the **journal** volume | does not start (`Restart=always` retries, and each retry tries the mount) |
+| an **extent** disk | starts, places nothing on it, lists it under `absent_disks` in `capacity` and in `valcli storage.list` |
+
+**On an existing cluster.** The old layout has the journal volume mounted *at*
+`/var/lib/hci/sidon` with a disk nested inside it. Operators:
+
+1. Run the normal rollout. It stages `/etc/hci/sidon-disks` from the volume the toolkit carved and
+   the fstab lines the node still has. It mounts, unmounts and edits nothing, so it is safe under
+   a running sidon, and running it again changes nothing.
+2. Move the node while sidon is stopped, in the maintenance window: either restart sidon (it moves
+   the layout before opening anything) or `systemctl stop sidon && sidon mounts apply`. `sidon
+   mounts` with no argument is read-only and says which layout the node is in.
+3. Until then the node works as before, and Mimir reports a WARN saying so.
+
+The move unmounts every mount under the root deepest first (never lazily), then removes the sidon
+lines from fstab, then mounts each disk at `disks/<uuid>`. It is idempotent and finishes a move
+that stopped half way. It **refuses**: while sidon's control socket answers (`apply` only); when a
+mount is busy (nothing lost, retried at the next start); and, before unmounting anything, when a
+filesystem mounted under the root is not in the manifest. No data is copied: the volume's contents
+are reached at a new path. A node that has no manifest is left exactly as it was.
+
+**On a fresh create.** `cluster create` (and provisioning) carves the volume, registers every empty
+XFS-or-blank disk, and writes the manifest; sidon mounts them when `cluster create` starts it.
+`cluster destroy` takes the mounts off deepest first and removes the manifest.
 
 `EgroupStore` becomes a set of stores. A disk that fails to mount is *absent*, not fatal:
 the node keeps serving from the disks it has.
 
-The directory names above are illustrative, and the real ones are worse than that. The claim
-script names a disk's directory after the kernel device it saw (`disks/sdc`), kernel names
-are assigned in probe order, and on one node the disk filling the `sdc` role is `/dev/sdb`:
-the path already lies. So the name is a **label** and nothing is keyed on it.
+The claim script used to name a disk's directory after the kernel device it saw (`disks/sdc`),
+kernel names are assigned in probe order, and on one node the disk filling the `sdc` role is
+`/dev/sdb`: the path lied. Directories are now named by filesystem UUID, and `disk.uid` below is
+still what everything that must stay true is keyed on.
 
 ### A disk is identified by what is written on it
 
@@ -298,8 +346,8 @@ Roughly, in `sidon`:
 * Placement on seal by tier, once there is mixed media: built, and a no-op until a node has
   disks of different classes. The temperature input is [metadata.md §8](./metadata.md); the
   migration job is `purah/tier.rs`.
-* Provisioning: claim *every* qualifying disk, one filesystem each, mounted under
-  `disks/`, rather than one PV in a shared VG.
+* Provisioning: claim *every* qualifying disk, one filesystem each, registered in
+  `/etc/hci/sidon-disks` and mounted by sidon under `disks/<uuid>`, rather than one PV in a shared VG.
 
 The provisioning half is the smaller piece and cannot land first: claiming both disks
 before sidon can use the second one gains nothing and loses the guard that currently keeps

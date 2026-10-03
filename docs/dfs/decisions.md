@@ -566,3 +566,73 @@ the node's own index. This is a correction to that sentence, not a new design.
 reason, which the ranking existing does not discharge: nobody has yet watched what it proposes
 on mixed media. Heat chooses where a copy sits and never whether one exists, so nothing in the
 pass deletes a group, shortens a replica set or touches the metadata that says one exists.
+
+**D-27 — sidon mounts its own disks, by filesystem UUID, as siblings; nothing sidon owns is in
+`/etc/fstab`; and no path is used whose disk is not provably there.** Two outages in one evening.
+The toolkit wrote each extra disk to fstab without `nofail`, so a late disk failed
+`local-fs.target` and two nodes came up with no network and no SSH. `nofail` fixed the boot and
+made the next failure silent: the parent volume did not mount, nothing complained, and sidon wrote
+extent groups to the root filesystem at the same path. Then, recovering, the parent was mounted
+over a child that was *nested inside it*, which hid the child: it was still listed as mounted, the
+path no longer reached it, and sixteen extent groups were unreachable. A real Nutanix CVM does
+none of that: nothing storage-related is in its fstab, every parent is a plain directory, the disk
+mounts are siblings, and they are named by serial. Mounting is the storage layer's job, and the
+storage layer is the thing that knows what a missing disk means.
+
+*Where the knowledge of "which devices are mine" lives.* `/etc/hci/sidon-disks`, one
+`<filesystem-uuid> <journal|extent>` per line, written by the claim step and staged by the rollout,
+read by sidon and by Mimir. It is configuration, so it is in `/etc/hci`, and sidon never rewrites
+its own list of what it expects: a daemon that did could forget a disk that went missing.
+**Rejected: fstab** (the status quo and both outages). **Discovery by scanning block devices for a
+`disk.uid`**, which has to mount a disk to read the sentinel, and would adopt any foreign or cloned
+disk that carried one. **A Hydra row**, for the reason option 1 in `multi_disk.md` gave: a
+node-local fact made a cluster write, and a node must know its disks before Hydra is reachable.
+**The serial**, which Nutanix uses: virtual disks on the lab nodes report none, and the filesystem
+UUID exists before anything is mounted and changes on a reformat, which is a different disk and so
+the right behaviour. This does not reopen D-26, which declined the filesystem UUID as a disk's
+*identity*: identity is still `disk.uid`, and the UUID is only the address used to find and prove
+the mount.
+
+*Who mounts.* Sidon, at startup, and `sidon mounts apply`. **Rejected: a unit `ExecStartPre`**, since
+the rollout does not write an existing node's unit file, so a step that lived there would never
+reach a node that already exists while a step in the binary arrives with the binary. **Generated
+`.mount` units**, which are fstab again with a different syntax and the same ability to fail a
+dependency. **udev or automount**, which race and hide absence.
+
+*The invariant.* A disk is present only if the directory is a mount point (its device differs from
+its parent's), is the device carrying the manifest's UUID, and holds the `disk.uid` sentinel. All
+by `stat`. **Rejected: `findmnt` and `mountpoint(1)`**, both of which still report a child covered
+by a later mount of its parent as mounted (confirmed on a node with loop devices), and **the
+sentinel alone**, which a file left on the root filesystem during an unmounted period satisfies.
+It is checked at startup, at each journal attach, and at each extent-group create and move, not
+once, because a disk can leave while sidon runs.
+
+*Layout, and what each part does when its disk is absent.* `/var/lib/hci/sidon` is a plain
+directory. `disks/<uuid>` are siblings. `nbd/` stays at `/var/lib/hci/sidon/nbd` on the root
+filesystem because libvirt domain XML names those sockets; it holds no data and is recreated at
+attach. The **journal volume** is the existing thin LV and holds `journal/`, `replica/`,
+`replica-egroups/` and its own extent groups, which means an existing node moves no data. With it
+absent sidon **refuses to start** (`Restart=always` retries, and each retry attempts the mount, so
+a late disk recovers by itself): without the journal it cannot say what it has acknowledged, and
+the alternative is journalling onto the root filesystem. **Rejected: the journal on the root
+filesystem**, which is the silent hazard and a small filesystem a full store must not be able to
+wedge. **A journal on every disk**, which is the "journal on the fastest disk" design that is
+still unbuilt and would be a manifest role change plus a drain. An **extent disk** absent costs
+that disk only: sidon starts, serves the others, places nothing on it, reports it in `capacity`
+as `absent_disks`, and reads of its groups fail as referenced-but-absent.
+
+*Existing nodes.* The rollout only stages the manifest. It mounts, unmounts and edits nothing,
+because moving a mount under a running sidon is the thing this exists to prevent. The move happens
+when sidon next starts, before anything is opened, or by `sidon mounts apply`, which refuses while
+the control socket answers. It unmounts every mount under the root deepest first and never lazily,
+in rounds so a covered child is recovered, then removes the sidon lines from fstab; it refuses on
+EBUSY (nothing lost, resumes at the next start) and, before unmounting anything, on a mount the
+manifest does not name. No data is copied. **Rejected: moving mounts during the rollout** (the
+invariant above), **copying data to new volumes** (all risk, no benefit), and **rebuilding nodes**.
+Until a node moves, a transitional repair keeps its old fstab lines from being able to fail the
+boot.
+
+*What it costs.* A disk attached after sidon starts is not used until sidon restarts. A missing
+journal volume produces a log line every few seconds until it appears. And the first start after
+the rollout is the one that moves the layout, so it belongs in the maintenance window the rolling
+upgrade already opens.

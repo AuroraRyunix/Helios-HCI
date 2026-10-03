@@ -83,7 +83,7 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
 | [dfs/extent_id_map.md](./dfs/extent_id_map.md) | The extent ID map (D-23): staged rollout and what to observe between stages. |
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
-| [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, and why pooling them is wrong. |
+| [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, why pooling them is wrong, and how sidon mounts them (sibling mounts by UUID, none in fstab). |
 | [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (a Dagur job), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
 | [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
 | [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |

@@ -2894,6 +2894,52 @@ def check_services(category):
 
     return results
 
+SIDON_ROOT = "/var/lib/hci/sidon"
+SIDON_DISKS_MANIFEST = "/etc/hci/sidon-disks"
+
+
+def sidon_manifest_disks():
+    """[(filesystem uuid, role)] from /etc/hci/sidon-disks, journal volume first, or None
+    when the node has no manifest (one the rollout has not reached)."""
+    try:
+        with open(SIDON_DISKS_MANIFEST, "r") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    disks = []
+    for raw in text.splitlines():
+        fields = raw.split("#", 1)[0].split()
+        if len(fields) >= 2 and fields[1] in ("journal", "extent"):
+            disks.append((fields[0], fields[1]))
+    disks.sort(key=lambda d: 0 if d[1] == "journal" else 1)
+    return disks
+
+
+def sidon_disk_absence(uuid):
+    """None when the disk is provably mounted where sidon put it, else why not.
+
+    By stat, never by findmnt: a mount that a later mount of its parent covered is still
+    listed by findmnt and the path no longer reaches it. The directory must be a mount
+    point, be the device carrying the filesystem UUID, and hold sidon's disk.uid sentinel
+    (a sentinel left on the root filesystem during an unmounted period proves nothing).
+    """
+    mount = os.path.join(SIDON_ROOT, "disks", uuid)
+    by_uuid = os.path.join("/dev/disk/by-uuid", uuid)
+    if not os.path.ismount(mount):
+        if not os.path.exists(by_uuid):
+            return "its device is not attached"
+        return "not mounted (a plain directory on the root filesystem)"
+    try:
+        wanted = os.stat(by_uuid).st_rdev
+    except OSError:
+        return "mounted, but its device is not attached to prove it is the right one"
+    if os.stat(mount).st_dev != wanted:
+        return "something else is mounted there"
+    if not os.path.isfile(os.path.join(mount, "disk.uid")):
+        return "mounted but carries no disk.uid"
+    return None
+
+
 def check_storage(category):
     results = {}
     
@@ -2961,22 +3007,59 @@ def check_storage(category):
     # every write on this node lands on the root filesystem instead, silently, until the
     # root filesystem fills.
     update_current_check(category, "storage_mount_options")
-    store = "/var/lib/hci/sidon"
-    rc_m, out_m, err_m = run_cmd("findmnt -o SOURCE,FSTYPE,OPTIONS -n %s" % store)
-    if rc_m != 0:
-        status = "FAIL"
-        msg = ("%s is not a mount point. Sidon will write extent groups onto the root "
-               "filesystem instead, which fills it and takes the host down with it. "
-               "Check that the vg_aether/sidon logical volume exists and that /etc/fstab has "
-               "its entry." % store)
-    else:
-        options = out_m.strip()
-        if " ro," in options or options.endswith(" ro"):
+    store = SIDON_ROOT
+    manifest = sidon_manifest_disks()
+    # Where a write test and the read-only check are aimed: the journal volume on a node
+    # whose disks sidon mounts, the sidon root itself on one that has not moved yet.
+    write_target = store
+    if manifest is None or os.path.ismount(store):
+        # An unmoved node, or a development host: the volume is mounted at the root.
+        rc_m, out_m, err_m = run_cmd("findmnt -o SOURCE,FSTYPE,OPTIONS -n %s" % store)
+        if rc_m != 0:
             status = "FAIL"
-            msg = "%s is mounted read-only: %s" % (store, options)
+            msg = ("%s is not a mount point. Sidon will write extent groups onto the root "
+                   "filesystem instead, which fills it and takes the host down with it. "
+                   "Check that the vg_aether/sidon logical volume exists, and that "
+                   "/etc/hci/sidon-disks names it." % store)
         else:
-            status = "PASS"
-            msg = "%s is mounted: %s" % (store, options)
+            options = out_m.strip()
+            if " ro," in options or options.endswith(" ro"):
+                status = "FAIL"
+                msg = "%s is mounted read-only: %s" % (store, options)
+            else:
+                status = "PASS"
+                msg = "%s is mounted: %s" % (store, options)
+                if manifest is not None:
+                    msg += (" (still the old layout; sidon moves it the next time it starts)")
+    else:
+        # Nothing to write to until a journal volume is proven present: a test file written
+        # to the directory a missing volume leaves behind would pass, on the root filesystem.
+        write_target = None
+        lines = []
+        status = "PASS"
+        for uuid, role in manifest:
+            why = sidon_disk_absence(uuid)
+            target = os.path.join(store, "disks", uuid)
+            if why:
+                lines.append("%s %s: %s" % (role, uuid, why))
+                status = "FAIL" if role == "journal" else (status if status == "FAIL" else "WARN")
+                continue
+            rc_o, out_o, _ = run_cmd("findmnt -o OPTIONS -n %s" % target)
+            if rc_o == 0 and (" ro," in " " + out_o.strip() + "," or out_o.strip().split(",")[0] == "ro"):
+                lines.append("%s %s is mounted read-only: %s" % (role, uuid, out_o.strip()))
+                status = "FAIL"
+            else:
+                lines.append("%s %s: mounted, proven by device and disk.uid" % (role, uuid))
+            if role == "journal":
+                write_target = target
+        if not any(role == "journal" for _, role in manifest):
+            status = "FAIL"
+            lines.append("%s names no journal volume, so sidon will not start" % SIDON_DISKS_MANIFEST)
+        if status == "PASS":
+            msg = "Every sidon disk is mounted:\n- " + "\n- ".join(lines)
+        else:
+            msg = ("Sidon disks that are absent or unsound (sidon refuses these paths and "
+                   "never writes to the root filesystem in their place):\n- " + "\n- ".join(lines))
     results["storage_mount_options"] = {"status": status, "output": msg}
 
     # 9. And it can actually be written to.
@@ -2985,8 +3068,13 @@ def check_storage(category):
     # a read-only remount after an I/O error, a full inode table. Mounted is not writable,
     # and the guest finds out the difference at the worst moment.
     update_current_check(category, "storage_volume_writable")
+    store = write_target or SIDON_ROOT
     test_file = os.path.join(store, ".mimir_rw_check")
     try:
+        if write_target is None:
+            raise RuntimeError("the journal volume is not mounted, so there is nothing to "
+                               "write to and nothing is written to the root filesystem "
+                               "in its place")
         import uuid
         test_content = "mimir-test-%s" % uuid.uuid4()
         with open(test_file, "w") as handle:
@@ -3013,53 +3101,55 @@ def check_storage(category):
                 pass
     results["storage_volume_writable"] = {"status": status, "output": msg}
 
-    # 10. /etc/fstab safety check
+    # 10. Nothing sidon owns is in /etc/fstab.
+    #
+    # A line there is what let one late disk fail local-fs.target and cost two nodes their
+    # network, and `nofail` then made a missing volume silent. Sidon mounts its disks itself
+    # and refuses a path whose disk is not there, so the property is that fstab holds no
+    # sidon mount at all. A node that has not yet moved still has them until sidon next
+    # starts: those are a WARN while they cannot fail the boot, and a FAIL when they can.
     update_current_check(category, "fstab_safety_check")
     status = "PASS"
-    msg = "No storage mount entries found in /etc/fstab."
-    
+    msg = "No sidon mounts in /etc/fstab: sidon mounts its own disks."
+
     try:
         with open("/etc/fstab", "r") as f:
             lines = f.readlines()
-            
+
         brick_entries = []
         for line in lines:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             parts = line.split()
-            if len(parts) >= 4 and "/var/lib/hci/sidon" in parts[1]:
+            if len(parts) >= 4 and (parts[1] == SIDON_ROOT or parts[1].startswith(SIDON_ROOT + "/")):
                 brick_entries.append((parts[0], parts[1], parts[3]))
-                
+
         if brick_entries:
             failed_safety = []
             for spec, mnt, opts in brick_entries:
                 opt_list = opts.split(",")
-                has_uuid = spec.startswith("UUID=")
-                has_nofail = "nofail" in opt_list
-                has_timeout = "x-systemd.device-timeout=5s" in opt_list or any("x-systemd.device-timeout" in o for o in opt_list)
-                
                 issues = []
-                if not has_uuid:
-                    issues.append("uses raw device path instead of UUID")
-                if not has_nofail:
-                    issues.append("missing 'nofail' flag")
-                if not has_timeout:
-                    issues.append("missing 'x-systemd.device-timeout=5s' flag")
-                    
+                if "nofail" not in opt_list:
+                    issues.append("missing 'nofail', so a late disk fails the boot")
+                if not any("x-systemd.device-timeout" in o for o in opt_list):
+                    issues.append("missing 'x-systemd.device-timeout=5s'")
                 if issues:
-                    failed_safety.append(f"Mount {mnt} ({spec}): " + ", ".join(issues))
-                    
+                    failed_safety.append("Mount %s (%s): " % (mnt, spec) + ", ".join(issues))
+            listed = "\n".join("%s %s" % (m, s_) for s_, m, _ in brick_entries)
             if failed_safety:
                 status = "FAIL"
-                msg = "The following fstab storage mounts do not meet safety requirements:\n" + "\n".join(failed_safety)
+                msg = ("/etc/fstab still declares sidon mounts that can fail the boot:\n"
+                       + "\n".join(failed_safety))
             else:
-                status = "PASS"
-                msg = f"All {len(brick_entries)} fstab storage mount(s) use UUIDs and contain safe timeout/recovery flags."
+                status = "WARN"
+                msg = ("/etc/fstab still declares sidon mounts (non-fatal, but they should be "
+                       "gone): sidon removes them when it next starts and moves this node to "
+                       "the layout where it mounts its own disks.\n" + listed)
     except Exception as e:
         status = "FAIL"
         msg = f"Failed to read or parse /etc/fstab: {str(e)}"
-        
+
     results["fstab_safety_check"] = {
         "status": status,
         "output": msg

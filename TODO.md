@@ -1100,6 +1100,28 @@ written by nothing. It was dropped by migration `0025`; see
 Provisioning must not land first -- claiming both disks before sidon can use the second one
 gains nothing and removes the guard currently keeping `sdc` untouched.
 
+**Built (D-27): sidon mounts its own disks.** Nothing sidon owns is in `/etc/fstab`; the disks are
+siblings at `/var/lib/hci/sidon/disks/<filesystem-uuid>`, named in `/etc/hci/sidon-disks`, and sidon
+refuses any path whose disk is not provably mounted (journal volume absent: no start; extent disk
+absent: that disk only). See [docs/dfs/multi_disk.md](docs/dfs/multi_disk.md). Still open:
+
+* **Move the existing nodes.** The rollout only stages the manifest. Each node moves to the new
+  layout the next time sidon starts, or by `sidon mounts apply` with sidon stopped. Until then
+  Mimir reports a WARN per node, and `RECONCILE_SIDON_FSTAB` (a transitional guard that keeps the
+  old fstab lines from failing the boot) must stay. Delete it once every node has moved.
+* **A disk attached after sidon starts is not used until sidon restarts.** `sidon mounts apply`
+  refuses while sidon runs, deliberately; mounting a *missing* disk (not moving one) under a live
+  sidon would be safe but Purah's store is built once at start and would not see it.
+* **Absent disk, then back.** Purah's repair may recreate a missing disk's groups from replicas, so
+  a returning disk can hold duplicates. The stray sweep is meant to resolve them; nothing has
+  exercised that path.
+* **The rollout never writes or enables `sidon.service`** (only provisioning does). This design
+  does not depend on it, which is why sidon does the mounting, but it means a unit change cannot
+  reach an existing node.
+* **`cluster create` after `destroy` used to leave no volume for sidon** (it re-claimed the first
+  disk and ran a `mount` with no fstab line). Fixed with the carve/claim/stage step; it has been
+  exercised only through unit tests and loop devices, not by a destroy and create on the cluster.
+
 ### The SPICE console, decided and built -- but unverified on hardware
 
 The goal was ESXi-class console performance in a browser. SPICE had been half-present for a
