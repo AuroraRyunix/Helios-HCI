@@ -170,6 +170,80 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         return -1, {}, str(e)
 
 
+def run_mtls_spark_api_full(ip, path, payload, method="POST"):
+    """Like run_mtls_spark_api, but says which HTTP status the body came with.
+
+    `run_mtls_spark_api` returns rc 0 for any answer that has a JSON body, including a 503
+    whose body is `{"error": ..., "kind": ...}`. A caller that then reads `body.get("total_bytes")
+    or 0` turns "sidon is not answering" into "online, 0.0 GiB". Returns
+    (status, body, error); status is None when nothing answered at all.
+    """
+    ip, verify_identity = spark_endpoint(ip)
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    context.check_hostname = verify_identity
+    data = None
+    if payload is not None and method != "GET":
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(f"https://{ip}:9099{path}", data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+            return response.status, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8")), ""
+        except Exception:
+            return e.code, {}, str(e)
+    except Exception as e:
+        return None, {}, str(e)
+
+
+def extent_store_row(host_label, status, body, err=""):
+    """One row of the Extent Store table, and the answer it may be trusted for.
+
+    Returns (row, body_or_None). The body is returned only for a real answer, so the
+    per-disk tables are built from nothing else.
+
+    Four states, and none of them is "online with zero":
+      online       200 and a capacity that is a positive number of bytes
+      not ready    the node answers but its sidon does not: spark's 503 while the daemon is
+                   starting (its control socket does not exist until its mounts are done), or
+                   a 200 that carries no capacity. The capacity is unknown, not zero.
+      unreachable  nothing answered
+      error        any other refusal, with what it said
+    """
+    def row(state, detail):
+        return [host_label, state, "-", "-", "-", str(detail)[:40]]
+
+    if status is None:
+        return row("unreachable", err or "no response"), None
+    if status != 200 or not isinstance(body, dict):
+        said = (body.get("error") if isinstance(body, dict) else None) or err \
+            or "HTTP %s" % status
+        if status == 503:
+            return row("not ready", "sidon starting? " + said), None
+        return row("error", said), None
+    try:
+        total = int(body.get("total_bytes"))
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        absent = body.get("absent_disks") or []
+        why = "no mounted disk" + (" (%d absent)" % len(absent) if absent else "")
+        return row("not ready", why), None
+    gib = 1024 ** 3
+    avail = int(body.get("available_bytes") or 0)
+    return [
+        body.get("node") or host_label,
+        "online",
+        "%.1f GiB" % (total / gib),
+        "%.1f GiB" % ((total - avail) / gib),
+        str(body.get("egroup_count", 0)),
+        "%.2f GiB" % (int(body.get("journal_bytes") or 0) / gib),
+    ], body
+
+
 def print_table(headers, rows):
     """Prints a beautiful ASCII table from headers and row list."""
     if not rows:
@@ -527,23 +601,11 @@ def cmd_storage_list():
         ip = host.get("ip")
         if not ip:
             continue
-        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "capacity"})
-        if rc != 0 or not isinstance(body, dict):
-            store_rows.append([host.get("hostname") or ip, "unreachable",
-                               "-", "-", "-",
-                               (str(err) or "no response")[:40]])
+        status, body, err = run_mtls_spark_api_full(ip, "/api/v1/dfs/vdisk", {"op": "capacity"})
+        store_row, body = extent_store_row(host.get("hostname") or ip, status, body, err)
+        store_rows.append(store_row)
+        if body is None:
             continue
-        gib = 1024 ** 3
-        total = int(body.get("total_bytes") or 0)
-        avail = int(body.get("available_bytes") or 0)
-        store_rows.append([
-            body.get("node") or host.get("hostname") or ip,
-            "online",
-            "%.1f GiB" % (total / gib),
-            "%.1f GiB" % ((total - avail) / gib),
-            str(body.get("egroup_count", 0)),
-            "%.2f GiB" % (int(body.get("journal_bytes") or 0) / gib),
-        ])
         for disk in body.get("disks") or []:
             disk_rows.append(_disk_row(body.get("node") or host.get("hostname") or ip, disk))
         for gone in body.get("absent_disks") or []:

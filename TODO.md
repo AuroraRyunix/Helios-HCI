@@ -53,6 +53,19 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
+## Fixed on 2026-10-04: `valcli storage.list` showed a restarting node as online with 0.0 GiB
+
+While sidon is down or starting its control socket does not exist, so spark answers the capacity
+request with `503 {"error": ..., "kind": "io"}`. `valcli`'s `run_mtls_spark_api` returns an HTTP
+error body with rc 0 (so a 409 keeps its explanation), and `cmd_storage_list` read
+`total_bytes or 0` out of that dict: "online, 0.0 GiB". Reproduced on the lab by stopping sidon on
+one node. Sidon, spark and the Phoenix page were not at fault (sidon fails the request outright
+rather than answering zero; Phoenix already treated errors as unreachable). `valcli` now reads the
+HTTP status (`run_mtls_spark_api_full`, `extent_store_row`) and shows `not ready` / `unreachable` /
+`error` / `online`; Phoenix distinguishes a 503 node as "starting" in the stores banner.
+`test_storage_list_not_ready.py`, `index_live_test.exs`. Not changed: `hylia`/`vali` read the same
+body but already fail closed on a zero capacity (the log message for a starting node is generic).
+
 ## P2 — Two-node clusters have no quorum tie-breaker (2026-10-03)
 
 **The witness node is gone from the docs because it is gone from the code.** `docs/cluster.md`,

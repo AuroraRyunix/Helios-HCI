@@ -431,6 +431,26 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       assert view |> element("#stores-unavailable") |> render() =~ "sidon not answering"
     end
 
+    test "a node whose sidon is starting is said to be starting, never a zero", %{conn: conn} do
+      put_source(%{
+        healthy()
+        | capacity:
+            Map.put(
+              healthy().capacity,
+              @b,
+              {:error, {503, "sidon control socket /run/sidon/control.sock is unreachable"}}
+            )
+      })
+
+      {:ok, view, _html} = mount_view(conn)
+
+      banner = view |> element("#stores-starting") |> render()
+      assert banner =~ "starting"
+      assert banner =~ "unknown, not zero"
+      refute has_element?(view, "#store-10-10-0-12")
+      assert has_element?(view, "#store-10-10-0-11")
+    end
+
     test "no node answering for vdisks is unavailable, not an empty list", %{conn: conn} do
       put_source(%{healthy() | vdisks: %{@a => {:error, :timeout}, @b => {:error, :timeout}}})
 
