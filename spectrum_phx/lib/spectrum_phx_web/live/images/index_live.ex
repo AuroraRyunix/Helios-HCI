@@ -57,11 +57,17 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   # 64 KB would be sixteen thousand round trips per gibibyte. Kept under the endpoint's
   # 8 MB frame cap with room for the channel envelope.
   @chunk_bytes 1_048_576
-  # The first chunk creates the vdisk and wins its ownership claim, so this is not a
-  # transfer timeout -- it is a provisioning one. Creating a vdisk is metadata work and
-  # returns in milliseconds where the LINSTOR placement it replaced took minutes, but a
-  # generous bound costs nothing when it is never reached.
-  @chunk_timeout_ms 120_000
+  # Two chunks do the real work and this bounds both. The first creates the vdisk and
+  # wins its ownership claim. The *last* one finishes the image: it waits for the host to
+  # flush the whole body (up to ten minutes in the Mint transport), seals the vdisk
+  # (up to five) and registers it, all inside that one chunk's reply.
+  #
+  # This is also the browser's own timeout for that push, and the browser has no handler
+  # for it expiring: the chunk simply never completes, the upload never finishes, the
+  # submit is never sent, and the page sits at "Uploading..." with no error anywhere.
+  # That is what the old 120 s did to any image whose seal took longer than two minutes.
+  # So the bound sits above the sum of the host-side ones.
+  @chunk_timeout_ms 20 * 60_000
   @max_image_bytes 64 * 1024 * 1024 * 1024
 
   @impl true
@@ -74,7 +80,12 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
     socket =
       socket
       |> assign(page_title: "Images", confirming: nil, db_error: nil, delete_error: nil)
-      |> assign(upload_note: Images.upload_note(), upload_error: nil)
+      |> assign(
+        upload_note: Images.upload_note(),
+        upload_error: nil,
+        upload_blocked: false,
+        upload_finalizing: false
+      )
       |> assign(max_image_bytes: @max_image_bytes)
       |> allow_upload(:image,
         accept: ~w(.iso .qcow2 .img),
@@ -84,8 +95,15 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
         chunk_timeout: @chunk_timeout_ms,
         auto_upload: false,
         writer: fn _name, entry, _socket ->
+          # This function runs inside the LiveView process, so `self()` is the page the
+          # writer reports to -- see the writer's "Failure is reported, never raised".
           {SpectrumPhx.Images.UploadWriter,
-           [name: entry.client_name, size_bytes: entry.client_size]}
+           [
+             name: entry.client_name,
+             size_bytes: entry.client_size,
+             notify: self(),
+             ref: entry.ref
+           ]}
         end
       )
       |> load_images()
@@ -96,19 +114,37 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   @impl true
   def handle_info(:refresh, socket), do: {:noreply, load_images(socket)}
   def handle_info({:image_deleted, _name}, socket), do: {:noreply, load_images(socket)}
+
+  # The upload writer's report of a failure, sent the moment it happens so the page does
+  # not wait for the rest of the file to drain before saying so. The same reason arrives
+  # again through consume_uploaded_entries on submit; assigning it twice is harmless.
+  def handle_info({:upload_failed, _ref, reason}, socket) do
+    {:noreply,
+     assign(socket, upload_error: Images.describe_upload_error(reason), upload_finalizing: false)}
+  end
+
+  # Every byte has been sent; the host is now flushing, sealing and registering the image
+  # inside the last chunk's reply, which is the longest silent stretch of an upload.
+  def handle_info({:upload_finalizing, _ref}, socket) do
+    {:noreply, assign(socket, upload_finalizing: true)}
+  end
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl true
   def handle_event("refresh", _params, socket), do: {:noreply, load_images(socket)}
 
   # Selecting a file only validates it. Nothing is allocated and nothing is transferred
-  # until "upload" -- `auto_upload: false` is what makes that true.
+  # until "upload" -- `auto_upload: false` is what makes that true. What *can* be known
+  # without storage is checked here, so "that name is already taken" is said before the
+  # browser reads a gibibyte, not after.
   def handle_event("validate_upload", _params, socket) do
-    {:noreply, assign(socket, upload_error: nil)}
+    {:noreply, assign_preflight(socket)}
   end
 
   def handle_event("cancel_upload", %{"ref" => ref}, socket) do
-    {:noreply, socket |> cancel_upload(:image, ref) |> assign(upload_error: nil)}
+    {:noreply,
+     socket |> cancel_upload(:image, ref) |> assign(upload_error: nil, upload_blocked: false)}
   end
 
   # Runs after every chunk has been written and the writer has closed. By this point the
@@ -116,6 +152,7 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
   # outcome the writer recorded.
   def handle_event("upload", _params, socket) do
     results = consume_uploaded_entries(socket, :image, fn meta, _entry -> {:ok, meta.result} end)
+    socket = assign(socket, upload_finalizing: false)
 
     case results do
       [{:ok, image}] ->
@@ -172,6 +209,15 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
     end
   end
 
+  defp assign_preflight(socket) do
+    with [entry | _] <- socket.assigns.uploads.image.entries,
+         {:error, reason} <- Images.preflight_upload(entry.client_name) do
+      assign(socket, upload_error: Images.describe_upload_error(reason), upload_blocked: true)
+    else
+      _ -> assign(socket, upload_error: nil, upload_blocked: false)
+    end
+  end
+
   # LiveView's own client-side rejections, which never reach the writer.
   defp upload_error_message(:too_large), do: "That file is larger than this console accepts."
 
@@ -180,6 +226,10 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
 
   defp upload_error_message(:too_many_files), do: "Upload one image at a time."
   defp upload_error_message(:external_client_failure), do: "The browser could not read the file."
+
+  defp upload_error_message({:writer_failure, reason}),
+    do: Images.describe_upload_error(reason)
+
   defp upload_error_message(other), do: "The file was rejected: #{inspect(other)}"
 
   defp uploaded_message(%{name: name, size_bytes: size}) do
@@ -286,9 +336,19 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
                 {SpectrumPhxWeb.Storage.Components.bytes(entry.client_size)}
               </span>
             </div>
-            <progress class="progress progress-primary w-full" value={entry.progress} max="100">
-              {entry.progress}%
-            </progress>
+            <div class="flex items-center gap-3">
+              <progress
+                id={"progress-" <> entry.ref}
+                class="progress progress-primary w-full"
+                value={entry.progress}
+                max="100"
+              >
+                {entry.progress}%
+              </progress>
+              <span class="text-xs tabular-nums opacity-70 w-10 text-right">
+                {entry.progress}%
+              </span>
+            </div>
             <div class="flex items-center justify-between gap-3">
               <p :for={error <- upload_errors(@uploads.image, entry)} class="text-xs text-error">
                 {upload_error_message(error)}
@@ -309,7 +369,14 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
             {upload_error_message(error)}
           </p>
 
-          <p :if={@upload_error} id="upload-error" class="text-sm text-error">{@upload_error}</p>
+          <p :if={@upload_finalizing} id="upload-finalizing" class="text-sm opacity-80">
+            All bytes sent. The host is flushing, sealing and registering the image; this can
+            take a few minutes for a large one. Keep this page open.
+          </p>
+
+          <p :if={@upload_error} id="upload-error" role="alert" class="text-sm text-error">
+            {@upload_error}
+          </p>
 
           <div class="card-actions items-center justify-between">
             <p class="text-xs opacity-60 max-w-2xl">{@upload_note}</p>
@@ -317,7 +384,7 @@ defmodule SpectrumPhxWeb.Images.IndexLive do
               id="upload-button"
               variant="primary"
               phx-disable-with="Uploading..."
-              disabled={@uploads.image.entries == []}
+              disabled={@uploads.image.entries == [] or @upload_blocked}
             >
               Upload
             </.button>

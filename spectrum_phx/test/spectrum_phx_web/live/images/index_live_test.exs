@@ -160,24 +160,115 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       assert byte_size(bytes) == 2048
     end
 
-    test "a failure is reported with the subsystem that refused, and rolls back", %{conn: conn} do
-      # The peer still holds Primary, so the promotion does not take.
+    # The tests below are the ones that matter most on this page. A writer that returned
+    # {:error, _} made LiveView stop the upload channel; the browser then failed the entry
+    # without ever sending the submit, and the LiveView dropped the entry together with the
+    # error it had just recorded. The operator clicked Upload and nothing happened, with
+    # nothing in the log either. Each failure point has to end on screen, in #upload-error.
+
+    defp upload_and_submit(view, name, size) do
+      upload = file_input(view, "#upload-form", :image, [entry(name, size)])
+      render_upload(upload, name, 100)
+      view |> element("#upload-form") |> render_submit()
+    end
+
+    test "a refused attach is shown in #upload-error and rolls back", %{conn: conn} do
       SpectrumPhx.UploadStubs.install(%{attach: {:error, {409, "hci-02 owns img-rocky"}}})
 
       {:ok, view, _html} = mount_view(conn)
+      html = upload_and_submit(view, "rocky.iso", 64)
 
-      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 64)])
-
-      # The chunk fails inside the writer; how LiveViewTest surfaces that is not the point.
-      # What matters is that the storage allocated a moment earlier was given back.
-      try do
-        render_upload(upload, "rocky.iso", 100)
-      catch
-        :exit, _reason -> :ok
-      end
-
+      assert has_element?(view, "#upload-error", "hci-02 owns img-rocky")
+      assert html =~ "could not be attached"
       assert_receive {:upload_stub, {:delete, _ip, "img-rocky"}}
       refute_receive {:upload_stub, {:finish, _bytes}}
+      # Nothing was registered: the image is not in the list.
+      refute has_element?(view, "#image-rocky-iso")
+    end
+
+    test "a transport that dies mid-stream is shown, not swallowed", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install(%{send_chunk: {:error, "connection reset"}})
+
+      {:ok, view, _html} = mount_view(conn)
+      upload_and_submit(view, "rocky.iso", 64)
+
+      assert has_element?(view, "#upload-error", "connection reset")
+      assert_receive {:upload_stub, {:delete, _ip, "img-rocky"}}
+    end
+
+    test "a host that refuses the finished write is shown", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install(%{
+        finish: {:error, {:write, "HTTP 500: vdisk write failed"}}
+      })
+
+      {:ok, view, _html} = mount_view(conn)
+      upload_and_submit(view, "rocky.iso", 64)
+
+      assert has_element?(view, "#upload-error", "The host refused the image write")
+      assert has_element?(view, "#upload-error", "vdisk write failed")
+      assert_receive {:upload_stub, {:delete, _ip, "img-rocky"}}
+    end
+
+    test "an image the seal refuses is shown and is not registered", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install(%{seal: {:error, "journal is not drained"}})
+
+      {:ok, view, _html} = mount_view(conn)
+      upload_and_submit(view, "rocky.iso", 64)
+
+      assert has_element?(view, "#upload-error", "could not be sealed")
+      assert_receive {:upload_stub, {:delete, _ip, "img-rocky"}}
+    end
+
+    test "a catalogue that stops answering is shown", %{conn: conn} do
+      # Hydra goes away between selecting the file and the first byte being written.
+      SpectrumPhx.UploadStubs.install()
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 64)])
+      Application.put_env(:spectrum_phx, :images_source, :hydra)
+      render_upload(upload, "rocky.iso", 100)
+      html = view |> element("#upload-form") |> render_submit()
+
+      assert has_element?(view, "#upload-error")
+      refute html =~ "Uploaded rocky.iso"
+    end
+
+    test "a name already in the catalogue is refused when the file is chosen", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install()
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("ubuntu-24.04.iso", 4096)])
+      render_upload(upload, "ubuntu-24.04.iso", 0)
+      # What the browser's phx-change sends after choosing a file.
+      view |> element("#upload-form") |> render_change()
+
+      assert has_element?(view, "#upload-error", "already in the catalogue")
+      assert has_element?(view, "#upload-button[disabled]")
+      # And nothing was allocated to find that out.
+      refute_receive {:upload_stub, {:create, _, _, _}}
+    end
+
+    test "progress is shown while an image is sent", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install()
+      {:ok, view, _html} = mount_view(conn)
+
+      upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 4096)])
+      assert render_upload(upload, "rocky.iso", 40) =~ "40%"
+      [entry] = upload.entries
+      assert has_element?(view, "#progress-" <> entry["ref"] <> "[value='40']")
+    end
+
+    test "a successful upload clears any earlier error", %{conn: conn} do
+      SpectrumPhx.UploadStubs.install(%{attach: {:error, {409, "boom"}}})
+      {:ok, view, _html} = mount_view(conn)
+      upload_and_submit(view, "rocky.iso", 64)
+      assert has_element?(view, "#upload-error")
+
+      SpectrumPhx.UploadStubs.install()
+      html = upload_and_submit(view, "rocky.iso", 64)
+
+      assert html =~ "Uploaded rocky.iso"
+      refute has_element?(view, "#upload-error")
     end
 
     test "the page explains that nothing is staged in the web tier", %{conn: conn} do

@@ -94,7 +94,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       state = writer("rocky.iso", 3)
       {:ok, state} = UploadWriter.write_chunk("abc", state)
 
-      assert {:error, {:seal, message}} = UploadWriter.close(state, :done)
+      assert {:ok, %{result: {:error, {:seal, message}}}} = UploadWriter.close(state, :done)
       assert message =~ "must not be used as a template"
       assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
@@ -108,7 +108,10 @@ defmodule SpectrumPhx.ImagesUploadTest do
       UploadStubs.install(%{attach: {:error, {409, "hci-02 owns img-rocky at epoch 4"}}})
 
       state = writer()
-      assert {:error, {:claim, message}, state} = UploadWriter.write_chunk("abc", state)
+
+      assert {:ok, %{result: {:error, {:claim, message}}} = state} =
+               UploadWriter.write_chunk("abc", state)
+
       assert message =~ "hci-02"
 
       calls = drain()
@@ -116,7 +119,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       assert Enum.any?(calls, &match?({:delete, _ip, "img-rocky"}, &1))
 
       # A later chunk must not restart anything.
-      assert {:error, _reason, _state} = UploadWriter.write_chunk("def", state)
+      assert {:ok, %{stage: :failed}} = UploadWriter.write_chunk("def", state)
       refute Enum.any?(drain(), &match?({:create, _, _, _}, &1))
     end
 
@@ -125,7 +128,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
 
       state = writer()
 
-      assert {:error, {:transport, "connection refused"}, _state} =
+      assert {:ok, %{result: {:error, {:transport, "connection refused"}}}} =
                UploadWriter.write_chunk("abc", state)
 
       assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
@@ -135,7 +138,9 @@ defmodule SpectrumPhx.ImagesUploadTest do
       UploadStubs.install(%{send_chunk: {:error, "closed"}})
 
       state = writer()
-      assert {:error, {:transport, "closed"}, _state} = UploadWriter.write_chunk("abc", state)
+
+      assert {:ok, %{result: {:error, {:transport, "closed"}}}} =
+               UploadWriter.write_chunk("abc", state)
 
       assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
     end
@@ -146,7 +151,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       state = writer("rocky.iso", 3)
       {:ok, state} = UploadWriter.write_chunk("abc", state)
 
-      assert {:error, {:truncated, message}} = UploadWriter.close(state, :done)
+      assert {:ok, %{result: {:error, {:truncated, message}}}} = UploadWriter.close(state, :done)
       assert message =~ "2 of 3 bytes"
       assert Enum.any?(drain(), &match?({:delete, _ip, "img-rocky"}, &1))
       # And nothing was sealed: a truncated image must not become permanently immutable.
@@ -159,7 +164,7 @@ defmodule SpectrumPhx.ImagesUploadTest do
       state = writer("rocky.iso", 10)
       {:ok, state} = UploadWriter.write_chunk("abc", state)
 
-      assert {:error, {:truncated, message}} = UploadWriter.close(state, :done)
+      assert {:ok, %{result: {:error, {:truncated, message}}}} = UploadWriter.close(state, :done)
       assert message =~ "sent 3 of the 10 bytes"
 
       # finish/1 was never called: the body is short, so there is nothing to ask the host.
@@ -235,13 +240,82 @@ defmodule SpectrumPhx.ImagesUploadTest do
       UploadStubs.install(%{send_chunk: {:error, "closed"}})
 
       state = writer()
-      {:error, _reason, state} = UploadWriter.write_chunk("abc", state)
+      {:ok, %{stage: :failed} = state} = UploadWriter.write_chunk("abc", state)
       _ = drain()
 
       # close/2 after a failure must not delete again: by then the vdisk name may have
       # been reused by another upload, and deleting it would take out live storage.
       {:ok, _state} = UploadWriter.close(state, {:error, :whatever})
       refute Enum.any?(drain(), &match?({:delete, _, _}, &1))
+    end
+  end
+
+  describe "a failure is reported, never returned as an error" do
+    # LiveView answers {:error, _} from a writer by stopping the upload channel. The
+    # browser then fails the entry without sending the submit, and the LiveView drops the
+    # entry along with the error it recorded -- a failed upload with nothing on screen.
+    # So every failure must come back as {:ok, state}, with the reason in the state and
+    # in a message to the LiveView.
+    setup do
+      UploadStubs.install()
+      :ok
+    end
+
+    defp notifying_writer(size) do
+      {:ok, state} =
+        UploadWriter.init(name: "rocky.iso", size_bytes: size, notify: self(), ref: "r0")
+
+      state
+    end
+
+    test "a failure on the first chunk reaches the notified process" do
+      UploadStubs.install(%{attach: {:error, {409, "hci-02 owns img-rocky"}}})
+
+      assert {:ok, %{stage: :failed}} = UploadWriter.write_chunk("abc", notifying_writer(3))
+      assert_receive {:upload_failed, "r0", {:claim, message}}
+      assert message =~ "hci-02"
+    end
+
+    test "a failure while closing reaches the notified process and is returned as ok" do
+      UploadStubs.install(%{seal: {:error, "journal is not drained"}})
+
+      {:ok, state} = UploadWriter.write_chunk("abc", notifying_writer(3))
+
+      assert {:ok, %{result: {:error, {:seal, _}}}} = UploadWriter.close(state, :done)
+      assert_receive {:upload_finalizing, "r0"}
+      assert_receive {:upload_failed, "r0", {:seal, _}}
+    end
+
+    test "chunks after a failure are accepted and discarded, not errors" do
+      UploadStubs.install(%{send_chunk: {:error, "closed"}})
+
+      {:ok, state} = UploadWriter.write_chunk("abc", notifying_writer(9))
+      {:ok, state} = UploadWriter.write_chunk("def", state)
+      {:ok, state} = UploadWriter.write_chunk("ghi", state)
+
+      # A rollback and a notification, once each.
+      assert_receive {:upload_failed, "r0", {:transport, "closed"}}
+      refute_receive {:upload_failed, _, _}, 20
+
+      # Completing the upload hands the failure to consume_uploaded_entries via meta/1.
+      {:ok, state} = UploadWriter.close(state, :done)
+      assert {:error, {:transport, "closed"}} = UploadWriter.meta(state).result
+    end
+
+    test "a transport that raises is a failure too, not a crashed channel" do
+      defmodule RaisingTransport do
+        def open(_allocation, _size), do: {:ok, :handle}
+        def send_chunk(_handle, _data), do: raise("socket exploded")
+        def finish(_handle), do: {:ok, 0}
+        def close(_handle), do: :ok
+      end
+
+      Application.put_env(:spectrum_phx, :images_upload_transport, RaisingTransport)
+
+      assert {:ok, %{result: {:error, {:transport, "socket exploded"}}}} =
+               UploadWriter.write_chunk("abc", notifying_writer(3))
+
+      assert_receive {:upload_failed, "r0", {:transport, "socket exploded"}}
     end
   end
 
