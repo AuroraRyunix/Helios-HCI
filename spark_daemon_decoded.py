@@ -3,6 +3,16 @@ __build__ = "1.2.3"
 import sys
 import os
 import ssl
+
+# Line-buffer the log. Under systemd stdout is a pipe, so Python block-buffers it and a line such as
+# "[WATCHDOG] Starting service health watchdog" can sit in memory for minutes. Mimir's watchdog
+# check looks for that line in the journal, so a healthy watchdog read as "not supervising", and an
+# operator reading the journal saw a daemon that seemed to have stopped.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 import json
 import subprocess
 import socket

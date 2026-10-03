@@ -241,5 +241,14 @@ class ScyllaStartsOneNodeAtATimeSeedFirst(unittest.TestCase):
         self.assertIn("start_scylla_in_order(ips)", body)
 
 
+class TheDaemonLogIsLineBuffered(unittest.TestCase):
+    def test_stdout_and_stderr_are_reconfigured_before_anything_prints(self):
+        text = read("spark_daemon_decoded.py")
+        head = text[:text.index("def ")]
+        self.assertIn("reconfigure(line_buffering=True)", head)
+        self.assertIn("sys.stdout", head)
+        self.assertIn("sys.stderr", head)
+
+
 if __name__ == "__main__":
     unittest.main()
