@@ -333,6 +333,43 @@ def get_cluster_ips():
         return ["127.0.0.1"]
 
 
+def configured_cluster_ips(path="/etc/hci/cluster.json"):
+    """The hosts this node's cluster consists of, or None when no cluster is configured.
+
+    get_cluster_ips() answers the same question with a silent fallback to 127.0.0.1, which
+    other commands lean on and which is wrong for `status`: asked about a cluster that does
+    not exist, it invented a one-host cluster and printed every service on it as DOWN. That
+    is a report about a cluster that was never there. "Nothing is configured" and "a
+    configured cluster is down" are different situations that need different answers, and
+    only the second one has a table to print.
+    """
+    try:
+        with open(path, "r") as handle:
+            hosts = [h["ip"] for h in json.load(handle).get("hosts", []) if h.get("ip")]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return hosts or None
+
+
+def print_no_cluster(as_json=False):
+    """Say there is no cluster, and how to make one. Nothing is probed to say it."""
+    if as_json:
+        print(json.dumps({"cluster_state": "not_configured", "source": "local",
+                          "nodes": {}}, indent=2))
+        return
+    print("==========================================================")
+    print("                 HCI Cluster Status                       ")
+    print("==========================================================")
+    print("No cluster is configured on this node.")
+    print("")
+    print(f"{GRAY}/etc/hci/cluster.json is absent or lists no hosts, so there is nothing to ask")
+    print(f"about: either no cluster has been created here, or it was destroyed.{RESET}")
+    print("")
+    print("Create one with:")
+    print("    cluster -s <ip1,ip2,ip3> -r 1 -v <vip> create")
+    print("==========================================================")
+
+
 # Control-socket one-liners, defined once.
 #
 # Every one of these is a shell command carrying a JSON document with quotes and a
@@ -2512,6 +2549,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("==========================================================")
 
     elif args.command == "status":
+        # No cluster configured is an answer in its own right. Without this the command
+        # fell back to 127.0.0.1 and reported a table of DOWN services for a cluster that
+        # does not exist -- which reads as a cluster in trouble rather than as no cluster.
+        if not args.servers and configured_cluster_ips() is None:
+            print_no_cluster(as_json=getattr(args, "json", False))
+            sys.exit(1)
+
         # Preferred path: read the state ZooKeeper already holds. One connection, no
         # fan-out, and liveness comes from ephemeral znode presence rather than a probe
         # that cannot distinguish "running" from "restarting".
