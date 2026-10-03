@@ -157,7 +157,7 @@ flag day.
 Stated here so their absence is a decision, not an accident. None of these is in v1, and
 several should never be built:
 
-- **Deduplication, compression, erasure coding, tiering** — each multiplies the state
+- **Deduplication, compression, erasure coding, tiering** (erasure coding: D-24) — each multiplies the state
   space Ganon must cover. Revisit individually, after years of stable operation, if ever.
 - **Multi-writer vdisks** (clustered guest filesystems) — unsupported, refused at attach.
   With one deliberate exception: an **immutable vdisk class** for golden images, served

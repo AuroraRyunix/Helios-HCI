@@ -1182,10 +1182,30 @@ as data* by DRBD and refused with EIO by Sidon.
   (a clone recovers data; it is not the same as putting a VM back), and a console view.
 * **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
   already carries an algorithm byte, so it is off the write path entirely.
-* **Erasure coding**, as a Purah job over cold sealed groups — after the above, not
-  before. **Deduplication is argued against** in [decisions.md](docs/dfs/decisions.md).
+* **Erasure coding**, as a Purah job over cold sealed groups — **decided against on three
+  nodes** (D-24 in [decisions.md](docs/dfs/decisions.md)): 2+1 saves at most 25% of the cold
+  data and cannot heal after a node loss because it has no spare node. Revisit at five or
+  more nodes with a cold sealed fraction above about half of used capacity; measure the
+  fraction with `valcli storage.heat`. **Deduplication is argued against** there too.
 * **`vhost-user-blk`** beside NBD, deliberately last: performance work reorders
-  operations, and reordering is where invariants go to die.
+  operations, and reordering is where invariants go to die. **Designed, not built**
+  ([docs/dfs/vhost_user_blk.md](docs/dfs/vhost_user_blk.md), D-25): the first step is a
+  benchmark, and the first thing it is likely to find is that the transport is not the limit.
+  Open prerequisite: on an EL10 node, run `/usr/libexec/qemu-kvm -device help | grep -i
+  vhost-user` to find out whether the shipped qemu has the device at all.
+* **Sidon serves one NBD request at a time per connection.** The serve loop reads a request,
+  executes it and replies before reading the next, behind one `Mutex<Vdisk>`, so a guest's
+  queue depth and the `queues='N'` the libvirt XML asks for are flattened to 1. Making the
+  backend concurrent is a journal-ordering change (gap-free sequences, replica order) and
+  needs its own Ganon scenario; it is the real prerequisite for any transport work.
+* **A 4 KiB read of drained data reads and checksums the whole 1 MiB extent**
+  (`extent.rs::read_extent`), 256x amplification, and opens the group file each time.
+* **Journal replication is sequential across replicas**, one mutex-guarded connection per
+  peer shared by every vdisk, although `docs/sidon.md` section 1 draws the replica appends
+  as parallel. Either the code or the diagram is wrong; at RF=2 it is one replica and the
+  difference is invisible, at RF=3 it is a second serial round trip per write.
+* **A drain runs inline in `Vdisk::write`** once the journal passes its high-water mark, with
+  the vdisk mutex held, so the write that crosses it waits for the whole drain.
 
 ### Scale-out add-ons (blueprints only)
 

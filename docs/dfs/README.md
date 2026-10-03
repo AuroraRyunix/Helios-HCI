@@ -22,7 +22,8 @@ prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; t
 half is still not built, and nothing moves an extent group on the strength of the ranking.
 
 Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
-and rollback, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
+and rollback, erasure coding (decided against on three nodes, D-24), and `vhost-user-blk`
+(designed, gated on a benchmark, D-25 and [vhost_user_blk.md](./vhost_user_blk.md)). (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
 
 The documents remain the specification -- where code and document disagree, that is a bug
@@ -73,6 +74,9 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 8. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
 9. [multi_disk.md](./multi_disk.md) — using more than one disk per node, and why pooling
    them into one volume group is the wrong answer.
+10. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
+    `vhost-user-blk` would and would not remove, the invariants it endangers, and the
+    benchmark that decides whether to build it.
 
 ## The one-paragraph version
 
