@@ -112,7 +112,8 @@ different, and smaller than the ADR first claimed:
 * **Relocation costs one row.** Moving, compacting or erasure-coding an extent group today
   means finding every block-map row in every vdisk that points at it, which is a full scan of
   the map and a rewrite under each owner's epoch. With the middle level it is one extent row.
-  That is the real prize, and it belongs to tiering and compaction, neither of which is built.
+  That is the real prize. Compaction (D-32, [compaction.md](./compaction.md)) uses it: an extent
+  named through the middle level is moved with one `extent-repoint` swap, whoever points at it.
 * **An extent has a name**, which is a precondition for dedup (see the addendum to D-23).
 
 Writers that would have to change, with the hazard each carries:

@@ -1645,6 +1645,232 @@ def cmd_storage_move(egroup_id, disk, node):
     print("The old copy stays until the sweep has seen it surplus on two passes.")
 
 
+def _compact_request(argv):
+    """The control request `storage.compact` sends, from its command line.
+
+    Plans unless `--apply` is present, and that is the only way to apply. Anything it does not
+    recognise is an error and not an ignored word: a misspelt `--aplly` that fell through to a
+    plan would be harmless, but a misspelt limit that fell through to the default would run a
+    bigger pass than the operator asked for.
+    """
+    request = {"op": "purah-compact", "apply": False}
+    numeric = {"--threshold": ("threshold", float), "--max-groups": ("max_groups", int),
+               "--max-bytes": ("max_bytes", int), "--seconds": ("seconds", int),
+               "--rate": ("rate_bytes_per_second", int)}
+    args = list(argv)
+    while args:
+        word = args.pop(0)
+        if word == "--apply":
+            request["apply"] = True
+        elif word in numeric and args:
+            key, kind = numeric[word]
+            try:
+                request[key] = kind(args.pop(0))
+            except ValueError:
+                raise SystemExit("Usage: valcli storage.compact [--apply] [--threshold F] "
+                                 "[--max-groups N] [--max-bytes N] [--seconds N] [--rate BYTES]")
+        else:
+            raise SystemExit("Usage: valcli storage.compact [--apply] [--threshold F] "
+                             "[--max-groups N] [--max-bytes N] [--seconds N] [--rate BYTES]")
+    return request
+
+
+def cmd_storage_compact(argv):
+    """Plan, or with --apply carry out, compaction of sparse sealed extent groups.
+
+    A guest overwrite leaves garbage inside a sealed group, and the sweep frees a group only
+    when nothing in it is live. Compaction copies the live extents of groups that are mostly
+    dead into new groups, verifies them, repoints the map by compare-and-swap, and leaves the
+    old groups for the sweep's two-scan grace.
+
+    Plans unless --apply is given, and nothing runs it on a timer (D-32). A pass is bounded by
+    a number of groups, a number of bytes, a rate and a time, and prints which bound it hit; run
+    it again to continue. Per node: a node compacts the groups it created.
+
+    It also says what it cannot do. Replicas keep their copy of an old group, so the figure for
+    what is added on replicas has no matching saving until a replica-side reclaim exists.
+    """
+    request = _compact_request(argv)
+    apply = request["apply"]
+    answered = 0
+    for host in _storage_hosts():
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", request)
+        if rc != 0 or not isinstance(body, dict) or "candidate_count" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] compaction failed: %s" % (label, detail))
+            continue
+        answered += 1
+        print()
+        print("%s: %s" % (label, body.get("status")))
+        for cand in body.get("candidates") or []:
+            print("  %-44s %5.1f%% live  %9d of %9d bytes  %d extent(s), %d shared  [%s]"
+                  % (cand.get("egroup_id"), 100.0 * (cand.get("live_fraction") or 0),
+                     cand.get("live_bytes") or 0, cand.get("size_bytes") or 0,
+                     cand.get("live_extents") or 0, cand.get("shared_extents") or 0,
+                     ", ".join(cand.get("vdisks") or [])))
+        if (body.get("candidate_count") or 0) > len(body.get("candidates") or []):
+            print("  ... and %d more" % (body["candidate_count"] - len(body.get("candidates") or [])))
+        for skip in body.get("skipped") or []:
+            print("  skipped %s: %s" % (skip.get("egroup_id"), skip.get("reason")))
+        for step in body.get("plan") or []:
+            print("  %s: copy %d bytes from %s to a new group; %d bytes freed here once swept; "
+                  "%d bytes added on %s"
+                  % ("would" if not apply else "plan", step.get("bytes_to_copy") or 0,
+                     ", ".join(step.get("sources") or []), step.get("freed_here_after_sweep") or 0,
+                     step.get("added_on_replicas") or 0, ", ".join(step.get("replicas") or []) or "no replicas"))
+        for done in body.get("executed") or []:
+            print("  done: %s (%d bytes) from %s; %d row(s) repointed, %d lost to an overwrite"
+                  % (done.get("new_group"), done.get("bytes") or 0, ", ".join(done.get("sources") or []),
+                     done.get("rows_repointed") or 0, done.get("lost_races") or 0))
+            for bad in done.get("unusable_sources") or []:
+                print("    left out %s: %s" % (bad.get("egroup_id"), bad.get("reason")))
+        for bad in body.get("failed") or []:
+            print("  FAILED %s: %s" % (", ".join(bad.get("sources") or []), bad.get("error")))
+        for anomaly in body.get("anomalies") or []:
+            print("  ANOMALY: %s" % anomaly)
+        if body.get("stopped_by"):
+            print("  stopped by %s; run it again to continue." % body["stopped_by"])
+    if not answered:
+        print()
+        print("No node answered. Either sidon is older than compaction or it is down.")
+    elif not apply:
+        print()
+        print("Nothing was changed. Re-run with --apply to carry the plan out.")
+
+
+def _dedup_request(argv):
+    request = {"op": "purah-dedup", "digests": True}
+    args = list(argv)
+    usage = "Usage: valcli storage.dedup.estimate [--sample F] [--seconds N]"
+    while args:
+        word = args.pop(0)
+        if word == "--sample" and args:
+            try:
+                request["sample"] = float(args.pop(0))
+            except ValueError:
+                raise SystemExit(usage)
+            if not 0 < request["sample"] <= 1:
+                raise SystemExit(usage + "   (the sample is a fraction above 0 and at most 1)")
+        elif word == "--seconds" and args:
+            try:
+                request["seconds"] = int(args.pop(0))
+            except ValueError:
+                raise SystemExit(usage)
+        else:
+            raise SystemExit(usage)
+    return request
+
+
+def _merge_dedup(bodies):
+    """Cluster-wide figures per container from every node's answer.
+
+    A node hashes only the groups it created, so two copies of one extent on two nodes are
+    invisible to either. Each node returns a short digest per sampled extent; counting those
+    across nodes is what finds the duplicates that straddle them. Nodes sampled the same
+    locations by construction, and a node cut short by its time budget covered less, so the
+    scaled figure uses the smallest fraction any node covered.
+    """
+    merged = {}
+    covered = min([b.get("sample_covered") or 0 for b in bodies] or [0])
+    exact = all(b.get("exact") for b in bodies)
+    for body in bodies:
+        for c in body.get("containers") or []:
+            m = merged.setdefault(c["container"], {
+                "stored_bytes": 0, "stored_extents": 0, "logical_bytes": 0,
+                "shared_by_clone_bytes": 0, "sampled_bytes": 0, "digests": [],
+                "zero_bytes": 0, "unreadable": 0, "have_digests": True})
+            m["stored_bytes"] += c.get("stored_bytes") or 0
+            m["stored_extents"] += c.get("stored_extents") or 0
+            m["logical_bytes"] += c.get("logical_bytes") or 0
+            m["shared_by_clone_bytes"] += c.get("shared_by_clone_bytes") or 0
+            m["sampled_bytes"] += c.get("sampled_bytes") or 0
+            m["zero_bytes"] += c.get("zero_extent_bytes_in_sample") or 0
+            m["unreadable"] += c.get("unreadable_extents") or 0
+            if "digests" in c:
+                m["digests"].extend(c["digests"])
+            elif c.get("sampled_extents"):
+                m["have_digests"] = False
+    out = []
+    for name in sorted(merged):
+        m = merged[name]
+        seen = set()
+        unique = 0
+        for digest, size in m["digests"]:
+            if digest not in seen:
+                seen.add(digest)
+                unique += size
+        observed = max(0, sum(s for _, s in m["digests"]) - unique)
+        scaled = observed if exact or covered <= 0 else min(m["stored_bytes"], int(round(observed / covered)))
+        out.append({
+            "container": name, "stored_bytes": m["stored_bytes"], "stored_extents": m["stored_extents"],
+            "logical_bytes": m["logical_bytes"], "shared_by_clone_bytes": m["shared_by_clone_bytes"],
+            "would_share_bytes": scaled, "zero_bytes_in_sample": m["zero_bytes"],
+            "unreadable": m["unreadable"], "fraction": (float(scaled) / m["stored_bytes"]) if m["stored_bytes"] else 0.0,
+            "merged_across_nodes": m["have_digests"],
+        })
+    return {"containers": out, "exact": exact, "covered": covered}
+
+
+def cmd_storage_dedup_estimate(argv):
+    """How many bytes dedup would share beyond what clone-from-image already shares.
+
+    The first step D-23's addendum asks for before anything is built: a number measured on
+    this cluster's own data. Read-only. It hashes sealed extents (changing no extent id),
+    counts the ones whose content another extent holds, and reports, per container, what is
+    already shared by clone and what dedup would add. Sampled by default so it is cheap; at
+    --sample 1 it reads every sealed extent and the figure is exact.
+
+    Writes nothing, builds no index and has no setting: it is not dedup. The working threshold
+    in D-23 is roughly ten to fifteen percent beyond clone sharing; below that the estimate
+    argues against building anything.
+    """
+    request = _dedup_request(argv)
+    bodies = []
+    for host in _storage_hosts():
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", request)
+        if rc != 0 or not isinstance(body, dict) or "containers" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] no estimate: %s" % (label, detail))
+            continue
+        bodies.append(body)
+        print("%s: %s" % (label, body.get("status")))
+    if not bodies:
+        print()
+        print("No node answered. Either sidon is older than the estimator or it is down.")
+        return
+    mib = float(1 << 20)
+    merged = _merge_dedup(bodies)
+    print()
+    print("Across %d node(s), %s (sampled %.1f%% of stored extents):"
+          % (len(bodies), "exact" if merged["exact"] else "an estimate", 100.0 * merged["covered"]))
+    for c in merged["containers"]:
+        print("  container %s" % c["container"])
+        print("    stored            %10.1f MiB in %d extent(s)" % (c["stored_bytes"] / mib, c["stored_extents"]))
+        print("    already shared    %10.1f MiB by clone and snapshot (logical %.1f MiB)"
+              % (c["shared_by_clone_bytes"] / mib, c["logical_bytes"] / mib))
+        print("    would also share  %10.1f MiB  = %.1f%% of stored%s"
+              % (c["would_share_bytes"] / mib, 100.0 * c["fraction"],
+                 "" if c["merged_across_nodes"] else "  (per node only: a node did not return digests)"))
+        if c["zero_bytes_in_sample"]:
+            print("    of the sample, %.1f MiB is zero-filled extents, which a sparse map would drop"
+                  " without hashing anything" % (c["zero_bytes_in_sample"] / mib))
+        if c["unreadable"]:
+            print("    %d sampled extent(s) could not be read and are not counted" % c["unreadable"])
+    print()
+    print("A sample sees a duplicate only when both copies were sampled, so it undercounts content")
+    print("that exists twice and is fair for content that exists many times. Extent granularity")
+    print("only. This is a measurement: nothing was written and nothing was deduplicated.")
+    print("D-23 puts the bar for building anything at roughly 10-15% beyond clone sharing.")
+
+
 def cmd_storage_heat(limit=10):
     """Which extent groups each node reads and writes most, and which have gone cold.
 
@@ -2986,6 +3212,9 @@ def print_usage():
     print("  valcli storage.placement [N]            Which disk of each node holds which extent groups")
     print("  valcli storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
     print("  valcli storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
+    print("  valcli storage.compact [--apply]        Plan (or with --apply, make) compaction of sparse sealed groups")
+    print("                                          [--threshold F] [--max-groups N] [--max-bytes N] [--seconds N] [--rate B/s]")
+    print("  valcli storage.dedup.estimate [--sample F]  Bytes dedup would share beyond clones (read-only)")
     print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
     print("  valcli image.delete <name>         Demote and delete image from storage and database")
     print("  valcli disk.list                   List all active and orphaned virtual disks")
@@ -3162,6 +3391,10 @@ def main():
             print("Usage: valcli storage.tier [--apply]")
             sys.exit(1)
         cmd_storage_tier(apply=bool(extra))
+    elif cmd == "storage.compact":
+        cmd_storage_compact(sys.argv[2:])
+    elif cmd == "storage.dedup.estimate":
+        cmd_storage_dedup_estimate(sys.argv[2:])
     elif cmd == "storage.move":
         if len(sys.argv) != 5:
             print("Usage: valcli storage.move <egroup_id> <disk> <node>")

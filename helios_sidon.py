@@ -274,6 +274,27 @@ def move_egroup(egroup_id, disk, **kw):
     return call("purah-move", egroup_id=egroup_id, disk=disk, **kw)
 
 
+def compact(apply=False, **kw):
+    """Plan, or carry out, compaction of this node's sparse sealed extent groups.
+
+    Copies the live extents of groups that are mostly garbage into new groups, verifies them,
+    repoints the map by compare-and-swap and leaves the old groups for the sweep. Plans only
+    unless `apply` is true, and nothing runs it on a timer (D-32). Limits (`threshold`,
+    `max_groups`, `max_bytes`, `seconds`, `rate_bytes_per_second`) are passed through when
+    given. See docs/dfs/compaction.md.
+    """
+    return call("purah-compact", apply=bool(apply), **kw)
+
+
+def dedup_estimate(**kw):
+    """How many bytes dedup would share beyond clone sharing, from this node's sealed groups.
+
+    Read-only: it writes nothing but its report. `sample` (a fraction), `seconds` and `digests`
+    are passed through when given. See D-23's addendum and docs/dfs/compaction.md.
+    """
+    return call("purah-dedup", **kw)
+
+
 def list_attached(**kw):
     return call("list", **kw)
 

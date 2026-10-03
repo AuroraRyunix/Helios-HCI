@@ -63,7 +63,7 @@ fn text(row: &Value, name: &str) -> Option<String> {
 /// such direction: either the migration is recorded, in which case the column exists and
 /// every failure from here on aborts the sweep, or it is not, in which case no writer has
 /// had a table to put an extent id in.
-fn applied_levels<D: Rows>(db: &D) -> Result<(bool, bool)> {
+pub fn applied_levels<D: Rows>(db: &D) -> Result<(bool, bool)> {
     let ids: HashSet<String> = db
         .rows(LEDGER_SCAN)?
         .iter()

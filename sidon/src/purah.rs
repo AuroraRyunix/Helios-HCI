@@ -36,7 +36,13 @@ use crate::extent::EgroupStore;
 use crate::heat::{heat_score, AccessLog, Counts};
 use crate::meta::{access_batches, cql_str, json_params, Daruk, ACCESS_BATCH};
 
+pub mod compact;
+pub mod dedup;
+pub mod occupancy;
 pub mod tier;
+
+#[cfg(test)]
+mod testkit;
 
 pub struct Purah {
     daruk: Daruk,
@@ -57,6 +63,9 @@ pub struct Purah {
     /// Surplus copies a disk-to-disk move left behind, and when each was first seen. Swept
     /// under the same two-scan grace as an unreferenced group; see `tier.rs`.
     strays: tier::StrayLedger,
+    /// What the last compaction pass said about itself, so the next one can show it. In
+    /// memory only: it is a status line, not state anything depends on.
+    last_compaction: Option<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -147,7 +156,44 @@ impl Purah {
             unreferenced_since: HashMap::new(),
             access,
             strays: tier::StrayLedger::default(),
+            last_compaction: None,
         }
+    }
+
+    /// Plan, and with `opts.apply` carry out, one compaction pass. See `purah/compact.rs`.
+    ///
+    /// Runs under the same lock as the sweep, which is part of why it is safe: the sweep cannot
+    /// observe a group between its registration and the first row that points at it.
+    pub fn compact(
+        &mut self,
+        opts: &compact::Options,
+        env: &dyn compact::Env,
+        now_ms: i64,
+    ) -> Result<Value> {
+        let daruk = self.daruk.clone();
+        let tier_of = |c: &str| crate::extent::container_tier(&daruk, c);
+        let clock = crate::replicate::throttle::SystemClock::new();
+        let mut report = compact::run(
+            &self.daruk,
+            &self.store,
+            &self.node,
+            self.grace,
+            env,
+            opts,
+            &compact::NoProbe,
+            &clock,
+            &tier_of,
+            now_ms,
+        )?;
+        if let Some(previous) = self.last_compaction.take() {
+            report["previous_run"] = previous;
+        }
+        self.last_compaction = Some(json!({
+            "at_ms": now_ms,
+            "applied": opts.apply,
+            "status": report["status"],
+        }));
+        Ok(report)
     }
 
     /// Every extent group id the block map currently points at, across all vdisks.

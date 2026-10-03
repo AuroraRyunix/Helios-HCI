@@ -120,7 +120,8 @@ class DfsAllowListTests(unittest.TestCase):
             self.node_ops,
             {"list", "ping", "capacity", "peers",
              "purah-sweep", "purah-scrub", "purah-heal", "purah-heat",
-             "purah-tier", "purah-move", "purah-placement"})
+             "purah-tier", "purah-move", "purah-placement",
+             "purah-compact", "purah-dedup"})
 
     def test_capacity_is_node_scoped(self):
         """Called out on its own: every caller that asks how much room a node has goes

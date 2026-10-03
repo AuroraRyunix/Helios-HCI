@@ -123,6 +123,19 @@ Purah's sweep rule implements I-7 directly: an egroup is reclaimable only if
 unreferenced by every map generation in **two consecutive scans** separated by more than
 the maximum drain duration. Slow reclaim, immune to the scan/drain race by construction.
 
+### Compaction: reclaiming inside a group
+
+Mark-sweep frees a *group*. A group three extents dead and one alive is never freed, and
+redirect-on-write makes that the ordinary result of a guest rewriting a small working set.
+**Compaction** (`valcli storage.compact`, [compaction.md](./compaction.md), D-32) copies the
+live extents of sparse sealed groups into a new group, verifies it against the seal hash and
+every footer, replicates it, repoints each row by compare-and-swap, and leaves the old group
+for the sweep's two-scan grace. It never deletes, so a stop at any step leaves a map that reads
+correctly (I-3); it rewrites a writable vdisk's rows only while that vdisk's drains are held, so
+the single-writer rule of the block map (I-4, [metadata.md](./metadata.md) section 3) is kept;
+and it is operator-invoked, bounded by groups, bytes, rate and time. It does not reclaim a
+replica's copy of the old group; nothing does yet.
+
 ## 6. Numbers, and why these numbers
 
 | Parameter | v1 value | Why |
