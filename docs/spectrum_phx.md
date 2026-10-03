@@ -307,6 +307,37 @@ need no lease and writes are refused by class at the NBD layer. A seal that fail
 failed upload, because an unsealed template is one attach away from changing what every VM
 cloned from it boots.
 
+**A failed upload used to be invisible, and still looked like it was working.** The
+operator picked an image, pressed Upload, and the entry vanished with no message anywhere.
+The cause was in how LiveView treats a writer that returns `{:error, reason}` -- which is
+what every failure path here did. LiveView stops the upload channel. The browser then fails
+the entry *without sending the form submit*, so the page never hears an outcome and the
+form stays locked on "Uploading..."; and the LiveView, seeing the channel go down, drops the
+entry together with the error it had just recorded for it. Nothing reaches the screen, and
+nothing is logged at info level. (Reproduced against the real LiveView JS in a browser with
+only the catalogue unreachable; the backend -- `POST /api/v1/dfs/write` with 16 MiB and
+600 MiB bodies over mTLS, create, seal and register -- was healthy throughout.)
+
+So `UploadWriter` never returns an error. A failure rolls back, records
+`result: {:error, reason}`, sends `{:upload_failed, ref, reason}` to the LiveView (the writer
+function runs inside it, so `self()` there is the page) and then accepts and discards
+whatever the browser still sends. The upload completes from the browser's side, the submit
+arrives, and `consume_uploaded_entries/3` hands the recorded error to the page, which
+renders every reason in `#upload-error`. The cost is that the rest of the file is read and
+thrown away after a mid-stream failure, so the failures that are likely before any byte
+moves -- an unusable name, a missing container, a name already in the catalogue -- are
+checked when the file is chosen (`Images.preflight_upload/2`, run from `validate_upload`),
+which also disables Upload. A writer that raises is converted the same way.
+
+**The last chunk does the slow work, and its timeout is the browser's.** Closing the
+writer runs inside the reply to the final chunk: wait for the host to flush the body (up to
+ten minutes), seal (up to five), register. `chunk_timeout` is also the browser's timeout
+for that push, and the browser has no handler for it expiring -- it just never completes,
+the submit is never sent, and the page hangs on "Uploading..." silently. The old value,
+two minutes, was shorter than a seal of a large image; it is now twenty minutes. The page
+shows the percentage as bytes are sent and, once the last chunk is in, says that the host
+is sealing and registering.
+
 ## 7a. Hardware
 
 The physical inventory. Four reads per node — CPU, memory, disks, network — in parallel,

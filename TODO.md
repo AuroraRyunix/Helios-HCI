@@ -1145,6 +1145,16 @@ overview, hosts, VM list/create/detail with disk allocation through the typed Li
 storage fabric, images, tasks, metrics, health. Navigation is one list checked against the router
 by `navigation_test.exs`.
 
+**Image upload failures are now visible (2026-10-04).** The Phoenix upload was reported to "just do
+nothing": the writer returned `{:error, _}` on every failure, which makes LiveView stop the upload
+channel, the browser skip the submit (form stuck on "Uploading..."), and the LiveView drop the entry
+with its error. The writer now records the failure, tells the page, and lets the upload complete so
+it renders in `#upload-error`; name/catalogue/container problems are refused when the file is chosen;
+`chunk_timeout` was raised from 2 to 20 minutes because the last chunk's reply includes flush, seal and
+register and the browser has no handler for that push timing out. Backend half (`/api/v1/dfs/write`,
+16 MiB and 600 MiB, mTLS, seal, register, delete) verified healthy on the lab. **Still needs a real-browser
+upload on the lab through Slate** (large websocket frames and a multi-GiB ISO were not exercised there).
+
 **Image upload is done and verified on hardware.** A custom `Phoenix.LiveView.UploadWriter`
 pushes each chunk onto an open request to spark-daemon, so nothing is spooled in the web
 tier. Verified end to end: 8 MiB written to a DRBD device and compared byte for byte,

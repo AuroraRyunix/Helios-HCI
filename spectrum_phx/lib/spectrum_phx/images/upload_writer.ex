@@ -33,6 +33,24 @@ defmodule SpectrumPhx.Images.UploadWriter do
 
   The outcome travels back to the LiveView through `meta/1`, which is what
   `consume_uploaded_entries/3` receives.
+
+  ## Failure is reported, never raised
+
+  A writer that returns `{:error, reason}` -- from `write_chunk/2` or from `close/2` --
+  looks like the right thing to do, and it is what made a failed upload a silent no-op.
+  LiveView answers it by stopping the upload channel. The browser then fails the entry
+  *without* sending the form submit (so the page never hears the outcome and the form
+  stays locked as "Uploading..."), and the LiveView, seeing the channel go down, drops the
+  entry together with the error it had just recorded for it. Nothing is rendered.
+
+  So this writer never returns an error. A failure rolls back, records
+  `result: {:error, reason}`, sends `{:upload_failed, ref, reason}` to the LiveView so the
+  message appears at once, and then accepts and discards what the browser still sends.
+  The upload completes from the browser's side, the submit arrives, and
+  `consume_uploaded_entries/3` hands the recorded error to the page. The cost is that the
+  rest of the file is read and thrown away after a mid-stream failure; the failures that
+  are likely before any byte is sent are caught by `SpectrumPhx.Images.preflight_upload/2`
+  when the file is chosen.
   """
   @behaviour Phoenix.LiveView.UploadWriter
 
@@ -56,6 +74,10 @@ defmodule SpectrumPhx.Images.UploadWriter do
      %{
        name: Keyword.fetch!(opts, :name),
        size_bytes: Keyword.fetch!(opts, :size_bytes),
+       # The LiveView to tell, and which entry to tell it about. Optional so the writer
+       # can still be driven on its own; see "Failure is reported, never raised".
+       notify: Keyword.get(opts, :notify),
+       ref: Keyword.get(opts, :ref),
        # :pending until the first chunk prepares storage, then :streaming, then whatever
        # close/2 settles on. Nothing here touches the network.
        stage: :pending,
@@ -79,32 +101,44 @@ defmodule SpectrumPhx.Images.UploadWriter do
   end
 
   @impl true
-  def write_chunk(data, %{stage: :pending} = state) do
+  def write_chunk(data, state) do
+    do_write_chunk(data, state)
+  rescue
+    error -> {:ok, fail(state, {:transport, Exception.message(error)})}
+  catch
+    :exit, reason -> {:ok, fail(state, {:transport, inspect(reason)})}
+  end
+
+  defp do_write_chunk(data, %{stage: :pending} = state) do
     case start(state) do
-      {:ok, started} -> write_chunk(data, started)
-      {:error, reason, failed} -> {:error, reason, failed}
+      {:ok, started} -> do_write_chunk(data, started)
+      {:failed, failed} -> {:ok, failed}
     end
   end
 
-  def write_chunk(data, %{stage: :streaming} = state) do
+  defp do_write_chunk(data, %{stage: :streaming} = state) do
     case transport().send_chunk(state.handle, data) do
       {:ok, handle} ->
         {:ok, %{state | handle: handle, written: state.written + byte_size(data)}}
 
       {:error, reason} ->
         # The request is dead. There is nothing left to finish, only to undo.
-        fail(state, {:transport, reason})
+        {:ok, fail(state, {:transport, reason})}
     end
   end
 
-  # A chunk after the stream already failed. Reject it rather than reopening anything:
-  # the allocation is gone and the entry is being torn down.
-  def write_chunk(_data, %{stage: :failed} = state) do
-    {:error, error_of(state), state}
-  end
+  # A chunk after the stream already failed. Accepted and dropped: the allocation is
+  # gone and the outcome is recorded, so there is nothing to write to. It is accepted
+  # rather than refused because a refusal is what made the failure invisible -- see
+  # "Failure is reported, never raised".
+  defp do_write_chunk(_data, %{stage: :failed} = state), do: {:ok, state}
 
   @impl true
   def close(%{stage: :streaming} = state, :done) do
+    # The last chunk is still waiting for its reply while this runs, and this is where
+    # the time goes (flush, seal, register). Say so, or the bar sits at its last value.
+    if is_pid(state.notify), do: send(state.notify, {:upload_finalizing, state.ref})
+
     with :ok <- declared_size_reached(state),
          {:ok, written} <- transport().finish(state.handle),
          :ok <- Images.finish_upload(state.allocation, written),
@@ -112,16 +146,15 @@ defmodule SpectrumPhx.Images.UploadWriter do
       {:ok, %{state | stage: :done, written: written, result: {:ok, image}}}
     else
       {:error, reason} ->
-        # Connection first, allocation second. The daemon holds the vdisk attached for
-        # as long as the request is alive, so a delete issued before the socket closes is
-        # refused and the vdisk leaks -- which is the exact failure this rollback exists
-        # to prevent.
-        transport().close(state.handle)
-        Images.rollback_upload(state.allocation)
-        # {:error, _} from close/2 fails the entry, which is right: an image that was not
-        # registered must not look uploaded.
-        {:error, reason}
+        # Connection first, allocation second: see fail/2. The outcome is recorded and
+        # the entry still *completes* -- an image that was not registered must not look
+        # uploaded, and it does not, because the result is an error.
+        {:ok, fail(state, reason)}
     end
+  rescue
+    error -> {:ok, fail(state, {:transport, Exception.message(error)})}
+  catch
+    :exit, reason -> {:ok, fail(state, {:transport, inspect(reason)})}
   end
 
   # Cancelled, or closed before a single chunk arrived. Nothing was allocated unless the
@@ -152,7 +185,7 @@ defmodule SpectrumPhx.Images.UploadWriter do
   defp start(state) do
     case Images.prepare_upload(state.name, state.size_bytes) do
       {:error, reason} ->
-        {:error, reason, %{state | stage: :failed, result: {:error, reason}}}
+        {:failed, fail(state, reason)}
 
       {:ok, allocation} ->
         case transport().open(allocation, state.size_bytes) do
@@ -161,24 +194,26 @@ defmodule SpectrumPhx.Images.UploadWriter do
 
           {:error, reason} ->
             # Storage was allocated and the connection was not. Undo the allocation, or
-            # it holds space on every node with nothing pointing at it. fail/2 already
-            # returns the {:error, reason, state} shape write_chunk/2 expects.
-            fail(%{state | allocation: allocation}, {:transport, reason})
+            # it holds space on every node with nothing pointing at it.
+            {:failed, fail(%{state | allocation: allocation}, {:transport, reason})}
         end
     end
   end
 
+  # Undo whatever exists, record why, tell the LiveView. Returns the new state.
   defp fail(state, reason) do
-    # Connection first, allocation second: see close/2.
+    # Connection first, allocation second: the daemon holds the vdisk attached for as
+    # long as the request is alive, so a delete issued before the socket closes is
+    # refused and the vdisk leaks -- the exact failure this rollback exists to prevent.
     if state.handle, do: transport().close(state.handle)
     if state.allocation, do: Images.rollback_upload(state.allocation)
 
-    {:error, reason,
-     %{state | stage: :failed, allocation: nil, handle: nil, result: {:error, reason}}}
-  end
+    Logger.warning("[images] Upload of #{state.name} failed: #{inspect(reason)}")
 
-  defp error_of(%{result: {:error, reason}}), do: reason
-  defp error_of(_state), do: {:transport, "The upload was already aborted."}
+    if is_pid(state.notify), do: send(state.notify, {:upload_failed, state.ref, reason})
+
+    %{state | stage: :failed, allocation: nil, handle: nil, result: {:error, reason}}
+  end
 
   defp register_attrs(state) do
     %{name: state.name, size_bytes: state.size_bytes, socket: state.allocation.socket}

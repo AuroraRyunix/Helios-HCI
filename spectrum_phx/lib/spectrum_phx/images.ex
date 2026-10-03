@@ -331,9 +331,7 @@ defmodule SpectrumPhx.Images do
     # default.
     container = if container in [nil, ""], do: Containers.default_name(), else: container
 
-    with {:ok, name} <- validate_name(name),
-         :ok <- ensure_container(container),
-         :ok <- refuse_if_catalogued(name) do
+    with {:ok, name} <- preflight_upload(name, container) do
       vdisk = resource_name(name)
       ip = local_ip()
 
@@ -353,6 +351,28 @@ defmodule SpectrumPhx.Images do
 
   def prepare_upload(_name, _size_bytes, _container),
     do: {:error, {:upload, "The image size is unknown."}}
+
+  @doc """
+  The checks that need no storage: a usable name, an existing container, no catalogue
+  entry of that name already.
+
+  `prepare_upload/3` runs these first, and the Images page runs them the moment a file is
+  chosen. That is the reason this is public. A refusal here is the likeliest way an
+  upload fails -- the name is already catalogued -- and discovering it on the first chunk
+  means the browser has already read and sent that chunk and, with `auto_upload: false`,
+  goes on sending the rest of a multi-gibibyte file to a writer that has no use for it.
+  Asked at selection time, the operator is told before any byte moves.
+  """
+  @spec preflight_upload(String.t(), String.t() | nil) :: {:ok, String.t()} | {:error, term()}
+  def preflight_upload(name, container \\ nil) do
+    container = if container in [nil, ""], do: Containers.default_name(), else: container
+
+    with {:ok, name} <- validate_name(name),
+         :ok <- ensure_container(container),
+         :ok <- refuse_if_catalogued(name) do
+      {:ok, name}
+    end
+  end
 
   defp ensure_container(container) do
     case Containers.ensure_exists(container) do
