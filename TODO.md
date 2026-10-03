@@ -82,10 +82,14 @@ support: **dedup**. Container compression shipped in `0008`; dedup is the obviou
 property an operator would expect beside it. It is *not* a settings toggle away, and the
 reason is recorded in **D-23**: dedup needs the extent id map, the middle level between the
 block map and extent groups that makes an extent an addressable thing several vdisks can
-reference. Until that exists there is nothing for a dedup flag to act on. So the honest
-ordering is D-23 first, dedup second, and the settings toggle last -- and D-23 itself is
-blocked on Purah's mark phase learning to traverse both levels, because a flag cannot make
-that safe.
+reference. That level now exists (stages 1 and 2, below), so the naming prerequisite is met;
+what is not met is everything D-23's **addendum** costs out -- an inline dedup would put
+roughly thirty times today's lightweight-transaction load on the drain, needs a lease to close
+a resurrection window the sweep's guards do not cover, and returns space only through a
+compaction pass that does not exist. The owner wants dedup; the addendum's recommendation is
+a **read-only estimator first** (a Purah pass that hashes sealed extents and reports how many
+would be shared beyond what clone-from-image already shares), then compaction, then a
+background post-process pass, each only if the last earned it. The settings toggle stays last.
 
 **Coordination and tasks (2026-10-02)**
 
@@ -130,13 +134,30 @@ The notes themselves are deliberately not in this repository.
   absolute totals per observer, so a flush is safe to fire and forget. The data may decide
   *where a copy of bytes goes, never whether it exists*.
 
-  **Outstanding**: the extent id map -- the middle level Nutanix has and Helios does not,
-  which is what makes dedup and extent-granular clone sharing possible -- is recorded as
-  **D-23** and deliberately not built. It cannot be landed behind a read-path flag, because
-  Purah's mark phase derives liveness from `dfs_block_map.egroup_id`: the first row naming an
-  extent instead makes a sweep see every live group as unreferenced, and the two-scan grace
-  delays that by ten minutes rather than preventing it. The mark phase has to traverse both
-  levels first.
+  **The extent id map** -- the middle level Nutanix has and Helios does not -- is **D-23**,
+  and is staged because it cannot be landed behind a read-path flag: Purah's mark phase
+  derives liveness from the block map, and the first row naming an extent instead of a group
+  makes a sweep see every live group as unreferenced, with the two-scan grace delaying that by
+  ten minutes rather than preventing it. Built, in this order:
+  * **Stage 1 (built, undeployed): Purah marks through both levels**, fails closed on an
+    extent it cannot follow, and is proved by a randomized model. **This is the one to roll out
+    first, alone, and let run through a full sweep cycle** on every node (restart sidon: the
+    deploy does not) before anything else on the list; what to observe is in
+    [docs/dfs/extent_id_map.md](./docs/dfs/extent_id_map.md).
+  * **Stage 2 (built, undeployed, dormant): migrations `0020-dfs-extent-id-map` and
+    `0021-dfs-block-map-extent-id`** and a read path that resolves extent-named rows only
+    when a row has no `egroup_id`. Nothing writes an extent id, and a test pins that.
+  * **Stage 3 (designed, not built): writing extent ids.** Needs a third migration id for the
+    per-vdisk writer opt-in on `dfs_vdisks` (not assigned), a drain commit that nulls
+    `extent_id` on repoint, `derive_child` taught the new shape (it refuses it today, the safe
+    direction), and a Purah pass reclaiming extent rows orphaned by a vdisk delete.
+  * **Corrected in D-23:** the middle level is not what lets clones diverge per extent -- they
+    already do. Its value is that relocating an extent group costs one row instead of a scan of
+    every block map, which tiering and compaction will need.
+  * **Found, not fixed:** the drain's `INSERT` lists only the columns it sets, so once a row has
+    ever named an extent a repoint leaves the old `extent_id` behind; marking tolerates it (it
+    marks both) but it must be nulled in stage 3. Not fixable earlier, because naming the column
+    in the drain before `0021` is on every node would break drains.
 
 **Cluster state (2026-08-17, later session)**
 * **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;

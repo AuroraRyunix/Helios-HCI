@@ -21,7 +21,11 @@ Per-extent-group access data is recorded and ranked -- see D-22 in
 prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; the migration
 half is still not built, and nothing moves an extent group on the strength of the ranking.
 
-Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
+The extent ID map (D-23) is staged: Purah's mark phase traverses both map levels and the
+table and column exist (migrations `0020`, `0021`) with a dormant read path; writing extent ids
+is designed and not built. The rollout procedure is [extent_id_map.md](./extent_id_map.md).
+
+Not built: tiering, writing extent ids (D-23 stage 3), dedup, scheduled snapshots
 and rollback, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
 

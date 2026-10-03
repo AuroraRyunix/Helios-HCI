@@ -81,6 +81,7 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/metadata.md](./dfs/metadata.md) | Schema sketch, Daruk endpoints, exactly-once drain, load arithmetic. |
 | [dfs/ganon.md](./dfs/ganon.md) | The fault-injection harness — built first, calibrated against DRBD. |
 | [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
+| [dfs/extent_id_map.md](./dfs/extent_id_map.md) | The extent ID map (D-23): staged rollout and what to observe between stages. |
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
 
 Status: **designed, not building** — implementation begins with the harness, not the filesystem.

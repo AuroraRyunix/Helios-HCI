@@ -358,61 +358,152 @@ class TheApproximationIsWrittenDown(unittest.TestCase):
         self.assertIn("storage.heat", multi)
 
 
-class TheExtentIdMapIsReservedRatherThanHalfBuilt(unittest.TestCase):
-    """The missing middle level is designed, and deliberately not created.
+class TheExtentIdMapIsStagedSoTheMarkPhaseComesFirst(unittest.TestCase):
+    """The middle level is built in an order, and the order is what stops it deleting data.
 
     `dfs_block_map` points straight at an extent group where Nutanix points at an extent
-    first, which is why a clone shares groups wholesale and cannot diverge one extent at a
-    time. The schema and the staged plan are D-23 and the migration id is reserved.
+    first. D-23 adds that level: `dfs_extent_id_map`, and a nullable `extent_id` on the block
+    map. The first row that names an extent instead of a group would make a sweep that only
+    reads `egroup_id` see every group behind it as unreferenced, and a flag on the read path
+    does nothing about that because the sweep is not on the read path. So Purah has to learn
+    both levels *before* anything can write the second one, and these tests pin the pieces of
+    that ordering that code can pin:
 
-    The table is not created, and that is the decision rather than the unfinished part.
-    `multi_disk.md` already records what an empty table with a suggestive shape costs: the
-    one that exists, `dfs_egroup_replicas`, has nothing writing to it, and every design that
-    came afterwards had to open by establishing that it is not a source of truth.
-
-    The hazard the flag would not have covered is the reason this is not landed behind one:
-    Purah marks from `dfs_block_map.egroup_id`, and the moment any row names an extent
-    instead, a sweep that still marked from that column sees the live groups as
-    unreferenced. The flag protects the read path; the curator runs on a timer whether
-    anyone opted in or not.
+      * the mark phase reads the extent level (stage 1), and falls back to the statement it
+        always issued when the ledger says the column does not exist yet;
+      * the migrations exist under the assigned ids, one bare ALTER, and the Rust and Python
+        sides agree on the ids, because the mark phase decides which statement to send by
+        looking for them in the ledger;
+      * **nothing writes an extent id**, so no vdisk can be on the three-level path before
+        the rollout document says it may be.
     """
 
-    def test_the_migration_id_is_reserved_and_unused(self):
+    EXTENT_MAP_RS = os.path.join(HERE, "sidon", "src", "extent_id_map.rs")
+    RESOLVE_RS = os.path.join(HERE, "sidon", "src", "extent_resolve.rs")
+    ROLLOUT_MD = os.path.join(HERE, "docs", "dfs", "extent_id_map.md")
+
+    def test_the_migration_ids_are_the_assigned_ones_and_rust_agrees(self):
         import helios_schema
 
         ids = [m["id"] for m in helios_schema.MIGRATIONS]
-        self.assertFalse([i for i in ids if "extent-id-map" in i],
-                         "the extent id map migration exists before its mark phase does")
-        statements = " ".join(
-            " ".join(m["statements"]) for m in helios_schema.MIGRATIONS)
-        self.assertNotIn("dfs_extent_id_map", statements)
+        self.assertIn("0020-dfs-extent-id-map", ids)
+        self.assertIn("0021-dfs-block-map-extent-id", ids)
+        source = read(self.EXTENT_MAP_RS)
+        for rust_name, wanted in (("TABLE_MIGRATION", "0020-dfs-extent-id-map"),
+                                  ("COLUMN_MIGRATION", "0021-dfs-block-map-extent-id")):
+            match = re.search(r'pub const %s: &str = "([^"]+)";' % rust_name, source)
+            self.assertTrue(match, rust_name)
+            self.assertEqual(match.group(1), wanted,
+                             "the mark phase looks for an id the schema does not declare, "
+                             "which would make it read the old column forever")
 
-    def test_nothing_resolves_a_read_through_an_extent_id(self):
-        """The read path is byte-for-byte what it was. A two-level map and a half-wired
-        three-level one are not two points on a spectrum."""
-        for path in (VDISK_RS, CONTROL_RS, PURAH_RS):
-            self.assertNotIn("extent_id", read(path),
-                             "%s references an extent id that no table holds"
-                             % os.path.basename(path))
+    def test_the_column_is_one_bare_alter_and_the_table_is_create_if_not_exists(self):
+        import helios_schema
 
-    def test_the_design_and_the_reason_it_waits_are_recorded(self):
+        by_id = {m["id"]: m for m in helios_schema.MIGRATIONS}
+        column = by_id["0021-dfs-block-map-extent-id"]["statements"]
+        self.assertEqual(column, ["ALTER TABLE hydra.dfs_block_map ADD extent_id text;"])
+        table = by_id["0020-dfs-extent-id-map"]["statements"]
+        self.assertEqual(len(table), 1)
+        self.assertIn("CREATE TABLE IF NOT EXISTS hydra.dfs_extent_id_map", table[0])
+        for column_name in ("extent_id text PRIMARY KEY", "egroup_id", "egroup_offset",
+                            "length", "vdisk_hash", "created_at_ms"):
+            self.assertIn(column_name, table[0])
+        # No refcount, now or ever (D-8).
+        self.assertNotIn("refcount", table[0].lower())
+
+    def test_the_migrations_rewrite_no_existing_row(self):
+        """A column and a table. A backfill would turn a null `extent_id` -- the two-level
+        path every existing vdisk uses -- into something else."""
+        import helios_schema
+
+        by_id = {m["id"]: m for m in helios_schema.MIGRATIONS}
+        for mid in ("0020-dfs-extent-id-map", "0021-dfs-block-map-extent-id"):
+            self.assertNotIn("backfill", by_id[mid], mid)
+
+    def test_the_mark_phase_goes_through_the_extent_map_and_not_only_the_old_column(self):
+        purah = rust_fn(read(PURAH_RS), "referenced_egroups")
+        self.assertIn("extent_id_map::referenced_egroups", purah)
+        self.assertNotIn("SELECT egroup_id FROM hydra.dfs_block_map", read(PURAH_RS),
+                         "Purah scans the old column on its own again, bypassing the extent level")
+        source = read(self.EXTENT_MAP_RS)
+        # The statement every cluster has always been sent, byte for byte.
+        self.assertIn('"SELECT egroup_id FROM hydra.dfs_block_map"', source)
+        self.assertIn("SELECT egroup_id, extent_id FROM hydra.dfs_block_map", source)
+        self.assertIn("hydra.dfs_extent_id_map", source)
+
+    def test_a_mark_phase_that_cannot_follow_an_extent_aborts_instead_of_skipping(self):
+        """The property the whole ordering exists for, stated on the source because the Rust
+        test that proves it cannot run here: an extent that cannot be followed is an error."""
+        source = read(self.EXTENT_MAP_RS)
+        self.assertIn("marked_groups_are_exactly_those_reachable_through_either_level", source)
+        self.assertIn("an_extent_that_cannot_be_followed_aborts_rather_than_being_skipped", source)
+        self.assertIn("a_failed_extent_map_scan_never_yields_a_partial_answer", source)
+
+    def test_nothing_writes_an_extent_id(self):
+        """The writer is what stays off. Every statement that writes the block map, or the
+        extent map, lives in meta.rs/vdisk.rs/control.rs, so none of them may name either."""
+        for path in (META_RS, VDISK_RS, CONTROL_RS, PURAH_RS, self.EXTENT_MAP_RS,
+                     self.RESOLVE_RS):
+            source = read(path)
+            self.assertNotRegex(source, r"INSERT INTO hydra\.dfs_extent_id_map",
+                                "%s writes the extent map" % os.path.basename(path))
+            self.assertNotRegex(source, r"UPDATE hydra\.dfs_extent_id_map",
+                                "%s writes the extent map" % os.path.basename(path))
+        batches = rust_fn(read(META_RS), "block_map_batches")
+        self.assertNotIn("extent_id", batches,
+                         "the drain's block-map writer names the column; that is stage 3, "
+                         "and it breaks every node that has not applied 0021")
+
+    def test_a_vdisk_with_no_extent_rows_issues_exactly_the_statement_it_always_did(self):
+        load = rust_fn(read(VDISK_RS), "load_map")
+        self.assertIn("SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash "
+                      "FROM hydra.dfs_block_map", load)
+        # The extent level is reached only for a row that has no egroup_id.
+        self.assertIn("by_extent", load)
+        self.assertIn("if !by_extent.is_empty()", load)
+
+    def test_the_rollout_says_stage_one_is_the_one_to_deploy_first_and_let_soak(self):
+        text = read(self.ROLLOUT_MD)
+        self.assertIn("Stage 1", text)
+        self.assertIn("the one to roll out first", text)
+        self.assertIn("full sweep cycle", text)
+        self.assertIn("restart sidon", text)
+        for term in ("0020", "0021", "purah: sweep failed", "dfs_extent_id_map"):
+            self.assertIn(term, text)
+
+    def test_the_design_and_the_reason_for_the_order_are_recorded(self):
         decisions = read(DECISIONS_MD)
         self.assertIn("**D-23", decisions)
-        self.assertIn("next free migration id", decisions,
-                      "D-23 reserves a number again; the last one was taken by something else")
-        self.assertIn("dfs_extent_id_map", decisions)
+        self.assertIn("0020-dfs-extent-id-map", decisions)
+        self.assertIn("0021-dfs-block-map-extent-id", decisions)
         # The two things the next person has to know before touching it: that existing
         # vdisks keep the two-level path, and that the curator is the part a read-path flag
         # does not protect.
-        self.assertIn("Null means the two-level", decisions)
+        self.assertIn("Null `extent_id` means the two-level path", decisions)
         self.assertIn("mark phase", decisions)
+        self.assertIn("full sweep", decisions)
 
-    def test_the_case_against_dedup_is_recorded_rather_than_deferred(self):
-        """Not "later": argued. The win on VM disks is identical OS images, which
-        clone-from-image already gets as a map copy."""
+    def test_dedup_is_costed_and_not_implemented(self):
+        """The case against dedup is recorded and so is the addendum that revisits it. What
+        is not allowed to exist is a content hash anywhere in the tree."""
         decisions = read(DECISIONS_MD)
         self.assertIn("Dedup is not being built", decisions)
         self.assertIn("clone-from-image", decisions)
+        self.assertIn("D-23 addendum", decisions)
+        for cost in ("Write amplification", "Memory", "Garbage collection", "resurrection",
+                     "Recommendation", "estimator"):
+            self.assertIn(cost, decisions)
+        for path in (self.EXTENT_MAP_RS, self.RESOLVE_RS, META_RS, VDISK_RS, PURAH_RS):
+            self.assertNotRegex(read(path), r"(?i)sha256|blake3|content_hash|by_hash",
+                                "%s hashes content; dedup is a recommendation, not code"
+                                % os.path.basename(path))
+
+    def test_the_new_document_is_linked_from_the_indexes(self):
+        for index in (os.path.join(HERE, "README.md"),
+                      os.path.join(HERE, "docs", "README.md"),
+                      os.path.join(HERE, "docs", "dfs", "README.md")):
+            self.assertIn("extent_id_map.md", read(index), index)
 
 
 if __name__ == "__main__":

@@ -380,14 +380,18 @@ that predates the setting — behaves exactly as it did.
   [dfs/multi_disk.md](./dfs/multi_disk.md). Measuring first and moving later is the order on
   purpose: a curator that began migrating data the moment it could measure temperature would
   be acting on a ranking nobody had looked at.
-- **The extent ID map.** Helios has two map levels where Nutanix has three, so a clone shares
-  extent groups wholesale and cannot diverge one extent at a time. The schema and the staged
-  plan are D-23; it takes the next free migration id when it is built, and the table is deliberately
-  not created, because an empty table with a suggestive shape costs every later design a
-  paragraph establishing that it is not a source of truth.
+- **The extent ID map, stage 3.** Helios has two map levels where Nutanix has three. Stages 1
+  and 2 of D-23 are built: Purah's mark phase follows both levels, and migrations `0020` and
+  `0021` add the table and the column, with a read path that stays dormant because nothing
+  writes an extent id. **Stage 1 is the one to roll out first and let run through a full sweep
+  cycle**; the procedure and what to observe between stages is
+  [dfs/extent_id_map.md](./dfs/extent_id_map.md). Writing extent ids is designed there and not
+  built.
 - **Erasure coding** as a Purah job over cold
   sealed groups. **Deduplication** is argued against in
-  [decisions.md](./dfs/decisions.md): the win on VM disks is identical OS images, which
-  clone-from-image now gets for free as a map copy.
+  [decisions.md](./dfs/decisions.md) (D-23 and its addendum): the win on VM disks is
+  identical OS images, which clone-from-image now gets for free as a map copy. The addendum
+  revisits that with the extent id map in hand, costs it, and recommends a read-only
+  estimator before anything is built.
 - **`vhost-user-blk`** beside NBD, deliberately last. Performance work reorders
   operations, and reordering is where invariants go to die.
