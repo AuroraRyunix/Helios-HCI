@@ -130,6 +130,23 @@ The notes themselves are deliberately not in this repository.
   absolute totals per observer, so a flush is safe to fire and forget. The data may decide
   *where a copy of bytes goes, never whether it exists*.
 
+* **Extent groups have a deliberate disk, and can be moved between a node's disks.** Disks are
+  identified by a `disk.uid` file on their own filesystem rather than by `disks/sdc`, a kernel
+  name that already names the wrong device on one node. Placement prefers the container's tier
+  where a node has a disk of that class, else most-free-first as before. `valcli storage.list`
+  shows each disk, `storage.placement` lists which holds which group, and `storage.tier` /
+  `storage.move` move sealed groups: copy, verify against the seal hash, publish by rename,
+  switch -- and the old copy is left for the sweep's two-scan grace (D-24). Operator-invoked;
+  nothing runs it on a timer. The test nodes' disks are identical, so there the policy plans
+  nothing and the mechanism is exercised by `storage.move`; no performance claim is made.
+  **Not built**: the journal on the fastest disk (a live journal cannot be relocated without a
+  drain, and there is no faster disk to put it on), any unattended tiering, and anything
+  showing tiering improves a workload.
+  **Known gap**: `hydra.dfs_egroups.path` records where a group was created and is stale after
+  a move; nothing reads it, and fixing it would turn a node-local fact into a cluster write.
+  **Known gap**: `capacity` counts a copy in progress and a surplus copy as extent groups,
+  which is true of the bytes and misleading as a count until the sweep clears them.
+
   **Outstanding**: the extent id map -- the middle level Nutanix has and Helios does not,
   which is what makes dedup and extent-granular clone sharing possible -- is recorded as
   **D-23** and deliberately not built. It cannot be landed behind a read-path flag, because

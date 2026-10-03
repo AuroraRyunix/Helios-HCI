@@ -101,7 +101,7 @@ which is the reason for fronting it. Two groups:
 | Group | Operations | `vdisk_id` |
 | :-- | :-- | :-- |
 | Per vdisk | `create` `attach` `detach` `delete` `status` `flush` `seal` `resize` | required |
-| Per node | `list` `ping` `capacity` `peers` `purah-sweep` `purah-scrub` `purah-heal` | not taken |
+| Per node | `list` `ping` `capacity` `peers` `purah-sweep` `purah-scrub` `purah-heal` `purah-heat` `purah-tier` `purah-move` `purah-placement` | not taken |
 
 The split is load-bearing and is pinned by `test_dfs_endpoint.py`. It was once written as
 "everything except `list` and `ping` needs a `vdisk_id`", which refused `capacity`,

@@ -239,6 +239,27 @@ def heat(limit=20, **kw):
     return call("purah-heat", limit=limit, **kw)
 
 
+def placement(limit=50, **kw):
+    """Which disk of this node holds which extent groups, read from the disks themselves."""
+    return call("purah-placement", limit=limit, **kw)
+
+
+def tier(apply=False, **kw):
+    """Plan the disk-to-disk moves the heat ranking argues for, or carry them out.
+
+    Plans only unless `apply` is true, and nothing runs it on a timer: the ranking shipped
+    as reporting so that somebody would read it before anything acted on it. See
+    docs/dfs/multi_disk.md.
+    """
+    return call("purah-tier", apply=bool(apply), **kw)
+
+
+def move_egroup(egroup_id, disk, **kw):
+    """Move one sealed extent group to another disk of this node, named by identity or by
+    label. The mechanism without the policy."""
+    return call("purah-move", egroup_id=egroup_id, disk=disk, **kw)
+
+
 def list_attached(**kw):
     return call("list", **kw)
 

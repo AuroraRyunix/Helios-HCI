@@ -303,3 +303,35 @@ generation, which is what Purah already does for extent groups and would now hav
 1 MiB granularity instead of 4 MiB. Against that cost, the win on VM disks is identical OS
 images, which clone-from-image already gets for free as a map copy sharing every extent
 with its parent (D-19). Dedup would be buying back something never spent.
+
+**D-24 — a disk is identified by what is written on it, and a move leaves the old copy to
+the sweep.** Two choices built `multi_disk.md`'s placement and tiering, each with a rejected
+alternative that looked simpler.
+
+*Identity.* The claim script names each disk's directory after the kernel device it saw
+(`disks/sdc`), kernel names follow probe order, and on one node the disk in the `sdc` role is
+`/dev/sdb`. Keying anything on that name keys it on a guess. **Rejected: the directory name**
+(the status quo); **the filesystem UUID from `blkid`**, which needs a mount-to-device-to-
+`/dev/disk/by-uuid` mapping sidon has no other use for and which does not exist on a dev box;
+**a column in Hydra**, which makes a node-local fact a cluster write for the reason option 3
+in `multi_disk.md` already gave. **Taken:** a `disk.uid` file at the top of each filesystem,
+written once. The name stays as a label.
+
+*Deletion.* **Rejected: delete the source as the last step of the move**, which is what
+"copy, verify, switch, delete" reads as. Every attached vdisk has its own `EgroupStore` with
+its own index, so the switch is not visible to them, and a reader that resolved the old path
+before the switch would meet `ENOENT` after the delete. **Taken:** the move never deletes; the
+sweep removes the surplus copy after seeing it on two passes with the grace between (the
+mark-sweep's own rule) and after proving it byte-identical to the one kept and that at least
+two copies exist. A crash then needs no recovery at any point: there is one valid copy, or
+two, never none.
+
+*No map repoint.* `multi_disk.md` described the move as including "the map repoint conditional
+on the epoch". The block map names a group, not a disk, and a group keeps its identity when it
+changes disk, so nothing in Hydra changes: no migration, no epoch. The only thing repointed is
+the node's own index. This is a correction to that sentence, not a new design.
+
+*Opt-in.* The pass plans unless told to apply and nothing runs it on a timer, for D-22's
+reason, which the ranking existing does not discharge: nobody has yet watched what it proposes
+on mixed media. Heat chooses where a copy sits and never whether one exists, so nothing in the
+pass deletes a group, shortens a replica set or touches the metadata that says one exists.

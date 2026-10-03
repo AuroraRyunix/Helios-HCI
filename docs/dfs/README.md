@@ -18,10 +18,13 @@ Replication is mutually authenticated against the cluster CA -- see D-20 in
 
 Per-extent-group access data is recorded and ranked -- see D-22 in
 [decisions.md](./decisions.md) and [metadata.md](./metadata.md) section 8. It is the
-prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing; the migration
-half is still not built, and nothing moves an extent group on the strength of the ranking.
+prerequisite the tiering half of [multi_disk.md](./multi_disk.md) was missing. Extent groups
+are placed across a node's disks by identity-keyed, free-space (and tier-preferring)
+placement, and Purah can move a sealed group between two disks of one node
+(`valcli storage.tier`, `storage.move`; D-24). The pass is operator-invoked and nothing runs
+it unattended; on the test cluster's identical disks it has nothing to decide.
 
-Not built: tiering, the extent ID map (designed and reserved as D-23), scheduled snapshots
+Not built: tiering on a timer or on mixed media, the journal on the fastest disk, the extent ID map (designed and reserved as D-23), scheduled snapshots
 and rollback, erasure coding, and `vhost-user-blk`. (Per-container compression *is*
 built -- migration `0008` -- and this line used to list it as missing.)
 
