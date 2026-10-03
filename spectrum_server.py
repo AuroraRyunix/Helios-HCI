@@ -4609,25 +4609,46 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             if host_ip and host_ip != LOCAL_IP and host_ip != "127.0.0.1":
                 console_ip = host_ip
 
-            rc, res_con, _ = run_mtls_spark_api(
-                console_ip,
-                "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
-                None,
-                method="GET")
-            # The endpoint reports the graphics device the domain actually has,
-            # and the listening port directly -- no display-number arithmetic.
-            # Asking virsh for a spice display on a VNC-only domain used to fail,
-            # so a mismatch stays a failure here rather than handing the client a
-            # console of the protocol it did not ask for.
-            if (rc == 0 and "error" not in res_con
-                    and str(res_con.get("graphics", "")).strip().lower() == console_type):
-                try:
-                    vnc_port = int(res_con.get("port"))
-                except (TypeError, ValueError):
-                    pass
+            # A VM that has just been started is recorded as running a moment before its graphics
+            # device is listening, so a console asked for in that window used to fail outright with
+            # "Could not resolve VM console port". Ask for a few seconds before giving up -- but only
+            # for a VM that is supposed to be running; for any other there is nothing to wait for.
+            recorded_state = str(db_vm.get("state", "")).strip().lower()
+            attempts = 6 if recorded_state == "running" else 1
+            for attempt in range(attempts):
+                rc, res_con, _ = run_mtls_spark_api(
+                    console_ip,
+                    "/api/v1/vm/" + urllib.parse.quote(vm_name, safe="") + "/console",
+                    None,
+                    method="GET")
+                # The endpoint reports the graphics device the domain actually has,
+                # and the listening port directly -- no display-number arithmetic.
+                # Asking virsh for a spice display on a VNC-only domain used to fail,
+                # so a mismatch stays a failure here rather than handing the client a
+                # console of the protocol it did not ask for.
+                if (rc == 0 and isinstance(res_con, dict) and "error" not in res_con
+                        and str(res_con.get("graphics", "")).strip().lower() == console_type):
+                    try:
+                        vnc_port = int(res_con.get("port"))
+                    except (TypeError, ValueError):
+                        pass
+                if vnc_port is not None:
+                    break
+                if attempt + 1 < attempts:
+                    time.sleep(2)
 
             if vnc_port is None:
-                self.send_json(500, {"error": "Could not resolve VM console port"})
+                reported_type = ""
+                if isinstance(res_con, dict):
+                    reported_type = str(res_con.get("graphics", "")).strip().lower()
+                # Say which of the reasons it is. The page used to show every one of these as
+                # "Authentication Failed", which sent people looking at their login.
+                if recorded_state != "running":
+                    self.send_json(409, {"error": f"VM '{vm_name}' is not running; start it to open its console."})
+                elif reported_type and reported_type != console_type:
+                    self.send_json(409, {"error": f"VM '{vm_name}' has a {reported_type} console, not {console_type}."})
+                else:
+                    self.send_json(503, {"error": f"VM '{vm_name}' is recorded as running but its console is not available on {console_ip}."})
                 return
 
             token = secrets.token_hex(16)

@@ -216,7 +216,15 @@
                 // Fetch a proper console token first
                 fetch(`/api/vms/console/token?name=${vmName}&type=vnc&token=${token}`)
                 .then(res => {
-                    if (!res.ok) throw new Error("VNC Token fetch failed");
+                    if (!res.ok) {
+                        // Say what the server said. Every failure here used to be reported as
+                        // "Authentication Failed", although only a 401 is about the login.
+                        return res.json().catch(() => ({})).then(body => {
+                            var err = new Error(body.error || ("the console service answered " + res.status));
+                            err.status = res.status;
+                            throw err;
+                        });
+                    }
                     return res.json();
                 })
                 .then(data => {
@@ -293,7 +301,11 @@
                 })
                 .catch(err => {
                     console.error("VNC token fetch failed:", err);
-                    showVncDisconnected("Authentication Failed", "Failed to fetch VNC console credentials: " + err.message);
+                    if (err.status === 401) {
+                        showVncDisconnected("Authentication Failed", "Your session is not valid for the console. Sign in again.");
+                    } else {
+                        showVncDisconnected("Console Unavailable", err.message);
+                    }
                 });
             }
 
