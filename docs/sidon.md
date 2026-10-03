@@ -413,12 +413,23 @@ Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURA
 (the test cluster) repeated runs accumulate garbage until a sweep is run.
 
 ```bash
+valcli storage.sweep                  # reclaim unreferenced extent groups on every node; says what waits
+valcli storage.scrub                  # re-hash sealed groups against their seal hash; exits 1 on damage
 valcli storage.placement [N]          # which disk of each node holds which extent groups
 valcli storage.tier [--apply]         # plan, or with --apply make, disk-to-disk moves
 valcli storage.move <egroup> <disk> <node>
 valcli storage.compact [--apply]       # plan, or with --apply compact sparse sealed groups
 valcli storage.dedup.estimate          # read-only: bytes dedup would share beyond clones
 ```
+
+`storage.sweep` runs one mark-sweep pass on every node and reports, per node, how many groups were
+candidates, how many were reclaimed and how many bytes that freed, how many are *awaiting a second scan*, and
+what kept others (open, held by an attached vdisk, too young). A group is removed only after two scans, at
+least the grace period apart (`SIDON_PURAH_GRACE`, 600 s), have found nothing pointing at it (I-7), so the first
+run after a delete typically reclaims nothing and says how many groups are waiting; the same pass runs on
+sidon's own timer, so the command brings the second scan forward and does not shorten the rule.
+`storage.cleanup_orphaned`, which the daily Dagur job runs, is the same command under its older name.
+`storage.scrub` is the sibling for damage: it re-hashes each sealed group and names any that no longer match.
 
 `storage.list` also prints one row per extent-store disk: its identity, the directory it is
 mounted at, the device the kernel says backs it, its class, and how full it is. The identity

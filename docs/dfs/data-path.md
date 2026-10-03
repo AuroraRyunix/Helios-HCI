@@ -138,6 +138,13 @@ Purah's sweep rule implements I-7 directly: an egroup is reclaimable only if
 unreferenced by every map generation in **two consecutive scans** separated by more than
 the maximum drain duration. Slow reclaim, immune to the scan/drain race by construction.
 
+Operating it: `valcli storage.sweep` runs the pass on every node and reports per node the
+candidates, the groups reclaimed and the bytes freed, the groups *awaiting a second scan*, and
+what the sweep left alone (open, held by an attached vdisk, too young). Because of the two-scan
+rule the first run after a delete reclaims nothing and says how many groups are waiting; sidon
+repeats the pass on its own timer (`SIDON_PURAH_INTERVAL`, 300 s by default), and the command
+only brings the second scan forward. `valcli storage.scrub` is the damage check.
+
 ### Compaction: reclaiming inside a group
 
 Mark-sweep frees a *group*. A group three extents dead and one alive is never freed, and

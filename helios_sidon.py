@@ -238,6 +238,21 @@ def peers(**kw):
     return call("peers", **kw)
 
 
+def sweep(**kw):
+    """One mark-sweep pass over this node's extent groups, and what it did.
+
+    A group is reclaimed only after two scans, at least the grace period apart, have found
+    nothing pointing at it (I-7), so one call may report candidates and reclaim none. The
+    report names what is waiting and why. See docs/dfs/data-path.md section 5.
+    """
+    return call("purah-sweep", **kw)
+
+
+def scrub(**kw):
+    """Re-hash this node's sealed extent groups against the hash taken at seal time."""
+    return call("purah-scrub", **kw)
+
+
 def heat(limit=20, **kw):
     """Which extent groups on this node are hot, and which have gone cold.
 
