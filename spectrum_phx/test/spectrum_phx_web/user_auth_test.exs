@@ -117,6 +117,35 @@ defmodule SpectrumPhxWeb.UserAuthTest do
       assert get_session(response, SpectrumPhxWeb.UserAuth.session_key()) == test_token()
     end
 
+    test "a stale shared cookie is replaced by the session this tier validated", %{conn: conn} do
+      # The session is read before the cookie, so a cookie left over from an earlier login kept
+      # naming a token that no longer existed while this tier went on working, and the Python
+      # tier (the guest console among its pages) refused the same browser as signed out.
+      stale = String.duplicate("a", 64)
+
+      response =
+        conn
+        |> log_in("helios")
+        |> put_req_cookie("session_id", stale)
+        |> get("/")
+
+      assert html_response(response, 200)
+      cookie = response.resp_cookies["session_id"]
+      assert cookie, "the stale cookie was left in place"
+      assert cookie.value == test_token()
+    end
+
+    test "a shared cookie that already matches is not rewritten", %{conn: conn} do
+      response =
+        conn
+        |> log_in("helios")
+        |> put_req_cookie("session_id", test_token())
+        |> get("/")
+
+      assert html_response(response, 200)
+      refute response.resp_cookies["session_id"]
+    end
+
     test "a rubbish shared cookie is not a session", %{conn: conn} do
       response =
         conn

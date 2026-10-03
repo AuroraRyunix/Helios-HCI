@@ -86,10 +86,26 @@ defmodule SpectrumPhxWeb.UserAuth do
       {:ok, username} ->
         conn
         |> put_session(@session_key, token)
+        |> sync_shared_cookie(token)
         |> assign(:current_username, username)
 
       _ ->
         assign(conn, :current_username, nil)
+    end
+  end
+
+  # Keep the cookie the Python tier reads equal to the session this tier just validated. The
+  # session is read first, so the two can drift: a cookie left over from an earlier login, or from
+  # before the cluster was rebuilt, kept naming a token that no longer exists while this tier went
+  # on working from its own session -- and every Python-tier request that relied on the cookie
+  # (the guest console among them) was refused as signed out. Only rewritten when it differs.
+  defp sync_shared_cookie(conn, token) do
+    current = conn |> fetch_cookies() |> Map.fetch!(:cookies) |> Map.get(@shared_cookie)
+
+    if current == token do
+      conn
+    else
+      put_resp_cookie(conn, @shared_cookie, token, @shared_cookie_opts)
     end
   end
 

@@ -79,57 +79,67 @@ def is_authenticated(handler):
         handler.current_user = "local-admin"
         return True
         
-    session_token = None
-    
-    # 1. Check Authorization Header
+    # Every token the request offers, in order of preference. The first one that is a live session
+    # authenticates the request. This used to take the first token it found and stop: a console page
+    # puts whatever the browser's localStorage holds into ?token=, and after the cluster was rebuilt
+    # that is a token from a session that no longer exists, so a request that also carried a perfectly
+    # good session_id cookie was refused. A stale token must not outrank a valid one.
+    candidates = []
+
+    # 1. Authorization Header
     auth_header = handler.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        session_token = auth_header[7:].strip()
-        
-    # 2. Check Query Parameters (e.g. for WebSockets or popup connections)
-    if not session_token:
+        candidates.append(auth_header[7:].strip())
+
+    # 2. Query Parameters (e.g. for WebSockets or popup connections)
+    try:
+        import urllib.parse
+        url_parsed = urllib.parse.urlparse(handler.path)
+        query_params = urllib.parse.parse_qs(url_parsed.query)
+        candidates.extend(query_params.get("token") or [])
+    except Exception as e:
+        print(f"[AUTH DEBUG] Path: {handler.path} | Query parameter parsing error: {e}", flush=True)
+
+    # 3. Cookie
+    cookie_header = handler.headers.get("Cookie", "")
+    if cookie_header:
         try:
-            import urllib.parse
-            url_parsed = urllib.parse.urlparse(handler.path)
-            query_params = urllib.parse.parse_qs(url_parsed.query)
-            token_list = query_params.get("token")
-            if token_list:
-                session_token = token_list[0]
+            cookie = http.cookies.SimpleCookie(cookie_header)
+            if "session_id" in cookie:
+                candidates.append(cookie["session_id"].value)
         except Exception as e:
-            print(f"[AUTH DEBUG] Path: {handler.path} | Query parameter parsing error: {e}", flush=True)
+            print(f"[AUTH DEBUG] Path: {handler.path} | Exception parsing cookie: {e}", flush=True)
 
-    # 3. Check Cookie Header fallback
-    if not session_token:
-        cookie_header = handler.headers.get("Cookie", "")
-        if cookie_header:
-            try:
-                cookie = http.cookies.SimpleCookie(cookie_header)
-                if "session_id" in cookie:
-                    session_token = cookie["session_id"].value
-            except Exception as e:
-                print(f"[AUTH DEBUG] Path: {handler.path} | Exception parsing cookie: {e}", flush=True)
-
-    if not session_token:
+    candidates = [c for c in dict.fromkeys(candidates) if c]
+    if not candidates:
         print(f"[AUTH DEBUG] Path: {handler.path} | No session token found", flush=True)
         return False
 
+    for session_token in candidates:
+        user = _session_user(handler, session_token)
+        if user:
+            handler.current_user = user
+            return True
+    return False
+
+
+def _session_user(handler, session_token):
+    """The username a session token belongs to, or None. Never raises."""
     # Reject anything that is not a token this server could have issued, before
     # it is ever interpolated into a CQL statement. This is pre-authentication,
     # attacker-controlled input taken from a header, query string or cookie.
     if not is_valid_session_token(session_token):
         print(f"[AUTH DEBUG] Path: {handler.path} | Malformed session token rejected", flush=True)
-        return False
+        return None
 
     # Check session cache first
     now = time.time()
     if session_token in SESSION_CACHE:
         cached_user, cache_expire = SESSION_CACHE[session_token]
         if now < cache_expire:
-            handler.current_user = cached_user
-            return True
-        else:
-            del SESSION_CACHE[session_token]
-        
+            return cached_user
+        del SESSION_CACHE[session_token]
+
     try:
         cql = f"SELECT username FROM hydra.sessions WHERE session_token = '{session_token}';"
         rc, out, err = run_cql_query(cql)
@@ -137,14 +147,14 @@ def is_authenticated(handler):
             lines = [l.strip() for l in out.splitlines() if l.strip()]
             user_lines = [l for l in lines if not l.startswith('(') and not l.startswith('-') and l != 'username']
             if user_lines:
-                handler.current_user = user_lines[0]
-                SESSION_CACHE[session_token] = (handler.current_user, time.time() + SESSION_CACHE_TTL)
-                print(f"[AUTH DEBUG] Path: {handler.path} | Authenticated as {handler.current_user}", flush=True)
-                return True
+                user = user_lines[0]
+                SESSION_CACHE[session_token] = (user, time.time() + SESSION_CACHE_TTL)
+                print(f"[AUTH DEBUG] Path: {handler.path} | Authenticated as {user}", flush=True)
+                return user
         print(f"[AUTH DEBUG] Path: {handler.path} | Session token {session_token} not found in DB (rc={rc}, err={err})", flush=True)
     except Exception as e:
         print(f"[AUTH DEBUG] Path: {handler.path} | Exception in auth: {e}", flush=True)
-    return False
+    return None
 
 # Hosts that upgrade packages may be downloaded from. The official update
 # service is always allowed; an operator running an internal mirror can add
