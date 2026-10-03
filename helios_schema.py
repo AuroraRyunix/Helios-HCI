@@ -600,6 +600,49 @@ MIGRATIONS = [
             "PRIMARY KEY ((egroup_id), node) );",
         ],
     },
+    {
+        "id": "0020-dfs-extent-id-map",
+        "description": (
+            "The middle map level of D-23: an extent as a named thing that says which "
+            "extent group, offset and length it is, so several vdisks can reference one "
+            "by name. Nothing writes to it yet and nothing reads it unless a block-map "
+            "row names an extent, which no row does. "
+            "It is *not* a second source of truth about where bytes are: a row here is "
+            "reachable only through a block-map row, and Purah's mark phase reads it only "
+            "to follow one (stage 1 of D-23, which must be deployed and have swept at "
+            "least once before this table is ever written to). "
+            "No reference count, now or ever: reclamation of an extent group stays "
+            "mark-sweep over what the block map reaches."
+        ),
+        "statements": [
+            # extent_id is the partition key because the only question asked of this table
+            # is "what is extent X", by id, from a row that names it. The id is
+            # birth-derived until dedup is decided (docs/dfs/decisions.md, D-23 addendum);
+            # a content-derived id is a different migration if it ever happens.
+            #
+            # vdisk_hash is the identity the extent's footer was stamped with (D-18). It is
+            # carried here because an extent shared between vdisks is read by vdisks that
+            # did not write it, which is the case that made the first snapshot return EIO
+            # when the reader's own hash was compared instead.
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_extent_id_map "
+            "( extent_id text PRIMARY KEY, egroup_id text, egroup_offset int, "
+            "length int, vdisk_hash bigint, created_at_ms bigint );",
+        ],
+    },
+    {
+        "id": "0021-dfs-block-map-extent-id",
+        "description": (
+            "The column that lets a block-map row name an extent instead of an extent "
+            "group. Null means the two-level path, so every vdisk that exists keeps "
+            "resolving reads exactly as it does now, byte for byte, and nothing rewrites "
+            "an existing row: this is a column, not a backfill, and must never become "
+            "one. A row fills `egroup_id` or `extent_id`, never both."
+        ),
+        "statements": [
+            # One ALTER, bare ADD: this ScyllaDB rejects ADD IF NOT EXISTS.
+            "ALTER TABLE hydra.dfs_block_map ADD extent_id text;",
+        ],
+    },
 ]
 
 

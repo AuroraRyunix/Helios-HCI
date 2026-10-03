@@ -359,7 +359,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
 * [docs/sidon.md](./docs/sidon.md) - The storage data path: what a write does, where the bytes live, how ownership moves, what Purah does, and how to operate it.
-* [docs/dfs/](./docs/dfs/README.md) - The reasoning behind it: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, the `vhost-user-blk` design and its benchmark plan, and the ADR list with every rejected alternative.
+* [docs/dfs/](./docs/dfs/README.md) - The reasoning behind it: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, the `vhost-user-blk` design and its benchmark plan, the ADR list with every rejected alternative, and the [extent ID map rollout](./docs/dfs/extent_id_map.md) (D-23), whose first stage is the one to deploy and soak before anything else.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).
 * [docs/architecture.md](./docs/architecture.md) - Mid-length system design overview (request path, control-plane vs. data-plane split, network architecture).
 * [docs/spark_api.md](./docs/spark_api.md) - The typed per-domain Spark API replacing raw root-shell execution.

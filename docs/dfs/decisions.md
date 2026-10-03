@@ -242,67 +242,183 @@ Reporting only. The pass ranks and prints; nothing migrates an extent group on t
 of a statistic nobody has read yet. A curator that started moving data the moment it could
 measure temperature is how a tiering feature becomes the reason a node is busy.
 
-**D-23 — the extent ID map is designed and reserved, not built.** Helios has two levels
-where Nutanix has three: `dfs_block_map` points `(vdisk, extent_index)` straight at an
-extent group, where their `medusa_vdiskblockmap` points at an *extent* and
-`medusa_extentidmap` then points that extent at a group. The missing middle level is what
-makes an extent an addressable thing several vdisks can reference by name, which is the
-precondition for extent-granular clone divergence and the only thing that makes
-deduplication expressible at all.
+**D-23 — the extent ID map is built in three stages, and the order is the safety property.**
+Helios has two levels where Nutanix has three: `dfs_block_map` points `(vdisk,
+extent_index)` straight at an extent group, where their `medusa_vdiskblockmap` points at an
+*extent* and `medusa_extentidmap` then points that extent at a group. The missing middle
+level makes an extent an addressable thing several vdisks can reference by name. The
+operator's procedure, including exactly what to observe between stages, is in
+[extent_id_map.md](./extent_id_map.md); this entry is the reasoning.
 
-The schema is written down below. It takes **the next free migration id when it is built**
--- deliberately not a number reserved in advance. This was first written as `0013`, and the
-task-tree and access-data migrations landed the same week and took 0011 through 0017, so
-the reservation named an id that belonged to something else. A number held for a table that
-does not exist yet is a collision waiting for the first migration that needs one. The table is deliberately *not* created yet, and that is the decision rather than an
-omission: `multi_disk.md` already records what an empty table with a suggestive shape costs
-— `dfs_egroup_replicas` sat in the schema with nothing writing to it, and every later
-design had to begin by establishing that it was not a source of truth. One of those is
-enough.
+The schema takes the two migration ids assigned for it, **`0020-dfs-extent-id-map`** and
+**`0021-dfs-block-map-extent-id`**. An earlier version of this entry reserved `0013`, and
+the task-tree and access-data migrations landed the same week and took 0011 through 0017;
+the next version said "the next free id" and so named no number at all, which left the table
+with nothing to be built against. A number held for a table that does not exist yet is a
+collision waiting for the first migration that needs one, so ids are assigned when the work
+is scheduled, and recorded here when they are.
 
 ```
-dfs_extent_id_map
-  extent_id text PRIMARY KEY,     -- content- or birth-derived; see below
+dfs_extent_id_map                  -- 0020
+  extent_id text PRIMARY KEY,      -- birth-derived; see the addendum on content-derived ids
   egroup_id text, egroup_offset int, length int,
-  vdisk_hash bigint,              -- the identity the footer was stamped with (D-18)
+  vdisk_hash bigint,               -- the identity the footer was stamped with (D-18)
   created_at_ms bigint
+
+dfs_block_map ADD extent_id text   -- 0021, one bare ALTER (this ScyllaDB rejects IF NOT EXISTS)
 ```
 
-and `dfs_block_map` grows one nullable column, `extent_id text`. **Null means the two-level
-path**, so every vdisk that exists today keeps resolving reads exactly as it does now,
-byte for byte, indefinitely. This is not a migration that rewrites the block map, and it
-must never become one.
+**Null `extent_id` means the two-level path**, so every vdisk that exists today keeps
+resolving reads exactly as it does now, byte for byte, indefinitely. A row fills `egroup_id`
+or `extent_id`, never both. Neither migration rewrites a block-map row, and no later one may.
+The table that `multi_disk.md` warned about -- an empty table with a suggestive shape, like
+`dfs_egroup_replicas`, that every later design must first establish is not a source of truth
+-- is avoided on purpose: a row of `dfs_extent_id_map` is reachable only through a block-map
+row, and nothing but Purah's mark phase reads it without one.
 
-Two things make this larger than it looks, and they are the reason it is not being landed
-on the strength of a flag.
+**Why this could not be landed behind a flag.** Purah's mark phase reads `egroup_id` off the
+block map and runs on a timer whether or not anyone opted in to anything. The first row that
+names an extent instead of a group makes a sweep that only knows the old column see every
+group behind it as unreferenced, and the two-scan grace delays that deletion by ten minutes
+rather than preventing it. A flag guards the *read* path; the curator is not on it. So the
+order is fixed, and it is the point of the entry:
 
-*Purah's mark phase reads `egroup_id` off the block map.* With the indirection live, a
-vdisk's rows name extents rather than groups, and a sweep that still marked from
-`egroup_id` would see every one of those groups as unreferenced — and the two-scan grace
-would delay the deletion of live data by ten minutes rather than prevent it. Marking has to
-traverse both levels before the first row can carry an extent id, and that ordering is the
-whole hazard: the flag protects the read path and does nothing for the curator, which runs
-on a timer whether anyone opted in or not.
+1. **Stage 1 -- Purah marks through both levels. Built.** With no row naming an extent it is
+   the scan it always was (the ledger says whether the column exists, so a cluster that has
+   not migrated is never sent a column it lacks). With extent names it follows them, and it
+   *fails closed*: an extent that cannot be followed aborts the sweep instead of being
+   skipped, because skipping leaves the group behind it unmarked. It is proved by a
+   randomized model -- any set of vdisks and extents, rows naming either level, orphan extent
+   rows nobody references -- asserting the marked groups equal exactly what is reachable,
+   in both directions. **This is the stage to roll out alone and let run through a full sweep
+   cycle before anything else exists on the cluster.**
+2. **Stage 2 -- the table, the column and the dormant read path. Built.** A vdisk resolves
+   extent-named rows when it opens, but only when a returned row has no `egroup_id`, so every
+   existing vdisk issues the one statement it always did. "Off by default per vdisk" is
+   structural rather than a switch: the reader follows what the row says, a flag would have to
+   agree with the rows, and a reader that disagreed with them returns the wrong vdisk's bytes.
+   What stays off is the *writer*, and nothing in the tree writes an extent id; a test pins
+   that.
+3. **Stage 3 -- writing extent ids. Designed, not built.** The writers that must change, and
+   the hazard each carries, are in [extent_id_map.md](./extent_id_map.md). They include the
+   drain commit, which must null `extent_id` when it repoints a row; `derive_child`, which
+   today refuses a row naming an extent, the safe direction; and a second Purah pass to
+   reclaim extent rows orphaned by a vdisk delete. The per-vdisk opt-in for the writer needs a
+   home on `dfs_vdisks`, which is a third migration id nobody has assigned.
 
-*Every path that copies or repoints a map row has to understand both shapes* —
-`derive_child`, the drain's commit, resize, delete, and the heal's replica accounting. A
-flag that covered the read path and missed one of those is precisely the half-migrated read
-path this entry exists to avoid.
+What an operator must see between stages: before stage 2, no `purah: sweep failed` for two
+sweep intervals plus the grace after every node's restart, and `referenced` unchanged;
+before stage 3, an empty `dfs_extent_id_map`, no non-null `extent_id` anywhere, and a clean
+sweep that has read the new column. The specifics are in the rollout document.
 
-So the plan, in the order it has to happen: teach Purah to mark through both levels and
-soak that against a cluster where no row has an extent id (a no-op change, fully testable
-before anything depends on it); then the migration and a resolver that treats a null
-`extent_id` as today's path; then writing extent ids behind a per-container opt-in, never a
-cluster switch; then clone divergence, which is the first thing that *gains* anything.
+*A correction to this entry's original claim.* It said the middle level was what made
+"extent-granular clone divergence" possible. It is not: a clone's rows are already a copy of
+its parent's, one per 1 MiB extent index, and a write to either redirects and repoints only
+that vdisk's own row, so clones already diverge extent by extent. What the middle level
+buys is that **relocating an extent group costs one row, not a scan of every block map that
+points at it** -- the thing tiering migration and compaction need and neither has yet --
+and that an extent has a name, which is what dedup would need. Those are the reasons to build
+it, and clone sharing is not one of them.
 
 **Dedup is not being built, and the reason is not difficulty.** On top of the extent id map
-it needs a content hash as the extent id, a by-hash index to find candidates, and — this is
-the part that decides it — some way to know when the last reference to a shared extent goes
+it needs a content hash as the extent id, a by-hash index to find candidates, and -- this is
+the part that decides it -- some way to know when the last reference to a shared extent goes
 away. D-8 forbids reference counts, so that answer has to be mark-sweep across every
 generation, which is what Purah already does for extent groups and would now have to do at
 1 MiB granularity instead of 4 MiB. Against that cost, the win on VM disks is identical OS
 images, which clone-from-image already gets for free as a map copy sharing every extent
 with its parent (D-19). Dedup would be buying back something never spent.
+
+**D-23 addendum -- dedup, revisited.** The paragraph above is the original position, and it
+is kept as written because the addendum is only useful if it can be seen what it is
+arguing with. The owner wants dedup. That is an input to this entry and not a measurement:
+this addendum states what it costs and when it pays, and recommends, and the decision is the
+owner's.
+
+*The original argument, stated fairly.* Dedup earns its keep where the same bytes are written
+many times independently. On VM disks the bulk of that is identical OS images, and a fleet
+cloned from one template shares every extent of it as a map copy at no cost. So the
+interesting question was never "does dedup save space" -- it does -- but "how much beyond
+what clone-from-image already saves", and the original answer was "not enough to pay for the
+machinery". That argument rested on a cost estimate, not a measurement, and the estimate
+assumed the middle level did not exist.
+
+*What has changed.* The middle level exists. An extent is now something a row can name, so
+the first of dedup's three prerequisites is no longer missing, and Purah marks through it. Two
+things the original did not count also cut the other way. Naming means that **with a
+content-derived extent id the extent map is its own by-hash index**: finding a candidate is
+`SELECT ... WHERE extent_id = <hash>`, so no separate index is needed. And relocating a shared
+extent is one row, which makes compaction -- needed anyway -- affordable. What has *not*
+changed is that a shared extent still has no reference count and no way to know its last
+reference has gone except a full mark.
+
+*What it would cost.*
+
+- **Write amplification and metadata load.** Every extent a drain commits has to be hashed
+  with a cryptographic hash (CRC32C is detection and nothing else, D-9) and looked up before
+  it is written. `metadata.md` section 5 puts a loaded cluster at roughly 2 MiB/s of drain per
+  vdisk across 1,000 vdisks: about **2,000 extents per second**, so ~2,000 point reads on a
+  hash-partitioned table that cannot be batched with the vdisk's own partition, plus an insert
+  for each miss. Racing drains writing identical content make "insert if absent" a
+  lightweight transaction, and the cluster is budgeted for ~60 LWTs per second today. That is
+  a thirty-fold increase in Paxos load, which is the figure to argue with. The alternative
+  is to accept duplicates when two drains race, making the index a hint, which costs a little
+  space and no correctness. None of it is on the guest's acknowledgement path (journal first),
+  but it lengthens every drain, which lengthens the journal's high-water pressure.
+- **Memory and index size.** At about 64 bytes per unique 1 MiB extent (32-byte hash, location,
+  overhead) the index is **64 MiB per TiB of unique data**, or 64 GiB per PiB. In capacity terms
+  that is 0.006% of the data and is not the cost. It matters as Scylla memory (bloom filters and
+  key cache for a table with one row per unique extent) and, if held in Sidon instead, as a
+  per-node resident set that must be rebuilt after a restart.
+- **Garbage collection, which is where it actually hurts.** Liveness moves to the extent but
+  deletion stays at the 4 MiB group, and a group holds up to four extents. A group is
+  reclaimable only when *every* extent in it is dead, and under sharing the dead ones sit beside
+  live ones from other vdisks. Space comes back only by compaction -- rewrite the live extents
+  into new groups, repoint one extent row, let the old group die -- and compaction does not
+  exist. Without it the headline dedup ratio overstates what is returned to the pool.
+  Second, dedup creates a hazard the guards in `purah.rs` do not cover: **resurrection**. A
+  drain that dedups against extent E re-references a group G that a sweep may already have
+  observed unreferenced once. G is old and not held, so neither the young guard nor the held
+  guard protects it, and a block row committed between the second scan's read and the delete
+  loses live data. Closing it needs a lease on lookup (the lookup refreshes the extent row and
+  the sweep honours it for the grace period), which is a new write on the path that was meant to
+  save one. Third, the mark phase grows from "one row per extent index across all vdisks" to
+  that plus "one row per unique extent".
+- **Smaller costs that are real.** The footer stamps the writer's vdisk hash and the extent
+  index (D-18); a shared extent is read by other vdisks at other indexes, so the identity check
+  would have to key to the extent, not the reader. Per-container compression means two
+  containers cannot share bytes stored differently. A shared extent lives on one group's
+  replica set, so a clone on another node reads it remotely. Cross-tenant dedup is a timing
+  side channel (a write that completes faster reveals the content exists), which matters if
+  containers ever belong to different parties.
+- **Granularity.** Extents are 1 MiB. Sub-extent duplicates -- the same 4 KiB filesystem
+  blocks at different alignments inside different extents -- are invisible to it, so on data
+  that is not a bit-identical image the hit rate will be well below what 4-16 KiB dedup
+  advertises. That is reasoning from the geometry, not a measured rate.
+
+*When it pays.* Not on what clone-from-image already shares. It pays on **identical bytes
+written after the clone**: a thousand VMs cloned from one template each applying the same
+patch set produce the same new extents a thousand times, and clone sharing cannot see that
+because it ends at the moment of divergence. It also pays on full copies that were never
+clones (the same installer run per VM, restored backups of similar machines). It does not pay
+on databases, encrypted guests or compressed media, whose extents are unique or look random.
+The index is nowhere near big enough to matter; what decides it is whether the LWT load, the
+resurrection guard and a compaction pass that does not yet exist are worth the percentage the
+cluster would save beyond what it already saves.
+
+*Recommendation.* Do not build inline dedup on the drain. Build, in this order and each only
+if the previous one earned it: (1) **a read-only estimator** -- a Purah pass in the style of
+the heat ranking (D-22), measuring before moving -- that hashes sealed extents and reports how
+many would be shared, split into "already shared by clone" and "would be new". It writes
+nothing and needs none of stages 2 or 3 to exist. It turns the owner's wish into a number on
+the owner's own data. (2) **Compaction**, which stage 3 and tiering need regardless. (3) Only
+then, if (1) shows a worthwhile figure, **a background, post-process pass** rather than an
+inline one: Purah finds duplicate sealed extents, creates or reuses an extent row, repoints the
+referencing block rows, and the redundant copy dies by the ordinary sweep. That removes the LWT
+load and the drain-path latency, and it keeps the resurrection window inside a pass that
+already owns the grace logic. As a working threshold, a result under roughly 10-15% saved beyond
+clone sharing does not justify a new failure class; that number is judgement, and the
+estimator exists so that it can be replaced with a measurement.
 
 **D-24 — erasure coding is not built, and on three nodes it should not be.** The question
 that decides it is what a 2+1 stripe actually buys on the cluster Helios runs, so the
