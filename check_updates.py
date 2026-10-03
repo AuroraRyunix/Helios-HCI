@@ -230,6 +230,7 @@ def collect_inventory():
             "helios-sig": "/usr/local/bin/helios_sig.py",
             "helios-sidon": "/usr/local/bin/helios_sidon.py",
             "helios-snapshots": "/usr/local/bin/helios_snapshots.py",
+            "rauru-protection": "/usr/local/bin/rauru_protection.py",
             "check-updates": "/usr/local/bin/check-updates",
             "nodetool": "/usr/local/bin/nodetool",
             "allssh": "/usr/local/bin/allssh",

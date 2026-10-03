@@ -636,3 +636,52 @@ boot.
 journal volume produces a log line every few seconds until it appears. And the first start after
 the rollout is the one that moves the layout, so it belongs in the maintenance window the rolling
 upgrade already opens.
+
+**D-28 — two sites trust each other by a pinned site certificate on an import-only listener,
+never by cross-signing.** The cluster CA is per cluster and its rule is "signed by our CA":
+`client.crt` is identical on every node and `spark-daemon` on 9099 is a root-equivalent API.
+Cross-signing, or putting a foreign CA in those trust stores, would make every node of the other
+cluster a full member of this one. Alternatives: **cross-signing / merged trust bundles**
+(rejected for that reason), **a separate listener that trusts the remote CA** (still trusts
+every certificate that CA ever issues, including the identical `client.crt`), **a shared bearer
+token** (replayable, a secret on the wire, needs its own rotation), **SSH or rsync** (the
+fleet's SSH mesh is root on every node), **trusting the network** (a VPN is welcome and is not
+an identity). Taken: a per-site key and certificate, authenticated by its SPKI SHA-256 pinned on
+the other side by a human ceremony, mutual TLS on a port that serves only the replication
+operations, with authorization (may push, a byte quota) held apart from authentication and the
+target choosing local vdisk names itself. Pinning the key rather than the certificate lets a
+renewal pass without re-pairing. Push only: a disaster-recovery site often cannot be dialled.
+[replication.md](./replication.md) section 2. Not built.
+
+**D-29 — replication ships the groups the target lacks and a verified map, not a log and not a
+delta against a base snapshot.** Groups are immutable and snapshots share them, so what a target
+is missing is exactly what was written since it last received anything, and asking the target
+what it holds is correct whether or not an earlier snapshot still exists on either side.
+Alternatives: **a change-tracking log** (a second source of truth about what changed, which every
+crash must keep in step), **a delta against the last delivered snapshot** (breaks the moment
+either side deletes it, and the target's own retention may have), **live extents only** (changes
+offsets, so the remote file is no longer byte-identical and the footers' identity stamps stop
+meaning anything). Taken: whole groups, with the waste of dead extents accepted and named; an
+open group shipped as a prefix named `<id>~<length>`; verification at three levels the target
+does *independently* of the sender (each referenced extent's footer, the seal hash, a SHA-256 per
+group) plus a SHA-256 of the canonical map recomputed from the rows actually written.
+
+**D-30 — a replicated snapshot becomes visible only by one compare-and-swap after everything
+else is true, and a transfer resumes by verification rather than by trust.** The snapshot's row
+is written `forming`, which nothing attaches or lists as a replica; the map follows, is read back
+and checksummed, and a single `forming` to `immutable` flip is the whole of "visible", the same
+shape a local snapshot already uses. Staged bytes resume on chunk boundaries but the end-of-group
+digest is what is believed. Same-snapshot-twice is decided by the digest: equal is a no-op,
+different is a hard refusal, because a source snapshot's name is immutable and the target never
+overwrites. Replication never frees target space to fit itself. Open question to settle before
+the transport: installed-but-unpublished groups are orphans to Purah and a transfer longer than
+its grace can lose one; registering a job's groups as roots is a change in `purah.rs`.
+
+**D-31 — bandwidth is limited at the sender, replication state has no tables until a second
+site exists, and failover and failback are a design and not code.** A token bucket per site at
+the sender, one transfer per node at a time; the target slows a sender by reading slowly.
+`dfs_remote_sites` and `dfs_replication_sets` are specified and **not migrated** (ids `0033`,
+`0034` reserved): two empty tables on every cluster is what `0025` removed. Failover is a clone
+of the replicated members plus a VM definition that is not yet replicated, and failback is the
+same replication reversed; neither can be exercised without a second site, and code written
+against fakes would be fiction. [replication.md](./replication.md) sections 5, 7 and 8.

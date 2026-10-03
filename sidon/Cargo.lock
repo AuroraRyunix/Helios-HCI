@@ -197,6 +197,7 @@ name = "sidon"
 version = "0.1.0"
 dependencies = [
  "lz4_flex",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "serde_json",

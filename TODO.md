@@ -1301,9 +1301,10 @@ as data* by DRBD and refused with EIO by Sidon.
     necessarily prefix-closed. Holding the lock across the map read fixes it. Found while
     writing this, not fixed: it is in a function other work is editing, and it predates the
     schedule, which only makes it likelier to matter.
-  * **No consistency group.** A VM with several disks is snapshotted per vdisk, minutes apart, so
-    a rollback of all of them lands on different moments. See the open questions in
-    `rollback_attached.md`.
+  * **Consistency group: resolved by protection domains**
+    ([docs/dfs/protection_domains.md](docs/dfs/protection_domains.md)) for the case that matters:
+    a VM's disks are snapshotted inside one guest pause and the set says what it achieved. A
+    per-vdisk policy is still per vdisk; a disk in an enabled domain is left to it.
   * **The `<vm>-disk<n>` convention is the only link from a vdisk to its VM**, and the rollback
     VM-state check depends on it; a vdisk named otherwise is checked by attachment alone.
   * **The console is read-only** and policy is set only with `valcli`.
@@ -1311,6 +1312,45 @@ as data* by DRBD and refused with EIO by Sidon.
     interval lowered, not the policy table changed.
   * **Task rows carry component `Catalyst`**, matching the scheduled job that parents them. If
     these should have a component of their own, that is the owner's naming call.
+* **Protection domains: built, never run against a real guest.**
+  [docs/dfs/protection_domains.md](docs/dfs/protection_domains.md); `rauru_protection.py`,
+  migrations `0030`-`0032`, `valcli storage.domain*`. Open:
+  * **No test has paused a real guest.** `virsh suspend` on a domain whose disks are Sidon NBD
+    exports has not been run: whether in-flight requests complete cleanly, how long a real set
+    takes under the barrier (a snapshot copies a map, about a row per MiB), and whether Mipha's
+    health checks object to a paused domain are all unmeasured. Measure the pause first; the
+    default 30 s limit is a guess.
+  * **Nothing runs it on a timer.** The Rauru daemon is the caller (`run()` on its timer,
+    `recover(force=True)` once at start-up, `pinned_sets` overridden). Until then
+    `valcli storage.domain.run`, or a Dagur row, is the trigger.
+  * **The console shows origin `domain` as "unindexed".** `spectrum_phx/lib/spectrum_phx/snapshots.ex`
+    maps unknown origins to `:unindexed`; it needs a `domain` clause (and the template one).
+    Left alone because the console is another agent's file.
+  * **`derive_child` is not atomic across a drain** (see the snapshots entry): under a guest
+    pause this reduces to the in-flight ambiguity a power cut has anyway, but with
+    `--quiesce none` it is a real hazard, and is why such sets are labelled `none`.
+  * **Application consistency** needs an agent in the guest (qemu-guest-agent `fsfreeze`) and
+    none is deployed. Out of scope; the doc says so on its first screen.
+  * **A bare `vdisk:` member cannot borrow a VM's cut.** The `<vm>-disk<n>` convention is a name,
+    not a fact; such a set says `none`.
+* **Replicating snapshots to another site: designed, data plane simulated.**
+  [docs/dfs/replication.md](docs/dfs/replication.md), D-28 to D-31. Built:
+  `sidon/src/replicate*` (manifest, framed groups, export with verification, importer with
+  staging and atomic publish, token bucket; 32 tests) and `rauru_replication.py` (manifest from
+  Hydra rows, delta, resumable driver; 37 tests). **All of it ran only against two directories on
+  one machine and fakes.** Not built, and each is a real piece of work:
+  * the transport, the pinned-SPKI TLS verifier and the import-only listener (D-28);
+  * the `offer`/`group`/`publish` wire operations and their entry in spark's `DFS_VDISK_OPS`;
+  * a Hydra-backed `MapSink` and a `GroupStore` over `EgroupStore` that registers in `dfs_egroups`
+    (needs an adopt-a-file method in `extent.rs`);
+  * **Purah must treat a job's installed-but-unpublished groups as roots**: its grace is 600 s and
+    a long transfer outlasts it. Settle this before the transport (`purah.rs`);
+  * the state tables `dfs_remote_sites` and `dfs_replication_sets`, ids `0033`/`0034` reserved and
+    deliberately not migrated until a second site exists (a table nothing exercises is what
+    `0025` removed);
+  * pairing, site certificate issuance and renewal in Impa, quota, bandwidth schedules;
+  * **failover and failback**: a design only, because they cannot be exercised without a second
+    site. A VM definition is not in the replicated data at all.
 * **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
   already carries an algorithm byte, so it is off the write path entirely.
 * **Erasure coding**, as a Purah job over cold sealed groups — **decided against on three

@@ -163,6 +163,8 @@ components_map = {
     "helios-sig": {"src": "helios_sig.py", "target": "/usr/local/bin/helios_sig.py"},
     "helios-sidon": {"src": "helios_sidon.py", "target": "/usr/local/bin/helios_sidon.py"},
     "helios-snapshots": {"src": "helios_snapshots.py", "target": "/usr/local/bin/helios_snapshots.py"},
+    # Imported by valcli for protection domains, and by the Rauru daemon.
+    "rauru-protection": {"src": "rauru_protection.py", "target": "/usr/local/bin/rauru_protection.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 
