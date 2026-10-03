@@ -218,4 +218,16 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLiveTest do
       assert view |> element("#probe-notice") |> render() =~ "ZooKeeper is unreachable"
     end
   end
+
+  describe "width" do
+    # The dashboard sat in a 1280px column (`mx-auto max-w-7xl`), which on a 1920px window
+    # is about two thirds, and on wider ones far less. Its whole job is density.
+    test "fills the window instead of a centred fixed-width column", %{conn: conn} do
+      {:ok, _view, html} = live(conn, ~p"/")
+
+      refute html =~ "max-w-7xl"
+      assert html =~ ~s(<div class="w-full space-y-4">)
+    end
+  end
+
 end

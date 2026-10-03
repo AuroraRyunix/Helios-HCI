@@ -553,4 +553,60 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
       assert view |> element("#refresh-button") |> render_click() =~ "vm-cache-01-disk0"
     end
   end
+
+  describe "layout" do
+    # The page used to be one column of full-width cards: a card per vdisk and a card per
+    # store, so a cluster with forty disks was forty screens. A vdisk is a row.
+
+    test "vdisks are rows of one table, not a card each", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      assert has_element?(view, "table#vdisks-table")
+      assert has_element?(view, "table#vdisks-table tbody#vdisk-vm-web-01-disk0")
+
+      row = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert row =~ "10.0 GiB"
+      assert row =~ "hci-01"
+      assert row =~ "2/2"
+      refute row =~ "card-body"
+    end
+
+    test "extent stores, containers, vdisks and physical disks each have their own panel", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      for id <- ~w(fabric-summary stores-section containers-section vdisks-section disks-section) do
+        assert has_element?(view, "section##{id}"), "missing panel #{id}"
+      end
+    end
+
+    test "per-node stores sit beside the containers rather than stacking above them", %{conn: conn} do
+      {:ok, _view, html} = mount_view(conn)
+
+      # One grid holds both, so on a wide window they share a row.
+      assert html =~ ~r/xl:grid-cols-5.*id="stores-section".*id="containers-section"/s
+    end
+
+    test "a vdisk's problem stays inside that vdisk's row group", %{conn: conn} do
+      put_source(%{
+        healthy()
+        | vdisks: %{
+            @a => attached([owned("vm-web-01-disk0", degraded: true)]),
+            @b => attached([])
+          }
+      })
+
+      {:ok, view, _html} = mount_view(conn)
+
+      body = view |> element("#vdisk-vm-web-01-disk0") |> render()
+      assert body =~ "degraded"
+      assert body =~ "text-error"
+    end
+
+    test "the page is not narrowed to a fixed-width column", %{conn: conn} do
+      {:ok, _view, html} = mount_view(conn)
+
+      refute html =~ "max-w-7xl"
+    end
+  end
+
 end

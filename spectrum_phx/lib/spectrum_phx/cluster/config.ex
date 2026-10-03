@@ -48,6 +48,12 @@ defmodule SpectrumPhx.Cluster.Config do
   @doc "Floating cluster VIP, if configured."
   def vip, do: all() |> Map.get(:vip)
 
+  @doc "The cluster's network, in CIDR form, if configured."
+  def cluster_subnet, do: all() |> Map.get(:cluster_subnet)
+
+  @doc "The cluster's identifier, if one has been generated."
+  def cluster_id, do: all() |> Map.get(:cluster_id)
+
   @doc "Fault-tolerance factor the cluster was created with."
   def redundancy_factor, do: all() |> Map.get(:redundancy_factor, 0)
 
@@ -77,6 +83,8 @@ defmodule SpectrumPhx.Cluster.Config do
       hosts: Map.get(cluster, "hosts", []),
       vip: Map.get(cluster, "vip"),
       cluster_name: Map.get(cluster, "cluster_name"),
+      cluster_subnet: Map.get(cluster, "cluster_subnet"),
+      cluster_id: Map.get(cluster, "cluster_id"),
       redundancy_factor: Map.get(cluster, "redundancy_factor", 0),
       local_ip: read_local_ip()
     }

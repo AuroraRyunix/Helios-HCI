@@ -104,3 +104,110 @@ VNC has always had here, and SPICE now matches it rather than making it worse â€
 means the console port is reachable directly on the LAN, bypassing the ticket exchange
 entirely. It is a pre-existing exposure with a second protocol on it now, and it belongs
 behind the network boundary until that changes.
+
+## What the Phoenix console lost in the port, and what was restored
+
+The strangler migration measured "every page is Phoenix". That is a measure of whether each
+page renders, not of whether it can still *do* what the page it replaced did, and six things
+could not. The rule for all of them was to find the old behaviour first (`static/settings.html`,
+`static/vms.html`, `static/app.js`, `spectrum_server.py`) and port it faithfully before
+improving it. Phoenix talks to Hydra, Spark and Catalyst directly, so "the same API the old UI
+used" means the same *effects*, not an HTTP hop through the Python tier.
+
+| What was reported | What had been lost | What it is now |
+|---|---|---|
+| **Settings is read-only, the VIP included** | The cluster name, VIP, subnet and replication factor were figures, not inputs. And saving DNS, NTP or timezone wrote a row and told no host: the Python save also rewrote `resolv.conf` and `chrony.conf`, set the timezone, rewrote `cluster.json` everywhere (restarting `bifrost` when the VIP moved), altered the keyspace and repaired when it rose, and re-scheduled the scrub. | `SpectrumPhx.Settings.save/2` validates the whole form, writes, and applies. See below. |
+| **Policies is nonsense** | There was no such page: it was a *panel* on Settings holding region, scrub interval, session timeout, rate limit, password policy and DRS. None of those is a policy in the sense the rest of the system uses the word. | The panel is gone. `/policies` shows the four things the cluster actually has that are policies. See below. |
+| **VM create lost most of its options** | The old wizard carried vCPU, memory with a unit, firmware, boot device, CPU model, any number of disks (size, unit, container, bus), any number of CD-ROMs and any number of NICs (network, model). The port had name, vCPU, MiB, firmware and three text boxes. | All of them, on one full-width page, plus the graphics device. See below. |
+| **Disks and CD-ROM are one text box** | A comma-separated string where the old form had repeatable rows with a container picker. | Repeatable rows: *Add disk*, *Add CD-ROM*, *Add NIC*, each removable. |
+| **The storage page looks bad** | One column of full-width cards, a card per vdisk and a card per store. | Panels in a grid; vdisks are table rows. See below. |
+| **The dashboard uses 55-60% of the window** | The layout wrapped every page in `mx-auto max-w-7xl`, a 1280px column. | Removed. Every page is full width. |
+
+### Saving a setting does what the old save did
+
+`SpectrumPhx.Settings.Apply` is the part that was dropped. Only what *changed* is applied -- the
+form submits every field, so re-saving an unchanged page touches no host.
+
+| Changed | Effect |
+|---|---|
+| DNS resolvers, search domains | `/etc/resolv.conf` rewritten on every host |
+| NTP servers | `/etc/chrony.conf` rewritten, `chronyd` restarted, on every host |
+| Timezone | `timedatectl set-timezone` on every host |
+| Cluster name, VIP, subnet | merged into `/etc/hci/cluster.json` on every host; `bifrost` restarted on every host when the VIP moved |
+| Replication factor | `ALTER KEYSPACE hydra` (NetworkTopologyStrategy, datacenter read from `system.local`), capped at the node count; a repair is started when it rose, because the new replicas are empty until one runs |
+| Scrub interval | `hydra.dagur_schedules` row for `storage_scrub` re-scheduled (disabled disables the job) |
+| Password policy, session timeout, rate limit, DRS, region, MTU | the row only, as before |
+
+What is new where the old save had none: every field is **validated first, as a whole**, and
+nothing is written or applied if any fails (the Python endpoint validated nothing; a VIP of
+`banana` went into `cluster.json` on every host). Values reach hosts as base64 inside the
+command, never as text the shell parses, and a timezone is refused rather than sanitised into a
+different one. A host that does not take a change is *named* on the page and does not hide that
+the others did; it is not rolled back. A blank cluster field means "not shown", never "clear it".
+Operator accounts can be created and have their password changed from the page, under the
+cluster's password policy.
+
+Two latent bugs surfaced on the way and are fixed. The settings page asked for the cluster name
+with a string key where `Cluster.Config` is keyed by atoms, so it never showed one. And the
+password-policy hint said `strict` where the backend tests for `enabled`, so an operator who
+followed it silently kept the weak rule; it is now a select offering the values the backend
+checks.
+
+Not ported from the old Settings page, and still on no Phoenix page: SSL certificate upload,
+node add / remove / safe reboot, the maintenance operations (rebalance, cleanup, keyspace
+cleanup), the language selector and theme cards. Those were not part of the report and are not
+claimed.
+
+### Policies
+
+`/policies` is read-only and says where each kind is edited. It shows:
+
+* **Snapshot policies** (`hydra.dfs_snapshot_policies`) by scope, with a disabled narrow row
+  called an *exemption* rather than "disabled", because that is what it does. Set with
+  `valcli storage.snapshot-policy.set`.
+* **Protection domains** (`hydra.dfs_protection_domains`): members, cadence, retention,
+  consistency level, pause bound and the latest set. Managed with `valcli storage.domain*`.
+* **Storage container policies** (`hydra.storage_containers`): tier, quota, fault tolerance and
+  compression. Edited on Storage.
+* **Security policy**: password complexity, session timeout, auth rate limit. Edited on Settings.
+
+*Assumption, stated:* the page was undefined in the report, so this is what was inferred from
+the policy objects that exist in the schema. A table that could not be read is reported as
+unreadable and never drawn as "no policies", because on this page that sentence means "nothing
+is being protected". There is no editing here on purpose: the first writer of each table has
+rules this page does not know, and a second writer is how a policy gets set that the first
+refuses to honour.
+
+### VM create
+
+One page, a grid of panels. Containers, images and networks are drop-downs over the real
+catalogues (`SpectrumPhx.Vms.Options`); a catalogue that failed to load says so rather than
+offering an empty list. `SpectrumPhx.Vms.Form` turns the rows into the strings Vali reads:
+`20GB:default-pool:virtio` in `disks_list`, comma-separated image names in `iso`, and the JSON
+list `["<network>:<model>"]` in `network_id` (no rows is `[]`, an isolated VM, not the default
+network). `Vm.disks/1` used to split an entry on its first colon only, which made the old
+console's three-part entries a container named `default-pool:virtio`; the bus is now a field.
+
+**Graphics: SPICE is offered only when every host reports it** in
+`/api/v1/host/capabilities`, for the reason in "Does this hypervisor support SPICE at all?"
+above -- the VM can be placed on any node and a host without SPICE refuses the domain. The
+choice is stored in `hydra.vms.graphics`.
+
+Two things the old form showed are **deliberately not offered**, because a control that does
+nothing is a lie. *Network (PXE)* as a boot device: `generate_vm_xml` only distinguishes
+`cdrom` from everything else, so choosing it booted the disk. And **Secure Boot**: nothing in
+`hydra.vms` or in `generate_vm_xml` expresses it (the host-side Secure Boot gate was removed with
+DRBD). Adding either is a change to Vali and the schema; the form follows.
+
+### Storage
+
+The same data as before -- Sidon's per-node capacity, vdisk list and peers, `lsblk` and the
+container catalogue -- laid out for reading: a summary panel (vdisk counts, capacity bar), then
+extent stores beside containers, then **one vdisks table** (a body per vdisk so that what is
+wrong with it stays inside it), then physical disks per node. Everything that refused to draw an
+unknown as healthy still refuses.
+
+### Not built: dedup
+
+Dedup is blocked on decision **D-23** (the extent id map and what an inline dedup would cost the
+drain). It is not a settings toggle and nothing here pretends otherwise. See `TODO.md`.

@@ -335,6 +335,16 @@ defmodule SpectrumPhx.Spark do
   @doc "Reboot a host. Requires explicit confirmation."
   def host_reboot(ip), do: post_json(ip, "/api/v1/host/reboot", %{"confirm" => true})
 
+  @doc """
+  Act on systemd units on a host: `restart`, `start` or `stop`.
+
+  The unit names are matched against the daemon's own allow-list, so a name the cluster
+  does not manage is refused rather than run as root.
+  """
+  def host_units(ip, action, units) when is_list(units) do
+    post_json(ip, "/api/v1/host/units", %{"action" => action, "units" => units})
+  end
+
   @doc "ScyllaDB ring membership."
   def db_ring(ip), do: get_json(ip, "/api/v1/db/ring")
 

@@ -37,7 +37,9 @@ defmodule SpectrumPhx.Settings do
 
   alias SpectrumPhx.Catalyst
   alias SpectrumPhx.Cluster.Config
+  alias SpectrumPhx.Accounts
   alias SpectrumPhx.Hydra
+  alias SpectrumPhx.Settings.Apply
 
   @settings_cql "SELECT key, value FROM hydra.cluster_settings"
   @users_cql "SELECT username FROM hydra.users"
@@ -137,8 +139,12 @@ defmodule SpectrumPhx.Settings do
 
   defp cluster_facts(_static) do
     %{
-      name: Config.all() |> Map.get("cluster_name"),
+      # `Config.all/0` is keyed by atoms. This used to ask for the string "cluster_name",
+      # which is never there, so the settings page named no cluster at all.
+      name: Config.all() |> Map.get(:cluster_name),
       vip: Config.vip(),
+      subnet: Config.cluster_subnet(),
+      id: Config.cluster_id(),
       nodes: length(Config.node_ips()),
       redundancy_factor: Config.redundancy_factor()
     }
@@ -229,6 +235,204 @@ defmodule SpectrumPhx.Settings do
         end
     end
   end
+
+  # -- saving what an operator changed ------------------------------------------------------
+
+  @doc """
+  Save the settings form: validate it as a whole, write what is stored, and *apply* what
+  has to be applied. See `SpectrumPhx.Settings.Apply` for why saving is more than a write.
+
+  Returns `{:ok, %{saved: n, applied: [sentence], failed: [sentence]}}` or
+  `{:error, message}`. `failed` is not an error: the row is written and one host did not
+  take it, which is a state to report and not to roll back, because the other hosts did.
+  Nothing is written if any field fails validation.
+  """
+  def save(params, opts \\ []) when is_map(params) do
+    # A blank cluster field means "not shown", not "clear it": when cluster.json lacks a
+    # subnet or the keyspace could not be read the input renders empty, and submitting the
+    # page must not turn that into an instruction to blank the VIP on every host.
+    blank_owned = for key <- Apply.cluster_fields() ++ [Apply.replication_field()], String.trim(to_string(params[key])) == "", do: key
+    params = params |> Map.drop(~w(_csrf_token _target)) |> Map.drop(blank_owned)
+    static = static_source(opts)
+
+    case Apply.validate(params) do
+      {:error, errors} ->
+        {:error, Enum.join(errors, " ")}
+
+      :ok ->
+        before = all(opts)
+        do_save(params, before, static, opts)
+    end
+  end
+
+  defp do_save(params, before, static, opts) do
+    owned = Apply.cluster_fields() ++ [Apply.replication_field()]
+    {mine, stored_params} = Map.split(params, owned)
+    # The form submits every field, so "changed" is measured against what is in force, not
+    # against what was submitted: re-saving the page must not rewrite every host's DNS.
+    changed = changed_keys(stored_params, before.stored)
+
+    with :ok <- write_stored(stored_params, opts) do
+      outcome =
+        %{saved: length(changed), applied: [], failed: []}
+        |> apply_stored(changed, stored_params, static)
+        |> apply_cluster(mine, before, static)
+        |> apply_replication(mine, before, static)
+
+      refresh_config(static)
+
+      {:ok,
+       %{outcome | applied: Enum.reverse(outcome.applied), failed: Enum.reverse(outcome.failed)}}
+    end
+  end
+
+  defp write_stored(params, _opts) when map_size(params) == 0, do: :ok
+
+  defp write_stored(params, opts) do
+    case update(params, opts) do
+      {:ok, _count} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp changed_keys(params, current) do
+    for {key, value} <- params,
+        Map.has_key?(current, key),
+        String.trim(to_string(value)) != String.trim(to_string(current[key])),
+        do: key
+  end
+
+  defp apply_stored(outcome, changed, params, static) do
+    outcome
+    |> scrub(changed, params, static)
+    |> push_dns(changed, params, static)
+    |> push_ntp(changed, params, static)
+    |> push_timezone(changed, params, static)
+  end
+
+  defp scrub(outcome, changed, params, static) do
+    if "scrub_interval" in changed do
+      value = String.trim(params["scrub_interval"])
+
+      case Apply.schedule_scrub(static, value) do
+        :ok -> note(outcome, "Disk scrub rescheduled (#{value}).")
+        {:error, reason} -> fail(outcome, "The scrub schedule could not be changed: #{describe(reason)}")
+      end
+    else
+      outcome
+    end
+  end
+
+  defp push_dns(outcome, changed, params, static) do
+    if Enum.any?(changed, &(&1 in ~w(dns_servers dns_search_domains))) do
+      content = Apply.resolv_conf(params["dns_servers"], params["dns_search_domains"])
+      command = Apply.write_file_command("/etc/resolv.conf", content)
+      to_hosts(outcome, static, [{:host, command}], "DNS")
+    else
+      outcome
+    end
+  end
+
+  defp push_ntp(outcome, changed, params, static) do
+    if "ntp_servers" in changed do
+      command = Apply.write_file_command("/etc/chrony.conf", Apply.chrony_conf(params["ntp_servers"]))
+      to_hosts(outcome, static, [{:host, command}, {:units, "restart", ["chronyd"]}], "NTP")
+    else
+      outcome
+    end
+  end
+
+  defp push_timezone(outcome, changed, params, static) do
+    if "timezone" in changed do
+      command = Apply.timezone_command(String.trim(params["timezone"]))
+      to_hosts(outcome, static, [{:host, command}], "Timezone")
+    else
+      outcome
+    end
+  end
+
+  defp apply_cluster(outcome, mine, before, static) do
+    current = %{
+      "cluster_name" => before.cluster[:name],
+      "vip" => before.cluster[:vip],
+      "cluster_subnet" => before.cluster[:subnet]
+    }
+
+    updates =
+      for {key, value} <- mine,
+          key in Apply.cluster_fields(),
+          String.trim(value) != to_string(current[key]),
+          into: %{},
+          do: {key, String.trim(value)}
+
+    if map_size(updates) == 0 do
+      outcome
+    else
+      steps = [{:host, Apply.cluster_json_command(updates)}]
+
+      steps =
+        if Map.has_key?(updates, "vip"), do: steps ++ [{:units, "restart", ["bifrost"]}], else: steps
+
+      what = updates |> Map.keys() |> Enum.sort() |> Enum.join(", ")
+      to_hosts(%{outcome | saved: outcome.saved + map_size(updates)}, static, steps, "Cluster details (#{what})")
+    end
+  end
+
+  defp apply_replication(outcome, mine, before, static) do
+    with value when is_binary(value) <- mine[Apply.replication_field()],
+         {factor, ""} <- Integer.parse(String.trim(value)),
+         true <- factor != before.replication.factor do
+      outcome = %{outcome | saved: outcome.saved + 1}
+
+      case Apply.set_replication(static, factor, before.replication.factor) do
+        {:ok, {:altered, applied}} ->
+          note(outcome, "Keyspace replication factor set to #{applied}.")
+
+        {:ok, {:altered_and_repairing, applied}} ->
+          note(
+            outcome,
+            "Keyspace replication factor raised to #{applied}; a repair was started and runs in " <>
+              "the background, and the new replicas are not populated until it finishes."
+          )
+
+        {:ok, {:altered_repair_failed, applied, reason}} ->
+          fail(
+            outcome,
+            "Replication factor is now #{applied} but the repair did not start " <>
+              "(#{describe(reason)}). The new replicas are empty until one is run: " <>
+              "nodetool repair -pr hydra."
+          )
+
+        {:error, message} ->
+          fail(%{outcome | saved: outcome.saved - 1}, message)
+      end
+    else
+      _ -> outcome
+    end
+  end
+
+  defp to_hosts(outcome, static, steps, what) do
+    results = Apply.to_hosts(static, steps)
+    failures = for {ip, {:error, reason}} <- results, do: "#{ip} (#{describe(reason)})"
+
+    cond do
+      results == [] -> fail(outcome, "#{what} was not applied: no hosts are configured.")
+      failures == [] -> note(outcome, "#{what} applied on #{length(results)} host(s).")
+      true -> fail(outcome, "#{what} did not apply on: #{Enum.join(failures, "; ")}.")
+    end
+  end
+
+  defp note(outcome, sentence), do: %{outcome | applied: [sentence | outcome.applied]}
+  defp fail(outcome, sentence), do: %{outcome | failed: [sentence | outcome.failed]}
+
+  # The cluster facts are cached; after cluster.json changed on disk the page would
+  # otherwise keep showing the old VIP until the container restarted.
+  defp refresh_config(nil) do
+    if Process.whereis(Config), do: Config.refresh()
+    :ok
+  end
+
+  defp refresh_config(_static), do: :ok
 
   defp write_all(pairs, opts) do
     case static_source(opts) do
@@ -440,6 +644,87 @@ defmodule SpectrumPhx.Settings do
         end
     end
   end
+
+  @doc """
+  Create an operator account.
+
+  The password is checked against the cluster's password policy -- `enabled` asks for eight
+  characters with an upper-case letter, a digit and a symbol, anything else for five -- the
+  same rule the Python console applied, and the username against the same pattern. An
+  account that already exists is refused: `INSERT` is an upsert, and creating `helios` a
+  second time would silently reset its password.
+  """
+  def create_user(username, password, opts \\ []) do
+    username = String.trim(to_string(username))
+    static = static_source(opts)
+    policy = stored_or_empty(static)["password_policy"] || "disabled"
+
+    cond do
+      not Regex.match?(~r/\A[A-Za-z0-9_]{3,20}\z/, username) ->
+        {:error, "Username must be 3-20 letters, digits or underscores."}
+
+      (message = password_problem(password, policy)) != nil ->
+        {:error, message}
+
+      username in users(static) ->
+        {:error, "That user already exists."}
+
+      static != nil ->
+        {:ok, username}
+
+      true ->
+        statement =
+          "INSERT INTO hydra.users (username, password_hash) VALUES (?, ?) IF NOT EXISTS"
+
+        case Hydra.apply_lwt(statement, [username, Accounts.hash_password(password)]) do
+          {:ok, true} -> {:ok, username}
+          {:ok, false} -> {:error, "That user already exists."}
+          {:error, reason} -> {:error, "The account could not be created: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Set an operator's password, under the same password policy as `create_user/3`."
+  def set_user_password(username, password, opts \\ []) do
+    static = static_source(opts)
+    policy = stored_or_empty(static)["password_policy"] || "disabled"
+
+    cond do
+      username not in users(static) ->
+        {:error, "No such user."}
+
+      (message = password_problem(password, policy)) != nil ->
+        {:error, message}
+
+      static != nil ->
+        {:ok, username}
+
+      true ->
+        statement = "UPDATE hydra.users SET password_hash = ? WHERE username = ? IF EXISTS"
+
+        case Hydra.apply_lwt(statement, [Accounts.hash_password(password), username]) do
+          {:ok, true} -> {:ok, username}
+          {:ok, false} -> {:error, "No such user."}
+          {:error, reason} -> {:error, "The password could not be changed: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Why a password is not acceptable under `policy`, or nil."
+  def password_problem(password, "enabled") when is_binary(password) do
+    if String.length(password) >= 8 and password =~ ~r/[A-Z]/ and password =~ ~r/[0-9]/ and
+         password =~ ~r/[^A-Za-z0-9]/ do
+      nil
+    else
+      "Password must be at least 8 characters long, with an upper-case letter, a number and a special character."
+    end
+  end
+
+  def password_problem(password, _policy) when is_binary(password) do
+    if String.length(password) >= 5, do: nil, else: "Password must be at least 5 characters long."
+  end
+
+  def password_problem(_password, _policy), do: "Password must be at least 5 characters long."
 
   # -- plumbing ---------------------------------------------------------------------------
 

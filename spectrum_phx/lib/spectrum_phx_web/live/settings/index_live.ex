@@ -45,7 +45,13 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
 
     {:ok,
      socket
-     |> assign(page_title: "Settings", confirming: nil, urbosa_error: nil, urbosa_task: nil)
+     |> assign(
+       page_title: "Settings",
+       confirming: nil,
+       urbosa_error: nil,
+       urbosa_task: nil,
+       apply_failures: []
+     )
      |> load()}
   end
 
@@ -57,18 +63,50 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
   def handle_event("refresh", _params, socket), do: {:noreply, load(socket)}
 
   def handle_event("save", params, socket) do
-    case Settings.update(Map.drop(params, ~w(_csrf_token _target))) do
-      {:ok, 0} ->
+    case Settings.save(Map.drop(params, ~w(_csrf_token _target))) do
+      {:ok, %{saved: 0, applied: [], failed: []}} ->
         {:noreply, put_flash(socket, :info, "Nothing changed.")}
 
-      {:ok, count} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "#{count} setting#{if count == 1, do: "", else: "s"} saved.")
-         |> load()}
+      {:ok, %{saved: saved, applied: applied, failed: failed}} ->
+        info = ["#{saved} setting#{if saved == 1, do: "", else: "s"} saved." | applied]
+
+        socket =
+          socket
+          |> put_flash(:info, Enum.join(info, " "))
+          |> assign(:apply_failures, failed)
+          |> load()
+
+        # A host that did not take a change is not a reason to hide that the others did, nor
+        # a reason to say "saved" and leave it there: it stays on the page past the next
+        # refresh, because the hosts and the rows now disagree.
+        {:noreply, if(failed == [], do: socket, else: put_flash(socket, :error, Enum.join(failed, " ")))}
 
       {:error, message} ->
         {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("create_user", %{"username" => username, "password" => password}, socket) do
+    case Settings.create_user(username, password) do
+      {:ok, name} -> {:noreply, socket |> put_flash(:info, "#{name} created.") |> load()}
+      {:error, message} -> {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event(
+        "set_password",
+        %{"username" => username, "password" => password, "confirm" => confirm},
+        socket
+      ) do
+    cond do
+      password != confirm ->
+        {:noreply, put_flash(socket, :error, "The two passwords do not match.")}
+
+      true ->
+        case Settings.set_user_password(username, password) do
+          {:ok, name} -> {:noreply, put_flash(socket, :info, "Password changed for #{name}.")}
+          {:error, message} -> {:noreply, put_flash(socket, :error, message)}
+        end
     end
   end
 
@@ -150,159 +188,208 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
         </span>
       </div>
 
+      <div :if={@apply_failures != []} class="alert alert-error alert-soft" id="apply-failures">
+        <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
+        <ul class="text-sm">
+          <li :for={failure <- @apply_failures}>{failure}</li>
+        </ul>
+      </div>
+
       <div class="flex flex-col gap-4">
-        <.panel id="cluster-facts" title="Cluster" subtitle="From cluster.json, not from a setting">
-          <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <.figure
-              id="fact-name"
-              label="Name"
-              value={@settings.cluster.name}
-              caption="cluster identity"
-            />
-            <.figure
-              id="fact-vip"
-              label="VIP"
-              value={@settings.cluster.vip}
-              caption="console address"
-              tone={:primary}
-            />
-            <.figure
-              id="fact-nodes"
-              label="Nodes"
-              value={@settings.cluster.nodes}
-              caption="configured hosts"
-            />
-            <.figure
-              id="fact-ftt"
-              label="Fault tolerance"
-              value={@settings.cluster.redundancy_factor}
-              caption="failures survivable"
-              tone={if (@settings.cluster.redundancy_factor || 0) < 1, do: :warn, else: :good}
-            />
+        <form phx-submit="save" id="settings-form" class="flex flex-col gap-4">
+          <div class="grid gap-4 xl:grid-cols-2">
+            <.panel
+              id="cluster-settings"
+              title="Cluster"
+              subtitle="Written to cluster.json on every host"
+            >
+              <div class="grid gap-3 sm:grid-cols-2">
+                <.setting_field
+                  name="cluster_name"
+                  label="Cluster name"
+                  value={@settings.cluster.name}
+                  hint="letters, digits and dashes"
+                />
+                <.setting_field
+                  name="vip"
+                  label="Virtual IP (VIP)"
+                  value={@settings.cluster.vip}
+                  hint="the console address; bifrost restarts on every host when it changes"
+                />
+                <.setting_field
+                  name="cluster_subnet"
+                  label="Cluster subnet"
+                  value={@settings.cluster[:subnet]}
+                  hint="CIDR, for example 10.10.102.0/24"
+                />
+                <.setting_field
+                  name="cluster_region"
+                  label="Datacenter / region"
+                  value={@settings.stored["cluster_region"]}
+                />
+                <.setting_field
+                  name="replication_factor"
+                  label="ScyllaDB replication factor"
+                  value={@settings.replication.factor}
+                  type="number"
+                  hint="metadata copies, capped at the node count; raising it starts a repair"
+                />
+                <.setting_select
+                  name="scrub_interval"
+                  label="Disk scrub interval"
+                  value={@settings.stored["scrub_interval"]}
+                  options={[
+                    {"daily", "Daily"},
+                    {"weekly", "Weekly (recommended)"},
+                    {"monthly", "Monthly"},
+                    {"disabled", "Disabled"}
+                  ]}
+                />
+              </div>
+              <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-4 pt-4 border-t border-base-300">
+                <.figure
+                  id="fact-id"
+                  label="Cluster ID"
+                  value={@settings.cluster[:id]}
+                  caption="read only"
+                />
+                <.figure
+                  id="fact-nodes"
+                  label="Nodes"
+                  value={@settings.cluster.nodes}
+                  caption="configured hosts"
+                />
+                <.figure
+                  id="fact-ftt"
+                  label="Fault tolerance"
+                  value={@settings.cluster.redundancy_factor}
+                  caption="failures survivable"
+                  tone={if (@settings.cluster.redundancy_factor || 0) < 1, do: :warn, else: :good}
+                />
+                <.figure
+                  id="rf-actual"
+                  label="Keyspace factor"
+                  value={@settings.replication.factor}
+                  caption={"asked for #{@settings.replication.implied} by ftt"}
+                  tone={replication_tone(@settings.replication)}
+                />
+              </div>
+              <p class="text-xs opacity-60 mt-3" id="replication-note">
+                The replication factor is the <span class="font-semibold">hydra keyspace</span>:
+                VM records, task history, the block map. It says nothing about how many copies of
+                a guest's <em>disk</em>
+                exist, which is a property of each vdisk and shown on <.link
+                  navigate={~p"/storage"}
+                  class="link"
+                >Storage</.link>.
+              </p>
+              <p
+                :if={mismatched?(@settings.replication)}
+                class="text-sm text-warning mt-2"
+                id="replication-mismatch"
+              >
+                The keyspace is replicating {@settings.replication.factor} way(s) but the cluster
+                asked for {@settings.replication.implied}. That gap is what a failed or unfinished
+                change looks like.
+              </p>
+            </.panel>
+
+            <div class="flex flex-col gap-4">
+              <.panel
+                id="dns-settings"
+                title="DNS &amp; networking"
+                subtitle="Written to resolv.conf on every host"
+              >
+                <div class="grid gap-3 sm:grid-cols-3">
+                  <.setting_field
+                    name="dns_servers"
+                    label="Resolvers"
+                    value={@settings.stored["dns_servers"]}
+                    hint="comma separated IP addresses"
+                  />
+                  <.setting_field
+                    name="dns_search_domains"
+                    label="Search domains"
+                    value={@settings.stored["dns_search_domains"]}
+                  />
+                  <.setting_field
+                    name="dns_mtu"
+                    label="MTU"
+                    value={@settings.stored["dns_mtu"]}
+                    type="number"
+                  />
+                </div>
+              </.panel>
+
+              <.panel
+                id="time-settings"
+                title="NTP &amp; time"
+                subtitle="Written to chrony.conf on every host; chronyd restarts"
+              >
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.setting_field
+                    name="ntp_servers"
+                    label="NTP servers"
+                    value={@settings.stored["ntp_servers"]}
+                    hint="comma separated"
+                  />
+                  <.setting_select
+                    name="timezone"
+                    label="Timezone"
+                    value={@settings.stored["timezone"]}
+                    options={timezones(@settings.stored["timezone"])}
+                  />
+                </div>
+              </.panel>
+
+              <.panel
+                id="scheduler-settings"
+                title="Scheduling"
+                subtitle="Background work the cluster does on its own"
+              >
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.setting_select
+                    name="drs_enabled"
+                    label="Distributed resource scheduler"
+                    value={@settings.stored["drs_enabled"]}
+                    options={[{"true", "Enabled: rebalance VMs across hosts"}, {"false", "Disabled"}]}
+                  />
+                </div>
+              </.panel>
+
+              <.panel
+                id="security-settings"
+                title="Security"
+                subtitle="Access control for console operators"
+              >
+                <div class="grid gap-3 sm:grid-cols-3">
+                  <.setting_select
+                    name="password_policy"
+                    label="Password complexity"
+                    value={@settings.stored["password_policy"]}
+                    options={[
+                      {"disabled", "Basic: 5+ characters"},
+                      {"enabled", "Strong: 8+, upper-case, digit, symbol"}
+                    ]}
+                  />
+                  <.setting_field
+                    name="session_timeout"
+                    label="Session timeout"
+                    value={@settings.stored["session_timeout"]}
+                    type="number"
+                    hint="minutes, 5 to 1440"
+                  />
+                  <.setting_field
+                    name="rate_limit"
+                    label="Auth requests / minute"
+                    value={@settings.stored["rate_limit"]}
+                    type="number"
+                    hint="5 to 1000"
+                  />
+                </div>
+              </.panel>
+            </div>
           </div>
-        </.panel>
-
-        <.panel
-          id="replication"
-          title="Metadata replication"
-          subtitle="How many copies of the cluster's own records exist"
-        >
-          <div class="grid grid-cols-2 sm:grid-cols-3 gap-4">
-            <.figure
-              id="rf-actual"
-              label="Keyspace factor"
-              value={@settings.replication.factor}
-              caption="what the database is doing"
-              tone={replication_tone(@settings.replication)}
-            />
-            <.figure
-              id="rf-implied"
-              label="Implied by ftt"
-              value={@settings.replication.implied}
-              caption="what the cluster asked for"
-            />
-            <.figure
-              id="rf-nodes"
-              label="Ceiling"
-              value={@settings.replication.nodes}
-              caption="one copy per node"
-            />
-          </div>
-
-          <p class="text-xs opacity-60 mt-3">
-            This is the <span class="font-semibold">hydra keyspace</span>: VM records, task
-            history, the block map. It says nothing about how many copies of a guest's <em>disk</em>
-            exist, which is a property of each vdisk and shown on <.link
-              navigate={~p"/storage"}
-              class="link"
-            >Storage</.link>.
-          </p>
-          <p
-            :if={mismatched?(@settings.replication)}
-            class="text-sm text-warning mt-2"
-          >
-            The keyspace is replicating {@settings.replication.factor} way(s) but the cluster
-            asked for {@settings.replication.implied}. That gap is what a failed or unfinished
-            change looks like.
-          </p>
-        </.panel>
-
-        <form phx-submit="save" class="flex flex-col gap-4">
-          <.panel id="dns-settings" title="DNS &amp; networking">
-            <div class="grid gap-3 sm:grid-cols-3">
-              <.setting_field
-                name="dns_servers"
-                label="Resolvers"
-                value={@settings.stored["dns_servers"]}
-                hint="comma separated"
-              />
-              <.setting_field
-                name="dns_search_domains"
-                label="Search domains"
-                value={@settings.stored["dns_search_domains"]}
-              />
-              <.setting_field
-                name="dns_mtu"
-                label="MTU"
-                value={@settings.stored["dns_mtu"]}
-                type="number"
-              />
-            </div>
-          </.panel>
-
-          <.panel id="time-settings" title="NTP &amp; time">
-            <div class="grid gap-3 sm:grid-cols-2">
-              <.setting_field
-                name="ntp_servers"
-                label="NTP servers"
-                value={@settings.stored["ntp_servers"]}
-                hint="comma separated"
-              />
-              <.setting_field name="timezone" label="Timezone" value={@settings.stored["timezone"]} />
-            </div>
-          </.panel>
-
-          <.panel id="policy-settings" title="Policies">
-            <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              <.setting_field
-                name="cluster_region"
-                label="Region"
-                value={@settings.stored["cluster_region"]}
-              />
-              <.setting_field
-                name="scrub_interval"
-                label="Scrub interval"
-                value={@settings.stored["scrub_interval"]}
-                hint="daily, weekly, monthly"
-              />
-              <.setting_field
-                name="session_timeout"
-                label="Session timeout"
-                value={@settings.stored["session_timeout"]}
-                type="number"
-                hint="minutes"
-              />
-              <.setting_field
-                name="rate_limit"
-                label="Rate limit"
-                value={@settings.stored["rate_limit"]}
-                type="number"
-                hint="requests per minute"
-              />
-              <.setting_field
-                name="password_policy"
-                label="Password policy"
-                value={@settings.stored["password_policy"]}
-                hint="disabled or strict"
-              />
-              <.setting_field
-                name="drs_enabled"
-                label="DRS"
-                value={@settings.stored["drs_enabled"]}
-                hint="true or false"
-              />
-            </div>
-          </.panel>
 
           <div class="flex justify-end">
             <button type="submit" class="btn btn-primary btn-sm" id="save-settings">
@@ -442,6 +529,70 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
               The last account cannot be removed: a console nobody can sign in to is not
               secured, it is bricked.
             </p>
+
+            <form
+              id="create-user-form"
+              phx-submit="create_user"
+              class="grid gap-2 sm:grid-cols-3 items-end mt-4 pt-4 border-t border-base-300"
+            >
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">New username</span>
+                <input
+                  type="text"
+                  name="username"
+                  class="input input-bordered input-sm w-full"
+                  autocomplete="off"
+                  required
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Password</span>
+                <input
+                  type="password"
+                  name="password"
+                  class="input input-bordered input-sm w-full"
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+              <button type="submit" class="btn btn-primary btn-sm" id="create-user">
+                <.icon name="hero-user-plus" class="size-4" /> Create user
+              </button>
+            </form>
+
+            <form
+              id="set-password-form"
+              phx-submit="set_password"
+              class="grid gap-2 sm:grid-cols-4 items-end mt-4 pt-4 border-t border-base-300"
+            >
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Change password for</span>
+                <select name="username" class="select select-bordered select-sm w-full">
+                  <option :for={user <- @settings.users} value={user}>{user}</option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">New password</span>
+                <input
+                  type="password"
+                  name="password"
+                  class="input input-bordered input-sm w-full"
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Confirm</span>
+                <input
+                  type="password"
+                  name="confirm"
+                  class="input input-bordered input-sm w-full"
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+              <button type="submit" class="btn btn-sm" id="set-password">Change password</button>
+            </form>
           </.panel>
         </div>
       </div>
@@ -470,6 +621,34 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
       <span :if={@hint} class="text-[0.65rem] opacity-45 mt-0.5">{@hint}</span>
     </label>
     """
+  end
+
+  attr :name, :string, required: true
+  attr :label, :string, required: true
+  attr :value, :any, default: nil
+  attr :options, :list, required: true
+
+  defp setting_select(assigns) do
+    ~H"""
+    <label class="form-control">
+      <span class="label-text text-xs opacity-70">{@label}</span>
+      <select name={@name} id={"setting-#{@name}"} class="select select-bordered select-sm w-full">
+        <option :for={{value, text} <- @options} value={value} selected={value == @value}>
+          {text}
+        </option>
+      </select>
+    </label>
+    """
+  end
+
+  @timezones ~w(UTC America/New_York America/Chicago America/Denver America/Los_Angeles
+                Europe/London Europe/Paris Europe/Brussels Asia/Tokyo Asia/Singapore)
+
+  # The stored zone is always an option, whatever it is: a select that cannot show the value
+  # in force would silently change it on the next save.
+  defp timezones(current) do
+    zones = if current in [nil, ""] or current in @timezones, do: @timezones, else: [current | @timezones]
+    Enum.map(zones, &{&1, &1})
   end
 
   defp urbosa_on?(settings), do: settings.read_only["urbosa_enabled"] == "true"
