@@ -350,17 +350,22 @@ def main():
                 cql = "SELECT JSON * FROM hydra.mimir_schedules;"
                 rc, stdout, stderr = run_cql_query(cql)
                 if rc == 0:
-                    schedules = []
+                    # Not `schedules`: that name is the leadership candidacy, held for the life of
+                    # the daemon. Rebinding it to the table's rows made the next iteration call
+                    # .leading() on a list, which raised every minute and was swallowed by the
+                    # except below -- so the scheduled health checks silently stopped after the
+                    # first pass in which this node led. See test_candidacy_not_rebound.
+                    rows = []
                     for line in stdout.splitlines():
                         line = line.strip()
                         if line.startswith("{") and line.endswith("}"):
                             try:
-                                schedules.append(json.loads(line))
+                                rows.append(json.loads(line))
                             except Exception:
                                 pass
                     
                     now = int(time.time())
-                    for s in schedules:
+                    for s in rows:
                         if s.get("enabled", False):
                             name = s.get("schedule_name")
                             last_run = s.get("last_run_epoch", 0)
