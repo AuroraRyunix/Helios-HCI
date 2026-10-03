@@ -11,8 +11,10 @@ Helios splits deployment deliberately between two mechanisms.
 **Third-party services run as Podman Quadlets** — a `.container` unit file under `/etc/containers/systemd/` that `podman-system-generator` turns into a regular `systemd` unit (`systemd-<name>.service`) at boot. `provision.py` writes these (grep for `node.write_file("/etc/containers/systemd/...")`). They are:
 
 ```
-zookeeper, hydra-db, spectrum, slate
+zookeeper, hydra-db, spectrum, spectrum-phx, slate
 ```
+
+`spectrum-phx` is the Phoenix console: its `.container` is read from `spectrum_phx/quadlet/` and its image is built from `spectrum_phx/` on every node by `provision.py`, started by `cluster create` and rebuilt by `deploy_updates.py` ([spectrum_phx.md](./spectrum_phx.md) section 0).
 
 These are genuine third-party services with real dependency trees — ZooKeeper, ScyllaDB, Traefik — plus the Spectrum image built from the repo `Dockerfile`.
 

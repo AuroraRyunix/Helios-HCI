@@ -29,7 +29,7 @@ defmodule SpectrumPhx.Zk.State do
 
   # The order `cluster status` lists services in. It belongs with the document schema
   # rather than with any one renderer, since the keys of `"services"` come from here.
-  @service_display_order ~w(ZooKeeper HydraDB Daruk Sidon Spark Spectrum Bifrost Dagur
+  @service_display_order ~w(ZooKeeper HydraDB Daruk Sidon Spark Spectrum Phoenix Bifrost Dagur
                             Mimir Rauru Vali Catalyst Hylia Gatoway Logos Mipha Agahnim Slate
                             Urbosa)
 

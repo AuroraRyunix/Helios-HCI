@@ -1865,7 +1865,7 @@ def process_queue_task(task):
                 run_remote_spark(target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
                 # Every cluster service except spark-daemon, which has to survive to
                 # be told to start them again.
-                maintenance_units = ["spectrum", "catalyst", "bifrost", "dagur", "mimir", "rauru",
+                maintenance_units = ["spectrum", "spectrum-phx", "catalyst", "bifrost", "dagur", "mimir", "rauru",
                                      "vali", "sidon", "hydra-db", "gatoway", "urbosa",
                                      "logos", "mipha", "daruk", "agahnim", "slate"]
 
@@ -1911,7 +1911,7 @@ def process_queue_task(task):
             }, method="POST")
             
             print(f"[Maintenance Catalyst Task] Starting services on host {hostname}...")
-            start_units = ["zookeeper", "hydra-db", "sidon", "spectrum", "bifrost",
+            start_units = ["zookeeper", "hydra-db", "sidon", "spectrum", "spectrum-phx", "bifrost",
                            "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa",
                            "logos", "mipha", "daruk", "agahnim", "slate"]
             ok, detail = spark_unit_action(target_ip, "start", start_units)

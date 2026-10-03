@@ -242,7 +242,7 @@ BOLD = "\033[1m"
 GRAY = "\033[90m"
 RESET = "\033[0m"
 
-SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum",
+SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Phoenix",
                          "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia",
                          "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa"]
 
@@ -901,6 +901,53 @@ def unit_is_active(ip, unit):
         if state.get("unit") == unit:
             return bool(state.get("active"))
     return False
+
+
+PHX_ENV_PATH = "/etc/hci/spectrum/spectrum-phx.env"
+
+
+def ensure_phoenix_env(ips):
+    """Make sure every node has the Phoenix console's environment file, with one secret.
+
+    Provisioning writes it, but `cluster destroy` removes /etc/hci/spectrum and with it the
+    secret, and the console's unit refuses to start without that file (a crash loop on a
+    missing SECRET_KEY_BASE is worse than an inactive unit). A cluster that is created again
+    on nodes that were already provisioned would otherwise reach Phase 6 with nothing for the
+    console to start from.
+
+    The secret has to be identical on every node -- a session cookie signed on one must verify
+    on the others -- so an existing one is reused, and a node that has none is given the same
+    value. A new one is minted only when no node has any, which is also the only time nobody
+    holds a session to lose. Existing files are never rewritten. Returns the nodes it wrote.
+    """
+    import secrets as _secrets
+
+    secret = ""
+    has_file = {}
+    for ip in ips:
+        rc, out, _ = run_remote_spark(
+            ip, "grep -h '^SECRET_KEY_BASE=' %s 2>/dev/null; true" % PHX_ENV_PATH)
+        value = out.strip().partition("=")[2].strip() if rc == 0 else ""
+        has_file[ip] = bool(value)
+        if value and not secret:
+            secret = value
+    if not secret:
+        secret = base64.b64encode(_secrets.token_bytes(48)).decode("ascii").rstrip("=")
+
+    written = []
+    for ip in ips:
+        if has_file[ip]:
+            continue
+        text = (f"SECRET_KEY_BASE={secret}\nPHX_HOST={ip}\n"
+                f"PHX_EXTRA_ORIGINS={','.join(ips)}\n")
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        rc, _, err = run_remote_spark(
+            ip, f"mkdir -p /etc/hci/spectrum && echo {encoded} | base64 -d > {PHX_ENV_PATH} "
+                f"&& chmod 600 {PHX_ENV_PATH}")
+        if rc != 0:
+            raise RuntimeError(f"could not write {PHX_ENV_PATH} on {ip}: {err}")
+        written.append(ip)
+    return written
 
 
 def port_listening(ip, port):
@@ -2439,7 +2486,7 @@ def main():
 
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         # `ignore_failed` is the `|| true` this used to carry: a service that is not
         # running cannot be stopped, and on a clean host none of them are.
         unit_action_parallel(ips, "stop", cleanup_services, ignore_failed=True)
@@ -2631,6 +2678,15 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             env_b64 = base64.b64encode(spectrum_env.encode('utf-8')).decode('utf-8')
             run_remote_spark(ip, f"mkdir -p /etc/hci/spectrum && echo {env_b64} | base64 -d > /etc/hci/spectrum/spectrum.env")
 
+        # The Phoenix console's own environment, which Phase 6 needs before it can start the
+        # console. Provisioning wrote it unless a destroy has removed it since.
+        try:
+            for ip in ensure_phoenix_env(ips):
+                print(f"[{ip}] wrote the Phoenix console environment (it was missing).")
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(1)
+
 
         # 5. Database Quorum Setup
         print("Creating ZooKeeper, ScyllaDB, and Aether volume directories on all nodes...")
@@ -2769,7 +2825,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
+        services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
         
         # Check if urbosa enabled
         urbosa_enabled = False
@@ -2880,6 +2936,28 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 print(f"[{ip}] Spectrum API/UI is responsive on port 8443.")
 
         if not spectrum_healthy:
+            sys.exit(1)
+
+        # The Phoenix console listens on 8444, on loopback only, behind Slate. Bifrost's
+        # health guard refuses to bind the VIP while Slate's console backend is down, so a
+        # console that is not listening here is a cluster with no VIP, found by Mimir later
+        # and less legibly than by the port.
+        print("Verifying Phoenix console reachability on port 8444...")
+        phoenix_healthy = True
+        for ip in ips:
+            reached = False
+            for _ in range(20):
+                if port_listening(ip, 8444):
+                    reached = True
+                    break
+                time.sleep(2)
+            if not reached:
+                print(f"[ERROR] Phoenix console is not listening on {ip}:8444.")
+                phoenix_healthy = False
+            else:
+                print(f"[{ip}] Phoenix console is listening on port 8444.")
+
+        if not phoenix_healthy:
             sys.exit(1)
 
         print("Running diagnostic verification checks using Mimir...")
@@ -3244,7 +3322,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
             ok, detail = unit_action(ip, "stop", services, ignore_failed=True)
@@ -3502,7 +3580,7 @@ run_with_timeout("systemctl stop sidon || true", timeout=15)
 run_with_timeout(__SIDON_TEARDOWN__, timeout=30)
 
 print("Removing system containers...", flush=True)
-run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum || true", timeout=15)
+run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum spectrum-phx || true", timeout=15)
 
 print("Removing storage directories...", flush=True)
 run_with_timeout("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", timeout=10)

@@ -273,6 +273,53 @@ def spark_endpoint(ip):
 # ceiling on a hung command, not a budget for a healthy one.
 STORAGE_PREP_TIMEOUT = 900
 
+PHX_ENV_PATH = "/etc/hci/spectrum/spectrum-phx.env"
+
+
+def ensure_phoenix_env(ips):
+    """Make sure every node has the Phoenix console's environment file, with one secret.
+
+    Provisioning writes it, but `cluster destroy` removes /etc/hci/spectrum and with it the
+    secret, and the console's unit refuses to start without that file (a crash loop on a
+    missing SECRET_KEY_BASE is worse than an inactive unit). A cluster that is created again
+    on nodes that were already provisioned would otherwise reach Phase 6 with nothing for the
+    console to start from.
+
+    The secret has to be identical on every node -- a session cookie signed on one must verify
+    on the others -- so an existing one is reused, and a node that has none is given the same
+    value. A new one is minted only when no node has any, which is also the only time nobody
+    holds a session to lose. Existing files are never rewritten. Returns the nodes it wrote.
+    """
+    import secrets as _secrets
+
+    secret = ""
+    has_file = {}
+    for ip in ips:
+        rc, out, _ = run_remote_spark(
+            ip, "grep -h '^SECRET_KEY_BASE=' %s 2>/dev/null; true" % PHX_ENV_PATH)
+        value = out.strip().partition("=")[2].strip() if rc == 0 else ""
+        has_file[ip] = bool(value)
+        if value and not secret:
+            secret = value
+    if not secret:
+        secret = base64.b64encode(_secrets.token_bytes(48)).decode("ascii").rstrip("=")
+
+    written = []
+    for ip in ips:
+        if has_file[ip]:
+            continue
+        text = (f"SECRET_KEY_BASE={secret}\nPHX_HOST={ip}\n"
+                f"PHX_EXTRA_ORIGINS={','.join(ips)}\n")
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        rc, _, err = run_remote_spark(
+            ip, f"mkdir -p /etc/hci/spectrum && echo {encoded} | base64 -d > {PHX_ENV_PATH} "
+                f"&& chmod 600 {PHX_ENV_PATH}")
+        if rc != 0:
+            raise RuntimeError(f"could not write {PHX_ENV_PATH} on {ip}: {err}")
+        written.append(ip)
+    return written
+
+
 def run_remote_spark(ip, command, timeout=None):
     ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
@@ -587,6 +634,10 @@ MANAGED_SERVICES = (
     {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043},
     {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True},
     {"unit": "spectrum", "display": "Spectrum", "requires": ("daruk",)},
+    # The Phoenix console, on 8444 behind Slate. Slate's console backend points here, and
+    # Bifrost's health guard will not bind the VIP while that backend is down, so a cluster
+    # without this unit running has no VIP and fails Mimir's vip_binding_status.
+    {"unit": "spectrum-phx", "display": "Phoenix", "requires": ("daruk",)},
     {"unit": "slate", "display": "Slate", "requires": ("daruk",)},
     {"unit": "agahnim", "display": "Agahnim", "requires": ("daruk",)},
     {"unit": "catalyst", "display": "Catalyst", "requires": ("daruk",)},
@@ -1245,7 +1296,7 @@ def build_node_status():
     # can never be UP means no VM can ever be placed. Leaving `aether` in after removing
     # it did exactly that -- creates succeeded, starts refused with "No active hypervisor
     # host has sufficient memory", and the memory had nothing to do with it.
-    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -1253,6 +1304,7 @@ def build_node_status():
         "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
+        "spectrum-phx": "Phoenix",
         "bifrost": "Bifrost",
         "dagur": "Dagur",
         "mimir": "Mimir",
@@ -1485,7 +1537,7 @@ VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset", "suspend"
 MANAGED_UNITS = frozenset((
     "agahnim", "bifrost", "catalyst", "chronyd", "dagur", "daruk", "gatoway",
     "hydra-db", "hylia", "libvirtd", "logos", "mimir", "mipha", "rauru", "sidon", "slate",
-    "spark-daemon", "spectrum", "urbosa", "vali", "virtqemud", "zookeeper",
+    "spark-daemon", "spectrum", "spectrum-phx", "urbosa", "vali", "virtqemud", "zookeeper",
 ))
 
 # `daemon-reload` is the odd one out: it takes no units at all, being a reload of
@@ -2818,7 +2870,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     if os.path.exists("/etc/hci/maintenance.state"):
                         os.remove("/etc/hci/maintenance.state")
                     
-                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir rauru vali catalyst gatoway logos mipha daruk agahnim slate"
+                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum spectrum-phx bifrost dagur mimir rauru vali catalyst gatoway logos mipha daruk agahnim slate"
                     subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                     self.send_json_response(200, {
@@ -3038,7 +3090,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
+                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Phoenix", "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
                     if "Urbosa" in services:
                         svc_list.append("Urbosa")
                     for svc_name in svc_list:
@@ -3411,6 +3463,10 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 spectrum_env = f"LOCAL_HYPERVISOR_IP={ip}\n"
                 env_b64 = base64.b64encode(spectrum_env.encode('utf-8')).decode('utf-8')
                 run_remote_spark(ip, f"mkdir -p /etc/hci/spectrum && echo {env_b64} | base64 -d > /etc/hci/spectrum/spectrum.env")
+
+            # The Phoenix console's environment, which the start below needs. Provisioning
+            # wrote it unless a destroy has removed it since.
+            ensure_phoenix_env(servers)
                 
             # Create local directories for images and nvram configs
             run_parallel_checked(servers, "mkdir -p /var/lib/hci/aether/images /var/lib/hci/aether/nvram")
@@ -3489,7 +3545,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
             
             # Start spectrum and other services
-            services = ["spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
+            services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
             for svc in services:
                 run_parallel_checked(servers, f"systemctl start {svc}")
                 for ip in servers:
@@ -3530,6 +3586,19 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                 if not reached:
                     raise Exception(f"Spectrum UI is unreachable on {ip}:8443")
 
+            # The Phoenix console, on loopback behind Slate. Bifrost will not bind the VIP
+            # while it is down.
+            for ip in servers:
+                reached = False
+                for _ in range(20):
+                    rc, out, _ = run_remote_spark(ip, "ss -tln | grep -E '[:.]8444[[:space:]]'")
+                    if rc == 0 and "8444" in out:
+                        reached = True
+                        break
+                    time.sleep(2)
+                if not reached:
+                    raise Exception(f"Phoenix console is not listening on {ip}:8444")
+
             self.send_json_response(200, {"message": "Cluster created and verified successfully."})
             return
         except Exception as ex:
@@ -3568,7 +3637,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop services on all hosts in parallel
         # 2. Stop services on all hosts in parallel
-        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         run_parallel(hosts, f"systemctl stop {svc_list} || true")
         
@@ -3788,7 +3857,7 @@ for dev, mount in claimed:
 # Clean up the extent store
 subprocess.run("systemctl stop sidon || true", shell=True)
 subprocess.run(__SIDON_TEARDOWN__, shell=True)
-subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum || true", shell=True)
+subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum spectrum-phx || true", shell=True)
 subprocess.run("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", shell=True)
 subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", shell=True)
 """
@@ -4818,7 +4887,7 @@ def check_cluster_and_autostart():
         if not os.path.exists("/etc/hci/cluster.json"):
             if not _stopped_for_no_cluster:
                 print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-                services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+                services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
                 for svc in services_to_stop:
                     subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 _stopped_for_no_cluster = True
@@ -4828,7 +4897,7 @@ def check_cluster_and_autostart():
         
     if os.path.exists("/etc/hci/maintenance.state"):
         print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")
-        services_to_stop = ["rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
+        services_to_stop = ["rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run("systemctl start zookeeper", shell=True)
@@ -4894,7 +4963,7 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:

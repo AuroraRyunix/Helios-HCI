@@ -2049,7 +2049,7 @@ def main():
                         
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
-                        start_units = ["zookeeper", "hydra-db", "daruk", "sidon", "spectrum",
+                        start_units = ["zookeeper", "hydra-db", "daruk", "sidon", "spectrum", "spectrum-phx",
                                        "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst",
                                        "gatoway", "logos", "mipha", "agahnim", "slate",
                                        "hylia"]

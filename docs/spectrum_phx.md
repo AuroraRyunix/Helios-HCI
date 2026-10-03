@@ -10,6 +10,32 @@ replacing, see [spectrum.md](./spectrum.md) and [spectrum_technical.md](./spectr
 
 ---
 
+## 0. Where it comes from on a node
+
+Every node gets the console from provisioning, not from a rollout. `provision.py` writes
+`/etc/containers/systemd/spectrum-phx.container` from `spectrum_phx/quadlet/` (the file
+`deploy_updates.py` installs, so the two cannot write different consoles), builds
+`localhost/spectrum-phx:latest` from the tree beside it, and writes
+`/etc/hci/spectrum/spectrum-phx.env`. The unit is `Pull=never`, so an image that was not built on
+the node is a console that cannot start; the build compiles an Elixir release and pulls its base
+images, and it is the slowest step of provisioning.
+
+It is not started there, because it needs the database. `cluster create` starts it in Phase 6, after
+`spectrum` and before `bifrost`, and checks 8444 in Phase 7; `cluster start`, `stop` and `status`
+handle it as the `spectrum-phx` entry of `MANAGED_SERVICES`. The ordering matters: the console binds
+loopback only, Slate routes the pages to it, and Bifrost refuses to bind the VIP while Slate's
+console backend is down, so a created cluster without it fails Mimir's `vip_binding_status`.
+
+A node provisioned with `--join` does not get the environment file: the secret minted for that run
+is not the existing cluster's, and the unit stays inactive until the rollout copies the cluster's
+own. `deploy_updates.py` still rebuilds the image and restarts the unit on every rollout. The
+console is not a component of the signed upgrade package, so a fast patch never touches it.
+
+The unit is the hardened form (all capabilities dropped, `NoNewPrivileges`, no `--privileged`).
+The open question about a privileged-versus-hardened console Quadlet in [TODO.md](../TODO.md) is
+about the *Python* console's Quadlet, which `provision.py` and `deploy_updates.py` still write
+differently; this one has a single source.
+
 ## 1. It is a strangler migration, not a rewrite-and-switch
 
 The Python `spectrum_server.py` keeps running on 8443. `spectrum-phx` runs beside it on

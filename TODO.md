@@ -76,15 +76,6 @@ same duplication, and the same risk -- it is how `cluster start` came to restart
 months after the unit was deleted. And the volume group is still named `vg_aether`, a name left over
 from the DRBD design that nothing but history explains.
 
-## P1 — A freshly created cluster has no Phoenix console until the rollout runs (2026-10-03, not started)
-
-Found by running `cluster create` on the test cluster. Create finishes with Spectrum on 8443 but
-nothing on 8444, because the console Quadlet is deployed by `deploy_updates.py`, not by
-provisioning or create. Bifrost's local health guard (rightly) refuses to bind the VIP while
-Slate's console backend is down, so Mimir's `vip_binding_status` fails on a brand-new cluster until
-a rollout is run. Create should bring the console up itself, or provisioning should install it, so
-that a created cluster passes its own health check without a second tool.
-
 ## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
 
 Reported from using it. The pages exist and render, which is what "every page is Phoenix"
@@ -953,7 +944,10 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   **Still open, and different in kind: the console's container image.** It pulls base
   images from a public registry at build time, so putting it in a signed package means
   either vendoring those bases or admitting the build is not hermetic.
-* ~~`provision.py` does not know about the Phoenix console.~~ **Half done (2026-08-22).**
+* ~~`provision.py` does not know about the Phoenix console.~~ **Done (2026-10-03):** provisioning now
+  installs the Quadlet, builds the image and writes the environment file on every node, and `cluster
+  create` starts it in Phase 6 (it is a `MANAGED_SERVICES` entry). The history below is why the secret
+  is decided where it is. *Half done (2026-08-22).*
   Provisioning now decides the one thing only it can: `SECRET_KEY_BASE`, generated once
   per cluster and written identically to every node. It has to be the same everywhere --
   a session cookie signed on one node must verify on the others, or Slate routing to a
@@ -1410,7 +1404,9 @@ entry fails the test the moment it is fixed, so it has to be deleted here too.
   `deploy_updates.py` builds and installs the binary and deliberately does not restart it. A node
   whose sidon unit is missing or stale cannot be repaired by a rollout. Belongs with the change
   to how sidon's disks are mounted, which edits the same code.
-* **The rollout writes a different console Quadlet from provisioning.** `deploy_updates.py`'s
+* **The rollout writes a different *Python* console Quadlet from provisioning.** (The Phoenix
+  console's Quadlet has a single source, `spectrum_phx/quadlet/`, is the hardened form, and is installed
+  by provisioning and the rollout alike -- see [docs/spectrum_phx.md](docs/spectrum_phx.md) section 0.) `deploy_updates.py`'s
   `spectrum_container_content` still has `PodmanArgs=--privileged`; `provision.py`'s drops all
   capabilities and sets `NoNewPrivileges`, with the reasoning. A node provisioned today is put back
   to the privileged console by its next rollout. They also disagree on the maintenance condition

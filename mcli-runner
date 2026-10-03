@@ -1241,7 +1241,7 @@ def check_services(category):
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
     in_maint = os.path.exists("/etc/hci/maintenance.state")
-    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "rauru", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
+    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "catalyst", "bifrost", "dagur", "mimir", "rauru", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
@@ -2670,7 +2670,7 @@ def check_services(category):
     update_current_check(category, "flapping_service_check")
     try:
         managed = ["zookeeper", "hydra-db", "daruk", "sidon",
-                   "spark-daemon", "spectrum", "slate", "agahnim", "catalyst", "vali",
+                   "spark-daemon", "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali",
                    "bifrost", "dagur", "mimir", "rauru", "logos", "mipha", "gatoway", "hylia",
                    "libvirtd"]
         if urbosa_active:

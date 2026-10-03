@@ -79,7 +79,7 @@ defmodule SpectrumPhx.Health do
   # still holds historical rows under it, the same reason the storage list below keeps its
   # `aether_*` names.
   @service_checks ~w(
-    zookeeper_status hydra-db_status daruk_status sidon_status aether_status spectrum_status
+    zookeeper_status hydra-db_status daruk_status sidon_status aether_status spectrum_status spectrum-phx_status
     spark-daemon_status libvirtd_status catalyst_status bifrost_status dagur_status
     mimir_status rauru_status vali_status gatoway_status urbosa_status logos_status mipha_status
     agahnim_status slate_status hylia_status scylladb_ring_status zookeeper_consensus

@@ -42,6 +42,7 @@ CHECK_ID_TO_FUNC = {
     "daruk_status": "database.daruk",
     "sidon_status": "storage.sidon",
     "spectrum_status": "service.spectrum",
+    "spectrum-phx_status": "service.spectrum-phx",
     "spark-daemon_status": "service.spark",
     "libvirtd_status": "service.libvirtd",
     "libvirt_responsiveness": "service.libvirtd.responsiveness",
@@ -181,7 +182,7 @@ def run_node_checks(node, category, local_ip, results_dict):
         # Setup specific list of checks depending on the category being run
         checks_map = {
             "services": [
-                "zookeeper_status", "hydra-db_status", "daruk_status", "sidon_status", "spectrum_status",
+                "zookeeper_status", "hydra-db_status", "daruk_status", "sidon_status", "spectrum_status", "spectrum-phx_status",
                 "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "rauru_status", "vali_status",
                 "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "hylia_status", "scylladb_ring_status",
                 "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
@@ -536,6 +537,7 @@ def show_list():
         ("database.scylladb", "hydra-db_status", "Check systemd ScyllaDB state"),
         ("database.scylladb.replication", "scylladb_replication", "Verify hydra keyspace replication factor config"),
         ("service.spectrum", "spectrum_status", "Check systemd Spectrum UI state"),
+        ("service.spectrum-phx", "spectrum-phx_status", "Check systemd Phoenix console state"),
         ("service.spectrum.port", "spectrum_api_port", "Verify Spectrum API console port 8443 is open"),
         ("service.spark", "spark-daemon_status", "Check systemd Spark Host Agent state"),
         ("service.libvirtd", "libvirtd_status", "Check systemd Virtualization hypervisor state"),

@@ -119,6 +119,7 @@ KINDS = {
     "sidon": frozenset(("rust-crate", "native-unit")),
     "spectrum": frozenset(("script", "quadlet")),
     "slate": frozenset(("quadlet",)),
+    "spectrum-phx": frozenset(("quadlet",)),
     "agahnim": frozenset(("rust-crate", "native-unit")),
     "catalyst": DAEMON,
     "vali": DAEMON,
@@ -362,6 +363,7 @@ LEGACY_WATCHDOG = {
     "slate": SUPERVISED_BY_THE_RECONCILE_LOOP,
     "agahnim": SUPERVISED_BY_THE_RECONCILE_LOOP,
     "hylia": SUPERVISED_BY_THE_RECONCILE_LOOP,
+    "spectrum-phx": SUPERVISED_BY_THE_RECONCILE_LOOP,
 }
 
 REGISTRIES = [
@@ -377,6 +379,10 @@ REGISTRIES = [
 
     # -- the fast-patch restart map ----------------------------------------------------------
     Registry("hylia.py", "hylia_rolling_upgrade", "service_components", exempt={
+        "spectrum-phx": ("the Phoenix console is not a component of the signed upgrade package: "
+                         "its image is built from a source tree the package does not carry (see "
+                         "TODO.md, the console image is not hermetic), so no fast patch changes "
+                         "it and only deploy_updates.py rebuilds and restarts it"),
         "sidon": ("a fast patch must not restart the storage daemon: that detaches every "
                   "vdisk on the node, so a new sidon takes effect on the reboot the full "
                   "upgrade performs (see deploy_updates.py, `sidon is installed but not "
@@ -954,6 +960,7 @@ class ElectionNames(unittest.TestCase):
         "spectrum": ("the console is stateless behind the VIP; the one leader-only job it hosts is "
                      "named for the job, `lanayru-queue`, and is not named for the daemon"),
         "slate": "a per-node Traefik; every node routes for itself",
+        "spectrum-phx": "the console is stateless behind the VIP, like the Python tier it sits beside",
         "agahnim": "a per-node console proxy",
         "logos": "per-node telemetry: every node reports its own, so there is nothing to elect",
         "gatoway": "per-node bridge synchronisation: each node builds its own bridges",

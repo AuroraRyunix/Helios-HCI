@@ -173,13 +173,14 @@ def get_dfs_engine():
     return value if value in ("linstor", "sidon") else "sidon"
 
 def show_status_json():
-    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
         "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
+        "spectrum-phx": "Phoenix",
         "bifrost": "Bifrost",
         "dagur": "Dagur",
         "mimir": "Mimir",
@@ -281,13 +282,14 @@ def show_status_json():
     print(json.dumps(result))
  
 def show_status():
-    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
         "sidon": "Sidon",
         "spark-daemon": "Spark",
         "spectrum": "Spectrum",
+        "spectrum-phx": "Phoenix",
         "bifrost": "Bifrost",
         "dagur": "Dagur",
         "mimir": "Mimir",
@@ -392,7 +394,7 @@ def show_status():
             print(f"                    {svc_map[svc]:<16}   {RED}DOWN{RESET}")
 
 def check_any_cluster_service_active():
-    services = ["spectrum", "sidon", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "slate"]
+    services = ["spectrum", "spectrum-phx", "sidon", "hydra-db", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "slate"]
     for svc in services:
         rc, out, _ = run_local(f"systemctl is-active {svc}")
         if rc == 0 and out.strip() == "active":
@@ -440,7 +442,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":

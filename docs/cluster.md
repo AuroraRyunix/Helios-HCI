@@ -73,10 +73,18 @@ cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.24
    (unit state, journal tail, mounts). The order is the one `cluster start` follows: sidon keeps
    vdisk ownership in Hydra, so it comes up behind it. Long steps print what they are doing and,
    every ten seconds, which nodes they are still waiting on.
-6. **Core services.** Starts the application daemons. This phase still starts services by hand,
-   which `cluster start` no longer does; converting it is recorded in [TODO.md](../TODO.md).
-7. **Liveness and health.** Verifies that every Sidon peer is reachable and that Spectrum
-   answers on 8443.
+6. **Core services.** Starts the application daemons, one service at a time across all nodes,
+   including `spectrum-phx`, the Phoenix console, which goes up right after `spectrum` and before
+   `bifrost`: Slate's console backend is `127.0.0.1:8444`, and Bifrost's local health guard will not
+   bind the VIP while that backend is down. The console's image and Quadlet are installed by
+   `provision.py` on every node, so nothing needs a rollout first. Before this phase create also
+   makes sure each node has `/etc/hci/spectrum/spectrum-phx.env`, which `cluster destroy` removes
+   with `/etc/hci/spectrum`: an existing `SECRET_KEY_BASE` is reused and a node that lacks one gets
+   the same value, and a new one is minted only when no node has any, because it has to be identical
+   everywhere. This phase still starts services by hand, which `cluster start` no longer does;
+   converting it is recorded in [TODO.md](../TODO.md).
+7. **Liveness and health.** Verifies that every Sidon peer is reachable, that Spectrum
+   answers on 8443 and that the Phoenix console is listening on 8444, then runs Mimir's checks.
 
 (Phase 5 no longer exists: it was the DRBD/Linstor bring-up.)
 
