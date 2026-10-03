@@ -352,6 +352,17 @@ else:
 PY
 """
 
+# Prefixed to the disk steps below, and deliberately NOT part of the shared scripts: those
+# are asserted byte-identical across four files, and this is a fact about the rollout alone.
+#
+# The rollout reaches nodes that already have a cluster. On one that does not -- destroyed,
+# or provisioned and not yet created -- there is nothing for a disk to be "additional" to,
+# and the blank disks it would claim are the ones `cluster create` carves the journal volume
+# from.
+ONLY_WITH_A_CLUSTER = """\
+[ -f /etc/hci/cluster.json ] || { echo "no cluster is configured on this node; its disks are left alone"; exit 0; }
+"""
+
 # Give sidon every empty disk, one filesystem each. Kept identical to the copy in
 # provision.py: one claims disks for a new node, the other reaches nodes that already
 # exist, and a difference between them would mean a disk laid out one way on some
@@ -1515,8 +1526,16 @@ def deploy_to_node(ip):
             # than one disk, so the rollout is where it reaches them. Idempotent: a disk
             # already carrying a filesystem is mounted, never reformatted, and one that is
             # already an LVM physical volume is the first disk and is skipped.
+            #
+            # Only on a node that belongs to a cluster. A node with no /etc/hci/cluster.json --
+            # just destroyed, or provisioned and not yet created -- has no journal volume for
+            # this to be "additional" to, so claiming its blank disks here takes the very disk
+            # `cluster create` is about to carve the journal volume from. That is how a rollout
+            # onto freshly destroyed nodes left both disks formatted and mounted, and create
+            # would then have failed with "No empty disk >= 100GB found". See
+            # test_rollout_leaves_a_clusterless_nodes_disks_alone.
             print(f"[{ip}] Claiming any additional disks for the extent store...")
-            _, stdout_dk, _ = ssh.exec_command(CLAIM_EXTRA_DISKS)
+            _, stdout_dk, _ = ssh.exec_command(ONLY_WITH_A_CLUSTER + CLAIM_EXTRA_DISKS)
             stdout_dk.channel.recv_exit_status()
             for line in stdout_dk.read().decode("utf-8", "replace").splitlines():
                 if line.strip():
@@ -1528,7 +1547,7 @@ def deploy_to_node(ip):
             # and edits no fstab line, so it is safe under a running sidon. The node moves
             # to the new layout when sidon next starts, which is the first moment nothing
             # of sidon's is holding a mount; see docs/dfs/multi_disk.md.
-            _, stdout_sg, _ = ssh.exec_command(STAGE_SIDON_DISKS)
+            _, stdout_sg, _ = ssh.exec_command(ONLY_WITH_A_CLUSTER + STAGE_SIDON_DISKS)
             sg_said = stdout_sg.read().decode("utf-8", "replace").strip()
             stdout_sg.channel.recv_exit_status()
             if sg_said and not sg_said.endswith("ok"):
