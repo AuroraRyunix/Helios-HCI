@@ -44,8 +44,8 @@ snapshot sets to another site is **designed** (D-28 to D-31, [replication.md](./
 data plane in `sidon/src/replicate*` and `rauru_replication.py` is built and tested only against
 two directories standing in for two sites. Failover and failback are a design, not code.
 
-Several guest requests in flight per NBD connection, and group commit of their journal syncs,
-are designed and deliberately not built: [group_commit.md](./group_commit.md).
+Several guest requests in flight per NBD connection, and group commit of their journal syncs
+and replica round trips, are built: [group_commit.md](./group_commit.md).
 
 Not built: tiering on a timer or on mixed media, the journal on the fastest disk, writing
 extent ids (D-23 stage 3), dedup itself (only its estimator exists), compaction on a timer or of groups a drain cannot be excluded from, rollback of an attached vdisk, erasure coding (decided

@@ -5,9 +5,10 @@
 //! so they are stated once and never departed from:
 //!
 //! 1. **A write is acknowledged when its journal records are durable -- here and on every
-//!    replica -- and not before.** The local sync and the replicas run concurrently, and
-//!    the whole group is synced once; what is acknowledged is unchanged. See
-//!    `append_group`.
+//!    replica -- and not before.** Writes that are in flight together share one local
+//!    `fdatasync` and one round trip per replica (group commit), and a write is visible to
+//!    readers only once its whole batch is durable everywhere; what is acknowledged is
+//!    unchanged. See `commit.rs`.
 //! 2. **Extent bytes are durable before any map row points at them.** A crash between
 //!    the two leaves orphaned bytes, which Purah sweeps. The reverse ordering
 //!    leaves a map pointing at bytes that do not exist, which is data loss.
@@ -59,6 +60,9 @@ use crate::meta::{
 };
 use crate::overlay::Overlay;
 use crate::peer::{self, PeerClient, Request};
+
+mod commit;
+pub use commit::{broken_reason, recover, Commit};
 
 /// Guest writes larger than this become several journal records terminated by one commit
 /// marker. Bounded so a single enormous write cannot pin an unbounded buffer.
@@ -153,6 +157,9 @@ pub struct Vdisk {
     /// groups are read by every clone of it, and a per-vdisk tally would have to be summed
     /// at flush time anyway to say anything true about the group.
     access: Arc<AccessLog>,
+    /// Group commit: the queue of appended writes, the batch being made durable, and the
+    /// state that stops appends when a batch failed. See `commit.rs`.
+    commit: Arc<commit::Pipeline>,
     /// Set when a drain fails after its bytes are durable. Reads stay correct (the
     /// overlay still holds the newest data), but the journal must not be truncated and
     /// the condition has to be visible rather than retried into silence.
@@ -249,6 +256,7 @@ impl Vdisk {
             map_replicas,
             compress,
             access: Arc::clone(&cfg.access),
+            commit: commit::Pipeline::new(),
             degraded: None,
             journal,
         };
@@ -440,55 +448,6 @@ impl Vdisk {
         Ok(buf)
     }
 
-    /// Append a guest write to the journal and acknowledge it. The only durability call
-    /// on this path is the journal's own `sync_data`.
-    pub fn write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
-        if self.class == CLASS_IMMUTABLE {
-            return Err(Error::refused(format!(
-                "vdisk {} is an immutable image and cannot be written",
-                self.id
-            )));
-        }
-        if data.is_empty() {
-            return Ok(());
-        }
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| Error::refused("write offset overflows".to_string()))?;
-        if end > self.size {
-            return Err(Error::refused(format!(
-                "write {offset}+{} runs past the end of vdisk {} ({} bytes)",
-                data.len(),
-                self.id,
-                self.size
-            )));
-        }
-
-        // Split oversized writes, marking only the final record. Replay applies the group
-        // or none of it, so a crash mid-split cannot expose a prefix of a guest write.
-        let mut chunks: Vec<(u64, &[u8])> = Vec::new();
-        let mut pos = 0usize;
-        while pos < data.len() {
-            let n = MAX_RECORD.min(data.len() - pos);
-            chunks.push((offset + pos as u64, &data[pos..pos + n]));
-            pos += n;
-        }
-        // Durable here and on every replica, or an error. A partial write-all is not an
-        // acknowledged write: if any replica refuses or cannot be reached, the guest sees
-        // EIO, which is the honest outcome -- acknowledging on a subset would mean the
-        // takeover proof's "read one replica sees every acknowledged write" is false.
-        let written = self.append_group(&chunks)?;
-        // Overlay updates only after every record is durable, so a partially written
-        // group never becomes visible to a read.
-        for (off, len, pos) in written {
-            self.overlay.insert(off, len, pos);
-        }
-        // Acknowledged. Whether the journal now wants draining is the caller's business
-        // (`write_through`), because starting the drain needs the handle this lock lives
-        // in and this write must not wait for it either way.
-        Ok(())
-    }
-
     /// Record that a drain failed, and stop starting new ones.
     ///
     /// The writes it was draining are acknowledged and still readable from the overlay, and
@@ -585,6 +544,14 @@ impl Vdisk {
                 self.id
             )));
         }
+        // A batch in flight was sent to the set as it was when its records were appended. The
+        // caller waits for the pipeline to empty (`lock_idle`); this is the backstop.
+        if self.commit.outstanding() != 0 {
+            return Err(Error::refused(format!(
+                "vdisk {} has writes in flight; a replica cannot join until they are durable",
+                self.id
+            )));
+        }
         let node = client.node.clone();
         self.replicas.push(client);
 
@@ -659,8 +626,12 @@ impl Vdisk {
     pub fn set_map_replicas(&mut self, nodes: Vec<String>) {
         self.map_replicas = nodes;
         // Healed. Left set, the watcher would re-heal on every tick forever, and an
-        // operator reading status would see a disk reported broken that is not.
-        self.degraded = None;
+        // operator reading status would see a disk reported broken that is not. Not while
+        // the commit pipeline is broken, though: a new member set does not make the replicas
+        // that missed a batch consistent, and `recover` clears the flag once they are.
+        if self.commit.broken().is_none() {
+            self.degraded = None;
+        }
     }
 
     fn replicate_extent_to(
@@ -731,148 +702,6 @@ impl Vdisk {
             );
         }
         None
-    }
-
-    /// Append a group of records -- one guest write, split at the record cap, only the last
-    /// carrying the commit marker -- and return once it is durable here **and** on every
-    /// replica, or with the error that says it is not.
-    ///
-    /// The local journal and the replicas work at the same time rather than one after the
-    /// other. Each replica has a thread that sends it the group's records in order, one
-    /// round trip each; this thread writes record `i + 1` to its own journal while record
-    /// `i` is on the wire, and makes the journal durable with a single `fdatasync` after the
-    /// last record, while the replicas are still finishing theirs. What the guest waits for
-    /// is therefore the slower of "this disk" and "the slowest replica", where it used to be
-    /// the sum of every record's disk time and every record's round trip.
-    ///
-    /// Nothing about *what is acknowledged* changes, and each piece is why:
-    ///
-    /// - **Acknowledged means durable everywhere.** This returns `Ok` only after the local
-    ///   sync succeeded and every replica has answered OK to the last record, which it
-    ///   sends without the "defer sync" flag, so it is made durable before it is answered
-    ///   and takes every earlier record of the file with it. An earlier record's reply, by
-    ///   contrast, promises nothing: it is never what a guest is told.
-    /// - **One sync per group is as safe as one per record.** Replay applies a group only
-    ///   if its commit marker survived, the marker is the last record, and it is made
-    ///   durable after the records before it. A crash before the sync leaves a group with no
-    ///   marker, which replay discards -- the same outcome as a crash between two records,
-    ///   which was already possible and already correct.
-    /// - **Order on the replica is the order here.** One thread per replica, one
-    ///   connection, records sent in sequence: the replica's journal is the owner's journal
-    ///   byte for byte.
-    /// - **A partial write-all is an error.** Any replica's failure fails the group, and
-    ///   stops this thread appending further records of it. A deposed owner learns it from
-    ///   whichever replica says so first and says so, rather than reporting an I/O error.
-    ///
-    /// When more than one thing went wrong the report is: deposed first (it is the one that
-    /// matters), then a replica failure (which flags the vdisk degraded, as it always did),
-    /// then a local failure.
-    fn append_group(&mut self, chunks: &[(u64, &[u8])]) -> Result<Vec<(u64, u32, u64)>> {
-        let epoch = self.epoch;
-        let last = chunks.len() - 1;
-        let flags_for = |i: usize| if i == last { FLAG_COMMIT } else { 0 };
-        let mut written: Vec<(u64, u32, u64)> = Vec::with_capacity(chunks.len());
-
-        if self.replicas.is_empty() {
-            for (i, (off, chunk)) in chunks.iter().enumerate() {
-                let rec = self.journal.append_unsynced(epoch, *off, flags_for(i), chunk)?;
-                written.push((*off, rec.data_len, rec.data_pos));
-            }
-            self.journal.sync()?;
-            return Ok(written);
-        }
-
-        let id = self.id.as_str();
-        let replicas = &self.replicas;
-        let journal = &mut self.journal;
-        let failed = AtomicBool::new(false);
-
-        let (local, remote) = std::thread::scope(|scope| {
-            let mut senders = Vec::with_capacity(replicas.len());
-            let mut workers = Vec::with_capacity(replicas.len());
-            for replica in replicas.iter() {
-                let (tx, rx) = std::sync::mpsc::sync_channel::<Streamed>(PIPELINE_DEPTH);
-                senders.push(tx);
-                let failed = &failed;
-                workers.push(scope.spawn(move || stream_to_replica(replica, id, epoch, rx, failed)));
-            }
-
-            let mut local: Result<()> = Ok(());
-            for (i, (off, chunk)) in chunks.iter().enumerate() {
-                if failed.load(Ordering::SeqCst) {
-                    // A replica has already failed, so this group cannot be acknowledged;
-                    // appending the rest would only grow the journal with a write nobody
-                    // will be told succeeded.
-                    break;
-                }
-                match journal.append_unsynced(epoch, *off, flags_for(i), chunk) {
-                    Ok(rec) => {
-                        written.push((*off, rec.data_len, rec.data_pos));
-                        let framed = Arc::new(rec.framed);
-                        for tx in &senders {
-                            // A closed channel is a worker that already gave up; its error
-                            // is collected below, so the send failing adds nothing.
-                            let _ = tx.send(Streamed { framed: Arc::clone(&framed), defer: i != last });
-                        }
-                    }
-                    Err(e) => {
-                        local = Err(e);
-                        break;
-                    }
-                }
-            }
-            // The local fsync, with the replicas still working through the tail of the group.
-            if local.is_ok() && written.len() == chunks.len() {
-                local = journal.sync();
-            }
-            drop(senders);
-            let remote: Vec<std::result::Result<(), ReplicaFault>> = workers
-                .into_iter()
-                .map(|w| w.join().unwrap_or(Err(ReplicaFault::Panicked)))
-                .collect();
-            (local, remote)
-        });
-
-        let mut failure: Option<Error> = None;
-        for outcome in &remote {
-            if let Err(ReplicaFault::Stale { node, fenced }) = outcome {
-                // Deposed. Not an I/O problem to retry -- somebody else owns this disk
-                // now, and the correct behaviour is to stop, loudly and immediately.
-                self.degraded = Some(format!(
-                    "deposed: replica {node} is fenced at epoch {fenced}, this owner holds {epoch}"
-                ));
-                return Err(Error::refused(format!(
-                    "vdisk {} is no longer owned by this node: replica {node} is fenced at \
-                     epoch {fenced} and refused a write at epoch {epoch}",
-                    self.id
-                )));
-            }
-        }
-        for outcome in remote {
-            match outcome {
-                Err(ReplicaFault::Failed(e)) if failure.is_none() => failure = Some(e),
-                Err(ReplicaFault::Panicked) if failure.is_none() => {
-                    failure = Some(Error::io("a replication thread panicked".to_string()))
-                }
-                _ => {}
-            }
-        }
-        if let Some(e) = failure {
-            // Flag it before returning, so the curator's watcher can act while the guest is
-            // still seeing errors rather than after the timer notices.
-            self.mark_degraded(e.to_string());
-            return Err(e);
-        }
-        local?;
-        if written.len() != chunks.len() {
-            return Err(Error::io(format!(
-                "vdisk {}: a write group stopped after {} of {} records with no error to report",
-                self.id,
-                written.len(),
-                chunks.len()
-            )));
-        }
-        Ok(written)
     }
 
     /// Note that this vdisk cannot currently satisfy write-all, and why.
@@ -995,6 +824,12 @@ impl Vdisk {
             }
         };
         let bytes = tail.len();
+        if self.commit.outstanding() != 0 {
+            return Err(Error::refused(format!(
+                "vdisk {} has writes in flight; its journal cannot be replaced now",
+                self.id
+            )));
+        }
         self.journal.replace(&tail)?;
         self.overlay.clear();
         let discarded = self.replay_journal()?;
@@ -1004,13 +839,6 @@ impl Vdisk {
             self.id
         );
         Ok(fenced.len())
-    }
-
-    /// Every acknowledged write is already durable, so a flush has nothing left to do.
-    /// It is not a lie by omission: the journal calls `sync_data` before the write is
-    /// acknowledged, which is strictly stronger than what a flush would promise.
-    pub fn flush(&mut self) -> Result<()> {
-        Ok(())
     }
 
     /// Whether anything is waiting to be drained: ranges in the overlay, or a sealed
@@ -1064,6 +892,15 @@ impl Vdisk {
         if !self.journal.has_sealed() {
             if self.journal.live_len() == 0 {
                 return Ok(None);
+            }
+            // Rotation moves the file a ticket's records are in. Callers hold the lock
+            // from `lock_quiet`, so this is the backstop: a ticket outstanding here would
+            // publish an overlay position into a segment the drain is about to delete.
+            if self.commit.outstanding() != 0 {
+                return Err(Error::refused(format!(
+                    "vdisk {} has writes in flight; its journal cannot be rotated now",
+                    self.id
+                )));
             }
             self.journal.rotate()?;
         }
@@ -1298,6 +1135,7 @@ impl Vdisk {
             "rf": self.rf,
             "peers": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
             "degraded": self.degraded,
+            "commit": self.commit.stats(),
         })
     }
 }
@@ -1306,70 +1144,10 @@ impl Vdisk {
 // The drain, and who waits for it.
 // ---------------------------------------------------------------------------------
 
-/// How many records of one guest write may be queued for a replica's thread at once. Bounds
-/// the memory a large write holds in flight (four 1 MiB records per replica) while leaving
-/// room for the local append to run ahead of the wire.
+/// How many extents of a drain may be queued for a replica's thread at once. Bounds the
+/// memory a drain holds in flight while leaving room for it to build the next extent while
+/// the last is on the wire.
 const PIPELINE_DEPTH: usize = 4;
-
-/// One record on its way to a replica.
-struct Streamed {
-    framed: Arc<Vec<u8>>,
-    /// Whether the replica may skip its fsync for this record because a later record of the
-    /// same group will be synced, which makes this one durable with it. False for the last.
-    defer: bool,
-}
-
-/// Why a replica did not take a group.
-enum ReplicaFault {
-    /// Fenced at a higher epoch: this owner has been deposed.
-    Stale { node: String, fenced: u64 },
-    Failed(Error),
-    Panicked,
-}
-
-/// The thread that feeds one replica: the group's records, in order, each answered before
-/// the next is sent. Keeps consuming after a failure so the producer is never blocked on a
-/// consumer that has stopped, and sets `failed` so the producer stops appending.
-fn stream_to_replica(
-    replica: &PeerClient,
-    vdisk: &str,
-    epoch: u64,
-    rx: std::sync::mpsc::Receiver<Streamed>,
-    failed: &AtomicBool,
-) -> std::result::Result<(), ReplicaFault> {
-    let mut outcome = Ok(());
-    for item in rx {
-        if outcome.is_err() {
-            continue;
-        }
-        let resp = replica.call(&Request {
-            opcode: peer::OP_APPEND,
-            vdisk: vdisk.to_string(),
-            epoch,
-            seq: 0,
-            offset: 0,
-            flags: if item.defer { peer::APPEND_DEFER_SYNC } else { 0 },
-            data: item.framed.to_vec(),
-        });
-        match resp {
-            Err(e) => outcome = Err(ReplicaFault::Failed(e)),
-            Ok(r) if r.status == peer::ST_STALE_EPOCH => {
-                outcome = Err(ReplicaFault::Stale { node: replica.node.clone(), fenced: r.epoch })
-            }
-            Ok(r) if !r.is_ok() => {
-                outcome = Err(ReplicaFault::Failed(Error::io(format!(
-                    "replica {} refused a journal append for {vdisk} with status {}",
-                    replica.node, r.status
-                ))))
-            }
-            Ok(_) => {}
-        }
-        if outcome.is_err() {
-            failed.store(true, Ordering::SeqCst);
-        }
-    }
-    outcome
-}
 
 /// How long a write waits at the hard ceiling for a drain to make room before it gives up
 /// and fails. Long enough to ride out a slow drain (a 128 MiB journal is seconds), short
@@ -1956,7 +1734,9 @@ fn run_background_drain(handle: Arc<Mutex<Vdisk>>, gate: Arc<DrainGate>) {
 
     loop {
         let mut plan = {
-            let mut v = handle.lock().expect("vdisk mutex poisoned");
+            // No write may be between its append and its commit when the journal rotates:
+            // `lock_quiet` returns with the lock held and nothing in flight.
+            let mut v = lock_quiet(&handle);
             match v.plan_drain() {
                 Ok(Some(p)) => p,
                 Ok(None) => return,
@@ -1996,21 +1776,58 @@ fn run_background_drain(handle: Arc<Mutex<Vdisk>>, gate: Arc<DrainGate>) {
     }
 }
 
-/// Lock a vdisk once no background drain is running on it.
+/// Lock a vdisk with no write between its append and its commit.
+///
+/// Rotating or replacing the journal moves the file that appended-but-uncommitted records
+/// are in, and an overlay position that names a segment a drain then deletes reads garbage.
+/// So the drain's plan step, a heal, a seal and a snapshot all start from here: new appends
+/// are paused, the pipeline is waited on *without* the vdisk lock (the leader needs it to
+/// publish), and the lock is taken again once it is empty. Returns with the lock held, and
+/// since only a holder of the lock can append, it stays empty until the guard is dropped.
+/// The wait is bounded by one flush, because nothing new joins the queue while it is paused.
+pub fn lock_quiet(handle: &Arc<Mutex<Vdisk>>) -> MutexGuard<'_, Vdisk> {
+    lock_when(handle, false)
+}
+
+/// Lock a vdisk once no background drain is running on it, and nothing is in flight.
 ///
 /// Waits on the gate *without* the lock, because the drain needs the lock for its first and
 /// last phases and a waiter holding it would be waiting on itself. Returns with the lock
 /// held and the gate idle, and since a drain can only be started by a holder of the lock,
 /// idle stays true until the guard is dropped.
 pub fn lock_idle(handle: &Arc<Mutex<Vdisk>>) -> MutexGuard<'_, Vdisk> {
+    lock_when(handle, true)
+}
+
+fn lock_when(handle: &Arc<Mutex<Vdisk>>, drain_idle: bool) -> MutexGuard<'_, Vdisk> {
+    // Whether this call is holding appends off. It never does while waiting for a drain: the
+    // drain may itself be waiting to rotate, and holding appends off for the length of a
+    // drain would be the stall the background drain exists to avoid.
+    let mut paused: Option<Arc<commit::Pipeline>> = None;
     loop {
         let v = handle.lock().expect("vdisk mutex poisoned");
-        if !v.gate.running() {
+        if drain_idle && v.gate.running() {
+            if let Some(p) = paused.take() {
+                p.unpause();
+            }
+            let gate = Arc::clone(&v.gate);
+            drop(v);
+            gate.wait_idle();
+            continue;
+        }
+        if v.commit.outstanding() == 0 {
+            if let Some(p) = paused.take() {
+                p.unpause();
+            }
             return v;
         }
-        let gate = Arc::clone(&v.gate);
+        let pipe = Arc::clone(&v.commit);
+        if paused.is_none() {
+            pipe.pause();
+            paused = Some(Arc::clone(&pipe));
+        }
         drop(v);
-        gate.wait_idle();
+        pipe.wait_empty(handle);
     }
 }
 
@@ -2021,22 +1838,36 @@ pub fn drain_all(handle: &Arc<Mutex<Vdisk>>) -> Result<()> {
     lock_idle(handle).close()
 }
 
-/// A guest write to a vdisk, with the drain kept out of its way.
+/// Append a guest write and queue it for the next commit, without waiting for it.
+///
+/// The write's records are in the journal, in the order writes were submitted, when this
+/// returns; they are neither durable nor visible until [`Commit::wait`] returns Ok. A caller
+/// that submits several writes before waiting on any gets them batched under one
+/// `fdatasync` and one round trip per replica.
 ///
 /// Admitted immediately unless the journal is at its hard ceiling, in which case it waits --
 /// without holding the vdisk lock, so reads and the drain itself carry on -- for a drain to
-/// make room. After the write, if the journal has passed the high-water mark, a background
-/// drain is started; this write does not wait for it.
-pub fn write_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, data: &[u8]) -> Result<()> {
+/// make room. If the journal has passed the high-water mark, a background drain is started;
+/// the write does not wait for it.
+pub fn submit_write(handle: &Arc<Mutex<Vdisk>>, offset: u64, data: &[u8]) -> Result<Commit> {
     let deadline = Instant::now() + STALL_LIMIT;
     loop {
         let mut v = handle.lock().expect("vdisk mutex poisoned");
         match v.admit() {
-            Admit::Go => {
-                let result = v.write(offset, data);
-                v.kick(handle);
-                return result;
-            }
+            Admit::Go => match v.begin_append(offset, data)? {
+                commit::Append::Queued(ticket) => {
+                    let pipe = Arc::clone(&v.commit);
+                    v.kick(handle);
+                    drop(v);
+                    return Ok(Commit::queued(pipe, Arc::clone(handle), ticket));
+                }
+                commit::Append::Nothing => return Ok(Commit::done()),
+                commit::Append::Paused(pipe) => {
+                    drop(v);
+                    pipe.wait_unpaused();
+                    continue;
+                }
+            },
             Admit::StartDrain => v.kick(handle),
             Admit::Wait => {}
             Admit::Refuse(e) => return Err(e),
@@ -2054,19 +1885,72 @@ pub fn write_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, data: &[u8]) -> Re
     }
 }
 
+/// A guest write to a vdisk: [`submit_write`], then wait until it is durable on every copy.
+pub fn write_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, data: &[u8]) -> Result<()> {
+    submit_write(handle, offset, data)?.wait()
+}
+
+/// NBD's flush: return once every write submitted before this call has been committed.
+///
+/// A write is acknowledged only when it is durable on every copy, so a flush has nothing of
+/// its own to make durable -- what it adds is the *barrier*: it does not return while an
+/// earlier write is still between its append and its commit, which is what a guest that
+/// issued the flush behind its writes (without waiting for their replies) means by it.
+/// Writes submitted after the call are not waited for. On a vdisk whose pipeline has
+/// stopped taking writes it is an error, because nothing can be made durable now.
+pub fn flush_through(handle: &Arc<Mutex<Vdisk>>) -> Result<()> {
+    let (pipe, id) = {
+        let v = handle.lock().expect("vdisk mutex poisoned");
+        (Arc::clone(&v.commit), v.id.clone())
+    };
+    let mark = pipe.barrier();
+    pipe.wait_below(handle, mark);
+    match broken_reason_of(&pipe) {
+        Some(why) => Err(Error::io(format!(
+            "vdisk {id} cannot make writes durable: an earlier commit failed ({why})"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn broken_reason_of(pipe: &commit::Pipeline) -> Option<String> {
+    pipe.broken().map(|b| b.why().to_string())
+}
+
 /// `write_zeroes` in the same terms as [`write_through`]: a chunk at a time, each admitted
 /// on its own, so a large trim cannot take the journal past the ceiling in one call.
 pub fn write_zeroes_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, len: u64) -> Result<()> {
+    // A few chunks in flight at once so that their commits are shared; the first error is
+    // reported once everything submitted has finished.
+    const WINDOW: usize = 8;
     let mut remaining = len;
     let mut at = offset;
     let zeros = vec![0u8; MAX_RECORD];
-    while remaining > 0 {
+    let mut pending: std::collections::VecDeque<Commit> = std::collections::VecDeque::new();
+    let mut first: Option<Error> = None;
+    while remaining > 0 && first.is_none() {
         let n = (MAX_RECORD as u64).min(remaining) as usize;
-        write_through(handle, at, &zeros[..n])?;
+        match submit_write(handle, at, &zeros[..n]) {
+            Ok(c) => pending.push_back(c),
+            Err(e) => first = Some(e),
+        }
         at += n as u64;
         remaining -= n as u64;
+        while pending.len() >= WINDOW || (first.is_some() && !pending.is_empty()) {
+            if let Err(e) = pending.pop_front().expect("non-empty").wait() {
+                first.get_or_insert(e);
+            }
+        }
     }
-    Ok(())
+    for c in pending {
+        if let Err(e) = c.wait() {
+            first.get_or_insert(e);
+        }
+    }
+    match first {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Whether a container asks for its extents to be compressed.
@@ -2151,6 +2035,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const MIB: usize = 1 << 20;
+
+    mod group_commit;
 
     fn tmpdir(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -2388,6 +2274,7 @@ mod tests {
             compress: false,
             replicas: peers,
             access: Arc::new(AccessLog::new(64, 0)),
+            commit: commit::Pipeline::new(),
             degraded: None,
         }
     }
@@ -3042,9 +2929,11 @@ mod tests {
 
         r.write(0, &fill(1, 5 * MIB)).unwrap();
         assert_eq!(syncs.load(Ordering::SeqCst), 1, "one fsync for five records");
+        // Five 1 MiB records go as two requests (a request carries up to 4 MiB of whole
+        // frames): the first defers its sync, the last is made durable before it is answered.
         assert_eq!(
             *flags.lock().unwrap(),
-            vec![peer::APPEND_DEFER_SYNC; 4].into_iter().chain([0]).collect::<Vec<u16>>(),
+            vec![peer::APPEND_DEFER_SYNC, 0],
             "the replica may defer all but the last, which it must make durable before answering"
         );
 
@@ -3103,12 +2992,13 @@ mod tests {
                 .then(|| Response::err(peer::ST_IO, 0))
         })));
 
-        let err = r.write(0, &fill(1, 3 * MIB)).expect_err("write-all: one replica failing fails it");
+        // Six records are two requests; the second is the one that fails.
+        let err = r.write(0, &fill(1, 6 * MIB)).expect_err("write-all: one replica failing fails it");
         assert!(err.to_string().contains("refused a journal append"), "{err}");
         assert!(r.degraded().unwrap().contains("refused a journal append"));
         // The records that did go in are not a write the guest was told about.
         assert!(!r.vd.lock().unwrap().needs_drain());
-        assert_eq!(r.read(0, 3 * MIB as u32), vec![0u8; 3 * MIB]);
+        assert_eq!(r.read(0, 6 * MIB as u32), vec![0u8; 6 * MIB]);
     }
 
     #[test]
@@ -3165,13 +3055,16 @@ mod tests {
         // Not durable here means not visible here, whatever the replicas hold.
         assert!(!r.vd.lock().unwrap().needs_drain());
         assert_eq!(r.read(0, 2 * MIB as u32), vec![0u8; 2 * MIB]);
-        // A local disk fault is not a replica fault, and is not reported as one.
-        assert!(r.degraded().is_none());
+        // A journal device that has just reported an error is not trusted with another write
+        // until the vdisk is re-attached: it is flagged, and takes no more appends.
+        assert!(r.degraded().unwrap().contains("injected local sync failure"));
         journal::testhook::set(&jpath(&r), None);
-
-        // And the vdisk recovers: the next write goes through.
-        r.write(0, &fill(2, 4096)).expect("the fault was transient");
-        assert_eq!(r.read(0, 4096), fill(2, 4096));
+        let again = r.write(0, &fill(2, 4096)).expect_err("the pipeline fails closed");
+        assert!(again.to_string().contains("cannot take writes"), "{again}");
+        assert_eq!(r.read(0, 4096), vec![0u8; 4096]);
+        // And it is not one a replica repair can fix.
+        let why = recover(&r.vd).expect_err("a local fault needs a re-attach");
+        assert!(why.to_string().contains("re-attached"), "{why}");
     }
 
     #[test]

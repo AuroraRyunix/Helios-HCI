@@ -42,6 +42,19 @@ guest write (offset, len, bytes)
   A replica seeing a gap refuses the append — a lost record must become a visible stall,
   never a silent hole replay will skip over.
 
+**How writes share a commit (built).** Steps 2 and 3 are not per guest write: writes that are in
+flight together are appended to the journal in arrival order (under the vdisk lock, a few
+microseconds each, the records of one write contiguous) and then committed as a *batch* -- one
+`fdatasync` here and one request per replica carrying the batch's frames, in parallel. The
+overlay is inserted only after the whole batch is durable everywhere, in sequence order, and a
+write is acknowledged only after that, so "acknowledged means durable on every copy" and "an
+unacknowledged write is never visible" are unchanged; what changed is how many writes a flush
+and a round trip are shared between. If anything in a batch fails the batch fails as a unit, the
+vdisk is flagged degraded and takes no more appends until a heal makes the replicas' journals
+the owner's again, because a replica that missed half a batch must not be appended to. The
+replica protocol is unchanged: a batch is just a larger append. See
+[group_commit.md](./group_commit.md).
+
 ### The drain
 
 Asynchronously, and under backpressure when the journal passes its high-water mark:
@@ -66,7 +79,9 @@ step 5's watermark is "delete the sealed file", and on a replica it is "drop the
 older than the first live sequence number". Overlay ranges carry the journal generation in
 their position, so "what this drain took" is exactly the ranges still pointing at the sealed
 file, and a range a newer write has covered is left for the next drain. Writers are held only
-at a hard ceiling of twice the high-water mark. See [sidon.md §2](../sidon.md).
+at a hard ceiling of twice the high-water mark. Rotation waits for the commit pipeline to be
+empty (a bounded wait of one flush; new appends pause meanwhile), so the file a write's records
+are in is never moved between its append and its commit. See [sidon.md §2](../sidon.md).
 
 ### Failure during drain: redirect, never block
 

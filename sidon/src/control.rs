@@ -1317,18 +1317,35 @@ impl Daemon {
         let mut healed = Vec::new();
         let mut degraded = Vec::new();
         for (id, handle) in owned {
-            let (before, down, epoch, want) = {
+            let (before, down, epoch, want, commit_broken) = {
                 let v = handle.lock().expect("vdisk mutex poisoned");
                 let (_up, down) = v.replica_health();
                 // The map's set, this node included -- the CAS is conditioned on what the
                 // map holds, not on the subset this node happens to dial.
-                (v.map_replicas(), down, v.epoch, v.rf as usize)
+                (v.map_replicas(), down, v.epoch, v.rf as usize, crate::vdisk::broken_reason(&v))
             };
             // Short of what it asked for, counting only the members that answer: a set of
             // two with one unreachable node is one copy short whichever of the two reasons
             // put it there, and healing it once should not leave it still short.
             let short = restore_rf && before.len().saturating_sub(down.len()) < want;
             if down.is_empty() && !short {
+                // Every replica answers, yet writes stopped: a batch failed (a timeout, a
+                // refused append) and the commit pipeline fails closed rather than append
+                // after a replica that may hold half of it. Nothing to replace; the
+                // replicas' journals are made identical to this node's again, in place.
+                if commit_broken.is_some() {
+                    match crate::vdisk::recover(&handle) {
+                        Ok(true) => healed.push(json!({
+                            "vdisk_id": id, "replaced": [], "with": Value::Null,
+                            "journals_resynchronised": true,
+                        })),
+                        Ok(false) => {}
+                        Err(e) => degraded.push(json!({
+                            "vdisk_id": id,
+                            "detail": format!("could not re-synchronise the replicas' journals: {e}"),
+                        })),
+                    }
+                }
                 continue;
             }
 
@@ -1424,6 +1441,17 @@ impl Daemon {
                     v.remove_replica(lost);
                 }
                 v.set_map_replicas(after.clone());
+            }
+            // A replica set that is right is not yet a set that is consistent, if the commit
+            // pipeline broke on a batch the survivors may hold half of.
+            if commit_broken.is_some() {
+                if let Err(e) = crate::vdisk::recover(&handle) {
+                    degraded.push(json!({
+                        "vdisk_id": id,
+                        "detail": format!("replicas replaced, but their journals could not be \
+                                           re-synchronised: {e}"),
+                    }));
+                }
             }
             healed.push(json!({
                 "vdisk_id": id, "replaced": down, "with": spare_node,

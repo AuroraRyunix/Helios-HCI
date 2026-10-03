@@ -30,6 +30,12 @@ was issued but never acknowledged — that unacknowledged write in full. Never a
 value, never a torn unit, never a stale value after a newer acknowledged one has been
 read (no time travel within a vdisk).
 
+Writes in flight together are committed together (one sync, one round trip per replica), which
+changes how many writes share a flush and nothing about what a read may return: a write becomes
+visible only after the *whole batch* it is in is durable on every copy, in sequence order, so
+the legal histories are exactly those of one write at a time. When a batch fails every write in
+it fails and nothing in it is visible ([group_commit.md](./group_commit.md) section 4).
+
 The atomicity unit is **one journal record** (a single guest write up to the record size
 cap). A guest write large enough to split into multiple records is made atomic by a
 commit marker: replay applies only complete marker-terminated groups, so a crash exposes
