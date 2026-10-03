@@ -25,6 +25,10 @@ rustls-pemfile = "1.0"
 # matters and it decompresses at memory bandwidth.
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode"] }
 
+# SHA-256 for replication digests. Already in the build as rustls's backend, at the version
+# Cargo.lock pins, so this adds a name to the dependency list and nothing to the audit surface.
+ring = "0.17"
+
 [profile.release]
 opt-level = 2
 panic = "unwind"

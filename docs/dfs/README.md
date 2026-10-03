@@ -32,6 +32,12 @@ Scheduled snapshots with a retention policy, and in-place rollback of a detached
 built -- see [snapshots.md](./snapshots.md). Rolling back an *attached* vdisk is designed and
 deliberately refused: [rollback_attached.md](./rollback_attached.md).
 
+Protection domains (VMs and vdisks snapshotted together, crash-consistent across a VM's disks by
+suspending the guest) are built: [protection_domains.md](./protection_domains.md). Replicating
+snapshot sets to another site is **designed** (D-28 to D-31, [replication.md](./replication.md)); its
+data plane in `sidon/src/replicate*` and `rauru_replication.py` is built and tested only against
+two directories standing in for two sites. Failover and failback are a design, not code.
+
 Not built: tiering on a timer or on mixed media, the journal on the fastest disk, writing
 extent ids (D-23 stage 3), dedup, rollback of an attached vdisk, erasure coding (decided
 against on three nodes, D-24), and `vhost-user-blk` (designed, gated on a benchmark, D-25 and
@@ -90,7 +96,11 @@ property of the data path itself (see [ownership.md](./ownership.md)).
     something depends on, and rollback of a detached vdisk.
 11. [rollback_attached.md](./rollback_attached.md) — the ownership and epoch reasoning for
     rolling back a vdisk a guest is reading. A design; nothing in it is built.
-12. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
+12. [protection_domains.md](./protection_domains.md) — groups of VMs and vdisks snapshotted
+    together: the consistency story, set retention, restore.
+13. [replication.md](./replication.md) — replicating snapshot sets to another site: trust,
+    what is shipped and verified, resume, failure modes. A design with a simulated data plane.
+14. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
     `vhost-user-blk` would and would not remove, the invariants it endangers, and the
     benchmark that decides whether to build it.
 

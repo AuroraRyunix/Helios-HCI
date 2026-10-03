@@ -86,6 +86,8 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
 | [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, and why pooling them is wrong. |
 | [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (run by Rauru), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
+| [dfs/protection_domains.md](./dfs/protection_domains.md) | Protection domains: VMs and vdisks snapshotted together under one policy, the crash-consistency story (and what it is not), set retention and restore, and the interface for the Rauru daemon. |
+| [dfs/replication.md](./dfs/replication.md) | Replicating snapshot sets to another site: how sites trust each other, what is shipped and verified, how a transfer resumes and never shows half a snapshot, failure modes. Designed; the data plane is built and tested only against a local simulation of a second site. |
 | [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
 | [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |
 

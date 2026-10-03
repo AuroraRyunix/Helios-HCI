@@ -266,6 +266,13 @@ Snapshots on a timer, with a retention policy, and rollback of a detached vdisk 
 see [dfs/snapshots.md](./dfs/snapshots.md). Rolling back an attached one is a design, not
 a feature: [dfs/rollback_attached.md](./dfs/rollback_attached.md).
 
+Several vdisks can be snapshotted together as a crash-consistent set, by holding their guest
+still, as a protection domain: [dfs/protection_domains.md](./dfs/protection_domains.md). Sending
+snapshots to another site is a design ([dfs/replication.md](./dfs/replication.md)); Sidon's
+`replicate` module holds its data plane (export a snapshot's missing extent groups, import them
+with verification, publish the map atomically), tested against two directories on one machine and
+reachable from nothing yet.
+
 Sealed extent groups are immutable, so parent and child share every one of them and
 neither can disturb the other: a write to either is redirect-on-write, appending
 somewhere new and repointing only its own map. The cost is the number of extents in the
@@ -434,6 +441,10 @@ that predates the setting — behaves exactly as it did.
   operation in Sidon can make the guest's caches true again. It is refused, and the design for
   doing it properly (stop the VM, roll back, start it, as one task tree) is
   [dfs/rollback_attached.md](./dfs/rollback_attached.md).
+- **Replication to another site.** Designed in [dfs/replication.md](./dfs/replication.md)
+  (D-28 to D-31). `sidon/src/replicate*` has the data plane and its tests, run against two
+  directories on one machine; there is no transport, no listener and no TLS verifier, and no
+  second cluster has ever been involved. Failover and failback are a design only.
 - **Tiering, on a timer and on mixed media.** The disk-to-disk move and the pass that plans
   it from the heat ranking are built and operator-invoked
   ([dfs/multi_disk.md](./dfs/multi_disk.md)); what is not built is anything running that pass
