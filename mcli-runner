@@ -164,7 +164,7 @@ WATCHDOG_PROBE_TIMEOUT = 30
 # behaviour, so a unit it does not supervise (zookeeper, libvirtd, sidon)
 # must not appear here -- their absence is somebody else's verdict.
 WATCHDOG_SERVICES = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur",
-                     "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+                     "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
 WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "sidon"]
 
 # `cluster_new.py` touches this on every node before a cluster operation and removes it
@@ -1241,7 +1241,7 @@ def check_services(category):
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
     in_maint = os.path.exists("/etc/hci/maintenance.state")
-    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
+    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "catalyst", "bifrost", "dagur", "mimir", "rauru", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
@@ -2667,7 +2667,7 @@ def check_services(category):
     try:
         managed = ["zookeeper", "hydra-db", "daruk", "sidon",
                    "spark-daemon", "spectrum", "slate", "agahnim", "catalyst", "vali",
-                   "bifrost", "dagur", "mimir", "logos", "mipha", "gatoway", "hylia",
+                   "bifrost", "dagur", "mimir", "rauru", "logos", "mipha", "gatoway", "hylia",
                    "libvirtd"]
         if urbosa_active:
             managed.append("urbosa")

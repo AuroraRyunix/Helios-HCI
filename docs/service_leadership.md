@@ -84,6 +84,7 @@ because funnelling them through one name rebuilds the coupling this replaces.
 | `hylia-upgrades` | every `hylia` | Which node drives a rolling upgrade. |
 | `mipha-ha` | every `mipha` | Which node watches the other hosts and orchestrates failover. |
 | `bifrost-vip` | every `bifrost` | Which node binds the cluster VIP. |
+| `rauru-snapshots` | every `rauru` | Which node runs the snapshot policy ([rauru.md](./rauru.md)). |
 
 The names are in `helios_zk` as constants, because the string is the contract between the
 daemon that stands and anything reading `/helios/leaders` to find out who won — and a typo in

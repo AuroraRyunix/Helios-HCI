@@ -5915,12 +5915,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             'zookeeper_status',
             'hydra-db_status',
             'daruk_status',
-            'aether_status',
+            'sidon_status',
             'spectrum_status',
             'catalyst_status',
             'bifrost_status',
             'dagur_status',
             'mimir_status',
+            'rauru_status',
             'vali_status',
             'gatoway_status',
             'urbosa_status',
@@ -5928,6 +5929,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'mipha_status',
             'agahnim_status',
             'slate_status',
+            'hylia_status',
             'libvirtd_status'
         ];
         
@@ -5936,12 +5938,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             'zookeeper_status': 'ZooKeeper',
             'hydra-db_status': 'Hydra DB',
             'daruk_status': 'Daruk DB Proxy',
-            'aether_status': 'Sidon Engine',
+            'sidon_status': 'Sidon Engine',
             'spectrum_status': 'Spectrum Web',
             'catalyst_status': 'Catalyst Task',
             'bifrost_status': 'Bifrost VIP',
             'dagur_status': 'Dagur Cron',
             'mimir_status': 'Mimir Health',
+            'rauru_status': 'Rauru Snapshots',
             'vali_status': 'Vali DRS',
             'gatoway_status': 'Gatoway Sync',
             'urbosa_status': 'Urbosa SDN',
@@ -5949,6 +5952,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'mipha_status': 'Mipha HA',
             'agahnim_status': 'Agahnim Proxy',
             'slate_status': 'Slate Ingress',
+            'hylia_status': 'Hylia Upgrades',
             'libvirtd_status': 'Libvirtd'
         };
         
@@ -9736,6 +9740,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 "bifrost": ["bifrost"],
                 "vali": ["vali", "valcli"],
                 "mimir": ["mimir", "mcli", "mcli-runner"],
+                "rauru": ["rauru"],
                 "dagur": ["dagur"],
                 "catalyst": ["catalyst", "catcli"],
                 "gatoway": ["gatoway"],
@@ -10260,6 +10265,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 "bifrost": ["bifrost"],
                 "vali": ["vali", "valcli"],
                 "mimir": ["mimir", "mcli", "mcli-runner"],
+                "rauru": ["rauru"],
                 "dagur": ["dagur"],
                 "catalyst": ["catalyst", "catcli"],
                 "gatoway": ["gatoway"],

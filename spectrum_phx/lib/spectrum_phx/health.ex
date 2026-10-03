@@ -72,10 +72,16 @@ defmodule SpectrumPhx.Health do
 
   # Verbatim from `mcli`'s `checks_map`, which is what actually decides which checks a
   # category runs. Anything not here is `:other`, deliberately.
+  #
+  # `sidon_status` is the check mcli-runner writes for the storage daemon. It was missing
+  # while `aether_status` was listed, so the one service every guest disk depends on filed
+  # under `:other`. `aether_status` stays only because a cluster upgraded from the DRBD era
+  # still holds historical rows under it, the same reason the storage list below keeps its
+  # `aether_*` names.
   @service_checks ~w(
-    zookeeper_status hydra-db_status daruk_status aether_status spectrum_status
+    zookeeper_status hydra-db_status daruk_status sidon_status aether_status spectrum_status
     spark-daemon_status libvirtd_status catalyst_status bifrost_status dagur_status
-    mimir_status vali_status gatoway_status urbosa_status logos_status mipha_status
+    mimir_status rauru_status vali_status gatoway_status urbosa_status logos_status mipha_status
     agahnim_status slate_status hylia_status scylladb_ring_status zookeeper_consensus
     scylladb_replication spectrum_api_port mtls_cert_expiration ingress_cert_expiration
     certs_seeding_check slate_config_status libvirt_responsiveness hostname_resolution

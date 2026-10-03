@@ -394,7 +394,7 @@ class ARunIsATaskWithAParent(unittest.TestCase):
         inserts = [s for s in c.task_statements() if s.startswith("INSERT")]
         self.assertEqual(len(inserts), 1)
         self.assertIn(parent, inserts[0])
-        self.assertIn("'Catalyst'", inserts[0])
+        self.assertIn("'Rauru'", inserts[0])
         self.assertIn("'snapshot_policy'", inserts[0])
         # The same helper every other writer uses, so the row has the columns a reader needs.
         self.assertIn("parent_task_id", inserts[0])
@@ -565,13 +565,16 @@ class TheWiring(unittest.TestCase):
                 self.assertTrue(statement.upper().startswith("CREATE TABLE IF NOT EXISTS"), statement)
                 self.assertNotIn("ALTER", statement.upper())
 
-    def test_the_job_is_seeded_idempotently_and_runs_the_cli(self):
+    def test_the_dagur_job_is_gone_and_existing_clusters_lose_it_so_the_policy_runs_once(self):
+        """Rauru runs the policy now. A Dagur job that also runs it would take every snapshot
+        twice a day's worth of runs, and a cluster that already has the seeded row keeps it
+        unless something removes it -- seeding with IF NOT EXISTS never repairs a node."""
         source = read("spectrum_server.py")
-        match = re.search(r"VALUES \('snapshot_policy'[^\n]*", source)
-        self.assertIsNotNone(match)
-        self.assertIn("valcli storage.snapshot-run", match.group(0))
-        self.assertIn("IF NOT EXISTS", match.group(0))
-        self.assertIn("run_conditional_cql_query(insert_snapshot_policy)", source)
+        self.assertNotIn("VALUES ('snapshot_policy'", source)
+        self.assertNotIn("insert_snapshot_policy", source)
+        self.assertIn("DELETE FROM hydra.dagur_schedules WHERE job_name = 'snapshot_policy' ", source)
+        self.assertIn("IF command = '/usr/local/bin/valcli storage.snapshot-run';", source)
+        self.assertIn("run_conditional_cql_query(retire_snapshot_policy_job)", source)
 
     def test_rollback_is_reachable_through_spark_not_just_implemented_in_sidon(self):
         # A Sidon op the spark allow-list does not name is refused as unsupported, which is

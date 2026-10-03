@@ -9,37 +9,16 @@ Three things are built and one is designed:
 
 | | State |
 | :-- | :-- |
-| Scheduled snapshots with a retention policy | **Built.** A Dagur job; policy in Hydra. |
+| Scheduled snapshots with a retention policy | **Built.** Run by [Rauru](../rauru.md); policy in Hydra. |
 | `valcli storage.*` views, and a read-only console page | **Built.** |
 | In-place rollback of a **detached** vdisk | **Built.** Sidon op `rollback`. |
 | In-place rollback of an **attached** vdisk | **Designed, not built:** [rollback_attached.md](./rollback_attached.md). |
 
 ## 1. Scheduling uses what already exists
 
-There is no new daemon. The cluster already has a clustered cron: Dagur runs jobs from
-`hydra.dagur_schedules`, Catalyst claims each tick exactly once cluster-wide
-(`/v1/schedule/claim-job`), and the job runs on the node holding the `dagur-queue`
-candidacy ([../service_leadership.md](../service_leadership.md)). The policy is one more
-row in that table:
+[Rauru](../rauru.md) runs it. It used to be a Dagur job (`snapshot_policy`, `valcli storage.snapshot-run` hourly); the daemon replaced the job, and the console's bootstrap deletes the seeded row on every start (only while its command is still the seeded one) so an existing cluster does not run the policy twice. `valcli storage.snapshot-run` stays as the manual command and runs the same code. Rauru is enabled from the start and does nothing until a policy exists: a run with no policy reads one table, says there is nothing to do, and waits for the next interval.
 
-```
-snapshot_policy   0 * * * *   3600s   /usr/local/bin/valcli storage.snapshot-run
-```
-
-It is seeded by the console's bootstrap with `IF NOT EXISTS`, which runs on every start of
-every node, so an existing cluster gains the job on its next rollout without a repair writer.
-It is enabled from the start and does nothing until a policy exists: a run with no policy
-reads one table, prints that there is nothing to do, and exits 0.
-
-**Leader-only work, and why nothing here elects a leader.** The job inherits its single-run
-guarantee from Dagur: the tick is claimed once, and the node running it is the
-`dagur-queue` candidacy holder, a per-service election in `helios_zk.py`. The code in
-`helios_snapshots.py` never asks who leads ZooKeeper and never compares an address to
-anything; `test_snapshot_policy.TheWiring` fails if it starts to. An operator running
-`valcli storage.snapshot-run` by hand concurrently with the job is a supported accident
-rather than a prevented one: snapshot names have minute resolution, so both compute the
-same name and the second is refused by Sidon as already existing, and a double prune
-deletes an already-absent row, which is a no-op.
+**Leader-only work.** [Rauru](../rauru.md), the snapshot and data-protection daemon, holds the `rauru-snapshots` election (`helios_zk.SERVICE_RAURU_SNAPSHOTS`, see [../service_leadership.md](../service_leadership.md)) and runs one pass every `RUN_INTERVAL_SECONDS`. The code in `helios_snapshots.py` never asks who leads ZooKeeper and never compares an address to anything; `test_snapshot_policy.TheWiring` fails if it starts to. An operator running `valcli storage.snapshot-run` by hand concurrently with Rauru is a supported accident rather than a prevented one: snapshot names have minute resolution, so both compute the same name and the second is refused by Sidon as already existing, and a double prune deletes an already-absent row, which is a no-op.
 
 **Granularity.** The job fires hourly, so that is the shortest interval a policy can honestly
 promise. `validate_policy` refuses less. A snapshot is due when the newest *policy*

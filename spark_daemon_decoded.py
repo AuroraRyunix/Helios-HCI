@@ -422,6 +422,12 @@ MANAGED_SERVICES = (
     {"unit": "bifrost", "display": "Bifrost", "requires": ("daruk",)},
     {"unit": "dagur", "display": "Dagur", "requires": ("daruk",)},
     {"unit": "mimir", "display": "Mimir", "requires": ("daruk",)},
+    # Requires daruk and nothing else: everything Rauru reads or writes in Hydra goes through
+    # Daruk (the snapshot policy tables, the task rows), so it is not started before Daruk is
+    # answering. It does not require sidon -- it reaches storage through spark-daemon's API on
+    # whichever node owns a vdisk, and tolerates that being down, so gating it on sidon would
+    # only delay a daemon that already waits for what it needs.
+    {"unit": "rauru", "display": "Rauru", "requires": ("daruk",)},
     {"unit": "logos", "display": "Logos", "requires": ("daruk",)},
     {"unit": "mipha", "display": "Mipha", "requires": ("daruk",)},
     {"unit": "gatoway", "display": "Gatoway", "requires": ("daruk",)},
@@ -1065,7 +1071,7 @@ def build_node_status():
     # can never be UP means no VM can ever be placed. Leaving `aether` in after removing
     # it did exactly that -- creates succeeded, starts refused with "No active hypervisor
     # host has sufficient memory", and the memory had nothing to do with it.
-    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -1076,6 +1082,7 @@ def build_node_status():
         "bifrost": "Bifrost",
         "dagur": "Dagur",
         "mimir": "Mimir",
+        "rauru": "Rauru",
         "vali": "Vali",
         "catalyst": "Catalyst",
         "hylia": "Hylia",
@@ -1300,7 +1307,7 @@ VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
 # between a stale call site that is invisible and one that reports itself.
 MANAGED_UNITS = frozenset((
     "agahnim", "bifrost", "catalyst", "chronyd", "dagur", "daruk", "gatoway",
-    "hydra-db", "hylia", "libvirtd", "logos", "mimir", "mipha", "sidon", "slate",
+    "hydra-db", "hylia", "libvirtd", "logos", "mimir", "mipha", "rauru", "sidon", "slate",
     "spark-daemon", "spectrum", "urbosa", "vali", "virtqemud", "zookeeper",
 ))
 
@@ -2634,7 +2641,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     if os.path.exists("/etc/hci/maintenance.state"):
                         os.remove("/etc/hci/maintenance.state")
                     
-                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir vali catalyst gatoway logos mipha daruk agahnim slate"
+                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum bifrost dagur mimir rauru vali catalyst gatoway logos mipha daruk agahnim slate"
                     subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                     self.send_json_response(200, {
@@ -2854,7 +2861,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
+                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
                     if "Urbosa" in services:
                         svc_list.append("Urbosa")
                     for svc_name in svc_list:
@@ -3299,7 +3306,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
             
             # Start spectrum and other services
-            services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+            services = ["spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
             for svc in services:
                 run_parallel_checked(servers, f"systemctl start {svc}")
                 for ip in servers:
@@ -3378,7 +3385,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop services on all hosts in parallel
         # 2. Stop services on all hosts in parallel
-        services = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         run_parallel(hosts, f"systemctl stop {svc_list} || true")
         
@@ -4617,14 +4624,14 @@ def check_cluster_and_autostart():
     # Check if cluster configuration exists
     if not os.path.exists("/etc/hci/cluster.json"):
         print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return
         
     if os.path.exists("/etc/hci/maintenance.state"):
         print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
+        services_to_stop = ["rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         subprocess.run("systemctl start zookeeper", shell=True)
@@ -4690,12 +4697,12 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
+        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
         for svc in services_to_stop:
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
         # Autostarting local database, storage, and UI workloads...
-        services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+        services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
         for svc in services:
             res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
             if res.stdout.decode().strip() != "active":
@@ -4763,7 +4770,7 @@ def check_cluster_and_autostart():
                 pass
                 
             if cluster_state == "started":
-                services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "logos", "mipha"]
+                services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
                 for svc in services:
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()

@@ -680,6 +680,7 @@ local_mcli_runner = "mcli-runner"
 local_allssh = "allssh"
 local_dagur = "dagur.py"
 local_mimir_daemon = "mimir.py"
+local_rauru = "rauru.py"
 local_vali = "vali.py"
 local_catalyst = "catalyst.py"
 local_catcli = "catcli"
@@ -867,6 +868,27 @@ ExecStart=/usr/local/bin/dagur
 Restart=always
 RestartSec=3
 User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+rauru_service_content = """[Unit]
+Description=Rauru Snapshot and Data Protection Manager
+After=zookeeper.service daruk.service
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rauru
+Restart=always
+RestartSec=5
+User=root
+Environment=PYTHONUNBUFFERED=1
 CPUWeight=100
 MemoryMax=256M
 MemoryHigh=200M
@@ -886,6 +908,7 @@ ExecStart=/usr/local/bin/mimir
 Restart=always
 RestartSec=3
 User=root
+Environment=PYTHONUNBUFFERED=1
 CPUWeight=100
 MemoryMax=256M
 MemoryHigh=200M
@@ -950,6 +973,7 @@ ExecStart=/usr/local/bin/bifrost
 Restart=always
 RestartSec=3
 User=root
+Environment=PYTHONUNBUFFERED=1
 CPUWeight=100
 MemoryMax=512M
 MemoryHigh=400M
@@ -976,6 +1000,11 @@ MemoryHigh=400M
 WantedBy=multi-user.target
 """
 
+# Every unit text in this block is the same text provision.py writes, and the rollout rewrites
+# the file on every run. This one used to lack the `cp` below and the [Install] section, so a
+# node provisioned correctly was downgraded by its first upgrade: an LCM patch replaces only
+# /usr/local/bin/daruk.py, and without the `cp` the restart that follows runs the stale copy
+# inside the database volume. test_service_wiring.py asserts the two copies are identical.
 daruk_service_content = """[Unit]
 Description=Daruk Database Query Proxy Service
 After=hydra-db.service
@@ -983,6 +1012,10 @@ Requires=hydra-db.service
 
 [Service]
 Type=simple
+# The proxy executes the copy inside the DB volume, but LCM upgrades only replace
+# /usr/local/bin/daruk.py. Refresh it on every start so a fast-patch plus a restart
+# actually runs the new code instead of silently re-running the old copy.
+ExecStartPre=-/usr/bin/cp -f /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py
 ExecStartPre=-/usr/bin/podman exec systemd-hydra-db pkill -f daruk.py
 ExecStart=/usr/bin/podman exec systemd-hydra-db python3 /var/lib/scylla/daruk.py
 Restart=always
@@ -990,6 +1023,9 @@ RestartSec=3
 User=root
 Environment=PYTHONUNBUFFERED=1
 CPUWeight=200
+
+[Install]
+WantedBy=multi-user.target
 """
 
 spectrum_container_content = """[Unit]
@@ -1206,6 +1242,16 @@ def deploy_to_node(ip):
             f_mim = sftp.open("/etc/systemd/system/mimir.service", "w")
             f_mim.write(mimir_service_content)
             f_mim.close()
+
+            # Rauru, the snapshot and data-protection manager. A node built before it existed
+            # has neither the script nor the unit, so the rollout installs both; the enable
+            # and restart at the end of the rollout then make it run.
+            print(f"[{ip}] Uploading rauru daemon to /usr/local/bin/rauru...")
+            put_text_file(sftp, local_rauru, "/usr/local/bin/rauru")
+            print(f"[{ip}] Writing rauru.service unit...")
+            f_rau = sftp.open("/etc/systemd/system/rauru.service", "w")
+            f_rau.write(rauru_service_content)
+            f_rau.close()
             
             # 2h. Copy vali CLI
             print(f"[{ip}] Uploading vali to /usr/local/bin/vali...")
@@ -1579,7 +1625,7 @@ def deploy_to_node(ip):
             
             # 4. Make executables runnable
             print(f"[{ip}] Setting executable permissions...")
-            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
+            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/rauru /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
             
             # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
             ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/spectrum_server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
@@ -1836,6 +1882,13 @@ WantedBy=multi-user.target
             print(f"[{ip}] Spectrum service restarted successfully.")
                 
             # 12. Restart catalyst, dagur, mimir, and vali if active to apply updates, and manage daruk/hydra-db-proxy cleanup
+            #
+            # Every daemon is enabled here as well as restarted. dagur, mimir, vali and daruk
+            # were only restarted, so a node whose unit had never been enabled -- or had lost
+            # the symlink -- stayed that way through every rollout: the unit file was rewritten
+            # above and nothing ever turned it on at boot. `enable` does not start anything, so
+            # the "restart only if it is already running" semantics of those four are unchanged.
+            # test_service_wiring.py asserts that every native-unit service is enabled here.
             print(f"[{ip}] Cleaning up old hydra-db-proxy and restarting services...")
             for cmd in [
                 "systemctl stop hydra-db-proxy || true",
@@ -1843,11 +1896,12 @@ WantedBy=multi-user.target
                 "rm -f /etc/systemd/system/hydra-db-proxy.service || true",
                 "podman exec systemd-hydra-db rm -f /var/lib/scylla/cql_proxy.py || true",
                 "systemctl daemon-reload",
-                "systemctl is-active hydra-db && systemctl restart daruk || true",
+                "systemctl enable daruk; systemctl is-active hydra-db && systemctl restart daruk || true",
                 "systemctl enable catalyst && systemctl restart catalyst || true",
-                "systemctl is-active dagur && systemctl restart dagur || true",
-                "systemctl is-active mimir && systemctl restart mimir || true",
-                "systemctl is-active vali && systemctl restart vali || true",
+                "systemctl enable dagur; systemctl is-active dagur && systemctl restart dagur || true",
+                "systemctl enable mimir; systemctl is-active mimir && systemctl restart mimir || true",
+                "systemctl enable vali; systemctl is-active vali && systemctl restart vali || true",
+                "systemctl enable rauru && systemctl restart rauru || true",
                 "systemctl daemon-reload && systemctl enable agahnim && systemctl restart agahnim || true",
                 # slate is a genuine Quadlet; generated units cannot be enabled (their [Install]
                 # section is what the generator acts on), so reload and restart only.

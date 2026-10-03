@@ -61,7 +61,7 @@ GRAY = "\033[90m"
 RESET = "\033[0m"
 
 SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum",
-                         "Bifrost", "Dagur", "Mimir", "Vali", "Catalyst", "Hylia",
+                         "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia",
                          "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa"]
 
 
@@ -2094,7 +2094,7 @@ def main():
 
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         # `ignore_failed` is the `|| true` this used to carry: a service that is not
         # running cannot be stopped, and on a clean host none of them are.
         unit_action_parallel(ips, "stop", cleanup_services, ignore_failed=True)
@@ -2413,7 +2413,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
-        services = ["spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
+        services = ["spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
         
         # Check if urbosa enabled
         urbosa_enabled = False
@@ -2888,7 +2888,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["hylia", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
         for ip in ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
             ok, detail = unit_action(ip, "stop", services, ignore_failed=True)

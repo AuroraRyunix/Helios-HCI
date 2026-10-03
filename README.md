@@ -104,7 +104,7 @@ Helios-HCI/
 │                          #   editing any embedded daemon/CLI — never hand-edit the *_B64 strings)
 ├── spectrum_server.py     # Main WebUI/REST API backend ("Spectrum")
 ├── cluster_new.py         # `cluster` CLI (create/status/start/stop/destroy)
-├── valcli.py, catalyst.py, vali.py, dagur.py, mimir.py, spark.py,
+├── valcli.py, catalyst.py, vali.py, dagur.py, mimir.py, rauru.py, spark.py,
 │   spark_daemon_decoded.py, gatoway.py, urbosa.py, urbosa_bootstrap.py,
 │   bifrost.py, mipha.py, hylia.py, logos.py, daruk.py, lanayru.py   # Daemons/CLIs, see component table below
 ├── catcli, mcli, mcli-runner, nodetool, allssh   # Companion CLIs/wrappers (non-.py)
@@ -142,6 +142,7 @@ Helios-HCI/
 | [Logos](./docs/logos.md) | **Arithmos** | Native Python collector | Distributed background telemetry agent collecting CPU, RAM, disk, and network stats. |
 | [Dagur](./docs/dagur.md) | **Chronos** | Native Python service | Clustered cron task scheduler executing maintenance scripts and database tasks. |
 | [Mimir](./docs/mimir.md) | **NCC (Health Checker)** | Native Python service | Background cluster diagnostics daemon executing periodic health checks. |
+| [Rauru](./docs/rauru.md) | **Cerebro (Snapshot / Data Protection)** | Native Python service | Snapshot and data-protection manager. Today it runs the snapshot policy (take what is due, prune what retention allows) behind its own leader election; replication and disaster recovery are intended and being designed separately. |
 | [Mipha](./docs/mipha.md) | **Acropolis HA Manager** | Native Python service | High-Availability host liveness monitor and VM failover coordinator. |
 | [Gatoway](./docs/gatoway.md) | **Flow** | Native Python service | Layer-2 VLAN network interface synchronization daemon. |
 | [Urbosa](./docs/urbosa.md) | **Flow SDN** | Native Python service | Layer-3 software-defined overlay, distributed routing, and micro-segmentation daemon. |
