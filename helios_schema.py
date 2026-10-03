@@ -713,6 +713,68 @@ MIGRATIONS = [
             "DROP TABLE IF EXISTS hydra.dfs_egroup_replicas;",
         ],
     },
+    {
+        "id": "0030-protection-domains",
+        "description": (
+            "A named group of VMs and vdisks that is snapshotted together under one policy: "
+            "the interval, how many sets to keep, and how far the barrier that makes the "
+            "snapshots of a VM's disks one instant reaches (`quiesce`: none, vm or domain) "
+            "and how long a guest may be held still for it (`max_pause_seconds`). "
+            "Unlike hydra.dfs_snapshot_policies a row here is a thing with members and "
+            "history, not a rule that matches disks by scope, so it is its own table. "
+            "No domain means nothing is snapshotted as a group: opt-in, for the reason "
+            "snapshot policies are. Holds no extent group reference, so Purah's mark phase "
+            "does not read it (invariants I-3, I-7). docs/dfs/protection_domains.md."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_protection_domains "
+            "( name text PRIMARY KEY, enabled boolean, interval_seconds int, keep_last int, "
+            "quiesce text, max_pause_seconds int, created_at_ms bigint, updated_at_ms bigint );",
+        ],
+    },
+    {
+        "id": "0031-protection-domain-members",
+        "description": (
+            "Which VMs and vdisks belong to a protection domain. `kind` is `vm` or `vdisk`. "
+            "A VM member is resolved to its vdisks at the moment a set is taken, by the "
+            "`<vm>-disk<n>` convention and the VM's `disks_list`, so a disk added to the VM "
+            "later is in the next set without anyone editing this table. "
+            "Partitioned by domain: the whole membership is read in one partition."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_protection_domain_members "
+            "( domain text, kind text, name text, added_at_ms bigint, "
+            "PRIMARY KEY ((domain), kind, name) );",
+        ],
+    },
+    {
+        "id": "0032-protection-sets",
+        "description": (
+            "One row per snapshot set a domain took: when, why (`origin`: policy or manual), "
+            "its `state` (taking, complete or failed), the `consistency` it actually "
+            "achieved (crash:domain, crash:vm or none, which can be weaker than the policy "
+            "asked for) and the measured spread between its first and last member snapshot "
+            "and how long the guests were held. `members` is a JSON list of "
+            "{vm, vdisk, snapshot, status, node}; it is written once and read whole, so it "
+            "is a column and not a table. While a set is `taking`, `paused_vms` names the "
+            "guests currently suspended and `cut_start_ms` is the heartbeat, which is what "
+            "lets a later run resume a guest a dead one left suspended. "
+            "A set is complete or it is not a set: a failed one has its snapshots deleted "
+            "and the row kept for the record until retention removes it. "
+            "Newest first within a domain. The member snapshots are ordinary immutable "
+            "vdisks that Purah marks through their block-map rows, so nothing here is a "
+            "reference to data."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_protection_sets "
+            "( domain text, taken_at_ms bigint, set_id text, origin text, state text, "
+            "consistency text, quiesce text, started_at_ms bigint, finished_at_ms bigint, "
+            "cut_start_ms bigint, cut_end_ms bigint, paused_ms bigint, members text, "
+            "paused_vms text, error text, "
+            "PRIMARY KEY ((domain), taken_at_ms, set_id) ) "
+            "WITH CLUSTERING ORDER BY (taken_at_ms DESC, set_id ASC);",
+        ],
+    },
 ]
 
 

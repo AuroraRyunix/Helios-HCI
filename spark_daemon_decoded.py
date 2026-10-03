@@ -1287,7 +1287,10 @@ ALLOWED_MODES = ("0600", "0640", "0644", "0660", "0664", "0666", "0700", "0750",
 AETHER_VOLUMES_ROOT = "/var/lib/hci/aether/volumes"
 
 HYDRA_DB_CONTAINER = "systemd-hydra-db"
-VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset")
+# `suspend` and `resume` are the barrier a protection domain holds a guest behind while every
+# disk of it is snapshotted (docs/dfs/protection_domains.md). They stop and restart the vCPUs
+# only; the domain stays defined and running as far as libvirt is concerned.
+VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset", "suspend", "resume")
 
 # The systemd units this daemon will act on, and the only ones.
 #

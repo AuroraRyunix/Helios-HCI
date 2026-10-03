@@ -489,6 +489,10 @@ class Runner(object):
 
         vdisks = self.vdisks()
         referenced = set(v.get("parent_vdisk") for v in vdisks if v.get("parent_vdisk"))
+        # A disk in an enabled protection domain is snapshotted with its domain, at one
+        # consistent cut; snapshotting it here too would take it twice an interval, once
+        # consistently and once not.
+        claimed = self.domain_claimed()
         where, unreachable = self.attached()
         owners = {}
         for vdisk_id, places in where.items():
@@ -503,8 +507,23 @@ class Runner(object):
             policy = effective_policy(all_policies, vdisk_id, vdisk.get("container"))
             if policy is None:
                 continue
+            if vdisk_id in claimed:
+                self.env.say("left %s to its protection domain" % vdisk_id)
+                continue
             self._one_vdisk(summary, vdisk, policy, owners, where, unreachable, referenced)
         return summary
+
+    def domain_claimed(self):
+        """Vdisk ids an enabled protection domain governs; empty when there are none, or when
+        the module or tables are absent (a node that has not rolled out domains yet)."""
+        try:
+            import rauru_protection
+        except ImportError:
+            return set()
+        try:
+            return rauru_protection.claimed_vdisks(self.env.query)
+        except Exception:
+            return set()
 
     def _one_vdisk(self, summary, vdisk, policy, owners, where, unreachable, referenced):
         vdisk_id = vdisk["vdisk_id"]
@@ -639,11 +658,12 @@ class Runner(object):
 
     # rollback ----------------------------------------------------------------------------
 
-    def rollback(self, vdisk_id, snapshot_id, keep=True):
-        """Put a detached vdisk back to a snapshot of itself. Returns Sidon's answer.
+    def check_rollback(self, vdisk_id, snapshot_id):
+        """Raise RollbackRefused unless the control-plane checks pass; return the vdisk rows.
 
-        Raises RollbackRefused with the reason when the control-plane checks fail, and
-        RuntimeError carrying Sidon's own message when it refuses or fails.
+        Split out of `rollback` so a caller restoring several disks as one unit can ask all
+        of them first and start none if any would be refused: restoring half of a set is a
+        state worse than either end of it.
         """
         rows = dict((v.get("vdisk_id"), v) for v in self._rows(
             "SELECT JSON vdisk_id, class, owner, epoch, parent_vdisk FROM hydra.dfs_vdisks;"))
@@ -659,6 +679,15 @@ class Runner(object):
             where.get(vdisk_id) or [], unreachable)
         if refusal:
             raise RollbackRefused(refusal)
+        return rows
+
+    def rollback(self, vdisk_id, snapshot_id, keep=True):
+        """Put a detached vdisk back to a snapshot of itself. Returns Sidon's answer.
+
+        Raises RollbackRefused with the reason when the control-plane checks fail, and
+        RuntimeError carrying Sidon's own message when it refuses or fails.
+        """
+        rows = self.check_rollback(vdisk_id, snapshot_id)
 
         now = self.env.now_ms()
         keep_as = pre_rollback_name(vdisk_id, now) if keep else None

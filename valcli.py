@@ -7,6 +7,7 @@ import helios_zk
 import subprocess
 import re
 import urllib.request
+import urllib.parse
 import urllib.error
 import time
 import os
@@ -1059,6 +1060,36 @@ def cmd_storage_snapshot_run(argv):
         len(summary.spared), len(summary.failures)))
     if not summary.ok:
         sys.exit(1)
+
+
+def _vm_power_call(host_ip, vm_name, action):
+    """One typed power call to the host a VM runs on: (rc, body, err).
+
+    A refusal comes back as an HTTP 409 whose body carries the domain's state after the
+    attempt, which is what a caller needs and what `_dfs_call`'s rule of turning every
+    `error` into a failure would discard. The body is returned as it came.
+    """
+    return run_mtls_spark_api(
+        host_ip, "/api/v1/vm/%s/power" % urllib.parse.quote(vm_name, safe=""),
+        {"action": action})
+
+
+def cmd_storage_domain(argv):
+    """The `storage.domain*` commands: protection domains. The implementation is
+    rauru_protection, which the Rauru daemon imports too, so the CLI and the daemon run one."""
+    try:
+        import rauru_protection
+        import helios_schema
+    except ImportError as exc:
+        print("Error: %s. Protection domains need rauru_protection.py and helios_schema.py "
+              "installed beside valcli." % exc)
+        sys.exit(1)
+    env = rauru_protection.Env(
+        run_cql_query, _dfs_call, _vm_power_call, say=print,
+        parent_task_id=os.environ.get("CATALYST_TASK_ID"))
+    status = rauru_protection.run_command(argv, env, helios_schema)
+    if status:
+        sys.exit(status)
 
 
 def cmd_storage_rollback(argv):
@@ -2806,6 +2837,9 @@ def print_usage():
     print("  valcli storage.snapshot-policy.delete cluster|container:<n>|vdisk:<id>")
     print("  valcli storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (Rauru does this hourly)")
     print("  valcli storage.rollback <vdisk> <snapshot> [--no-keep]  Put a stopped VM's disk back to a snapshot")
+    print("  valcli storage.domain                   Protection domains: VMs and vdisks snapshotted together")
+    print("  valcli storage.domain.create|delete|add|remove|snapshot|run|sets|restore|recover ...")
+    print("                                          (run valcli storage.domain.help for each form)")
     print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
     print("                                          asked for, copies it actually has")
     print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
@@ -2963,6 +2997,8 @@ def main():
         cmd_storage_snapshot_run(sys.argv)
     elif cmd == "storage.rollback":
         cmd_storage_rollback(sys.argv)
+    elif cmd.startswith("storage.domain"):
+        cmd_storage_domain(sys.argv)
     elif cmd == "storage.heat":
         limit = 10
         if len(sys.argv) > 2:

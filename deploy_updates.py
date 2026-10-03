@@ -1187,6 +1187,11 @@ def deploy_to_node(ip):
             print(f"[{ip}] Uploading helios_snapshots to /usr/local/bin/helios_snapshots.py...")
             put_text_file(sftp, "helios_snapshots.py", "/usr/local/bin/helios_snapshots.py")
 
+            # Imported by valcli for protection domains; lands with helios_snapshots, which
+            # it imports and which in turn looks for it.
+            print(f"[{ip}] Uploading rauru_protection to /usr/local/bin/rauru_protection.py...")
+            put_text_file(sftp, "rauru_protection.py", "/usr/local/bin/rauru_protection.py")
+
             # Imported by spectrum_server at runtime, so it needs to be on the host as
             # well as inside the console image.
             print(f"[{ip}] Uploading lanayru to /usr/local/bin/lanayru.py...")
