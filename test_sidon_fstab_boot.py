@@ -168,8 +168,10 @@ class StagingNeverMovesAMount(unittest.TestCase):
 
     def test_the_rollout_stages_after_claiming_and_before_it_repairs(self):
         deploy = read("deploy_updates.py")
-        claim = deploy.index("ssh.exec_command(CLAIM_EXTRA_DISKS)")
-        stage = deploy.index("ssh.exec_command(STAGE_SIDON_DISKS)")
+        # Located by the script each call runs, not by its exact spelling: the claim and stage
+        # calls carry a guard prefix now (ONLY_WITH_A_CLUSTER +), and the order is the property.
+        claim = deploy.index("CLAIM_EXTRA_DISKS)", deploy.index("ssh.exec_command(ONLY_WITH_A_CLUSTER"))
+        stage = deploy.index("ssh.exec_command(ONLY_WITH_A_CLUSTER + STAGE_SIDON_DISKS)")
         repair = deploy.index("ssh.exec_command(RECONCILE_SIDON_FSTAB)")
         self.assertLess(claim, stage, "the record is staged before the disks are registered")
         self.assertLess(stage, repair)
