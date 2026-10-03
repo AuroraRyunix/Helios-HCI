@@ -86,8 +86,8 @@ the exact cluster the gate exists for.
 
 Two members are exempt:
 
-* a host that is **not in the ring** — a three-node layout's witness runs no ScyllaDB, so
-  draining it costs the ring nothing;
+* a host that is **not in the ring** — one that was never joined, or has been
+  decommissioned, holds no replicas, so draining it costs the ring nothing;
 * a host that is **already not `UN`** — stopping it removes nothing that is answering.
 
 ### What it decides
@@ -242,7 +242,8 @@ identical.
    occupies one field or two and every column after it shifts. *(Manual.)*
 5. **`cluster decommission --node <ip> --finalize`.** Only once the node is genuinely out
    of the ring. It rewrites `/etc/hci/cluster.json` on the surviving nodes, renumbers
-   `node_id` (position identifies the witness in a three-node layout), deletes the
+   `node_id` (ZooKeeper's voter-or-observer role follows position in the list, so a removal
+   slides everyone after it up a place), deletes the
    `hydra.nodes` row, and shrinks the ZooKeeper ensemble to the survivors — restarting
    them one at a time, so a quorum of the previous ensemble stays alive throughout.
 

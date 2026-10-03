@@ -17,17 +17,17 @@ mindmap
       make_request (status endpoints via Spark)
     Lifecycle Operations (main command parsing)
       create
-        bootstrap cluster.json (witness-aware)
-        carve and mount the extent store - skipped on witness
+        bootstrap cluster.json
+        carve and mount the extent store
         generate certs (Odin/Zookeeper/ScyllaDB)
         seed ssh known_hosts
       start
-        starts container services via systemd - filtered for workload services
+        declares the desired state on every node, then watches until each reports compliant
       stop
-        graceful unmount and service teardown - filtered for workload services
+        declares the stopped state, then watches the same way; the node quiesces its own storage
       destroy
         podman container purge
-        extent store teardown - skipped on witness
+        extent store teardown
         data path wipe
 ```
 
@@ -67,21 +67,18 @@ mindmap
 - `--verbose` prints detailed pool allocations, node roles, and disk layout.
 
 #### `cluster start`
-- Sends API commands to activate systemd units: `sidon`, `daruk`, `odin`, `hydra-db`, `spectrum`, `bifrost`, `dagur`, `mimir`, `vali`, `catalyst`, `gatoway`, `logos`. Start verification refuses to declare the cluster up while `sidon` is inactive on any node, because a host whose storage daemon is down can neither attach a disk nor serve one it already owns.
-- Automatically filters out non-witness workloads (e.g. ScyllaDB, Daruk, and application services) to avoid service startup errors on the witness node.
+- Writes the desired state through `POST /api/v1/cluster/state` on each node and then watches
+  the nodes' published status until every service is compliant or one reports an error. The CLI
+  names no service: the declared service table, with its units and dependency order, lives in
+  the reconcile loop in `spark_daemon_decoded.py`. See [cluster_state.md](./cluster_state.md).
 
 #### `cluster stop`
-- Safely shuts down virtual workloads, stops systemd daemons, and unmounts local directories.
-- Skips unmounting and stopping non-existent databases and application containers on the witness node.
+- The same shape inverted: it declares the stopped state and watches. The node drains the
+  storage journals and unmounts the extent store itself, immediately before the storage daemon
+  stops, and in the reverse of the start order.
 
 #### `cluster destroy`
 - Confirms first: the operator types `destroy`, or passes `-y`/`--yes`. A non-interactive
   stdin without `--yes` is refused, and the prompt runs ahead of the cluster lock and every
   phase (`confirm_destroy` in `cluster_new.py`, pinned by `test_destroy_confirmation.py`).
 - Purges systemd unit templates, deletes Podman containers, removes storage targets, and cleans `/var/lib/hci` configuration directories.
-- Skips LVM signatures removal and physical disks wiping on the witness node.
-
-### Witness Node Orchestration Logic
-- **`WITNESS_IP` Detection**: Loads host config from `/etc/hci/cluster.json` and evaluates the `is_witness` boolean (auto-flagged for the 3rd IP in a 3-node layout).
-- **Service & Volume Filtering**: Employs `non_witness_ips` lists to prevent SSH command execution for non-witness components (e.g. libvirt VM management, `hydra-db` nodetool checks, ScyllaDB cluster settings, and Spectrum UI reachability on port 8443).
-- **Storage peer lists**: Sidon's peer set is drawn from `non_witness_ips`, so a witness is never dialled for replication and never appears in a vdisk's replica set.

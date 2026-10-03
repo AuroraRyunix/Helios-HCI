@@ -53,19 +53,28 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
-## P2 — Docs that disagree with the running cluster (2026-10-03)
+## P2 — Two-node clusters have no quorum tie-breaker (2026-10-03)
 
-* **The "witness node" is documented as current and is not.** `docs/cluster.md` ("3-Node
-  Layout (Witness Node Support)"), `docs/cluster_technical.md` and `docs/ring_lifecycle.md`
-  say the third host is a diskless ZooKeeper-only tie-breaker with no ScyllaDB, no Daruk and
-  no storage. The running three-node cluster has HydraDB, Daruk, Sidon and Spectrum up on all
-  three, a mounted extent store on each, and no `is_witness` anywhere in `cluster.json`. What
-  survives in code is vestigial -- a comment in `cluster_new.py` and one in `vali.py`, and a
-  test in `test_ring_lifecycle.py` that still asserts witness behaviour. Not rewritten here
-  because the right answer depends on whether the witness was removed on purpose or is a
-  layout still meant to exist (it was a DRBD-era need: an odd number of voters for each
-  replicated volume, which Sidon does not have). Decide that, then make the docs, the
-  comments and the test say one thing.
+**The witness node is gone from the docs because it is gone from the code.** `docs/cluster.md`,
+`docs/cluster_technical.md` and `docs/ring_lifecycle.md` described a diskless third host, a
+ZooKeeper voter and nothing else, auto-flagged by position in a three-node layout. It was a
+**two-node quorum tie-breaker** added in July 2026 (commits `6cd254c` to `6ebbc6c`). The code has no
+`--witness` flag and no `is_witness` field, and the running three-node cluster has HydraDB, Daruk and
+Sidon on all three hosts, so the docs now say every host is a full member. Three stale comments and
+a test were reworded: the behaviour they described -- a host that is not in the ScyllaDB ring holds
+no replicas, so stopping it costs the ring nothing -- is generic and never depended on a witness.
+
+I could not find the commit that removed it, so **it is not known whether that was deliberate**.
+The need it served is still real for one case: **a two-node cluster has a two-member ZooKeeper
+ensemble, which needs both nodes up and tolerates no failure.** Nothing in the toolkit offers a
+tie-breaker for that. Whether to bring one back, and as what (a ZooKeeper-only third host is the
+natural shape now that DRBD's odd-voter requirement is gone), is a decision for the owner.
+
+**Also found while correcting `docs/cluster.md`:** `cluster create` still starts the application
+daemons by hand in its phase 6, which `cluster start` stopped doing when it became declarative. The
+same duplication, and the same risk -- it is how `cluster start` came to restart `aether` for
+months after the unit was deleted. And the volume group is still named `vg_aether`, a name left over
+from the DRBD design that nothing but history explains.
 
 ## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
 

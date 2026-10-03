@@ -2202,8 +2202,9 @@ def evaluate_stop(members, replication_factor, address):
     }
     target = next((m for m in members if m["address"] == address), None)
     if target is None:
-        # Witness nodes run no ScyllaDB at all, so they hold no replicas and stopping
-        # one costs the ring nothing.
+        # A host that is not in the ring -- one that was never joined, or has been
+        # decommissioned -- holds no replicas, so stopping it costs the ring nothing. A gate
+        # keyed on "is this host in hydra.nodes" would refuse it forever.
         facts["ring_member"] = False
         return True, f"{address} is not a member of the ScyllaDB ring; it holds no replicas.", facts
     facts["ring_member"] = True

@@ -3335,8 +3335,10 @@ print("--- Local wipe completed ---", flush=True)
             if config:
                 remaining_hosts = [h for h in config.get("hosts", []) if h.get("ip") != target]
                 if len(remaining_hosts) != len(config.get("hosts", [])):
-                    # Renumber, because node_id is an index other tooling counts on -- the
-                    # witness node in a three node layout is identified by position.
+                    # Renumber, because node_id is an index other tooling counts on: whether a
+                    # ZooKeeper member votes or observes follows its position in this list
+                    # (the first three vote), so a removal slides everyone after it up a place
+                    # and the ids have to follow.
                     for index, host in enumerate(remaining_hosts):
                         host["node_id"] = index + 1
                     config["hosts"] = remaining_hosts

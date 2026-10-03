@@ -20,33 +20,52 @@ The `cluster` CLI utility (`/usr/local/bin/cluster`) is an administrative orches
 ### A. Cluster Creation (`cluster create`)
 Bootstrap a new cluster across a set of physical hosts.
 
-#### 1-Node, 2-Node, and 4+ Node Layouts
-- **1-Node / 2-Node**: All hosts are fully provisioned hypervisors and storage nodes.
+#### Layouts
+Every host is a **full member**: a hypervisor, a storage node, a ScyllaDB (Hydra) node, and
+it runs every control-plane daemon. There is no lightweight or diskless role.
+- **1 node**: no replication; the redundancy factor is forced to 0.
+- **2 nodes**: both hosts are ZooKeeper voters, so the ensemble needs **both** up -- it has no
+  tie-breaker and tolerates no failure. See *What there is not* below.
+- **3 nodes**: all three vote in ZooKeeper, which tolerates the loss of one host. With `-r 1`
+  every vdisk asks for two copies, on any two of the three.
 - **4+ Nodes**: ZooKeeper consensus quorum is maintained by the first 3 nodes as voting members, and additional hosts are automatically configured as observers to scale the cluster cleanly. That is the starting set, not a fixed one — `cluster zk-promote` / `zk-demote` (section H) move the vote between members afterwards.
 
-#### 3-Node Layout (Witness Node Support)
-In a **3-node cluster layout**, the third host (Node 3, index 2 in the IP list) automatically acts as a low-overhead, diskless **Witness Node**.
-- **Role**: a ZooKeeper voter, and nothing else — a quorum tie-breaker that costs neither a third hypervisor nor a third database instance.
-- **Provisioned Services**: `spark-daemon` and `zookeeper`.
-- **Excluded Services**: virtualization (`libvirtd`/`qemu`), the database (`hydra-db`/ScyllaDB), the CQL proxy (`daruk`), and every workload service.
-- **Storage**: none claimed, and no storage role. The DRBD design needed a diskless replica here to give each replicated volume an odd number of voters. Sidon does not vote — a vdisk has one owner and a fenced epoch, so the tie is broken by the CAS in Hydra, not by counting storage peers. A witness therefore holds no extent groups and is never a replica target.
+#### What there is not: a witness node
+Earlier versions of this document described a diskless third host acting as a quorum
+tie-breaker for two-node clusters (July 2026, commits `6cd254c` to `6ebbc6c`). **That mode does
+not exist in the code**: there is no `--witness` flag and no `is_witness` field in
+`cluster.json`, and a three-node cluster runs HydraDB, Daruk and Sidon on all three hosts.
+The need it served was real -- an even ensemble tolerates nothing, and DRBD wanted an odd
+number of voters per volume -- but only the first half survives DRBD. A two-node cluster
+currently has no tie-breaker; whether to bring one back is a decision, recorded in
+[TODO.md](../TODO.md).
 
 ```bash
 # Syntax
 cluster create -s <IP1,IP2,IP3,...> [-r <redundancy_factor>] [-v <virtual_ip>]
 
-# Example: Create a 3-node cluster with Node 3 acting automatically as the Witness node
+# Example: a 3-node cluster; every host is a full member and all three vote
 cluster create -s 10.10.102.220,10.10.102.222,10.10.102.223 -r 1 -v 10.10.102.240
 ```
-**Creation Workflow**:
-1. Creates the cluster configuration file `/etc/hci/cluster.json` on all nodes.
-2. Formats and claims raw disks $\ge 100\text{ GB}$ to construct the Aether storage resource pools (`default-vm-container` and `default-image-container`).
-3. Writes `/etc/hci/aether/storage-pools.json` on each host.
-4. Distributes environment parameters `/etc/hci/spectrum/spectrum.env`.
-5. Starts the core storage layer (`Aether`) and mounts containers locally over loopback.
-6. Starts ZooKeeper (`Odin`) and ScyllaDB (`HydraDB`) nodes to form the database ring.
-7. Seeds the initial metadata schemas, user accounts, and default schedules.
-8. Launches all application workloads (`spectrum`, `bifrost`, `dagur`, `mimir`, `vali`, `catalyst`, `gatoway`, `logos`).
+**Creation Workflow** (the phases `cluster create` prints):
+1. **Connectivity and pre-checks.** `spark-daemon` answers on every host over mTLS, port conflicts
+   are reported, and any running cluster services are stopped so the bootstrap starts clean.
+   There is no Secure Boot check: Sidon loads no kernel module.
+2. **Hostnames and cluster setup.** Resolves each hostname and writes `/etc/hci/cluster.json`
+   (hosts, node ids, redundancy factor, VIP) on every node.
+3. **Disk scan.** Finds an empty disk of at least 100 GB on each host and builds the thin-provisioned
+   LVM pool for the extent store (the volume group is still named `vg_aether`, a name left over
+   from the DRBD design).
+4. **The storage data path, and the coordination layer.** Verifies each node's extent store is
+   mounted and answering, writes the per-host configuration, then starts ZooKeeper and records the
+   desired state `started`, starts ScyllaDB (waiting for it to listen on 9042) and starts Daruk
+   (waiting for 9043). Despite its heading this phase brings up the database as well as storage.
+6. **Core services.** Starts the application daemons. This phase still starts services by hand,
+   which `cluster start` no longer does; converting it is recorded in [TODO.md](../TODO.md).
+7. **Liveness and health.** Verifies that every Sidon peer is reachable and that Spectrum
+   answers on 8443.
+
+(Phase 5 no longer exists: it was the DRBD/Linstor bring-up.)
 
 ### B. Cluster Status (`cluster status`)
 Query cluster health and engine statistics.

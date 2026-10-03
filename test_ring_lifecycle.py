@@ -438,10 +438,12 @@ class QuorumArithmeticTests(RingTestCase):
         allowed, _reason, _facts = vali.evaluate_stop(members, 1, "10.0.0.2")
         self.assertFalse(allowed)
 
-    def test_a_witness_node_is_not_a_ring_member_and_may_be_stopped(self):
-        # Three-node layouts run no ScyllaDB on the witness, so it holds no replicas and
-        # draining it costs the ring nothing. A gate keyed on "is this host in
-        # hydra.nodes" would have refused it forever.
+    def test_a_host_that_is_not_a_ring_member_may_be_stopped(self):
+        # A host outside the ring -- never joined, or decommissioned -- holds no replicas,
+        # so draining it costs the ring nothing. A gate keyed on "is this host in
+        # hydra.nodes" would have refused it forever. (This used to be written as the
+        # three-node witness, which the toolkit no longer has; the behaviour is the same
+        # and never depended on the witness.)
         members = vali.parse_nodetool_status(THREE_UP)
         allowed, reason, facts = vali.evaluate_stop(members, 3, "10.0.0.9")
         self.assertTrue(allowed)
