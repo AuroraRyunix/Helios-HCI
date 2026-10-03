@@ -1119,6 +1119,10 @@ impl Vdisk {
             held: Arc::clone(&self.drain_held),
             id_seed: self.journal.next_seq(),
             groups_made: 0,
+            t_replicate: Duration::ZERO,
+            t_local: Duration::ZERO,
+            t_hydra: Duration::ZERO,
+            pipe: ExtentPipe::none(),
         };
         Ok(Some(DrainPlan { job, replicas, keep_seq, sealed_gen }))
     }
@@ -1409,6 +1413,139 @@ struct DrainJob {
     held: Arc<Mutex<HashSet<String>>>,
     id_seed: u64,
     groups_made: u64,
+    /// Where the time went, for the one log line a drain writes. A drain that is slow is
+    /// slow for one of three reasons (the replicas, this disk, or Hydra) and which one is
+    /// the whole of the diagnosis.
+    t_replicate: Duration,
+    t_local: Duration,
+    t_hydra: Duration,
+    /// The threads that ship this drain's extents to the replicas. Empty until `run` starts
+    /// them, and dropping it ends them.
+    pipe: ExtentPipe,
+}
+
+/// Ships a drain's extents to the replicas on threads of their own, in order, so that the
+/// drain can read and build the next extent while the last one is on the wire.
+///
+/// One thread and one bounded queue per replica. A replica's puts are therefore applied in
+/// the order the drain made them, over one connection, which is the order a group is
+/// appended in. Nothing about *when the drain may proceed* changes: it asks `flush` for the
+/// moment every replica has answered everything sent so far, and does so before it tells
+/// Hydra a group is sealed and before it writes a single map row.
+struct ExtentPipe {
+    senders: Vec<std::sync::mpsc::SyncSender<PipeMsg>>,
+    /// The first failure any replica reported. Later puts to a failed replica are skipped
+    /// rather than attempted, since the drain is already lost.
+    failure: Arc<Mutex<Option<Error>>>,
+    failed: Arc<AtomicBool>,
+}
+
+enum PipeMsg {
+    Put { group: String, offset: u64, framed: Arc<Vec<u8>>, defer: bool },
+    /// Answered once every message before it has been handled.
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
+
+impl ExtentPipe {
+    fn none() -> ExtentPipe {
+        ExtentPipe {
+            senders: Vec::new(),
+            failure: Arc::new(Mutex::new(None)),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn new(replicas: &[Arc<PeerClient>], epoch: u64) -> ExtentPipe {
+        let mut pipe = ExtentPipe::none();
+        for replica in replicas {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PipeMsg>(PIPELINE_DEPTH);
+            pipe.senders.push(tx);
+            let replica = Arc::clone(replica);
+            let failure = Arc::clone(&pipe.failure);
+            let failed = Arc::clone(&pipe.failed);
+            std::thread::spawn(move || {
+                for msg in rx {
+                    let (group, offset, framed, defer) = match msg {
+                        PipeMsg::Barrier(done) => {
+                            let _ = done.send(());
+                            continue;
+                        }
+                        PipeMsg::Put { group, offset, framed, defer } => (group, offset, framed, defer),
+                    };
+                    if failed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let outcome = replica.call(&Request {
+                        opcode: peer::OP_EGROUP_PUT,
+                        vdisk: group.clone(),
+                        epoch,
+                        seq: 0,
+                        offset,
+                        flags: if defer { peer::APPEND_DEFER_SYNC } else { 0 },
+                        data: framed.to_vec(),
+                    });
+                    let err = match outcome {
+                        Err(e) => Some(e),
+                        Ok(resp) if !resp.is_ok() => Some(Error::io(format!(
+                            "replica {} refused extent group {group} at offset {offset} \
+                             with status {}",
+                            replica.node, resp.status
+                        ))),
+                        Ok(_) => None,
+                    };
+                    if let Some(e) = err {
+                        let mut slot = failure.lock().expect("pipe mutex poisoned");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        failed.store(true, Ordering::SeqCst);
+                    }
+                }
+            });
+        }
+        pipe
+    }
+
+    /// The first failure, if any replica has reported one.
+    fn check(&self) -> Result<()> {
+        if self.failed.load(Ordering::SeqCst) {
+            let e = self.failure.lock().expect("pipe mutex poisoned").take();
+            return Err(e.unwrap_or_else(|| {
+                Error::io("a replica refused an extent earlier in this drain".to_string())
+            }));
+        }
+        Ok(())
+    }
+
+    /// Queue one extent for every replica. Blocks only when a replica is `PIPELINE_DEPTH`
+    /// extents behind, which is the drain running ahead of the network.
+    fn put(&self, group: &str, offset: u64, framed: Vec<u8>, defer: bool) -> Result<()> {
+        self.check()?;
+        let framed = Arc::new(framed);
+        for tx in &self.senders {
+            tx.send(PipeMsg::Put {
+                group: group.to_string(),
+                offset,
+                framed: Arc::clone(&framed),
+                defer,
+            })
+            .map_err(|_| Error::io("a replication thread ended unexpectedly".to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Wait until every replica has answered everything sent so far; the first failure if any.
+    fn flush(&self) -> Result<()> {
+        for tx in &self.senders {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            tx.send(PipeMsg::Barrier(done_tx))
+                .map_err(|_| Error::io("a replication thread ended unexpectedly".to_string()))?;
+            done_rx
+                .recv()
+                .map_err(|_| Error::io("a replication thread ended unexpectedly".to_string()))?;
+        }
+        self.check()
+    }
 }
 
 /// What a plan hands back: the job, and what the caller needs after it.
@@ -1452,6 +1589,11 @@ impl DrainJob {
             return Ok(Committed { locs: Vec::new(), sealed: Vec::new(), next_seq: self.drain_seq });
         }
 
+        let started = Instant::now();
+        // The extent whose write ends the drain: its group's last write is synced on the
+        // replicas whether or not the group is full.
+        let last_idx = indices.iter().rev().find(|i| self.extent_len(**i) > 0).copied();
+        self.pipe = ExtentPipe::new(&self.replicas, self.epoch);
         let mut new_rows: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(indices.len());
         let mut new_locs: Vec<(u64, ExtentLoc)> = Vec::with_capacity(indices.len());
         let mut sealed: Vec<String> = Vec::new();
@@ -1505,7 +1647,19 @@ impl DrainJob {
             // extent exists once: the journal is replicated, so an un-drained write
             // survives a node loss, and draining it would *reduce* its durability. Data
             // that becomes less safe by being tidied up is not a tidy-up.
-            self.replicate_extent(&eg_id, offset as u64, &framed)?;
+            //
+            // Handed to a thread per replica rather than sent here, so the next extent is
+            // read and built while this one is on the wire and on the replica's disk. The
+            // writes to one group may skip their fsync but its last: that one flushes the
+            // file, and nothing is committed until `replicas_caught_up` has seen every reply.
+            let full = self
+                .open_eg
+                .as_ref()
+                .map(|eg| self.store.is_full(eg))
+                .unwrap_or(false);
+            let t = Instant::now();
+            self.pipe.put(&eg_id, offset as u64, framed, !(full || Some(idx) == last_idx))?;
+            self.t_replicate += t.elapsed();
             // An append into this extent group, which is the only kind of write an extent
             // group ever takes -- the guest's write reached the journal and was
             // acknowledged there. So a group's write count is a count of drained extents
@@ -1525,21 +1679,30 @@ impl DrainJob {
                 vdisk_hash: self.vh,
             }));
 
-            let full = self
-                .open_eg
-                .as_ref()
-                .map(|eg| self.store.is_full(eg))
-                .unwrap_or(false);
             if full {
+                // The group is complete here and must be complete on every replica before
+                // Hydra is told it is sealed. Flush this disk's copy first, while the
+                // replicas are still taking theirs, and only then wait for them.
+                let t = Instant::now();
+                if let Some(eg) = self.open_eg.as_mut() {
+                    self.store.sync(eg)?;
+                }
+                self.t_local += t.elapsed();
+                self.replicas_caught_up()?;
                 sealed.push(self.seal_open_egroup()?);
             }
         }
 
-        // Rule 2: bytes durable before any row points at them.
+        // Rule 2: bytes durable before any row points at them -- here, with the replicas
+        // still working through the tail of what they were sent, and then there.
+        let t = Instant::now();
         if let Some(eg) = self.open_eg.as_mut() {
             self.store.sync(eg)?;
         }
+        self.t_local += t.elapsed();
+        self.replicas_caught_up()?;
 
+        let t = Instant::now();
         for batch in block_map_batches(&self.id, self.epoch, &new_rows, MAP_ROWS_PER_BATCH) {
             self.daruk.query(&batch)?;
         }
@@ -1567,30 +1730,30 @@ impl DrainJob {
                 self.drain_seq
             )));
         }
+        self.t_hydra += t.elapsed();
+        eprintln!(
+            "sidon: vdisk {}: drained {} extent(s) in {} ms (replicas {} ms, this disk {} ms, \
+             hydra {} ms)",
+            self.id,
+            new_locs.len(),
+            started.elapsed().as_millis(),
+            self.t_replicate.as_millis(),
+            self.t_local.as_millis(),
+            self.t_hydra.as_millis()
+        );
+        // Done with the replicas: let their threads end now rather than when the job drops.
+        self.pipe = ExtentPipe::none();
         Ok(Committed { locs: new_locs, sealed, next_seq: next })
     }
 
-    /// Ship one extent (payload plus footer) to every replica.
-    fn replicate_extent(&self, egroup_id: &str, offset: u64, framed: &[u8]) -> Result<()> {
-        for replica in &self.replicas {
-            let resp = replica.call(&Request {
-                opcode: peer::OP_EGROUP_PUT,
-                vdisk: egroup_id.to_string(),
-                epoch: self.epoch,
-                seq: 0,
-                offset,
-                flags: 0,
-                data: framed.to_vec(),
-            })?;
-            if !resp.is_ok() {
-                return Err(Error::io(format!(
-                    "replica {} refused extent group {egroup_id} at offset {offset} \
-                     with status {}",
-                    replica.node, resp.status
-                )));
-            }
-        }
-        Ok(())
+    /// Wait until every replica has taken every extent sent so far, or report the first
+    /// that did not. The point after which the replicas hold what the map is about to say
+    /// they hold.
+    fn replicas_caught_up(&mut self) -> Result<()> {
+        let t = Instant::now();
+        let r = self.pipe.flush();
+        self.t_replicate += t.elapsed();
+        r
     }
 
     fn ensure_open_egroup(&mut self) -> Result<String> {
@@ -1598,6 +1761,7 @@ impl DrainJob {
             if !self.store.is_full(eg) {
                 return Ok(eg.id.clone());
             }
+            self.replicas_caught_up()?;
             let id = self.seal_open_egroup()?;
             eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
         }
@@ -1607,10 +1771,13 @@ impl DrainJob {
             &self.id,
             now_ms() as u64 ^ self.id_seed ^ (self.groups_made << 48)
         );
+        let t = Instant::now();
         let eg = self.store.create(&id)?;
+        self.t_local += t.elapsed();
         // Held from the moment the group exists, before Hydra hears of it: the sweep reads
         // Hydra, and a group that is in no map and not in this set looks like an orphan.
         self.held.lock().expect("held mutex poisoned").insert(id.clone());
+        let t = Instant::now();
         let cas = self.daruk.cas(
             "/v1/dfs/egroup-create",
             json_params(vec![
@@ -1623,6 +1790,7 @@ impl DrainJob {
                 ("created_at_ms", json!(now_ms())),
             ]),
         )?;
+        self.t_hydra += t.elapsed();
         if !cas.applied {
             return Err(Error::meta(format!(
                 "extent group id {id} is already registered; refusing to reuse it"
@@ -1634,8 +1802,11 @@ impl DrainJob {
 
     fn seal_open_egroup(&mut self) -> Result<String> {
         let mut eg = self.open_eg.take().expect("caller checked");
+        let t = Instant::now();
         self.store.sync(&mut eg)?;
         let hash = self.store.seal_hash(&eg.id)?;
+        self.t_local += t.elapsed();
+        let t = Instant::now();
         let cas = self.daruk.cas(
             "/v1/dfs/egroup-state",
             json_params(vec![
@@ -1646,6 +1817,7 @@ impl DrainJob {
                 ("expected_state", json!("open")),
             ]),
         )?;
+        self.t_hydra += t.elapsed();
         if !cas.applied {
             return Err(Error::meta(format!(
                 "extent group {} could not be sealed: it is in state {}",
@@ -2002,6 +2174,10 @@ mod tests {
                         st.log.lock().unwrap().push("batch".to_string());
                     }
                     json!({"status": "success", "rows": []})
+                }
+                "/v1/dfs/egroup-state" => {
+                    st.log.lock().unwrap().push("seal".to_string());
+                    json!({"status": "success", "applied": true, "current": {}})
                 }
                 "/v1/dfs/drain-commit" => {
                     st.arrived.fetch_add(1, Ordering::SeqCst);
@@ -2867,5 +3043,116 @@ mod tests {
         assert!(took >= Duration::from_millis(300), "{took:?}");
         assert!(took < Duration::from_millis(550), "serial would be 600ms+, took {took:?}");
         journal::testhook::set(&jpath(&r), None);
+    }
+
+    // ================================================================================
+    // The drain ships its extents through a pipeline
+    // ================================================================================
+
+    /// Make a replica apply every request for real and note, after it has been applied,
+    /// which journal-or-extent writes it took, in Hydra's event log -- so one ordered list
+    /// holds both what the replica durably took and what Hydra was then told.
+    fn log_puts(replica: &TestReplica, hydra: &Hydra) {
+        let store = Arc::clone(&replica.store);
+        let st = Arc::clone(&hydra.st);
+        replica.set_hook(Some(Arc::new(move |req| {
+            if req.opcode != peer::OP_EGROUP_PUT {
+                return None;
+            }
+            let resp = peer::serve_request(&store, req);
+            st.log.lock().unwrap().push(format!("put:{}", req.flags));
+            Some(resp)
+        })));
+    }
+
+    #[test]
+    fn every_extent_is_on_every_replica_before_a_group_is_sealed_and_before_any_map_row() {
+        let r = rig("pipeline-order", 2, 2 * MIB as u64, 64 * MIB as u64);
+        for replica in &r.replicas {
+            log_puts(replica, &r.hydra);
+        }
+        // Six extents: the first four fill a 4 MiB group, which is sealed; two are left in
+        // the next, which is not.
+        r.write(0, &fill(1, 6 * MIB)).unwrap();
+        r.settle();
+
+        let log = r.hydra.log();
+        // Each put appears once per replica; a replica's puts are in order and so are the two
+        // replicas', but they interleave, so compare as a count per stage.
+        let seal = log.iter().position(|e| e == "seal").expect("the full group was sealed");
+        let batch = log.iter().position(|e| e == "batch").expect("rows written");
+        let commit = log.iter().position(|e| e == "commit").expect("committed");
+        let puts_before_seal = log[..seal].iter().filter(|e| e.starts_with("put:")).count();
+        assert_eq!(puts_before_seal, 4 * 2, "all four extents of the group, on both replicas, before the seal");
+        let puts_before_rows = log[..batch].iter().filter(|e| e.starts_with("put:")).count();
+        assert_eq!(puts_before_rows, 6 * 2, "all six extents on both replicas before any map row");
+        assert!(log[batch..].iter().all(|e| !e.starts_with("put:")), "{log:?}");
+        assert!(seal < batch && batch < commit, "{log:?}");
+
+        // And both replicas have the bytes -- the whole of each group the map names.
+        let groups: Vec<_> = r.vd.lock().unwrap().map.values().map(|l| l.egroup_id.clone()).collect();
+        for replica in &r.replicas {
+            for g in &groups {
+                assert!(replica.store.get_egroup(g, 0, 16).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_last_write_to_each_group_is_synced_on_the_replica() {
+        let r = rig("pipeline-flags", 1, 2 * MIB as u64, 64 * MIB as u64);
+        log_puts(&r.replicas[0], &r.hydra);
+        r.write(0, &fill(1, 6 * MIB)).unwrap();
+        r.settle();
+        let puts: Vec<String> = r.hydra.log().into_iter().filter(|e| e.starts_with("put:")).collect();
+        let d = peer::APPEND_DEFER_SYNC;
+        // Group one: three deferred and the fourth, which fills it, synced. Group two: one
+        // deferred and the last of the drain, synced.
+        let want: Vec<String> = [d, d, d, 0, d, 0].iter().map(|f| format!("put:{f}")).collect();
+        assert_eq!(puts, want);
+    }
+
+    #[test]
+    fn a_replica_refusing_an_extent_stops_the_drain_before_the_group_is_sealed_or_any_row_written() {
+        let r = rig("pipeline-refused", 1, 2 * MIB as u64, 64 * MIB as u64);
+        let seen = Arc::new(AtomicUsize::new(0));
+        r.replicas[0].set_hook(Some(Arc::new(move |req| {
+            (req.opcode == peer::OP_EGROUP_PUT && seen.fetch_add(1, Ordering::SeqCst) == 1)
+                .then(|| Response::err(peer::ST_IO, 0))
+        })));
+        let data = fill(2, 6 * MIB);
+        r.write(0, &data).unwrap();
+        r.settle();
+
+        assert!(r.degraded().unwrap().contains("refused extent group"), "{:?}", r.degraded());
+        let log = r.hydra.log();
+        assert!(!log.iter().any(|e| e == "seal" || e == "batch" || e == "commit"), "{log:?}");
+        assert!(r.sealed_exists(), "and the journal still holds it all");
+        assert_eq!(r.read(0, 6 * MIB as u32), data);
+    }
+
+    #[test]
+    fn a_drain_to_a_dead_replica_fails_cleanly_instead_of_hanging() {
+        let r = rig("pipeline-dead", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.vd.lock().unwrap().replicas.push(Arc::new(PeerClient::new(
+            "dead",
+            "127.0.0.1:1",
+            Duration::from_secs(2),
+        )));
+        // No replica to take the journal either, so write through the lock-free path the
+        // heal uses: put the records in directly and drain.
+        {
+            let mut v = r.vd.lock().unwrap();
+            let saved = std::mem::take(&mut v.replicas);
+            v.write(0, &fill(3, 3 * MIB)).unwrap();
+            v.replicas = saved;
+        }
+        let err = within(20, {
+            let vd = Arc::clone(&r.vd);
+            move || drain_all(&vd)
+        })
+        .expect_err("a drain that cannot reach its replica must not commit");
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        assert!(r.vd.lock().unwrap().journal.has_sealed());
     }
 }

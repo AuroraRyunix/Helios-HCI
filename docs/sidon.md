@@ -98,6 +98,15 @@ rate. The mechanics, in `sidon/src/vdisk.rs`:
    (`OP_TRUNCATE_TO`; a replica from before this change refuses it and keeps its whole
    journal, which is the safe way to be wrong).
 
+Inside the run phase the extents go to the replicas through a pipeline: one thread and one
+connection per replica, fed in order, so the drain reads and builds the next extent while the
+last is on the wire. Every put to an extent group but its last carries `APPEND_DEFER_SYNC` (the
+replica skips its fsync; the group's last put, which is synced, flushes the file), the drain
+flushes its own copy of a full group while the replicas catch up, and it waits for every
+replica's answer before it tells Hydra a group is sealed and before it writes a single map row.
+Each drain logs one line, `drained N extent(s) in T ms (replicas …, this disk …, hydra …)`,
+saying which of the three it spent its time on.
+
 Guests are held back only at a **hard ceiling**, twice the high-water mark (128 MiB by
 default): a write that finds the journal there waits, without the vdisk lock, for a drain to
 make room, and fails with an error if the drain cannot run (a degraded vdisk) rather than

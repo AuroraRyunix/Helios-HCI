@@ -70,10 +70,11 @@ pub const OP_FORWARD_WRITE: u16 = 9;
 /// writes made while the drain ran.
 pub const OP_TRUNCATE_TO: u16 = 10;
 
-/// Request flag on OP_APPEND: the record is not the last of its group, so the replica need
-/// not fsync it -- the group's last record, sent without the flag, is synced and takes every
-/// earlier write to the file with it. A replica from before this flag ignores it and syncs
-/// every record, which is slower and no less safe.
+/// Request flag on OP_APPEND and OP_EGROUP_PUT: this is not the last write of its group, so
+/// the replica need not fsync it -- the group's last write, sent without the flag, is synced
+/// and takes every earlier write to the file with it. For an append the group is one guest
+/// write; for a put it is one extent group within a drain. A replica from before this flag
+/// ignores it and syncs every write, which is slower and no less safe.
 pub const APPEND_DEFER_SYNC: u16 = 1;
 
 pub const ST_OK: u16 = 0;
@@ -469,12 +470,31 @@ impl ReplicaStore {
     }
 
     pub fn put_egroup(&self, egroup: &str, offset: u64, data: &[u8]) -> Result<()> {
+        self.put_egroup_deferring(egroup, offset, data, false)
+    }
+
+    /// `put_egroup`, optionally leaving the fsync to a later put to the same group.
+    ///
+    /// A drain appends a group's extents one after another and the owner will not point the
+    /// block map at any of them until every one is durable. So all but the last put to a
+    /// group can skip the sync: the last one's `sync_data` flushes the whole file, and the
+    /// owner marks the drain committed only after that last reply. What this saves is a
+    /// disk flush per extent, which on this hardware cost more than the transfer did.
+    pub fn put_egroup_deferring(
+        &self,
+        egroup: &str,
+        offset: u64,
+        data: &[u8],
+        defer_sync: bool,
+    ) -> Result<()> {
         let path = self.egroup_path(egroup);
         let mut file = OpenOptions::new().write(true).create(true).open(&path)?;
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
-        file.sync_data()?;
+        if !defer_sync {
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -554,7 +574,12 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
                 Response::err(ST_IO, 0)
             }
         },
-        OP_EGROUP_PUT => match store.put_egroup(&req.vdisk, req.offset, &req.data) {
+        OP_EGROUP_PUT => match store.put_egroup_deferring(
+            &req.vdisk,
+            req.offset,
+            &req.data,
+            req.flags & APPEND_DEFER_SYNC != 0,
+        ) {
             Ok(()) => Response::ok(Vec::new()),
             Err(_) => Response::err(ST_IO, 0),
         },
@@ -1154,6 +1179,35 @@ mod tests {
         let before = store.read_tail("vd").unwrap();
         assert!(store.truncate_before("vd", 1, 5).is_err());
         assert_eq!(store.read_tail("vd").unwrap(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deferring_the_sync_changes_when_bytes_are_durable_and_never_which_bytes_are_written() {
+        // Through the serve layer, as a drain's pipeline sends them: three extents of one
+        // group, the last without the flag.
+        let dir = tmpdir("put-deferred");
+        let store = ReplicaStore::new(&dir).unwrap();
+        for (i, (chunk, flags)) in [(b"aaaa", APPEND_DEFER_SYNC), (b"bbbb", APPEND_DEFER_SYNC), (b"cccc", 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let resp = serve_request(&store, &Request {
+                opcode: OP_EGROUP_PUT, vdisk: "eg-a".to_string(), epoch: 1, seq: 0,
+                offset: (i * 4) as u64, flags, data: chunk.to_vec(),
+            });
+            assert!(resp.is_ok());
+        }
+        assert_eq!(store.get_egroup("eg-a", 0, 12).unwrap(), b"aaaabbbbcccc");
+
+        // And a deferred append is a whole record on disk all the same.
+        let rec = records(0, 1).remove(0);
+        let resp = serve_request(&store, &Request {
+            opcode: OP_APPEND, vdisk: "vd".to_string(), epoch: 1, seq: 0,
+            offset: 0, flags: APPEND_DEFER_SYNC, data: rec.clone(),
+        });
+        assert!(resp.is_ok());
+        assert_eq!(store.read_tail("vd").unwrap(), rec);
         std::fs::remove_dir_all(&dir).ok();
     }
 
