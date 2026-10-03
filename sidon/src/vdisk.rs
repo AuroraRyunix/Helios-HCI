@@ -2806,19 +2806,32 @@ mod tests {
 
     #[test]
     fn the_local_sync_runs_while_the_replica_is_being_written_not_before_it() {
-        // The local sync is made to wait until the replica has been contacted. If the
-        // owner synced first and only then went to the replica, the sync would wait out its
-        // deadline and fail the write: the only way through is both being in flight at once.
+        // Each side is made to wait for the other: the local sync will not return until the
+        // replica has been contacted, and the replica will not answer until the local sync has
+        // started. Whichever order a serial owner used -- sync and then the replica, or the
+        // replica and then the sync -- one side would wait out its deadline and fail the
+        // write. The only way through is both being in flight at once.
         let r = rig("overlap-sync", 1, 64 * MIB as u64, 128 * MIB as u64);
         let contacted = Arc::new(AtomicBool::new(false));
-        let c2 = Arc::clone(&contacted);
+        let syncing = Arc::new(AtomicBool::new(false));
+        let (c2, s2) = (Arc::clone(&contacted), Arc::clone(&syncing));
         r.replicas[0].set_hook(Some(Arc::new(move |req| {
-            if req.opcode == peer::OP_APPEND {
-                c2.store(true, Ordering::SeqCst);
+            if req.opcode != peer::OP_APPEND {
+                return None;
+            }
+            c2.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !s2.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    return Some(Response::err(peer::ST_IO, 0));
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
             None
         })));
+        let s3 = Arc::clone(&syncing);
         journal::testhook::set(&jpath(&r), Some(Arc::new(move || {
+            s3.store(true, Ordering::SeqCst);
             let deadline = Instant::now() + Duration::from_secs(5);
             while !contacted.load(Ordering::SeqCst) {
                 if Instant::now() > deadline {

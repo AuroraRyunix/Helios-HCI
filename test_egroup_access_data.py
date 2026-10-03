@@ -175,7 +175,11 @@ class TheReadPathNeverWaitsOnHydra(unittest.TestCase):
         self.assertNotIn("record_write", write_fn)
 
     def test_the_drain_is_what_counts_a_write(self):
-        drain_fn = rust_fn(self.vdisk, "drain")
+        # The drain's work is `DrainJob::run`: the drain runs on its own thread from a job
+        # that owns everything it needs, so the loop that appends extents -- and counts them
+        # -- lives there rather than in `Vdisk::drain`, which only plans, runs and finishes it.
+        drain_fn = rust_fn(self.vdisk, "run")
+        self.assertIn("append_framed", drain_fn)
         self.assertIn("record_write", drain_fn)
 
 
