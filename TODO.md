@@ -53,6 +53,20 @@ already-fixed when it had never worked.
 * `deploy_updates.py` verifies SSH host keys instead of `AutoAddPolicy`, with
   `HELIOS_SSH_TRUST_NEW_HOSTS=1` as an explicit first-contact opt-in.
 
+## P2 — Docs that disagree with the running cluster (2026-10-03)
+
+* **The "witness node" is documented as current and is not.** `docs/cluster.md` ("3-Node
+  Layout (Witness Node Support)"), `docs/cluster_technical.md` and `docs/ring_lifecycle.md`
+  say the third host is a diskless ZooKeeper-only tie-breaker with no ScyllaDB, no Daruk and
+  no storage. The running three-node cluster has HydraDB, Daruk, Sidon and Spectrum up on all
+  three, a mounted extent store on each, and no `is_witness` anywhere in `cluster.json`. What
+  survives in code is vestigial -- a comment in `cluster_new.py` and one in `vali.py`, and a
+  test in `test_ring_lifecycle.py` that still asserts witness behaviour. Not rewritten here
+  because the right answer depends on whether the witness was removed on purpose or is a
+  layout still meant to exist (it was a DRBD-era need: an odd number of voters for each
+  replicated volume, which Sidon does not have). Decide that, then make the docs, the
+  comments and the test say one thing.
+
 ## P1 — The Phoenix console lost function in the port (2026-10-02, not started)
 
 Reported from using it. The pages exist and render, which is what "every page is Phoenix"

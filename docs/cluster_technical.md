@@ -75,6 +75,9 @@ mindmap
 - Skips unmounting and stopping non-existent databases and application containers on the witness node.
 
 #### `cluster destroy`
+- Confirms first: the operator types `destroy`, or passes `-y`/`--yes`. A non-interactive
+  stdin without `--yes` is refused, and the prompt runs ahead of the cluster lock and every
+  phase (`confirm_destroy` in `cluster_new.py`, pinned by `test_destroy_confirmation.py`).
 - Purges systemd unit templates, deletes Podman containers, removes storage targets, and cleans `/var/lib/hci` configuration directories.
 - Skips LVM signatures removal and physical disks wiping on the witness node.
 

@@ -1788,6 +1788,58 @@ def make_request(path, method="GET", payload=None):
             
     return -1, {"error": f"Failed to connect to spark-daemon (tried {', '.join(target_ips)}): {last_err}"}
 
+def confirm_destroy(ips, assume_yes=False, read=input, interactive=None):
+    """Make `cluster destroy` ask before it does the one thing that cannot be undone.
+
+    It used to start straight away: stop every VM, wipe the LVM pool and disk signatures,
+    delete the ZooKeeper and Hydra data and /etc/hci/cluster.json, and remove the sidon
+    store -- on every host named, with no prompt, because nothing had ever put one in. The
+    command that erases a cluster was easier to run by accident than `rm -r`.
+
+    The phrase is typed rather than a bare y/n, because "y" is what a finger does when it
+    is expecting a different question. It is the word `destroy` and not the host list, since
+    a script that has to quote the hosts back is just a longer way to say --yes.
+
+    A non-interactive stdin with no --yes is a refusal, not a pass: a pipe or a cron job
+    that reaches this line has not been asked, and "nobody answered" must never mean "yes".
+    Returns True when the destroy may proceed.
+    """
+    if assume_yes:
+        print("[--yes] Skipping the confirmation prompt.")
+        return True
+
+    if interactive is None:
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:
+            interactive = False
+
+    if not interactive:
+        print("Refusing to destroy a cluster with no one at the keyboard to confirm it.")
+        print("Run it from a terminal, or pass --yes if a script really means it.")
+        return False
+
+    print("")
+    print("This will permanently destroy the cluster on:")
+    for ip in ips:
+        print(f"    {ip}")
+    print("")
+    print("  - every VM is stopped and undefined, and its disks are lost")
+    print("  - the LVM pool and disk signatures are wiped")
+    print("  - ZooKeeper and Hydra data, and the sidon extent store, are deleted")
+    print("  - /etc/hci/cluster.json is removed, so `create` will need -s afterwards")
+    print("")
+    try:
+        answer = read("Type 'destroy' to continue: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return False
+    if answer != "destroy":
+        print("Not confirmed. Nothing was changed.")
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="HCI Cluster Management Utility")
     parser.add_argument("-s", "--servers", required=False, help="Comma-separated list of host IPs")
@@ -1802,6 +1854,8 @@ def main():
                         help="For 'zk-promote'/'zk-demote': the member that takes the "
                              "opposite role in the same change, so a vote is handed over "
                              "rather than added or dropped")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip the confirmation prompt of 'destroy', for scripts")
     parser.add_argument("--finalize", action="store_true", help="Perform the bookkeeping half of a decommission or rejoin, once the ring work is done")
     parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy",
                                             "ring", "decommission", "rejoin",
@@ -1880,15 +1934,16 @@ def main():
                         print(f"[WARNING] Port {port} is already in use on {ip} by "
                               f"{holder}. This may cause conflicts.")
 
-            # Validate Secure Boot and ELRepo module signing key
-            rc_sb, sb_out, _ = run_remote_spark(ip, "mokutil --is-sb-enabled")
-            if rc_sb == 0 and "secureboot enabled" in sb_out.lower():
-                rc_key, _, _ = run_remote_spark(ip, "mokutil --test-key /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der")
-                if rc_key != 0:
-                    print(f"[ERROR] Secure Boot is enabled on host {ip} and the ELRepo Secure Boot key is not enrolled.")
-                    print(f"[ERROR] Unsigned out-of-tree kernel modules will fail to load under Secure Boot.")
-                    print(f"[ERROR] Please disable Secure Boot in the UEFI/BIOS settings of {ip}, or import the key ('mokutil --import /etc/pki/elrepo/SECURE-BOOT-KEY-elrepo.org.der') and reboot to enroll it.")
-                    sys.exit(1)
+            # There is no Secure Boot check here any more, and that is worth stating rather
+            # than silently dropping. This refused to create a cluster on any host with Secure
+            # Boot enabled and the ELRepo key not enrolled, because DRBD shipped as an
+            # out-of-tree kernel module (kmod-drbd9x) the kernel rejects without that key --
+            # which took the whole storage layer down. Sidon is a userspace daemon speaking
+            # NBD over a unix socket and loads no module, so Secure Boot can simply stay on.
+            #
+            # provision.py and spark-daemon dropped the same gate when DRBD went; this copy
+            # was missed, so `cluster create` kept refusing hosts that nothing required to
+            # change. Two of three nodes failed on it.
 
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
@@ -2657,6 +2712,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             ips = ["127.0.0.1"]
 
         print(f"Target cluster hosts: {', '.join(ips)}")
+
+        if not confirm_destroy(ips, assume_yes=args.yes):
+            sys.exit(1)
 
         acquire_cluster_lock(ips)
         import atexit

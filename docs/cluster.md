@@ -215,8 +215,19 @@ Both sequences, and the quorum gate that governs maintenance mode, are documente
 Wipe all databases, clear claimed disks, remove configuration parameters, and reset the hypervisor hosts to factory default.
 ```bash
 # WARNING: Wipes all VM disks, metadata tables, and system configurations permanently
-cluster destroy
+cluster destroy          # asks you to type the word `destroy` first
+cluster destroy --yes    # skips the prompt, for a script that really means it
 ```
+
+It asks because there is nothing to undo afterwards: every VM is stopped and undefined, the
+LVM pool and disk signatures are wiped, the ZooKeeper and Hydra data and the sidon extent
+store are deleted, and `/etc/hci/cluster.json` is removed -- which is why `cluster create`
+needs `-s` again afterwards. The prompt wants the word `destroy` rather than `y`, because
+`y` is what a finger types when it is expecting a different question.
+
+Run without a terminal and without `--yes` -- a pipe, a cron job, a closed stdin -- it
+**refuses**. Nobody answering is never read as consent. Declining, or Ctrl+C at the prompt,
+exits non-zero before the cluster lock is taken and before any phase has started.
 
 ---
 
