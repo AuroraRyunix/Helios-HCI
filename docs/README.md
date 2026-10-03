@@ -82,6 +82,8 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/ganon.md](./dfs/ganon.md) | The fault-injection harness — built first, calibrated against DRBD. |
 | [dfs/milestones.md](./dfs/milestones.md) | Build order with gates and abandonment values. |
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
+| [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, and why pooling them is wrong. |
+| [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |
 
 Status: **designed, not building** — implementation begins with the harness, not the filesystem.
 

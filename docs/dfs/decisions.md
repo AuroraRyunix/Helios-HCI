@@ -303,3 +303,115 @@ generation, which is what Purah already does for extent groups and would now hav
 1 MiB granularity instead of 4 MiB. Against that cost, the win on VM disks is identical OS
 images, which clone-from-image already gets for free as a map copy sharing every extent
 with its parent (D-19). Dedup would be buying back something never spent.
+
+**D-24 — erasure coding is not built, and on three nodes it should not be.** The question
+that decides it is what a 2+1 stripe actually buys on the cluster Helios runs, so the
+arithmetic comes first and the recommendation follows from it.
+
+*What it buys.* A replica pair stores 2x. A 2+1 stripe -- two data groups and one parity
+group, each on a different node -- stores 1.5x and survives the same single failure. On the
+cold fraction `f` of the data, raw capacity per logical byte goes from 2 to `2 - 0.5f`, a
+saving of `f/4` of the cluster, and never more than 25% even if everything were cold. At
+`f` = 0.5 that is 12.5% of raw capacity. On three nodes 2+1 is the *only* stripe there is:
+every shard needs its own node, so `k+m` cannot exceed 3, and `1+2` is just three-way
+replication.
+
+*What it costs, line by line.*
+
+- **Write path: nothing.** The guest's write still lands in the replicated journal and is
+  acknowledged there; encoding is a background job over groups that are already sealed.
+  This is the one place erasure coding is cheap.
+- **The encode itself.** Reading two 4 MiB groups (one local at best), computing parity,
+  writing and verifying a third group elsewhere, recording the stripe, then dropping one
+  replica of each data group: 12 MiB of I/O to turn 16 MiB of replicas into 12 MiB of stripe.
+  A one-off 4 MiB saving per 8 MiB of data, paid in background I/O.
+- **Degraded read.** A replica pair reads the surviving copy: one read, one hop. A stripe
+  with a member lost must read the same byte range from *both* surviving shards, check both
+  footers and combine them: two reads on two other nodes, latency the slower of the two.
+  Healthy reads are not worse in bytes, but a stripe keeps one copy of each group instead of
+  two, so on three nodes about two cold reads in three become network reads where an RF=2
+  pair would have served them locally.
+- **Rebuild, and the part that decides it.** Healing one lost shard reads two shards and
+  writes one: 12 MiB of traffic per 4 MiB healed against 8 MiB for re-replicating a copy.
+  Worse, **a stripe on three nodes has nowhere to heal to.** The shards must sit on three
+  distinct nodes and after a node loss only two exist, so the stripe stays at zero
+  redundancy until the node returns. An RF=2 pair loses a node and re-replicates onto the
+  third -- about three seconds for the journal, measured on the test cluster -- and is back
+  to full redundancy with two nodes left. That is the reason Nutanix's smallest EC-X stripe
+  needs four nodes: the stripe is one node narrower than the cluster so that a rebuild has a
+  home. On three nodes erasure coding does not merely trade capacity for read cost; it
+  trades *self-healing* for capacity, on data the cluster claims `ftt=1` for.
+- **Delete.** Today reclaiming a group is local: mark it dead, remove the file, no other
+  node's agreement needed (Purah's `reclaim`). With a stripe it is not, because a parity
+  group protects its other members and a dead member's bytes are still an input to
+  reconstructing the live one. Deleting group G1 while G2 relies on `G1 xor P` silently
+  removes G2's redundancy. A stripe with a dead member therefore has to be *undone* first --
+  the live member re-replicated, the parity dropped -- as a coordinated three-node
+  operation, or left in place until every member is dead. Either is new state, a new
+  failure mode for the sweep, and a new Ganon scenario.
+- **The immutability assumption holds, and that is not the problem.** Parity over sealed
+  groups is computed once and stays valid, because sealed means immutable (D-4); mark-sweep
+  never has to touch a group's bytes. What does not survive is the other assumption in D-8
+  and I-7, that each group's fate is independent of every other group's. A stripe couples
+  three groups' lifetimes, and the two-scan grace rule would have to be applied to the
+  stripe rather than to the group.
+- **Invariants.** I-6 says every live group has exactly RF verified replicas on distinct
+  failure domains. That would need restating for stripe members, and scrub, which compares
+  a group against its own seal hash, would need a parity check beside it.
+- **D-22's boundary.** Access data may decide where a copy goes, never whether it exists
+  (D-22). Encoding deletes a replica because a group *looks cold*, which is a decision about
+  whether a copy exists, taken on an approximate statistic that a lost flush understates.
+  A mistake would cost a degraded read rather than data, but the line was drawn on purpose
+  and the choice would be either to amend D-22 explicitly or to select on something exact,
+  such as the age since seal with no recorded access across two flush windows.
+
+*Recommendation: do not build.* A 12 to 25 percent saving on the cold fraction does not pay
+for the loss of self-healing at `ftt=1`, for a delete that is no longer local, and for a
+codec, a stripe table and a Ganon matrix that would be the largest new surface in Sidon
+since the journal. Compression is already built (migration `0008`) and takes bytes off the
+same cold groups without any of that cost. No code was written for this decision, and none
+should be: a codec with nothing wired to it is the same trap as the `dfs_egroup_replicas`
+table, a thing of suggestive shape that every later design has to establish is not a source
+of truth.
+
+*What would change the answer.* Node count first. At four nodes 2+1 has a rebuild target
+and the objection above disappears, leaving a saving of at most 25% on cold data. At five or
+more nodes the case becomes real: 3+1 stores 1.33x (a third less than a replica pair, on the
+cold fraction), and 2+2 gives `ftt=2` at 2x where replication needs 3x. A threshold stated as
+a proposal for the owner to move: **at least five nodes, and a cold sealed fraction above
+about half of used capacity, on a cluster where a saving of 15% of raw capacity is worth
+more than the operating cost** -- that is 2+1 at 60% cold, or 3+1 and 2+2 at 45%. The cold
+fraction is measurable now with `valcli storage.heat`, which is the first thing to do when
+the node count changes. The prerequisites, in order, are the tiering migration job (copy,
+repoint, delete, conditional on the epoch -- most of the machinery is shared), the D-22
+amendment above, and a stripe-aware sweep designed *before* the codec. When it is built it
+follows the pattern D-23 set: a stripe table that takes the next free migration id at that
+time, a per-container opt-in, and no cluster-wide switch.
+
+**D-25 — `vhost-user-blk` is designed and not built, and the next step is a measurement,
+not code.** [vhost_user_blk.md](./vhost_user_blk.md) holds the reasoning. D-3 named it the
+v2 performance path and `sidon.md` calls it deliberately last; this is the first time the
+claim was checked against the code. Three findings, in order of consequence:
+
+1. **Sidon serves one request at a time per connection**, so a guest's queue depth is
+   flattened to 1 before any transport is involved, and the libvirt XML's `queues='N'
+   iothread='1'` feeds N queues into one serial loop and one `Mutex<Vdisk>`. A faster
+   transport does not change that. Concurrent requests do, and concurrent requests are the
+   journal-ordering change the "deliberately last" warning is about, needed over NBD
+   exactly as much as over vhost-user.
+2. **The transport is a small part of the request.** An estimated ten microseconds of socket
+   work sits beside a journal `fdatasync` and a sequential round trip to each replica on a
+   write, and beside a 1 MiB read and checksum to serve 4 KiB on a read.
+3. **Whether the EL10 `qemu-kvm` ships the device is unverified.** Upstream 10.1 has it,
+   and D-3's "qemu 10.1 supports it" meant that. Red Hat's RHEL 10 documentation says it
+   does not support a user-space vHost interface, which is a statement about support rather
+   than about the build, and the check is three read-only commands that were not run
+   because work on the cluster was limited to building under `/tmp`.
+
+Recommendation: **do not build until a benchmark shows NBD is what limits a guest.** The
+benchmark, its stages and its kill criteria are in the document; stage 1 compares the two
+transports with no Sidon at all and stage 3 is the concurrency work that is the actual
+prerequisite. Alternatives it beat: building it now because the design is clear (it
+reorders the one thing the invariants rest on, to speed a path that is not the slow one),
+and ublk (D-3's other alternative, a kernel dependency NBD avoids, and no better placed on
+the concurrency question).

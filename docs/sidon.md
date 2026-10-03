@@ -385,9 +385,15 @@ that predates the setting — behaves exactly as it did.
   plan are D-23; it takes the next free migration id when it is built, and the table is deliberately
   not created, because an empty table with a suggestive shape costs every later design a
   paragraph establishing that it is not a source of truth.
-- **Erasure coding** as a Purah job over cold
-  sealed groups. **Deduplication** is argued against in
-  [decisions.md](./dfs/decisions.md): the win on VM disks is identical OS images, which
-  clone-from-image now gets for free as a map copy.
+- **Erasure coding** as a Purah job over cold sealed groups. Decided against, for now: on
+  three nodes a 2+1 stripe saves at most 25% of the cold data's raw capacity, and costs the
+  ability to re-replicate after a node loss, because the stripe has no spare node to heal
+  onto. The arithmetic, and the node count that would change the answer, are D-24 in
+  [decisions.md](./dfs/decisions.md). **Deduplication** is argued against there too: the win
+  on VM disks is identical OS images, which clone-from-image now gets for free as a map copy.
 - **`vhost-user-blk`** beside NBD, deliberately last. Performance work reorders
-  operations, and reordering is where invariants go to die.
+  operations, and reordering is where invariants go to die. Designed, not built: the NBD
+  transport is a small part of a request, and Sidon serves one request at a time per
+  connection whatever the guest's queue depth, which no transport changes. D-25 and
+  [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) carry the design and the benchmark that
+  would justify it.
