@@ -6,17 +6,17 @@ around it that makes it a backup tier rather than a button: something that takes
 timer, something that stops them accumulating, and a way to put a VM back that is not a
 clone under a new name.
 
-This module is the policy. The mechanism stays in Sidon, and the scheduling stays in Dagur:
+This module is the policy. The mechanism stays in Sidon, and the scheduling is Rauru's:
 
-  * **There is no new daemon.** Dagur already runs jobs on an interval, claims each tick
-    once cluster-wide (`/v1/schedule/claim-job`), and runs it on the node holding the
-    `dagur-queue` candidacy. The `snapshot_policy` job is `valcli storage.snapshot-run`, and
-    inherits both properties. Nothing here asks who leads ZooKeeper, or compares an address
-    to anything: that question was removed from ten places for being the wrong one.
-  * **A run is a task.** Dagur's own task is the parent; each snapshot taken, each snapshot
-    pruned and each rollback is a child row in `hydra.catalyst_tasks`, with the component and
-    sequence every task carries. A failure is a `failed` row in the console's task ring and
-    a non-zero exit from the job, which is what makes Dagur record the run failed.
+  * **Rauru runs it.** The snapshot and data-protection daemon holds the `rauru-snapshots`
+    election and calls `Runner.run()` on `RUN_INTERVAL_SECONDS`. It used to be a Dagur job
+    (`snapshot_policy`) that ran `valcli storage.snapshot-run`; `valcli storage.snapshot-run`
+    stays as the manual command and runs this same code. Nothing here asks who leads
+    ZooKeeper, or compares an address to anything: that question was removed from ten places
+    for being the wrong one.
+  * **A run is a task.** Each snapshot taken, each snapshot pruned and each rollback is a
+    row in `hydra.catalyst_tasks` with component `Rauru` and the sequence every task carries.
+    A failure is a `failed` row in the console's task ring and, for the CLI, a non-zero exit.
 
 Every function that decides something takes plain values and returns plain values, so the
 decisions -- which policy applies, whether a snapshot is due, what retention may delete,
@@ -47,7 +47,7 @@ ORIGIN_POLICY = "policy"
 ORIGIN_MANUAL = "manual"
 ORIGIN_PRE_ROLLBACK = "pre-rollback"
 
-# How often the Dagur job runs, and therefore the shortest interval a policy can honestly
+# How often Rauru runs the policy, and therefore the shortest interval a policy can honestly
 # promise. A policy asking for ten minutes would be a lie the scheduler could not keep.
 RUN_INTERVAL_SECONDS = 3600
 # A snapshot is due when the newest is within this much of a full interval. The scheduler
@@ -60,8 +60,10 @@ MAX_KEEP_LAST = 1000
 # reason: these values end up inside CQL text and inside a socket path.
 NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
 
-TASK_COMPONENT = "Catalyst"
-TASK_SERVICE = "dagur"
+# Rauru owns this work, so its rows say so. `service` is the queue a task is dispatched
+# through and Rauru runs its own loop, so it names itself there too.
+TASK_COMPONENT = "Rauru"
+TASK_SERVICE = "rauru"
 
 DARUK_URL = "http://127.0.0.1:9043"
 CLUSTER_JSON = "/etc/hci/cluster.json"

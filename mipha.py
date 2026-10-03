@@ -2050,7 +2050,7 @@ def main():
                         # B. Start all hypervisor services on the returning host
                         print(f"[Mipha HA] Starting all services on returning host {hostname}...")
                         start_units = ["zookeeper", "hydra-db", "daruk", "sidon", "spectrum",
-                                       "bifrost", "dagur", "mimir", "vali", "catalyst",
+                                       "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst",
                                        "gatoway", "logos", "mipha", "agahnim", "slate",
                                        "hylia"]
                         ok_start, detail_start = spark_unit_action(ip, "start", start_units)

@@ -680,6 +680,7 @@ local_mcli_runner = "mcli-runner"
 local_allssh = "allssh"
 local_dagur = "dagur.py"
 local_mimir_daemon = "mimir.py"
+local_rauru = "rauru.py"
 local_vali = "vali.py"
 local_catalyst = "catalyst.py"
 local_catcli = "catcli"
@@ -866,6 +867,26 @@ Type=simple
 ExecStart=/usr/local/bin/dagur
 Restart=always
 RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+CPUWeight=100
+MemoryMax=256M
+MemoryHigh=200M
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+rauru_service_content = """[Unit]
+Description=Rauru Snapshot and Data Protection Manager
+After=zookeeper.service daruk.service
+ConditionPathExists=!/etc/hci/maintenance.state
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rauru
+Restart=always
+RestartSec=5
 User=root
 Environment=PYTHONUNBUFFERED=1
 CPUWeight=100
@@ -1221,6 +1242,16 @@ def deploy_to_node(ip):
             f_mim = sftp.open("/etc/systemd/system/mimir.service", "w")
             f_mim.write(mimir_service_content)
             f_mim.close()
+
+            # Rauru, the snapshot and data-protection manager. A node built before it existed
+            # has neither the script nor the unit, so the rollout installs both; the enable
+            # and restart at the end of the rollout then make it run.
+            print(f"[{ip}] Uploading rauru daemon to /usr/local/bin/rauru...")
+            put_text_file(sftp, local_rauru, "/usr/local/bin/rauru")
+            print(f"[{ip}] Writing rauru.service unit...")
+            f_rau = sftp.open("/etc/systemd/system/rauru.service", "w")
+            f_rau.write(rauru_service_content)
+            f_rau.close()
             
             # 2h. Copy vali CLI
             print(f"[{ip}] Uploading vali to /usr/local/bin/vali...")
@@ -1594,7 +1625,7 @@ def deploy_to_node(ip):
             
             # 4. Make executables runnable
             print(f"[{ip}] Setting executable permissions...")
-            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
+            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/rauru /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool")
             
             # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
             ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/spectrum_server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
@@ -1870,6 +1901,7 @@ WantedBy=multi-user.target
                 "systemctl enable dagur; systemctl is-active dagur && systemctl restart dagur || true",
                 "systemctl enable mimir; systemctl is-active mimir && systemctl restart mimir || true",
                 "systemctl enable vali; systemctl is-active vali && systemctl restart vali || true",
+                "systemctl enable rauru && systemctl restart rauru || true",
                 "systemctl daemon-reload && systemctl enable agahnim && systemctl restart agahnim || true",
                 # slate is a genuine Quadlet; generated units cannot be enabled (their [Install]
                 # section is what the generator acts on), so reload and restart only.

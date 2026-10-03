@@ -81,7 +81,7 @@ defmodule SpectrumPhx.Health do
   @service_checks ~w(
     zookeeper_status hydra-db_status daruk_status sidon_status aether_status spectrum_status
     spark-daemon_status libvirtd_status catalyst_status bifrost_status dagur_status
-    mimir_status vali_status gatoway_status urbosa_status logos_status mipha_status
+    mimir_status rauru_status vali_status gatoway_status urbosa_status logos_status mipha_status
     agahnim_status slate_status hylia_status scylladb_ring_status zookeeper_consensus
     scylladb_replication spectrum_api_port mtls_cert_expiration ingress_cert_expiration
     certs_seeding_check slate_config_status libvirt_responsiveness hostname_resolution

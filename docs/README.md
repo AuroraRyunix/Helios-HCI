@@ -38,6 +38,7 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Lanayru (`lanayru.py`) | [lanayru.md](./lanayru.md) | [lanayru_technical.md](./lanayru_technical.md) |
 | Logos (`logos.py`) | [logos.md](./logos.md) | [logos_technical.md](./logos_technical.md) |
 | Mimir (`mimir.py` / `mcli`) | [mimir.md](./mimir.md) | [mimir_technical.md](./mimir_technical.md) |
+| Rauru (`rauru.py`) | [rauru.md](./rauru.md) | (this one document; the technical detail is in `rauru.py`'s docstrings) |
 | Mipha (`mipha.py`) | [mipha.md](./mipha.md) | [mipha_technical.md](./mipha_technical.md) |
 | Spark (`spark.py` / `spark_daemon_decoded.py`) | [spark.md](./spark.md) | [spark_technical.md](./spark_technical.md) |
 | Spectrum (`spectrum_server.py`) | [spectrum.md](./spectrum.md) | [spectrum_technical.md](./spectrum_technical.md) |
@@ -84,7 +85,7 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/extent_id_map.md](./dfs/extent_id_map.md) | The extent ID map (D-23): staged rollout and what to observe between stages. |
 | [dfs/decisions.md](./dfs/decisions.md) | The ADR list: every choice, its alternatives, its reasoning. |
 | [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, and why pooling them is wrong. |
-| [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (a Dagur job), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
+| [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (run by Rauru), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
 | [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
 | [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |
 

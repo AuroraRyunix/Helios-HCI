@@ -213,6 +213,7 @@ def collect_inventory():
             "mcli-runner": "/usr/local/bin/mcli-runner",
             "dagur": "/usr/local/bin/dagur",
             "mimir": "/usr/local/bin/mimir",
+            "rauru": "/usr/local/bin/rauru",
             "vali": "/usr/local/bin/vali",
             "catalyst": "/usr/local/bin/catalyst",
             "catcli": "/usr/local/bin/catcli",

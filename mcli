@@ -72,6 +72,7 @@ CHECK_ID_TO_FUNC = {
     "bifrost_status": "service.bifrost",
     "dagur_status": "service.dagur",
     "mimir_status": "service.mimir",
+    "rauru_status": "service.rauru",
     "vali_status": "service.vali",
     "gatoway_status": "service.gatoway",
     "urbosa_status": "service.urbosa",
@@ -181,7 +182,7 @@ def run_node_checks(node, category, local_ip, results_dict):
         checks_map = {
             "services": [
                 "zookeeper_status", "hydra-db_status", "daruk_status", "sidon_status", "spectrum_status",
-                "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "vali_status",
+                "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "rauru_status", "vali_status",
                 "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "hylia_status", "scylladb_ring_status",
                 "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
                 "mtls_cert_expiration", "ingress_cert_expiration", "certs_seeding_check", "slate_config_status", "libvirt_responsiveness", "hostname_resolution",
@@ -574,6 +575,7 @@ def show_list():
         ("service.bifrost", "bifrost_status", "Check systemd Bifrost VIP and VM lifecycle state"),
         ("service.dagur", "dagur_status", "Check systemd Dagur scheduler state"),
         ("service.mimir", "mimir_status", "Check systemd Mimir health-check daemon state"),
+        ("service.rauru", "rauru_status", "Check systemd Rauru snapshot and data-protection manager state"),
         ("service.vali", "vali_status", "Check systemd Vali placement and compliance daemon state"),
         ("service.gatoway", "gatoway_status", "Check systemd Gatoway network sync state"),
         ("service.urbosa", "urbosa_status", "Check systemd Urbosa SDN state (when enabled)"),

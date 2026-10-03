@@ -138,6 +138,7 @@ components_map = {
     "allssh": {"src": "allssh", "target": "/usr/local/bin/allssh"},
     "dagur": {"src": "dagur.py", "target": "/usr/local/bin/dagur"},
     "mimir": {"src": "mimir.py", "target": "/usr/local/bin/mimir"},
+    "rauru": {"src": "rauru.py", "target": "/usr/local/bin/rauru"},
     "vali": {"src": "vali.py", "target": "/usr/local/bin/vali"},
     "catalyst": {"src": "catalyst.py", "target": "/usr/local/bin/catalyst"},
     "catcli": {"src": "catcli", "target": "/usr/local/bin/catcli"},

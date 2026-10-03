@@ -1040,10 +1040,10 @@ def cmd_storage_snapshot_policy_delete(argv):
 
 
 def cmd_storage_snapshot_run(argv):
-    """One pass of the snapshot policy. What the `snapshot_policy` Dagur job executes.
+    """One pass of the snapshot policy. The same pass Rauru runs on its interval; this is the manual form.
 
     The exit status is the verdict: non-zero when any snapshot or prune failed, which is what
-    makes Dagur record the run as failed and the console show it. A vdisk skipped because it
+    a script or an operator keys on. A vdisk skipped because it
     is not attached is not a failure -- nothing is writing to it, so the newest snapshot is
     still a true picture of it -- but it is printed, never silent.
     """
@@ -2804,7 +2804,7 @@ def print_usage():
     print("  valcli storage.snapshot-policy          Scheduled snapshot policies and what each covers")
     print("  valcli storage.snapshot-policy.set cluster|container:<n>|vdisk:<id> --every-hours N --keep N [--disable]")
     print("  valcli storage.snapshot-policy.delete cluster|container:<n>|vdisk:<id>")
-    print("  valcli storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (the Dagur job)")
+    print("  valcli storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (Rauru does this hourly)")
     print("  valcli storage.rollback <vdisk> <snapshot> [--no-keep]  Put a stopped VM's disk back to a snapshot")
     print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
     print("                                          asked for, copies it actually has")

@@ -48,3 +48,23 @@ There are two related but independent code paths for shipping updates — they s
 **Slate** (Traefik, configured by `slate_config/traefik.yml` and `slate_config/dynamic.yml`) is the sole externally-facing ingress, terminating all client traffic — WebUI, REST API, and VNC/SPICE console WebSocket traffic — on port `443`, and reverse-proxying it same-origin to Spectrum (`spectrum_server.py`) and Agahnim (the console proxy) on their internal ports. No other service in the component list is meant to be exposed directly to end users; see [docs/AGENTS.md](./AGENTS.md) §4 for the caveat that Catalyst (`:9091`) and Vali (`:9095`) are nonetheless reachable on the cluster network today (Quadlet `Network=host`, no loopback restriction, no auth) — this is an open item in [TODO.md](../TODO.md), not an intended second ingress path.
 
 For the full network flow (ports, mTLS mesh, ScyllaDB/ZooKeeper cluster-facing traffic), see the Cluster Network Architecture section and flowchart in the top-level [README.md](../README.md) §7, and [docs/network.md](./network.md).
+
+## Adding a service: the checklist is a test
+
+A daemon is registered by hand in a dozen files and its systemd unit is written twice (in
+`provision.py` and in `deploy_updates.py`). Nobody could say which files "all the places" were, and
+the omissions cost real things: `cluster start` restarted a deleted `aether` unit for months, and
+`cluster destroy` left `slate` and `agahnim` running.
+
+`test_service_wiring.py` is the list. Its source of truth is `MANAGED_SERVICES` in
+`spark_daemon_decoded.py`. Add the service there, give it a kind in the test (script, native unit,
+Quadlet, Rust crate), and run the test: it names every file and list that is missing the service.
+A registry that legitimately does not apply is an *exemption with its reason* in that file, and an
+exemption nobody needs fails the test. It also asserts that no list names a unit nothing installs,
+that `provision.py` and `deploy_updates.py` write identical unit text, that a daemon's unit runs
+`/usr/local/bin/<name>` with `PYTHONUNBUFFERED` set, and that every literal list of five or more
+services is either registered or recorded as not being an inventory, so a *new* list cannot be
+forgotten. [rauru.md](./rauru.md) is the first service added this way.
+
+The rollout also converges a node that already exists: it installs a service's script and unit if
+absent and enables it, which is asserted per service.

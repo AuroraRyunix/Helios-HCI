@@ -1255,9 +1255,10 @@ as data* by DRBD and refused with EIO by Sidon.
   Scheduled snapshots with a retention policy, in-place rollback of a detached vdisk and a
   read-only console view are built since -- see the next entry.
 * **Scheduled snapshots, retention and rollback.** Built; [docs/dfs/snapshots.md](docs/dfs/snapshots.md).
-  A Dagur job (`snapshot_policy`) runs `valcli storage.snapshot-run`; policy is in
+  [Rauru](docs/rauru.md) runs the policy hourly (it was a Dagur job; the seed is gone and the
+  console deletes the old row on start); policy is in
   `hydra.dfs_snapshot_policies` (migration `0022`) and provenance in `hydra.dfs_snapshot_index`
-  (`0023`); each snapshot, prune and rollback is a child Catalyst task. Rollback is Sidon's new
+  (`0023`); each snapshot, prune and rollback is a Catalyst task with component `Rauru`. Rollback is Sidon's new
   `rollback` op and is refused unless the vdisk is detached. Open around it:
   * **Rollback of an attached vdisk** is a design, not a feature
     ([docs/dfs/rollback_attached.md](docs/dfs/rollback_attached.md)): stop the VM, roll back,
@@ -1324,3 +1325,32 @@ as data* by DRBD and refused with EIO by Sidon.
 * **Helios Horizon** — AD-integrated VDI/application streaming via Apache Guacamole (`guacd`).
 * **Scale-Out Urbosa** — FRRouting BGP EVPN control plane with per-host ARP suppression, resolving the
   head-end-replication and FDB-leak items above.
+
+## Service wiring (found by `test_service_wiring.py`)
+
+Everything `KNOWN_GAPS` and `EXCLUDED` in that test records as a gap rather than a decision. Each
+entry fails the test the moment it is fixed, so it has to be deleted here too.
+
+* **Rauru has not been run against a cluster.** It is wired and its loop is tested with fakes, and
+  `rauru --check` and `systemd-analyze verify` were run on a node's own Python, but a real start
+  against Hydra, the `rauru-snapshots` election and one scheduled run need a cluster. The commands
+  to run after `cluster create` are in [docs/rauru.md](docs/rauru.md).
+* **The rollout never writes or enables sidon's unit.** `provision.py` is the only writer;
+  `deploy_updates.py` builds and installs the binary and deliberately does not restart it. A node
+  whose sidon unit is missing or stale cannot be repaired by a rollout. Belongs with the change
+  to how sidon's disks are mounted, which edits the same code.
+* **The rollout writes a different console Quadlet from provisioning.** `deploy_updates.py`'s
+  `spectrum_container_content` still has `PodmanArgs=--privileged`; `provision.py`'s drops all
+  capabilities and sets `NoNewPrivileges`, with the reasoning. A node provisioned today is put back
+  to the privileged console by its next rollout. They also disagree on the maintenance condition
+  and volume labels (and slate's Quadlet differs in `:ro,z` and `[Install]`). Which is canonical
+  is the owner's call, and the change restarts the console on every node.
+* **`mcli-runner`'s maintenance residue probe names six services** of those vali stops when a host
+  enters maintenance, so a seventh left running is not reported. Which of the rest may
+  legitimately stay up needs a cluster to judge.
+* **`static/app.js` `getCheckCategory` still carries `aether_*` and `linstor_latency_check`.**
+  They are check names, not services, so the wiring test does not look at them.
+* **The watchdog and the boot-time start list do not supervise slate, agahnim or hylia.** The
+  reconcile loop (`MANAGED_SERVICES`) and `Restart=always` do, and `test_mimir_checks` pins that
+  slate and hylia are not in the watchdog's set. Recorded as an exemption, not a decision to
+  remove the older lists.

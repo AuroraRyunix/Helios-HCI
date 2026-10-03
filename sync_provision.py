@@ -15,6 +15,7 @@ mapping = {
     "VALCLI_CLI_B64": "valcli.py",
     "DAGUR_CLI_B64": "dagur.py",
     "MIMIR_CLI_B64": "mimir.py",
+    "RAURU_B64": "rauru.py",
     "CLUSTER_CLI_B64": "cluster_new.py",
     "SPARK_CLI_B64": "spark.py",
     "SPARK_DAEMON_B64": "spark_daemon_decoded.py",

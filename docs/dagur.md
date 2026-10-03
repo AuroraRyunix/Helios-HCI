@@ -24,8 +24,9 @@ Dagur queries ScyllaDB and triggers the following default background maintenance
 | `storage_scrub` | `storage_scrub` | `0 */6 * * *` | 6 hours | `purah-scrub` on `/run/sidon/control.sock` | Rehashes every sealed extent group and compares it against the hash taken when the group was sealed. Needs no lock, because sealed means immutable. |
 | `db_compaction` | `db_compaction` | `0 */12 * * *` | 12 hours | `nodetool compact` | Compacts metadata database. |
 | `storage_auto_heal` | `storage_auto_heal` | `0 1 * * *` | 24 hours | `/usr/local/bin/mipha --auto-heal` | A backstop only. Purah re-replicates within seconds of a write failing, so a daily pass exists to catch what an event-driven path missed, not to be the path. |
-| `snapshot_policy` | `snapshot_policy` | `0 * * * *` | 1 hour | `/usr/local/bin/valcli storage.snapshot-run` | Takes the snapshots the policy in `hydra.dfs_snapshot_policies` says are due and prunes the ones past retention. Does nothing until a policy is set. Each snapshot and prune is a child task of this run, and a failure makes the job exit non-zero. See [dfs/snapshots.md](./dfs/snapshots.md). |
 | `metadata_backup` | `backup` | `30 1 * * *` | 24 hours | `/usr/local/bin/saga backup --all-nodes` | Backs up the `hydra` keyspace — which holds the block map, and so the only statement of which extent group holds which part of which vdisk — and `/etc/hci`, to an external target, then prunes to the retention policy. See [backup_restore.md](./backup_restore.md). |
+
+The snapshot policy used to be a job here (`snapshot_policy`). [Rauru](./rauru.md) runs it now, and the console's bootstrap deletes the seeded row on every start so it is not run twice.
 
 `metadata_backup` is **enabled on a fresh cluster even though no backup target is
 configured yet**, so it fails once a day with a message naming the command that fixes it

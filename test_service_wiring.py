@@ -130,6 +130,7 @@ KINDS = {
     "gatoway": DAEMON,
     "urbosa": DAEMON,
     "hylia": DAEMON,
+    "rauru": DAEMON,
 }
 
 # The file a script service is embedded from, where it is not simply `<unit>.py`, and the
