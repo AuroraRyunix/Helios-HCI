@@ -30,6 +30,19 @@ journal append + fdatasync          ← on every other replica
 acknowledged to the guest
 ```
 
+The two journal appends really are concurrent (`vdisk::append_group`): a replica has its own
+thread, fed the write's records in order, while the owner writes record *i+1* to its own
+journal and, after the last record, issues a single `fdatasync`. A guest write bigger than
+1 MiB is several records and one commit marker, and only the last record of the group is
+made durable on the replica before it answers (the earlier ones carry `APPEND_DEFER_SYNC`; the
+last record's `fdatasync` takes them with it). The guest is told nothing until the local sync
+has succeeded *and* every replica has answered OK to the last record, so what is acknowledged
+is exactly what it always was: durable on every copy. A crash after some records but before
+the commit marker leaves a group replay discards, the same as a crash between two records
+always did. Before 2026-10 the appends were serial — a local `fdatasync` and then a round trip
+to each replica, per 1 MiB record — and this section's diagram described what it was meant to
+do rather than what it did.
+
 Nothing on that path touches Hydra. That is the design's one inviolable performance rule:
 acknowledgement never waits on the metadata layer.
 
@@ -62,6 +75,47 @@ volume) and one per further disk. Nothing sidon owns is in `/etc/fstab`; see
 When the journal reaches its high-water mark (64 MiB by default) a **drain** runs: each
 touched extent is read, patched with the journal's newer bytes, and appended somewhere
 new. The block map in Hydra is repointed, and only then is the journal allowed to forget.
+
+The drain runs **beside** the guest, not in front of it. The write that crosses the
+high-water mark starts the drain on a background thread and is acknowledged on its own
+journal record; before 2026-10 it ran the drain inline and sat out the whole thing (about 3
+seconds for 64 MiB), which is why a single large write measured a third of the streaming
+rate. The mechanics, in `sidon/src/vdisk.rs`:
+
+1. **Plan, under the vdisk lock.** The journal is *rotated*: `<vdisk>.jrn` is renamed
+   `<vdisk>.jrn.old` and sealed, and a fresh `<vdisk>.jrn` takes new writes. The overlay
+   ranges that point into the sealed file are frozen, and the block-map entries they touch are
+   copied out.
+2. **Run, unlocked.** The drain reads the sealed file, builds the extents, appends and
+   replicates them, syncs, writes the map rows and makes the drain-commit CAS. Guest reads
+   see the old map plus the overlay, which still holds every range being drained; guest
+   writes go to the live file.
+3. **Finish, under the lock.** The new map entries are applied, the overlay ranges still
+   pointing into the sealed file are dropped (a range a newer write has covered points into
+   the live file and stays), and the sealed file is deleted. The replicas are then told to
+   drop the journal records *older than* the first live sequence number — by sequence, never
+   wholesale, because they hold records acknowledged while the drain ran
+   (`OP_TRUNCATE_TO`; a replica from before this change refuses it and keeps its whole
+   journal, which is the safe way to be wrong).
+
+Inside the run phase the extents go to the replicas through a pipeline: one thread and one
+connection per replica, fed in order, so the drain reads and builds the next extent while the
+last is on the wire. Every put to an extent group but its last carries `APPEND_DEFER_SYNC` (the
+replica skips its fsync; the group's last put, which is synced, flushes the file), the drain
+flushes its own copy of a full group while the replicas catch up, and it waits for every
+replica's answer before it tells Hydra a group is sealed and before it writes a single map row.
+Each drain logs one line, `drained N extent(s) in T ms (replicas …, this disk …, hydra …)`,
+saying which of the three it spent its time on.
+
+Guests are held back only at a **hard ceiling**, twice the high-water mark (128 MiB by
+default): a write that finds the journal there waits, without the vdisk lock, for a drain to
+make room, and fails with an error if the drain cannot run (a degraded vdisk) rather than
+hang or let the journal fill the volume. A write admitted just under the ceiling may take the
+journal past it by that one write. Anything that needs a *drained* vdisk — detach, seal,
+snapshot, clone, `flush`, a replica heal — waits for a running drain and then drains whatever
+is left under the lock (`vdisk::drain_all`, `lock_idle`), so what they hand back is as drained
+as it ever was. A crash at any point leaves the sealed and live files; replay reads them in
+that order. `valcli storage.list`/`status` report `draining`, `high_water` and `hard_ceiling`.
 
 Two orderings are load-bearing and never depart from:
 
@@ -324,6 +378,31 @@ ranking, so what comes back describes the node now and not as of the last timer 
 Nothing here moves data; this is the input the tiering job reads.
 `SIDON_ACCESS_FLUSH=0` turns the tally off entirely, counters included, in which case this
 command has nothing to rank and says so.
+
+```bash
+valcli storage.benchmark default-pool
+```
+
+Creates a throwaway 256 MiB vdisk in the container, attaches it, measures it through the NBD
+socket a guest would use, and detaches and deletes it (also on failure). **Before 2026-10 it
+wrote 64 MiB in one request into a new 100 MiB vdisk and printed that single timing.** One
+request is not a rate: it landed exactly on the journal's high-water mark, so the drain ran
+inside that write and the printed ~14 MiB/s was a drain divided into 64 MiB. It now warms up,
+then prints one labelled line per workload with MiB/s, IOPS and the per-request time:
+1 MiB sequential writes at queue depth 1, 4 KiB synchronous writes at queue depth 1 (the
+latency a guest's fsync sees), 1 MiB sequential reads, 1 MiB writes at queue depths 4 and 16,
+and 16 MiB writes. The vdisk is four times the journal high-water mark so drains happen during
+the run. Because a write is acknowledged before the drain it triggered has finished, a write
+line also shows the **sustained** rate (bytes over the time until those drains are done)
+whenever a drain outlived it; that is the figure that stays true over a long stream, and the
+acknowledged rate is the one a guest sees in a burst. A final line reads the sequential range
+back and checks every byte, because a benchmark that is fast by losing data is worse than a
+slow one. Queue depth above 1 does not currently help much: a connection is served one request
+at a time ([dfs/group_commit.md](./dfs/group_commit.md)). It uses `qemu-img bench` (queue depth,
+millisecond timing) and `qemu-io` (the read-back).
+
+Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURAH_INTERVAL=0`
+(the test cluster) repeated runs accumulate garbage until a sweep is run.
 
 ```bash
 valcli storage.placement [N]          # which disk of each node holds which extent groups

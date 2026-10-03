@@ -405,11 +405,10 @@ impl Daemon {
         self.replica_store.fence(id, epoch)?;
         self.replica_store.truncate(id, epoch)?;
         let journal = crate::mounts::journal_dir(&self.cfg.root)?.join(format!("{id}.jrn"));
-        match std::fs::remove_file(journal) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::io(format!("could not remove the local journal of {id}: {e}"))),
-        }
+        // Both files: a sealed segment left behind would be replayed over the rolled-back
+        // map the next time the vdisk is attached.
+        crate::journal::remove_files(&journal)
+            .map_err(|e| Error::io(format!("could not remove the local journal of {id}: {e}")))
     }
 
     /// An immutable copy of `id`'s current map under `name`: the same forming -> copy ->

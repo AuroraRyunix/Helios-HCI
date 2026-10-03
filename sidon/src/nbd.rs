@@ -92,13 +92,17 @@ impl Backend for LocalVdisk {
         self.0.lock().expect("vdisk mutex poisoned").read(offset, len)
     }
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
-        self.0.lock().expect("vdisk mutex poisoned").write(offset, data)
+        // Not `vdisk.write` under the lock: a write that fills the journal must start the
+        // drain on its own thread and be acknowledged without it, and one that finds the
+        // journal at its ceiling must wait for room *without* holding the lock the drain
+        // needs. Both are `write_through`'s job.
+        crate::vdisk::write_through(&self.0, offset, data)
     }
     fn flush(&self) -> Result<()> {
         self.0.lock().expect("vdisk mutex poisoned").flush()
     }
     fn write_zeroes(&self, offset: u64, len: u64) -> Result<()> {
-        self.0.lock().expect("vdisk mutex poisoned").write_zeroes(offset, len)
+        crate::vdisk::write_zeroes_through(&self.0, offset, len)
     }
 }
 

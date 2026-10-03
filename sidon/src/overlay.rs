@@ -26,7 +26,7 @@ impl Seg {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Overlay {
     segs: BTreeMap<u64, Seg>,
 }
@@ -50,6 +50,19 @@ impl Overlay {
 
     pub fn iter(&self) -> impl Iterator<Item = &Seg> {
         self.segs.values()
+    }
+
+    /// A copy holding only the segments `keep` accepts. A drain works from one of these: a
+    /// frozen view of what it was asked to move, which guest writes arriving meanwhile
+    /// cannot change under it.
+    pub fn filtered(&self, keep: impl Fn(&Seg) -> bool) -> Overlay {
+        Overlay { segs: self.segs.iter().filter(|(_, s)| keep(s)).map(|(k, s)| (*k, *s)).collect() }
+    }
+
+    /// Drop every segment `drop_it` accepts. What is left is, by the structure's own
+    /// invariant, still non-overlapping: removing a segment can only open a gap.
+    pub fn remove_where(&mut self, drop_it: impl Fn(&Seg) -> bool) {
+        self.segs.retain(|_, s| !drop_it(s));
     }
 
     /// Record that `[start, start+len)` now lives at `data_pos` in the journal, evicting
@@ -219,5 +232,30 @@ mod tests {
         assert_eq!(hits[0].start, 0);
         assert!(o.overlapping(8192, 9000).is_empty());
         assert!(o.overlapping(100, 100).is_empty());
+    }
+
+    /// The drain's two views of one overlay. `filtered` is what it works from (a frozen
+    /// copy of the segments it took), `remove_where` is what it forgets at commit -- and a
+    /// write that landed in the middle of a drained range while the drain ran must survive
+    /// that, because it is newer than anything the drain wrote.
+    #[test]
+    fn a_range_overwritten_during_a_drain_keeps_the_newer_bytes_when_the_drained_ones_go() {
+        const OLD: u64 = 0;
+        const NEW: u64 = 1 << 44;
+        let mut o = Overlay::new();
+        o.insert(0, 4096, OLD + 100);
+        let frozen = o.filtered(|s| s.data_pos < NEW);
+        // A guest write inside the drained range, while the drain is running.
+        o.insert(1000, 500, NEW + 7);
+
+        // The frozen copy is untouched by it.
+        assert_eq!(covered(&frozen), vec![(0, 4096, OLD + 100)]);
+
+        o.remove_where(|s| s.data_pos < NEW);
+        assert_eq!(covered(&o), vec![(1000, 500, NEW + 7)]);
+        // And what it left has no old-generation fragments: the pieces either side of the
+        // new write were drained, so they are in the extent now and need no overlay entry.
+        assert!(o.overlapping(0, 1000).is_empty());
+        assert!(o.overlapping(1500, 4096).is_empty());
     }
 }

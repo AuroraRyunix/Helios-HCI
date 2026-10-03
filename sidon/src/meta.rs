@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
 
+#[derive(Clone)]
 pub struct Daruk {
     addr: String,
     timeout: Duration,

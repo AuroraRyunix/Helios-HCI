@@ -59,6 +59,15 @@ Order is load-bearing at every step (invariant I-3): bytes, then map, then recla
 crash at any point leaves either undrained journal (replayed) or orphaned egroup bytes
 (scrubbed away) — never a map entry pointing at nothing.
 
+**How it runs beside the guest (built).** The drain does not stand in front of an
+acknowledgement. It *rotates* the journal first (the file is sealed as `<vdisk>.jrn.old`,
+new writes go to a fresh `<vdisk>.jrn`), moves only the sealed file, and reclaims only it;
+step 5's watermark is "delete the sealed file", and on a replica it is "drop the records
+older than the first live sequence number". Overlay ranges carry the journal generation in
+their position, so "what this drain took" is exactly the ranges still pointing at the sealed
+file, and a range a newer write has covered is left for the next drain. Writers are held only
+at a hard ceiling of twice the high-water mark. See [sidon.md §2](../sidon.md).
+
 ### Failure during drain: redirect, never block
 
 If an egroup replica write fails or times out, the drain does **not** wait for the node

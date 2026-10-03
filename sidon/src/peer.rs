@@ -35,6 +35,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileExt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -62,6 +63,19 @@ pub const OP_EGROUP_GET: u16 = 7;
 /// `offset` is the guest offset; for a read, `seq` carries the length.
 pub const OP_FORWARD_READ: u16 = 8;
 pub const OP_FORWARD_WRITE: u16 = 9;
+/// Drop the drained prefix of a replicated journal: every record older than `seq`, keeping
+/// the rest. A separate opcode from OP_TRUNCATE (which empties the file) so that a replica
+/// running an older build answers "unknown opcode" and keeps its journal, instead of
+/// reading a new request as the old one and emptying a journal that holds acknowledged
+/// writes made while the drain ran.
+pub const OP_TRUNCATE_TO: u16 = 10;
+
+/// Request flag on OP_APPEND and OP_EGROUP_PUT: this is not the last write of its group, so
+/// the replica need not fsync it -- the group's last write, sent without the flag, is synced
+/// and takes every earlier write to the file with it. For an append the group is one guest
+/// write; for a put it is one extent group within a drain. A replica from before this flag
+/// ignores it and syncs every write, which is slower and no less safe.
+pub const APPEND_DEFER_SYNC: u16 = 1;
 
 pub const ST_OK: u16 = 0;
 /// The caller's epoch is below the highest this replica has been fenced at. The response
@@ -300,7 +314,27 @@ impl ReplicaStore {
     }
 
     /// Append a replicated journal record, refusing anything from a fenced-out epoch.
+    #[cfg(test)]
     pub fn append(&self, vdisk: &str, epoch: u64, record: &[u8]) -> Result<()> {
+        self.append_deferring(vdisk, epoch, record, false)
+    }
+
+    /// `append`, optionally leaving the fsync to a later record.
+    ///
+    /// With `defer_sync` the record is written and *not* made durable, and the reply says
+    /// nothing about durability. The owner only does this for a record that is not the last
+    /// of its group, and sends the last without the flag: that record's `sync_data` flushes
+    /// every earlier write to the file, so by the time the owner hears an OK it needs --
+    /// the one it acknowledges the guest on -- the whole group is on this disk. A replica
+    /// that never sees the last record (the owner died) holds records that were never
+    /// acknowledged and, with no commit marker, never applied.
+    pub fn append_deferring(
+        &self,
+        vdisk: &str,
+        epoch: u64,
+        record: &[u8],
+        defer_sync: bool,
+    ) -> Result<()> {
         let fenced = self.fenced_epoch(vdisk);
         if epoch < fenced {
             return Err(Error::refused(format!(
@@ -311,8 +345,11 @@ impl ReplicaStore {
         let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
         file.write_all(record)?;
         // The guest's write is acknowledged only after every replica has synced, so this
-        // is on the critical path by design -- it is what "durable on RF nodes" means.
-        file.sync_data()?;
+        // is on the critical path by design -- it is what "durable on RF nodes" means. For
+        // a record the owner marked deferred, the sync that matters is the last record's.
+        if !defer_sync {
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -347,13 +384,119 @@ impl ReplicaStore {
         }
     }
 
+    /// Drop the drained *prefix* of a replicated journal: every record older than
+    /// `keep_seq`, and nothing else.
+    ///
+    /// This is what a drain that ran beside guest writes has to ask for. `truncate` empties
+    /// the file, which is right only when nothing was appended since the records being
+    /// dropped -- and with the drain on its own thread, records acknowledged while it ran
+    /// are in this file already and are the *only* copy of those writes that is not also
+    /// in the owner's journal. Dropping them would be dropping acknowledged data from a
+    /// replica, so the cut is made by sequence number, at a record boundary found by
+    /// reading headers, and what follows it is carried over intact.
+    ///
+    /// The rewrite goes through a temporary file and a rename, so a crash leaves either the
+    /// old journal (a superset, which replay handles because re-applying drained records is
+    /// idempotent) or the new one -- never a journal with its middle missing.
+    pub fn truncate_before(&self, vdisk: &str, epoch: u64, keep_seq: u64) -> Result<()> {
+        let fenced = self.fenced_epoch(vdisk);
+        if epoch < fenced {
+            return Err(Error::refused(format!(
+                "truncate at epoch {epoch} refused: this replica is fenced at {fenced}"
+            )));
+        }
+        let path = self.journal_path(vdisk);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Error::io(format!("replica journal truncate: {e}"))),
+        };
+        let total = file.metadata()?.len();
+
+        // Walk record headers to the first record at or after `keep_seq`.
+        let mut pos = 0u64;
+        let mut cut: Option<u64> = None;
+        while pos + crate::journal::HEADER_LEN as u64 <= total {
+            let mut head = [0u8; crate::journal::HEADER_LEN];
+            file.read_exact_at(&mut head, pos)?;
+            if u32::from_le_bytes(head[0..4].try_into().unwrap()) != crate::journal::MAGIC {
+                break;
+            }
+            let data_len = u32::from_le_bytes(head[4..8].try_into().unwrap()) as u64;
+            let seq = u64::from_le_bytes(head[8..16].try_into().unwrap());
+            let end = pos + crate::journal::HEADER_LEN as u64 + data_len;
+            if end > total {
+                break;
+            }
+            if seq >= keep_seq {
+                cut = Some(pos);
+                break;
+            }
+            pos = end;
+        }
+        let cut = match cut {
+            Some(c) => c,
+            // Every record is older than the cut: all of it is drained.
+            None if pos == total => total,
+            // The walk stopped on something that is not a whole record, with no record at
+            // or after the cut seen. Guessing which side of it the cut falls on is how an
+            // acknowledged record gets dropped, so leave the file as it is.
+            None => {
+                return Err(Error::corrupt(format!(
+                    "replica journal of {vdisk} is not a clean record stream at byte {pos}; \
+                     not truncating it"
+                )))
+            }
+        };
+        if cut == 0 {
+            return Ok(());
+        }
+        if cut == total {
+            let f = OpenOptions::new().write(true).open(&path)?;
+            f.set_len(0)?;
+            f.sync_all()?;
+            return Ok(());
+        }
+        let mut rest = vec![0u8; (total - cut) as usize];
+        file.read_exact_at(&mut rest, cut)?;
+        let tmp = path.with_extension("jrn.tmp");
+        {
+            let mut out = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+            out.write_all(&rest)?;
+            out.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        File::open(path.parent().unwrap_or(Path::new(".")))?.sync_all()?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn put_egroup(&self, egroup: &str, offset: u64, data: &[u8]) -> Result<()> {
+        self.put_egroup_deferring(egroup, offset, data, false)
+    }
+
+    /// `put_egroup`, optionally leaving the fsync to a later put to the same group.
+    ///
+    /// A drain appends a group's extents one after another and the owner will not point the
+    /// block map at any of them until every one is durable. So all but the last put to a
+    /// group can skip the sync: the last one's `sync_data` flushes the whole file, and the
+    /// owner marks the drain committed only after that last reply. What this saves is a
+    /// disk flush per extent, which on this hardware cost more than the transfer did.
+    pub fn put_egroup_deferring(
+        &self,
+        egroup: &str,
+        offset: u64,
+        data: &[u8],
+        defer_sync: bool,
+    ) -> Result<()> {
         let path = self.egroup_path(egroup);
         let mut file = OpenOptions::new().write(true).create(true).open(&path)?;
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(data)?;
-        file.sync_data()?;
+        if !defer_sync {
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -397,7 +540,12 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
                 Response::err(ST_IO, 0)
             }
         },
-        OP_APPEND => match store.append(&req.vdisk, req.epoch, &req.data) {
+        OP_APPEND => match store.append_deferring(
+            &req.vdisk,
+            req.epoch,
+            &req.data,
+            req.flags & APPEND_DEFER_SYNC != 0,
+        ) {
             Ok(()) => Response::ok(Vec::new()),
             Err(Error::Refused(_)) => {
                 Response::err(ST_STALE_EPOCH, store.fenced_epoch(&req.vdisk))
@@ -418,7 +566,22 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
             }
             Err(_) => Response::err(ST_IO, 0),
         },
-        OP_EGROUP_PUT => match store.put_egroup(&req.vdisk, req.offset, &req.data) {
+        OP_TRUNCATE_TO => match store.truncate_before(&req.vdisk, req.epoch, req.seq) {
+            Ok(()) => Response::ok(Vec::new()),
+            Err(Error::Refused(_)) => {
+                Response::err(ST_STALE_EPOCH, store.fenced_epoch(&req.vdisk))
+            }
+            Err(e) => {
+                eprintln!("sidon: peer truncate-to {}: {e}", req.vdisk);
+                Response::err(ST_IO, 0)
+            }
+        },
+        OP_EGROUP_PUT => match store.put_egroup_deferring(
+            &req.vdisk,
+            req.offset,
+            &req.data,
+            req.flags & APPEND_DEFER_SYNC != 0,
+        ) {
             Ok(()) => Response::ok(Vec::new()),
             Err(_) => Response::err(ST_IO, 0),
         },
@@ -509,7 +672,8 @@ pub fn listen(bind: &str, store: Arc<ReplicaStore>, owner: Arc<dyn Owned>) -> Re
                             },
                             None => Box::new(stream),
                         };
-                        if let Err(e) = serve_connection(wire, &store, owner.as_ref()) {
+                        let handler = |req: &Request| serve_with_owner(&store, owner.as_ref(), req);
+                        if let Err(e) = serve_connection(wire, &handler) {
                             eprintln!("sidon: peer connection ended: {e}");
                         }
                     });
@@ -524,13 +688,35 @@ pub fn listen(bind: &str, store: Arc<ReplicaStore>, owner: Arc<dyn Owned>) -> Re
     Ok(())
 }
 
-fn serve_connection(mut stream: Box<dyn Wire>, store: &ReplicaStore, owner: &dyn Owned) -> Result<()> {
+/// A replication server on a loopback port, answering every request with `handler`, for
+/// tests that need a real replica -- a real socket, real framing, a real `ReplicaStore`
+/// behind it -- with the option of misbehaving: refusing, stalling, or recording what it
+/// was sent. Returns the address to dial.
+#[cfg(test)]
+pub fn spawn_test_server(handler: Arc<dyn Fn(&Request) -> Response + Send + Sync>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(stream) = conn else { break };
+            stream.set_nodelay(true).ok();
+            let handler = Arc::clone(&handler);
+            thread::spawn(move || {
+                let h = |req: &Request| handler(req);
+                let _ = serve_connection(Box::new(stream), &h);
+            });
+        }
+    });
+    addr
+}
+
+fn serve_connection(mut stream: Box<dyn Wire>, handler: &dyn Fn(&Request) -> Response) -> Result<()> {
     loop {
         // A decode failure is a desynchronised stream, so the connection is dropped
         // rather than answered: replying would let shifted bytes be read as a plausible
         // sequence of commands.
         let req = decode_request(&mut stream)?;
-        let resp = serve_with_owner(store, owner, &req);
+        let resp = handler(&req);
         stream
             .write_all(&encode_response(&resp))
             .map_err(|e| Error::io(format!("peer write: {e}")))?;
@@ -913,6 +1099,117 @@ mod tests {
         assert_eq!(store.read_tail("vd").unwrap(), b"acknowledged data");
         store.truncate("vd", 3).unwrap();
         assert!(store.read_tail("vd").unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `n` framed journal records with sequence numbers `first..first+n`.
+    fn records(first: u64, n: u64) -> Vec<Vec<u8>> {
+        (first..first + n)
+            .map(|s| crate::journal::Journal::encode(s, 1, s * 4096, 0, &[s as u8; 64]))
+            .collect()
+    }
+
+    #[test]
+    fn truncating_before_a_sequence_drops_only_the_drained_prefix() {
+        // The point of the opcode: a drain that ran beside guest writes has records in the
+        // replica's journal that it never saw. They are acknowledged data, and a replica
+        // that emptied its journal would be the only place they were lost.
+        let dir = tmpdir("truncate-before");
+        let store = ReplicaStore::new(&dir).unwrap();
+        let all = records(0, 6);
+        for r in &all {
+            store.append("vd", 1, r).unwrap();
+        }
+        store.truncate_before("vd", 1, 4).unwrap();
+        let tail = store.read_tail("vd").unwrap();
+        assert_eq!(tail, [all[4].clone(), all[5].clone()].concat());
+        // No temporary file is left beside it.
+        assert!(!store.journal_path("vd").with_extension("jrn.tmp").exists());
+        // It is a normal journal still: the owner's next append lands after the kept records.
+        let next = records(6, 1);
+        store.append("vd", 1, &next[0]).unwrap();
+        assert!(store.read_tail("vd").unwrap().ends_with(&next[0]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncating_before_the_first_record_changes_nothing_and_past_the_last_empties_it() {
+        let dir = tmpdir("truncate-before-edges");
+        let store = ReplicaStore::new(&dir).unwrap();
+        let all = records(10, 3);
+        for r in &all {
+            store.append("vd", 1, r).unwrap();
+        }
+        store.truncate_before("vd", 1, 0).unwrap();
+        store.truncate_before("vd", 1, 10).unwrap();
+        assert_eq!(store.read_tail("vd").unwrap(), all.concat());
+        store.truncate_before("vd", 1, 13).unwrap();
+        assert!(store.read_tail("vd").unwrap().is_empty());
+        // And a vdisk this replica has no journal for is not an error.
+        store.truncate_before("never-seen", 1, 5).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncating_before_is_fenced_like_every_other_write_to_the_journal() {
+        let dir = tmpdir("truncate-before-fenced");
+        let store = ReplicaStore::new(&dir).unwrap();
+        let all = records(0, 3);
+        for r in &all {
+            store.append("vd", 2, r).unwrap();
+        }
+        store.fence("vd", 3).unwrap();
+        assert!(matches!(store.truncate_before("vd", 2, 2), Err(Error::Refused(_))));
+        assert_eq!(store.read_tail("vd").unwrap(), all.concat());
+        // Through the serve layer a deposed owner is told so, not that something broke.
+        let resp = serve_request(&store, &Request {
+            opcode: OP_TRUNCATE_TO, vdisk: "vd".to_string(), epoch: 2, seq: 2,
+            offset: 0, flags: 0, data: Vec::new(),
+        });
+        assert_eq!((resp.status, resp.epoch), (ST_STALE_EPOCH, 3));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_journal_that_is_not_a_clean_record_stream_is_left_alone() {
+        // Guessing where the cut falls inside bytes that are not records is how an
+        // acknowledged one gets dropped, so the replica declines and the owner logs it.
+        let dir = tmpdir("truncate-before-garbage");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.append("vd", 1, &records(0, 1)[0]).unwrap();
+        store.append("vd", 1, b"this is not a journal record at all, just bytes").unwrap();
+        let before = store.read_tail("vd").unwrap();
+        assert!(store.truncate_before("vd", 1, 5).is_err());
+        assert_eq!(store.read_tail("vd").unwrap(), before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deferring_the_sync_changes_when_bytes_are_durable_and_never_which_bytes_are_written() {
+        // Through the serve layer, as a drain's pipeline sends them: three extents of one
+        // group, the last without the flag.
+        let dir = tmpdir("put-deferred");
+        let store = ReplicaStore::new(&dir).unwrap();
+        for (i, (chunk, flags)) in [(b"aaaa", APPEND_DEFER_SYNC), (b"bbbb", APPEND_DEFER_SYNC), (b"cccc", 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let resp = serve_request(&store, &Request {
+                opcode: OP_EGROUP_PUT, vdisk: "eg-a".to_string(), epoch: 1, seq: 0,
+                offset: (i * 4) as u64, flags, data: chunk.to_vec(),
+            });
+            assert!(resp.is_ok());
+        }
+        assert_eq!(store.get_egroup("eg-a", 0, 12).unwrap(), b"aaaabbbbcccc");
+
+        // And a deferred append is a whole record on disk all the same.
+        let rec = records(0, 1).remove(0);
+        let resp = serve_request(&store, &Request {
+            opcode: OP_APPEND, vdisk: "vd".to_string(), epoch: 1, seq: 0,
+            offset: 0, flags: APPEND_DEFER_SYNC, data: rec.clone(),
+        });
+        assert!(resp.is_ok());
+        assert_eq!(store.read_tail("vd").unwrap(), rec);
         std::fs::remove_dir_all(&dir).ok();
     }
 
