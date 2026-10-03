@@ -252,6 +252,7 @@ impl Daemon {
             root: self.cfg.root.clone(),
             node: self.cfg.node.clone(),
             high_water: self.cfg.high_water,
+            hard_ceiling: 0,
             access: Arc::clone(&self.access),
         }
     }
@@ -712,7 +713,9 @@ impl Daemon {
         // next open has nothing to replay. A failure here is reported, not swallowed --
         // the data is still safe in the journal, but somebody needs to know.
         let drain_result = match &a.vdisk {
-            Some(handle) => handle.lock().expect("vdisk mutex poisoned").close(),
+            // Waits for a background drain first, then drains whatever is left under the
+            // lock, so the journal is empty when this returns.
+            Some(handle) => crate::vdisk::drain_all(handle),
             // Forwarding: nothing local to drain. The owner still holds the journal, and
             // draining is its business.
             None => Ok(()),
@@ -755,7 +758,7 @@ impl Daemon {
             "DELETE FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(&id)
         ))?;
-        let _ = std::fs::remove_file(&journal);
+        let _ = crate::journal::remove_files(&journal);
         // Extent groups are left for Purah: they may be shared with snapshots, and
         // deleting shared data because one referrer went away is the bug refcounts exist
         // to cause. Mark-sweep reclaims them when nothing points at them.
@@ -773,12 +776,12 @@ impl Daemon {
         let id = str_field(req, "vdisk_id")?;
         let vdisk = self.owned_vdisk(&id)?;
         {
-            let mut v = vdisk.lock().expect("vdisk mutex poisoned");
+            let v = vdisk.lock().expect("vdisk mutex poisoned");
             if v.class == CLASS_IMMUTABLE {
                 return Ok(json!({"vdisk_id": id, "class": CLASS_IMMUTABLE, "already_sealed": true}));
             }
-            v.close()?;
         }
+        crate::vdisk::drain_all(&vdisk)?;
         let cas = self.daruk().cas(
             "/v1/dfs/vdisk-seal",
             json_params(vec![
@@ -864,10 +867,9 @@ impl Daemon {
                          here first, or seal it."
                     ))
                 })?;
-                let mut v = vdisk.lock().expect("vdisk mutex poisoned");
-                if v.needs_drain() {
-                    v.drain()?;
-                }
+                // Drained to the end, not merely started: the child's map is a copy of what
+                // Hydra holds, so a drain still running here would be left out of it.
+                crate::vdisk::drain_all(&vdisk)?;
             }
             other => {
                 return Err(Error::refused(format!(
@@ -1226,10 +1228,8 @@ impl Daemon {
     fn op_flush(&self, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
         let vdisk = self.owned_vdisk(&id)?;
-        let mut v = vdisk.lock().expect("vdisk mutex poisoned");
-        if v.needs_drain() {
-            v.drain()?;
-        }
+        crate::vdisk::drain_all(&vdisk)?;
+        let v = vdisk.lock().expect("vdisk mutex poisoned");
         Ok(v.stats())
     }
 }
@@ -1362,7 +1362,10 @@ impl Daemon {
             after.push(spare_node.clone());
 
             let copied = {
-                let mut v = handle.lock().expect("vdisk mutex poisoned");
+                // Once no drain is running: one in flight replicates its extents to the set
+                // it was planned with, and a member joining mid-drain would be listed by the
+                // map as holding extents it never received.
+                let mut v = crate::vdisk::lock_idle(&handle);
                 match v.add_replica(Arc::clone(&spare_client)) {
                     Ok(n) => n,
                     Err(e) => {
@@ -1664,8 +1667,7 @@ impl Owned for Daemon {
             let map = self.attached.lock().expect("attached mutex poisoned");
             map.get(vdisk).and_then(|a| a.vdisk.clone())?
         };
-        let mut v = handle.lock().expect("vdisk mutex poisoned");
-        Some(v.write(offset, data))
+        Some(crate::vdisk::write_through(&handle, offset, data))
     }
 }
 

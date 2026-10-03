@@ -11,17 +11,44 @@
 //! 3. **The journal is not truncated until the map commit has been applied.** A crash
 //!    between the two replays records that are already drained, which is idempotent.
 //! 4. **Nothing on the guest's write path talks to Hydra.**
+//! 5. **The drain runs beside the guest, not in front of it.** A write that crosses the
+//!    high-water mark does not wait for the drain: it starts one on a background thread
+//!    and is acknowledged on its own journal record. Guests are held back only at the hard
+//!    ceiling (twice the high-water mark), where waiting is the alternative to a journal
+//!    that grows until the disk is full. See [`DrainGate`] and `write_through`.
+//!
+//! ## How a drain runs without stopping writes
+//!
+//! A drain has three phases, and only the first and last hold the vdisk lock:
+//!
+//! 1. **Plan** (locked, microseconds plus one rename). Rotate the journal: everything
+//!    acknowledged so far is now in a sealed segment that nothing will ever append to, and
+//!    new writes go to a fresh live segment. Freeze the overlay ranges that point into the
+//!    sealed segment and copy out the block-map entries those ranges touch.
+//! 2. **Run** (unlocked, seconds). Read the sealed segment, build the new extents, append
+//!    them to an extent group, replicate them, sync, write the map rows and make the one
+//!    drain-commit CAS in Hydra. Guest writes and reads proceed throughout: reads see the
+//!    old map plus the overlay, which still holds every drained range.
+//! 3. **Finish** (locked). Apply the new map entries, drop the overlay ranges that still
+//!    point into the sealed segment -- the ones a newer write has covered point into the
+//!    live segment and stay -- and delete the sealed segment. Rule 3 holds: the segment
+//!    is deleted only after Hydra has the new map.
+//!
+//! The replicas are then told to drop the drained *prefix* of their journals by sequence
+//! number, which leaves the records acknowledged while the drain ran.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
 use crate::extent::{vdisk_hash, EgroupStore, OpenEgroup};
 use crate::heat::AccessLog;
-use crate::journal::{Journal, FLAG_COMMIT};
+use crate::journal::{self, Journal, FLAG_COMMIT};
 use crate::meta::{
     block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_IMMUTABLE, CLASS_RW,
     MAP_BATCH as MAP_ROWS_PER_BATCH,
@@ -77,9 +104,21 @@ pub struct Vdisk {
     journal: Journal,
     overlay: Overlay,
     map: BTreeMap<u64, ExtentLoc>,
-    store: EgroupStore,
+    store: Arc<EgroupStore>,
+    /// The extent group the next drain appends to. `None` while a drain is running: the
+    /// drain owns it for the duration and hands it back at its finish.
     open_eg: Option<OpenEgroup>,
+    /// Journal size at which a write starts a background drain.
     high_water: u64,
+    /// Journal size at which a write waits for a drain instead of being admitted. A write
+    /// that was admitted just under it may take the journal past it by that one write.
+    hard_ceiling: u64,
+    /// Who is draining, and the means for others to wait on it. Shared with the drain
+    /// thread and with whoever is waiting at the ceiling.
+    gate: Arc<DrainGate>,
+    /// Extent groups a running drain has created or is appending to. They are in no map
+    /// until the drain finishes, and Purah's sweep must not read "in no map" as "unused".
+    drain_held: Arc<Mutex<HashSet<String>>>,
     daruk: Daruk,
     /// The replica set exactly as the map records it, this node included.
     ///
@@ -120,6 +159,8 @@ pub struct VdiskConfig {
     pub root: PathBuf,
     pub node: String,
     pub high_water: u64,
+    /// The journal size at which writers wait for a drain. Zero means twice `high_water`.
+    pub hard_ceiling: u64,
     /// The node's extent-group access tally. Carried in the config rather than passed
     /// separately so that every path which opens a vdisk gets the same one -- a vdisk
     /// opened with its own fresh tally would be invisible to the flusher, and the extents
@@ -175,7 +216,7 @@ impl Vdisk {
         // Proven present each time: attaching onto a journal directory that is really on
         // the root filesystem would acknowledge writes into a file the next mount hides.
         let journal_path = crate::mounts::journal_dir(&cfg.root)?.join(format!("{id}.jrn"));
-        let mut journal = Journal::open(&journal_path)?;
+        let journal = Journal::open(&journal_path)?;
 
         let mut v = Vdisk {
             id: id.to_string(),
@@ -189,21 +230,24 @@ impl Vdisk {
             node: cfg.node.clone(),
             overlay: Overlay::new(),
             map: BTreeMap::new(),
-            store,
+            store: Arc::new(store),
             open_eg: None,
             high_water: cfg.high_water,
+            hard_ceiling: if cfg.hard_ceiling > 0 {
+                cfg.hard_ceiling
+            } else {
+                cfg.high_water.saturating_mul(2)
+            },
+            gate: DrainGate::new(),
+            drain_held: Arc::new(Mutex::new(HashSet::new())),
             daruk,
             replicas,
             map_replicas,
             compress,
             access: Arc::clone(&cfg.access),
             degraded: None,
-            journal: Journal::open(&journal_path)?,
+            journal,
         };
-        // `journal` above was opened twice during construction; keep the first handle and
-        // drop the duplicate so there is exactly one writer to the file.
-        std::mem::swap(&mut v.journal, &mut journal);
-        drop(journal);
 
         v.load_map()?;
         // At ftt=0 the local journal is the only copy there is, so it is authoritative and
@@ -298,15 +342,6 @@ impl Vdisk {
             eprintln!("sidon: vdisk {}: replayed {applied} journal record(s)", self.id);
         }
         Ok(discarded)
-    }
-
-    pub fn extent_len(&self, index: u64) -> u64 {
-        let start = index * self.extent_bytes;
-        if start >= self.size {
-            0
-        } else {
-            self.extent_bytes.min(self.size - start)
-        }
     }
 
     /// Read `len` bytes at `offset`. Extent store first, overlay on top: the overlay is
@@ -457,17 +492,68 @@ impl Vdisk {
         for (off, len, pos) in written {
             self.overlay.insert(off, len, pos);
         }
-
-        if self.journal.len() >= self.high_water && self.degraded.is_none() {
-            if let Err(e) = self.drain() {
-                // The write is already acknowledged and still readable from the overlay.
-                // Record the failure, stop draining, and let the operator see it rather
-                // than retrying forever against a full disk or an unreachable Hydra.
-                self.degraded = Some(e.to_string());
-                eprintln!("sidon: vdisk {}: drain failed: {e}", self.id);
-            }
-        }
+        // Acknowledged. Whether the journal now wants draining is the caller's business
+        // (`write_through`), because starting the drain needs the handle this lock lives
+        // in and this write must not wait for it either way.
         Ok(())
+    }
+
+    /// Record that a drain failed, and stop starting new ones.
+    ///
+    /// The writes it was draining are acknowledged and still readable from the overlay, and
+    /// the journal still holds them: nothing is lost. What would be lost by carrying on is
+    /// the operator's chance to notice -- retrying forever against a full disk or an
+    /// unreachable Hydra is how a vdisk looks healthy until the journal volume fills.
+    fn note_drain_failure(&mut self, e: &Error) {
+        eprintln!("sidon: vdisk {}: drain failed: {e}", self.id);
+        self.degraded = Some(e.to_string());
+    }
+
+    /// Whether the journal has reached the size at which a drain should be running.
+    fn drain_wanted(&self) -> bool {
+        self.journal.len() >= self.high_water && self.degraded.is_none()
+    }
+
+    /// May a write be taken now, or must it wait for a drain to make room?
+    fn admit(&self) -> Admit {
+        if self.journal.len() < self.hard_ceiling {
+            return Admit::Go;
+        }
+        if self.gate.running() {
+            return Admit::Wait;
+        }
+        if let Some(why) = &self.degraded {
+            // Nothing is going to make room. Blocking would hang the guest on a condition
+            // that never clears; admitting would grow the journal until the volume is full
+            // and every vdisk on the node stops. An error now is the honest outcome, and it
+            // clears itself the moment the cause does (a heal clears `degraded`).
+            return Admit::Refuse(Error::io(format!(
+                "vdisk {} has {} MiB of undrained journal, at its ceiling, and cannot drain: \
+                 {why}. Refusing the write rather than growing the journal without bound.",
+                self.id,
+                self.journal.len() >> 20
+            )));
+        }
+        Admit::StartDrain
+    }
+
+    /// Start a background drain if one is wanted and none is running. The caller holds the
+    /// lock this vdisk is behind, which is what makes "none is running" stay true until the
+    /// thread is spawned.
+    fn kick(&self, handle: &Arc<Mutex<Vdisk>>) {
+        if !self.drain_wanted() || !self.gate.try_begin() {
+            return;
+        }
+        let handle = Arc::clone(handle);
+        let gate = Arc::clone(&self.gate);
+        let name = format!("drain-{}", self.id);
+        if let Err(e) = std::thread::Builder::new()
+            .name(name)
+            .spawn(move || run_background_drain(handle, gate))
+        {
+            self.gate.finish();
+            eprintln!("sidon: vdisk {}: could not start a drain thread: {e}", self.id);
+        }
     }
 
     /// Which replicas are answering, and which are not.
@@ -497,6 +583,16 @@ impl Vdisk {
     pub fn add_replica(&mut self, client: Arc<PeerClient>) -> Result<usize> {
         if self.replicas.iter().any(|r| r.node == client.node) {
             return Ok(0);
+        }
+        // A drain in flight replicates its new extents to the set it was planned with. A
+        // member that joined after that would be listed by the map as holding extents it
+        // never received, which is a durability claim nothing could later notice was false.
+        // The caller waits for the drain first (`lock_idle`); this is the backstop.
+        if self.gate.running() {
+            return Err(Error::refused(format!(
+                "vdisk {} is draining; a replica cannot join until the drain has finished",
+                self.id
+            )));
         }
         let node = client.node.clone();
         self.replicas.push(client);
@@ -602,29 +698,6 @@ impl Vdisk {
                 "replica {node} refused extent group {egroup_id} with status {}",
                 resp.status
             )));
-        }
-        Ok(())
-    }
-
-    /// Ship one extent (payload plus footer) to every replica.
-    fn replicate_extent(&mut self, egroup_id: &str, offset: u64, framed: &[u8]) -> Result<()> {
-        for replica in &self.replicas {
-            let resp = replica.call(&Request {
-                opcode: peer::OP_EGROUP_PUT,
-                vdisk: egroup_id.to_string(),
-                epoch: self.epoch,
-                seq: 0,
-                offset,
-                flags: 0,
-                data: framed.to_vec(),
-            })?;
-            if !resp.is_ok() {
-                return Err(Error::io(format!(
-                    "replica {} refused extent group {egroup_id} at offset {offset} \
-                     with status {}",
-                    replica.node, resp.status
-                )));
-            }
         }
         Ok(())
     }
@@ -838,29 +911,6 @@ impl Vdisk {
         Ok(fenced.len())
     }
 
-    /// Tell every replica the journal has been drained and may be dropped.
-    fn replicate_truncate(&mut self) -> Result<()> {
-        for replica in &self.replicas {
-            // A failure here wastes disk on a replica; it does not endanger data, because
-            // the map already points at the drained extents. Logged, not fatal.
-            if let Err(e) = replica.call(&Request {
-                opcode: peer::OP_TRUNCATE,
-                vdisk: self.id.clone(),
-                epoch: self.epoch,
-                seq: 0,
-                offset: 0,
-                flags: 0,
-                data: Vec::new(),
-            }) {
-                eprintln!(
-                    "sidon: vdisk {}: replica {} did not drop its drained journal: {e}",
-                    self.id, replica.node
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// Every acknowledged write is already durable, so a flush has nothing left to do.
     /// It is not a lie by omission: the journal calls `sync_data` before the write is
     /// acknowledged, which is strictly stronger than what a flush would promise.
@@ -868,44 +918,379 @@ impl Vdisk {
         Ok(())
     }
 
-    pub fn write_zeroes(&mut self, offset: u64, len: u64) -> Result<()> {
-        let mut remaining = len;
-        let mut at = offset;
-        let zeros = vec![0u8; MAX_RECORD];
-        while remaining > 0 {
-            let n = (MAX_RECORD as u64).min(remaining) as usize;
-            self.write(at, &zeros[..n])?;
-            at += n as u64;
-            remaining -= n as u64;
+    /// Whether anything is waiting to be drained: ranges in the overlay, or a sealed
+    /// segment that a drain which failed left behind.
+    pub fn needs_drain(&self) -> bool {
+        !self.overlay.is_empty() || self.journal.has_sealed()
+    }
+
+    /// Drain everything, now, on this thread, and return with the journal empty.
+    ///
+    /// This is the synchronous drain that detach, seal, snapshot and flush rely on to hand
+    /// back a fully drained vdisk, and it holds the vdisk lock throughout, exactly as the
+    /// drain used to. It refuses if a background drain is running, because that one is
+    /// moving the same journal; callers go through [`drain_all`], which waits for it first.
+    ///
+    /// It takes at most two rounds: one for a sealed segment a failed background drain left
+    /// behind, one for the live segment. A vdisk it returns for is drained in the strong
+    /// sense -- no overlay ranges, no sealed segment, an empty live one -- because nothing
+    /// can append while this holds the lock.
+    pub fn drain(&mut self) -> Result<()> {
+        if self.gate.running() {
+            return Err(Error::refused(format!(
+                "vdisk {} has a drain running; wait for it before draining synchronously",
+                self.id
+            )));
+        }
+        for _ in 0..4 {
+            let mut plan = match self.plan_drain()? {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let outcome = plan.job.run();
+            self.finish_drain(plan.sealed_gen, plan.job, outcome)?;
+            truncate_replicas(&plan.replicas, &self.id, self.epoch, plan.keep_seq);
+            if !self.journal.has_sealed() && self.journal.live_len() == 0 {
+                return Ok(());
+            }
         }
         Ok(())
     }
 
-    pub fn needs_drain(&self) -> bool {
-        !self.overlay.is_empty()
-    }
-
-    /// Move everything in the overlay into extent groups and commit the map.
+    /// Phase one of a drain, under the lock: seal the journal, freeze what is to be moved,
+    /// and hand it all to a job that can run without this vdisk.
     ///
-    /// Read-modify-write per extent, then redirect-on-write: the extent's current bytes
-    /// are read, the overlay is applied on top, and the result is appended somewhere new.
-    /// The old location becomes garbage rather than being overwritten, because a sealed
-    /// egroup is immutable and that is what makes repair and snapshots cheap.
-    pub fn drain(&mut self) -> Result<()> {
-        if self.overlay.is_empty() {
-            return Ok(());
+    /// If a sealed segment is already waiting -- a drain failed after rotating, or the
+    /// daemon died mid-drain and replay found both files -- that segment is what gets
+    /// drained, and no second rotation is made. The frozen view is then whatever of its
+    /// ranges is still newest, which is exactly what has to reach the extents: a range a
+    /// later write has covered is that write's to move, in a later drain.
+    fn plan_drain(&mut self) -> Result<Option<DrainPlan>> {
+        if !self.journal.has_sealed() {
+            if self.journal.live_len() == 0 {
+                return Ok(None);
+            }
+            self.journal.rotate()?;
         }
+        let (sealed_gen, src) = self.journal.sealed().expect("rotated, or already sealed");
+        let keep_seq = self.journal.live_first_seq();
+        let frozen = self.overlay.filtered(|s| journal::gen_of(s.data_pos) == sealed_gen);
 
-        let mut touched: HashSet<u64> = HashSet::new();
-        for seg in self.overlay.iter() {
+        let mut touched: Vec<u64> = Vec::new();
+        for seg in frozen.iter() {
             let first = seg.start / self.extent_bytes;
             let last = (seg.end() - 1) / self.extent_bytes;
             for idx in first..=last {
-                touched.insert(idx);
+                if touched.last() != Some(&idx) {
+                    touched.push(idx);
+                }
             }
         }
-        let mut indices: Vec<u64> = touched.into_iter().collect();
-        indices.sort_unstable();
+        // Segments come in ascending order and never overlap, so the list is sorted already
+        // and only the same extent appearing twice in a row needs dropping -- which the
+        // check above did. Dedup anyway: the guarantee is cheap and the cost of being wrong
+        // is an extent written twice in one drain.
+        touched.sort_unstable();
+        touched.dedup();
+
+        let locs: HashMap<u64, ExtentLoc> = touched
+            .iter()
+            .filter_map(|i| self.map.get(i).map(|l| (*i, l.clone())))
+            .collect();
+
+        if let Some(eg) = &self.open_eg {
+            self.drain_held.lock().expect("held mutex poisoned").insert(eg.id.clone());
+        }
+        let replicas = self.replicas.clone();
+        let job = DrainJob {
+            id: self.id.clone(),
+            node: self.node.clone(),
+            epoch: self.epoch,
+            vh: self.vh,
+            compress: self.compress,
+            extent_bytes: self.extent_bytes,
+            size: self.size,
+            store: Arc::clone(&self.store),
+            daruk: self.daruk.clone(),
+            replicas: replicas.clone(),
+            access: Arc::clone(&self.access),
+            src,
+            src_gen: sealed_gen,
+            frozen,
+            indices: touched,
+            locs,
+            open_eg: self.open_eg.take(),
+            drain_seq: self.drain_seq,
+            held: Arc::clone(&self.drain_held),
+            id_seed: self.journal.next_seq(),
+            groups_made: 0,
+        };
+        Ok(Some(DrainPlan { job, replicas, keep_seq, sealed_gen }))
+    }
+
+    /// Phase three of a drain, under the lock: take what the job committed into the in-memory
+    /// state, and let the journal forget it.
+    ///
+    /// On failure nothing is applied and nothing is forgotten. The sealed segment stays, the
+    /// overlay still holds every range, and reads are unaffected -- the next drain starts
+    /// from the same segment.
+    fn finish_drain(
+        &mut self,
+        sealed_gen: u64,
+        job: DrainJob,
+        outcome: Result<Committed>,
+    ) -> Result<()> {
+        // The open group comes back whether the drain worked or not: extents already
+        // appended to it by a drain that then failed are unreferenced garbage, and the next
+        // drain appends after them.
+        self.open_eg = job.open_eg;
+        let result = match outcome {
+            Err(e) => Err(e),
+            Ok(done) => {
+                for (idx, loc) in done.locs {
+                    self.map.insert(idx, loc);
+                }
+                self.drain_seq = done.next_seq;
+                for id in &done.sealed {
+                    eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
+                }
+                // Rule 3: only now may the journal forget -- here and, once the caller has
+                // told them, on every replica. The ranges that go are those still pointing
+                // into the sealed segment. A range a newer write covered points into the
+                // live segment and stays: it is newer than anything the drain wrote.
+                self.overlay.remove_where(|s| journal::gen_of(s.data_pos) == sealed_gen);
+                if let Err(e) = self.journal.discard_sealed() {
+                    // The map is committed and the overlay has let go of the segment, so
+                    // nothing depends on the file any more. If it stays, replay will apply
+                    // records that are already drained, which is idempotent; and the next
+                    // drain finds it, plans nothing for it, and removes it again.
+                    eprintln!(
+                        "sidon: vdisk {}: could not remove the drained journal segment: {e}",
+                        self.id
+                    );
+                }
+                Ok(())
+            }
+        };
+        // Whatever the outcome the job holds nothing now: groups it made are in the map (or
+        // are garbage), and the open one is back in `open_eg`, which `held_egroups` reads.
+        self.drain_held.lock().expect("held mutex poisoned").clear();
+        result
+    }
+
+    /// Called at detach. Drains what is left so a clean shutdown leaves an empty journal.
+    pub fn close(&mut self) -> Result<()> {
+        if !self.needs_drain() {
+            return Ok(());
+        }
+        self.drain()
+    }
+
+    /// Every extent group this vdisk is using right now: everything its map points at,
+    /// plus the open group the next drain will append to.
+    ///
+    /// The sweep needs this because Hydra can be a moment behind the owner: a drain that
+    /// has just repointed an extent leaves the previous group unreferenced in a stale
+    /// read while this vdisk still has the new one only in memory.
+    pub fn held_egroups(&self) -> HashSet<String> {
+        let mut held: HashSet<String> =
+            self.map.values().map(|l| l.egroup_id.clone()).collect();
+        if let Some(eg) = &self.open_eg {
+            held.insert(eg.id.clone());
+        }
+        // The groups a running drain has made or is appending to: in no map yet, and the
+        // open group is out of `open_eg` while the drain has it.
+        held.extend(self.drain_held.lock().expect("held mutex poisoned").iter().cloned());
+        held
+    }
+
+    pub fn stats(&self) -> Value {
+        json!({
+            "vdisk_id": self.id,
+            "size_bytes": self.size,
+            "class": self.class,
+            "epoch": self.epoch,
+            "drain_seq": self.drain_seq,
+            "extent_bytes": self.extent_bytes,
+            "journal_bytes": self.journal.len(),
+            "draining": self.gate.running(),
+            "high_water": self.high_water,
+            "hard_ceiling": self.hard_ceiling,
+            "overlay_segments": self.overlay.len(),
+            "mapped_extents": self.map.len(),
+            // The set as the map records it, this node included -- not `self.replicas`,
+            // which is the peers this node dials and is therefore one short. Reporting
+            // the dialled list under this name is how a reader counting replicas against
+            // the redundancy factor concludes every vdisk is one copy down.
+            "replicas": self.map_replicas.clone(),
+            // Beside the set, never instead of it. `rf` is what was asked for and
+            // `replicas` is what exists, and a reader that has only one of the two cannot
+            // tell a vdisk that is short of its copies from one that never asked for any.
+            "rf": self.rf,
+            "peers": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
+            "degraded": self.degraded,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// The drain, and who waits for it.
+// ---------------------------------------------------------------------------------
+
+/// How long a write waits at the hard ceiling for a drain to make room before it gives up
+/// and fails. Long enough to ride out a slow drain (a 128 MiB journal is seconds), short
+/// enough that a wedged one surfaces as a guest I/O error instead of a hung VM.
+const STALL_LIMIT: Duration = Duration::from_secs(120);
+
+/// Whether a drain is running for one vdisk, and a way to wait for it to stop.
+///
+/// A flag and a counter under one mutex and one condition variable. The flag is what makes
+/// "start a drain" idempotent -- a hundred writes crossing the high-water mark in the same
+/// moment start one drain, not a hundred -- and what `drain` and `add_replica` check before
+/// touching a journal a background drain is moving. The counter exists so that a waiter can
+/// say "wake me when a drain *after this one* finishes" without missing a drain that
+/// finished between its check and its wait.
+pub struct DrainGate {
+    state: Mutex<GateState>,
+    cv: Condvar,
+}
+
+#[derive(Default)]
+struct GateState {
+    running: bool,
+    finished: u64,
+}
+
+impl DrainGate {
+    fn new() -> Arc<DrainGate> {
+        Arc::new(DrainGate { state: Mutex::new(GateState::default()), cv: Condvar::new() })
+    }
+
+    /// Claim the right to run a drain. False if one is already running.
+    fn try_begin(&self) -> bool {
+        let mut s = self.state.lock().expect("gate mutex poisoned");
+        if s.running {
+            return false;
+        }
+        s.running = true;
+        true
+    }
+
+    fn finish(&self) {
+        let mut s = self.state.lock().expect("gate mutex poisoned");
+        s.running = false;
+        s.finished += 1;
+        self.cv.notify_all();
+    }
+
+    pub fn running(&self) -> bool {
+        self.state.lock().expect("gate mutex poisoned").running
+    }
+
+    fn finished(&self) -> u64 {
+        self.state.lock().expect("gate mutex poisoned").finished
+    }
+
+    /// Block until no drain is running.
+    fn wait_idle(&self) {
+        let mut s = self.state.lock().expect("gate mutex poisoned");
+        while s.running {
+            s = self.cv.wait(s).expect("gate mutex poisoned");
+        }
+    }
+
+    /// Block until a drain has finished since `seen`, or `timeout` passes.
+    fn wait_progress(&self, seen: u64, timeout: Duration) {
+        let s = self.state.lock().expect("gate mutex poisoned");
+        if s.finished != seen {
+            return;
+        }
+        let _ = self.cv.wait_timeout(s, timeout).expect("gate mutex poisoned");
+    }
+}
+
+/// What a writer is told when it asks to write.
+enum Admit {
+    Go,
+    /// At the ceiling, with no drain running and none failing: start one, then wait.
+    StartDrain,
+    /// At the ceiling with a drain running: wait for it.
+    Wait,
+    /// At the ceiling and nothing will make room.
+    Refuse(Error),
+}
+
+/// Everything phase two needs, owned, so that it can run with no reference to the vdisk.
+struct DrainJob {
+    id: String,
+    node: String,
+    epoch: u64,
+    vh: u64,
+    compress: bool,
+    extent_bytes: u64,
+    size: u64,
+    store: Arc<EgroupStore>,
+    daruk: Daruk,
+    /// The write-all set as it was when the drain was planned. A replica cannot join while
+    /// a drain runs (`add_replica` refuses), so this is also the set at its finish.
+    replicas: Vec<Arc<PeerClient>>,
+    access: Arc<AccessLog>,
+    /// The sealed journal segment, read by position, and the generation its positions carry.
+    src: Arc<File>,
+    src_gen: u64,
+    /// The overlay ranges that point into the sealed segment, as they were at the plan.
+    frozen: Overlay,
+    /// The extents those ranges touch, ascending.
+    indices: Vec<u64>,
+    /// What the block map says about each of them, as it was at the plan.
+    locs: HashMap<u64, ExtentLoc>,
+    open_eg: Option<OpenEgroup>,
+    drain_seq: u64,
+    held: Arc<Mutex<HashSet<String>>>,
+    id_seed: u64,
+    groups_made: u64,
+}
+
+/// What a plan hands back: the job, and what the caller needs after it.
+struct DrainPlan {
+    job: DrainJob,
+    replicas: Vec<Arc<PeerClient>>,
+    /// First sequence number to keep when telling replicas to drop their drained prefix.
+    keep_seq: u64,
+    sealed_gen: u64,
+}
+
+/// A drain that committed: the map entries to apply and the counter it advanced to.
+struct Committed {
+    locs: Vec<(u64, ExtentLoc)>,
+    sealed: Vec<String>,
+    next_seq: u64,
+}
+
+impl DrainJob {
+    fn extent_len(&self, index: u64) -> u64 {
+        let start = index * self.extent_bytes;
+        if start >= self.size {
+            0
+        } else {
+            self.extent_bytes.min(self.size - start)
+        }
+    }
+
+    /// Phase two: move the frozen ranges into extent groups and commit the map.
+    ///
+    /// Read-modify-write per extent, then redirect-on-write: the extent's current bytes
+    /// are read, the frozen ranges are applied on top, and the result is appended somewhere
+    /// new. The old location becomes garbage rather than being overwritten, because a
+    /// sealed egroup is immutable and that is what makes repair and snapshots cheap.
+    fn run(&mut self) -> Result<Committed> {
+        let indices = std::mem::take(&mut self.indices);
+        // Nothing the map needs to hear about: the sealed segment held no committed write
+        // (a failed write's records, say). There is nothing to repoint, so no Hydra round
+        // trip, and the counter does not move.
+        if indices.is_empty() {
+            return Ok(Committed { locs: Vec::new(), sealed: Vec::new(), next_seq: self.drain_seq });
+        }
 
         let mut new_rows: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(indices.len());
         let mut new_locs: Vec<(u64, ExtentLoc)> = Vec::with_capacity(indices.len());
@@ -921,7 +1306,7 @@ impl Vdisk {
             // Start from what is already stored, so a partial overwrite keeps the bytes
             // it did not touch.
             let mut buf = vec![0u8; ext_len];
-            if let Some(loc) = self.map.get(&idx).cloned() {
+            if let Some(loc) = self.locs.get(&idx) {
                 let cur = self
                     .store
                     .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, idx)?;
@@ -929,15 +1314,23 @@ impl Vdisk {
                 buf[..n].copy_from_slice(&cur[..n]);
             }
 
-            for seg in self.overlay.overlapping(ext_start, ext_start + ext_len as u64) {
+            for seg in self.frozen.overlapping(ext_start, ext_start + ext_len as u64) {
                 let copy_start = ext_start.max(seg.start);
                 let copy_end = (ext_start + ext_len as u64).min(seg.end());
                 if copy_end <= copy_start {
                     continue;
                 }
+                if journal::gen_of(seg.data_pos) != self.src_gen {
+                    return Err(Error::corrupt(format!(
+                        "vdisk {}: a drain was handed a range from segment {} but reads segment {}",
+                        self.id,
+                        journal::gen_of(seg.data_pos),
+                        self.src_gen
+                    )));
+                }
                 let skip = copy_start - seg.start;
                 let n = (copy_end - copy_start) as usize;
-                let data = self.journal.read_at(seg.data_pos + skip, n)?;
+                let data = journal::read_in(&self.src, seg.data_pos + skip, n)?;
                 let dst = (copy_start - ext_start) as usize;
                 buf[dst..dst + n].copy_from_slice(&data);
             }
@@ -945,9 +1338,8 @@ impl Vdisk {
             let eg_id = self.ensure_open_egroup()?;
             let (offset, stored_len, framed) = {
                 let store = &self.store;
-                let compress = self.compress;
                 let eg = self.open_eg.as_mut().expect("ensure_open_egroup set it");
-                store.append_framed(eg, &buf, self.vh, idx, compress)?
+                store.append_framed(eg, &buf, self.vh, idx, self.compress)?
             };
             // The same bytes to every replica, extent plus footer. Without this a drained
             // extent exists once: the journal is replicated, so an un-drained write
@@ -1015,19 +1407,29 @@ impl Vdisk {
                 self.drain_seq
             )));
         }
-        self.drain_seq = next;
+        Ok(Committed { locs: new_locs, sealed, next_seq: next })
+    }
 
-        for (idx, loc) in new_locs {
-            self.map.insert(idx, loc);
+    /// Ship one extent (payload plus footer) to every replica.
+    fn replicate_extent(&self, egroup_id: &str, offset: u64, framed: &[u8]) -> Result<()> {
+        for replica in &self.replicas {
+            let resp = replica.call(&Request {
+                opcode: peer::OP_EGROUP_PUT,
+                vdisk: egroup_id.to_string(),
+                epoch: self.epoch,
+                seq: 0,
+                offset,
+                flags: 0,
+                data: framed.to_vec(),
+            })?;
+            if !resp.is_ok() {
+                return Err(Error::io(format!(
+                    "replica {} refused extent group {egroup_id} at offset {offset} \
+                     with status {}",
+                    replica.node, resp.status
+                )));
+            }
         }
-        for id in sealed {
-            eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
-        }
-
-        // Rule 3: only now is the journal allowed to forget -- here and on every replica.
-        self.overlay.clear();
-        self.journal.reset()?;
-        self.replicate_truncate()?;
         Ok(())
     }
 
@@ -1039,8 +1441,16 @@ impl Vdisk {
             let id = self.seal_open_egroup()?;
             eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
         }
-        let id = format!("eg-{}-{:x}", &self.id, now_ms() as u64 ^ self.journal.next_seq());
+        self.groups_made += 1;
+        let id = format!(
+            "eg-{}-{:x}",
+            &self.id,
+            now_ms() as u64 ^ self.id_seed ^ (self.groups_made << 48)
+        );
         let eg = self.store.create(&id)?;
+        // Held from the moment the group exists, before Hydra hears of it: the sweep reads
+        // Hydra, and a group that is in no map and not in this set looks like an orphan.
+        self.held.lock().expect("held mutex poisoned").insert(id.clone());
         let cas = self.daruk.cas(
             "/v1/dfs/egroup-create",
             json_params(vec![
@@ -1085,54 +1495,164 @@ impl Vdisk {
         }
         Ok(eg.id)
     }
+}
 
-    /// Called at detach. Drains what is left so a clean shutdown leaves an empty journal.
-    pub fn close(&mut self) -> Result<()> {
-        if self.overlay.is_empty() {
-            return Ok(());
+/// Tell every replica the drained prefix of its journal may go: records older than
+/// `keep_seq`. Best effort -- a failure wastes disk on a replica and endangers nothing, because
+/// the map already points at the drained extents and replaying a drained record is idempotent.
+///
+/// A replica running a build from before this opcode answers "refused" and keeps its whole
+/// journal, which is the safe way for it to be wrong: it never empties a journal that holds
+/// writes acknowledged while the drain ran.
+fn truncate_replicas(replicas: &[Arc<PeerClient>], vdisk: &str, epoch: u64, keep_seq: u64) {
+    for replica in replicas {
+        match replica.call(&Request {
+            opcode: peer::OP_TRUNCATE_TO,
+            vdisk: vdisk.to_string(),
+            epoch,
+            seq: keep_seq,
+            offset: 0,
+            flags: 0,
+            data: Vec::new(),
+        }) {
+            Ok(resp) if resp.is_ok() => {}
+            Ok(resp) => eprintln!(
+                "sidon: vdisk {vdisk}: replica {} did not drop its drained journal (status {})",
+                replica.node, resp.status
+            ),
+            Err(e) => eprintln!(
+                "sidon: vdisk {vdisk}: replica {} did not drop its drained journal: {e}",
+                replica.node
+            ),
         }
-        self.drain()
     }
+}
 
-    /// Every extent group this vdisk is using right now: everything its map points at,
-    /// plus the open group the next drain will append to.
-    ///
-    /// The sweep needs this because Hydra can be a moment behind the owner: a drain that
-    /// has just repointed an extent leaves the previous group unreferenced in a stale
-    /// read while this vdisk still has the new one only in memory.
-    pub fn held_egroups(&self) -> HashSet<String> {
-        let mut held: HashSet<String> =
-            self.map.values().map(|l| l.egroup_id.clone()).collect();
-        if let Some(eg) = &self.open_eg {
-            held.insert(eg.id.clone());
+/// The body of the drain thread. The gate was claimed by whoever spawned it, and is released
+/// when this returns for any reason -- including a panic, which would otherwise leave every
+/// writer at the ceiling waiting for a drain that no longer exists.
+fn run_background_drain(handle: Arc<Mutex<Vdisk>>, gate: Arc<DrainGate>) {
+    struct Release(Arc<DrainGate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.finish();
         }
-        held
     }
+    let _release = Release(gate);
 
-    pub fn stats(&self) -> Value {
-        json!({
-            "vdisk_id": self.id,
-            "size_bytes": self.size,
-            "class": self.class,
-            "epoch": self.epoch,
-            "drain_seq": self.drain_seq,
-            "extent_bytes": self.extent_bytes,
-            "journal_bytes": self.journal.len(),
-            "overlay_segments": self.overlay.len(),
-            "mapped_extents": self.map.len(),
-            // The set as the map records it, this node included -- not `self.replicas`,
-            // which is the peers this node dials and is therefore one short. Reporting
-            // the dialled list under this name is how a reader counting replicas against
-            // the redundancy factor concludes every vdisk is one copy down.
-            "replicas": self.map_replicas.clone(),
-            // Beside the set, never instead of it. `rf` is what was asked for and
-            // `replicas` is what exists, and a reader that has only one of the two cannot
-            // tell a vdisk that is short of its copies from one that never asked for any.
-            "rf": self.rf,
-            "peers": self.replicas.iter().map(|r| r.node.clone()).collect::<Vec<_>>(),
-            "degraded": self.degraded,
-        })
+    loop {
+        let mut plan = {
+            let mut v = handle.lock().expect("vdisk mutex poisoned");
+            match v.plan_drain() {
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(e) => {
+                    v.note_drain_failure(&e);
+                    return;
+                }
+            }
+        };
+
+        // The long part, with no lock held: guest reads and writes carry on.
+        let outcome = plan.job.run();
+
+        let (again, committed) = {
+            let mut v = handle.lock().expect("vdisk mutex poisoned");
+            match v.finish_drain(plan.sealed_gen, plan.job, outcome) {
+                Ok(()) => (v.drain_wanted(), true),
+                Err(e) => {
+                    v.note_drain_failure(&e);
+                    (false, false)
+                }
+            }
+        };
+        if committed {
+            // Outside the lock: a round trip per replica, and the replica rewrites the tail.
+            // Safe there because the cut is by sequence number, so a record appended
+            // meanwhile is simply after it.
+            let (id, epoch) = {
+                let v = handle.lock().expect("vdisk mutex poisoned");
+                (v.id.clone(), v.epoch)
+            };
+            truncate_replicas(&plan.replicas, &id, epoch, plan.keep_seq);
+        }
+        if !again {
+            return;
+        }
     }
+}
+
+/// Lock a vdisk once no background drain is running on it.
+///
+/// Waits on the gate *without* the lock, because the drain needs the lock for its first and
+/// last phases and a waiter holding it would be waiting on itself. Returns with the lock
+/// held and the gate idle, and since a drain can only be started by a holder of the lock,
+/// idle stays true until the guard is dropped.
+pub fn lock_idle(handle: &Arc<Mutex<Vdisk>>) -> MutexGuard<'_, Vdisk> {
+    loop {
+        let v = handle.lock().expect("vdisk mutex poisoned");
+        if !v.gate.running() {
+            return v;
+        }
+        let gate = Arc::clone(&v.gate);
+        drop(v);
+        gate.wait_idle();
+    }
+}
+
+/// Drain a vdisk completely, waiting for any background drain first. What detach, seal,
+/// snapshot and flush call when they need a drained vdisk: it returns with the overlay
+/// empty and the journal empty, or with the error that stopped it.
+pub fn drain_all(handle: &Arc<Mutex<Vdisk>>) -> Result<()> {
+    lock_idle(handle).close()
+}
+
+/// A guest write to a vdisk, with the drain kept out of its way.
+///
+/// Admitted immediately unless the journal is at its hard ceiling, in which case it waits --
+/// without holding the vdisk lock, so reads and the drain itself carry on -- for a drain to
+/// make room. After the write, if the journal has passed the high-water mark, a background
+/// drain is started; this write does not wait for it.
+pub fn write_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, data: &[u8]) -> Result<()> {
+    let deadline = Instant::now() + STALL_LIMIT;
+    loop {
+        let mut v = handle.lock().expect("vdisk mutex poisoned");
+        match v.admit() {
+            Admit::Go => {
+                let result = v.write(offset, data);
+                v.kick(handle);
+                return result;
+            }
+            Admit::StartDrain => v.kick(handle),
+            Admit::Wait => {}
+            Admit::Refuse(e) => return Err(e),
+        }
+        let gate = Arc::clone(&v.gate);
+        let seen = gate.finished();
+        drop(v);
+        if Instant::now() >= deadline {
+            return Err(Error::io(format!(
+                "timed out after {}s waiting for the journal to drain",
+                STALL_LIMIT.as_secs()
+            )));
+        }
+        gate.wait_progress(seen, Duration::from_millis(200));
+    }
+}
+
+/// `write_zeroes` in the same terms as [`write_through`]: a chunk at a time, each admitted
+/// on its own, so a large trim cannot take the journal past the ceiling in one call.
+pub fn write_zeroes_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, len: u64) -> Result<()> {
+    let mut remaining = len;
+    let mut at = offset;
+    let zeros = vec![0u8; MAX_RECORD];
+    while remaining > 0 {
+        let n = (MAX_RECORD as u64).min(remaining) as usize;
+        write_through(handle, at, &zeros[..n])?;
+        at += n as u64;
+        remaining -= n as u64;
+    }
+    Ok(())
 }
 
 /// Whether a container asks for its extents to be compressed.
@@ -1195,5 +1715,724 @@ pub(crate) fn field_u64(row: &Value, name: &str) -> Result<u64> {
             .parse::<u64>()
             .map_err(|_| Error::meta(format!("column '{name}' is not a number: {s:?}"))),
         _ => Err(Error::meta(format!("row is missing numeric column '{name}'"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The vdisk with real files, real replication sockets and a stand-in for Hydra.
+    //!
+    //! Nothing here mocks the thing under test. The journal is a file on disk, the replicas
+    //! are `ReplicaStore`s behind a real TCP listener speaking the real framing (with a hook
+    //! that can refuse, stall or record), and Hydra is a small HTTP server that answers
+    //! Daruk's requests from memory and can be told to hold or refuse the drain commit.
+    //! Holding the commit is what makes the interesting states reachable on purpose: a drain
+    //! that is *running* is a drain stopped at its commit, and the test can look around.
+
+    use super::*;
+    use crate::peer::{ReplicaStore, Response};
+    use std::io::{Read, Write};
+    use std::path::Path;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const MIB: usize = 1 << 20;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("sidon-vdisk-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Wait for `cond`, failing the test rather than hanging it.
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !cond() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Run `f` on its own thread and fail the test if it has not returned in `secs` --
+    /// which is how "the write waited for the drain" shows up when the drain is held.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).expect("timed out: the call did not return")
+    }
+
+    // ---- Hydra, in memory ---------------------------------------------------------
+
+    #[derive(Default)]
+    struct HydraState {
+        /// What Hydra was asked, in order: "batch" for a block-map write, "commit" for an
+        /// applied drain-commit, "commit-refused" for one it declined.
+        log: Mutex<Vec<String>>,
+        fail_commit: AtomicBool,
+        fail_batch: AtomicBool,
+        hold: Mutex<bool>,
+        cv: Condvar,
+        arrived: AtomicUsize,
+        /// The journal whose sealed segment is probed on every commit request.
+        probe: Mutex<Option<PathBuf>>,
+        sealed_at_commit: Mutex<Vec<bool>>,
+    }
+
+    struct Hydra {
+        addr: String,
+        st: Arc<HydraState>,
+    }
+
+    impl Hydra {
+        fn start() -> Hydra {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let st = Arc::new(HydraState::default());
+            let st2 = Arc::clone(&st);
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut s) = conn else { break };
+                    let st = Arc::clone(&st2);
+                    std::thread::spawn(move || {
+                        // Request line and headers, then the body by Content-Length.
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            if s.read(&mut byte).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            head.push(byte[0]);
+                        }
+                        let text = String::from_utf8_lossy(&head).to_string();
+                        let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let len: usize = text
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        let mut body = vec![0u8; len];
+                        s.read_exact(&mut body).ok();
+                        let out = Hydra::answer(&st, &path, &body).to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                            out.len()
+                        );
+                        let _ = s.write_all(resp.as_bytes());
+                    });
+                }
+            });
+            Hydra { addr, st }
+        }
+
+        fn answer(st: &HydraState, path: &str, body: &[u8]) -> Value {
+            match path {
+                "/query" => {
+                    let q = String::from_utf8_lossy(body);
+                    if q.starts_with("BEGIN") && q.contains("dfs_block_map") {
+                        if st.fail_batch.load(Ordering::SeqCst) {
+                            return json!({"status": "error", "error": "injected batch failure"});
+                        }
+                        st.log.lock().unwrap().push("batch".to_string());
+                    }
+                    json!({"status": "success", "rows": []})
+                }
+                "/v1/dfs/drain-commit" => {
+                    st.arrived.fetch_add(1, Ordering::SeqCst);
+                    if let Some(p) = st.probe.lock().unwrap().as_ref() {
+                        st.sealed_at_commit.lock().unwrap().push(journal::sealed_path(p).exists());
+                    }
+                    {
+                        let mut held = st.hold.lock().unwrap();
+                        while *held {
+                            held = st.cv.wait(held).unwrap();
+                        }
+                    }
+                    if st.fail_commit.load(Ordering::SeqCst) {
+                        st.log.lock().unwrap().push("commit-refused".to_string());
+                        return json!({"status": "success", "applied": false,
+                                      "current": {"epoch": 9, "drain_seq": 0}});
+                    }
+                    st.log.lock().unwrap().push("commit".to_string());
+                    json!({"status": "success", "applied": true, "current": {}})
+                }
+                _ => json!({"status": "success", "applied": true, "current": {}}),
+            }
+        }
+
+        fn hold(&self, on: bool) {
+            *self.st.hold.lock().unwrap() = on;
+            self.st.cv.notify_all();
+        }
+
+        fn wait_for_commits(&self, n: usize) {
+            wait_until("a drain-commit to reach Hydra", || self.st.arrived.load(Ordering::SeqCst) >= n);
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.st.log.lock().unwrap().clone()
+        }
+    }
+
+    // ---- a replica that can misbehave ------------------------------------------------
+
+    type Hook = Arc<dyn Fn(&peer::Request) -> Option<Response> + Send + Sync>;
+
+    struct TestReplica {
+        store: Arc<ReplicaStore>,
+        client: Arc<PeerClient>,
+        hook: Arc<Mutex<Option<Hook>>>,
+    }
+
+    impl TestReplica {
+        fn start(dir: &Path, name: &str) -> TestReplica {
+            let store = Arc::new(ReplicaStore::new(&dir.join(format!("replica-{name}"))).unwrap());
+            let hook: Arc<Mutex<Option<Hook>>> = Arc::new(Mutex::new(None));
+            let (s2, h2) = (Arc::clone(&store), Arc::clone(&hook));
+            let addr = peer::spawn_test_server(Arc::new(move |req| {
+                let hook = h2.lock().unwrap().clone();
+                if let Some(h) = hook {
+                    if let Some(resp) = h(req) {
+                        return resp;
+                    }
+                }
+                peer::serve_request(&s2, req)
+            }));
+            let client = Arc::new(PeerClient::new(name, &addr, Duration::from_secs(10)));
+            TestReplica { store, client, hook }
+        }
+
+        fn set_hook(&self, h: Option<Hook>) {
+            *self.hook.lock().unwrap() = h;
+        }
+
+        fn journal(&self) -> Vec<u8> {
+            self.store.read_tail("vd").unwrap()
+        }
+    }
+
+    /// (seq, flags) of every record in a journal byte stream.
+    fn records_in(bytes: &[u8]) -> Vec<(u64, u32)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + journal::HEADER_LEN <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            let seq = u64::from_le_bytes(bytes[pos + 8..pos + 16].try_into().unwrap());
+            let flags = u32::from_le_bytes(bytes[pos + 32..pos + 36].try_into().unwrap());
+            out.push((seq, flags));
+            pos += journal::HEADER_LEN + len;
+        }
+        out
+    }
+
+    // ---- the vdisk -------------------------------------------------------------------
+
+    const SIZE: u64 = 16 << 20;
+
+    struct Rig {
+        dir: PathBuf,
+        hydra: Hydra,
+        replicas: Vec<TestReplica>,
+        vd: Arc<Mutex<Vdisk>>,
+    }
+
+    fn build(dir: &Path, hydra: &Hydra, peers: Vec<Arc<PeerClient>>, high: u64, ceil: u64) -> Vdisk {
+        let jpath = dir.join("journal").join("vd.jrn");
+        let mut map_replicas = vec!["self".to_string()];
+        map_replicas.extend(peers.iter().map(|p| p.node.clone()));
+        Vdisk {
+            id: "vd".to_string(),
+            size: SIZE,
+            epoch: 3,
+            class: CLASS_RW.to_string(),
+            extent_bytes: MIB as u64,
+            drain_seq: 0,
+            rf: map_replicas.len() as u64,
+            vh: vdisk_hash("vd"),
+            node: "self".to_string(),
+            journal: Journal::open(&jpath).unwrap(),
+            overlay: Overlay::new(),
+            map: BTreeMap::new(),
+            store: Arc::new(EgroupStore::new(&dir.join("egroups"), 4 << 20).unwrap()),
+            open_eg: None,
+            high_water: high,
+            hard_ceiling: ceil,
+            gate: DrainGate::new(),
+            drain_held: Arc::new(Mutex::new(HashSet::new())),
+            daruk: Daruk::new(&hydra.addr, Duration::from_secs(10)),
+            map_replicas,
+            compress: false,
+            replicas: peers,
+            access: Arc::new(AccessLog::new(64, 0)),
+            degraded: None,
+        }
+    }
+
+    fn rig(name: &str, nreplicas: usize, high: u64, ceil: u64) -> Rig {
+        let dir = tmpdir(name);
+        let hydra = Hydra::start();
+        *hydra.st.probe.lock().unwrap() = Some(dir.join("journal").join("vd.jrn"));
+        let replicas: Vec<TestReplica> =
+            (0..nreplicas).map(|i| TestReplica::start(&dir, &format!("r{i}"))).collect();
+        let peers = replicas.iter().map(|r| Arc::clone(&r.client)).collect();
+        let vd = Arc::new(Mutex::new(build(&dir, &hydra, peers, high, ceil)));
+        Rig { dir, hydra, replicas, vd }
+    }
+
+    impl Rig {
+        fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+            write_through(&self.vd, offset, data)
+        }
+        fn read(&self, offset: u64, len: u32) -> Vec<u8> {
+            self.vd.lock().unwrap().read(offset, len).unwrap()
+        }
+        fn settle(&self) {
+            let gate = Arc::clone(&self.vd.lock().unwrap().gate);
+            wait_until("the drain to finish", || !gate.running());
+        }
+        fn running(&self) -> bool {
+            self.vd.lock().unwrap().gate.running()
+        }
+        fn journal_len(&self) -> u64 {
+            self.vd.lock().unwrap().journal.len()
+        }
+        fn sealed_exists(&self) -> bool {
+            journal::sealed_path(&self.dir.join("journal").join("vd.jrn")).exists()
+        }
+        fn degraded(&self) -> Option<String> {
+            self.vd.lock().unwrap().degraded.clone()
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            self.hydra.hold(false);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fill(seed: u8, n: usize) -> Vec<u8> {
+        (0..n).map(|i| seed.wrapping_add((i % 251) as u8)).collect()
+    }
+
+    /// A model disk to compare reads against.
+    struct Model(Vec<u8>);
+    impl Model {
+        fn new() -> Model {
+            Model(vec![0u8; SIZE as usize])
+        }
+        fn put(&mut self, off: u64, data: &[u8]) {
+            self.0[off as usize..off as usize + data.len()].copy_from_slice(data);
+        }
+        fn slice(&self, off: u64, len: usize) -> &[u8] {
+            &self.0[off as usize..off as usize + len]
+        }
+    }
+
+    // ================================================================================
+    // The drain is out of the acknowledgement path
+    // ================================================================================
+
+    #[test]
+    fn a_write_that_crosses_the_high_water_mark_is_acknowledged_while_its_drain_still_runs() {
+        // The drain is held at its commit, so it cannot finish. If the write that started
+        // it had to wait for it, this write would never return.
+        let r = rig("ack-before-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        let data = fill(1, 3 * MIB);
+        r.write(0, &data).expect("acknowledged without waiting for the drain");
+
+        r.hydra.wait_for_commits(1);
+        assert!(r.running(), "the drain is running, stopped at its commit");
+        assert!(r.vd.lock().unwrap().stats()["draining"].as_bool().unwrap());
+        // And the guest carries on writing and reading through it.
+        let more = fill(9, 4096);
+        r.write(5 * MIB as u64, &more).expect("a second write during the drain");
+        assert_eq!(r.read(0, MIB as u32), data[..MIB]);
+        assert_eq!(r.read(5 * MIB as u64, 4096), more);
+
+        r.hydra.hold(false);
+        r.settle();
+        assert!(!r.sealed_exists());
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
+        assert_eq!(r.read(5 * MIB as u64, 4096), more);
+    }
+
+    #[test]
+    fn writes_below_the_high_water_mark_start_no_drain() {
+        let r = rig("below-high-water", 0, 8 * MIB as u64, 64 * MIB as u64);
+        r.write(0, &fill(1, MIB)).unwrap();
+        assert!(!r.running());
+        assert_eq!(r.hydra.st.arrived.load(Ordering::SeqCst), 0);
+        assert!(r.sealed_exists() == false);
+    }
+
+    #[test]
+    fn reads_stay_correct_through_a_drain_including_ranges_written_while_it_ran() {
+        let r = rig("read-during-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        let mut model = Model::new();
+        r.hydra.hold(true);
+
+        let a = fill(1, 3 * MIB);
+        r.write(0, &a).unwrap();
+        model.put(0, &a);
+        r.hydra.wait_for_commits(1);
+
+        // While the drain is stopped at its commit: overwrite the middle of a range it is
+        // moving, and write somewhere it never saw.
+        let b = fill(100, 700);
+        r.write(1000, &b).unwrap();
+        model.put(1000, &b);
+        let c = fill(50, MIB / 2);
+        r.write(6 * MIB as u64, &c).unwrap();
+        model.put(6 * MIB as u64, &c);
+        assert_eq!(r.read(0, 8 * MIB as u32), model.slice(0, 8 * MIB), "read during the drain");
+
+        r.hydra.hold(false);
+        r.settle();
+        assert_eq!(r.read(0, 8 * MIB as u32), model.slice(0, 8 * MIB), "read after the drain");
+        // What was written during the drain is still journalled, and is *not* lost with the
+        // sealed segment: it is newer than anything the drain wrote.
+        assert!(r.vd.lock().unwrap().needs_drain());
+
+        drain_all(&r.vd).unwrap();
+        let v = r.vd.lock().unwrap();
+        assert!(!v.needs_drain());
+        assert_eq!(v.journal.len(), 0);
+        drop(v);
+        // Now every byte comes from extent groups, and the overwritten middle is the new one.
+        assert_eq!(r.read(0, 8 * MIB as u32), model.slice(0, 8 * MIB), "read from extents only");
+    }
+
+    #[test]
+    fn the_journal_forgets_only_after_hydra_has_the_new_map() {
+        let r = rig("forget-after-commit", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.settle();
+
+        // At the moment the commit reached Hydra the sealed segment was still on disk, and
+        // the rows had already been written. Afterwards it is gone.
+        assert_eq!(*r.hydra.st.sealed_at_commit.lock().unwrap(), vec![true]);
+        assert_eq!(r.hydra.log(), vec!["batch".to_string(), "commit".to_string()]);
+        assert!(!r.sealed_exists());
+        assert_eq!(r.vd.lock().unwrap().drain_seq, 1);
+    }
+
+    #[test]
+    fn a_refused_commit_forgets_nothing_and_stops_further_drains() {
+        let r = rig("commit-refused", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.st.fail_commit.store(true, Ordering::SeqCst);
+        let data = fill(3, 3 * MIB);
+        r.write(0, &data).unwrap();
+        r.settle();
+
+        // Deposed, as far as Hydra is concerned: flagged, and nothing was dropped.
+        let why = r.degraded().expect("a refused drain degrades the vdisk");
+        assert!(why.contains("no longer owns"), "{why}");
+        assert!(r.sealed_exists(), "the journal must keep what Hydra does not have");
+        assert_eq!(r.vd.lock().unwrap().drain_seq, 0);
+        assert_eq!(r.read(0, 3 * MIB as u32), data, "reads are served from the overlay");
+
+        // Degraded means no drain is retried into silence on every write.
+        r.write(4 * MIB as u64, &fill(4, 1000)).unwrap();
+        r.settle();
+        assert_eq!(r.hydra.st.arrived.load(Ordering::SeqCst), 1);
+
+        // But a synchronous drain (a detach, a flush) still tries, and succeeds once Hydra
+        // agrees -- picking up the sealed segment the failed one left, then the live one.
+        r.hydra.st.fail_commit.store(false, Ordering::SeqCst);
+        drain_all(&r.vd).unwrap();
+        assert!(!r.sealed_exists());
+        let v = r.vd.lock().unwrap();
+        assert_eq!((v.journal.len(), v.needs_drain()), (0, false));
+        drop(v);
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
+        assert_eq!(r.read(4 * MIB as u64, 1000), fill(4, 1000));
+    }
+
+    #[test]
+    fn a_failure_writing_the_map_rows_forgets_nothing_either() {
+        let r = rig("batch-fails", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.st.fail_batch.store(true, Ordering::SeqCst);
+        let data = fill(5, 3 * MIB);
+        r.write(0, &data).unwrap();
+        r.settle();
+        assert!(r.degraded().unwrap().contains("injected batch failure"));
+        assert!(r.sealed_exists());
+        assert_eq!(r.hydra.st.arrived.load(Ordering::SeqCst), 0, "no commit without its rows");
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
+    }
+
+    #[test]
+    fn a_crash_mid_drain_recovers_every_acknowledged_write() {
+        let r = rig("crash-mid-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        let mut model = Model::new();
+        // Everything acknowledged, in two generations: some before the drain was planned,
+        // some after.
+        let a = fill(1, 3 * MIB);
+        {
+            // No threads: write directly, then plan and run the drain by hand and stop it
+            // before the finish -- the process dying after the extents were written and
+            // before the journal was allowed to forget.
+            let mut v = r.vd.lock().unwrap();
+            v.write(0, &a).unwrap();
+            model.put(0, &a);
+            let mut plan = v.plan_drain().unwrap().expect("something to drain");
+            let b = fill(60, 5000);
+            v.write(2 * MIB as u64 + 7, &b).unwrap();
+            model.put(2 * MIB as u64 + 7, &b);
+            let committed = plan.job.run();
+            assert!(committed.is_ok(), "the drain's bytes and commit went through");
+            // ... and here the daemon dies: no finish_drain.
+        }
+        assert!(r.sealed_exists(), "the sealed segment is still on disk");
+
+        // A new life. Same files, a map that never heard of the extents (the commit is
+        // modelled as lost with the process), and no replicas, so open replays the journal.
+        let hydra2 = Hydra::start();
+        let mut v2 = build(&r.dir, &hydra2, Vec::new(), 2 * MIB as u64, 64 * MIB as u64);
+        let discarded = v2.replay_journal().unwrap();
+        assert_eq!(discarded, 0);
+        assert!(v2.journal.has_sealed());
+        let got = v2.read(0, 4 * MIB as u32).unwrap();
+        assert_eq!(got, model.slice(0, 4 * MIB), "every acknowledged write came back");
+
+        // And it can carry on: the next drain takes the sealed segment, then the live one.
+        let h2 = Arc::new(Mutex::new(v2));
+        drain_all(&h2).unwrap();
+        let mut v2 = h2.lock().unwrap();
+        assert_eq!((v2.journal.len(), v2.needs_drain()), (0, false));
+        assert_eq!(v2.read(0, 4 * MIB as u32).unwrap(), model.slice(0, 4 * MIB));
+    }
+
+    // ---- backpressure ----------------------------------------------------------------
+
+    #[test]
+    fn a_writer_at_the_ceiling_waits_for_the_drain_and_the_journal_does_not_grow_past_it() {
+        let r = rig("ceiling-waits", 0, MIB as u64, 3 * MIB as u64);
+        r.hydra.hold(true);
+        // The first two writes are admitted (the journal is under the ceiling when each
+        // arrives); together they take it to the ceiling.
+        r.write(0, &fill(1, 3 * MIB / 2)).unwrap();
+        r.write(2 * MIB as u64, &fill(2, 3 * MIB / 2)).unwrap();
+        r.hydra.wait_for_commits(1);
+        let at_ceiling = r.journal_len();
+        assert!(at_ceiling >= 3 * MIB as u64, "{at_ceiling}");
+
+        // The third must wait for the held drain -- and must not have written anything.
+        let vd = Arc::clone(&r.vd);
+        let third = std::thread::spawn(move || write_through(&vd, 8 * MIB as u64, &fill(3, 4096)));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!third.is_finished(), "a writer at the ceiling must wait");
+        assert_eq!(r.journal_len(), at_ceiling, "and the journal must not have grown");
+
+        r.hydra.hold(false);
+        third.join().unwrap().expect("admitted once the drain made room");
+        r.settle();
+        assert_eq!(r.read(8 * MIB as u64, 4096), fill(3, 4096));
+        assert!(r.journal_len() < at_ceiling);
+    }
+
+    #[test]
+    fn at_the_ceiling_with_a_drain_that_cannot_run_the_write_fails_instead_of_hanging() {
+        let r = rig("ceiling-refuses", 0, MIB as u64, 3 * MIB as u64);
+        r.hydra.st.fail_commit.store(true, Ordering::SeqCst);
+        r.write(0, &fill(1, 3 * MIB / 2)).unwrap();
+        r.write(2 * MIB as u64, &fill(2, 3 * MIB / 2)).unwrap();
+        r.settle();
+        assert!(r.degraded().is_some());
+
+        let err = within(10, {
+            let vd = Arc::clone(&r.vd);
+            move || write_through(&vd, 8 * MIB as u64, &fill(3, 4096))
+        })
+        .expect_err("nothing will make room");
+        assert!(err.to_string().contains("ceiling"), "{err}");
+        // Nothing of the refused write is visible.
+        assert_eq!(r.read(8 * MIB as u64, 4096), vec![0u8; 4096]);
+    }
+
+    #[test]
+    fn a_large_trim_is_admitted_a_chunk_at_a_time_so_it_cannot_overshoot_the_ceiling() {
+        let r = rig("trim-chunks", 0, MIB as u64, 3 * MIB as u64);
+        r.write(0, &fill(1, 8 * MIB)).unwrap();
+        r.settle();
+
+        // Sample the journal while a trim four times the ceiling runs.
+        let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (vd, peak, stop) = (Arc::clone(&r.vd), Arc::clone(&peak), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let len = vd.lock().unwrap().journal.len();
+                    peak.fetch_max(len, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        write_zeroes_through(&r.vd, 0, 8 * MIB as u64).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        sampler.join().unwrap();
+        r.settle();
+
+        assert_eq!(r.read(0, 8 * MIB as u32), vec![0u8; 8 * MIB]);
+        // Admitted just under the ceiling, so it can overshoot by one chunk and no more.
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= 3 * MIB as u64 + MIB as u64 + 4096, "the journal reached {peak} bytes");
+    }
+
+    // ---- callers that need a drained vdisk -------------------------------------------
+
+    #[test]
+    fn drain_all_waits_for_a_drain_in_flight_and_returns_a_fully_drained_vdisk() {
+        let r = rig("drain-all", 0, 2 * MIB as u64, 64 * MIB as u64);
+        let mut model = Model::new();
+        r.hydra.hold(true);
+        let a = fill(1, 3 * MIB);
+        r.write(0, &a).unwrap();
+        model.put(0, &a);
+        r.hydra.wait_for_commits(1);
+        let b = fill(8, 3000);
+        r.write(7 * MIB as u64, &b).unwrap();
+        model.put(7 * MIB as u64, &b);
+
+        let vd = Arc::clone(&r.vd);
+        let all = std::thread::spawn(move || drain_all(&vd));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!all.is_finished(), "it must wait for the running drain, not race it");
+
+        r.hydra.hold(false);
+        within(20, move || all.join().unwrap()).expect("drained");
+        let v = r.vd.lock().unwrap();
+        assert_eq!(v.journal.len(), 0);
+        assert!(!v.needs_drain());
+        assert!(!v.gate.running());
+        drop(v);
+        assert!(!r.sealed_exists());
+        assert_eq!(r.read(0, 8 * MIB as u32), model.slice(0, 8 * MIB));
+    }
+
+    #[test]
+    fn a_synchronous_drain_refuses_to_run_beside_a_background_one() {
+        let r = rig("no-two-drains", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.hydra.wait_for_commits(1);
+        let err = r.vd.lock().unwrap().drain().expect_err("two drains would move one journal twice");
+        assert!(err.to_string().contains("running"), "{err}");
+        r.hydra.hold(false);
+        r.settle();
+    }
+
+    #[test]
+    fn a_replica_cannot_join_while_a_drain_runs() {
+        // The drain replicates to the set it was planned with. A member that joined after
+        // would be listed by the map as holding extents it never received.
+        let r = rig("join-during-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        let late = TestReplica::start(&r.dir, "late");
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.hydra.wait_for_commits(1);
+        let err = r.vd.lock().unwrap().add_replica(Arc::clone(&late.client)).expect_err("refused");
+        assert!(err.to_string().contains("draining"), "{err}");
+        assert!(r.vd.lock().unwrap().replicas.is_empty());
+
+        r.hydra.hold(false);
+        // The heal's own path waits for the drain, then joins -- and the new member gets
+        // every extent the finished drain committed, and the journal.
+        let mut v = lock_idle(&r.vd);
+        let copied = v.add_replica(Arc::clone(&late.client)).unwrap();
+        assert_eq!(copied, 3, "the three extents the drain wrote");
+        drop(v);
+        let groups: Vec<_> = r.vd.lock().unwrap().map.values().map(|l| l.egroup_id.clone()).collect();
+        for g in groups {
+            assert!(late.store.get_egroup(&g, 0, 16).is_ok(), "replica has {g}");
+        }
+    }
+
+    #[test]
+    fn extent_groups_a_running_drain_has_made_are_held_against_the_sweep() {
+        let r = rig("held-by-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.hydra.wait_for_commits(1);
+        // The group exists on disk and in Hydra's egroup table but is in no map yet and is
+        // not `open_eg` (the drain has it): the sweep must still be told it is in use.
+        let held = r.vd.lock().unwrap().held_egroups();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held.iter().next().unwrap().starts_with("eg-vd-"));
+        r.hydra.hold(false);
+        r.settle();
+        // Afterwards it is the open group, still held, and now also in the map.
+        let held_after = r.vd.lock().unwrap().held_egroups();
+        assert_eq!(held, held_after);
+    }
+
+    // ---- replicas see the drain by sequence, not wholesale ----------------------------
+
+    #[test]
+    fn a_drain_trims_replica_journals_by_sequence_and_keeps_writes_made_while_it_ran() {
+        let r = rig("replica-trim", 1, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap(); // seqs 0..=2
+        r.hydra.wait_for_commits(1);
+        r.write(5 * MIB as u64, &fill(2, 1000)).unwrap(); // seq 3, while the drain is held
+        assert_eq!(records_in(&r.replicas[0].journal()).len(), 4);
+
+        r.hydra.hold(false);
+        r.settle();
+        // The drain's three records are gone from the replica; the one acknowledged while it
+        // ran is not. Emptying the file here would be dropping an acknowledged write from the
+        // only other copy of it.
+        wait_until("the replica to drop its drained prefix", || {
+            records_in(&r.replicas[0].journal()).len() == 1
+        });
+        assert_eq!(records_in(&r.replicas[0].journal()), vec![(3, FLAG_COMMIT)]);
+        // The extents reached the replica before the commit.
+        let groups: Vec<_> = r.vd.lock().unwrap().map.values().map(|l| l.egroup_id.clone()).collect();
+        assert!(!groups.is_empty());
+        for g in groups {
+            assert!(r.replicas[0].store.get_egroup(&g, 0, 16).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_replica_that_does_not_know_the_new_opcode_keeps_its_journal() {
+        // An older replica answers "refused" to OP_TRUNCATE_TO. The drain carries on, and the
+        // replica's journal is untouched -- a superset, which replay handles.
+        let r = rig("old-replica", 1, 2 * MIB as u64, 64 * MIB as u64);
+        r.replicas[0].set_hook(Some(Arc::new(|req| {
+            (req.opcode == peer::OP_TRUNCATE_TO).then(|| Response::err(peer::ST_REFUSED, 0))
+        })));
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.settle();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!r.sealed_exists(), "the drain itself completed");
+        assert_eq!(records_in(&r.replicas[0].journal()).len(), 3, "and the replica kept its records");
+        assert!(r.degraded().is_none(), "a replica that cannot trim is not a failed drain");
+    }
+
+    #[test]
+    fn a_drain_that_cannot_reach_a_replica_with_its_extents_does_not_commit() {
+        // Draining must not make data less durable than the journal was: an extent that is on
+        // one node only, with the journal that backed it about to be forgotten, is a copy lost.
+        let r = rig("replica-extent-fails", 1, 2 * MIB as u64, 64 * MIB as u64);
+        r.replicas[0].set_hook(Some(Arc::new(|req| {
+            (req.opcode == peer::OP_EGROUP_PUT).then(|| Response::err(peer::ST_IO, 0))
+        })));
+        let data = fill(7, 3 * MIB);
+        r.write(0, &data).unwrap();
+        r.settle();
+        assert!(r.degraded().is_some());
+        assert_eq!(r.hydra.st.arrived.load(Ordering::SeqCst), 0, "no commit");
+        assert!(r.sealed_exists());
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
     }
 }

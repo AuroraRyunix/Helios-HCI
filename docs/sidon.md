@@ -63,6 +63,38 @@ When the journal reaches its high-water mark (64 MiB by default) a **drain** run
 touched extent is read, patched with the journal's newer bytes, and appended somewhere
 new. The block map in Hydra is repointed, and only then is the journal allowed to forget.
 
+The drain runs **beside** the guest, not in front of it. The write that crosses the
+high-water mark starts the drain on a background thread and is acknowledged on its own
+journal record; before 2026-10 it ran the drain inline and sat out the whole thing (about 3
+seconds for 64 MiB), which is why a single large write measured a third of the streaming
+rate. The mechanics, in `sidon/src/vdisk.rs`:
+
+1. **Plan, under the vdisk lock.** The journal is *rotated*: `<vdisk>.jrn` is renamed
+   `<vdisk>.jrn.old` and sealed, and a fresh `<vdisk>.jrn` takes new writes. The overlay
+   ranges that point into the sealed file are frozen, and the block-map entries they touch are
+   copied out.
+2. **Run, unlocked.** The drain reads the sealed file, builds the extents, appends and
+   replicates them, syncs, writes the map rows and makes the drain-commit CAS. Guest reads
+   see the old map plus the overlay, which still holds every range being drained; guest
+   writes go to the live file.
+3. **Finish, under the lock.** The new map entries are applied, the overlay ranges still
+   pointing into the sealed file are dropped (a range a newer write has covered points into
+   the live file and stays), and the sealed file is deleted. The replicas are then told to
+   drop the journal records *older than* the first live sequence number — by sequence, never
+   wholesale, because they hold records acknowledged while the drain ran
+   (`OP_TRUNCATE_TO`; a replica from before this change refuses it and keeps its whole
+   journal, which is the safe way to be wrong).
+
+Guests are held back only at a **hard ceiling**, twice the high-water mark (128 MiB by
+default): a write that finds the journal there waits, without the vdisk lock, for a drain to
+make room, and fails with an error if the drain cannot run (a degraded vdisk) rather than
+hang or let the journal fill the volume. A write admitted just under the ceiling may take the
+journal past it by that one write. Anything that needs a *drained* vdisk — detach, seal,
+snapshot, clone, `flush`, a replica heal — waits for a running drain and then drains whatever
+is left under the lock (`vdisk::drain_all`, `lock_idle`), so what they hand back is as drained
+as it ever was. A crash at any point leaves the sealed and live files; replay reads them in
+that order. `valcli storage.list`/`status` report `draining`, `high_water` and `hard_ceiling`.
+
 Two orderings are load-bearing and never depart from:
 
 - **Extent bytes are durable before any map row points at them.** A crash between the two
