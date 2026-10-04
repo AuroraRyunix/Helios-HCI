@@ -258,9 +258,11 @@ class TheReconcilerDoesNotFightAStopInProgress(unittest.TestCase):
         scope = load_functions(
             SPARK, {"converge_to_desired_state", "unit_active_states", "service_entry",
                     "service_is_disabled", "service_is_ready", "listening_ports",
-                    "convergence_gate",
+                    "convergence_gate", "run_unit_commands",
                     "drain_local_storage"},
             {"MANAGED_SERVICE_ORDER": list(self.ORDER),
+             "CONVERGE_PARALLELISM": 8,
+             "UNIT_DOWN_STATES": ("inactive", "failed", ""),
              # Two services with nothing to wait on, so what is asserted below is the
              # in-flight handling and not the dependency gates.
              "MANAGED_SERVICES": tuple({"unit": unit, "requires": ()} for unit in self.ORDER),

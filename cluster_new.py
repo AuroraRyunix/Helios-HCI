@@ -506,6 +506,65 @@ def declare_cluster_state(ips, desired, stop_state_store=False):
     return declared
 
 
+# How long guests are given to shut down on their own before they are powered off. One window for
+# all of them together: it used to be five seconds *each*, one guest after another, so a dozen
+# guests that ignored the request cost a minute while a guest that needed ten seconds to shut
+# down cleanly never got them.
+VM_SHUTDOWN_GRACE_SECONDS = 20
+
+
+def stop_vms_together(running_vms, grace=VM_SHUTDOWN_GRACE_SECONDS, runner=None, sleep=None,
+                      update_row=None):
+    """Shut down every running guest at once, then power off whatever has not gone.
+
+    A guest is cluster state and not node state, so this runs from the CLI once. Every
+    guest is asked to shut down at the same time and polled together against one shared
+    deadline; the ones still running when it passes are destroyed together; and each one's
+    row is then marked stopped and unplaced. Returns the names of the guests that had to be
+    powered off.
+    """
+    import concurrent.futures
+
+    runner = runner or run_remote_spark
+    sleep = sleep or time.sleep
+    update_row = update_row or (lambda name: run_cql_query(
+        "UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '%s';"
+        % name.replace("'", "''")))
+
+    guests = []
+    for vm in running_vms:
+        name, host_ip = vm.get("name"), vm.get("host_ip")
+        if not name or not host_ip or host_ip == "N/A":
+            continue
+        guests.append((name, host_ip))
+    if not guests:
+        return []
+
+    def each(fn, items):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+            return list(pool.map(fn, items))
+
+    for name, host_ip in guests:
+        print(f"Stopping VM '{name}' on host {host_ip}...")
+    each(lambda g: runner(g[1], f"virsh shutdown {shlex.quote(g[0])}"), guests)
+
+    deadline = time.time() + grace
+    remaining = list(guests)
+    while remaining and time.time() < deadline:
+        sleep(1)
+        states = each(lambda g: runner(g[1], f"virsh domstate {shlex.quote(g[0])}"), remaining)
+        remaining = [g for g, (rc, out, _) in zip(remaining, states)
+                     if not (rc == 0 and "shut off" in out.lower())]
+
+    if remaining:
+        for name, _ in remaining:
+            print(f"VM '{name}' did not shut down gracefully. Forcing power off (destroy)...")
+        each(lambda g: runner(g[1], f"virsh destroy {shlex.quote(g[0])}"), remaining)
+    for name, _ in guests:
+        update_row(name)
+    return [name for name, _ in remaining]
+
+
 def get_cluster_ips():
     try:
         with open("/etc/hci/cluster.json", "r") as f:
@@ -3241,28 +3300,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         running_vms = [v for v in vms if v.get("state") in ["Running", "start", "on"]]
         if running_vms:
-            for vm in running_vms:
-                name = vm.get("name")
-                host_ip = vm.get("host_ip")
-                if not host_ip or host_ip == "N/A":
-                    continue
-                print(f"Stopping VM '{name}' on host {host_ip}...")
-                run_remote_spark(host_ip, f"virsh shutdown {name}")
-
-                # Poll up to 5 seconds
-                stopped = False
-                for _ in range(5):
-                    time.sleep(1)
-                    rc_dom, dom_state, _ = run_remote_spark(host_ip, f"virsh domstate {name}")
-                    if rc_dom == 0 and "shut off" in dom_state.lower():
-                        stopped = True
-                        break
-                if not stopped:
-                    print(f"VM '{name}' did not shut down gracefully. Forcing power off (destroy)...")
-                    run_remote_spark(host_ip, f"virsh destroy {name}")
-
-                # Update ScyllaDB
-                run_cql_query(f"UPDATE hydra.vms SET state = 'Stopped', host_ip = '' WHERE name = '{name}';")
+            stop_vms_together(running_vms)
         else:
             print("No running VMs detected.")
 

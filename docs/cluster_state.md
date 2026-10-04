@@ -102,6 +102,7 @@ Two timers remain, and neither is the mechanism:
 | Timer | Interval | What it is for |
 | :--- | :--- | :--- |
 | `ZK_DRIFT_CHECK_INTERVAL` | 30s | The local drift check. Nothing to do with ZooKeeper: a unit that dies while the desired state is unchanged produces no event to watch for. |
+| `ZK_CONVERGE_RETRY_INTERVAL` | 3s | The wait after a pass that left work behind (`retry` true): a layer waiting for a port to answer, or for a unit that is still going down. Replaces waiting a whole drift interval per layer. |
 | `ZK_STATE_REREAD_INTERVAL` | 300s | A re-read of `/cluster_state`, so a **dropped** notification cannot wedge a node indefinitely. It also re-arms the watch, so it repairs as well as reads. |
 
 The long one is deliberately long. Shorten it and it becomes the poll it replaced, with
@@ -164,6 +165,24 @@ having nothing useful to say. An unreachable node is the opposite case: it is re
 bounded number of times and then reported, because the desired state outlives it and the
 node converges when it returns. A node in maintenance publishes that it is, and is not
 waited on.
+
+### Why a stop used to take minutes, and what changed
+
+A pass reads the units' states once and then acts. Stopping the services in reverse dependency
+order, only the leaves could go in the first pass: Sidon, Daruk and the database each waited on a
+dependent that the snapshot still showed as active, so they went in the 2nd, 3rd and 4th passes —
+and the passes were a drift interval (30 s) apart because nothing woke the loop in between. A
+cluster stop was four idle waits and fifteen services stopped one after another.
+
+Now a pass works **tier by tier**: it acts on every pending unit whose gates are clear *at once*
+(concurrently, up to `CONVERGE_PARALLELISM`), re-reads what that changed, and carries on to the next
+tier in the same pass, so the whole stop chain is one pass. A unit is only taken away from what uses
+it while that is *down* — `deactivating` counts as still using it, so Daruk is not stopped under a
+Sidon that is draining its journals. A unit that fails to stop keeps its state, so what it uses stays
+up, and its error is latched as before. A start behaves the same way, but its gates are ports that
+only answer some seconds after the unit is active, so it ends the pass there and relies on
+`ZK_CONVERGE_RETRY_INTERVAL` to come back in seconds. `cluster stop` also shuts the guests down
+together against one shared 20 s window, instead of five seconds per guest in turn.
 
 ### A unit that is mid-transition is not drift
 

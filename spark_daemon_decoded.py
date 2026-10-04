@@ -591,6 +591,15 @@ ZK_NODES_PATH = ZK_ROOT + "/nodes"
 ZK_CLUSTER_STATE = "/cluster_state"
 ZK_PUBLISH_INTERVAL = 5          # seconds between state refreshes
 ZK_DRIFT_CHECK_INTERVAL = 30     # seconds between drift re-assertions
+# While a pass reports that work remains (a start waiting for a port to answer, a stop waiting for
+# a unit that is still going down) the next pass is this soon, not a drift interval away. A
+# multi-layer stop or start used to take one 30 second wait per layer, doing nothing in them.
+ZK_CONVERGE_RETRY_INTERVAL = 3
+# How many `systemctl start|stop` run at once within one tier of the dependency order.
+CONVERGE_PARALLELISM = 8
+# What a unit is called while it is anywhere between up and fully down: anything but these is
+# a unit something may still be using.
+UNIT_DOWN_STATES = ("inactive", "failed", "")
 # How often the reconcile loop re-reads /cluster_state when no watch has fired. This is a
 # safety net, not the mechanism: a watch delivers a change in milliseconds, and this bounds
 # how long a *missed* one can wedge a node. Long on purpose -- short enough and it becomes
@@ -941,6 +950,39 @@ def apply_desired_cluster_state(desired, stop_state_store=False):
     return write_desired_cluster_state(desired)
 
 
+def run_unit_commands(action, units):
+    """`systemctl <action> <unit>` for each unit, concurrently. Returns {unit: (rc, detail)}.
+
+    One command per unit and not one transaction for the list, because the caller has already
+    decided these units are independent *of each other* (nothing in the set requires anything
+    else in it) and wants each one's own outcome, so a refusal names the unit. Concurrent
+    because each call blocks until its unit has finished starting or stopping, and a cluster
+    stop that waited for fifteen services one after the other took as long as all of them put
+    together instead of as long as the slowest.
+    """
+    import concurrent.futures
+
+    def one(unit):
+        res = subprocess.run(f"systemctl {action} {unit}", shell=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return res.returncode, (res.stderr or b"").decode("utf-8", "replace").strip()
+
+    results = {}
+    if len(units) <= 1:
+        for unit in units:
+            results[unit] = one(unit)
+        return results
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(CONVERGE_PARALLELISM, len(units))) as pool:
+        futures = {unit: pool.submit(one, unit) for unit in units}
+        for unit, future in futures.items():
+            try:
+                results[unit] = future.result()
+            except Exception as exc:
+                results[unit] = (1, str(exc))
+    return results
+
+
 def converge_to_desired_state(desired, full=False):
     """Bring local services into line with the desired cluster state, in order.
 
@@ -1006,6 +1048,7 @@ def converge_to_desired_state(desired, full=False):
 
     if not targets:
         globals()["CONVERGE_RETRY"] = False
+        globals()["LAST_WAITING_REPORT"] = None
         return
 
     if not full:
@@ -1013,37 +1056,60 @@ def converge_to_desired_state(desired, full=False):
 
     ports = None
     waiting = {}
-    for svc in targets:
-        gate = convergence_gate(svc, order, running)
-        if running and gate:
-            if ports is None:
-                ports = listening_ports()
-            unready = [req for req in gate if not service_is_ready(req, states, ports)]
-            if unready:
-                waiting[svc] = unready
-                continue
+    pending = list(targets)
+    # Tier by tier. Each round acts on every pending unit whose gates are clear, all at once,
+    # then re-reads what that changed -- so a stop that frees the next layer proceeds to it in
+    # the same pass. It used to act on one snapshot, which left each layer waiting for the
+    # *next pass*, up to a drift interval (30 s) away: a stop took one idle wait per layer
+    # (leaves, then sidon, then daruk, then the database) on top of the stops themselves.
+    while pending:
+        ready = []
+        waiting = {}
+        for svc in pending:
+            gate = convergence_gate(svc, order, running)
+            if running and gate:
+                if ports is None:
+                    ports = listening_ports()
+                unready = [req for req in gate if not service_is_ready(req, states, ports)]
+                if unready:
+                    waiting[svc] = unready
+                    continue
+            if not running:
+                # Inverted for a stop: a service is not taken away from the services that
+                # require it while they are still running -- or still going down.
+                holding = [other for other in gate
+                           if states.get(other, "") not in UNIT_DOWN_STATES]
+                if holding:
+                    waiting[svc] = holding
+                    continue
+            ready.append(svc)
+        if not ready:
+            break
         if not running:
-            # Inverted for a stop: a service is not taken away from the services that
-            # require it while they are still running.
-            holding = [other for other in gate if states.get(other) == "active"]
-            if holding:
-                waiting[svc] = holding
-                continue
-            if service_entry(svc).get("drain_before_stop"):
-                drain_local_storage()
-        res = subprocess.run(f"systemctl {action} {svc}", shell=True,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        detail = (res.stderr or b"").decode("utf-8", "replace").strip()
-        if res.returncode:
-            # The error is latched where the status publisher will find it. A caller
-            # watching a start learns that a unit refused to come up, and why, without
-            # reading a journal on three hosts.
-            errors[svc] = detail or f"systemctl {action} {svc} failed"
-        else:
-            errors.pop(svc, None)
+            for svc in ready:
+                if service_entry(svc).get("drain_before_stop"):
+                    drain_local_storage()
+        for svc, (returncode, detail) in run_unit_commands(action, ready).items():
+            if returncode:
+                # The error is latched where the status publisher will find it. A caller
+                # watching a start learns that a unit refused to come up, and why, without
+                # reading a journal on three hosts. The unit keeps the state it had, so what
+                # is gated on it stays gated.
+                errors[svc] = detail or f"systemctl {action} {svc} failed"
+            else:
+                errors.pop(svc, None)
+                states[svc] = "active" if running else "inactive"
+        pending = [svc for svc in pending if svc not in ready]
+        # What was just started may now be answering; what a stop freed is in `states`.
+        ports = None
 
-    for svc, blockers in sorted(waiting.items()):
-        print(f"[ZK] {svc} is waiting on {', '.join(blockers)}.", flush=True)
+    # Said once per change and not once per pass: while a layer waits on a port the pass runs
+    # every few seconds, and the same line repeated is noise that hides the one that matters.
+    report = sorted((svc, tuple(blockers)) for svc, blockers in waiting.items())
+    if report != globals().get("LAST_WAITING_REPORT"):
+        globals()["LAST_WAITING_REPORT"] = report
+        for svc, blockers in report:
+            print(f"[ZK] {svc} is waiting on {', '.join(blockers)}.", flush=True)
 
     # The node's own judgement about whether it is done, published for the CLI to loop on
     # rather than re-derived there. A latched error is not something to retry: it is
@@ -1105,6 +1171,7 @@ def zk_reconcile_loop():
     applied = None
     last_drift_check = 0.0
     last_reread = 0.0
+    retry_soon = False
     while True:
         try:
             if client is None or not client.is_connected():
@@ -1137,16 +1204,20 @@ def zk_reconcile_loop():
             desired = seen["desired"]
             if desired:
                 if os.path.exists("/etc/hci/maintenance.state"):
+                    retry_soon = False
                     if desired != applied:
                         print(f"[ZK] Desired state '{desired}' ignored: host is in maintenance.", flush=True)
                         applied = desired
                 else:
                     changed = desired != applied
                     due = (now - last_drift_check) >= ZK_DRIFT_CHECK_INTERVAL
-                    if changed or due:
+                    if changed or due or retry_soon:
                         last_drift_check = now
                         converge_to_desired_state(desired, full=changed)
                         applied = desired
+                        # A pass that left work behind (a layer waiting on a port, on a
+                        # unit still going down) asks to be run again soon.
+                        retry_soon = bool(globals().get("CONVERGE_RETRY"))
         except Exception as exc:
             print(f"[ZK] Reconcile error ({exc}); reconnecting.", flush=True)
             try:
@@ -1165,7 +1236,7 @@ def zk_reconcile_loop():
         # value before it sets the event, and the next pass through the loop reads that
         # value after this clear, so a notification arriving in the gap is acted on rather
         # than dropped.
-        woken.wait(ZK_DRIFT_CHECK_INTERVAL)
+        woken.wait(ZK_CONVERGE_RETRY_INTERVAL if retry_soon else ZK_DRIFT_CHECK_INTERVAL)
         woken.clear()
 
 

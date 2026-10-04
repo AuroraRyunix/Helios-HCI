@@ -25,6 +25,9 @@ Run with:  python -m unittest test_cluster_declarative
 import ast
 import io
 import os
+import re
+import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -215,8 +218,10 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
             SPARK,
             functions=("converge_to_desired_state", "unit_active_states", "service_entry",
                        "service_is_disabled", "service_is_ready", "listening_ports",
-                       "convergence_gate"),
+                       "convergence_gate", "run_unit_commands"),
             scope={"MANAGED_SERVICE_ORDER": list(self.ORDER),
+                   "CONVERGE_PARALLELISM": 8,
+                   "UNIT_DOWN_STATES": ("inactive", "failed", ""),
                    "MANAGED_SERVICES": self.TABLE,
                    "SERVICE_SETTING_PROBES": {},
                    "SERVICE_ERRORS": dict(stale or {}),
@@ -281,8 +286,32 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
     def test_the_stop_order_is_the_start_order_inverted(self):
         issued, _ = self.converge(["active", "active", "active"], desired="stopped")
         self.assertEqual(
-            issued, ["systemctl stop sidon"],
-            "the database was stopped out from under the services still using it")
+            issued, ["systemctl stop sidon", "systemctl stop daruk", "systemctl stop hydra-db"],
+            "each service is stopped only after the ones that use it, and the whole chain "
+            "in one pass: this used to stop one layer per pass, and the passes were a "
+            "drift interval (30 s) apart, which is why `cluster stop` was slow")
+
+    def test_a_service_that_will_not_stop_keeps_what_it_uses_up(self):
+        """The reason the order exists. With sidon refusing to stop, Daruk and the database
+        must stay: stopping them under a storage daemon that is still serving is the
+        failure the gates are there to prevent."""
+        issued, scope = self.converge(["active", "active", "active"], desired="stopped",
+                                      failing=("sidon",))
+        self.assertEqual(issued, ["systemctl stop sidon"])
+        self.assertIn("sidon", scope["SERVICE_ERRORS"])
+
+    def test_a_service_still_going_down_keeps_what_it_uses_up(self):
+        """`deactivating` is not down. Sidon draining its journals for half a minute is
+        still using Daruk, and Daruk was being stopped under it."""
+        issued, _ = self.converge(["deactivating", "active", "active"], desired="stopped")
+        self.assertEqual(issued, [], "Daruk was stopped while Sidon was still shutting down")
+
+    def test_a_pass_that_left_work_asks_to_be_run_again_soon(self):
+        """After the stops above nothing is left to stop, but the pass cannot know that
+        until it has looked again, so it says it has work: the loop then runs the next pass
+        in seconds and not after the drift interval."""
+        _, scope = self.converge(["active", "active", "active"], desired="stopped")
+        self.assertTrue(scope["CONVERGE_RETRY"])
 
     def test_storage_is_drained_before_it_is_stopped(self):
         # States are in the order being converged, which for a stop is the inverse: sidon
@@ -480,3 +509,75 @@ class TheWaitObservesAndAbortsOnAPublishedError(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheLoopDoesNotIdleBetweenTiers(unittest.TestCase):
+    """Why `cluster stop` and `cluster start` were slow: one pass per layer, and the pass
+    interval is the drift interval."""
+
+    def setUp(self):
+        self.src = read(SPARK)
+
+    def test_a_pass_with_work_left_is_followed_by_a_short_wait(self):
+        self.assertIn("ZK_CONVERGE_RETRY_INTERVAL", self.src)
+        self.assertIn("woken.wait(ZK_CONVERGE_RETRY_INTERVAL if retry_soon else "
+                      "ZK_DRIFT_CHECK_INTERVAL)", self.src)
+        interval = int(re.search(r"^ZK_CONVERGE_RETRY_INTERVAL = (\d+)", self.src, re.M).group(1))
+        drift = int(re.search(r"^ZK_DRIFT_CHECK_INTERVAL = (\d+)", self.src, re.M).group(1))
+        self.assertLess(interval * 5, drift)
+
+    def test_independent_units_are_acted_on_together(self):
+        """The leaf services of a stop depend on nothing among themselves; each blocks until
+        its unit is down, so one after the other costs the sum of their stop times."""
+        calls = []
+        lock = threading.Lock()
+        running = {"now": 0, "peak": 0}
+
+        class Done:
+            returncode = 0
+            stderr = b""
+
+        class FakeSubprocess:
+            DEVNULL = -3
+            PIPE = -1
+
+            @staticmethod
+            def run(command, shell=False, stdout=None, stderr=None):
+                with lock:
+                    running["now"] += 1
+                    running["peak"] = max(running["peak"], running["now"])
+                time.sleep(0.05)
+                with lock:
+                    running["now"] -= 1
+                    calls.append(command)
+                return Done()
+
+        scope = load(SPARK, functions=("run_unit_commands",),
+                     scope={"CONVERGE_PARALLELISM": 8, "subprocess": FakeSubprocess})
+        results = scope["run_unit_commands"]("stop", ["a", "b", "c", "d"])
+        self.assertEqual(sorted(results), ["a", "b", "c", "d"])
+        self.assertEqual(sorted(calls), ["systemctl stop %s" % u for u in "abcd"])
+        self.assertGreater(running["peak"], 1, "the units were stopped one at a time")
+
+    def test_a_failure_names_its_unit(self):
+        class Fail:
+            returncode = 1
+            stderr = b"Job for b failed"
+
+        class Done:
+            returncode = 0
+            stderr = b""
+
+        class FakeSubprocess:
+            DEVNULL = -3
+            PIPE = -1
+
+            @staticmethod
+            def run(command, shell=False, stdout=None, stderr=None):
+                return Fail() if command.endswith(" b") else Done()
+
+        scope = load(SPARK, functions=("run_unit_commands",),
+                     scope={"CONVERGE_PARALLELISM": 8, "subprocess": FakeSubprocess})
+        results = scope["run_unit_commands"]("stop", ["a", "b"])
+        self.assertEqual(results["a"][0], 0)
+        self.assertEqual(results["b"], (1, "Job for b failed"))

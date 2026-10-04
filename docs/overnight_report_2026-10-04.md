@@ -49,6 +49,34 @@ journal has no unit test.
 
 Status: **done in code; live verification needed**.
 
+### Cluster stop was slow and could look stuck: fixed in code and unit tests, needs a live check
+
+*Root cause (by reading the code; not measured on a cluster).* `converge_to_desired_state` read the
+units' states once per pass and acted on that snapshot. A stop goes in reverse dependency order, but
+Sidon, Daruk and the database each waited on a dependent the snapshot still showed active, so they
+were only stopped in the 2nd, 3rd and 4th pass, and passes were `ZK_DRIFT_CHECK_INTERVAL` (30 s) apart
+because nothing woke the loop: roughly 90 s of idle waiting before any stop time. Every `systemctl
+stop` was also run one after another, and `cluster stop` shut guests down one at a time with a
+5 s window each (guests that needed longer were powered off). A start had the same one-layer-per-30 s
+shape. A dependent in `deactivating` was also treated as not holding its requirement.
+
+*Change.* Tier by tier within one pass (concurrent `systemctl` per tier, states updated after each
+tier, ports re-read), a 3 s retry interval after a pass that left work (`ZK_CONVERGE_RETRY_INTERVAL`),
+`deactivating`/`activating` count as still holding, the "waiting on" log line is printed once per
+change. `cluster stop` stops all guests together against one 20 s window (`stop_vms_together`).
+Files: `spark_daemon_decoded.py`, `cluster_new.py`, `docs/cluster_state.md`.
+
+*Tests.* `test_cluster_declarative.py`: the old test `test_the_stop_order_is_the_start_order_inverted`
+pinned the slow behaviour (one `systemctl stop sidon` per pass) and was rewritten; new tests for a
+failing stop keeping what it uses up, a deactivating dependent holding its requirement, concurrency,
+and the retry interval. `test_cluster_stop.py`: 7 tests. Both fail against the old code.
+
+*Not changed deliberately.* `drain_local_storage` still detaches vdisks one after another (each is a
+journal drain; parallelising IO-heavy drains is a decision for someone watching a real node).
+Stop/start semantics (order, gates, error latching, state store stopped last) are unchanged.
+
+Status: **done in code; live verification needed**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification
@@ -60,6 +88,12 @@ Status: **done in code; live verification needed**.
   `journalctl -u sidon | grep 'released to another node'`; on the target `grep 'took over from'`.
   If `.42`/`.43` (TCG) refuse the migration for CPU/accelerator reasons the error comes from libvirt and
   names no NBD socket. A failed takeover is finished with `valcli storage.takeover <vdisk> <target-node>`.
+
+- Cluster stop, on the lab: `time valcli cluster stop` (or `cluster stop`) on .41 with at least one running
+  guest. Pass: it finishes well inside a minute for the services (it used to need several 30 s waits),
+  `cluster status` shows every service DOWN, no `last_error` is printed, and the guests are `shut off`
+  (a guest that ignores ACPI is powered off after 20 s). Then `cluster start` must still bring everything
+  back in order (hydra-db, daruk, then the rest): the start path shares the loop that was changed.
 
 ## Decisions for the owner
 
