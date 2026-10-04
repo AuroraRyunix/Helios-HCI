@@ -13,7 +13,7 @@
 //!
 //! The safety rule the whole sweep rests on: **an extent group is deleted only after it
 //! has been observed unreferenced twice, with a grace period between the observations,
-//! and only if it is not open, not young, and not held by an attached vdisk.** Each of
+//! and only if it is not held by an attached vdisk, not young, and (if open) not recent.** Each of
 //! those guards a different way a live group can look like garbage:
 //!
 //! - *Twice, with a gap*: a drain writes egroup bytes before it commits the map rows that
@@ -21,7 +21,10 @@
 //!   group nothing references. It is not garbage; it is thirty milliseconds from being
 //!   referenced.
 //! - *Not young*: the same window, for a group created between two scans.
-//! - *Not open*: an open group is the drain's current target.
+//! - *Not held, and if open, old*: an open group is a drain's append target, but only while a
+//!   vdisk attached here holds it, which `held` says. One nothing holds is abandoned (a crash, a
+//!   detach, a failover left the row open) and is reclaimed like any other once it is older than
+//!   the abandon bound; see `reclaim::abandoned` for what open means and why this is safe.
 //! - *Not held*: a vdisk attached here has map entries in memory that may be ahead of a
 //!   stale read.
 //!
@@ -48,13 +51,16 @@ pub mod replica;
 pub mod tier;
 
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 
 pub struct Purah {
     daruk: Daruk,
     store: EgroupStore,
     node: String,
     grace: Duration,
+    /// How old an `open` group must be before it can be called abandoned; see
+    /// `reclaim::abandoned`.
+    open_abandon: Duration,
     /// egroup_id -> when it was first seen unreferenced. Cleared the moment a group is
     /// seen referenced again, so a reused or re-referenced group starts its grace over.
     unreferenced_since: HashMap<String, Instant>,
@@ -72,6 +78,15 @@ pub struct Purah {
     /// What the last compaction pass said about itself, so the next one can show it. In
     /// memory only: it is a status line, not state anything depends on.
     last_compaction: Option<Value>,
+}
+
+/// An hour, or twice the grace if that is longer. Long next to anything a drain does between
+/// registering a group and being held for it (seconds), short next to how long a leak is worth
+/// having. Overridable with `SIDON_PURAH_OPEN_ABANDON`.
+pub const OPEN_ABANDON_DEFAULT: Duration = Duration::from_secs(3600);
+
+fn default_open_abandon(grace: Duration) -> Duration {
+    OPEN_ABANDON_DEFAULT.max(grace * 2)
 }
 
 #[derive(Debug, Default)]
@@ -93,6 +108,8 @@ pub struct SweepReport {
     pub missing: Vec<String>,
     pub candidates: usize,
     pub reclaimed: Vec<String>,
+    /// The part of `reclaimed` that was `open`: groups no drain owned. See `reclaim::abandoned`.
+    pub reclaimed_abandoned_open: Vec<String>,
     pub bytes_reclaimed: u64,
     pub skipped_young: usize,
     pub skipped_open: usize,
@@ -166,11 +183,19 @@ impl Purah {
             store,
             node: node.to_string(),
             grace,
+            open_abandon: default_open_abandon(grace),
             unreferenced_since: HashMap::new(),
             access,
             strays: tier::StrayLedger::default(),
             last_compaction: None,
         }
+    }
+
+    /// Set how old an `open` group must be to count as abandoned. Never less than twice the
+    /// grace: a bound shorter than the grace would make "open" mean nothing.
+    pub fn with_open_abandon(mut self, bound: Duration) -> Purah {
+        self.open_abandon = bound.max(self.grace * 2);
+        self
     }
 
     /// Plan, and with `opts.apply` carry out, one compaction pass. See `purah/compact.rs`.
@@ -248,6 +273,7 @@ impl Purah {
             grace: self.grace,
             access: &self.access,
             peers,
+            open_abandon: self.open_abandon,
         };
         let report = reclaim::sweep_pass(&pass, &mut self.unreferenced_since, held, now_ms, Instant::now())?;
         // The copy a move left behind is surplus bytes, not garbage: it is removed by the
@@ -471,6 +497,7 @@ impl SweepReport {
             "egroups_referenced": self.egroups_referenced,
             "candidates": self.candidates,
             "reclaimed": self.reclaimed,
+            "reclaimed_abandoned_open": self.reclaimed_abandoned_open,
             "bytes_reclaimed": self.bytes_reclaimed,
             "skipped_open": self.skipped_open,
             "skipped_held": self.skipped_held,

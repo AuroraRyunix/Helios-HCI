@@ -209,6 +209,10 @@ fn main() {
         // costs disk, reclaiming early costs data, and those are not comparable.
         purah_interval: Duration::from_secs(env_bytes("SIDON_PURAH_INTERVAL", 300)),
         purah_grace: Duration::from_secs(env_bytes("SIDON_PURAH_GRACE", 600)),
+        // An `open` extent group is reclaimed like any other only once it is this old and no
+        // attached vdisk holds it: what open means and why this is safe is in
+        // `purah/reclaim.rs`. An hour; never less than twice the grace, whatever is set here.
+        purah_open_abandon: Duration::from_secs(env_bytes("SIDON_PURAH_OPEN_ABANDON", 3600)),
         // Where this node listens for replication, and how to reach the others.
         //
         // SIDON_PEERS is "node=host:port,node=host:port". Generated from cluster.json on

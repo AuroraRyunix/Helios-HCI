@@ -226,8 +226,10 @@ The notes themselves are deliberately not in this repository.
     node, a detached VM) are skipped; a safe way to exclude that vdisk's drain from here does not exist.
   * Nothing has run on the test cluster: the passes are proved against a model of Hydra and real extent
     files, not against live nodes, and the lead integrates the live check.
-  * Found while reading, not fixed: the sweep skips every `open` group (`skipped_open`), so an open group
-    a crashed drain abandoned, and which no row references, appears never to be reclaimed.
+  * ~~The sweep skips every `open` group~~ **Fixed (D-33):** an open group no attached vdisk holds, that
+    no row references and that is older than `SIDON_PURAH_OPEN_ABANDON` (1 h) is reclaimed under the
+    two-scan rule. **Still open:** an open group that rows *do* reference (vdisk detached after
+    committing into it) is never sealed, so scrub and compaction never see it.
 
 **Cluster state (2026-08-17, later session)**
 * **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;

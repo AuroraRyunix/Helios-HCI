@@ -19,6 +19,8 @@ use crate::peer::ReplicaStore;
 
 const NOW_MS: i64 = 1_000_000_000_000;
 const GRACE: Duration = Duration::from_secs(600);
+const OPEN_ABANDON: Duration = Duration::from_secs(3600);
+const HOUR_MS: i64 = 3_600_000;
 
 fn later(base: Instant, secs: u64) -> Instant {
     base + Duration::from_secs(secs)
@@ -132,6 +134,7 @@ impl<'a> World<'a> {
             grace: GRACE,
             access: &self.access,
             peers: self.peers,
+            open_abandon: OPEN_ABANDON,
         };
         sweep_pass(&pass, &mut self.ledger, held, NOW_MS, later(self.base, secs)).unwrap()
     }
@@ -820,4 +823,236 @@ fn random_histories_never_drop_a_copy_that_was_live_at_either_sighting() {
             }
         }
     }
+}
+
+// --- Abandoned open groups ------------------------------------------------------------------
+
+/// An `open` group the owner has: unreferenced, created `age_ms` ago, with a copy on each peer.
+fn open_group(rig: &Rig, peers: &FakePeers, id: &str, age_ms: i64, on: &[&str]) {
+    garbage(rig, peers, id, on);
+    let mut st = rig.model.st.borrow_mut();
+    let g = st.egroups.get_mut(id).unwrap();
+    g.state = "open".into();
+    g.created_ms = NOW_MS - age_ms;
+}
+
+#[test]
+fn an_open_group_nothing_holds_is_reclaimed_after_two_scans_and_its_replicas_with_it() {
+    let rig = Rig::new("open-abandoned");
+    let peers = FakePeers::new(&rig, &["n2", "n3"]);
+    open_group(&rig, &peers, "eg-orphaned-open", 2 * HOUR_MS, &["n2", "n3"]);
+    let mut w = World::new(&rig, &peers);
+
+    let first = w.sweep_at(0, &HashSet::new());
+    assert!(first.reclaimed.is_empty(), "first sight reclaims nothing: {first:?}");
+    assert_eq!(first.skipped_grace, 1);
+    let second = w.sweep_at(601, &HashSet::new());
+
+    assert_eq!(second.reclaimed, vec!["eg-orphaned-open".to_string()], "{second:?}");
+    assert_eq!(second.reclaimed_abandoned_open, vec!["eg-orphaned-open".to_string()]);
+    assert!(!rig.store.path_for("eg-orphaned-open").exists());
+    assert_eq!(state_of(&rig, "eg-orphaned-open"), None);
+    assert!(!peers.r("n2").has("eg-orphaned-open") && !peers.r("n3").has("eg-orphaned-open"));
+    assert_eq!(second.to_json()["reclaimed_abandoned_open"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn an_open_group_younger_than_the_bound_is_never_reclaimed_however_many_scans_see_it() {
+    let rig = Rig::new("open-young");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    // Past the grace, short of the bound: a vdisk that has been writing for half an hour.
+    open_group(&rig, &peers, "eg-open", HOUR_MS / 2, &["n2"]);
+    let mut w = World::new(&rig, &peers);
+    for secs in [0, 601, 2000, 4000] {
+        let r = w.sweep_at(secs, &HashSet::new());
+        assert!(r.reclaimed.is_empty(), "{secs}: {r:?}");
+        assert_eq!(r.skipped_open, 1, "{secs}");
+    }
+    assert!(rig.store.path_for("eg-open").exists() && peers.r("n2").has("eg-open"));
+    assert_eq!(state_of(&rig, "eg-open").as_deref(), Some("open"));
+}
+
+#[test]
+fn an_open_group_a_running_drain_holds_is_never_reclaimed_whatever_its_age() {
+    // The drain's group is in `held` from before the first byte until it is sealed or the vdisk
+    // is gone: `Vdisk::held_egroups` names the open group and every group a running drain made.
+    let rig = Rig::new("open-held");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    open_group(&rig, &peers, "eg-draining", 48 * HOUR_MS, &["n2"]);
+    let held: HashSet<String> = ["eg-draining".to_string()].into_iter().collect();
+    let mut w = World::new(&rig, &peers);
+    for secs in [0, 601, 5000, 90_000] {
+        let r = w.sweep_at(secs, &held);
+        assert!(r.reclaimed.is_empty(), "{secs}: {r:?}");
+        assert_eq!(r.skipped_held, 1);
+    }
+    assert!(rig.store.path_for("eg-draining").exists() && peers.r("n2").has("eg-draining"));
+    assert!(peers.calls.borrow().is_empty());
+}
+
+#[test]
+fn a_group_that_becomes_held_between_the_scans_starts_over() {
+    // Seen unheld on the first scan; a vdisk is then attached and holds it. The second scan sees it
+    // held and must not reclaim, and the first sighting no longer counts afterwards.
+    let rig = Rig::new("open-held-between");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    open_group(&rig, &peers, "eg-open", 3 * HOUR_MS, &["n2"]);
+    let mut w = World::new(&rig, &peers);
+    w.sweep_at(0, &HashSet::new());
+    let held: HashSet<String> = ["eg-open".to_string()].into_iter().collect();
+    let held_scan = w.sweep_at(601, &held);
+    assert!(held_scan.reclaimed.is_empty() && held_scan.skipped_held == 1, "{held_scan:?}");
+    // Released again: a fresh first sighting, so nothing yet.
+    let after = w.sweep_at(700, &HashSet::new());
+    assert!(after.reclaimed.is_empty(), "{after:?}");
+    assert!(rig.store.path_for("eg-open").exists());
+}
+
+#[test]
+fn an_open_group_the_map_points_into_is_never_reclaimed() {
+    // A drain committed rows into it and the vdisk went away: referenced, so live.
+    let rig = Rig::new("open-referenced");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    let bytes = data(2, 4096);
+    let loc = rig.group("eg-open-live", "v1", &[(0, bytes.clone())]);
+    rig.point("v1", 0, "eg-open-live", (loc[0].1, loc[0].2), "v1", &bytes);
+    {
+        let mut st = rig.model.st.borrow_mut();
+        let g = st.egroups.get_mut("eg-open-live").unwrap();
+        g.state = "open".into();
+        g.created_ms = NOW_MS - 48 * HOUR_MS;
+    }
+    peers.r("n2").put("eg-open-live", &bytes, 99_999);
+    let mut w = World::new(&rig, &peers);
+    for secs in [0, 601, 5000] {
+        let r = w.sweep_at(secs, &HashSet::new());
+        assert!(r.reclaimed.is_empty(), "{r:?}");
+        assert_eq!(r.egroups_referenced, 1);
+    }
+    rig.assert_every_row_reads_correctly();
+    assert!(peers.r("n2").has("eg-open-live"));
+}
+
+#[test]
+fn a_group_sealed_by_a_drain_while_the_sweep_runs_is_not_taken() {
+    // The only race the guards leave: between the inventory and the compare-and-swap a drain seals
+    // the group. The swap is conditional on the state the sweep saw, so it is refused.
+    let rig = Rig::new("open-sealed-under-us");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    open_group(&rig, &peers, "eg-open", 3 * HOUR_MS, &["n2"]);
+    let mut w = World::new(&rig, &peers);
+    w.sweep_at(0, &HashSet::new());
+    rig.model.st.borrow_mut().before_cas = Some(Box::new(|st, _p, _x| {
+        st.egroups.get_mut("eg-open").unwrap().state = "sealed".into();
+    }));
+    let r = w.sweep_at(601, &HashSet::new());
+    assert!(r.reclaimed.is_empty(), "{r:?}");
+    assert!(rig.store.path_for("eg-open").exists() && peers.r("n2").has("eg-open"));
+    assert!(peers.calls.borrow().is_empty());
+    assert_eq!(state_of(&rig, "eg-open").as_deref(), Some("sealed"));
+}
+
+#[test]
+fn an_open_group_of_unknown_age_is_never_called_abandoned() {
+    let rig = Rig::new("open-unknown-age");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    open_group(&rig, &peers, "eg-open", 0, &["n2"]);
+    rig.model.st.borrow_mut().egroups.get_mut("eg-open").unwrap().created_ms = 0;
+    let mut w = World::new(&rig, &peers);
+    for secs in [0, 601, 5000] {
+        let r = w.sweep_at(secs, &HashSet::new());
+        assert!(r.reclaimed.is_empty() && r.skipped_open == 1, "{r:?}");
+    }
+    assert!(rig.store.path_for("eg-open").exists());
+}
+
+#[test]
+fn the_age_test_is_a_bound_and_not_a_guess() {
+    let h = Duration::from_secs(3600);
+    assert!(!abandoned(0, NOW_MS, h));
+    assert!(!abandoned(NOW_MS - HOUR_MS + 1, NOW_MS, h));
+    assert!(abandoned(NOW_MS - HOUR_MS, NOW_MS, h));
+    // A clock that went backwards makes a group look younger, never older.
+    assert!(!abandoned(NOW_MS + HOUR_MS, NOW_MS, h));
+    assert!(!abandoned(i64::MAX, i64::MIN, h));
+}
+
+/// Whatever mix of open and sealed groups, held sets and references the passes see, a group is
+/// reclaimed only if at that pass it was unreferenced, not held, and (when open) old enough --
+/// and had been so at an earlier pass at least a grace before. In particular a group in `held`
+/// at the pass that would reclaim it is never reclaimed: that is the running drain.
+#[test]
+fn random_histories_never_reclaim_what_a_drain_holds_or_the_map_points_at() {
+    // The property is only worth anything if the histories reach the interesting cases.
+    let (mut reclaimed_total, mut reclaimed_open) = (0usize, 0usize);
+    for seed in 1..=40u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let rig = Rig::new(&format!("open-random-{seed}"));
+        let peers = FakePeers::new(&rig, &["n2"]);
+        let ids: Vec<String> = (0..12).map(|i| format!("eg-r{seed}-{i}")).collect();
+        for id in &ids {
+            garbage(&rig, &peers, id, &["n2"]);
+            let mut st = rig.model.st.borrow_mut();
+            let g = st.egroups.get_mut(id).unwrap();
+            g.state = ["open", "sealed"][rng.below(2) as usize].into();
+            g.created_ms = NOW_MS - [HOUR_MS / 2, 2 * HOUR_MS, 30 * HOUR_MS][rng.below(3) as usize];
+        }
+        let mut w = World::new(&rig, &peers);
+        let mut since: HashMap<String, u64> = HashMap::new();
+        let mut clock = 0u64;
+        for _ in 0..8 {
+            for id in &ids {
+                match rng.below(8) {
+                    0 => rig.model.st.borrow_mut().block.push(MRow {
+                        vdisk: "v".into(), idx: rng.below(1000), egroup: Some(id.clone()), offset: 0, length: 1, vhash: 1, extent: None,
+                    }),
+                    1 => rig.model.st.borrow_mut().block.retain(|r| r.egroup.as_deref() != Some(id.as_str())),
+                    _ => {}
+                }
+            }
+            let held: HashSet<String> = ids.iter().filter(|_| rng.below(4) == 0).cloned().collect();
+            clock += [10, 300, 601, 900][rng.below(4) as usize];
+            let referenced: HashSet<String> =
+                rig.model.st.borrow().block.iter().filter_map(|r| r.egroup.clone()).collect();
+            let states: HashMap<String, (String, i64)> = rig
+                .model
+                .st
+                .borrow()
+                .egroups
+                .iter()
+                .map(|(k, g)| (k.clone(), (g.state.clone(), g.created_ms)))
+                .collect();
+            let r = w.sweep_at(clock, &held);
+            reclaimed_total += r.reclaimed.len();
+            reclaimed_open += r.reclaimed_abandoned_open.len();
+            for id in &r.reclaimed {
+                assert!(!held.contains(id), "seed {seed}: {id} was held by a drain and was reclaimed");
+                assert!(!referenced.contains(id), "seed {seed}: {id} was referenced and was reclaimed");
+                let (state, created) = &states[id];
+                if state == "open" {
+                    assert!(abandoned(*created, NOW_MS, OPEN_ABANDON), "seed {seed}: {id} open and too young");
+                }
+                let first = since.get(id).unwrap_or_else(|| panic!("seed {seed}: {id} reclaimed on first sight"));
+                assert!(clock - first >= 600, "seed {seed}: {id} reclaimed {}s after first sight", clock - first);
+            }
+            // The oracle of "seen reclaimable": unreferenced, not held, and old enough if open.
+            let reclaimable_now: HashSet<String> = ids
+                .iter()
+                .filter(|id| {
+                    // Already reclaimed in an earlier pass: gone, so nothing to be seen about.
+                    let Some((state, created)) = states.get(*id) else { return false };
+                    !referenced.contains(*id)
+                        && !held.contains(*id)
+                        && (state != "open" || abandoned(*created, NOW_MS, OPEN_ABANDON))
+                })
+                .cloned()
+                .collect();
+            since.retain(|id, _| reclaimable_now.contains(id));
+            for id in &reclaimable_now {
+                since.entry(id.clone()).or_insert(clock);
+            }
+        }
+    }
+    assert!(reclaimed_total > 20, "the histories reclaimed only {reclaimed_total} group(s)");
+    assert!(reclaimed_open > 5, "the histories reclaimed only {reclaimed_open} open group(s)");
 }

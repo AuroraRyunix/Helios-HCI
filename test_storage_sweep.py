@@ -302,6 +302,75 @@ class ReplicaReclamationKeepsItsRules(unittest.TestCase):
         self.assertIn("unknown opcode", entry)
 
 
+class AbandonedOpenGroupsAreReclaimedUnderTheSameRules(unittest.TestCase):
+    """What `open` means and why the sweep may take an abandoned one is D-33; the proof is in Rust
+    (`purah/reclaim/tests.rs`, and `vdisk.rs` against a real running drain). These pin the shape."""
+
+    def sweep(self):
+        return body(rust("purah", "reclaim.rs"), "pub fn sweep_pass<")
+
+    def test_an_open_group_is_skipped_only_while_it_is_not_old_enough(self):
+        sweep = self.sweep()
+        self.assertIn('state == "open" && !abandoned(created_at_ms, now_ms, p.open_abandon)', sweep)
+        self.assertNotRegex(sweep, r'if state == "open" \{\s*report\.skipped_open')
+
+    def test_the_held_check_applies_to_open_groups_too_and_comes_before_any_removal(self):
+        sweep = self.sweep()
+        open_check = sweep.index('state == "open"')
+        held_check = sweep.index("held.contains(&id)")
+        self.assertLess(open_check, held_check)
+        self.assertLess(held_check, sweep.index("mark_dead_and_remove_local(p"))
+
+    def test_the_swap_to_dead_is_conditional_on_the_state_that_was_seen(self):
+        mark = body(rust("purah", "reclaim.rs"), "fn mark_dead_and_remove_local<")
+        self.assertIn('("expected_state", json!(current_state))', mark)
+        self.assertIn("Ok(()) => pending.push((id, size.max(0) as u64, first_seen, state == \"open\"))", self.sweep())
+
+    def test_an_unknown_age_is_never_abandoned(self):
+        abandoned = body(rust("purah", "reclaim.rs"), "pub fn abandoned(")
+        self.assertIn("created_at_ms > 0 &&", abandoned)
+
+    def test_the_bound_is_configurable_and_never_below_twice_the_grace(self):
+        main = rust("main.rs")
+        self.assertIn('"SIDON_PURAH_OPEN_ABANDON"', main)
+        purah = rust("purah.rs")
+        self.assertIn("self.open_abandon = bound.max(self.grace * 2);", purah)
+        self.assertIn("OPEN_ABANDON_DEFAULT.max(grace * 2)", purah)
+
+    def test_the_attached_set_is_read_under_the_curators_lock(self):
+        sweep = body(rust("control.rs"), "fn op_purah_sweep(")
+        self.assertLess(sweep.index("purah_state.lock()"), sweep.index("self.held_egroups()"))
+        self.assertLess(sweep.index("self.held_egroups()"), sweep.index("purah.sweep("))
+
+    def test_nothing_adopts_an_open_group(self):
+        """The premise of the rule: a vdisk that starts, restarts or moves creates a new group.
+
+        If this fails, something now resumes appending to an existing open group, and the rule
+        that an open group no attached vdisk holds is abandoned needs to be re-argued.
+        """
+        vdisk = production(rust("vdisk.rs"))
+        self.assertEqual(vdisk.count("open_eg: None,"), 1, "a second place builds a vdisk without an open group")
+        creates = re.findall(r'"/v1/dfs/egroup-create"', vdisk)
+        self.assertEqual(len(creates), 1, "more than one place registers a group")
+        self.assertNotRegex(vdisk, r"state\s*==\s*\"open\"", "something reads open groups back from Hydra")
+
+    def test_the_cli_reports_the_abandoned_ones_apart(self):
+        ns, _ = cluster({"10.0.0.1": dict(IDLE, reclaimed=["a", "b"], reclaimed_abandoned_open=["b"])})
+        out, _ = run(load_valcli(**ns), "cmd_storage_sweep")
+        self.assertIn("1 were open and abandoned", out)
+
+    def test_the_decision_covers_it(self):
+        decisions = read("docs", "dfs", "decisions.md")
+        entry = decisions[decisions.index("**D-33"):]
+        self.assertIn("SIDON_PURAH_OPEN_ABANDON", entry)
+        self.assertIn("Nothing adopts an open group", entry.replace("\n", " ").replace("  ", " "))
+
+
+def production(source):
+    """Everything before the unit tests."""
+    return source.split("#[cfg(test)]")[0]
+
+
 class StorageListIsUntouchedByThisChange(unittest.TestCase):
     def test_the_sweep_functions_do_not_call_into_storage_list(self):
         source = read("valcli.py")

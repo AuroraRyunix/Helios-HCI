@@ -48,6 +48,8 @@ pub struct DaemonConfig {
     pub daruk_timeout: Duration,
     pub purah_interval: Duration,
     pub purah_grace: Duration,
+    /// How old an `open` extent group must be before the sweep may call it abandoned.
+    pub purah_open_abandon: Duration,
     pub peer_bind: String,
     pub peers: Vec<(String, String)>,
     pub peer_timeout: Duration,
@@ -183,7 +185,8 @@ impl Daemon {
             // than letting an operator who asked for no grace have none.
             cfg.purah_grace,
             Arc::clone(&access),
-        );
+        )
+        .with_open_abandon(cfg.purah_open_abandon);
         // Shares the tally, so the reads this node serves to another node's vdisk count.
         let replica_store =
             Arc::new(ReplicaStore::new(&volume)?.with_access(Arc::clone(&access)));

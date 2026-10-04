@@ -12,6 +12,8 @@
 //!    is what a replica checks, so it must still be there;
 //! 4. delete the row (and the access data).
 //!
+//! What an `open` group is, and when the sweep may take one, is in [`abandoned`] below.
+//!
 //! A stop after any step is safe. After 1 the group is a dead row with a file, which the next
 //! sweep takes through the same steps again (the CAS is conditional on the state it *leaves*,
 //! and `dead` -> `dead` is allowed here as it always was). After 3 the replicas are done and
@@ -135,6 +137,40 @@ pub struct Pass<'a, D: Db> {
     pub grace: Duration,
     pub access: &'a AccessLog,
     pub peers: &'a dyn ReplicaPeers,
+    /// How old an `open` group must be before it can be called abandoned. See [`abandoned`].
+    pub open_abandon: Duration,
+}
+
+/// Whether an `open` group may be treated as abandoned, as far as its age goes.
+///
+/// **What `open` means.** A drain writes extents into a group and records the group in Hydra as
+/// `open` *before* the first byte (so that the sweep, which reads Hydra, can see it exists);
+/// the group becomes `sealed` when it is full, with a hash. Until then it is the append target
+/// of exactly one thing: the vdisk instance that created it, in memory, on the node that
+/// created it -- `Vdisk::open_eg`, or the drain's own copy of it while a drain runs. Nothing
+/// ever *adopts* an open group: a restarted daemon, or a vdisk attached on another node, starts
+/// a new group and leaves the old row `open` for ever. That is the only way a group stays open
+/// with nobody writing it, and the sweep used to skip every open group, so those rows and their
+/// files were never reclaimed.
+///
+/// **Why the sweep skipped them.** Because "open" looked like "someone is writing it", and a
+/// group someone is writing is unreferenced until the drain commits (data before metadata, I-3).
+/// That is true, and it is already covered twice: the vdisk's `held_egroups` names its open
+/// group and every group a running drain has made, and the sweep checks `held` for every group
+/// regardless of state. So the skip protected nothing `held` did not, and cost the leak above.
+///
+/// **The rule.** An open group is reclaimed exactly like a sealed one -- unreferenced by every
+/// map level, not held by a vdisk attached on this node, not young, seen so on two scans a grace
+/// apart -- and in addition must be older than `open_abandon` (an hour by default, never less
+/// than twice the grace). The age is the third guard and not the first: it covers the one
+/// window `held` cannot, a group created between the moment the attached set was read and the
+/// moment the map was, and it means a clock stepped forward would still have to beat both of the
+/// others. A group a running drain is writing is in `held` for as long as it runs, on every
+/// scan; a drain that has finished left either a map reference or nothing at all.
+///
+/// An age of zero (`created_at_ms` unset) is unknown, not old, and is never abandoned.
+pub fn abandoned(created_at_ms: i64, now_ms: i64, open_abandon: Duration) -> bool {
+    created_at_ms > 0 && now_ms.saturating_sub(created_at_ms) >= open_abandon.as_millis() as i64
 }
 
 fn my_egroups<D: Db>(db: &D, node: &str) -> Result<Vec<(String, String, i64, i64)>> {
@@ -220,7 +256,7 @@ pub fn sweep_pass<D: Db>(
     let grace_ms = p.grace.as_millis() as i64;
     let mut still_unreferenced: HashMap<String, Instant> = HashMap::new();
     // Marked dead and gone from this node, awaiting the replicas and then the row.
-    let mut pending: Vec<(String, u64, Instant)> = Vec::new();
+    let mut pending: Vec<(String, u64, Instant, bool)> = Vec::new();
 
     for (id, state, created_at_ms, size) in inventory {
         if referenced.contains(&id) {
@@ -234,7 +270,9 @@ pub fn sweep_pass<D: Db>(
             // Seen referenced: any grace it had accumulated is void.
             continue;
         }
-        if state == "open" {
+        // An open group is judged like any other once it is old enough to be abandoned, and the
+        // `held` check below applies to it exactly as to a sealed one.
+        if state == "open" && !abandoned(created_at_ms, now_ms, p.open_abandon) {
             report.skipped_open += 1;
             continue;
         }
@@ -268,7 +306,7 @@ pub fn sweep_pass<D: Db>(
 
         report.candidates += 1;
         match mark_dead_and_remove_local(p, &id, &state) {
-            Ok(()) => pending.push((id, size.max(0) as u64, first_seen)),
+            Ok(()) => pending.push((id, size.max(0) as u64, first_seen, state == "open")),
             Err(e) => {
                 eprintln!("purah: could not reclaim extent group {id}: {e}");
                 still_unreferenced.insert(id, first_seen);
@@ -280,7 +318,7 @@ pub fn sweep_pass<D: Db>(
     // replica reads the block map once per request.
     let mut keep_row: HashSet<String> = HashSet::new();
     if !pending.is_empty() {
-        let ids: Vec<String> = pending.iter().map(|(id, _, _)| id.clone()).collect();
+        let ids: Vec<String> = pending.iter().map(|(id, _, _, _)| id.clone()).collect();
         report.replica_drops = push_drops(p.peers, p.node, &ids);
         for drop in &report.replica_drops {
             for id in &drop.referenced {
@@ -289,7 +327,7 @@ pub fn sweep_pass<D: Db>(
         }
     }
 
-    for (id, size, first_seen) in pending {
+    for (id, size, first_seen, was_open) in pending {
         if keep_row.contains(&id) {
             // A replica found a reference this node's scans missed. The local copy is gone and
             // cannot be restored from here, but the replica kept its own, and the row stays
@@ -303,6 +341,9 @@ pub fn sweep_pass<D: Db>(
         }
         match forget_group(p, &id) {
             Ok(()) => {
+                if was_open {
+                    report.reclaimed_abandoned_open.push(id.clone());
+                }
                 report.reclaimed.push(id);
                 report.bytes_reclaimed += size;
             }

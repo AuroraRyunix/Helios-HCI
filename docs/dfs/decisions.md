@@ -823,3 +823,32 @@ sweeps past the grace without anyone running anything.
 replaced this node and the old copy was never removed) is left alone: Hydra says the group is live,
 and whether this node should hold it is a question about the vdisk's replica set that this pass
 does not ask (I-6 territory). The operator-visible number is `live` in the scan report.
+
+*Open groups nothing holds (D-33, second part).* `open` means one thing: the append target of the
+vdisk instance that created the group, in memory, on the node that created it (`Vdisk::open_eg`, or
+the drain's own copy while a drain runs). Nothing adopts an open group -- a restarted daemon, a
+detached vdisk or a failover starts a new group -- so a row stays `open` with nobody writing it
+exactly when its writer is gone, and the sweep, which skipped every open group, never reclaimed any:
+18 of them on one lab node after all its vdisks were deleted. The skip protected nothing the `held`
+check did not already protect (a vdisk's `held_egroups` names its open group and every group a
+running drain made, and the sweep checks `held` for every group whatever its state), so it is
+removed. **Taken:** an open group is judged like any other -- unreferenced through both map levels,
+not held, not young, seen so on two scans a grace apart, and the compare-and-swap to `dead` is
+conditional on `open`, so a drain that seals it mid-pass wins -- and in addition it must be older
+than `SIDON_PURAH_OPEN_ABANDON` (an hour; never less than twice the grace). The age is the third
+guard and not the first: it covers the one window `held` cannot (a group created between the moment
+the attached set was read and the moment the map was), and the attached set is now read under the
+curator's lock, immediately before the scan, instead of before queueing for it. An unknown age
+(`created_at_ms` unset) is never abandoned. **Rejected:** *asking each node whether a drain is
+running for the vdisk* (an open group is only ever written by the node that created it, so only that
+node can be asked, and that node is the sweep); *sealing abandoned groups instead of deleting them*
+(an unreferenced group has no reason to exist, and sealing needs a hash of bytes nobody has
+verified); *shortening or removing the age bound* (a free guard, and the only one that does not
+depend on the attached set being read at the right moment). **Proof that a running drain's group is
+safe:** `purah/reclaim/tests.rs` runs random histories of held sets, references and ages and checks
+that nothing held or referenced is ever reclaimed and nothing is reclaimed on first sight, and
+`vdisk.rs` runs a real vdisk with a drain parked at its commit and sweeps against its live
+`held_egroups` past the bound and the grace, many times, before showing the same group go once the
+vdisk is gone. **Not addressed:** an open group that rows *do* reference (its vdisk detached after
+committing extents into it) stays open for ever and so is never scrubbed or compacted, which both
+require a sealed group; sealing such a group needs the vdisk's drain excluded and is its own change.

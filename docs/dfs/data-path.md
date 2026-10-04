@@ -154,6 +154,14 @@ longer lists and drops them after two scans a grace apart, which covers a replic
 owner that crashed, an older owner, and every orphan left before this existed. An older replica
 refuses the new opcode and keeps its copy, which is safe.
 
+**Open groups.** A group is `open` while it is a drain's append target: recorded in Hydra before
+the first byte, sealed when full. Only the vdisk that created it, on the node that created it,
+writes it, and a vdisk attached on that node names it (and every group a running drain made) in the
+set the sweep protects. A group left open by a crash, a detach or a failover has no writer and used
+to be skipped for ever; it is now reclaimed under the same rule as any other, once it is also older
+than an hour (`SIDON_PURAH_OPEN_ABANDON`). D-33 has the argument that a running drain's group is never
+taken.
+
 ### Compaction: reclaiming inside a group
 
 Mark-sweep frees a *group*. A group three extents dead and one alive is never freed, and

@@ -436,6 +436,12 @@ request (it keeps its copy until it is upgraded). Each node also scans the copie
 nodes' groups and drops those Hydra no longer lists, under the same two-scan rule; the report line for that
 shows how many it scanned, dropped, and is still waiting on. A replica never drops a copy of a group Hydra
 lists as live, whoever asks.
+Groups still marked `open` are no longer skipped for being open. An open group is a drain's append
+target only while a vdisk attached on that node holds it; a crash, a detach or a failover leaves the
+row `open` with nobody writing it, and such a group is now reclaimed like any other once it is older
+than `SIDON_PURAH_OPEN_ABANDON` (3600 s by default, never less than twice the grace) and the two scans
+have seen it unreferenced and unheld. The report counts those separately (`reclaimed_abandoned_open`),
+and `left alone: N open` is the open groups that are not yet old enough or are held.
 `storage.scrub` is the sibling for damage: it re-hashes each sealed group and names any that no longer match.
 
 `storage.list` also prints one row per extent-store disk: its identity, the directory it is

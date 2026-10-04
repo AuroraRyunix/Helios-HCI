@@ -2737,6 +2737,98 @@ mod tests {
         r.settle();
     }
 
+    /// The claim D-33 rests on, against a real vdisk and a real drain: the sweep cannot take an
+    /// `open` group a running drain is writing, however old Hydra says it is and however many
+    /// scans see it, because the vdisk names it in `held_egroups` for as long as the drain has
+    /// it -- and the same group is taken, by the same code, once nothing holds it.
+    #[test]
+    fn the_sweep_cannot_take_the_open_group_of_a_running_drain_and_can_once_nothing_holds_it() {
+        use crate::purah::reclaim::{sweep_pass, PeerAnswer, Pass, ReplicaPeers};
+        use crate::purah::testkit::{MGroup, Model};
+
+        struct Alone;
+        impl ReplicaPeers for Alone {
+            fn nodes(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn drop_groups(&self, _n: &str, _f: &str, _i: &[String]) -> Result<PeerAnswer> {
+                unreachable!("there are no peers")
+            }
+        }
+
+        let r = rig("sweep-vs-drain", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.hydra.hold(true);
+        r.write(0, &fill(1, 3 * MIB)).unwrap();
+        r.hydra.wait_for_commits(1);
+
+        let (id, store) = {
+            let v = r.vd.lock().unwrap();
+            let making = v.drain_groups();
+            assert_eq!(making.len(), 1, "{making:?}");
+            (making.into_iter().next().unwrap(), Arc::clone(&v.store))
+        };
+        assert!(store.path_for(&id).exists(), "the drain's group is on disk");
+
+        // Hydra's view: registered `open` two days ago, nothing points at it (the drain has not
+        // committed its rows) -- exactly what an abandoned group looks like.
+        let model = Model::new();
+        let long_ago = now_ms() - 48 * 3_600_000;
+        model.st.borrow_mut().egroups.insert(
+            id.clone(),
+            MGroup {
+                state: "open".into(),
+                node: "self".into(),
+                created_ms: long_ago,
+                size: 0,
+                seal_hash: String::new(),
+                hint: "vd".into(),
+            },
+        );
+        let access = AccessLog::new(16, 0);
+        let grace = Duration::from_secs(600);
+        let base = Instant::now();
+        let mut ledger = HashMap::new();
+        let mut sweep = |secs: u64, held: &HashSet<String>| {
+            let pass = Pass {
+                db: &model,
+                store: &store,
+                node: "self",
+                grace,
+                access: &access,
+                peers: &Alone,
+                open_abandon: Duration::from_secs(3600),
+            };
+            sweep_pass(&pass, &mut ledger, held, now_ms(), base + Duration::from_secs(secs)).unwrap()
+        };
+
+        // While the drain runs, every pass reads the attached set from the live vdisk, as the
+        // daemon does. Past the age bound, past the grace, many times over.
+        for secs in [0u64, 601, 1500, 5000, 90_000] {
+            let held = r.vd.lock().unwrap().held_egroups();
+            assert!(held.contains(&id));
+            let report = sweep(secs, &held);
+            assert!(report.reclaimed.is_empty(), "at {secs}s: {report:?}");
+            assert_eq!(report.skipped_held, 1, "at {secs}s: {report:?}");
+            assert!(store.path_for(&id).exists(), "at {secs}s the drain's group was removed");
+        }
+
+        // The drain finishes; the vdisk still has the group as its open group, so it is still held.
+        r.hydra.hold(false);
+        r.settle();
+        let held = r.vd.lock().unwrap().held_egroups();
+        assert!(held.contains(&id), "the open group is held after the drain, until the vdisk is gone");
+        assert!(sweep(100_000, &held).reclaimed.is_empty());
+
+        // The vdisk is gone (detached, or the daemon restarted): nothing holds the group, and the
+        // same pass now treats it as abandoned -- the two scans first.
+        let none = HashSet::new();
+        assert!(sweep(200_000, &none).reclaimed.is_empty(), "first sight after the hold ended");
+        let last = sweep(200_601, &none);
+        assert_eq!(last.reclaimed, vec![id.clone()], "{last:?}");
+        assert_eq!(last.reclaimed_abandoned_open, vec![id.clone()]);
+        assert!(!store.path_for(&id).exists());
+    }
+
     // ---- replicas see the drain by sequence, not wholesale ----------------------------
 
     #[test]
