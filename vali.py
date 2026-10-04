@@ -1049,22 +1049,6 @@ def get_vm_disk_size(vm_name):
     return None
 
 
-def hostname_for_ip(ip):
-    """The cluster hostname of a node, or None.
-
-    The map keys everything by node name while this code passes addresses around, so the
-    two have to be reconciled somewhere. `cluster.json` is the only place that holds both.
-    """
-    try:
-        with open("/etc/hci/cluster.json", "r") as f:
-            for host in json.load(f).get("hosts", []):
-                if host.get("ip") == ip:
-                    return host.get("hostname")
-    except Exception:
-        pass
-    return None
-
-
 def get_storage_free_space(target_ip):
     """Free MiB in the target node's extent store, or None if unknown.
 

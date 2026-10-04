@@ -4,6 +4,7 @@ import base64
 import subprocess
 import socket
 import ssl
+import urllib.error
 import urllib.request
 import uuid
 import sys
@@ -72,6 +73,34 @@ def run_remote_spark(ip, command):
     except Exception as e:
         return -1, "", str(e)
 
+def spark_unit_action(ip, action, units, ignore_failed=False):
+    """Act on systemd units through spark-daemon's typed endpoint. Returns (ok, detail).
+
+    The unit names are matched against the far side's allow-list, so nothing here can turn
+    into a different command the way a `systemctl ...` shell string can.
+    """
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+    ip, verify_identity = spark_endpoint(ip)
+    context.check_hostname = verify_identity
+    payload = {"action": action, "units": list(units)}
+    if ignore_failed:
+        payload["ignore_failed"] = True
+    req = urllib.request.Request(
+        f"https://{ip}:9099/api/v1/host/units", data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=60):
+            return True, ""
+    except urllib.error.HTTPError as e:
+        try:
+            return False, str(json.loads(e.read().decode("utf-8")).get("error") or e.code)
+        except Exception:
+            return False, "HTTP %s" % e.code
+    except Exception as e:
+        return False, str(e)
+
+
 def main():
     # 1. Load cluster hosts
     hosts = []
@@ -137,8 +166,13 @@ def main():
         
         # 2. Iterate hosts to clean up namespaces, processes, links, and firewall rules
         for ip in hosts:
+            # The unit first, through the typed endpoint; whether it was running is not the
+            # question, so a failure to stop or disable it is reported and not fatal.
+            for verb in ("stop", "disable"):
+                ok, detail = spark_unit_action(ip, verb, ["urbosa"], ignore_failed=True)
+                if not ok:
+                    print(f"[{ip}] Could not {verb} urbosa (continuing): {detail}")
             cmd = (
-                "systemctl stop urbosa || true && systemctl disable urbosa || true && "
                 "for ns in $(ip netns show | awk '{print $1}'); do "
                 "  if [[ \"$ns\" =~ ^ns-t[01]- ]]; then "
                 "    for pid in $(ip netns pids \"$ns\" 2>/dev/null); do "
@@ -183,11 +217,13 @@ def main():
     # 2. Start urbosa systemd service on all hosts
     print(f"Enabling and starting urbosa service on nodes: {', '.join(hosts)}")
     for ip in hosts:
-        rc, stdout, stderr = run_remote_spark(ip, "systemctl enable urbosa && systemctl start urbosa")
-        if rc == 0:
+        ok, detail = spark_unit_action(ip, "enable", ["urbosa"])
+        if ok:
+            ok, detail = spark_unit_action(ip, "start", ["urbosa"])
+        if ok:
             print(f"[{ip}] Service started successfully.")
         else:
-            print(f"[{ip}] Warning: Failed to start service: {stderr or stdout}")
+            print(f"[{ip}] Warning: Failed to start service: {detail}")
             
     # 3. Configure Defaults in ScyllaDB if empty
     print("Checking if default logical routers and segments exist...")

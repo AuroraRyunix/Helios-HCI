@@ -32,6 +32,17 @@ def get_local_ip():
         pass
     return local_ip
 
+def has_node_identity(local_ip):
+    """True when `local_ip` names this node.
+
+    Every row is keyed by it. A node whose spectrum.env lacks LOCAL_HYPERVISOR_IP answers
+    127.0.0.1, and every such node would write to the same partition, each overwriting the
+    others' samples while the console showed a mix of nodes under one address. Writing nothing
+    is the honest answer, and it is said once.
+    """
+    return bool(local_ip) and not local_ip.startswith("127.")
+
+
 def get_cpu_stats():
     try:
         with open("/proc/stat", "r") as f:
@@ -159,6 +170,7 @@ def main():
     print("Logos Telemetry Daemon started.")
     local_ip = get_local_ip()
     print(f"Local IP resolved: {local_ip}")
+    warned_without_identity = False
 
     # Initial sample
     last_time = time.time()
@@ -267,6 +279,19 @@ def main():
             else:
                 combined_cql = statements[0]
                 
+            if not has_node_identity(local_ip):
+                # Re-read it: the file may be written after this daemon starts.
+                local_ip = get_local_ip()
+                if not warned_without_identity:
+                    warned_without_identity = True
+                    sys.stderr.write(
+                        "[logos] WARNING: this node does not know its own address "
+                        "(LOCAL_HYPERVISOR_IP is absent from /etc/hci/spectrum/spectrum.env), "
+                        "so no telemetry is written: rows are keyed by that address and every "
+                        "node without one would overwrite the others.\n")
+                    sys.stderr.flush()
+                time.sleep(5)
+                continue
             rc, out, err = run_cql_query(combined_cql, local_ip)
             if rc != 0:
                 print(f"Failed to write batch metrics to ScyllaDB: {err.strip()}")

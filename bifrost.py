@@ -6,6 +6,7 @@ import time
 import socket
 import helios_zk
 import subprocess
+import threading
 
 # Slate/Traefik client-facing ingress. This is the port clients actually reach
 # through the VIP (README section 8), so it is what gates VIP ownership.
@@ -132,12 +133,35 @@ current_vip = None
 current_iface = None
 current_prefixlen = 24
 
+def withdraw_ballot(candidacy, wait=3.0):
+    """Resign the ballot, bounded: the call talks to ZooKeeper, which may not answer, and a
+    stopping process must not wait on it. If it does not finish, the session timeout does what
+    it always did."""
+    done = threading.Event()
+
+    def run():
+        try:
+            candidacy.withdraw()
+        except Exception as e:
+            sys.stderr.write(f"Error withdrawing the VIP ballot on signal: {e}\n")
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    return done.wait(wait)
+
+
 def signal_handler(signum, frame):
     global running
     sys.stdout.write(f"Received signal {signum}. Stopping Bifrost VIP Manager...\n")
     sys.stdout.flush()
     running = False
-    
+
+    # Give up the ballot first, so the address passes to a healthy peer now and not after the
+    # session's 15 s timeout. The ballot is only ever made when a candidacy was created.
+    if _VIP_CANDIDACY is not None:
+        withdraw_ballot(_VIP_CANDIDACY)
+
     if current_vip and current_iface:
         try:
             # Check if bound (exact match) and delete it. current_prefixlen must

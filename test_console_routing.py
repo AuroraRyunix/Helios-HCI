@@ -84,6 +84,26 @@ def nav_items():
     ]
 
 
+class EveryPhoenixRouteIsReachableThroughSlate(unittest.TestCase):
+    """The navigation table only names the top-level pages. A route with a parameter, such as a
+    vdisk's snapshot page, fell to the Python catch-all because nothing checked the router
+    itself, so the link on the storage page led to a 404 in the Python tier."""
+
+    def test_each_route_in_router_ex_matches_the_phoenix_rule(self):
+        source = read(os.path.join(HERE, "spectrum_phx", "lib", "spectrum_phx_web", "router.ex"))
+        rule = phoenix_rule()
+        paths = []
+        for line in source.splitlines():
+            m = re.match(r'\s*(?:live|get|post|delete|put)\s+"(/[^"]*)"', line)
+            if m:
+                paths.append(m.group(1))
+        self.assertGreater(len(paths), 15, "the router was not parsed")
+        # The development-only scope is not served in production.
+        unreachable = [p for p in paths
+                       if not p.startswith("/dev") and not rule.matches(re.sub(r":\w+", "x", p))]
+        self.assertEqual(unreachable, [], "routed by Phoenix but sent to the Python tier by Slate")
+
+
 class TheTwoHalvesAgree(unittest.TestCase):
     def setUp(self):
         self.rule = phoenix_rule()

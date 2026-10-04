@@ -3142,13 +3142,21 @@ def cmd_cluster_vip_set(vip_ip):
     json_str = json.dumps(cdata, indent=4)
     json_b64 = base64.b64encode(json_str.encode()).decode()
     
-    cmd_write = f"mkdir -p /etc/hci && echo {json_b64} | base64 -d > /etc/hci/cluster.json && systemctl restart bifrost"
-    
+    cmd_write = f"mkdir -p /etc/hci && echo {json_b64} | base64 -d > /etc/hci/cluster.json"
+
     for ip in hosts:
         print(f"Propagating VIP configuration to host {ip}...")
         rc, stdout, stderr = run_remote_spark(ip, cmd_write)
         if rc != 0:
             print(f"Warning: Failed to configure VIP on host {ip}: {stderr or stdout}")
+            continue
+        # Bifrost reads the address at start. Through the typed unit endpoint, so the name is
+        # matched against the daemon's own allow-list and not spliced into a shell string.
+        status, body, error = run_mtls_spark_api_full(
+            ip, "/api/v1/host/units", {"action": "restart", "units": ["bifrost"]})
+        if status != 200:
+            detail = error or str((body or {}).get("error") or "spark-daemon answered %s" % status)
+            print(f"Warning: the VIP is written on {ip} but bifrost was not restarted: {detail}")
             
     print(f"Successfully configured cluster Virtual IP (VIP) to {vip_ip} cluster-wide.")
 

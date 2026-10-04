@@ -28,11 +28,6 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     run_cql_query,
 )
 
-def run_command_local(cmd):
-    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return res.returncode, res.stdout.decode('utf-8', errors='ignore').strip(), res.stderr.decode('utf-8', errors='ignore').strip()
-
-
 LOCAL_IP = "127.0.0.1"
 
 # Load local environment settings if available

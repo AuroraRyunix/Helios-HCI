@@ -47,7 +47,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # exactly that left one caller dialling plain HTTP after the port was hardened.
 CALLERS = [
     "spectrum_server.py", "cluster_new.py", "vali.py", "hylia.py", "mipha.py",
-    "dagur.py",
+    "dagur.py", "valcli.py", "mimir.py", "catalyst.py", "lanayru.py",
+    "urbosa_bootstrap.py", "rauru.py",
 ]
 
 DAEMON = "spark_daemon_decoded.py"
@@ -103,6 +104,28 @@ KNOWN_SHELL_COMMANDS = {
         "/api/v1/host/units too. Migrating the compatibility path to the endpoint it "
         "exists to be compatible without would fail silently, because a 404 on the unit "
         "call reads exactly like a fence that was attempted.",
+    ("lanayru.py", "systemctl restart systemd-networkd"):
+        "A line of cloud-init user data that runs inside the guest being created, not on a "
+        "hypervisor and not through spark-daemon.",
+    ("lanayru.py", "ip link add name br-ov-10010 type bridge || true"):
+        "Host gateway bridges for the default overlay segments. There is no typed endpoint for "
+        "creating a link or an address (the host/network endpoint is read-only), and one is a "
+        "design of its own: which links may be created, with which names. Fixed text, no "
+        "caller-supplied value. Listed in docs/service_review.md.",
+    ("lanayru.py", "ip addr add 172.16.10.250/24 dev br-ov-10010 || true"): "See the entry above.",
+    ("lanayru.py", "ip link set br-ov-10010 up || true"): "See the entry above.",
+    ("lanayru.py", "ip link add name br-ov-10011 type bridge || true"): "See the entry above.",
+    ("lanayru.py", "ip addr add 172.16.11.250/24 dev br-ov-10011 || true"): "See the entry above.",
+    ("lanayru.py", "ip link set br-ov-10011 up || true"): "See the entry above.",
+    ("urbosa_bootstrap.py", "ip netns show"):
+        "Urbosa's teardown walks the namespaces and links it created and deletes them. No typed "
+        "endpoint exists for namespace or link management; the only interpolated part is the "
+        "firewall-rule text built from Hydra rows, which is in a different family. The unit "
+        "control that used to share this string now goes through the units endpoint.",
+    ("urbosa_bootstrap.py", "ip netns pids"): "See the entry above.",
+    ("urbosa_bootstrap.py", "ip netns del"): "See the entry above.",
+    ("urbosa_bootstrap.py", "ip -o link show"): "See the entry above.",
+    ("urbosa_bootstrap.py", "ip link del"): "See the entry above.",
 }
 
 
