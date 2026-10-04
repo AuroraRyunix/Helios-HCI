@@ -10,12 +10,14 @@ edition = "2021"
 # day the output changes.
 [dependencies]
 serde_json = "1.0"
+# `dangerous_configuration` is what lets `replicate::site_tls` install a verifier that checks a
+# pinned key instead of a chain; it is used for the cross-site listener only, never for 9105.
 # Mutual TLS on the replication port. 0.21 to match agahnim, which already ships rustls
 # on these nodes -- same version means one copy in the registry and one audit surface.
 # Plain rustls, not tokio-rustls: this daemon's byte path is blocking threads and std,
 # and pulling in an async runtime for the transport would restructure the data path to
 # solve a problem it does not have.
-rustls = "0.21"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0"
 # Compression at seal time. A codec is the one thing on the byte path that cannot be std,
 # and hand-rolling one to keep the dependency list short would put a bespoke decompressor

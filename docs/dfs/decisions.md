@@ -902,3 +902,18 @@ the journal volume could hold it. **Taken:** `SIDON_HARD_CEILING` (0 = the defau
 mark is replaced and said so, and startup warns when the volume could not hold eight busy vdisks' ceilings. **Not
 addressed:** Sidon still does not re-attach on start.
 
+**D-36 — the cross-site key pin lives in Sidon; failover is a pure state machine with nothing automatic.**
+Built the parts of D-28 to D-31 that can be built without a second site. *The pin:* the verifier is a rustls
+`ServerCertVerifier` and `ClientCertVerifier` in `sidon/src/replicate/site_tls.rs` that accepts a leaf iff its
+SubjectPublicKeyInfo SHA-256 is in the pin set, with a one-day expiry leeway and skew reported as skew; the handshake
+signature is still checked. **Rejected:** *Python `ssl` for the listener* (it cannot request a client certificate
+without validating the chain, and a self-signed site certificate has no chain to validate; loading every pinned
+certificate as a trust anchor would make a renewal on the same key need an import, which D-28 says it must not);
+*cross-signing* (already rejected in D-28). Enabling rustls's `dangerous_configuration` feature is the price, and it is
+used only for this listener, never for 9105. *The map sink:* `HydraMapSink` writes a replica as class `forming`, the map
+in single-partition batches, reads it back, and flips to `immutable` with the existing class compare-and-swap; a crashed
+publish is redone from an empty map, a visible name is never overwritten. *Failover:* `rauru_failover.step` returns the
+next state and the actions to take; it never decides to fail over by itself, because a lost link is not evidence that
+the other site is down, and a guest reported running at the original site moves the set to `split_brain`, which only an
+operator's `resolve` leaves. **Not addressed:** everything that needs a second cluster (the listener, the wire
+operations, the driver); see the status table in replication.md section 9.

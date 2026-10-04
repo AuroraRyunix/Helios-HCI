@@ -242,6 +242,27 @@ D-33: no stale text found. Reads outside the vdisk lock: not attempted.
 *Not run:* the new seal and retry paths against a live cluster (they are covered by the fake-Hydra rig and the replica store tests).
 Status: **done for the three; the rest not built**.
 
+### K (part). valcli reaches a live peer when this node's database is down
+
+`valcli` could run no command that reads the cluster on a node whose `hydra-db` was down, including the ones needed
+to see why. `run_cql_query_via_peers` (aliased as `run_cql_query`, so the one-query-layer guard still holds) asks each other node in the cluster
+document through its spark daemon after a local failure that is about reaching the database; a rejected statement is not
+retried elsewhere. 10 tests. Documented in `docs/valcli_technical.md`.
+Status: **done**.
+
+### J. Rauru growth stages: three parts built and tested in isolation, nothing wired
+
+Built (D-36): the pinned-key TLS verifier (`sidon/src/replicate/site_tls.rs`, 11 tests, a real TLS handshake over
+loopback between throwaway certificates; I mutated the pin check and four tests failed, as they should); the Hydra-backed map sink
+(`hydra_sink.rs`, 8 tests) against an in-memory Hydra I wrote, so it proves the order and the crash behaviour, not that Scylla accepts the
+statements; and the failover and failback state machine as a pure function (`rauru_failover.py`, 17 tests).
+*Not built:* the listener and the wire operations, the group store, the Purah root registration, the state tables, the driver.
+*Wiring:* none of this is a service, so nothing was added to the service checklist; `docs/rauru.md` says so.
+*Surprise worth knowing:* rustls 0.21 still sends a certificate request when the verifier names no root subjects (its newer
+documentation says it does not); a test pins that anonymous dialling is refused.
+*Needs the second cluster:* everything above running against a real remote.
+Status: **built in isolation; the real work (a second site) not possible here**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification

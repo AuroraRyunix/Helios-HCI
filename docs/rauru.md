@@ -17,9 +17,13 @@ prunes what something depends on are in [dfs/snapshots.md](./dfs/snapshots.md). 
 be a Dagur job; Rauru took it over and the job is gone.
 
 **It is meant to grow** into replication and disaster recovery: protection domains, replicating
-snapshots to another cluster, and recovering a workload from them. That is being designed
-separately and **none of it exists yet**. What exists is the daemon, the election it works under
-and the one job, so the rest has somewhere to live that is not a cron line.
+snapshots to another cluster, and recovering a workload from them. That is designed in
+[dfs/replication.md](./dfs/replication.md) and **none of it runs**. What runs is the daemon, the
+election it works under and the one job. Beside it, built and tested in isolation but called by
+nothing (so no new unit, and nothing new in the service checklist): the replication planner
+(`rauru_replication.py`), the failover and failback decision logic (`rauru_failover.py`), and in
+Sidon the pinned-key verifier and the Hydra map sink for a replicated snapshot. The second
+cluster these would talk to does not exist, which is why no driver was written.
 
 ## Architecture and lifecycle
 

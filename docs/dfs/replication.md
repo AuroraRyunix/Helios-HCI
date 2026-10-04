@@ -1,8 +1,10 @@
 # Replicating snapshots to another site
 
 **Status: designed. The data plane's building blocks are built and tested against a local
-simulation of a second site (section 9); no transport, no listener, no orchestration against a
-real remote exists, and no second cluster has ever been involved.** Decisions: D-28 to D-31 in
+simulation of a second site (section 9); no network transport of group bytes, no listener and no driver
+against a real remote exists, and no second cluster has ever been involved. Three more pieces are
+built and tested in isolation (the pinned-key verifier, the Hydra map sink and the failover state
+machine, section 9); none is called by any daemon.** Decisions: D-28 to D-31 in
 [decisions.md](./decisions.md). The unit being replicated is a *snapshot set* from a
 [protection domain](./protection_domains.md).
 
@@ -196,10 +198,18 @@ dfs_replication_sets   ((site_id), set_id): domain, state, map digest per snapsh
 
 `rauru_replication.StateStore` is the interface; the tests use an in-memory one.
 
-## 8. Disaster-recovery orchestration: designed only
+## 8. Disaster-recovery orchestration: the decision logic is built, the driver is not
 
-Failover and failback are not built, and nothing here pretends otherwise: they cannot be
-exercised without a second site, and an orchestration written against fakes would be fiction.
+`rauru_failover.py` is the state machine below as a pure function: `step(state, event)` returns the
+next state and the *actions* a driver would carry out (clone members, rebuild the definition, start,
+stop, reverse-replicate, final delta, verify), or refuses with a reason. It performs nothing, and no
+driver exists, because a driver cannot be exercised without a second site and one written against
+fakes would be fiction. What is pinned is what can be wrong without a second site: the order of
+the steps (failback stops the guest, ships the last changes and proves they are visible before it
+starts anywhere), and the refusals (nothing automatic; no failover while the original site reports
+the guest running; an unreachable site needs the risk accepted by name; both sites running the guest
+is a `split_brain` state that only an explicit `resolve` leaves). The states are `replicating`,
+`running_at_target`, `failback_syncing`, `failback_ready`, `cutting_over`, `split_brain`.
 What the design commits to, so the replication above does not foreclose it:
 
 * A replica is an ordinary immutable vdisk under a site-qualified name, with provenance in the
@@ -229,5 +239,19 @@ by the real `EgroupStore`:
 | Import: preflight, stage, verify, install; atomic publish through a sink | `replicate/import.rs` |
 | Delta planning, job state machine, resumable driver | `rauru_replication.py` |
 
-Not built: the transport and TLS verifier, the listener, the have/offer wire operations, the
-Hydra-backed sink, the Purah root registration, the state tables, pairing, any scheduling.
+Built afterwards, each tested only in isolation and called by nothing:
+
+| Piece | Where | What was exercised |
+| :-- | :-- | :-- |
+| Pinned-key verifier for both ends of a connection (SPKI SHA-256 pin set, one-day leeway, skew reported as skew, handshake signature still verified) | `sidon/src/replicate/site_tls.rs` (11 tests) | A loopback TLS connection between throwaway certificates made with the `openssl` command: both pinned works; an unpinned server is refused by the dialler; an unpinned or anonymous client is refused by the listener; a certificate renewed on the same key still works; a second pin works during an overlap; a revoked pin refuses the next connection; the fingerprint equals openssl's own; mutating the pin check makes four tests fail |
+| Hydra-backed `MapSink`: vdisk row `forming`, map in batches, read back, one class compare-and-swap to `immutable` | `sidon/src/replicate/hydra_sink.rs` (8 tests) | An in-memory Hydra that understands exactly the statements and endpoints involved (`block_map_batches`, `/v1/dfs/vdisk-create`, `/v1/dfs/vdisk-class`); **no real Scylla** |
+| The decision logic of failover and failback | `rauru_failover.py` (17 tests) | Pure function; no effects |
+
+The verifier is in Rust because the listener is (D-20's rule that bytes do not pass through
+Python), and because Python's `ssl` cannot ask a peer for a certificate without also validating its
+chain, which is exactly what a pin replaces.
+
+Not built: the listener and the wire operations that use these configs, the `GroupStore` over
+`EgroupStore` that registers groups in `dfs_egroups`, the Purah root registration, the state
+tables, pairing, site certificate issuance, any scheduling, and the driver that feeds
+`rauru_failover.step` and carries out its actions.

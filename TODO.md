@@ -1473,9 +1473,11 @@ as data* by DRBD and refused with EIO by Sidon.
   staging and atomic publish, token bucket; 32 tests) and `rauru_replication.py` (manifest from
   Hydra rows, delta, resumable driver; 37 tests). **All of it ran only against two directories on
   one machine and fakes.** Not built, and each is a real piece of work:
-  * the transport, the pinned-SPKI TLS verifier and the import-only listener (D-28);
+  * the transport and the import-only listener (D-28). **The pinned-key verifier is built** (`site_tls.rs`, 11 tests over a loopback
+    connection, D-36), as is **the Hydra-backed `MapSink`** (`hydra_sink.rs`, 8 tests against an in-memory Hydra) and the
+    **failover/failback state machine** (`rauru_failover.py`, 17 tests, pure logic). None is called by any daemon;
   * the `offer`/`group`/`publish` wire operations and their entry in spark's `DFS_VDISK_OPS`;
-  * a Hydra-backed `MapSink` and a `GroupStore` over `EgroupStore` that registers in `dfs_egroups`
+  * a `GroupStore` over `EgroupStore` that registers in `dfs_egroups`
     (needs an adopt-a-file method in `extent.rs`);
   * **Purah must treat a job's installed-but-unpublished groups as roots**: its grace is 600 s and
     a long transfer outlasts it. Settle this before the transport (`purah.rs`);
@@ -1483,7 +1485,7 @@ as data* by DRBD and refused with EIO by Sidon.
     deliberately not migrated until a second site exists (a table nothing exercises is what
     `0025` removed);
   * pairing, site certificate issuance and renewal in Impa, quota, bandwidth schedules;
-  * **failover and failback**: a design only, because they cannot be exercised without a second
+  * the **driver** for failover and failback (the decision logic is built, D-36): it cannot be exercised without a second
     site. A VM definition is not in the replicated data at all.
 * **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
   already carries an algorithm byte, so it is off the write path entirely.
