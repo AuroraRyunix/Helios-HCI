@@ -87,6 +87,13 @@ pub const OP_EGROUP_DROP: u16 = 11;
 /// once per request, so batching is the economy; the cap only keeps a frame small.
 pub const MAX_DROP_IDS: usize = 256;
 
+/// Ask the node that owns a vdisk to hand it over: drain the journal into extent groups,
+/// stop serving the disk and let go of its socket. Sent by the node that is about to take
+/// the disk over (a live migration's destination), which holds its own guest's I/O stalled
+/// while it waits. A node that does not know the opcode answers ST_REFUSED, so a handover
+/// toward an older build fails before anything changed rather than half way.
+pub const OP_RELEASE: u16 = 12;
+
 /// Request flag on OP_APPEND and OP_EGROUP_PUT: this is not the last write of its group, so
 /// the replica need not fsync it -- the group's last write, sent without the flag, is synced
 /// and takes every earlier write to the file with it. For an append the group is one guest
@@ -639,6 +646,11 @@ pub trait Owned: Send + Sync {
     fn drop_replica_groups(&self, _from: &str, _ids: &[String]) -> Option<Result<serde_json::Value>> {
         None
     }
+    /// Drain and stop serving a vdisk this node owns, for a handover to the asking node.
+    /// None if it does not serve the disk at all.
+    fn owned_release(&self, _vdisk: &str) -> Option<Result<()>> {
+        None
+    }
 }
 
 /// Answer one request against the local replica store.
@@ -753,6 +765,15 @@ pub fn serve_with_owner(store: &ReplicaStore, owner: &dyn Owned, req: &Request) 
                 None => Response::err(ST_REFUSED, 0),
             }
         }
+        OP_RELEASE => match owner.owned_release(&req.vdisk) {
+            Some(Ok(())) => Response::ok(Vec::new()),
+            Some(Err(e)) => {
+                eprintln!("sidon: release of {} refused: {e}", req.vdisk);
+                // The reason travels back: the asking node reports which step failed.
+                Response { status: ST_REFUSED, epoch: 0, data: e.to_string().into_bytes() }
+            }
+            None => Response::err(ST_NOT_FOUND, 0),
+        },
         _ => serve_request(store, req),
     }
 }
@@ -902,6 +923,15 @@ impl PeerClient {
             conn: Mutex::new(None),
             tls,
         }
+    }
+
+    /// A client for the same peer with its own connection, timeout and attempt count.
+    ///
+    /// A handover asks the owner to drain a journal, which takes as long as the journal is
+    /// full and not as long as an append, and it must not share a connection with guest I/O
+    /// that is being forwarded to the same peer.
+    pub fn derive(&self, timeout: Duration, attempts: u32) -> PeerClient {
+        PeerClient::with_attempts(&self.node, &self.addr, timeout, attempts)
     }
 
     /// Send one request. Reconnects once on a transport failure, because the common case
