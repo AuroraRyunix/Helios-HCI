@@ -57,6 +57,18 @@ the factor across datacenters and `QUORUM` is a majority of their *sum*, so the
 per-datacenter values are added. `LocalStrategy` and `EverywhereStrategy` have no
 replication factor at all.
 
+### What the factor should be
+
+The keyspace is read and written at `QUORUM`, a strict majority of its replicas, and a majority
+survives F failures only with **2F+1** replicas. A cluster that tolerates one failure
+(`redundancy_factor` 1) therefore needs a keyspace factor of **3**, capped by the node count;
+`helios_cql.metadata_replication_factor` is the one definition of that, and Mimir's replication audit
+and the Settings page in Phoenix use the same number. At RF=2 a majority is both replicas, so losing
+either one stops every read and write in the cluster, and this gate will (correctly) refuse to stop
+any node. "Fault tolerance + 1" is the right count for a guest's disk, which needs one surviving
+copy, and the wrong one here. The Settings page used to derive it that way, called a correct RF=3 a
+mismatch and offered 2; it now expects the 2F+1 value and refuses to lower the factor below it.
+
 If it cannot be read, the gate **refuses**. A plausible-looking default of 3 on a cluster
 actually running RF=1 waves through the stop that takes the only copy of the metadata
 offline — which is exactly the single-node case. `spectrum_server.get_actual_replication_factor()`

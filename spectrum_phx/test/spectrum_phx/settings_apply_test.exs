@@ -173,8 +173,18 @@ defmodule SpectrumPhx.SettingsApplyTest do
       assert Enum.any?(outcome.applied, &(&1 =~ "repair was started"))
     end
 
-    test "lowering it needs no repair" do
-      {{:ok, _}, effects} = save(%{"replication_factor" => "1"})
+    test "lowering it below what the cluster's fault tolerance needs is refused" do
+      # ftt 1 on three nodes needs a factor of 3: at 2, a QUORUM is both replicas and the first node
+      # that goes down or enters maintenance stops the database. The page used to offer exactly this.
+      {{:ok, outcome}, effects} = save(%{"replication_factor" => "2"})
+
+      assert effects == [], "a quorum-unsafe factor reached the keyspace"
+      assert Enum.any?(outcome.failed, &(&1 =~ "below 3"))
+    end
+
+    test "lowering it to a factor the cluster still tolerates needs no repair" do
+      {{:ok, _}, effects} =
+        save(%{"replication_factor" => "1"}, %{cluster: cluster(redundancy_factor: 0)})
 
       assert [{:cql, statement, []}] = effects
       assert statement =~ "'datacenter1': 1"

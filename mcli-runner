@@ -2493,9 +2493,15 @@ def check_services(category):
         except (TypeError, ValueError):
             ftt = 1
         rf, rf_detail = get_hydra_replication_factor()
-        # Same derivation spectrum_server.py uses: one replica per tolerated failure plus
-        # the original, capped by the number of nodes that can actually hold one.
-        expected_rf = min(node_count, ftt + 1) if node_count > 1 else 1
+        # The metadata keyspace is read and written at QUORUM, a strict majority, which survives F
+        # failures only with 2F+1 replicas: ftt=1 needs RF=3. "ftt + 1" is the count for guest data,
+        # which needs one surviving copy; used here it called RF=2 correct, and at RF=2 either node
+        # going down stops every read and write in the cluster. Kept identical to
+        # helios_cql.metadata_replication_factor (test_metadata_replication_rule checks they agree).
+        if node_count > 1 and ftt > 0:
+            expected_rf = min(node_count, 2 * ftt + 1)
+        else:
+            expected_rf = 1
 
         if rf is None:
             status = "WARN"
@@ -2537,6 +2543,14 @@ def check_services(category):
                 findings.append(
                     f"keyspace 'hydra' is RF={rf} but redundancy_factor={ftt} over {node_count} "
                     f"nodes calls for RF={expected_rf}")
+                # Reads and writes are QUORUM. If losing `ftt` nodes leaves fewer replicas than a
+                # majority of RF, one failure the cluster claims to survive stops the database.
+                if rf > 1 and ftt > 0 and (rf - ftt) < (rf // 2 + 1):
+                    critical = True
+                    findings.append(
+                        f"at RF={rf} a QUORUM needs {rf // 2 + 1} replicas, so losing {ftt} node(s) "
+                        f"-- which redundancy_factor={ftt} promises to survive -- leaves "
+                        f"{rf - ftt} and the hydra keyspace stops answering")
 
             # Repair evidence. With RF >= node count every live node must hold a full copy of
             # the keyspace, so a node carrying a fraction of what its peers carry is what an

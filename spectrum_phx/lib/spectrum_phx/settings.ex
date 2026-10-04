@@ -178,9 +178,13 @@ defmodule SpectrumPhx.Settings do
         _ -> nil
       end
 
-    # ftt is what the cluster was created with; +1 is the copies that implies.
-    implied = (cluster[:redundancy_factor] || 0) + 1
+    # ftt is what the cluster was created with. The keyspace is read and written at QUORUM, a strict
+    # majority, which survives `ftt` failures only with 2*ftt+1 replicas: ftt 1 needs a factor of 3.
+    # This used to be ftt + 1, the count right for a guest's disk and wrong for metadata -- the page
+    # then called RF 3 a mismatch ("asked for 2 by ftt") and offered 2, at which either node going
+    # down stops every read and write in the cluster.
     nodes = cluster[:nodes] || 1
+    implied = metadata_replication(cluster[:redundancy_factor] || 0, nodes)
 
     %{
       factor: factor,
@@ -192,6 +196,17 @@ defmodule SpectrumPhx.Settings do
       scope: :metadata
     }
   end
+
+  @doc """
+  The replication factor the keyspace needs to survive `ftt` node failures at QUORUM: 2*ftt+1,
+  capped by the node count, and 1 for a single node or a cluster that tolerates none.
+  Mirrors `helios_cql.metadata_replication_factor`.
+  """
+  def metadata_replication(ftt, nodes) when is_integer(ftt) and is_integer(nodes) do
+    if nodes <= 1 or ftt <= 0, do: 1, else: min(nodes, 2 * ftt + 1)
+  end
+
+  def metadata_replication(_ftt, _nodes), do: 1
 
   defp parse_replication(row) do
     case Map.get(row, "replication") do
@@ -384,30 +399,48 @@ defmodule SpectrumPhx.Settings do
          true <- factor != before.replication.factor do
       outcome = %{outcome | saved: outcome.saved + 1}
 
-      case Apply.set_replication(static, factor, before.replication.factor) do
-        {:ok, {:altered, applied}} ->
-          note(outcome, "Keyspace replication factor set to #{applied}.")
+      # Refuse a factor below what the cluster's own fault tolerance needs. Lowering it is one
+      # click and takes effect at once, and a keyspace below a majority-safe factor stops
+      # answering the first time a node is down or in maintenance.
+      safe = before.replication.implied
 
-        {:ok, {:altered_and_repairing, applied}} ->
-          note(
-            outcome,
-            "Keyspace replication factor raised to #{applied}; a repair was started and runs in " <>
-              "the background, and the new replicas are not populated until it finishes."
-          )
-
-        {:ok, {:altered_repair_failed, applied, reason}} ->
-          fail(
-            outcome,
-            "Replication factor is now #{applied} but the repair did not start " <>
-              "(#{describe(reason)}). The new replicas are empty until one is run: " <>
-              "nodetool repair -pr hydra."
-          )
-
-        {:error, message} ->
-          fail(%{outcome | saved: outcome.saved - 1}, message)
+      if is_integer(safe) and factor < safe do
+        fail(
+          %{outcome | saved: outcome.saved - 1},
+          "The replication factor was left at #{before.replication.factor}: #{factor} is below " <>
+            "#{safe}, which this cluster needs to keep the database available when a node is " <>
+            "down (reads and writes need a majority of the replicas)."
+        )
+      else
+        apply_replication_change(outcome, static, factor, before)
       end
     else
       _ -> outcome
+    end
+  end
+
+  defp apply_replication_change(outcome, static, factor, before) do
+    case Apply.set_replication(static, factor, before.replication.factor) do
+      {:ok, {:altered, applied}} ->
+        note(outcome, "Keyspace replication factor set to #{applied}.")
+
+      {:ok, {:altered_and_repairing, applied}} ->
+        note(
+          outcome,
+          "Keyspace replication factor raised to #{applied}; a repair was started and runs in " <>
+            "the background, and the new replicas are not populated until it finishes."
+        )
+
+      {:ok, {:altered_repair_failed, applied, reason}} ->
+        fail(
+          outcome,
+          "Replication factor is now #{applied} but the repair did not start " <>
+            "(#{describe(reason)}). The new replicas are empty until one is run: " <>
+            "nodetool repair -pr hydra."
+        )
+
+      {:error, message} ->
+        fail(%{outcome | saved: outcome.saved - 1}, message)
     end
   end
 

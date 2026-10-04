@@ -449,6 +449,8 @@ FENCE_METHOD_STORAGE = "storage-epoch"
 # on any host whose status is not exactly NORMAL, so this needs no scheduler change.
 NODE_STATUS_FENCED = "FENCED"
 NODE_STATUS_DEGRADED = "DEGRADED"
+# Healthy watchdog passes between looks for a quarantine this process no longer remembers.
+ORPHAN_CHECK_EVERY = 6
 
 # Mount points a fence has to take down before this host counts as released. Fixed rather
 # than derived, so a fence never unmounts something it did not put there.
@@ -1481,6 +1483,51 @@ def clear_self_fence(force=False):
     return 0
 
 
+def local_health_is_clean(probe):
+    """The same test the fence's own recovery uses: nothing unserviceable, libvirt and storage fine."""
+    return (not probe["unserviceable"]
+            and probe["libvirt"] != "failed"
+            and probe["storage"] != "failed")
+
+
+def clear_orphaned_quarantine():
+    """Return this host to NORMAL when hydra.nodes still says DEGRADED and nothing here owns that.
+
+    A quarantine is announced once and lifted by the same process that announced it, which keeps the
+    fact in memory. Mipha is restarted by every rollout and every upgrade, so a host quarantined
+    while its storage was down stayed DEGRADED -- refused for placement, and refused as a
+    maintenance target -- for as long as nobody noticed, long after storage came back, because the
+    process that would have lifted it no longer knew it had set it. Only this watchdog writes
+    DEGRADED, so a DEGRADED row on a host that is currently clean and is not being quarantined by
+    this process is an orphan.
+
+    Returns True when it moved the row. The change is the same compare-and-swap announce_node_status
+    always uses, so a status an operator changed in the meantime is not overwritten.
+    """
+    hostname = local_hostname()
+    rc, stdout, _ = run_cql_query(
+        f"SELECT JSON status FROM hydra.nodes WHERE hostname = '{hostname}';")
+    if rc != 0 or not stdout:
+        return False
+    current = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                current = json.loads(line).get("status")
+            except Exception:
+                pass
+    if current != NODE_STATUS_DEGRADED:
+        return False
+    if SELF_FENCE_STATE.get("quarantined") or self_fence_is_active():
+        return False
+    if announce_node_status("NORMAL"):
+        print("[Mipha Self-Fence] This host was still recorded as DEGRADED from an earlier "
+              "quarantine and its subsystems are healthy; recorded it as NORMAL.")
+        return True
+    return False
+
+
 def self_fence_loop():
     """The per-host watchdog. Runs everywhere, leader or not."""
     started = time.time()
@@ -1493,6 +1540,9 @@ def self_fence_loop():
     print("[Mipha Self-Fence] Local subsystem watchdog started.")
 
     clean_since = None
+    # Passes since the last look for an orphaned quarantine; starts due, so the first clean pass
+    # after a restart checks, then once a minute at the default interval.
+    since_orphan_check = ORPHAN_CHECK_EVERY
     while True:
         try:
             config, _ = load_fencing_config()
@@ -1548,6 +1598,11 @@ def self_fence_loop():
                     SELF_FENCE_STATE["quarantined"] = False
                     SELF_FENCE_STATE["announced"] = False
                     SELF_FENCE_STATE["reason"] = ""
+            elif local_health_is_clean(probe):
+                since_orphan_check += 1
+                if since_orphan_check >= ORPHAN_CHECK_EVERY:
+                    since_orphan_check = 0
+                    clear_orphaned_quarantine()
         except Exception as exc:
             sys.stderr.write(f"[Mipha Self-Fence] Error in watchdog loop: {exc}\n")
         time.sleep(interval)

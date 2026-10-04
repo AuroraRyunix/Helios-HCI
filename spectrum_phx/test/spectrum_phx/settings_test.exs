@@ -97,12 +97,22 @@ defmodule SpectrumPhx.SettingsTest do
       assert result.replication.implied == 3
     end
 
-    test "the implied factor is ftt + 1, capped at the node count" do
-      # Asking for two failures survivable on three nodes needs three copies; asking for
-      # it on one node cannot have more than one.
+    test "the implied factor is 2 * ftt + 1, capped at the node count" do
+      # The keyspace is read and written at QUORUM, a strict majority, which survives F failures
+      # only with 2F+1 replicas. ftt 1 on three nodes is therefore 3, not 2: at 2 either node
+      # going down stops every read and write in the cluster, and this page used to ask for 2.
+      assert all(%{cluster: cluster(ftt: 1, nodes: 3)}).replication.implied == 3
+      assert all(%{cluster: cluster(ftt: 1, nodes: 2)}).replication.implied == 2
       assert all(%{cluster: cluster(ftt: 2, nodes: 3)}).replication.implied == 3
+      assert all(%{cluster: cluster(ftt: 2, nodes: 5)}).replication.implied == 5
       assert all(%{cluster: cluster(ftt: 2, nodes: 1)}).replication.implied == 1
       assert all(%{cluster: cluster(ftt: 0, nodes: 3)}).replication.implied == 1
+    end
+
+    test "the metadata rule agrees with the Python one" do
+      for {ftt, nodes, expected} <- [{1, 3, 3}, {1, 2, 2}, {1, 1, 1}, {0, 3, 1}, {2, 5, 5}, {2, 3, 3}] do
+        assert Settings.metadata_replication(ftt, nodes) == expected
+      end
     end
 
     test "it is labelled as metadata, because it says nothing about a guest's disk" do

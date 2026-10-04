@@ -238,6 +238,28 @@ def _cqlsh_fallback(cql_query):
     )
 
 
+def metadata_replication_factor(ftt, nodes):
+    """The replication factor the hydra keyspace needs to survive `ftt` node failures.
+
+    The keyspace is read and written at QUORUM, which is a strict majority of its replicas. A
+    majority survives F failures only when there are 2F+1 replicas, so a cluster that tolerates one
+    failure needs RF=3, not RF=2: at RF=2 quorum is both replicas, and losing either one stops every
+    read and write in the cluster. "ftt + 1 copies" is the right count for guest data, which only
+    needs one surviving copy, and the wrong one for metadata, which needs a majority.
+
+    Capped by the node count, because a replica with nowhere to live is not a replica. One node, or
+    a cluster that tolerates no failures, is RF=1.
+    """
+    try:
+        ftt = max(int(ftt), 0)
+        nodes = int(nodes)
+    except (TypeError, ValueError):
+        return 1
+    if nodes <= 1 or ftt == 0:
+        return 1
+    return min(nodes, 2 * ftt + 1)
+
+
 def parse_replication_factor(text):
     """The number of replicas the hydra keyspace declares, or None if it cannot be read.
 
