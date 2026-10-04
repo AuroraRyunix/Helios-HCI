@@ -361,5 +361,127 @@ class SidonKeepsRunningInMaintenance(unittest.TestCase):
         self.assertIn("ConditionPathExists=/etc/hci/cluster.json", unit)
 
 
+class SpectrumKeepsTryingToSeedItsDatabase(unittest.TestCase):
+    """spectrum_server.py must not be imported by a test, so the function is compiled out of the
+    source with a fake environment."""
+
+    def build(self, attempts):
+        import ast
+        import threading
+        import time as real_time
+        src = read("spectrum_server.py")
+        tree = ast.parse(src)
+        wanted = {"init_db"}
+        body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        scope = {"INIT_DB_RETRY_SECONDS": 0.01, "_INIT_DB_RETRY_THREAD": [None],
+                 "threading": threading, "time": real_time, "print": lambda *a, **k: None}
+        calls = []
+
+        def once():
+            calls.append(1)
+            return attempts[min(len(calls) - 1, len(attempts) - 1)]
+        scope["_init_db_once"] = once
+        exec(compile(ast.Module(body=body, type_ignores=[]), "spectrum_server.py", "exec"), scope)
+        return scope, calls
+
+    def test_a_first_failure_starts_a_thread_that_runs_until_it_succeeds(self):
+        import time
+        scope, calls = self.build([False, False, True])
+        self.assertFalse(scope["init_db"]())
+        deadline = time.time() + 3
+        while len(calls) < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(calls), 3)
+        self.assertIsNotNone(scope["_INIT_DB_RETRY_THREAD"][0])
+
+    def test_a_first_success_starts_nothing(self):
+        scope, calls = self.build([True])
+        self.assertTrue(scope["init_db"]())
+        self.assertIsNone(scope["_INIT_DB_RETRY_THREAD"][0])
+        self.assertEqual(len(calls), 1)
+
+    def test_the_attempt_has_no_loop_of_its_own(self):
+        src = read("spectrum_server.py")
+        once = src[src.index("def _init_db_once"):src.index("def init_db")]
+        self.assertNotIn("for i in range(15)", once)
+
+
+class ValcliDoesNotReportARefusalAsSuccess(unittest.TestCase):
+    def setUp(self):
+        self.valcli = load("valcli.py", "valcli_refusal")
+
+    def test_the_classifier(self):
+        refused = self.valcli.spark_call_refused
+        self.assertIsNone(refused(0, {"ok": True}))
+        self.assertEqual(refused(0, {"error": "vdisk is attached"}), "vdisk is attached")
+        self.assertEqual(refused(-1, {}, "timed out"), "timed out")
+        self.assertEqual(refused(-1, {"error": "x"}, "y"), "x")
+        self.assertEqual(refused(-1, {}, ""), "no answer")
+
+    def test_both_delete_commands_use_it(self):
+        src = read("valcli.py")
+        self.assertEqual(src.count("spark_call_refused(rc_del, body_del, err_del)"), 2)
+
+    def test_a_refused_image_delete_leaves_the_catalogue_row(self):
+        src = read("valcli.py")
+        body = src[src.index("Deleting vdisk '{vdisk_id}'"):src.index("# 4. Delete from ScyllaDB")]
+        self.assertIn("The image's catalogue entry was left in place.", body)
+
+
+class HyliaCanFinishAnUpgrade(unittest.TestCase):
+    def test_the_post_reboot_check_names_services_the_status_document_has(self):
+        src = read("hylia.py")
+        self.assertIn('critical_services = ["ZooKeeper", "HydraDB", "Sidon", "Spark"]', src)
+        self.assertNotIn('"Aether"', src)
+        daemon = read("spark_daemon_decoded.py")
+        self.assertIn('"Sidon"', daemon)
+
+    def test_builds_are_given_longer_than_the_daemons_default(self):
+        src = read("hylia.py")
+        self.assertIn("BUILD_TIMEOUT_SECONDS = 1800", src)
+        self.assertEqual(src.count("timeout=BUILD_TIMEOUT_SECONDS"), 2)
+        self.assertIn("set -o pipefail; cd '{work}' && cargo build", src)
+
+    def test_the_spectrum_image_build_gets_every_module_the_dockerfile_copies(self):
+        import re
+        dockerfile = read("Dockerfile")
+        modules = set(re.findall(r"^COPY (helios_\w+)\.py \.", dockerfile, re.M))
+        src = read("hylia.py")
+        loop = re.search(r"for m in ([\w ]+); do", src).group(1).split()
+        self.assertTrue(modules <= set(loop), modules - set(loop))
+
+
+class EveryImportedModuleIsPartOfTheUpgrade(unittest.TestCase):
+    def test_helios_cql_and_schema_ship_and_are_inventoried(self):
+        for name in ("create_upgrade_zip.py", "check_updates.py"):
+            src = read(name)
+            for component in ('"helios-cql"', '"helios-schema"'):
+                self.assertIn(component, src, name)
+
+
+class TheAuthCheckAlwaysAnswersOnce(unittest.TestCase):
+    def test_both_branches_answer_and_return(self):
+        src = read("spectrum_server.py")
+        block = src[src.index('if path == "/api/auth/check":'):src.index('elif path == "/api/lcm/upgrade/check"')]
+        self.assertIn("self.send_json(401", block)
+        self.assertIn("return", block)
+
+
+class MiphaDoesNotRepeatAFailoverThatFinished(unittest.TestCase):
+    def test_guests_left_on(self):
+        mipha = load("mipha.py", "mipha_h")
+        rows = {"a": {"host_ip": "10.0.0.2", "state": "Running"}, "b": {"host_ip": "", "state": "Stopped"}}
+        self.assertTrue(mipha.guests_left_on("10.0.0.2", lambda: rows))
+        self.assertFalse(mipha.guests_left_on("10.0.0.9", lambda: rows))
+        rows["a"]["state"] = "Stopped"
+        self.assertFalse(mipha.guests_left_on("10.0.0.2", lambda: rows))
+        self.assertTrue(mipha.guests_left_on("10.0.0.2", lambda: None), "an unreadable table is not 'finished'")
+
+    def test_the_loop_skips_a_down_host_with_nothing_left(self):
+        src = read("mipha.py")
+        self.assertIn('already_failed_over = (db_status == "DOWN" and not guests_left_on(ip))', src)
+        self.assertIn("and not already_failed_over)", src)
+
+
 if __name__ == "__main__":
     unittest.main()

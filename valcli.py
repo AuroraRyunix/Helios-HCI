@@ -236,6 +236,20 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         return -1, {}, str(e)
 
 
+def spark_call_refused(rc, body, err=""):
+    """The reason a `run_mtls_spark_api` answer is a failure, or None.
+
+    That helper returns rc 0 for any HTTP answer that has a JSON body, including a refused
+    operation (409 with {"error": ...}); a caller that tests only `rc != 0` reports a refusal as
+    success. Callers that act on the outcome check this.
+    """
+    if rc != 0:
+        return (body.get("error") if isinstance(body, dict) and body.get("error") else err) or "no answer"
+    if isinstance(body, dict) and body.get("error"):
+        return str(body["error"])
+    return None
+
+
 def run_mtls_spark_api_full(ip, path, payload, method="POST", timeout=120):
     """Like run_mtls_spark_api, but says which HTTP status the body came with.
 
@@ -2476,9 +2490,16 @@ def cmd_image_delete(image_name):
     rc_del, body_del, err_del = run_mtls_spark_api(
         hosts_list[0].get("ip", "127.0.0.1"), "/api/v1/dfs/vdisk",
         {"op": "delete", "vdisk_id": vdisk_id})
-    if rc_del != 0:
-        detail = body_del.get("error") if isinstance(body_del, dict) else err_del
-        print(f"Warning: could not delete the vdisk: {detail}")
+    refusal = spark_call_refused(rc_del, body_del, err_del)
+    if refusal:
+        print(f"Error: could not delete the vdisk: {refusal}")
+        gone = any(word in refusal.lower() for word in ("not found", "no such", "does not exist", "unknown vdisk"))
+        if not gone:
+            # Removing the catalogue row now would leave the vdisk allocated and invisible, which
+            # is the one outcome worse than a failed delete.
+            print("The image's catalogue entry was left in place.")
+            return
+        print("The vdisk is already gone; removing the stale catalogue entry.")
     else:
         print("Successfully deleted the vdisk. Its extents will be reclaimed by Purah.")
 
@@ -2616,9 +2637,9 @@ def cmd_disk_delete(disk_name):
     print(f"Deleting vdisk '{disk_name}'...")
     rc_del, body_del, err_del = run_mtls_spark_api(
         hosts[0], "/api/v1/dfs/vdisk", {"op": "delete", "vdisk_id": disk_name})
-    if rc_del != 0:
-        detail = body_del.get("error") if isinstance(body_del, dict) else err_del
-        print(f"Error: could not delete the vdisk: {detail}")
+    refusal = spark_call_refused(rc_del, body_del, err_del)
+    if refusal:
+        print(f"Error: could not delete the vdisk: {refusal}")
         return
     print("Successfully deleted the vdisk. Its extents will be reclaimed by Purah.")
 

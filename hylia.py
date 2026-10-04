@@ -48,6 +48,10 @@ def spark_endpoint(ip):
         return ip, False
     return ip, True
 
+# Source builds and image builds. spark-daemon applies 45 seconds when a caller names none.
+BUILD_TIMEOUT_SECONDS = 1800
+
+
 def run_remote_spark(ip, command, timeout=45):
     ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
@@ -489,8 +493,12 @@ def build_component(job_id, node_ip, hostname, comp_name, comp_info, extract_dir
     # `--offline` is deliberately *not* passed. The lockfile pins what to fetch, and a
     # node with a cold registry must be able to fetch it; refusing would make the first
     # upgrade after a reprovision fail for a reason unrelated to the upgrade.
+    # A cold build takes minutes and run_remote_spark's default is 45 seconds, after which the
+    # daemon kills it: every source upgrade failed as "failed to compile". `pipefail` because the
+    # `| tail` would otherwise report tail's success whatever cargo did.
     rc_b, out_b, err_b = run_remote_spark(
-        node_ip, f"cd '{work}' && cargo build --release --locked 2>&1 | tail -40")
+        node_ip, f"set -o pipefail; cd '{work}' && cargo build --release --locked 2>&1 | tail -40",
+        timeout=BUILD_TIMEOUT_SECONDS)
     if rc_b != 0:
         detail = (err_b or out_b or "").strip()[:600]
         run_remote_spark(node_ip, f"rm -rf '{work}' '{tar_path}'")
@@ -898,6 +906,10 @@ def hylia_rolling_upgrade(job_id):
                         "rm -rf /tmp/spectrum_build && mkdir -p /tmp/spectrum_build/static && "
                         "cp /usr/local/bin/spectrum_server /tmp/spectrum_build/spectrum_server.py && "
                         "cp /usr/local/bin/hylia /tmp/spectrum_build/hylia.py && "
+                        # The Dockerfile COPYs these too; a build without them failed on every
+                        # upgrade, and the failure was only logged as a warning.
+                        "for m in helios_sig helios_schema helios_sidon helios_cql helios_zk; do "
+                        "cp /usr/local/bin/$m.py /tmp/spectrum_build/$m.py || exit 1; done && "
                         "cp /usr/local/bin/Dockerfile /tmp/spectrum_build/Dockerfile && "
                         # lanayru is imported by spectrum_server at runtime; tolerate its
                         # absence on nodes provisioned before it shipped.
@@ -905,7 +917,8 @@ def hylia_rolling_upgrade(job_id):
                         "cp -r /usr/local/bin/static/* /tmp/spectrum_build/static/ && "
                         "podman build -t localhost/spectrum:latest /tmp/spectrum_build"
                     )
-                    rc_b, out_b, err_b = run_remote_spark(node_ip, build_cmd)
+                    rc_b, out_b, err_b = run_remote_spark(node_ip, build_cmd,
+                                                          timeout=BUILD_TIMEOUT_SECONDS)
                     if rc_b != 0:
                         log_upgrade(job_id, f"[{hostname}] Warning during Spectrum build: {err_b or out_b}")
                     else:

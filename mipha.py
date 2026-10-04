@@ -1873,6 +1873,17 @@ def read_vm_rows():
     return rows
 
 
+def guests_left_on(ip, read_rows=None):
+    """True when Hydra still places a VM on `ip`. A host that is DOWN and holds none has been
+    failed over completely; one that does still holds work a retry can place elsewhere. When the
+    rows cannot be read the answer is True, so the retry is not lost to a failed read."""
+    rows = (read_rows or read_vm_rows)()
+    if rows is None:
+        return True
+    return any(row.get("host_ip") == ip and str(row.get("state") or "").lower() == "running"
+               for row in rows.values())
+
+
 def reconcile_returning_host(hostname, ip, request=None, read_rows=None):
     """Drop what a host that came back still holds of guests that live elsewhere now.
 
@@ -2289,7 +2300,12 @@ def main():
                 self_fenced = (db_status == NODE_STATUS_FENCED)
                 if not self_fenced:
                     self_fence_handled.discard(ip)
-                if consecutive_failures.get(ip, 0) >= 3 or (self_fenced and ip not in self_fence_handled):
+                # A host already recorded DOWN has been failed over. Without this the counter reached
+                # three again every thirty seconds and the whole orchestration re-ran for as long as
+                # the host stayed away: a new task row, a nodetool probe and a ZooKeeper poll each time.
+                already_failed_over = (db_status == "DOWN" and not guests_left_on(ip))
+                if (consecutive_failures.get(ip, 0) >= 3 and not already_failed_over) \
+                        or (self_fenced and ip not in self_fence_handled):
                     if self_fenced:
                         print(f"[Mipha HA] Host {hostname} ({ip}) has fenced itself. "
                               "Starting failover orchestration...")

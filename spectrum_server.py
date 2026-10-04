@@ -1770,7 +1770,7 @@ def cluster_fault_tolerance():
         return None
 
 
-def init_db():
+def _init_db_once():
     """Attempts to initialize the ScyllaDB keyspace and table on startup."""
     print("Connecting to ScyllaDB and creating keyspace/table if not exists...")
     nodes = get_cluster_nodes()
@@ -1863,9 +1863,10 @@ def init_db():
     insert_default_image_container = "SELECT now() FROM system.local;"
 
 
-    # Retry loop since ScyllaDB may take a moment to bootstrap on boot
-    for i in range(15):
-        rc, out, err = run_cql_query(create_keyspace)
+    # One attempt. Retrying is `init_db`'s job: the loop that stood here wrapped only this
+    # statement, with no break and no sleep, so it ran fifteen times in a row and then went on
+    # with whatever the last answer was.
+    rc, out, err = run_cql_query(create_keyspace)
     # An existing cluster was created before this and is still on SimpleStrategy. The
     # CREATE above is IF NOT EXISTS, so it cannot move one.
     if rc == 0:
@@ -1991,9 +1992,38 @@ def init_db():
                     print(f"Error altering keyspace replication on startup: {e}")
                     
                 return True
-        print(f"Waiting for ScyllaDB to start... (Attempt {i+1}/15)")
-        time.sleep(5)
     print("Warning: Could not initialize database schema. ScyllaDB might still be offline.")
+    return False
+
+
+INIT_DB_RETRY_SECONDS = 15
+_INIT_DB_RETRY_THREAD = [None]
+
+
+def init_db():
+    """Seed the schema, default operator account, settings and schedules.
+
+    The first attempt is made here. If it does not complete (Hydra or Daruk is not up yet, which
+    is ordinary at boot) a background thread keeps trying until it does: the process goes on
+    serving either way, so without that nothing would ever seed them -- no operator account to
+    log in with -- until somebody restarted the console.
+    """
+    if _init_db_once():
+        return True
+
+    def keep_trying():
+        while True:
+            time.sleep(INIT_DB_RETRY_SECONDS)
+            try:
+                if _init_db_once():
+                    print("Database initialisation completed on a later attempt.")
+                    return
+            except Exception as exc:
+                print(f"Database initialisation attempt failed: {exc}")
+
+    if _INIT_DB_RETRY_THREAD[0] is None:
+        _INIT_DB_RETRY_THREAD[0] = threading.Thread(target=keep_trying, daemon=True)
+        _INIT_DB_RETRY_THREAD[0].start()
     return False
 
 def init_ssl():
@@ -3139,8 +3169,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 return
 
         if path == "/api/auth/check":
+            # Both branches answer and return. Without that an unauthenticated caller got no
+            # body at all (so the page's `res.json()` threw) and an authenticated one got a second
+            # response written onto the same keep-alive connection by whatever ran next.
             if is_authenticated(self):
                 self.send_json(200, {"authenticated": True, "username": getattr(self, "current_user", "")})
+            else:
+                self.send_json(401, {"authenticated": False})
+            return
         elif path == "/api/lcm/upgrade/check":
             try:
                 # Query lcm_update_state table

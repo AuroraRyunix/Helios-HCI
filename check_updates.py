@@ -229,6 +229,8 @@ def collect_inventory():
             "helios-zk": "/usr/local/bin/helios_zk.py",
             "helios-sig": "/usr/local/bin/helios_sig.py",
             "helios-sidon": "/usr/local/bin/helios_sidon.py",
+            "helios-cql": "/usr/local/bin/helios_cql.py",
+            "helios-schema": "/usr/local/bin/helios_schema.py",
             "helios-snapshots": "/usr/local/bin/helios_snapshots.py",
             "rauru-protection": "/usr/local/bin/rauru_protection.py",
             "check-updates": "/usr/local/bin/check-updates",

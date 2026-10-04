@@ -164,7 +164,18 @@ pub struct Vdisk {
     /// overlay still holds the newest data), but the journal must not be truncated and
     /// the condition has to be visible rather than retried into silence.
     pub degraded: Option<String>,
+    /// When the last drain failed, if the current `degraded` is that failure. A drain that failed
+    /// is retried once this long ago, and a drain that succeeds clears it: stopping for good on one
+    /// transient Daruk timeout left the journal to grow to its ceiling and the guest with EIO
+    /// until a detach and attach.
+    drain_failed_at: Option<Instant>,
+    drain_retry_after: Duration,
 }
+
+/// How long a failed drain is left alone before one more attempt is allowed. Long enough that a
+/// vdisk against a full disk or an unreachable Hydra does not hammer it on every write, short
+/// enough that a transient failure is not a wedge.
+pub const DRAIN_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 pub struct VdiskConfig {
     pub root: PathBuf,
@@ -258,6 +269,8 @@ impl Vdisk {
             access: Arc::clone(&cfg.access),
             commit: commit::Pipeline::new(),
             degraded: None,
+            drain_failed_at: None,
+            drain_retry_after: DRAIN_RETRY_AFTER,
             journal,
         };
 
@@ -457,11 +470,17 @@ impl Vdisk {
     fn note_drain_failure(&mut self, e: &Error) {
         eprintln!("sidon: vdisk {}: drain failed: {e}", self.id);
         self.degraded = Some(e.to_string());
+        self.drain_failed_at = Some(Instant::now());
+    }
+
+    /// Whether a failed drain has waited long enough to be tried again.
+    fn drain_retry_due(&self) -> bool {
+        self.drain_failed_at.map_or(false, |at| at.elapsed() >= self.drain_retry_after)
     }
 
     /// Whether the journal has reached the size at which a drain should be running.
     fn drain_wanted(&self) -> bool {
-        self.journal.len() >= self.high_water && self.degraded.is_none()
+        self.journal.len() >= self.high_water && (self.degraded.is_none() || self.drain_retry_due())
     }
 
     /// May a write be taken now, or must it wait for a drain to make room?
@@ -471,6 +490,9 @@ impl Vdisk {
         }
         if self.gate.running() {
             return Admit::Wait;
+        }
+        if self.degraded.is_some() && self.drain_retry_due() {
+            return Admit::StartDrain;
         }
         if let Some(why) = &self.degraded {
             // Nothing is going to make room. Blocking would hang the guest on a condition
@@ -531,6 +553,20 @@ impl Vdisk {
     /// That is garbage, not damage: nothing reads a replica the map does not name, and
     /// Purah sweeps what is left.
     pub fn add_replica(&mut self, client: Arc<PeerClient>) -> Result<usize> {
+        let node = client.node.clone();
+        let was_member = self.replicas.iter().any(|r| r.node == node);
+        let result = self.add_replica_inner(client);
+        if result.is_err() && !was_member {
+            // Whatever went wrong after the join -- an extent that would not copy, a journal the
+            // replica refused, a timeout -- the half-filled spare must not stay in the write-all
+            // set. Left there, the next heal tick found it "already a member" and skipped the
+            // backfill, then recorded it in the map as a full replica.
+            self.replicas.retain(|r| r.node != node);
+        }
+        result
+    }
+
+    fn add_replica_inner(&mut self, client: Arc<PeerClient>) -> Result<usize> {
         if self.replicas.iter().any(|r| r.node == client.node) {
             return Ok(0);
         }
@@ -554,6 +590,32 @@ impl Vdisk {
         }
         let node = client.node.clone();
         self.replicas.push(client);
+
+        // A node that was removed and is being re-added keeps whatever journal it had. The
+        // backfill below is appended after it, so a stale tail would sit in front of the new
+        // records, and takeover (which picks the longest replica journal) would then refuse to
+        // replay "a hole" or replay old records over drained data. Start it empty.
+        let truncated = self
+            .replicas
+            .iter()
+            .find(|r| r.node == node)
+            .expect("just pushed")
+            .clone()
+            .call(&Request {
+                opcode: peer::OP_TRUNCATE,
+                vdisk: self.id.clone(),
+                epoch: self.epoch,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: Vec::new(),
+            })?;
+        if !truncated.is_ok() {
+            return Err(Error::io(format!(
+                "replica {node} would not empty its old journal for {} (status {})",
+                self.id, truncated.status
+            )));
+        }
 
         // Every extent the map currently points at. Read locally and pushed as-is, so the
         // new copy is byte-identical rather than re-framed.
@@ -756,8 +818,17 @@ impl Vdisk {
 
         let mut fenced = Vec::new();
         let mut unreachable = Vec::new();
+        let mut ahead = Vec::new();
         for handle in handles {
             match handle.join() {
+                // A replica answers a fence with the epoch it is *now* fenced at. Higher than the
+                // one asked for means it already holds a later owner's fence: either this node has
+                // been deposed, or the replica carries the record of an earlier vdisk that had
+                // this name. Either way every append would be refused as "deposed", so attaching
+                // would produce a disk that looks fine and cannot be written.
+                Ok((replica, Ok(resp))) if resp.is_ok() && resp.epoch > self.epoch => {
+                    ahead.push(format!("{} is fenced at epoch {}", replica.node, resp.epoch))
+                }
                 Ok((replica, Ok(resp))) if resp.is_ok() => fenced.push(replica),
                 Ok((replica, Ok(resp))) => {
                     unreachable.push(format!("{} (status {})", replica.node, resp.status))
@@ -767,6 +838,17 @@ impl Vdisk {
                 // treating a crash as a success.
                 Err(_) => unreachable.push("a fence thread panicked".to_string()),
             }
+        }
+        if !ahead.is_empty() {
+            return Err(Error::refused(format!(
+                "{} cannot be taken over at epoch {}: {}. Either a later owner holds it, or the \
+                 replica kept the fence of an earlier vdisk with this name; `valcli storage.takeover` \
+                 claims at the epoch Hydra records, and a stale replica fence has to be cleared \
+                 before the disk can be written.",
+                self.id,
+                self.epoch,
+                ahead.join("; ")
+            )));
         }
         if fenced.is_empty() {
             return Err(Error::refused(format!(
@@ -987,6 +1069,12 @@ impl Vdisk {
                     self.map.insert(idx, loc);
                 }
                 self.drain_seq = done.next_seq;
+                if self.drain_failed_at.take().is_some() {
+                    // The failure that stopped the drains was this one's predecessor, and this
+                    // one worked: whatever it was has passed.
+                    eprintln!("sidon: vdisk {}: draining again after an earlier failure", self.id);
+                    self.degraded = None;
+                }
                 for id in &done.sealed {
                     eprintln!("sidon: vdisk {}: sealed extent group {id}", self.id);
                 }
@@ -2340,6 +2428,8 @@ mod tests {
             access: Arc::new(AccessLog::new(64, 0)),
             commit: commit::Pipeline::new(),
             degraded: None,
+            drain_failed_at: None,
+            drain_retry_after: DRAIN_RETRY_AFTER,
         }
     }
 
@@ -2568,6 +2658,28 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_that_failed_is_retried_after_the_wait_and_the_vdisk_recovers() {
+        let r = rig("retry-after", 0, 2 * MIB as u64, 64 * MIB as u64);
+        r.vd.lock().unwrap().drain_retry_after = Duration::from_millis(50);
+        r.hydra.st.fail_batch.store(true, Ordering::SeqCst);
+        let data = fill(7, 3 * MIB);
+        r.write(0, &data).unwrap();
+        r.settle();
+        assert!(r.degraded().is_some(), "the first failure degrades it");
+
+        // Hydra recovers. Before the wait nothing is retried; after it, the next write is.
+        r.hydra.st.fail_batch.store(false, Ordering::SeqCst);
+        r.write(4 * MIB as u64, &fill(8, 1000)).unwrap();
+        r.settle();
+        assert!(r.degraded().is_some(), "not retried inside the wait");
+        std::thread::sleep(Duration::from_millis(80));
+        r.write(5 * MIB as u64, &fill(9, 1000)).unwrap();
+        r.settle();
+        assert!(r.degraded().is_none(), "a successful drain after the wait clears it");
+        assert_eq!(r.read(0, 3 * MIB as u32), data);
+    }
+
+    #[test]
     fn a_failure_writing_the_map_rows_forgets_nothing_either() {
         let r = rig("batch-fails", 0, 2 * MIB as u64, 64 * MIB as u64);
         r.hydra.st.fail_batch.store(true, Ordering::SeqCst);
@@ -2766,6 +2878,40 @@ mod tests {
         for g in groups {
             assert!(late.store.get_egroup(&g, 0, 16).is_ok(), "replica has {g}");
         }
+    }
+
+    #[test]
+    fn a_replica_whose_backfill_fails_does_not_stay_in_the_write_all_set() {
+        let r = rig("backfill-fails", 0, 64 * MIB as u64, 128 * MIB as u64);
+        let late = TestReplica::start(&r.dir, "late-fails");
+        r.write(0, &fill(1, 1000)).unwrap(); // journal records, nothing drained
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        late.set_hook(Some(Arc::new(move |req| {
+            seen2.lock().unwrap().push(req.opcode);
+            (req.opcode == peer::OP_APPEND).then(|| Response::err(peer::ST_REFUSED, 0))
+        })));
+        let mut v = lock_idle(&r.vd);
+        let err = v.add_replica(Arc::clone(&late.client)).expect_err("the backfill was refused");
+        assert!(err.to_string().contains("refused the journal backfill"), "{err}");
+        assert!(v.replicas.is_empty(), "the half-filled spare was left in the set");
+        let ops = seen.lock().unwrap().clone();
+        let truncate = ops.iter().position(|o| *o == peer::OP_TRUNCATE).expect("emptied first");
+        let append = ops.iter().position(|o| *o == peer::OP_APPEND).expect("then backfilled");
+        assert!(truncate < append, "{ops:?}");
+    }
+
+    #[test]
+    fn a_replica_that_cannot_be_reached_for_the_backfill_is_not_left_in_the_set_either() {
+        let r = rig("backfill-unreachable", 0, 64 * MIB as u64, 128 * MIB as u64);
+        let late = TestReplica::start(&r.dir, "late-unreachable");
+        r.write(0, &fill(1, 1000)).unwrap();
+        late.set_hook(Some(Arc::new(|req| {
+            (req.opcode == peer::OP_TRUNCATE).then(|| Response::err(peer::ST_REFUSED, 0))
+        })));
+        let mut v = lock_idle(&r.vd);
+        assert!(v.add_replica(Arc::clone(&late.client)).is_err());
+        assert!(v.replicas.is_empty());
     }
 
     #[test]
@@ -3240,6 +3386,19 @@ mod tests {
         assert_eq!(r.read(0, 2 * MIB as u32), vec![0u8; 2 * MIB]);
         // And it did not reach the new owner's journal.
         assert!(r.replicas[0].journal().is_empty());
+    }
+
+    #[test]
+    fn a_takeover_is_refused_when_a_replica_is_already_fenced_above_it() {
+        // The vdisk is at epoch 3. A replica that kept the fence of an earlier vdisk with this
+        // name (or of a later owner) answers a fence with its own, higher, epoch; accepting that
+        // as "fenced" attached a disk every append to which would then be refused as deposed.
+        let r = rig("takeover-ahead", 1, 64 * MIB as u64, 128 * MIB as u64);
+        r.replicas[0].store.fence("vd", 9).unwrap();
+        let clients = vec![Arc::clone(&r.replicas[0].client)];
+        let err = r.vd.lock().unwrap().fence_and_recover(&clients).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("fenced at epoch 9") && text.contains("cannot be taken over"), "{text}");
     }
 
     #[test]

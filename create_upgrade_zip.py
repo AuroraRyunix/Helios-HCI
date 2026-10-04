@@ -162,6 +162,10 @@ components_map = {
     # it keeps its .py suffix like the other importable modules here.
     "helios-sig": {"src": "helios_sig.py", "target": "/usr/local/bin/helios_sig.py"},
     "helios-sidon": {"src": "helios_sidon.py", "target": "/usr/local/bin/helios_sidon.py"},
+    # Imported by every daemon (the one CQL query layer) and by the cluster CLI, which calls
+    # functions added to it over time: a node that took the new CLI without it failed on import.
+    "helios-cql": {"src": "helios_cql.py", "target": "/usr/local/bin/helios_cql.py"},
+    "helios-schema": {"src": "helios_schema.py", "target": "/usr/local/bin/helios_schema.py"},
     "helios-snapshots": {"src": "helios_snapshots.py", "target": "/usr/local/bin/helios_snapshots.py"},
     # Imported by valcli for protection domains, and by the Rauru daemon.
     "rauru-protection": {"src": "rauru_protection.py", "target": "/usr/local/bin/rauru_protection.py"},
