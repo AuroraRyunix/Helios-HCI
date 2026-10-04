@@ -178,6 +178,8 @@ def call_catalyst_api(path, payload=None, method="GET"):
 
 def insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, output):
     clean_output = output.replace("'", "''").replace("\\", "\\\\")
+    job_name = cql_escape(job_name)
+    status = cql_escape(status)
     cql = f"""
     INSERT INTO hydra.dagur_runs (job_name, start_time, run_id, end_time, status, exit_code, output)
     VALUES ('{job_name}', {start_time}, {run_id}, {end_time}, '{status}', {exit_code}, '{clean_output}');
@@ -188,10 +190,11 @@ def execute_dagur_job_thread(task_id, job_name, command,
                              timeout=DEFAULT_JOB_TIMEOUT, reports_progress=False):
     run_id = str(uuid.uuid4())
     start_time = int(time.time() * 1000)
+    job_name_for_cql = cql_escape(job_name)
 
     cql_start = f"""
     INSERT INTO hydra.dagur_runs (job_name, start_time, run_id, status, exit_code, output)
-    VALUES ('{job_name}', {start_time}, {run_id}, 'RUNNING', -1, 'Job started...');
+    VALUES ('{job_name_for_cql}', {start_time}, {run_id}, 'RUNNING', -1, 'Job started...');
     """
     run_cql_query(cql_start)
 

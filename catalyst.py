@@ -308,6 +308,22 @@ def submit_task_to_memory(service, task_data):
             task_events[task_id] = threading.Event()
             queued_task_ids.add(task_id)
 
+def queue_scheduled_task(service, task_data):
+    """Put a scheduled task on this node's queues only if this node holds them.
+
+    The scheduler and the dispatcher are separate candidacies and can be different nodes. The
+    row is already recorded as pending, and the dispatcher's sweep replays recorded rows, so a
+    scheduler that is not the dispatcher has nothing more to do: queuing here would leave an
+    entry nothing drains, which runs the job a second time if this node later becomes the
+    dispatcher.
+    """
+    if not holds_dispatch():
+        print("[Scheduler] %s is recorded; the dispatching node will queue it." % task_data["task_id"])
+        return False
+    submit_task_to_memory(service, task_data)
+    return True
+
+
 def claim_scheduled_run(job_name, expected_last_run, now):
     """Take this tick of `job_name`, or report that somebody else already has it.
 
@@ -407,7 +423,7 @@ def scheduler_thread_loop():
                                     task_type="scheduled_job",
                                     sequence_id=next_sequence_id(DEFAULT_COMPONENT)))
                                 
-                                submit_task_to_memory("dagur", {
+                                queue_scheduled_task("dagur", {
                                     "task_id": task_id,
                                     "action": "execute",
                                     "payload": {"job_name": name, "command": command}
@@ -472,7 +488,14 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
         # 2. GET /api/v1/tasks/status/<task_id> (Long polling completion)
         elif len(parts) == 6 and parts[3] == "tasks" and parts[4] == "status":
             task_id = parts[5]
-            
+            try:
+                task_id = str(uuid.UUID(task_id))
+            except (ValueError, AttributeError, TypeError):
+                # The id is spliced into the statement below as a bare uuid literal, so
+                # anything that is not exactly one never reaches the database.
+                self.send_json(400, {"error": "task id must be a UUID"})
+                return
+
             # Query DB first to see if task is already completed/failed in the database
             cql = (f"SELECT JSON status, progress, error_msg, parent_task_id, component, "
                    f"sequence_id, task_type, completed_at "

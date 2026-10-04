@@ -1494,15 +1494,6 @@ def delete_vm(name):
             run_lwt("/v1/vm/migrate-unlock", {"name": name})
 
 
-def get_zookeeper_leader_ip():
-    """Finds the IP of the current ZooKeeper leader by querying stat on port 2181."""
-    nodes = get_cluster_nodes()
-    if not nodes:
-        return "127.0.0.1"
-    # One cached probe, shared by every daemon -- see helios_zk.leader_ip.
-    ips = [node.get("ip") for node in nodes if node.get("ip")]
-    return helios_zk.leader_ip(ips, timeout=0.5) or "127.0.0.1"
-
 VM_CPU_CACHE = {}
 VM_IO_CACHE = {}
 

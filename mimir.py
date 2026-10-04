@@ -21,6 +21,7 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     is_conditional_cql,
     run_conditional_cql_query,
     run_cql_query,
+    run_lwt,
 )
 
 socket.setdefaulttimeout(45.0)
@@ -423,6 +424,38 @@ def publish_cert_survey():
     run_cql_query(cql)
     return status
 
+
+def schedule_interval(row):
+    """Seconds between runs: the row's own `interval_seconds` if it has one, else by name."""
+    given = row.get("interval_seconds")
+    if isinstance(given, int) and given > 0:
+        return given
+    return 3600 if row.get("schedule_name") == "hourly_checks" else 86400
+
+
+def claim_schedule(name, expected_last_run, now):
+    """Take this tick of a schedule, or report that another Mimir already has it.
+
+    Two Mimirs can both believe they lead for a moment (a session lost mid-pass), and a blind
+    write of `last_run_epoch` lets each run the same checks. The write is conditional on the
+    value that was read, so exactly one proceeds; failing to ask counts as not claimed, because
+    a skipped tick runs a minute later and a doubled one cannot be taken back.
+    """
+    ok, applied, current, error = run_lwt("/v1/schedule/claim-check", {
+        "schedule_name": name,
+        "last_run_epoch": now,
+        "expected_last_run_epoch": expected_last_run,
+    })
+    if not ok:
+        sys.stderr.write("[Mimir] Could not claim '%s': %s. Skipping this pass.\n" % (name, error))
+        return False
+    if not applied:
+        sys.stderr.write("[Mimir] '%s' was already claimed (last_run_epoch is now %s). Skipping.\n"
+                         % (name, current.get("last_run_epoch")))
+        return False
+    return True
+
+
 def main():
     print("Mimir health checker daemon started.")
     local_last_run = {}
@@ -466,18 +499,23 @@ def main():
                     for s in rows:
                         if s.get("enabled", False):
                             name = s.get("schedule_name")
-                            last_run = s.get("last_run_epoch", 0)
-                            interval = 3600 if name == "hourly_checks" else 86400
-                            
+                            if not name:
+                                continue
+                            # A null column comes back as None, which `now - None` cannot
+                            # subtract; it used to raise and cost every other schedule that pass.
+                            recorded = s.get("last_run_epoch")
+                            last_run = recorded if isinstance(recorded, int) else 0
+                            interval = schedule_interval(s)
+
                             if name in local_last_run and now - local_last_run[name] < interval:
                                 continue
-                                
+
                             if now - last_run >= interval:
+                                if not claim_schedule(name, recorded, now):
+                                    continue
                                 print(f"[Mimir] Triggering check: {name}...")
                                 local_last_run[name] = now
-                                cql_update = f"UPDATE hydra.mimir_schedules SET last_run_epoch = {now} WHERE schedule_name = '{name}';"
-                                run_cql_query(cql_update)
-                                
+
                                 category = s.get("category", "all")
                                 run_cmd = f"/usr/local/bin/mcli health_checks run_all" if category == "all" else f"/usr/local/bin/mcli health_checks {category}"
                                 threading.Thread(target=run_remote_spark, args=("127.0.0.1", run_cmd), daemon=True).start()

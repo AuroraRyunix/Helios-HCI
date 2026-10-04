@@ -374,24 +374,6 @@ class UdevHelper:
                 time.sleep(0.1)
 
 
-def run_mtls_spark_api(ip, path, payload, method="POST"):
-    ip, verify_identity = spark_endpoint(ip)
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
-    context.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
-    context.check_hostname = verify_identity
-
-    url = f"https://{ip}:9099{path}"
-    data = None
-    if payload is not None and method != "GET":
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
-            res = json.loads(response.read().decode("utf-8"))
-            return 0, res, ""
-    except Exception as e:
-        return -1, {}, str(e)
-
 def run_parallel(ips, cmd, timeout=None):
     results = {}
     threads = []
@@ -3377,25 +3359,6 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 peer_status = "sidon did not answer: %s" % str(exc)[:200]
 
-        # Parse query params for verbose flag
-        import urllib.parse
-        parsed = urllib.parse.urlparse(self.path)
-        query_params = urllib.parse.parse_qs(parsed.query)
-        is_verbose = "verbose" in query_params and query_params["verbose"][0] in ["1", "true", "True"]
-        
-        if not is_verbose and volume_info:
-            filtered_lines = []
-            skipping = False
-            for line in volume_info.splitlines():
-                if "volume name:" in line.lower():
-                    skipping = False
-                elif "options reconfigured:" in line.lower():
-                    skipping = True
-                
-                if not skipping:
-                    filtered_lines.append(line)
-            volume_info = "\n".join(filtered_lines).strip()
-        
         # 3. Read host list from config
         hosts = []
         try:
@@ -5513,9 +5476,9 @@ def main():
                                     cql = f"INSERT INTO hydra.vm_nvram (vm_name, nvram_data) VALUES ('{vm_name}', '{b64_data}');"
                                     run_cql_query(cql)
                                 except Exception as fe:
-                                    sys.stderr.write(f"[NVRAM Watcher] Error reading/saving {filename}: {fe}\\n")
+                                    sys.stderr.write(f"[NVRAM Watcher] Error reading/saving {filename}: {fe}\n")
             except Exception as e:
-                sys.stderr.write(f"[NVRAM Watcher] Error: {e}\\n")
+                sys.stderr.write(f"[NVRAM Watcher] Error: {e}\n")
             time.sleep(5)
 
     t_nvram = threading.Thread(target=nvram_watcher_loop, daemon=True)

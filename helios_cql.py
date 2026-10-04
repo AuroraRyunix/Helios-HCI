@@ -47,6 +47,7 @@ import json
 import re
 import socket
 import subprocess
+import urllib.error
 import urllib.request
 
 DARUK_URL = "http://127.0.0.1:9043"
@@ -178,6 +179,33 @@ def run_conditional_cql_query(cql_query, *args, **kwargs):
         return 1, "", body.get("error", "Database query execution error")
     except Exception:
         return _cqlsh_fallback(cql_query)
+
+
+def run_lwt(endpoint, params, timeout=15):
+    """One of Daruk's typed compare-and-swap endpoints, as `(ok, applied, current, error)`.
+
+    `ok` is False only for a genuine failure (Daruk unreachable, a malformed request, a database
+    error). A refused compare-and-swap is `(True, False, {...}, "")`: a lost race, with `current`
+    holding what beat it. There is deliberately no cqlsh fallback, which cannot report whether a
+    condition held. Daruk's address is read at call time so a test can point it elsewhere.
+    """
+    try:
+        req = urllib.request.Request(
+            DARUK_URL + endpoint,
+            data=json.dumps(params).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            res = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return False, False, {}, json.loads(e.read().decode("utf-8")).get("error", "HTTP %s" % e.code)
+        except Exception:
+            return False, False, {}, "HTTP %s" % e.code
+    except Exception as e:
+        return False, False, {}, "Daruk is not answering on %s: %s" % (DARUK_URL, e)
+    if res.get("status") != "success":
+        return False, False, {}, res.get("error", "compare-and-swap failed")
+    return True, bool(res.get("applied")), res.get("current") or {}, ""
 
 
 def _render_rows(rows):
