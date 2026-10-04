@@ -111,9 +111,11 @@ class PurahMarksFromTheBlockMapAlone(unittest.TestCase):
         invariants I-3 and I-7: a sweep must never derive liveness from a table that can
         disagree with the files, which is exactly what a replica-placement table was.
         """
-        purah = read(os.path.join(HERE, "sidon", "src", "purah.rs"))
-        body = purah[purah.index("fn referenced_egroups"):]
-        body = body[:body.index("\n    }\n")]
+        # The mark phase is the first thing the pass does: its one statement, kept to a line.
+        reclaim = read(os.path.join(HERE, "sidon", "src", "purah", "reclaim.rs"))
+        pass_ = reclaim[reclaim.index("pub fn sweep_pass"):]
+        body = pass_[pass_.index("let referenced"):]
+        body = body[:body.index(";")]
 
         # The method itself reads nothing: it hands off to the module that follows both levels.
         self.assertIn("extent_id_map::referenced_egroups", body,

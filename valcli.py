@@ -1756,8 +1756,10 @@ def cmd_storage_compact(argv):
     a number of groups, a number of bytes, a rate and a time, and prints which bound it hit; run
     it again to continue. Per node: a node compacts the groups it created.
 
-    It also says what it cannot do. Replicas keep their copy of an old group, so the figure for
-    what is added on replicas has no matching saving until a replica-side reclaim exists.
+    The old groups are freed by the sweep, here and (D-33) on every replica, which the sweep asks
+    to drop its copy. Each plan step prints what is added on the replicas and what they get back
+    once the sweep has run twice; a replica still running a build from before D-33 keeps its copy,
+    and for that replica the added figure is growth with no saving until it is upgraded.
     """
     request = _compact_request(argv)
     apply = request["apply"]
@@ -1786,11 +1788,16 @@ def cmd_storage_compact(argv):
         for skip in body.get("skipped") or []:
             print("  skipped %s: %s" % (skip.get("egroup_id"), skip.get("reason")))
         for step in body.get("plan") or []:
-            print("  %s: copy %d bytes from %s to a new group; %d bytes freed here once swept; "
-                  "%d bytes added on %s"
-                  % ("would" if not apply else "plan", step.get("bytes_to_copy") or 0,
-                     ", ".join(step.get("sources") or []), step.get("freed_here_after_sweep") or 0,
-                     step.get("added_on_replicas") or 0, ", ".join(step.get("replicas") or []) or "no replicas"))
+            replicas = ", ".join(step.get("replicas") or [])
+            line = ("  %s: copy %d bytes from %s to a new group; %d bytes freed here once swept"
+                    % ("would" if not apply else "plan", step.get("bytes_to_copy") or 0,
+                       ", ".join(step.get("sources") or []), step.get("freed_here_after_sweep") or 0))
+            if replicas:
+                line += ("; on %s %d bytes added now and %d freed once swept (net %d)"
+                         % (replicas, step.get("added_on_replicas") or 0,
+                            step.get("freed_on_replicas_after_sweep") or 0,
+                            step.get("net_freed_on_replicas") or 0))
+            print(line)
         for done in body.get("executed") or []:
             print("  done: %s (%d bytes) from %s; %d row(s) repointed, %d lost to an overwrite"
                   % (done.get("new_group"), done.get("bytes") or 0, ", ".join(done.get("sources") or []),
@@ -2030,58 +2037,195 @@ def _print_heat_rows(label, rows):
                  idle_ms / 3600000.0, row.get("heat") or 0.0, row.get("state")))
 
 
-def cmd_storage_cleanup_orphaned():
-    """Report reclaimable space, and ask Purah to reclaim it.
+def _sweep_mib(count):
+    return "%.1f MiB" % (int(count or 0) / (1024.0 * 1024.0))
 
-    This used to glob the container volumes for *.raw and *_vars.fd files and match the
-    filenames against hydra.vms -- a disk was a file named after its VM, so an orphan was
-    a file no row mentioned. An extent group is not named after anything: it holds extents
-    from whichever vdisk was draining, and the only statement of what is referenced is the
-    block map.
 
-    So this asks Purah rather than working it out. A second implementation of the mark
-    phase would be a second thing to get wrong, and the consequence of getting it wrong is
-    deleting live data. The two-scan rule means one invocation may report candidates and
-    reclaim nothing; that is the rule working, not a failure.
+def _grace_phrase(body):
+    """The grace period as a duration in words, or "the grace period" when the daemon did not say.
+
+    A daemon older than this field does not report its grace, and then the honest thing is to
+    say there is one rather than to guess a number.
     """
-    hosts = []
-    try:
-        if os.path.exists("/etc/hci/cluster.json"):
-            with open("/etc/hci/cluster.json", "r") as f:
-                hosts = json.load(f).get("hosts", [])
-    except Exception:
-        pass
-    if not hosts:
-        hosts = [{"ip": "127.0.0.1", "hostname": "this node"}]
+    grace = body.get("grace_seconds")
+    if not isinstance(grace, (int, float)) or grace <= 0:
+        return "the grace period"
+    if grace % 60 == 0:
+        return "%d minute(s)" % int(grace // 60)
+    return "%d second(s)" % int(grace)
 
-    rows = []
-    for host in hosts:
+
+def sweep_lines(label, body):
+    """What one node's sweep did, as plain lines.
+
+    Every number the daemon reports is shown, because the sweep is deliberately slow and an
+    operator who sees "reclaimed 0" needs to be able to tell the three different reasons for
+    it apart: nothing is garbage, the garbage has not been seen twice yet, or it was seen
+    and something kept it (open, held by an attached vdisk, too young). Fields an older
+    daemon does not send are left out rather than shown as zero.
+    """
+    def n(key):
+        value = body.get(key)
+        return int(value) if isinstance(value, (int, float)) else 0
+
+    lines = []
+    lines.append("%s: %d extent group(s) recorded on this node, %d still referenced"
+                 % (label, n("egroups_known"), n("egroups_referenced")))
+    reclaimed = body.get("reclaimed") or []
+    lines.append("    unreferenced for %s or more: %d candidate(s); reclaimed %d group(s), %s freed here"
+                 % (_grace_phrase(body), n("candidates"), len(reclaimed),
+                    _sweep_mib(body.get("bytes_reclaimed"))))
+    awaiting = n("skipped_awaiting_grace")
+    if awaiting:
+        lines.append("    awaiting a second scan: %d group(s) first seen unreferenced, or seen too "
+                     "recently, to be removed yet" % awaiting)
+    skipped = []
+    if n("skipped_open"):
+        skipped.append("%d open (the target of a drain, or too recent to call abandoned)"
+                       % n("skipped_open"))
+    if n("skipped_held"):
+        skipped.append("%d held by a vdisk attached here" % n("skipped_held"))
+    if n("skipped_young"):
+        skipped.append("%d too young" % n("skipped_young"))
+    if skipped:
+        lines.append("    left alone: " + "; ".join(skipped))
+    abandoned = body.get("reclaimed_abandoned_open")
+    if isinstance(abandoned, list) and abandoned:
+        lines.append("    of the reclaimed groups, %d were open and abandoned (no drain owns them)"
+                     % len(abandoned))
+    for drop in body.get("replica_drops") or []:
+        if not isinstance(drop, dict):
+            continue
+        node = drop.get("node") or "?"
+        if drop.get("error"):
+            lines.append("    replica %s: could not be asked (%s); its copies are found by its own "
+                         "orphan scan" % (node, drop["error"]))
+        elif drop.get("unsupported"):
+            lines.append("    replica %s: runs a sidon older than replica reclamation and keeps its "
+                         "copies until it is upgraded" % node)
+        else:
+            lines.append("    replica %s: dropped %d copy(ies), %s; already gone %d; refused %d"
+                         % (node, int(drop.get("dropped") or 0), _sweep_mib(drop.get("bytes")),
+                            int(drop.get("absent") or 0), int(drop.get("refused") or 0)))
+            for why in drop.get("refusals") or []:
+                lines.append("        refused: %s" % why)
+    orphans = body.get("replica_orphans")
+    if isinstance(orphans, dict):
+        if orphans.get("error"):
+            lines.append("    replica copies held for other nodes: scan failed (%s)" % orphans["error"])
+        else:
+            lines.append("    replica copies held for other nodes: %d scanned; dropped %d orphan(s), "
+                         "%s; %d awaiting a second scan"
+                         % (int(orphans.get("scanned") or 0), len(orphans.get("dropped") or []),
+                            _sweep_mib(orphans.get("bytes_dropped")),
+                            int(orphans.get("awaiting_grace") or 0)))
+            for anomaly in orphans.get("anomalies") or []:
+                lines.append("        ANOMALY: %s" % anomaly)
+    for anomaly in body.get("anomalies") or []:
+        lines.append("    ANOMALY: %s" % anomaly)
+    if n("missing_count"):
+        lines.append("    WARNING: %d referenced group(s) have no file on this node's disks: %s"
+                     % (n("missing_count"), ", ".join((body.get("missing") or [])[:5])))
+    return lines
+
+
+def cmd_storage_sweep():
+    """Run the reclaimer on every node and say what it did and what it is waiting for.
+
+    Space is returned by mark-sweep (I-7): a group goes only after two scans, at least the
+    grace period apart, have found nothing pointing at it. So this command may run once, find
+    garbage, and reclaim none of it; that is the rule working, and the output says which
+    groups are waiting. It does not shorten the rule. Sidon runs the same pass by itself
+    every few minutes, so running it here brings the second scan forward and nothing else.
+    """
+    answered = 0
+    awaiting = 0
+    grace = None
+    for host in _storage_hosts():
         ip = host.get("ip")
         if not ip:
             continue
-        rc, body, err = run_mtls_spark_api(
-            ip, "/api/v1/dfs/vdisk", {"op": "purah-sweep"})
-        if rc != 0 or not isinstance(body, dict):
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "purah-sweep"})
+        if rc != 0 or not isinstance(body, dict) or "egroups_known" not in body:
             detail = body.get("error") if isinstance(body, dict) else err
-            rows.append([host.get("hostname") or ip, "-", "-", "-",
-                         (str(detail) or "no response")[:40]])
+            print("[%s] sweep failed: %s" % (label, detail or "no response"))
             continue
-        reclaimed = body.get("reclaimed") or []
-        rows.append([
-            host.get("hostname") or ip,
-            str(body.get("egroups_known", 0)),
-            str(body.get("egroups_referenced", 0)),
-            "%d (%.1f MiB)" % (len(reclaimed),
-                               int(body.get("bytes_reclaimed") or 0) / (1024 * 1024)),
-            "%d awaiting a second scan" % body.get("skipped_awaiting_grace", 0),
-        ])
-
-    print_table(["Node", "Extent groups", "Referenced", "Reclaimed", "Notes"], rows)
+        answered += 1
+        awaiting += int(body.get("skipped_awaiting_grace") or 0)
+        if grace is None:
+            grace = body
+        for line in sweep_lines(label, body):
+            print(line)
     print()
-    print("An extent group is reclaimed only after two consecutive scans have found it "
-          "unreferenced. One run reporting candidates and reclaiming nothing is that rule "
-          "working: a drain makes bytes durable before the map points at them, so a single "
-          "scan landing in that window sees a group that is milliseconds from being live.")
+    if not answered:
+        print("No node answered. Either sidon is down or the spark API is unreachable.")
+        return
+    if awaiting:
+        print("%d group(s) are awaiting a second scan. A group is removed only when two scans, at "
+              "least %s apart, have both found nothing pointing at it: a drain makes bytes durable "
+              "before the map names them, so one scan can see a group that is milliseconds from "
+              "being live. Run this again after that time; sidon also repeats the pass on its own."
+              % (awaiting, _grace_phrase(grace or {})))
+    else:
+        print("Nothing is waiting for a second scan.")
+
+
+def scrub_lines(label, body):
+    """One node's scrub answer: how many sealed groups were re-hashed, and any damage."""
+    lines = ["%s: %d sealed group(s) re-hashed, %d not sealed yet (skipped)"
+             % (label, int(body.get("checked") or 0), int(body.get("skipped_unsealed") or 0))]
+    for group in body.get("mismatched") or []:
+        lines.append("    DAMAGED: %s no longer hashes to what it was sealed as" % group)
+    for group in body.get("missing") or []:
+        lines.append("    MISSING: %s is recorded sealed here and has no file on any disk" % group)
+    if body.get("clean"):
+        lines.append("    clean")
+    return lines
+
+
+def cmd_storage_scrub():
+    """Re-hash every sealed extent group on every node against the hash taken at seal time.
+
+    Sealed means immutable, so any difference is damage. Exits non-zero if any node reports
+    damage or a missing group, so that a script can act on it.
+    """
+    answered = 0
+    damaged = False
+    for host in _storage_hosts():
+        ip = host.get("ip")
+        if not ip:
+            continue
+        label = host.get("hostname") or ip
+        rc, body, err = run_mtls_spark_api(ip, "/api/v1/dfs/vdisk", {"op": "purah-scrub"})
+        if rc != 0 or not isinstance(body, dict) or "checked" not in body:
+            detail = body.get("error") if isinstance(body, dict) else err
+            print("[%s] scrub failed: %s" % (label, detail or "no response"))
+            continue
+        answered += 1
+        if body.get("clean") is not True:
+            damaged = True
+        for line in scrub_lines(label, body):
+            print(line)
+    if not answered:
+        print("No node answered. Either sidon is down or the spark API is unreachable.")
+        sys.exit(1)
+    if damaged:
+        sys.exit(1)
+
+
+def cmd_storage_cleanup_orphaned():
+    """The name the daily Dagur job and older documents use for the sweep.
+
+    Kept so that the scheduled job and anyone's muscle memory keep working; it is
+    `storage.sweep`. This used to glob the container volumes for *.raw and *_vars.fd files and
+    match them against hydra.vms, which stopped being the right question when a disk stopped
+    being a file named after its VM. An extent group is not named after anything, and the only
+    statement of what is referenced is the block map, so this asks Purah rather than working it
+    out: a second implementation of the mark phase would be a second thing to get wrong, and
+    the consequence is deleting live data.
+    """
+    cmd_storage_sweep()
 
 
 def format_size(bytes_val):
@@ -3281,6 +3425,8 @@ def print_usage():
     print("  valcli storage.placement [N]            Which disk of each node holds which extent groups")
     print("  valcli storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
     print("  valcli storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
+    print("  valcli storage.sweep                    Reclaim unreferenced extent groups on every node; says what is waiting")
+    print("  valcli storage.scrub                    Re-hash every sealed extent group against its seal hash")
     print("  valcli storage.compact [--apply]        Plan (or with --apply, make) compaction of sparse sealed groups")
     print("                                          [--threshold F] [--max-groups N] [--max-bytes N] [--seconds N] [--rate B/s]")
     print("  valcli storage.dedup.estimate [--sample F]  Bytes dedup would share beyond clones (read-only)")
@@ -3460,6 +3606,16 @@ def main():
             print("Usage: valcli storage.tier [--apply]")
             sys.exit(1)
         cmd_storage_tier(apply=bool(extra))
+    elif cmd == "storage.sweep":
+        if sys.argv[2:]:
+            print("Usage: valcli storage.sweep")
+            sys.exit(1)
+        cmd_storage_sweep()
+    elif cmd == "storage.scrub":
+        if sys.argv[2:]:
+            print("Usage: valcli storage.scrub")
+            sys.exit(1)
+        cmd_storage_scrub()
     elif cmd == "storage.compact":
         cmd_storage_compact(sys.argv[2:])
     elif cmd == "storage.dedup.estimate":

@@ -44,6 +44,7 @@ SCHEMA = os.path.join(HERE, "helios_schema.py")
 HEAT_RS = os.path.join(HERE, "sidon", "src", "heat.rs")
 META_RS = os.path.join(HERE, "sidon", "src", "meta.rs")
 PURAH_RS = os.path.join(HERE, "sidon", "src", "purah.rs")
+RECLAIM_RS = os.path.join(HERE, "sidon", "src", "purah", "reclaim.rs")
 VDISK_RS = os.path.join(HERE, "sidon", "src", "vdisk.rs")
 CONTROL_RS = os.path.join(HERE, "sidon", "src", "control.rs")
 MAIN_RS = os.path.join(HERE, "sidon", "src", "main.rs")
@@ -226,7 +227,7 @@ class ReclamationTakesTheAccessDataWithIt(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.reclaim = rust_fn(read(PURAH_RS), "reclaim")
+        cls.reclaim = rust_fn(read(RECLAIM_RS), "forget_group")
 
     def test_the_whole_partition_goes(self):
         """Every node's row, not this node's: the group is gone everywhere."""
@@ -236,7 +237,7 @@ class ReclamationTakesTheAccessDataWithIt(unittest.TestCase):
     def test_the_in_memory_entry_goes_too(self):
         """Otherwise the id keeps being flushed for the life of the daemon, and the row it
         describes comes straight back after being deleted."""
-        self.assertIn("self.access.forget(", self.reclaim)
+        self.assertIn("p.access.forget(", self.reclaim)
 
     def test_access_data_cannot_block_reclaiming_disk(self):
         """Deleted last and best-effort. A leftover access row is a stale label that the
@@ -426,10 +427,11 @@ class TheExtentIdMapIsStagedSoTheMarkPhaseComesFirst(unittest.TestCase):
             self.assertNotIn("backfill", by_id[mid], mid)
 
     def test_the_mark_phase_goes_through_the_extent_map_and_not_only_the_old_column(self):
-        purah = rust_fn(read(PURAH_RS), "referenced_egroups")
-        self.assertIn("extent_id_map::referenced_egroups", purah)
-        self.assertNotIn("SELECT egroup_id FROM hydra.dfs_block_map", read(PURAH_RS),
-                         "Purah scans the old column on its own again, bypassing the extent level")
+        sweep = rust_fn(read(RECLAIM_RS), "sweep_pass")
+        self.assertIn("extent_id_map::referenced_egroups", sweep)
+        for path in (PURAH_RS, RECLAIM_RS):
+            self.assertNotIn("SELECT egroup_id FROM hydra.dfs_block_map", read(path),
+                             "Purah scans the old column on its own again, bypassing the extent level")
         source = read(self.EXTENT_MAP_RS)
         # The statement every cluster has always been sent, byte for byte.
         self.assertIn('"SELECT egroup_id FROM hydra.dfs_block_map"', source)

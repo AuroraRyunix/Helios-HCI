@@ -69,6 +69,23 @@ pub const OP_FORWARD_WRITE: u16 = 9;
 /// reading a new request as the old one and emptying a journal that holds acknowledged
 /// writes made while the drain ran.
 pub const OP_TRUNCATE_TO: u16 = 10;
+/// Drop this node's replica copies of extent groups the sender has declared dead.
+///
+/// `vdisk` carries the sender's node name, `data` the group ids one per line, and the reply
+/// is a JSON document with a verdict per id. It is a request, never a command: the replica
+/// checks Hydra itself (the group's row is `dead` and was created by the sender, and nothing
+/// in the block map or the extent id map points into it) and drops only what that proves.
+///
+/// Wire compatibility is the point of giving it an opcode of its own. A replica from before
+/// this opcode answers "unknown opcode" with an empty body and keeps its copy, which is the
+/// safe way to be wrong: space is not freed on it until it is upgraded, and nothing is lost.
+/// The sender tells that apart from an answer (a new replica always answers `ST_OK` with a
+/// body, even to refuse) and reports the replica as running an older build.
+pub const OP_EGROUP_DROP: u16 = 11;
+
+/// The most group ids one `OP_EGROUP_DROP` may name. The replica reads the whole block map
+/// once per request, so batching is the economy; the cap only keeps a frame small.
+pub const MAX_DROP_IDS: usize = 256;
 
 /// Request flag on OP_APPEND and OP_EGROUP_PUT: this is not the last write of its group, so
 /// the replica need not fsync it -- the group's last write, sent without the flag, is synced
@@ -268,6 +285,74 @@ impl ReplicaStore {
 
     fn egroup_path(&self, egroup: &str) -> PathBuf {
         self.volume.join("replica-egroups").join(format!("{egroup}.eg"))
+    }
+
+    /// Every extent group this node holds a replica copy of, with its size and how long ago
+    /// it was last written. Only whole `<id>.eg` files: a name this does not recognise is not
+    /// a group and is never offered for removal.
+    pub fn list_egroups(&self) -> Result<Vec<ReplicaGroup>> {
+        let dir = self.volume.join("replica-egroups");
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| Error::io(format!("cannot list {}: {e}", dir.display())))?
+        {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_suffix(".eg") else { continue };
+            if !valid_group_id(id) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            // A modification time in the future (a clock stepped back) reads as zero age,
+            // which is the conservative answer: it makes the copy look recent.
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .unwrap_or(Duration::ZERO);
+            out.push(ReplicaGroup { id: id.to_string(), size: meta.len(), age });
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    pub fn has_egroup(&self, egroup: &str) -> bool {
+        valid_group_id(egroup) && self.egroup_path(egroup).is_file()
+    }
+
+    /// Remove this node's replica copy of a group. `Ok(None)` when there was none, so the
+    /// call is idempotent: a retry after a crash, or a second sender, finds the work done.
+    ///
+    /// The unlink is atomic and is followed by a sync of the directory, so a crash leaves
+    /// either the whole file or no file -- never a truncated one that a later read would take
+    /// for a short group. If the crash comes between the unlink and the directory sync the
+    /// file may reappear, and it is removed again on the next request or scan.
+    ///
+    /// The caller is responsible for having *established that the group is dead*; nothing
+    /// here knows what is live. The name is checked because it becomes a path.
+    pub fn remove_egroup(&self, egroup: &str) -> Result<Option<u64>> {
+        if !valid_group_id(egroup) {
+            return Err(Error::refused(format!("{egroup:?} is not an extent group id")));
+        }
+        let path = self.egroup_path(egroup);
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::io(format!("replica extent group {egroup}: {e}"))),
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::io(format!("removing replica extent group {egroup}: {e}"))),
+        }
+        File::open(self.volume.join("replica-egroups"))?.sync_all()?;
+        if let Some(access) = &self.access {
+            access.forget(egroup);
+        }
+        Ok(Some(size))
     }
 
     /// The highest epoch this replica has been fenced at, read from disk on first use.
@@ -517,6 +602,26 @@ impl ReplicaStore {
     }
 }
 
+/// One replica copy of another node's extent group, as the directory shows it.
+#[derive(Debug, Clone)]
+pub struct ReplicaGroup {
+    pub id: String,
+    pub size: u64,
+    /// Time since the file was last written.
+    pub age: Duration,
+}
+
+/// Whether a name is safe to turn into a path under `replica-egroups`. Group ids are
+/// `eg-<vdisk>-<hex>` and the like; anything with a separator, a leading dot or a `..` is
+/// not one, and a drop request is the one place a peer's text becomes a file name.
+pub fn valid_group_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && !id.starts_with('.')
+        && !id.contains("..")
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
 /// What can answer guest I/O for a vdisk this node owns.
 ///
 /// A trait so the peer listener does not have to know about the daemon's attach table:
@@ -527,6 +632,13 @@ pub trait Owned: Send + Sync {
     fn owned_read(&self, vdisk: &str, offset: u64, len: u32) -> Option<Result<Vec<u8>>>;
     /// Write to a vdisk this node owns, or None if it does not own it.
     fn owned_write(&self, vdisk: &str, offset: u64, data: &[u8]) -> Option<Result<()>>;
+    /// Answer an `OP_EGROUP_DROP`: `from` declares these groups dead and asks this node to
+    /// drop its replica copies. Returns the verdict document, or `None` if this thing cannot
+    /// check Hydra, in which case the transport refuses and the copies stay. The default is
+    /// `None` because a transport with no way to verify must not drop on its own say-so.
+    fn drop_replica_groups(&self, _from: &str, _ids: &[String]) -> Option<Result<serde_json::Value>> {
+        None
+    }
 }
 
 /// Answer one request against the local replica store.
@@ -619,6 +731,28 @@ pub fn serve_with_owner(store: &ReplicaStore, owner: &dyn Owned, req: &Request) 
             }
             None => Response::err(ST_NOT_FOUND, 0),
         },
+        OP_EGROUP_DROP => {
+            if req.data.len() > MAX_DROP_IDS * 256 {
+                return Response::err(ST_REFUSED, 0);
+            }
+            let ids: Vec<String> = String::from_utf8_lossy(&req.data)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            if ids.len() > MAX_DROP_IDS || req.vdisk.is_empty() {
+                return Response::err(ST_REFUSED, 0);
+            }
+            match owner.drop_replica_groups(&req.vdisk, &ids) {
+                Some(Ok(doc)) => Response::ok(doc.to_string().into_bytes()),
+                Some(Err(e)) => {
+                    eprintln!("sidon: replica drop for {}: {e}", req.vdisk);
+                    Response::err(ST_IO, 0)
+                }
+                // Nothing here can check Hydra: refuse, and the copies stay.
+                None => Response::err(ST_REFUSED, 0),
+            }
+        }
         _ => serve_request(store, req),
     }
 }
@@ -824,6 +958,29 @@ impl PeerClient {
         match &self.tls {
             Some(m) => m.connect(tls::server_name_for(&self.addr)?, sock),
             None => Ok(Box::new(sock)),
+        }
+    }
+
+    /// Ask this peer to drop its replica copies of `ids`, which `from` (this node) has
+    /// declared dead. `Ok(None)` is a peer that does not know the opcode -- an older build --
+    /// and means "nothing was dropped, and nothing will be until it is upgraded".
+    pub fn drop_groups(&self, from: &str, ids: &[String]) -> Result<Option<serde_json::Value>> {
+        let resp = self.call(&Request {
+            opcode: OP_EGROUP_DROP,
+            vdisk: from.to_string(),
+            epoch: 0,
+            seq: 0,
+            offset: 0,
+            flags: 0,
+            data: ids.join("\n").into_bytes(),
+        })?;
+        match resp.status {
+            ST_OK => serde_json::from_slice(&resp.data)
+                .map(Some)
+                .map_err(|e| Error::io(format!("peer {} sent an unreadable drop answer: {e}", self.node))),
+            // An old build, or a transport that could not verify: either way the copies stay.
+            ST_REFUSED => Ok(None),
+            other => Err(Error::io(format!("peer {} answered a drop with status {other}", self.node))),
         }
     }
 
@@ -1210,6 +1367,116 @@ mod tests {
         });
         assert!(resp.is_ok());
         assert_eq!(store.read_tail("vd").unwrap(), rec);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn drop_request(from: &str, ids: &[&str]) -> Request {
+        Request {
+            opcode: OP_EGROUP_DROP,
+            vdisk: from.to_string(),
+            epoch: 0,
+            seq: 0,
+            offset: 0,
+            flags: 0,
+            data: ids.join("\n").into_bytes(),
+        }
+    }
+
+    struct NoVdisks;
+    impl Owned for NoVdisks {
+        fn owned_read(&self, _v: &str, _o: u64, _l: u32) -> Option<Result<Vec<u8>>> { None }
+        fn owned_write(&self, _v: &str, _o: u64, _d: &[u8]) -> Option<Result<()>> { None }
+    }
+
+    /// An owner that can check Hydra, and says every group is dead.
+    struct Verifier;
+    impl Owned for Verifier {
+        fn owned_read(&self, _v: &str, _o: u64, _l: u32) -> Option<Result<Vec<u8>>> { None }
+        fn owned_write(&self, _v: &str, _o: u64, _d: &[u8]) -> Option<Result<()>> { None }
+        fn drop_replica_groups(&self, from: &str, ids: &[String]) -> Option<Result<serde_json::Value>> {
+            let rows: Vec<serde_json::Value> = ids
+                .iter()
+                .map(|i| serde_json::json!({"id": i, "outcome": "refused", "reason": format!("asked by {from}")}))
+                .collect();
+            Some(Ok(serde_json::json!({ "results": rows })))
+        }
+    }
+
+    /// An older replica does not know the opcode: it refuses with an empty body and keeps its
+    /// copy. The old dispatch is `serve_request`, which has no arm for it.
+    #[test]
+    fn a_replica_from_before_the_drop_opcode_refuses_it_and_keeps_its_copy() {
+        let dir = tmpdir("drop-old");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.put_egroup("eg-a", 0, b"precious").unwrap();
+        let resp = serve_request(&store, &drop_request("n1", &["eg-a"]));
+        assert_eq!(resp.status, ST_REFUSED);
+        assert!(resp.data.is_empty());
+        assert_eq!(store.get_egroup("eg-a", 0, 8).unwrap(), b"precious");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A transport with nothing to verify against does not drop on the sender's word.
+    #[test]
+    fn a_node_that_cannot_check_hydra_refuses_a_drop() {
+        let dir = tmpdir("drop-unverified");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.put_egroup("eg-a", 0, b"precious").unwrap();
+        let resp = serve_with_owner(&store, &NoVdisks, &drop_request("n1", &["eg-a"]));
+        assert_eq!(resp.status, ST_REFUSED);
+        assert!(store.has_egroup("eg-a"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_drop_names_a_bounded_number_of_groups_and_a_sender() {
+        let dir = tmpdir("drop-bounds");
+        let store = ReplicaStore::new(&dir).unwrap();
+        let many: Vec<String> = (0..MAX_DROP_IDS + 1).map(|i| format!("eg-{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(serve_with_owner(&store, &Verifier, &drop_request("n1", &refs)).status, ST_REFUSED);
+        assert_eq!(serve_with_owner(&store, &Verifier, &drop_request("", &["eg-a"])).status, ST_REFUSED);
+        let ok = serve_with_owner(&store, &Verifier, &drop_request("n1", &refs[..MAX_DROP_IDS]));
+        assert_eq!(ok.status, ST_OK);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Over a real socket: a replica that answers, and one that does not know the opcode.
+    #[test]
+    fn the_client_tells_an_answer_from_an_older_build() {
+        let dir = tmpdir("drop-client");
+        let store = Arc::new(ReplicaStore::new(&dir).unwrap());
+        let new_store = Arc::clone(&store);
+        let new_build = spawn_test_server(Arc::new(move |req| serve_with_owner(&new_store, &Verifier, req)));
+        let old_store = Arc::clone(&store);
+        let old_build = spawn_test_server(Arc::new(move |req| serve_request(&old_store, req)));
+
+        let ids = vec!["eg-a".to_string(), "eg-b".to_string()];
+        let new = PeerClient::with_attempts("new", &new_build, Duration::from_secs(5), 1);
+        let answer = new.drop_groups("n1", &ids).unwrap().expect("a new replica answers");
+        assert_eq!(answer["results"].as_array().unwrap().len(), 2);
+        assert!(answer["results"][0]["reason"].as_str().unwrap().contains("asked by n1"));
+
+        let old = PeerClient::with_attempts("old", &old_build, Duration::from_secs(5), 1);
+        assert!(old.drop_groups("n1", &ids).unwrap().is_none(), "an older replica reads as 'unsupported'");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_replica_copy_is_idempotent_and_checks_the_name() {
+        let dir = tmpdir("remove-egroup");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.put_egroup("eg-a", 0, b"twelve bytes").unwrap();
+        assert!(store.has_egroup("eg-a"));
+        assert_eq!(store.list_egroups().unwrap().len(), 1);
+        assert_eq!(store.remove_egroup("eg-a").unwrap(), Some(12));
+        assert_eq!(store.remove_egroup("eg-a").unwrap(), None, "a second removal finds it done");
+        assert!(store.list_egroups().unwrap().is_empty());
+        for bad in ["", "../x", "a/b", ".h", "x..y", "a b"] {
+            assert!(store.remove_egroup(bad).is_err(), "{bad:?}");
+            assert!(!valid_group_id(bad), "{bad:?}");
+        }
+        assert!(valid_group_id("eg-0f3a9c11-1b2c-4d5e-8f90-aabbccddeeff-1a2b3c"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

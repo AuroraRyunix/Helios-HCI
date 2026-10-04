@@ -420,12 +420,36 @@ Each benchmark leaves its extent groups for Purah, so on a node with `SIDON_PURA
 (the test cluster) repeated runs accumulate garbage until a sweep is run.
 
 ```bash
+valcli storage.sweep                  # reclaim unreferenced extent groups on every node; says what waits
+valcli storage.scrub                  # re-hash sealed groups against their seal hash; exits 1 on damage
 valcli storage.placement [N]          # which disk of each node holds which extent groups
 valcli storage.tier [--apply]         # plan, or with --apply make, disk-to-disk moves
 valcli storage.move <egroup> <disk> <node>
 valcli storage.compact [--apply]       # plan, or with --apply compact sparse sealed groups
 valcli storage.dedup.estimate          # read-only: bytes dedup would share beyond clones
 ```
+
+`storage.sweep` runs one mark-sweep pass on every node and reports, per node, how many groups were
+candidates, how many were reclaimed and how many bytes that freed, how many are *awaiting a second scan*, and
+what kept others (open, held by an attached vdisk, too young). A group is removed only after two scans, at
+least the grace period apart (`SIDON_PURAH_GRACE`, 600 s), have found nothing pointing at it (I-7), so the first
+run after a delete typically reclaims nothing and says how many groups are waiting; the same pass runs on
+sidon's own timer, so the command brings the second scan forward and does not shorten the rule.
+`storage.cleanup_orphaned`, which the daily Dagur job runs, is the same command under its older name.
+With replicas the report has one more part. When the sweep reclaims a group it asks every peer to drop
+its copy (D-33); the output names, per peer, how many copies were dropped and how many bytes that freed,
+how many were already gone, how many were refused and why, and whether a peer runs a sidon older than the
+request (it keeps its copy until it is upgraded). Each node also scans the copies it holds for *other*
+nodes' groups and drops those Hydra no longer lists, under the same two-scan rule; the report line for that
+shows how many it scanned, dropped, and is still waiting on. A replica never drops a copy of a group Hydra
+lists as live, whoever asks.
+Groups still marked `open` are no longer skipped for being open. An open group is a drain's append
+target only while a vdisk attached on that node holds it; a crash, a detach or a failover leaves the
+row `open` with nobody writing it, and such a group is now reclaimed like any other once it is older
+than `SIDON_PURAH_OPEN_ABANDON` (3600 s by default, never less than twice the grace) and the two scans
+have seen it unreferenced and unheld. The report counts those separately (`reclaimed_abandoned_open`),
+and `left alone: N open` is the open groups that are not yet old enough or are held.
+`storage.scrub` is the sibling for damage: it re-hashes each sealed group and names any that no longer match.
 
 `storage.list` also prints one row per extent-store disk: its identity, the directory it is
 mounted at, the device the kernel says backs it, its class, and how full it is. The identity
@@ -440,8 +464,10 @@ is exercised there. Neither is a performance result.
 rewrote what they held, copies the live extents into a new group, verifies and replicates it, repoints
 the map by compare-and-swap, and leaves the old groups to the sweep. It plans unless `--apply`, is
 bounded by groups, bytes, rate and time, and never runs on a timer. It leaves alone any group a writable
-vdisk not attached on that node still points into, and it does not free a replica's copy of the old
-group (nothing does yet), so the plan prints what it would add on replicas beside what it would free.
+vdisk not attached on that node still points into. The old groups are freed by the sweep, here and (D-33)
+on every replica, so at ftt>=1 compaction does give space back on the replicas once the sweep has run twice;
+the plan prints, per batch, what it adds on the replicas now, what they get back after the sweep, and the
+net. A replica still running a build from before D-33 keeps its copy and is named by `storage.sweep`.
 `storage.dedup.estimate` hashes a sample of sealed extents and reports, per container, what dedup would
 share beyond what clones and snapshots already share; it writes nothing. Both are described in
 [dfs/compaction.md](./dfs/compaction.md).

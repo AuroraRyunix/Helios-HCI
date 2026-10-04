@@ -741,12 +741,19 @@ the cost is space.
 convergence is structural (a new group is all live; a half-moved group is a smaller candidate).
 Ids `0018`/`0019`/`0024`/`0026`-`0029`/`0033`/`0034` are untouched and `0035` is not taken.
 
-*The cost it does not remove.* A replica's copy of a group sits in its replica store and nothing
-in Sidon removes one, whether the group was swept, compacted or deleted. Compaction adds the live
-extents to each replica and frees nothing there, so at ftt>=1 it moves space from the creator to
-its replicas until a replica-side reclaim exists (an opcode, sent by the node that swept a group,
-to drop that group). **Not built**, and not hidden: the plan prints the growth beside the saving.
-Pre-existing, found while reading, and the reason this is opt-in rather than a default.
+*The cost it did not remove, and D-33 did.* A replica's copy of a group sat in its replica store
+and nothing in Sidon removed one, whether the group was swept, compacted or deleted. Compaction
+adds the live extents to each replica, so at ftt>=1 it moved space from the creator to its
+replicas. **Resolved by D-33:** the sweep now asks every peer to drop its copy of a group it
+reclaims, each replica re-checking Hydra and the map itself, and each node scans for orphaned
+replica copies besides. Compaction's old groups are swept like any other, so at ftt>=1 the replicas
+get the old group's space back after the sweep's two scans, by the amount the plan prints
+(`freed_on_replicas_after_sweep`); a Rust test runs compact, sweep, sweep and lists the replica's
+directory. It holds for replicas that run the D-33 build: an older replica refuses the request
+and keeps its copy (safe, and reported), and a replica that was down is cleaned by its own scan.
+The plan still prints the growth beside the saving, because until the sweep has run twice the
+replicas hold both groups. This no longer argues against `--apply` at ftt>=1; it stays opt-in for
+D-22's reason.
 
 *Opt-in.* `storage.compact` plans unless `--apply`; a pass is bounded by groups, bytes, rate and
 wall clock and says which bound it hit; nothing runs it on a timer, D-22's reason unchanged.
@@ -763,3 +770,92 @@ its time budget is still a uniform sample and says what it covered; a sample und
 that exists twice and is fair for content that exists many times, which is the content that could
 clear D-23's 10-15% bar. Duplicates that straddle two nodes are found by merging short digests
 across nodes in `valcli`; one node alone cannot see them.
+
+**D-33 — a replica drops a copy only when Hydra says the group is dead; the sweep asks, and a
+scan finds what nobody asked about.** The sweep (I-7) freed a group on the node that created it
+and nowhere else. Every other copy sits in `replica-egroups/` on the nodes that replicate the
+group, nothing told them the group was gone, and nothing on them looked: on the test cluster, one
+node still held 12.7 GiB of replica copies for groups the owner had long since swept. The cost was
+real (half the raw space at RF 2 never came back) and it is why D-32 could not recommend
+compaction at ftt>=1.
+
+*Taken: two mechanisms, one rule.* (1) **The request.** When a sweep reclaims groups it asks
+every peer, once per pass and with every group in one frame, to drop its copy (`OP_EGROUP_DROP`,
+opcode 11). It asks *after* the row says `dead` and the owner's own copy is gone, and *before* the
+row is deleted, because that row is what the replica checks; a stop after any step is finished by
+the next sweep (`purah/reclaim.rs` header). (2) **The scan.** Each node's sweep also scans its own
+`replica-egroups/` for copies whose group Hydra has no row for, or a `dead` row, and drops them
+under the sweep's own rule: unreferenced, last written longer ago than the grace, and seen so on
+two scans a grace apart. The scan is the backstop for everything the request cannot do: a replica
+that was down when the owner swept, an owner that crashed between marking a group dead and asking,
+an owner that predates the opcode, and the orphans already on disk before any of this existed.
+Neither mechanism trusts the other and neither depends on it.
+
+*What a replica checks, and why it is not an epoch.* A replica never takes the sender's word. For
+each group it requires, from Hydra, that the row exists, says `dead`, and **names the sender as the
+node that created it**; and then it reads the block map and the extent id map itself and refuses
+any group something still points into (`referenced`, which the sender treats as an alarm: it keeps
+the row `dead` as evidence and reports an anomaly, because a replica that kept the last copy of a
+referenced group has saved it). A missing row, an `open` or `sealed` row, a different sender, a
+name that is not a group id, and any failed read of Hydra are all refusals or errors that drop
+nothing: silence is not permission. The request asked for an epoch fence; there is no epoch to
+use. A group is not owned by a vdisk (clones and snapshots share one), so the epoch of whichever
+vdisk wrote it would fence the wrong object. What a deposed or stale sender cannot do is make
+Hydra say `dead`: that is a lightweight transaction conditional on the state it leaves, which a
+node that cannot reach a quorum cannot perform, and it cannot make the block map stop pointing at
+a group. The authority is therefore Hydra's row, re-read by the replica, plus the replica's own
+look at the references -- two independent reads instead of one sender's claim.
+
+*Rejected.* **The replica trusts the request** (a sender that marked a group dead wrongly -- a
+drain committed a reference after its scans, the very race I-7 exists for -- would take the last
+copy with it, because the owner has already deleted its own). **The owner asks only the replicas
+of the vdisk that wrote the group** (the vdisk may be deleted, its replica set changes over time,
+and a group outlives both; a peer that holds nothing answers in one directory lookup, so the owner
+asks everyone). **The owner keeps the row until every replica has acknowledged** (it couples a
+row's life to every peer being up, and an older replica never acknowledges, so it would leak rows
+for ever; the scan makes the acknowledgement unnecessary). **A tombstone table** (a second table to
+keep in step with the first, a migration, and nothing the `dead` row does not already say).
+**Dropping on the replica's own scan alone** (correct, and two grace periods slower; kept as the
+backstop, not the mechanism).
+
+*Rolling upgrade.* The opcode is new, so an older replica answers "unknown opcode" with an empty
+body and keeps its copy: space is not freed on it until it is upgraded, and nothing is lost. The
+sender tells that from an answer (a new replica always answers `ST_OK` with a verdict per group,
+even to refuse) and reports the peer as `unsupported` in `valcli storage.sweep`. An older *owner*
+never asks; a new replica's own scan finds the copy after two scans past the grace. So any mix of
+versions is safe, and a cluster that is fully upgraded drops its existing orphans on the first two
+sweeps past the grace without anyone running anything.
+
+*What it does not do.* A copy of a **live** group that its replica set no longer includes (a heal
+replaced this node and the old copy was never removed) is left alone: Hydra says the group is live,
+and whether this node should hold it is a question about the vdisk's replica set that this pass
+does not ask (I-6 territory). The operator-visible number is `live` in the scan report.
+
+*Open groups nothing holds (D-33, second part).* `open` means one thing: the append target of the
+vdisk instance that created the group, in memory, on the node that created it (`Vdisk::open_eg`, or
+the drain's own copy while a drain runs). Nothing adopts an open group -- a restarted daemon, a
+detached vdisk or a failover starts a new group -- so a row stays `open` with nobody writing it
+exactly when its writer is gone, and the sweep, which skipped every open group, never reclaimed any:
+18 of them on one lab node after all its vdisks were deleted. The skip protected nothing the `held`
+check did not already protect (a vdisk's `held_egroups` names its open group and every group a
+running drain made, and the sweep checks `held` for every group whatever its state), so it is
+removed. **Taken:** an open group is judged like any other -- unreferenced through both map levels,
+not held, not young, seen so on two scans a grace apart, and the compare-and-swap to `dead` is
+conditional on `open`, so a drain that seals it mid-pass wins -- and in addition it must be older
+than `SIDON_PURAH_OPEN_ABANDON` (an hour; never less than twice the grace). The age is the third
+guard and not the first: it covers the one window `held` cannot (a group created between the moment
+the attached set was read and the moment the map was), and the attached set is now read under the
+curator's lock, immediately before the scan, instead of before queueing for it. An unknown age
+(`created_at_ms` unset) is never abandoned. **Rejected:** *asking each node whether a drain is
+running for the vdisk* (an open group is only ever written by the node that created it, so only that
+node can be asked, and that node is the sweep); *sealing abandoned groups instead of deleting them*
+(an unreferenced group has no reason to exist, and sealing needs a hash of bytes nobody has
+verified); *shortening or removing the age bound* (a free guard, and the only one that does not
+depend on the attached set being read at the right moment). **Proof that a running drain's group is
+safe:** `purah/reclaim/tests.rs` runs random histories of held sets, references and ages and checks
+that nothing held or referenced is ever reclaimed and nothing is reclaimed on first sight, and
+`vdisk.rs` runs a real vdisk with a drain parked at its commit and sweeps against its live
+`held_egroups` past the bound and the grace, many times, before showing the same group go once the
+vdisk is gone. **Not addressed:** an open group that rows *do* reference (its vdisk detached after
+committing extents into it) stays open for ever and so is never scrubbed or compacted, which both
+require a sealed group; sealing such a group needs the vdisk's drain excluded and is its own change.

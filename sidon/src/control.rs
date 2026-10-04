@@ -32,6 +32,8 @@ use crate::nbd::{self, Export, LocalVdisk};
 use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
 use crate::extent::vdisk_hash;
 use crate::vdisk::field_u64;
+use crate::purah::reclaim::{PeerAnswer, ReplicaPeers};
+use crate::purah::replica::{verdicts_from_json, verdicts_to_json, ReplicaReaper};
 use crate::purah::Purah;
 use crate::vdisk::{Vdisk, VdiskConfig};
 
@@ -46,6 +48,8 @@ pub struct DaemonConfig {
     pub daruk_timeout: Duration,
     pub purah_interval: Duration,
     pub purah_grace: Duration,
+    /// How old an `open` extent group must be before the sweep may call it abandoned.
+    pub purah_open_abandon: Duration,
     pub peer_bind: String,
     pub peers: Vec<(String, String)>,
     pub peer_timeout: Duration,
@@ -90,6 +94,9 @@ pub struct Daemon {
     fence_peers: HashMap<String, Arc<PeerClient>>,
     /// What this node stores on behalf of vdisks it does not own.
     replica_store: Arc<ReplicaStore>,
+    /// Reclaims those copies once their group is dead (D-33): answers an owner's drop request
+    /// and scans for copies whose group Hydra no longer knows.
+    reaper: ReplicaReaper,
     /// Where every attached vdisk tallies its extent-group accesses, and where the flusher
     /// thread and the ranking pass read them from. One per node: an extent group is shared
     /// between a parent and every snapshot of it, so its temperature is the sum of what
@@ -178,7 +185,8 @@ impl Daemon {
             // than letting an operator who asked for no grace have none.
             cfg.purah_grace,
             Arc::clone(&access),
-        );
+        )
+        .with_open_abandon(cfg.purah_open_abandon);
         // Shares the tally, so the reads this node serves to another node's vdisk count.
         let replica_store =
             Arc::new(ReplicaStore::new(&volume)?.with_access(Arc::clone(&access)));
@@ -194,6 +202,7 @@ impl Daemon {
                 Arc::new(PeerClient::with_attempts(node, addr, cfg.fence_timeout, 1)),
             );
         }
+        let cfg_grace = cfg.purah_grace;
         Ok(Arc::new(Daemon {
             cfg,
             attached: Mutex::new(HashMap::new()),
@@ -201,6 +210,7 @@ impl Daemon {
             peers,
             fence_peers,
             replica_store,
+            reaper: ReplicaReaper::new(cfg_grace),
             access,
         }))
     }
@@ -1466,10 +1476,30 @@ impl Daemon {
         // lives across sweeps, so it is held by the daemon rather than rebuilt per call.
         // Two consecutive observations is the rule; a fresh Purah each time would reset
         // that and could reclaim on first sight.
-        let held = self.held_egroups();
-        let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
-        let report = purah.sweep(&held, now_ms())?;
-        Ok(report.to_json())
+        let mut report = {
+            let mut purah = self.purah_state.lock().expect("purah mutex poisoned");
+            // Taken under the curator's lock, not before it: a sweep can queue behind a
+            // compaction for most of a minute, and what is attached is only worth knowing
+            // as of the moment the scan reads the map. (The lock order, purah then attached,
+            // is the one compaction already takes.)
+            let held = self.held_egroups();
+            purah.sweep(&held, now_ms(), &DaemonPeers(self))?.to_json()
+        };
+        // The copies this node holds for other nodes' groups. After the sweep and outside the
+        // curator's lock: it reads Hydra and this node's replica directory and touches nothing
+        // Purah owns. A failure is part of the answer and not a failure of the sweep.
+        report["replica_orphans"] = match self.reaper.scan(
+            &self.daruk(),
+            &self.replica_store,
+            std::time::Instant::now(),
+        ) {
+            Ok(r) => r.to_json(),
+            Err(e) => {
+                eprintln!("purah: replica orphan scan failed: {e}");
+                json!({"error": e.to_string()})
+            }
+        };
+        Ok(report)
     }
 
     fn op_purah_scrub(&self) -> Result<Value> {
@@ -1701,6 +1731,13 @@ impl Daemon {
                         println!("purah: reclaimed {reclaimed} extent group(s), {} bytes",
                                  r.get("bytes_reclaimed").and_then(Value::as_u64).unwrap_or(0));
                     }
+                    let orphans = r.pointer("/replica_orphans/dropped")
+                        .and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                    if orphans > 0 {
+                        println!("purah: dropped {orphans} orphaned replica copy(ies), {} bytes",
+                                 r.pointer("/replica_orphans/bytes_dropped")
+                                     .and_then(Value::as_u64).unwrap_or(0));
+                    }
                 }
                 // Hydra being unreachable is not a reason to stop curating forever; the
                 // next tick tries again. Reclamation is allowed to be late.
@@ -1725,6 +1762,36 @@ impl Daemon {
                 Err(e) => eprintln!("purah: scrub failed: {e}"),
             }
         });
+    }
+}
+
+/// The peers as the sweep sees them: who to ask to drop a replica copy.
+struct DaemonPeers<'a>(&'a Daemon);
+
+impl ReplicaPeers for DaemonPeers<'_> {
+    fn nodes(&self) -> Vec<String> {
+        let mut nodes: Vec<String> = self.0.cfg.peers.iter().map(|(n, _)| n.clone()).collect();
+        nodes.sort();
+        nodes
+    }
+
+    fn drop_groups(&self, node: &str, from: &str, ids: &[String]) -> Result<PeerAnswer> {
+        let addr = self
+            .0
+            .cfg
+            .peers
+            .iter()
+            .find(|(n, _)| n == node)
+            .map(|(_, a)| a.clone())
+            .ok_or_else(|| Error::refused(format!("this daemon has no address for {node}")))?;
+        // A client of its own, one attempt: this runs under the curator's lock, so a peer that
+        // is down must cost one timeout and not two, and the shared clients' retry is for
+        // bulk replication, where a peer that restarted between two appends is the common case.
+        let client = PeerClient::with_attempts(node, &addr, self.0.cfg.peer_timeout, 1);
+        match client.drop_groups(from, ids)? {
+            None => Ok(PeerAnswer::Unsupported),
+            Some(doc) => Ok(PeerAnswer::Verdicts(verdicts_from_json(&doc)?)),
+        }
     }
 }
 
@@ -1860,6 +1927,14 @@ impl Owned for Daemon {
             map.get(vdisk).and_then(|a| a.vdisk.clone())?
         };
         Some(crate::vdisk::write_through(&handle, offset, data))
+    }
+
+    fn drop_replica_groups(&self, from: &str, ids: &[String]) -> Option<Result<Value>> {
+        Some(
+            self.reaper
+                .drop_declared_dead(&self.daruk(), &self.replica_store, from, ids)
+                .map(|verdicts| verdicts_to_json(&verdicts)),
+        )
     }
 }
 

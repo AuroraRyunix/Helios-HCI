@@ -138,6 +138,30 @@ Purah's sweep rule implements I-7 directly: an egroup is reclaimable only if
 unreferenced by every map generation in **two consecutive scans** separated by more than
 the maximum drain duration. Slow reclaim, immune to the scan/drain race by construction.
 
+Operating it: `valcli storage.sweep` runs the pass on every node and reports per node the
+candidates, the groups reclaimed and the bytes freed, the groups *awaiting a second scan*, and
+what the sweep left alone (open, held by an attached vdisk, too young). Because of the two-scan
+rule the first run after a delete reclaims nothing and says how many groups are waiting; sidon
+repeats the pass on its own timer (`SIDON_PURAH_INTERVAL`, 300 s by default), and the command
+only brings the second scan forward. `valcli storage.scrub` is the damage check.
+
+**Replica copies (D-33).** The sweep frees a group on the node that created it, and then asks
+every peer to drop its replica copy, after Hydra says `dead` and before the row is deleted. A
+replica does not take the request on trust: it re-reads the group's row (must be `dead`, created by
+the asking node) and the block map and extent id map (must not point into it) and drops only what
+that proves. Each node's sweep also scans its own replica directory for copies whose group Hydra no
+longer lists and drops them after two scans a grace apart, which covers a replica that was down, an
+owner that crashed, an older owner, and every orphan left before this existed. An older replica
+refuses the new opcode and keeps its copy, which is safe.
+
+**Open groups.** A group is `open` while it is a drain's append target: recorded in Hydra before
+the first byte, sealed when full. Only the vdisk that created it, on the node that created it,
+writes it, and a vdisk attached on that node names it (and every group a running drain made) in the
+set the sweep protects. A group left open by a crash, a detach or a failover has no writer and used
+to be skipped for ever; it is now reclaimed under the same rule as any other, once it is also older
+than an hour (`SIDON_PURAH_OPEN_ABANDON`). D-33 has the argument that a running drain's group is never
+taken.
+
 ### Compaction: reclaiming inside a group
 
 Mark-sweep frees a *group*. A group three extents dead and one alive is never freed, and
@@ -148,8 +172,10 @@ every footer, replicates it, repoints each row by compare-and-swap, and leaves t
 for the sweep's two-scan grace. It never deletes, so a stop at any step leaves a map that reads
 correctly (I-3); it rewrites a writable vdisk's rows only while that vdisk's drains are held, so
 the single-writer rule of the block map (I-4, [metadata.md](./metadata.md) section 3) is kept;
-and it is operator-invoked, bounded by groups, bytes, rate and time. It does not reclaim a
-replica's copy of the old group; nothing does yet.
+and it is operator-invoked, bounded by groups, bytes, rate and time. It frees nothing itself:
+the sweep frees the old group here and, since D-33, on every replica, so at ftt>=1 compaction
+returns space on the replicas too, after the sweep's two scans (the plan prints what each replica
+gets back beside what it is first given).
 
 ## 6. Numbers, and why these numbers
 

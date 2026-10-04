@@ -75,7 +75,9 @@ repairs, never one it forgets.
 **I-7 — GC safety.** Space is reclaimed only if unreferenced by *every* map generation —
 current and all snapshots — in two consecutive Purah scans separated by more than the
 maximum drain duration. The two-scan grace period is what makes mark-sweep immune to the
-race where a drain commits a reference between scan and sweep.
+race where a drain commits a reference between scan and sweep. The rule covers every copy of a
+group, not only the creator's: a replica drops its copy only when Hydra says the group is dead and
+the map does not point into it, or when the copy has been orphaned on two scans a grace apart (D-33).
 
 **I-8 — Isolation.** No read of vdisk A ever returns bytes written to vdisk B. Every
 journal record and every extent carries the vdisk UUID it belongs to, verified on read —
