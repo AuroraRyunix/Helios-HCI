@@ -784,5 +784,48 @@ class ValiClaimReleaseTests(LwtTestCase):
         self.assertEqual(SESSION.row(VMS, "web-01")["host_ip"], "10.0.0.9")
 
 
+class DarukServesRequestsConcurrently(unittest.TestCase):
+    """One slow query must not hold every other daemon's metadata call behind it."""
+
+    def test_a_blocked_request_does_not_block_the_next(self):
+        from http.server import BaseHTTPRequestHandler
+        gate = threading.Event()
+        finished = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path == "/slow":
+                    gate.wait(5)
+                finished.append(self.path)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+        server = daruk.DarukServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        slow = threading.Thread(target=lambda: urllib.request.urlopen(base + "/slow", timeout=10).read(),
+                                daemon=True)
+        slow.start()
+        try:
+            with urllib.request.urlopen(base + "/fast", timeout=3) as response:
+                self.assertEqual(response.read(), b"ok")
+            self.assertEqual(finished, ["/fast"], "the fast request waited for the slow one")
+        finally:
+            gate.set()
+            slow.join(5)
+
+    def test_run_uses_that_server(self):
+        with open(os.path.join(HERE, "daruk.py"), encoding="utf-8") as handle:
+            src = handle.read()
+        self.assertIn("DarukServer((\'127.0.0.1\', 9043)".replace("\\'", "'"), src)
+        self.assertNotIn(" HTTPServer((", src.replace("ThreadingHTTPServer", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,45 @@ class TheStatusPathTakesOnlyAUuid(unittest.TestCase):
         self.assertIn("task_id = %s;" % task, self.statements[0])
 
 
+class ASubmissionNamesAServiceThatHasAWorker(unittest.TestCase):
+    def setUp(self):
+        self.c = load()
+        self.statements = []
+        self.c.run_cql_query = lambda cql, *a, **k: self.statements.append(cql) or (0, "", "")
+        self.c.holds_dispatch = lambda: True
+
+        class Plain(self.c.CatalystAPIHandler):
+            def setup(self):
+                self.connection = self.request
+                self.rfile = self.connection.makefile("rb", self.rbufsize)
+                self.wfile = self.connection.makefile("wb", self.wbufsize)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Plain)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def submit(self, service):
+        request = urllib.request.Request(
+            self.base + "/api/v1/tasks/submit",
+            data=json.dumps({"service": service, "action": "execute", "payload": {}}).encode(),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_the_spark_queue_is_gone_and_a_submission_to_it_is_refused_unrecorded(self):
+        self.assertNotIn("spark", self.c.queues)
+        self.assertEqual(self.submit("spark"), 400)
+        self.assertEqual(self.statements, [], "a task nothing would run was recorded")
+
+    def test_a_service_with_a_worker_is_recorded(self):
+        self.assertEqual(self.submit("dagur"), 200)
+        self.assertTrue(self.statements)
+
+
 class AScheduledTaskIsQueuedOnlyWhereTheQueuesAre(unittest.TestCase):
     def setUp(self):
         self.c = load()

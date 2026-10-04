@@ -225,5 +225,88 @@ class ItIsWiredToTheNamesTheRestOfTheClusterUses(unittest.TestCase):
         self.assertNotRegex(provision, r"ExecStart=/usr/local/bin/rauru\.py")
 
 
+class TheProtectionDomainsAreRunByTheSameLoop(unittest.TestCase):
+    """`docs/dfs/protection_domains.md` listed "a timer that calls it" as not wired: an operator
+    could create a domain with an interval and nothing would ever take a set."""
+
+    def setUp(self):
+        self.said = []
+        self._saved = (rauru.run_snapshot_policy, rauru.run_domain_pass, rauru.rauru_protection,
+                       rauru.log)
+        rauru.log = self.said.append
+        rauru._PROTECTION_SKIP_SAID[0] = False
+        self.order = []
+
+    def tearDown(self):
+        (rauru.run_snapshot_policy, rauru.run_domain_pass, rauru.rauru_protection,
+         rauru.log) = self._saved
+
+    def patch(self, policy=None, domains=None):
+        def run_policy():
+            self.order.append("policy")
+            return policy() if policy else Summary()
+
+        def run_domains():
+            self.order.append("domains")
+            return domains() if domains else Summary()
+        rauru.run_snapshot_policy = run_policy
+        rauru.run_domain_pass = run_domains
+        rauru.rauru_protection = object()
+
+    def test_the_policy_runs_first_and_then_the_domains(self):
+        self.patch()
+        summary = rauru.run_everything()
+        self.assertEqual(self.order, ["policy", "domains"])
+        self.assertTrue(summary.ok)
+
+    def test_a_cluster_that_cannot_be_read_raises_before_any_domain_is_touched(self):
+        def unreadable():
+            raise RuntimeError("the tables are not there yet")
+        self.patch(policy=unreadable)
+        with self.assertRaises(RuntimeError):
+            rauru.run_everything()
+        self.assertEqual(self.order, ["policy"])
+
+    def test_a_domain_pass_that_raises_does_not_lose_the_policy_result(self):
+        def broken():
+            raise ValueError("boom")
+        self.patch(domains=broken)
+        summary = rauru.run_everything()
+        self.assertTrue(summary.ok)
+        self.assertTrue(any("protection-domain pass failed" in line for line in self.said))
+
+    def test_domain_failures_are_said_and_do_not_change_the_return(self):
+        self.patch(domains=lambda: Summary(ok=False))
+        self.assertTrue(rauru.run_everything().ok)
+        self.assertTrue(any("1 failure" in line for line in self.said))
+
+    def test_a_missing_module_skips_the_domains_and_says_so_once(self):
+        self.patch()
+        rauru.rauru_protection = None
+        rauru.run_everything()
+        rauru.run_everything()
+        self.assertEqual(self.order, ["policy", "policy"])
+        self.assertEqual(len([l for l in self.said if "cannot be imported" in l]), 1)
+
+    def test_the_daemon_loop_runs_both(self):
+        source = open(os.path.join(HERE, "rauru.py"), encoding="utf-8").read()
+        self.assertIn("Daemon(snapshots_election, hydra_ready, run_everything,", source)
+
+    def test_the_power_call_keeps_the_body_of_a_refusal(self):
+        import json
+        import urllib.error
+        import urllib.request
+        from unittest import mock
+
+        def refuse(request, context=None, timeout=None):
+            raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {},
+                                         io.BytesIO(json.dumps({"state": "running"}).encode()))
+        with mock.patch.object(urllib.request, "urlopen", refuse), \
+                mock.patch.object(rauru.ssl, "create_default_context") as ctx:
+            ctx.return_value = mock.Mock()
+            rc, body, err = rauru.vm_power_call("10.0.0.2", "web 01", "suspend")
+        self.assertEqual((rc, body), (0, {"state": "running"}))
+
+
 if __name__ == "__main__":
     unittest.main()

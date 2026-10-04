@@ -31,6 +31,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # Imported defensively so that `--check` can say which module is missing instead of dying with
@@ -56,6 +57,16 @@ try:
 except Exception as exc:    # pragma: no cover
     helios_snapshots = None
     IMPORT_ERRORS["helios_snapshots"] = str(exc)
+
+# Protection domains ride beside the snapshot policy, and an install that lacks the module still
+# runs the policy: it is reported once and the domain pass is skipped, not a reason to refuse to
+# start the job that has always worked.
+try:
+    import rauru_protection
+    PROTECTION_IMPORT_ERROR = None
+except Exception as exc:    # pragma: no cover
+    rauru_protection = None
+    PROTECTION_IMPORT_ERROR = str(exc)
 
 TASK_COMPONENT = "Rauru"
 
@@ -151,11 +162,74 @@ def hydra_ready():
     return True, ""
 
 
+def vm_power_call(host_ip, vm_name, action):
+    """One typed power call to the host a VM runs on: (rc, body, err).
+
+    A refusal is an HTTP 409 whose body carries the domain's state after the attempt, which is
+    what the barrier trusts, so the body is returned as it came (rc 0, as `valcli` does) and not
+    turned into a failure.
+    """
+    address, verify_identity = spark_endpoint(host_ip)
+    try:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+        context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+        context.check_hostname = verify_identity
+        request = urllib.request.Request(
+            "https://%s:9099/api/v1/vm/%s/power" % (address, urllib.parse.quote(vm_name, safe="")),
+            data=json.dumps({"action": action}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, context=context, timeout=120) as response:
+            return 0, json.loads(response.read().decode("utf-8")), ""
+    except urllib.error.HTTPError as exc:
+        try:
+            return 0, json.loads(exc.read().decode("utf-8")), ""
+        except Exception:
+            return -1, {}, str(exc)
+    except Exception as exc:
+        return -1, {}, str(exc)
+
+
 def run_snapshot_policy():
     """One pass of the policy. Returns the Summary; raises RuntimeError if the cluster cannot
     be read, which the loop treats as "not ready yet" and not as a fault."""
     env = helios_snapshots.Env(run_cql_query, dfs_call, say=log)
     return helios_snapshots.Runner(env, helios_schema).run()
+
+
+def run_domain_pass():
+    """One pass of the protection domains: resume anything a dead run left paused, take the sets
+    that are due, prune. A cluster with no enabled domain costs one table read and one line."""
+    env = rauru_protection.Env(run_cql_query, dfs_call, vm_power_call, say=log)
+    return rauru_protection.Runner(env, helios_schema).run()
+
+
+_PROTECTION_SKIP_SAID = [False]
+
+
+def run_everything():
+    """The per-vdisk policy, then the protection domains.
+
+    The domain pass is separate in failure: a domain that cannot be taken, or a module that is
+    missing, is reported and does not stop the policy's result being recorded, and a policy
+    that cannot read the cluster is raised as it always was (the loop treats it as "not ready
+    yet") before any domain is touched.
+    """
+    summary = run_snapshot_policy()
+    if rauru_protection is None:
+        if not _PROTECTION_SKIP_SAID[0]:
+            _PROTECTION_SKIP_SAID[0] = True
+            log("protection domains are not run: rauru_protection cannot be imported (%s)"
+                % PROTECTION_IMPORT_ERROR)
+        return summary
+    try:
+        domains = run_domain_pass()
+    except Exception as exc:
+        log("the protection-domain pass failed (%s); the snapshot policy result stands" % exc)
+        return summary
+    if not domains.ok:
+        log("the protection-domain pass reported %d failure(s); they are recorded as Rauru tasks"
+            % len(domains.failures))
+    return summary
 
 
 class Daemon(object):
@@ -280,7 +354,7 @@ def main(argv=None):
 
     log("snapshot and data-protection manager started on %s." % LOCAL_IP)
     snapshots_election = helios_zk.cluster_candidacy(helios_zk.SERVICE_RAURU_SNAPSHOTS, LOCAL_IP)
-    daemon = Daemon(snapshots_election, hydra_ready, run_snapshot_policy,
+    daemon = Daemon(snapshots_election, hydra_ready, run_everything,
                     helios_snapshots.RUN_INTERVAL_SECONDS)
     while True:
         time.sleep(daemon.step())

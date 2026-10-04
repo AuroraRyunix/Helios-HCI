@@ -9,7 +9,13 @@ counterpart is **Cerebro**, the snapshot, protection-domain and replication serv
 
 ## What it does today, and what it is meant to become
 
-**Today it does one thing:** it runs the snapshot policy. On its interval
+**Today it does two things:** it runs the snapshot policy, and after each pass it runs one pass of the
+[protection domains](./dfs/protection_domains.md) (the sets an operator has enabled; with none enabled, one table read
+and a line). The domain pass is separate in failure: a domain that cannot be taken is logged and recorded as a Rauru task
+and does not lose the policy's result, and an install without `rauru_protection.py` still runs the policy. **The domain
+pass has never run against a real cluster**, and its suspend-snapshot-resume barrier has never run against a real guest.
+
+The snapshot policy: On its interval
 (`helios_snapshots.RUN_INTERVAL_SECONDS`, one hour) it takes the snapshots the policy in
 `hydra.dfs_snapshot_policies` says are due and prunes the ones retention says are no longer kept,
 by calling `helios_snapshots.Runner.run()`. The policy, the retention rules and how a run never

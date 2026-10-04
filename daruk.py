@@ -1,7 +1,7 @@
 import sys
 import json
 import socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from cassandra.cluster import Cluster
 
 # Get local hypervisor IP dynamically using UDP socket method
@@ -938,8 +938,21 @@ class CQLProxyHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+class DarukServer(ThreadingHTTPServer):
+    """One thread per request.
+
+    Every daemon on the node goes through this port, and a plain HTTPServer answers one request
+    at a time: a slow query (a repair-time read, a wide scan) held every other daemon's metadata
+    call behind it, and Sidon's calls time out at 15 s. The driver's Session is safe to share
+    between threads, and nothing here keeps per-request state in the process. A compare-and-swap
+    is atomic in the database, not in this process, so concurrency changes none of their answers.
+    """
+    daemon_threads = True
+    request_queue_size = 128
+
+
 def run():
-    server = HTTPServer(('127.0.0.1', 9043), CQLProxyHandler)
+    server = DarukServer(('127.0.0.1', 9043), CQLProxyHandler)
     print("Daruk CQL HTTP Proxy listening on 127.0.0.1:9043...")
     server.serve_forever()
 

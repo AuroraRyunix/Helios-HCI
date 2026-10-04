@@ -227,6 +227,35 @@ async fn handle_connection(
     }
 }
 
+/// A token as it may appear in a log: enough to tell two connections apart, not enough to use.
+/// The token is the credential for a guest console, and the journal is readable by more people
+/// than are allowed to open one.
+fn redact(token: &str) -> String {
+    let head: String = token.chars().take(4).collect();
+    format!("{}... ({} characters)", head, token.chars().count())
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::redact;
+
+    #[test]
+    fn a_log_line_never_carries_the_whole_token() {
+        let token = "abcdefghijklmnopqrstuvwxyz012345";
+        let shown = redact(token);
+        assert!(shown.starts_with("abcd..."));
+        assert!(!shown.contains("efgh"));
+        assert!(shown.contains("32 characters"));
+    }
+
+    #[test]
+    fn a_short_token_and_a_multibyte_one_do_not_panic() {
+        assert_eq!(redact("ab"), "ab... (2 characters)");
+        assert_eq!(redact(""), "... (0 characters)");
+        assert_eq!(redact("ééééé"), "éééé... (5 characters)");
+    }
+}
+
 async fn run_proxy<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     token_mutex: Arc<std::sync::Mutex<String>>,
@@ -244,7 +273,7 @@ where
         return Err("Missing token parameter".into());
     }
 
-    println!("[Agahnim] Verifying token '{}' from client {}", token, client_addr);
+    println!("[Agahnim] Verifying token {} from client {}", redact(&token), client_addr);
 
     // Connect to Python token verifier
     let mut verifier_stream = TcpStream::connect("127.0.0.1:8089").await?;
@@ -323,6 +352,6 @@ where
         _ = vm_to_client => {},
     }
 
-    println!("[Agahnim] Tearing down connection for token '{}'", token);
+    println!("[Agahnim] Tearing down connection for token {}", redact(&token));
     Ok(())
 }

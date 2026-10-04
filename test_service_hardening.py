@@ -177,5 +177,21 @@ class TheClusterCliVerifiesTheDaemonItCalls(unittest.TestCase):
         self.assertEqual(opened, [])
 
 
+class AgahnimDoesNotLogTheConsoleToken(unittest.TestCase):
+    def test_every_log_line_that_names_the_token_redacts_it(self):
+        src = read("agahnim/src/main.rs")
+        for line in src.splitlines():
+            if "println!" in line and "token" in line.lower() and "{}" in line and "token" in line.split("println!")[1]:
+                if "Missing token" in line:
+                    continue
+                self.assertTrue("redact(" in line or "token" not in line.split('",', 1)[-1],
+                                "a log line prints a console token in the clear: " + line.strip())
+
+    def test_the_redaction_exists_and_is_tested(self):
+        src = read("agahnim/src/main.rs")
+        self.assertIn("fn redact(token: &str)", src)
+        self.assertIn("a_log_line_never_carries_the_whole_token", src)
+
+
 if __name__ == "__main__":
     unittest.main()

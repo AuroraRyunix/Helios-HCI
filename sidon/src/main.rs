@@ -1,16 +1,16 @@
 //! Sidon: the per-node data-path daemon.
 //!
-//! Two listening surfaces, and **neither of them is a TCP port**:
+//! Three surfaces:
 //!
 //! - a control socket at `/run/sidon/control.sock`, spoken by spark-daemon on this host.
 //!   Cluster-facing control therefore arrives over the existing mutual-TLS mesh on 9099
 //!   and is translated locally, so adding a storage tier adds no new authenticated
 //!   surface, no new certificate, and nothing new to firewall.
 //! - one NBD socket per attached vdisk, which qemu opens directly.
-//!
-//! A peer data port is reserved for replication (9105) and is not opened here: at ftt=0
-//! there is no peer to talk to, and a port that binds before it has a purpose is a port
-//! somebody has to explain.
+//! - the peer data port (9105), where replicas receive appends, fences and repairs from
+//!   the other nodes. It is mutual TLS against the cluster CA (`tls`), and it binds this
+//!   node's own address, or loopback when the node is not in the cluster document, so a
+//!   single-node cluster exposes nothing on the network.
 
 mod control;
 mod crc;
@@ -50,8 +50,6 @@ fn env_bytes(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// This node's name, matching what LINSTOR and the rest of the stack already use as a
-/// node identity so the map's `owner` column means the same thing everywhere.
 /// Parse "node=host:port,node=host:port" into pairs.
 ///
 /// A malformed entry is dropped with a warning rather than failing startup: a daemon that
@@ -173,6 +171,8 @@ fn peer_bind_address(me: &str, port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
+/// This node's name, matching the node identity the rest of the stack uses so the map's `owner`
+/// column means the same thing everywhere.
 fn node_name() -> String {
     if let Ok(n) = std::env::var("SIDON_NODE") {
         return n;

@@ -3,7 +3,8 @@ defmodule SpectrumPhx.Catalyst do
   The one place this tier hands a long operation to the cluster.
 
   Catalyst is a task queue whose queues are `queue.Queue` objects *inside the process on
-  the ZooKeeper leader*. `POST /api/v1/tasks/submit` does two separate things: it writes a
+  the node holding the `catalyst-dispatch` election* (`leader_ip/0`, which is not the
+  ZooKeeper ensemble's leader). `POST /api/v1/tasks/submit` does two separate things: it writes a
   row to `hydra.catalyst_tasks`, which is the record the console reads back, and it puts
   the task on the in-memory queue for the named service, which is the only thing that
   causes any work to happen. A console that wrote the row itself would produce a task that
@@ -47,8 +48,12 @@ defmodule SpectrumPhx.Catalyst do
 
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Spark
+  alias SpectrumPhx.Zk.State
 
   @port 9091
+
+  # The election whose winner holds the in-memory queues (helios_zk.SERVICE_CATALYST_DISPATCH).
+  @dispatch_election "catalyst-dispatch"
 
   # The queues that have a worker draining them on the leader. See the moduledoc.
   @services ~w(vali dagur lanayru)
@@ -176,19 +181,17 @@ defmodule SpectrumPhx.Catalyst do
   @doc """
   The node holding Catalyst's dispatch queue.
 
-  Catalyst runs on every node but only the ZooKeeper leader holds the queues (they are
-  in-process `queue.Queue` objects, not a table), so tasks must be submitted there and
-  nowhere else.
+  Catalyst runs on every node but only the holder of the `catalyst-dispatch` election has the
+  queues (they are in-process `queue.Queue` objects, not a table), so tasks are submitted there.
+  That is not the ZooKeeper ensemble's leader: the two are separate elections and sit on
+  different nodes whenever the lowest ballot is not the ensemble leader. The winner publishes
+  its address in its ballot, so this reads it, exactly as `vali.py`, `mipha.py` and the console
+  backend do.
 
-  TODO: leader resolution. `vali.py`'s `get_zookeeper_leader_ip/0` probes each node's
-  ZooKeeper four-letter `stat` for "mode: leader", then checks that the leader is actually
-  answering on 9091 and otherwise falls back to the lowest-numbered node that is.
-  `SpectrumPhx.Zk` has no equivalent yet -- `Zk.Client` and `Zk.State` cover the connection
-  and the cluster-state document, not leader election -- and that module is owned
-  elsewhere. This resolves the function at runtime rather than compile time so it wires
-  itself up when the capability lands; until then it submits to the local node, which is
-  correct only when this node happens to be the leader. Configure `:catalyst_ip` to pin it
-  in the meantime.
+  When the election cannot be read (nobody standing, ZooKeeper unreachable), the ensemble
+  leader from the published node documents is the second guess and this node the last. A
+  submission that reaches a Catalyst that does not hold the queues is not lost: it records the
+  row, and the holder's sweep replays it. Configure `:catalyst_ip` to pin the address.
   """
   @spec leader_ip() :: String.t()
   def leader_ip do
@@ -197,16 +200,7 @@ defmodule SpectrumPhx.Catalyst do
         ip
 
       _ ->
-        [Module.concat([:SpectrumPhx, :Zk]), Module.concat([:SpectrumPhx, :Zk, :State])]
-        |> Enum.find_value(fn module ->
-          if Code.ensure_loaded?(module) and function_exported?(module, :leader_ip, 0) do
-            case apply(module, :leader_ip, []) do
-              ip when is_binary(ip) and ip != "" -> ip
-              _ -> nil
-            end
-          end
-        end)
-        |> Kernel.||(Config.local_ip())
+        State.election_holder(@dispatch_election) || State.leader_ip() || Config.local_ip()
     end
   end
 

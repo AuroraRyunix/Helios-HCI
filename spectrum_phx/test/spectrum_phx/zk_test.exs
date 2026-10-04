@@ -773,4 +773,71 @@ defmodule SpectrumPhx.ZkTest do
     {path, _offset} = Client.decode_string(payload, 0)
     path
   end
+
+  describe "who holds an election" do
+    # A stand-in for the client process: Client.get/2 and get_children/2 are GenServer calls.
+    defmodule FakeZk do
+      use GenServer
+
+      def start_link(tree), do: GenServer.start_link(__MODULE__, tree)
+      @impl true
+      def init(tree), do: {:ok, tree}
+
+      @impl true
+      def handle_call({:get_children, path}, _from, tree) do
+        {:reply, Map.get(tree, {:children, path}, {:error, :no_node}), tree}
+      end
+
+      def handle_call({:get, path}, _from, tree) do
+        {:reply, Map.get(tree, {:data, path}, {:error, :no_node}), tree}
+      end
+    end
+
+    @parent "/helios/leaders/catalyst-dispatch"
+
+    defp zk(tree), do: start_supervised!(%{id: make_ref(), start: {FakeZk, :start_link, [tree]}})
+
+    test "the lowest ballot holds the service and its published address is the answer" do
+      client =
+        zk(%{
+          {:children, @parent} => {:ok, ["n_0000000011", "n_0000000007", "n_0000000009"]},
+          {:data, @parent <> "/n_0000000007"} => {:ok, "10.10.102.43\n"},
+          {:data, @parent <> "/n_0000000009"} => {:ok, "10.10.102.41"}
+        })
+
+      assert State.election_holder("catalyst-dispatch", client) == "10.10.102.43"
+    end
+
+    test "ballots are compared as numbers, not as text" do
+      assert State.lowest_ballot(["n_10", "n_9", "n_100"]) == "n_9"
+      assert State.lowest_ballot(["n_0000000010", "n_0000000009"]) == "n_0000000009"
+    end
+
+    test "nothing standing, an absent tree and an unreachable ensemble are all nil" do
+      assert State.election_holder("catalyst-dispatch", zk(%{{:children, @parent} => {:ok, []}})) ==
+               nil
+
+      assert State.election_holder("catalyst-dispatch", zk(%{})) == nil
+
+      assert State.election_holder(
+               "catalyst-dispatch",
+               zk(%{{:children, @parent} => {:error, :timeout}})
+             ) == nil
+    end
+
+    test "a ballot with no published address is not an address" do
+      client =
+        zk(%{
+          {:children, @parent} => {:ok, ["n_0000000001"]},
+          {:data, @parent <> "/n_0000000001"} => {:ok, "  "}
+        })
+
+      assert State.election_holder("catalyst-dispatch", client) == nil
+    end
+
+    test "names that are not ballots are ignored" do
+      assert State.lowest_ballot(["lock", "n_x", "n_0000000003"]) == "n_0000000003"
+      assert State.lowest_ballot(["lock"]) == nil
+    end
+  end
 end

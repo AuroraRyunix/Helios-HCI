@@ -1008,6 +1008,14 @@ single-threaded, one slow query holds every other client, including Sidon's 15 s
 
 ### 4.1 Low-risk fixes (safe to do with a test)
 
+> **Status, second pass (2026-10-04).** Done, each with a test that fails on the old code: 1, 2, 3, 4, 5, 6, 7, 8, 9 (the
+> scanner now covers `valcli`, `mimir`, `catalyst`, `lanayru`, `urbosa_bootstrap` and `rauru`; the unit-control call sites
+> moved to the typed endpoint; the remaining network commands are listed with reasons in `test_spark_shell_calls.py`),
+> 10 (except `catalyst.dispatch_ip`, kept because it is the published way to find the queue holder, and `hylia`'s
+> dead `return None`), 12, 13, 14. Item 11 (documentation) is partly done: `docs/rauru.md`, `docs/dfs/protection_domains.md`,
+> `docs/maintenance.md`, `docs/host_states.md`; `docs/logos.md`, `docs/vali.md`, `docs/spark_api.md` and `docs/service_leadership.md`
+> still need a read against the code.
+
 1. **Validate `task_id` in `GET /api/v1/tasks/status/<id>`** (`catalyst.py:446-479`). It is
    spliced into CQL as `task_id = {task_id}`. Reject anything that is not a UUID with 400.
    Test: a path with `; DROP` or a quote returns 400 and issues no query.
@@ -1047,6 +1055,19 @@ single-threaded, one slow query holds every other client, including Sidon's 15 s
     `withdraw()`), so the address does not wait out the 15 s session.
 
 ### 4.2 Risks and inconsistencies (need a decision)
+
+> **Status, second pass (2026-10-04).** *Fixed:* R-1 (earlier), R-2 (boot autostart and the watchdog now run the declared-table
+> reconcile pass, serialised with the ZooKeeper loop; the Mimir watchdog check follows), R-3 (the cluster CLI verifies the
+> daemon and no longer carries one machine's path; `HCI_CERT_DIR` relocates it), R-4 and 4.1(6) (a scheduler that is not the
+> dispatcher no longer queues), R-5, R-7, R-10 (the `spark` queue is gone and a submission naming a service with no queue is
+> refused unrecorded), R-13, R-15, R-17 (Rauru runs the protection-domain pass; **never run live**), R-18 (and every Phoenix
+> route is now checked against the ingress rule), R-19 (the console token is redacted in Agahnim's log; the loopback verifier
+> on 8089 is still unauthenticated), R-20 (Phoenix resolves the `catalyst-dispatch` election holder, not the ZooKeeper leader),
+> R-22 (Daruk serves one thread per request). *Left open, with reasons:* R-6 (low), R-8 and R-14 (scrub cadence is a decision),
+> R-9 (the unused cluster create/destroy endpoints are 300+ lines with their own service lists; removing them is a deletion
+> that deserves its own review), R-11, R-12 (`#[allow(dead_code)]` stays while the replication pieces are not called),
+> R-16 (the duplicate hourly health check is harmless, and the console's Health page reads the Dagur run record), R-21,
+> R-23, R-24, R-25.
 
 * **R-1 (high) Mipha's storage-epoch fence appears to call a path Spark does not serve.**
   **FIXED 2026-10-04** (the claim now goes through `run_lwt` to Daruk; `test_fencing.py` pins it). Original finding: `mipha.py:923` posts `/v1/dfs/claim` with `run_mtls_spark_api_full("127.0.0.1", ...)`, i.e.

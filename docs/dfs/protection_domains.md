@@ -9,7 +9,7 @@ one policy. It is the part of Nutanix's Cerebro that Helios had only as a per-vd
 | :-- | :-- |
 | Domains, membership, scheduled sets, retention of sets, restore of a set | **Built.** `rauru_protection.py`; tables `0030`-`0032`; `valcli storage.domain*`. |
 | A crash-consistent cut across a VM's disks, by suspending the guest | **Built and unit-tested against a fake. Never run against a real guest.** |
-| A timer that calls it | **Not wired.** The Rauru daemon is the caller; until it exists an operator (or a Dagur row) runs `valcli storage.domain.run`. |
+| A timer that calls it | **Wired, never run against a real cluster.** The Rauru daemon runs one domain pass after each snapshot-policy pass (`rauru.run_everything`); an enabled domain is the opt-in, and with none enabled the pass is one table read. A failure in the domain pass is logged and does not lose the policy's result. `valcli storage.domain.run` is the same pass by hand. |
 | Application-consistent sets | **Not possible without an agent in the guest. Out of scope.** |
 
 ## 1. Why a per-disk snapshot is not enough

@@ -113,6 +113,60 @@ defmodule SpectrumPhx.Zk.State do
     end
   end
 
+  @leaders_path "/helios/leaders"
+
+  # The ballot znodes are named `n_<counter>`, where ZooKeeper appends a zero-padded
+  # sequence number; the lowest counter holds the service.
+  @ballot_prefix "n_"
+
+  @doc """
+  The identity published by whoever currently holds the election for `service`, or `nil`.
+
+  Daemons stand for a service under `/helios/leaders/<service>` and the winner writes its own
+  address in its ballot, so this is a read of two znodes and not a guess. It is how a caller
+  finds the node holding Catalyst's in-memory queues (`"catalyst-dispatch"`): that is a
+  different election from ZooKeeper's own leadership, and the two are on different nodes
+  whenever the ensemble's leader is not also the lowest ballot.
+
+  `nil` means nobody is standing, the tree does not exist yet, or ZooKeeper could not be
+  asked; the caller decides what to do about each of those the same way.
+  """
+  @spec election_holder(String.t(), GenServer.server()) :: String.t() | nil
+  def election_holder(service, client \\ Client) when is_binary(service) do
+    parent = @leaders_path <> "/" <> service
+
+    with {:ok, children} <- Client.get_children(client, parent),
+         winner when is_binary(winner) <- lowest_ballot(children),
+         {:ok, identity} when is_binary(identity) <- Client.get(client, parent <> "/" <> winner),
+         ip when ip != "" <- String.trim(identity) do
+      ip
+    else
+      _ -> nil
+    end
+  end
+
+  @doc """
+  The ballot with the lowest counter, or `nil`. Compared as numbers: the zero padding is only
+  reliable until the counter rolls past ten digits.
+  """
+  @spec lowest_ballot([String.t()]) :: String.t() | nil
+  def lowest_ballot(children) do
+    children
+    |> Enum.flat_map(fn name ->
+      with true <- String.contains?(name, @ballot_prefix),
+           tail = name |> String.split(@ballot_prefix) |> List.last(),
+           {counter, ""} <- Integer.parse(tail) do
+        [{counter, name}]
+      else
+        _ -> []
+      end
+    end)
+    |> case do
+      [] -> nil
+      standing -> standing |> Enum.min() |> elem(1)
+    end
+  end
+
   @doc """
   Whether a node's document is older than #{@stale_after_seconds} seconds.
 

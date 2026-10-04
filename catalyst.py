@@ -276,16 +276,15 @@ def next_sequence_id(component):
 # One entry per worker that long-polls /api/v1/queues/<name> on the node holding the dispatch
 # candidacy. A name with no worker behind it is worse than a missing name: the
 # submission succeeds, a row is written, and the task sits `pending` forever, which reads
-# as "slow" rather than "nothing is going to happen". `spark` is exactly that today --
-# nothing drains it -- and it is left in place only because removing a queue is a change
-# to what a submission means, which belongs with whatever finally claims the name.
+# as "slow" rather than "nothing is going to happen". `spark` was exactly that -- nothing
+# drained it -- so it is gone, and a submission naming a service with no queue is refused at the
+# door instead of being recorded and failed by the sweep a pass later.
 #
 # `lanayru` is drained by the console backend rather than by a daemon of its own, because
 # `lanayru.py` is a module that tier imports and the deploy needs everything it imports.
 queues = {
     "vali": queue.Queue(),
     "dagur": queue.Queue(),
-    "spark": queue.Queue(),
     "lanayru": queue.Queue()
 }
 
@@ -570,6 +569,12 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
 
             if not service or not action:
                 self.send_json(400, {"error": "service and action fields required"})
+                return
+
+            if service not in queues:
+                self.send_json(400, {"error": "No queue named '%s' exists, so this task would never "
+                                              "run. Services with a worker: %s."
+                                              % (service, ", ".join(sorted(queues)))})
                 return
 
             task_id = str(uuid.uuid4())
