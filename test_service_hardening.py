@@ -543,7 +543,10 @@ class TheNvramBackupDeletesTheLocalCopyOnlyAfterItIsSaved(unittest.TestCase):
         path = os.path.join(directory, "vm1_vars.fd")
         with open(path, "wb") as handle:
             handle.write(b"x" * 100)
-        code = code.replace("/var/lib/hci/aether/nvram/{vm_name}_vars.fd", path.replace("vm1_vars.fd", "{vm_name}_vars.fd"))
+        # Forward slashes: this is source text compiled below, and a Windows temp path full of backslashes
+        # is an invalid escape sequence there. Python on Windows accepts forward slashes.
+        portable = path.replace("\\", "/")
+        code = code.replace("/var/lib/hci/aether/nvram/{vm_name}_vars.fd", portable.replace("vm1_vars.fd", "{vm_name}_vars.fd"))
         calls = []
 
         class Resp(object):
@@ -610,7 +613,7 @@ class TheSettingsSaveReallyUpdatesClusterJson(unittest.TestCase):
         updates_b64 = base64.b64encode(json.dumps({"vip": "10.0.0.45", "cluster_name": "it's \"x\""}).encode()).decode()
         scope = {"updates_b64": updates_b64}
         exec(block.replace("rc_json", "_"), scope)
-        command = scope["update_json_cmd"].replace("/etc/hci/cluster.json", path)
+        command = scope["update_json_cmd"].replace("/etc/hci/cluster.json", path.replace("\\", "/"))
         done = subprocess.run(["bash", "-c", command], capture_output=True, stdin=subprocess.DEVNULL)
         self.assertEqual(done.returncode, 0, done.stderr)
         merged = json.load(open(path))
