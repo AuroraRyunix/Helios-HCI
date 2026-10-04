@@ -27,7 +27,7 @@ use crate::meta::{
     block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_FORMING, CLASS_IMMUTABLE,
     CLASS_RW, MAP_BATCH,
 };
-use crate::handover::Switch;
+use crate::handover::{self, Switch};
 use crate::heat::AccessLog;
 use crate::nbd::{self, Export, LocalVdisk};
 use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
@@ -58,6 +58,9 @@ pub struct DaemonConfig {
     /// How long a handover waits for the owner to drain its journal and let go. Longer than
     /// any append timeout, because the work is a drain and not an append.
     pub handover_timeout: Duration,
+    /// How long a node asked to release a disk waits for its own client (the source qemu,
+    /// on its way out after a migration) to disconnect before refusing.
+    pub release_wait: Duration,
     /// The cluster's `redundancy_factor` from `cluster.json`, when it could be read.
     ///
     /// The fallback for a create whose container says nothing, and the reason a vdisk
@@ -758,25 +761,9 @@ impl Daemon {
     }
 
     /// Turn a disk this node is forwarding into a disk this node owns, underneath the NBD
-    /// session the guest already has open. The second half of a live migration; see
-    /// docs/dfs/ownership.md section 5.
-    ///
-    /// Everything that can fail does so in a stated step, and the steps are ordered so that
-    /// a failure before the last two changes nothing:
-    ///
-    /// 1. `stall`: guest I/O on this node is held at the switch. Nothing is dropped; it waits.
-    /// 2. `release`: the current owner drains its journal into extent groups and stops serving
-    ///    the disk. A refusal or an unreachable owner ends the handover here, with the
-    ///    owner still serving and this node still forwarding to it.
-    /// 3. `claim`: compare-and-swap in Hydra, owner and epoch together, epoch e to e+1.
-    /// 4. `fence`: every reachable journal replica is fenced at e+1 and the journal tail is
-    ///    adopted from one of them (the owner drained, so it is normally empty).
-    /// 5. `install`: the opened vdisk becomes the backend behind the socket and I/O resumes.
-    ///
-    /// A failure in steps 3 to 5 comes after the owner stopped serving, so guest I/O on this
-    /// node errors until the handover is run again, and it is safe to run again: the claim
-    /// is conditional on the owner and epoch as they are then read, and a second attempt
-    /// finds the row wherever the first one left it.
+    /// session the guest already has open. The second half of a live migration; the order of
+    /// the steps and what each failure leaves is [`handover::handover`], and
+    /// docs/dfs/ownership.md section 5 is the design.
     fn op_takeover(self: &Arc<Self>, req: &Value) -> Result<Value> {
         let id = str_field(req, "vdisk_id")?;
         let (switch, forwarding_to) = {
@@ -795,90 +782,14 @@ impl Daemon {
             (switch, a.forwarding_to.clone().unwrap_or_default())
         };
 
-        let step = |name: &str, e: Error| -> Error {
-            let wrap = |m: String| format!("handover of {id} failed at step '{name}': {m}");
-            match e {
-                Error::Io(m) => Error::Io(wrap(m)),
-                Error::Corrupt(m) => Error::Corrupt(wrap(m)),
-                Error::Meta(m) => Error::Meta(wrap(m)),
-                Error::Refused(m) => Error::Refused(wrap(m)),
+        let steps = DaemonSteps { daemon: self, id: id.clone(), row: Mutex::new(None) };
+        let done = match handover::handover(&switch, &steps).map_err(|f| f.into_error(&id))? {
+            handover::Outcome::AlreadyOwned => {
+                return Ok(json!({"vdisk_id": id, "already_owned": true}));
             }
+            handover::Outcome::Done(d) => d,
         };
-
-        let daruk = self.daruk();
-        let rows = daruk
-            .query(&format!(
-                "SELECT owner, epoch, replicas, size_bytes, class FROM hydra.dfs_vdisks \
-                 WHERE vdisk_id = {}",
-                cql_str(&id)
-            ))
-            .map_err(|e| step("read ownership", e))?;
-        let row = rows.first().ok_or_else(|| {
-            step("read ownership", Error::refused(format!("vdisk {id} does not exist")))
-        })?;
-        let cur_owner = row.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
-        let cur_epoch = row.get("epoch").and_then(Value::as_i64).unwrap_or(0);
-
-        let stall = switch.stall();
-
-        // Step 2. Skipped only when Hydra already names this node (an earlier handover won
-        // the claim and failed after it) or names nobody; there is then no owner to ask.
-        let mut released = false;
-        if !cur_owner.is_empty() && cur_owner != self.cfg.node {
-            let client = self.peers.get(&cur_owner).ok_or_else(|| {
-                step("release", Error::refused(format!(
-                    "owner {cur_owner} is not a peer this daemon has an address for"
-                )))
-            })?;
-            let long = client.derive(self.cfg.handover_timeout, 1);
-            let resp = long
-                .call(&peer::Request {
-                    opcode: peer::OP_RELEASE,
-                    vdisk: id.clone(),
-                    epoch: 0,
-                    seq: 0,
-                    offset: 0,
-                    flags: 0,
-                    data: Vec::new(),
-                })
-                .map_err(|e| step("release", Error::io(format!(
-                    "owner {cur_owner} could not be asked to hand the disk over ({e}); it is \
-                     still the owner and this node is still forwarding to it"
-                ))))?;
-            match resp.status {
-                peer::ST_OK => released = true,
-                // Not serving it: it already let go, or it restarted and holds nothing. The
-                // fence in step 4 is what makes proceeding safe in either case.
-                peer::ST_NOT_FOUND => {}
-                peer::ST_REFUSED => {
-                    let why = String::from_utf8_lossy(&resp.data).to_string();
-                    let why = if why.is_empty() {
-                        "an older Sidon that does not know the handover request".to_string()
-                    } else {
-                        why
-                    };
-                    return Err(step("release", Error::refused(format!(
-                        "owner {cur_owner} refused to hand the disk over ({why}); it is still \
-                         the owner and this node is still forwarding to it"
-                    ))));
-                }
-                other => {
-                    return Err(step("release", Error::io(format!(
-                        "owner {cur_owner} answered the handover request with status {other}"
-                    ))))
-                }
-            }
-        }
-
-        // Steps 3 and 4.
-        let (vdisk, replica_nodes, fenced) = self
-            .claim_and_open(&id, row, &cur_owner, cur_epoch)
-            .map_err(|e| step(if released { "claim and fence (the owner has already released the disk)" } else { "claim and fence" }, e))?;
-
-        // Step 5.
-        switch
-            .install(&stall, Arc::new(LocalVdisk(Arc::clone(&vdisk))))
-            .map_err(|e| step("install", e))?;
+        let (vdisk, replica_nodes, fenced) = done.opened;
         {
             let mut map = self.attached.lock().expect("attached mutex poisoned");
             if let Some(a) = map.get_mut(&id) {
@@ -886,34 +797,35 @@ impl Daemon {
                 a.forwarding_to = None;
             }
         }
-        drop(stall);
-        eprintln!(
-            "sidon: vdisk {id}: took over from {forwarding_to} at epoch {}",
-            cur_epoch + 1
-        );
+        eprintln!("sidon: vdisk {id}: took over from {forwarding_to} at epoch {}", done.epoch);
         Ok(json!({
             "vdisk_id": id,
-            "epoch": cur_epoch + 1,
-            "previous_owner": cur_owner,
-            "released": released,
+            "epoch": done.epoch,
+            "previous_owner": done.previous_owner,
+            "released": done.released,
             "replicas": replica_nodes,
             "replicas_fenced": fenced,
         }))
     }
 
-    /// The owner's half of a handover: drain, stop serving, let go of the socket.
+    /// The owner's half of a handover: stop serving, drain, let go of the socket.
     ///
     /// Refuses while a client is still connected to the socket here, because a guest that is
     /// still using the disk on this node is exactly the second writer the handover must not
     /// create. Waits a bounded time for one that is on its way out: libvirt finishes
     /// tearing the source qemu down a moment after the migration command returns.
+    ///
+    /// The disk leaves the attached table first, so a forwarded request that arrives from now
+    /// on is answered "not served here" instead of being appended behind the drain. If the
+    /// drain fails, or a client turns up after all, the entry goes back and the disk keeps
+    /// being served: a release that cannot leave an empty journal has not released anything.
     fn release_for_handover(&self, id: &str) -> Option<Result<()>> {
         let (handle, sessions) = {
             let map = self.attached.lock().expect("attached mutex poisoned");
             let a = map.get(id)?;
             (a.vdisk.clone()?, Arc::clone(&a.sessions))
         };
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + self.cfg.release_wait;
         while sessions.load(Ordering::SeqCst) > 0 {
             if std::time::Instant::now() >= deadline {
                 return Some(Err(Error::refused(format!(
@@ -923,20 +835,26 @@ impl Daemon {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        // Drain first, and keep serving if it fails: a release that cannot leave an empty
-        // journal has not released anything.
-        if let Err(e) = crate::vdisk::drain_all(&handle) {
-            return Some(Err(Error::refused(format!("the journal could not be drained: {e}"))));
-        }
-        let a = {
+        let entry = {
             let mut map = self.attached.lock().expect("attached mutex poisoned");
             map.remove(id)
+        }?;
+        let put_back = |entry: Attached| {
+            self.attached.lock().expect("attached mutex poisoned").insert(id.to_string(), entry);
         };
-        if let Some(a) = a {
-            a.stop.store(true, Ordering::SeqCst);
-            let _ = UnixStream::connect(&a.socket);
-            let _ = std::fs::remove_file(&a.socket);
+        if let Err(e) = crate::vdisk::drain_all(&handle) {
+            put_back(entry);
+            return Some(Err(Error::refused(format!("the journal could not be drained: {e}"))));
         }
+        if entry.sessions.load(Ordering::SeqCst) > 0 {
+            put_back(entry);
+            return Some(Err(Error::refused(format!(
+                "a client connected to {id} on this node while it was being released"
+            ))));
+        }
+        entry.stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&entry.socket);
+        let _ = std::fs::remove_file(&entry.socket);
         eprintln!("sidon: vdisk {id}: released to another node");
         Some(Ok(()))
     }
@@ -2182,6 +2100,85 @@ fn u64_field(req: &Value, name: &str) -> Result<u64> {
     req.get(name)
         .and_then(Value::as_u64)
         .ok_or_else(|| Error::refused(format!("request is missing numeric '{name}'")))
+}
+
+/// The real steps of a handover: Hydra, the owner over the peer protocol, the replicas.
+struct DaemonSteps<'a> {
+    daemon: &'a Arc<Daemon>,
+    id: String,
+    /// The vdisk row `read_ownership` fetched, which `claim_and_open` needs for the replica set.
+    row: Mutex<Option<Value>>,
+}
+
+impl handover::Steps for DaemonSteps<'_> {
+    type Opened = (Arc<Mutex<Vdisk>>, Vec<String>, usize);
+
+    fn node(&self) -> &str {
+        &self.daemon.cfg.node
+    }
+
+    fn read_ownership(&self) -> Result<handover::Ownership> {
+        let rows = self.daemon.daruk().query(&format!(
+            "SELECT owner, epoch, replicas, size_bytes, class FROM hydra.dfs_vdisks \
+             WHERE vdisk_id = {}",
+            cql_str(&self.id)
+        ))?;
+        let row = rows
+            .first()
+            .ok_or_else(|| Error::refused(format!("vdisk {} does not exist", self.id)))?
+            .clone();
+        let owner = row.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+        let epoch = row.get("epoch").and_then(Value::as_i64).unwrap_or(0);
+        *self.row.lock().expect("row mutex poisoned") = Some(row);
+        Ok(handover::Ownership { owner, epoch })
+    }
+
+    fn release(&self, owner: &str) -> Result<handover::Released> {
+        let client = self.daemon.peers.get(owner).ok_or_else(|| {
+            Error::refused(format!("owner {owner} is not a peer this daemon has an address for"))
+        })?;
+        let long = client.derive(self.daemon.cfg.handover_timeout, 1);
+        let resp = long
+            .call(&peer::Request {
+                opcode: peer::OP_RELEASE,
+                vdisk: self.id.clone(),
+                epoch: 0,
+                seq: 0,
+                offset: 0,
+                flags: 0,
+                data: Vec::new(),
+            })
+            .map_err(|e| Error::io(format!("owner {owner} could not be asked to hand the disk over ({e})")))?;
+        match resp.status {
+            peer::ST_OK => Ok(handover::Released::Yes),
+            // Not serving it: it already let go, or it restarted and holds nothing. The
+            // fence after the claim is what makes proceeding safe in either case.
+            peer::ST_NOT_FOUND => Ok(handover::Released::NotServing),
+            peer::ST_REFUSED => {
+                let why = String::from_utf8_lossy(&resp.data).to_string();
+                let why = if why.is_empty() {
+                    "an older Sidon that does not know the handover request".to_string()
+                } else {
+                    why
+                };
+                Err(Error::refused(format!("owner {owner} refused to hand the disk over ({why})")))
+            }
+            other => Err(Error::io(format!(
+                "owner {owner} answered the handover request with status {other}"
+            ))),
+        }
+    }
+
+    fn claim_and_open(&self, seen: &handover::Ownership) -> Result<Self::Opened> {
+        let row = self.row.lock().expect("row mutex poisoned").clone().ok_or_else(|| {
+            Error::refused("claim attempted before the ownership was read".to_string())
+        })?;
+        self.daemon.claim_and_open(&self.id, &row, &seen.owner, seen.epoch)
+    }
+
+    fn backend(&self, opened: &Self::Opened) -> Arc<dyn nbd::Backend> {
+        Arc::new(LocalVdisk(Arc::clone(&opened.0)))
+    }
 }
 
 #[cfg(test)]
