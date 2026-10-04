@@ -763,3 +763,63 @@ its time budget is still a uniform sample and says what it covered; a sample und
 that exists twice and is fair for content that exists many times, which is the content that could
 clear D-23's 10-15% bar. Duplicates that straddle two nodes are found by merging short digests
 across nodes in `valcli`; one node alone cannot see them.
+
+**D-33 — a replica drops a copy only when Hydra says the group is dead; the sweep asks, and a
+scan finds what nobody asked about.** The sweep (I-7) freed a group on the node that created it
+and nowhere else. Every other copy sits in `replica-egroups/` on the nodes that replicate the
+group, nothing told them the group was gone, and nothing on them looked: on the test cluster, one
+node still held 12.7 GiB of replica copies for groups the owner had long since swept. The cost was
+real (half the raw space at RF 2 never came back) and it is why D-32 could not recommend
+compaction at ftt>=1.
+
+*Taken: two mechanisms, one rule.* (1) **The request.** When a sweep reclaims groups it asks
+every peer, once per pass and with every group in one frame, to drop its copy (`OP_EGROUP_DROP`,
+opcode 11). It asks *after* the row says `dead` and the owner's own copy is gone, and *before* the
+row is deleted, because that row is what the replica checks; a stop after any step is finished by
+the next sweep (`purah/reclaim.rs` header). (2) **The scan.** Each node's sweep also scans its own
+`replica-egroups/` for copies whose group Hydra has no row for, or a `dead` row, and drops them
+under the sweep's own rule: unreferenced, last written longer ago than the grace, and seen so on
+two scans a grace apart. The scan is the backstop for everything the request cannot do: a replica
+that was down when the owner swept, an owner that crashed between marking a group dead and asking,
+an owner that predates the opcode, and the orphans already on disk before any of this existed.
+Neither mechanism trusts the other and neither depends on it.
+
+*What a replica checks, and why it is not an epoch.* A replica never takes the sender's word. For
+each group it requires, from Hydra, that the row exists, says `dead`, and **names the sender as the
+node that created it**; and then it reads the block map and the extent id map itself and refuses
+any group something still points into (`referenced`, which the sender treats as an alarm: it keeps
+the row `dead` as evidence and reports an anomaly, because a replica that kept the last copy of a
+referenced group has saved it). A missing row, an `open` or `sealed` row, a different sender, a
+name that is not a group id, and any failed read of Hydra are all refusals or errors that drop
+nothing: silence is not permission. The request asked for an epoch fence; there is no epoch to
+use. A group is not owned by a vdisk (clones and snapshots share one), so the epoch of whichever
+vdisk wrote it would fence the wrong object. What a deposed or stale sender cannot do is make
+Hydra say `dead`: that is a lightweight transaction conditional on the state it leaves, which a
+node that cannot reach a quorum cannot perform, and it cannot make the block map stop pointing at
+a group. The authority is therefore Hydra's row, re-read by the replica, plus the replica's own
+look at the references -- two independent reads instead of one sender's claim.
+
+*Rejected.* **The replica trusts the request** (a sender that marked a group dead wrongly -- a
+drain committed a reference after its scans, the very race I-7 exists for -- would take the last
+copy with it, because the owner has already deleted its own). **The owner asks only the replicas
+of the vdisk that wrote the group** (the vdisk may be deleted, its replica set changes over time,
+and a group outlives both; a peer that holds nothing answers in one directory lookup, so the owner
+asks everyone). **The owner keeps the row until every replica has acknowledged** (it couples a
+row's life to every peer being up, and an older replica never acknowledges, so it would leak rows
+for ever; the scan makes the acknowledgement unnecessary). **A tombstone table** (a second table to
+keep in step with the first, a migration, and nothing the `dead` row does not already say).
+**Dropping on the replica's own scan alone** (correct, and two grace periods slower; kept as the
+backstop, not the mechanism).
+
+*Rolling upgrade.* The opcode is new, so an older replica answers "unknown opcode" with an empty
+body and keeps its copy: space is not freed on it until it is upgraded, and nothing is lost. The
+sender tells that from an answer (a new replica always answers `ST_OK` with a verdict per group,
+even to refuse) and reports the peer as `unsupported` in `valcli storage.sweep`. An older *owner*
+never asks; a new replica's own scan finds the copy after two scans past the grace. So any mix of
+versions is safe, and a cluster that is fully upgraded drops its existing orphans on the first two
+sweeps past the grace without anyone running anything.
+
+*What it does not do.* A copy of a **live** group that its replica set no longer includes (a heal
+replaced this node and the old copy was never removed) is left alone: Hydra says the group is live,
+and whether this node should hold it is a question about the vdisk's replica set that this pass
+does not ask (I-6 territory). The operator-visible number is `live` in the scan report.

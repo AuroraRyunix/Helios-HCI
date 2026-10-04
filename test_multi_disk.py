@@ -333,7 +333,7 @@ class AMoveNeverDeletes(unittest.TestCase):
         self.assertIn("copies.len() < 2", body)
 
     def test_reclaiming_a_group_removes_every_local_copy(self):
-        reclaim = rust_function(self.purah, "fn reclaim(")
+        reclaim = rust_function(rust_source("purah", "reclaim.rs"), "fn mark_dead_and_remove_local<")
         self.assertIn("remove_all", reclaim)
 
     def test_a_reader_with_a_stale_index_is_not_failed_by_a_move(self):

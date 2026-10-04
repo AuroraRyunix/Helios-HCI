@@ -145,6 +145,15 @@ rule the first run after a delete reclaims nothing and says how many groups are 
 repeats the pass on its own timer (`SIDON_PURAH_INTERVAL`, 300 s by default), and the command
 only brings the second scan forward. `valcli storage.scrub` is the damage check.
 
+**Replica copies (D-33).** The sweep frees a group on the node that created it, and then asks
+every peer to drop its replica copy, after Hydra says `dead` and before the row is deleted. A
+replica does not take the request on trust: it re-reads the group's row (must be `dead`, created by
+the asking node) and the block map and extent id map (must not point into it) and drops only what
+that proves. Each node's sweep also scans its own replica directory for copies whose group Hydra no
+longer lists and drops them after two scans a grace apart, which covers a replica that was down, an
+owner that crashed, an older owner, and every orphan left before this existed. An older replica
+refuses the new opcode and keeps its copy, which is safe.
+
 ### Compaction: reclaiming inside a group
 
 Mark-sweep frees a *group*. A group three extents dead and one alive is never freed, and

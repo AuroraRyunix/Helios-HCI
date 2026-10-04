@@ -24,6 +24,10 @@
 //! - *Not open*: an open group is the drain's current target.
 //! - *Not held*: a vdisk attached here has map entries in memory that may be ahead of a
 //!   stale read.
+//!
+//! The pass itself is `reclaim.rs`, which also asks the peers to drop their replica copies of
+//! what it reclaims; `replica.rs` is the other end of that request and the scan for orphaned
+//! copies (D-33).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,14 +35,16 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::err::{Error, Result};
+use crate::err::Result;
 use crate::extent::EgroupStore;
 use crate::heat::{heat_score, AccessLog, Counts};
-use crate::meta::{access_batches, cql_str, json_params, Daruk, ACCESS_BATCH};
+use crate::meta::{access_batches, cql_str, Daruk, ACCESS_BATCH};
 
 pub mod compact;
 pub mod dedup;
 pub mod occupancy;
+pub mod reclaim;
+pub mod replica;
 pub mod tier;
 
 #[cfg(test)]
@@ -92,6 +98,13 @@ pub struct SweepReport {
     pub skipped_open: usize,
     pub skipped_held: usize,
     pub skipped_grace: usize,
+    /// The grace period in force, so that "awaiting a second scan" can say for how long.
+    pub grace_seconds: u64,
+    /// What asking each peer to drop its replica copies of the groups reclaimed this pass came
+    /// to. Empty when nothing was reclaimed or there are no peers.
+    pub replica_drops: Vec<reclaim::PeerDropReport>,
+    /// States that should not exist and that the pass did not resolve by deleting.
+    pub anomalies: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -196,20 +209,6 @@ impl Purah {
         Ok(report)
     }
 
-    /// Every extent group id the block map currently points at, across all vdisks.
-    ///
-    /// A full scan of `dfs_block_map`. That is the cost of not keeping reference counts,
-    /// and it is paid deliberately -- see the module header. It must be read *before* the
-    /// egroup inventory, so that a group created between the two reads appears in the
-    /// inventory as unreferenced-and-young rather than being missed entirely.
-    ///
-    /// Through **both** map levels (D-23): a row naming an extent keeps alive the group that
-    /// extent's row names. On a cluster where nothing names an extent this is the scan it
-    /// always was; see `extent_id_map::referenced_egroups`.
-    fn referenced_egroups(&self) -> Result<HashSet<String>> {
-        crate::extent_id_map::referenced_egroups(&self.daruk)
-    }
-
     fn my_egroups(&self) -> Result<Vec<(String, String, i64, i64)>> {
         let rows = self.daruk.query(&format!(
             "SELECT egroup_id, state, created_at_ms, size FROM hydra.dfs_egroups WHERE node = {} ALLOW FILTERING",
@@ -234,124 +233,28 @@ impl Purah {
     }
 
     /// One mark-sweep pass. `held` is the set of extent groups attached vdisks are using
-    /// right now, which the caller supplies because only it knows what is attached.
-    pub fn sweep(&mut self, held: &HashSet<String>, now_ms: i64) -> Result<SweepReport> {
-        let mut report = SweepReport::default();
-
-        // Order matters: references first. See referenced_egroups().
-        let referenced = self.referenced_egroups()?;
-        let inventory = self.my_egroups()?;
-        report.egroups_known = inventory.len();
-
-        let grace_ms = self.grace.as_millis() as i64;
-        let now = Instant::now();
-        let mut still_unreferenced: HashMap<String, Instant> = HashMap::new();
-
-        for (id, state, created_at_ms, size) in inventory {
-            if referenced.contains(&id) {
-                report.egroups_referenced += 1;
-                // Referenced and recorded here, so it should be on one of this node's
-                // disks. If it is on none of them the bytes are gone locally -- a disk
-                // that failed, was unmounted, or never came back after a reboot.
-                if !self.store.path_for(&id).exists() {
-                    report.missing.push(id.clone());
-                }
-                // Seen referenced: any grace it had accumulated is void.
-                continue;
-            }
-            if state == "open" {
-                report.skipped_open += 1;
-                continue;
-            }
-            if held.contains(&id) {
-                report.skipped_held += 1;
-                continue;
-            }
-            if created_at_ms > 0 && now_ms - created_at_ms < grace_ms {
-                report.skipped_young += 1;
-                // Still record the observation so its grace can start ticking.
-                let first = self.unreferenced_since.get(&id).copied().unwrap_or(now);
-                still_unreferenced.insert(id, first);
-                continue;
-            }
-
-            let first_seen = match self.unreferenced_since.get(&id) {
-                Some(t) => *t,
-                None => {
-                    // First observation. It gets no further than this on this pass --
-                    // this is the second half of the two-scan rule.
-                    still_unreferenced.insert(id, now);
-                    report.skipped_grace += 1;
-                    continue;
-                }
-            };
-            if now.duration_since(first_seen) < self.grace {
-                still_unreferenced.insert(id, first_seen);
-                report.skipped_grace += 1;
-                continue;
-            }
-
-            report.candidates += 1;
-            match self.reclaim(&id, &state) {
-                Ok(()) => {
-                    report.reclaimed.push(id);
-                    report.bytes_reclaimed += size.max(0) as u64;
-                }
-                Err(e) => {
-                    eprintln!("purah: could not reclaim extent group {id}: {e}");
-                    still_unreferenced.insert(id, first_seen);
-                }
-            }
-        }
-
-        self.unreferenced_since = still_unreferenced;
+    /// right now, which the caller supplies because only it knows what is attached. `peers`
+    /// is who to ask to drop their replica copies of what is reclaimed (D-33).
+    pub fn sweep(
+        &mut self,
+        held: &HashSet<String>,
+        now_ms: i64,
+        peers: &dyn reclaim::ReplicaPeers,
+    ) -> Result<SweepReport> {
+        let pass = reclaim::Pass {
+            db: &self.daruk,
+            store: &self.store,
+            node: &self.node,
+            grace: self.grace,
+            access: &self.access,
+            peers,
+        };
+        let report = reclaim::sweep_pass(&pass, &mut self.unreferenced_since, held, now_ms, Instant::now())?;
         // The copy a move left behind is surplus bytes, not garbage: it is removed by the
         // same two-scan rule, on the same cadence, so there is one answer in this daemon to
         // "when may bytes be deleted".
         self.reap_strays();
         Ok(report)
-    }
-
-    /// Mark dead in the map, then remove the file. That order, always: a file removed
-    /// before the map forgets it is a map row pointing at nothing, which reads as data
-    /// loss. A row marked dead whose file still exists is a wasted block and a warning.
-    fn reclaim(&self, id: &str, current_state: &str) -> Result<()> {
-        let cas = self.daruk.cas(
-            "/v1/dfs/egroup-state",
-            json_params(vec![
-                ("egroup_id", json!(id)),
-                ("state", json!("dead")),
-                ("seal_hash", json!("")),
-                ("size", json!(0)),
-                ("expected_state", json!(current_state)),
-            ]),
-        )?;
-        if !cas.applied {
-            return Err(Error::refused(format!(
-                "extent group {id} changed state to {} while it was being reclaimed",
-                cas.current_str("state")
-            )));
-        }
-        // Every copy on this node, including a surplus one a disk-to-disk move left behind.
-        self.store.remove_all(id)?;
-        self.daruk.query(&format!(
-            "DELETE FROM hydra.dfs_egroups WHERE egroup_id = {}",
-            cql_str(id)
-        ))?;
-        // The access data is about this extent group, so it dies with it -- the whole
-        // partition, every node's row, because the group is gone everywhere and not only
-        // here. Last, after the row the group is actually described by, and best-effort:
-        // nothing reads these rows except the ranking pass, and a leftover one ranks a
-        // group that no inventory lists, which the pass ignores. Failing the reclaim over
-        // it would be letting a statistic block the reclamation of disk.
-        if let Err(e) = self.daruk.query(&format!(
-            "DELETE FROM hydra.dfs_egroup_access WHERE egroup_id = {}",
-            cql_str(id)
-        )) {
-            eprintln!("purah: access data for reclaimed extent group {id} could not be deleted: {e}");
-        }
-        self.access.forget(id);
-        Ok(())
     }
 
     /// Write the in-memory access tally to Hydra.
@@ -573,6 +476,10 @@ impl SweepReport {
             "skipped_held": self.skipped_held,
             "skipped_young": self.skipped_young,
             "skipped_awaiting_grace": self.skipped_grace,
+            "grace_seconds": self.grace_seconds,
+            // What each peer did about its replica copies of the groups reclaimed here.
+            "replica_drops": self.replica_drops.iter().map(|d| d.to_json()).collect::<Vec<_>>(),
+            "anomalies": self.anomalies,
             // Named, not just counted: an operator needs to know which extent groups went
             // with a disk, and a bare number cannot be acted on.
             "missing": self.missing,

@@ -429,6 +429,13 @@ least the grace period apart (`SIDON_PURAH_GRACE`, 600 s), have found nothing po
 run after a delete typically reclaims nothing and says how many groups are waiting; the same pass runs on
 sidon's own timer, so the command brings the second scan forward and does not shorten the rule.
 `storage.cleanup_orphaned`, which the daily Dagur job runs, is the same command under its older name.
+With replicas the report has one more part. When the sweep reclaims a group it asks every peer to drop
+its copy (D-33); the output names, per peer, how many copies were dropped and how many bytes that freed,
+how many were already gone, how many were refused and why, and whether a peer runs a sidon older than the
+request (it keeps its copy until it is upgraded). Each node also scans the copies it holds for *other*
+nodes' groups and drops those Hydra no longer lists, under the same two-scan rule; the report line for that
+shows how many it scanned, dropped, and is still waiting on. A replica never drops a copy of a group Hydra
+lists as live, whoever asks.
 `storage.scrub` is the sibling for damage: it re-hashes each sealed group and names any that no longer match.
 
 `storage.list` also prints one row per extent-store disk: its identity, the directory it is

@@ -217,11 +217,11 @@ The notes themselves are deliberately not in this repository.
   stop a batch at every step, overwrite mid-pass, share extents across clones and snapshots, refuse at
   a replica, and run random maps to a fixed point; `test_compaction.py` pins the wiring and the rules.
   **Not built / known:**
-  * **Replica copies of a dead group are never reclaimed** -- not by the sweep, not by compaction, not
-    when a vdisk is deleted -- as far as the code shows (`replica-egroups/` has no remover). Compaction
-    therefore *adds* its live bytes on every replica and frees nothing there; the plan prints both
-    numbers. A replica-side drop (an opcode sent by the node that swept a group) is the fix and is the
-    thing to build before recommending `--apply` at ftt>=1.
+  * ~~**Replica copies of a dead group are never reclaimed**~~ **Built (D-33):** the sweep asks every
+    peer to drop its copy (`OP_EGROUP_DROP`), each replica re-checks Hydra and the map itself, and each
+    node scans its replica directory for orphans under the two-scan rule. Needs deploying to every node
+    and watching: until a node runs the new build its copies stay. Existing orphans (12.7 GiB on one
+    lab node) go on the first two sweeps past the grace after the upgrade.
   * Groups a writable vdisk not attached on the creating node still points into (a clone on another
     node, a detached VM) are skipped; a safe way to exclude that vdisk's drain from here does not exist.
   * Nothing has run on the test cluster: the passes are proved against a model of Hydra and real extent

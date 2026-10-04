@@ -174,6 +174,11 @@ class TheSweepOutputExplainsItself(unittest.TestCase):
         self.assertIn("dropped 1 orphan(s), 1.0 MiB; 2 awaiting a second scan", text)
         self.assertIn("ANOMALY: g9", text)
 
+    def test_an_anomaly_the_sweep_would_not_resolve_by_deleting_is_shown(self):
+        body = dict(IDLE, anomalies=["extent group eg-x was reclaimed here but a replica reports ..."])
+        text = "\n".join(load_valcli()["sweep_lines"]("n1", body))
+        self.assertIn("ANOMALY: extent group eg-x", text)
+
     def test_one_node_failing_does_not_hide_the_others(self):
         ns, _ = cluster({"10.0.0.1": RuntimeError("tls handshake failed"), "10.0.0.2": dict(IDLE)})
         out, _ = run(load_valcli(**ns), "cmd_storage_sweep")
@@ -215,6 +220,86 @@ class ScrubReportsDamageAndExitsNonZero(unittest.TestCase):
         ns, _ = cluster({"10.0.0.1": RuntimeError("down")})
         out, code = run(load_valcli(**ns), "cmd_storage_scrub")
         self.assertEqual(code, 1)
+
+
+def rust(*parts):
+    return read("sidon", "src", *parts)
+
+
+def body(source, signature):
+    """The text of one Rust function, from its signature to the closing brace at its indent."""
+    start = source.index(signature)
+    indent = len(source[:start].rsplit("\n", 1)[-1])
+    end = re.search(r"\n%s\}" % (" " * indent), source[start + len(signature):])
+    return source[start:start + len(signature) + (end.end() if end else len(source))]
+
+
+class ReplicaReclamationKeepsItsRules(unittest.TestCase):
+    """The behaviour is proved in Rust (`purah/reclaim/tests.rs`, `peer.rs`); these pin the shape
+    that proof assumes, so that a refactor cannot move a step without a test noticing (D-33)."""
+
+    def test_the_drop_opcode_is_new_and_unique(self):
+        peer = rust("peer.rs")
+        ops = re.findall(r"pub const (OP_[A-Z_]+): u16 = (\d+);", peer)
+        numbers = [n for _, n in ops]
+        self.assertEqual(len(numbers), len(set(numbers)), "two opcodes share a number: %s" % ops)
+        self.assertIn(("OP_EGROUP_DROP", "11"), ops)
+        # Every older opcode keeps its number: a replica from before must still read them.
+        old = dict(ops)
+        for name, number in (("OP_PING", "1"), ("OP_APPEND", "2"), ("OP_TRUNCATE_TO", "10")):
+            self.assertEqual(old[name], number)
+
+    def test_an_unknown_opcode_is_still_refused_not_answered(self):
+        """The rolling-upgrade guarantee: an older replica refuses what it does not know."""
+        serve = body(rust("peer.rs"), "pub fn serve_request(")
+        self.assertIn("other => {", serve)
+        self.assertIn("ST_REFUSED", serve[serve.index("other => {"):])
+        self.assertNotIn("OP_EGROUP_DROP", serve, "the replica-only dispatch must not handle the drop")
+
+    def test_a_transport_with_nothing_to_verify_refuses_the_drop(self):
+        peer = rust("peer.rs")
+        self.assertRegex(peer, r"fn drop_replica_groups\([^)]*\) -> Option<Result<serde_json::Value>> \{\s*None\s*\}")
+
+    def test_a_replica_checks_the_row_the_sender_and_the_map_before_it_removes_anything(self):
+        replica = rust("purah", "replica.rs")
+        drop = body(replica, "pub fn drop_declared_dead<")
+        removal = drop.index("store.remove_egroup")
+        for needle in ('state != "dead"', "node != from", "referenced_egroups(db)", "referenced.contains(id)"):
+            self.assertIn(needle, drop)
+            self.assertLess(drop.index(needle), removal, "%s must come before the removal" % needle)
+
+    def test_the_scan_needs_two_sightings_age_and_no_reference(self):
+        scan = body(rust("purah", "replica.rs"), "pub fn scan<")
+        removal = scan.index("store.remove_egroup")
+        for needle in ("referenced.contains(&id)", "file.age < self.grace",
+                       "saturating_duration_since(first) < self.grace"):
+            self.assertIn(needle, scan)
+            self.assertLess(scan.index(needle), removal)
+
+    def test_the_owner_asks_while_the_row_is_dead_and_deletes_it_afterwards(self):
+        sweep = body(rust("purah", "reclaim.rs"), "pub fn sweep_pass<")
+        self.assertLess(sweep.index("mark_dead_and_remove_local(p"), sweep.index("push_drops("))
+        self.assertLess(sweep.index("push_drops("), sweep.index("forget_group(p, &id)"))
+
+    def test_the_mark_dead_comes_before_any_file_is_removed(self):
+        mark = body(rust("purah", "reclaim.rs"), "fn mark_dead_and_remove_local<")
+        self.assertLess(mark.index("/v1/dfs/egroup-state"), mark.index("remove_all"))
+
+    def test_the_sweep_takes_the_attached_set_under_the_curators_lock(self):
+        sweep = body(rust("control.rs"), "fn op_purah_sweep(")
+        self.assertLess(sweep.index("purah_state.lock()"), sweep.index("self.held_egroups()"))
+
+    def test_the_daemon_answers_the_drop_and_reports_the_orphan_scan(self):
+        control = rust("control.rs")
+        self.assertIn("fn drop_replica_groups(&self, from: &str, ids: &[String])", control)
+        self.assertIn('report["replica_orphans"]', control)
+
+    def test_the_decision_is_recorded_and_the_rolling_upgrade_is_documented(self):
+        decisions = read("docs", "dfs", "decisions.md")
+        self.assertIn("**D-33", decisions)
+        entry = decisions[decisions.index("**D-33"):]
+        self.assertIn("Rolling upgrade", entry)
+        self.assertIn("unknown opcode", entry)
 
 
 class StorageListIsUntouchedByThisChange(unittest.TestCase):

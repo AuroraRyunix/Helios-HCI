@@ -2052,6 +2052,8 @@ def sweep_lines(label, body):
                             int(orphans.get("awaiting_grace") or 0)))
             for anomaly in orphans.get("anomalies") or []:
                 lines.append("        ANOMALY: %s" % anomaly)
+    for anomaly in body.get("anomalies") or []:
+        lines.append("    ANOMALY: %s" % anomaly)
     if n("missing_count"):
         lines.append("    WARNING: %d referenced group(s) have no file on this node's disks: %s"
                      % (n("missing_count"), ", ".join((body.get("missing") or [])[:5])))

@@ -71,6 +71,13 @@ pub struct State {
     /// Called before each compare-and-swap is evaluated, with the state it will see: how a
     /// test makes a drain land between a scan and a repoint.
     pub before_cas: Option<CasHook>,
+    /// Fail every read whose statement contains this text with a metadata error: Hydra
+    /// unreachable, for the one statement a test names.
+    pub fail_read_containing: Option<String>,
+    /// Fail the delete of an extent group's row.
+    pub fail_delete: bool,
+    /// Every statement the model was asked, in order, for tests about what was read.
+    pub statements: Vec<String>,
 }
 
 pub struct Model {
@@ -85,12 +92,46 @@ impl Model {
 
 impl Rows for Model {
     fn rows(&self, cql: &str) -> Result<Vec<Value>> {
+        {
+            let mut st = self.st.borrow_mut();
+            st.statements.push(cql.to_string());
+            if let Some(needle) = &st.fail_read_containing {
+                if cql.contains(needle.as_str()) {
+                    return Err(Error::meta("injected: hydra unreachable".to_string()));
+                }
+            }
+            if let Some(rest) = cql.strip_prefix("DELETE FROM hydra.dfs_egroups WHERE egroup_id = ") {
+                if st.fail_delete {
+                    return Err(Error::meta("injected: the delete failed".to_string()));
+                }
+                let id = rest.trim().trim_matches('\'').to_string();
+                st.egroups.remove(&id);
+                return Ok(Vec::new());
+            }
+            if cql.starts_with("DELETE FROM hydra.dfs_egroup_access WHERE egroup_id = ") {
+                return Ok(Vec::new());
+            }
+        }
         let st = self.st.borrow();
         if cql == LEDGER_SCAN {
             return Ok(vec![
                 json!({"id": crate::extent_id_map::TABLE_MIGRATION}),
                 json!({"id": crate::extent_id_map::COLUMN_MIGRATION}),
             ]);
+        }
+        if cql == crate::extent_id_map::BLOCK_MAP_SCAN {
+            return Ok(st
+                .block
+                .iter()
+                .map(|r| json!({"egroup_id": r.egroup, "extent_id": r.extent}))
+                .collect());
+        }
+        if cql == crate::extent_id_map::EXTENT_MAP_SCAN {
+            return Ok(st
+                .extents
+                .iter()
+                .map(|(id, e)| json!({"extent_id": id, "egroup_id": e.egroup}))
+                .collect());
         }
         if cql == BLOCK_ROWS {
             return Ok(st
@@ -126,6 +167,32 @@ impl Rows for Model {
                     json!({"vdisk_id": id, "class": v.class, "container": v.container,
                            "owner": "", "replicas": v.replicas})
                 })
+                .collect());
+        }
+        if cql.starts_with("SELECT egroup_id, state, created_at_ms, size FROM hydra.dfs_egroups WHERE node = ") {
+            return Ok(st
+                .egroups
+                .iter()
+                .filter(|(_, g)| cql.contains(&cql_str(&g.node)))
+                .map(|(id, g)| {
+                    json!({"egroup_id": id, "state": g.state, "created_at_ms": g.created_ms,
+                           "size": g.size as i64})
+                })
+                .collect());
+        }
+        if let Some(rest) = cql.strip_prefix("SELECT state, node FROM hydra.dfs_egroups WHERE egroup_id = ") {
+            let id = rest.trim().trim_matches('\'');
+            return Ok(st
+                .egroups
+                .get(id)
+                .map(|g| vec![json!({"state": g.state, "node": g.node})])
+                .unwrap_or_default());
+        }
+        if cql == "SELECT egroup_id, state FROM hydra.dfs_egroups" {
+            return Ok(st
+                .egroups
+                .iter()
+                .map(|(id, g)| json!({"egroup_id": id, "state": g.state}))
                 .collect());
         }
         if cql.starts_with("SELECT egroup_id, state, created_at_ms, size, seal_hash, vdisk_hint") {
@@ -183,6 +250,16 @@ impl Db for Model {
                         hint: s(&p, "vdisk_hint"),
                     },
                 );
+                Ok(Cas { applied: true, current: Value::Null })
+            }
+            "/v1/dfs/egroup-state" => {
+                let id = s(&p, "egroup_id");
+                let Some(g) = st.egroups.get_mut(&id) else { return refused(Value::Null) };
+                if g.state != s(&p, "expected_state") {
+                    return refused(json!({"state": g.state}));
+                }
+                g.state = s(&p, "state");
+                g.size = n(&p, "size");
                 Ok(Cas { applied: true, current: Value::Null })
             }
             "/v1/dfs/block-map-repoint" => {
