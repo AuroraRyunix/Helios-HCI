@@ -426,21 +426,31 @@ if os.path.exists(nvram_path):
             content = f.read()
         b64_data = base64.b64encode(content).decode('utf-8')
         cql = f"INSERT INTO hydra.vm_nvram (vm_name, nvram_data) VALUES ('{{vm_name}}', '{{b64_data}}');"
-        req = urllib.request.Request('http://127.0.0.1:9043/query', data=cql.encode('utf-8'), headers={{'Content-Type': 'text/plain'}})
-        with urllib.request.urlopen(req, timeout=5) as response:
-            pass
-    except Exception:
+        saved = False
         try:
+            req = urllib.request.Request('http://127.0.0.1:9043/query', data=cql.encode('utf-8'), headers={{'Content-Type': 'text/plain'}})
+            with urllib.request.urlopen(req, timeout=5) as response:
+                saved = json.loads(response.read().decode('utf-8')).get('status') == 'success'
+        except Exception:
+            saved = False
+        if not saved:
+            # Daruk did not take it. The statement goes to cqlsh on stdin: a varstore is about a
+            # megabyte once encoded, which is past the length of a command line, so passing it as
+            # an argument failed with "Argument list too long" and the failure was swallowed.
             import socket
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(('10.255.255.255', 1))
             local_ip = s.getsockname()[0]
             s.close()
-            cmd = f"echo {{base64.b64encode(cql.encode('utf-8')).decode('utf-8')}} | base64 -d | podman exec -i systemd-hydra-db cqlsh {{local_ip}}"
-            subprocess.run(cmd, shell=True, timeout=10)
-        except Exception:
-            pass
-    if {delete_local}:
+            done = subprocess.run(['podman', 'exec', '-i', 'systemd-hydra-db', 'cqlsh', local_ip],
+                                  input=cql.encode('utf-8'), timeout=30,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            saved = (done.returncode == 0)
+    except Exception:
+        saved = False
+    # The local copy goes only once the database has the data: deleting it after a failed write
+    # lost the guest's UEFI boot entries on the next stop.
+    if {delete_local} and saved:
         try:
             os.remove(nvram_path)
         except Exception:

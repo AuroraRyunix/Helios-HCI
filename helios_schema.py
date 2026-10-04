@@ -1227,6 +1227,23 @@ def _run(execute, statement):
         raise SchemaError(
             "execute() must return (rc, stdout, stderr); got %r" % (result,))
     if rc != 0:
+        if _is_column_already_there(statement, "%s %s" % (stderr or "", stdout or "")):
+            # The column is already in the table: an earlier run of this very statement applied
+            # it and died before the ledger recorded it, or two nodes raced. Re-running an ALTER
+            # ... ADD cannot be made safe in this dialect (ADD IF NOT EXISTS does not parse), and
+            # migrations 0006 and 0008 hold two of them, so without this a partial apply there
+            # would fail every later start for good -- and their text cannot be changed, because
+            # the ledger checksums it. The goal state is reached, so this is success.
+            return 0, stdout, stderr
         raise SchemaError("%s\n  statement: %s" % ((stderr or stdout or "").strip(),
                                                    statement[:200]))
     return rc, stdout, stderr
+
+
+def _is_column_already_there(statement, message):
+    text = " ".join(statement.split()).upper()
+    if not (text.startswith("ALTER TABLE") and " ADD " in text):
+        return False
+    lowered = message.lower()
+    return ("conflicts with an existing column" in lowered
+            or "already exists" in lowered and "column" in lowered)

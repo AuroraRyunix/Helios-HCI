@@ -3457,9 +3457,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             dhcp_leases = get_consolidated_dhcp_leases()
             # 1. Fetch local VMs list from libvirt
             libvirt_vms = {}
+            # Reconciling a VM to "Stopped" because libvirt did not list it is only sound when
+            # libvirt answered. A failed `virsh list` (spark restarting, a 45 s timeout) used to
+            # leave this empty and every VM on this node was unplaced by a page load.
+            virsh_read_ok = False
             try:
                 rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
                 if rc == 0:
+                    virsh_read_ok = True
                     lines = stdout.splitlines()
                     for line in lines[2:]:
                         parts = line.split()
@@ -3495,7 +3500,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 
                 # Align if VM is mapped to local node
                 is_local = (host_ip == LOCAL_IP or host_ip == "127.0.0.1")
-                if is_local:
+                if is_local and virsh_read_ok:
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
@@ -4014,9 +4019,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             dhcp_leases = get_consolidated_dhcp_leases()
             # 1. Fetch local VMs list from libvirt
             libvirt_vms = {}
+            # Reconciling a VM to "Stopped" because libvirt did not list it is only sound when
+            # libvirt answered. A failed `virsh list` (spark restarting, a 45 s timeout) used to
+            # leave this empty and every VM on this node was unplaced by a page load.
+            virsh_read_ok = False
             try:
                 rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
                 if rc == 0:
+                    virsh_read_ok = True
                     lines = stdout.splitlines()
                     for line in lines[2:]:
                         parts = line.split()
@@ -4052,7 +4062,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 
                 # Align if VM is mapped to local node
                 is_local = (host_ip == LOCAL_IP or host_ip == "127.0.0.1")
-                if is_local:
+                if is_local and virsh_read_ok:
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
                         if name in libvirt_vms:
@@ -5861,32 +5871,45 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if "cluster_id" in data:
                     updates["cluster_id"] = data["cluster_id"]
                 
-                updates_json = json.dumps(updates).replace("'", "\\'")
+                # The update travels as base64 on stdin. It used to be spliced into a
+                # double-quoted `python3 -c` as JSON, whose own double quotes ended the string, so
+                # the command failed on every host and the name, VIP and subnet never reached
+                # cluster.json (and bifrost was never restarted for a new VIP).
+                updates_b64 = base64.b64encode(json.dumps(updates).encode("utf-8")).decode("utf-8")
 
                 def propagate_settings():
                     vip_changed = ("vip" in data)
+                    # Only what the request carried. The page's MTU save sends nothing else, and
+                    # every host used to have resolv.conf, chrony.conf and its timezone rewritten
+                    # from hard-coded defaults.
+                    touch_dns = ("dns_servers" in data) or ("dns_search_domains" in data)
+                    touch_ntp = ("ntp_servers" in data)
+                    touch_tz = ("timezone" in data)
                     for host in hosts:
                         host_ip = host.get("ip", "")
                         if host_ip:
-                            cmd_dns = f"echo {b64_resolv} | base64 -d > /etc/resolv.conf"
-                            run_remote_spark(host_ip, cmd_dns)
+                            if touch_dns:
+                                cmd_dns = f"echo {b64_resolv} | base64 -d > /etc/resolv.conf"
+                                run_remote_spark(host_ip, cmd_dns)
                             # Writing the file is still a shell string; restarting the
                             # unit that reads it is not, so the `&&` becomes an
                             # ordering the caller keeps rather than one the shell does.
-                            cmd_ntp = f"echo {b64_chrony} | base64 -d > /etc/chrony.conf"
-                            rc_ntp, _, _ = run_remote_spark(host_ip, cmd_ntp)
-                            if rc_ntp == 0:
-                                spark_unit_action(host_ip, "restart", ["chronyd"])
-                            if timezone_sanitized:
+                            if touch_ntp:
+                                cmd_ntp = f"echo {b64_chrony} | base64 -d > /etc/chrony.conf"
+                                rc_ntp, _, _ = run_remote_spark(host_ip, cmd_ntp)
+                                if rc_ntp == 0:
+                                    spark_unit_action(host_ip, "restart", ["chronyd"])
+                            if touch_tz and timezone_sanitized:
                                 cmd_tz = f"timedatectl set-timezone {timezone_sanitized} || true"
                                 run_remote_spark(host_ip, cmd_tz)
-                            
+
+                            if not updates:
+                                continue
                             update_json_cmd = (
-                                f"python3 -c \"import json, os; "
+                                f"echo {updates_b64} | base64 -d | python3 -c \"import json, os, sys; "
                                 f"path='/etc/hci/cluster.json'; "
                                 f"data=json.load(open(path)) if os.path.exists(path) else {{}}; "
-                                f"updates=json.loads('{updates_json}'); "
-                                f"data.update(updates); "
+                                f"data.update(json.load(sys.stdin)); "
                                 f"json.dump(data, open(path,'w'), indent=4)\""
                             )
                             rc_json, _, _ = run_remote_spark(host_ip, update_json_cmd)

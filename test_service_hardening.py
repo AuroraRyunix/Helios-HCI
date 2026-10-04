@@ -483,5 +483,146 @@ class MiphaDoesNotRepeatAFailoverThatFinished(unittest.TestCase):
         self.assertIn("and not already_failed_over)", src)
 
 
+class AMigrationThatAlreadyAppliedItsColumnIsNotAFailure(unittest.TestCase):
+    def setUp(self):
+        self.schema = load("helios_schema.py", "schema_h")
+
+    def run_with(self, statement, rc, err):
+        return self.schema._run(lambda s: (rc, "", err), statement)
+
+    def test_an_add_of_a_column_that_exists_is_success(self):
+        self.assertEqual(self.run_with(
+            "ALTER TABLE hydra.t ADD c text;", 2,
+            "Invalid column name c because it conflicts with an existing column")[0], 0)
+        self.assertEqual(self.run_with(
+            "alter table hydra.t add c text", 2, "Column c already exists")[0], 0)
+
+    def test_every_other_failure_still_raises(self):
+        for statement, err in (
+                ("ALTER TABLE hydra.t ADD c text;", "no viable alternative at input 'IF'"),
+                ("ALTER TABLE hydra.t ADD c text;", "Unavailable"),
+                ("CREATE TABLE hydra.t (a int PRIMARY KEY);", "already exists"),
+                ("INSERT INTO hydra.t (a) VALUES (1);", "conflicts with an existing column")):
+            with self.assertRaises(self.schema.SchemaError):
+                self.run_with(statement, 2, err)
+
+
+class CandidaciesDialTheLocalZooKeeperFirst(unittest.TestCase):
+    def test_order(self):
+        zk = load("helios_zk.py", "zk_h")
+        c = zk.cluster_candidacy("svc", "10.0.0.3", hosts=["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+        self.assertEqual(list(c.hosts), ["10.0.0.3", "10.0.0.1", "10.0.0.2"])
+
+    def test_a_node_not_in_the_list_keeps_the_document_order(self):
+        zk = load("helios_zk.py", "zk_h2")
+        c = zk.cluster_candidacy("svc", "10.0.0.9", hosts=["10.0.0.1", "10.0.0.2"])
+        self.assertEqual(list(c.hosts), ["10.0.0.1", "10.0.0.2"])
+
+
+class AFencedMiphaLeaderStandsDown(unittest.TestCase):
+    def test_the_loop_withdraws_before_it_checks_leadership(self):
+        src = read("mipha.py")
+        loop = src[src.index("ballot_withdrawn = False\n\n    while True:"):]
+        self.assertLess(loop.index("if self_fence_is_active():"), loop.index("if not monitor.leading():"))
+        self.assertIn("monitor.withdraw()", loop)
+        self.assertIn("ballot_withdrawn = False\n\n            # 1. Leadership Check", loop)
+
+
+class TheNvramBackupDeletesTheLocalCopyOnlyAfterItIsSaved(unittest.TestCase):
+    def run_script(self, daruk_ok, cqlsh_rc):
+        import base64
+        import json
+        import re
+        import subprocess
+        import tempfile
+        import types
+        vali = load("vali.py", "vali_nvram")
+        command = vali.get_nvram_backup_cmd("vm1", delete_local=True)
+        code = base64.b64decode(re.search(r"b64decode\('([^']+)'", command).group(1)).decode()
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "vm1_vars.fd")
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 100)
+        code = code.replace("/var/lib/hci/aether/nvram/{vm_name}_vars.fd", path.replace("vm1_vars.fd", "{vm_name}_vars.fd"))
+        calls = []
+
+        class Resp(object):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({"status": "success" if daruk_ok else "error"}).encode()
+
+        def fake_urlopen(*a, **k):
+            return Resp()
+
+        def fake_run(argv, **k):
+            calls.append((argv, k))
+            return types.SimpleNamespace(returncode=cqlsh_rc)
+        import urllib.request
+        from unittest import mock
+        with mock.patch.object(urllib.request, "urlopen", fake_urlopen), \
+                mock.patch.object(subprocess, "run", fake_run):
+            exec(compile(code, "nvram", "exec"), {"__name__": "x"})
+        return os.path.exists(path), calls
+
+    def test_daruk_took_it(self):
+        kept, calls = self.run_script(True, 1)
+        self.assertFalse(kept)
+        self.assertEqual(calls, [])
+
+    def test_daruk_refused_and_cqlsh_took_it_by_stdin(self):
+        kept, calls = self.run_script(False, 0)
+        self.assertFalse(kept)
+        argv, kwargs = calls[0]
+        self.assertIsInstance(argv, list, "no shell string: the statement is too long for one")
+        self.assertIn(b"INSERT INTO hydra.vm_nvram", kwargs["input"])
+
+    def test_nobody_took_it_so_the_local_copy_stays(self):
+        kept, calls = self.run_script(False, 1)
+        self.assertTrue(kept)
+
+
+class AFailedVirshListDoesNotUnplaceVms(unittest.TestCase):
+    def test_both_page_handlers_reconcile_only_after_libvirt_answered(self):
+        src = read("spectrum_server.py")
+        self.assertEqual(src.count("virsh_read_ok = False"), 2)
+        self.assertEqual(src.count("if is_local and virsh_read_ok:"), 2)
+        self.assertEqual(src.count("virsh_read_ok = True"), 2)
+
+
+class TheSettingsSaveReallyUpdatesClusterJson(unittest.TestCase):
+    def test_the_command_the_console_builds_runs_and_merges(self):
+        import base64
+        import json
+        import re
+        import subprocess
+        import tempfile
+        src = read("spectrum_server.py")
+        block = src[src.index("update_json_cmd = ("):src.index("rc_json, _, _ = run_remote_spark")]
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "cluster.json")
+        with open(path, "w") as handle:
+            json.dump({"hosts": [{"ip": "10.0.0.1"}], "vip": "old"}, handle)
+        updates_b64 = base64.b64encode(json.dumps({"vip": "10.0.0.45", "cluster_name": "it's \"x\""}).encode()).decode()
+        scope = {"updates_b64": updates_b64}
+        exec(block.replace("rc_json", "_"), scope)
+        command = scope["update_json_cmd"].replace("/etc/hci/cluster.json", path)
+        done = subprocess.run(["bash", "-c", command], capture_output=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        merged = json.load(open(path))
+        self.assertEqual(merged["vip"], "10.0.0.45")
+        self.assertEqual(merged["cluster_name"], "it's \"x\"")
+        self.assertEqual(merged["hosts"], [{"ip": "10.0.0.1"}], "existing keys survive")
+
+    def test_only_the_keys_sent_touch_dns_ntp_and_timezone(self):
+        src = read("spectrum_server.py")
+        for flag in ("touch_dns", "touch_ntp", "touch_tz"):
+            self.assertIn("if %s" % flag, src)
+
+
 if __name__ == "__main__":
     unittest.main()

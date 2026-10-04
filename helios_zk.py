@@ -1395,6 +1395,14 @@ def cluster_candidacy(service, identity, hosts=None, cluster_file="/etc/hci/clus
                              if host.get("ip")]
         except Exception:
             addresses = []
+    # This node's own server first. Every candidacy used to dial the addresses in document order,
+    # so every session in the cluster pinned to the first host's ZooKeeper, and restarting that
+    # server (the first node a rolling upgrade reboots) dropped every ballot of every service at
+    # once and re-ran every election. Local-first spreads the sessions, and a node whose own server
+    # is down still reaches the others in order.
+    ident = identity.decode("utf-8", "replace").strip() if isinstance(identity, bytes) else identity
+    if ident in addresses:
+        addresses = [ident] + [a for a in addresses if a != ident]
     return Candidacy(service, identity=identity, hosts=addresses or ["127.0.0.1"], **kwargs)
 
 

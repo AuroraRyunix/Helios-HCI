@@ -138,5 +138,30 @@ class AScheduledTaskIsQueuedOnlyWhereTheQueuesAre(unittest.TestCase):
         self.assertNotIn("submit_task_to_memory(", loop)
 
 
+class DispatchAcquisitionStartsFromAnEmptyQueue(unittest.TestCase):
+    def test_stale_entries_are_dropped_and_counted(self):
+        c = load()
+        c.queues["dagur"].put({"task_id": "a"})
+        c.queues["dagur"].put({"task_id": "b"})
+        c.queues["vali"].put({"task_id": "c"})
+        self.assertEqual(c.drain_in_memory_queues(), 3)
+        self.assertTrue(all(q.empty() for q in c.queues.values()))
+        self.assertEqual(c.drain_in_memory_queues(), 0)
+
+    def test_an_unreadable_table_is_recorded_so_the_first_pass_is_not_spent(self):
+        c = load()
+        c.read_open_tasks = lambda: None
+        c.recover_open_tasks(fail_in_flight=True)
+        self.assertFalse(c.LAST_RECOVERY_READ_OK)
+        c.read_open_tasks = lambda: []
+        c.recover_open_tasks(fail_in_flight=True)
+        self.assertTrue(c.LAST_RECOVERY_READ_OK)
+
+    def test_the_loop_only_clears_the_flag_after_a_read(self):
+        with open(os.path.join(HERE, "catalyst.py"), encoding="utf-8") as h:
+            src = h.read()
+        self.assertIn("if LAST_RECOVERY_READ_OK:\n                    just_acquired = False", src)
+
+
 if __name__ == "__main__":
     unittest.main()

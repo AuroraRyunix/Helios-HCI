@@ -2144,9 +2144,27 @@ def main():
     # Hosts whose self-fence this leader has already acted on. A self-fenced host keeps
     # answering its health check, so without this the failover would re-run every pass.
     self_fence_handled = set()
+    ballot_withdrawn = False
 
     while True:
         try:
+            # 0. A fenced host does not stand. Its guests were killed and the fence recorded, and
+            # the leader never monitors its own address, so a fenced leader left its own guests
+            # restarted by nobody. Giving up the ballot hands the election to a healthy node, whose
+            # next pass sees this host as FENCED and fails its guests over.
+            if self_fence_is_active():
+                if not ballot_withdrawn:
+                    print("[Mipha HA] This host has fenced itself; withdrawing from the HA election.")
+                    try:
+                        monitor.withdraw()
+                    except Exception as exc:
+                        print(f"[Mipha HA] Could not withdraw the HA ballot: {exc}")
+                    ballot_withdrawn = True
+                consecutive_failures.clear()
+                time.sleep(10)
+                continue
+            ballot_withdrawn = False
+
             # 1. Leadership Check
             if not monitor.leading():
                 # I am a follower, reset trackers and idle

@@ -706,6 +706,27 @@ def fail_task(task_id, reason):
         task_id, "failed", 100, now_ms, error_msg=reason))
 
 
+LAST_RECOVERY_READ_OK = True
+
+
+def drain_in_memory_queues():
+    """Empty every queue and return how many entries were dropped.
+
+    Run when this node takes the dispatch candidacy. Entries left from an earlier spell of
+    holding it are tasks the sweep is about to replay from their recorded rows; keeping both
+    runs the job twice (a scrub, a backup).
+    """
+    dropped = 0
+    for q in queues.values():
+        while True:
+            try:
+                q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+    return dropped
+
+
 def recover_open_tasks(fail_in_flight=False):
     """Replay what can be replayed and fail the rest with a reason. Returns (requeued, failed).
 
@@ -724,6 +745,7 @@ def recover_open_tasks(fail_in_flight=False):
     caller has to say which one it means rather than this inferring it.
     """
     open_tasks = read_open_tasks()
+    globals()["LAST_RECOVERY_READ_OK"] = open_tasks is not None
     if open_tasks is None:
         print("[Catalyst] Task recovery skipped: the task table could not be read. "
               "Nothing has been failed or replayed.")
@@ -808,6 +830,10 @@ def dispatch_thread_loop():
                     just_acquired = True
                     with lock:
                         queued_task_ids.clear()
+                    dropped = drain_in_memory_queues()
+                    if dropped:
+                        print("Catalyst dispatch: dropped %d stale in-memory queue entr%s; the "
+                              "recorded rows are replayed instead." % (dropped, "y" if dropped == 1 else "ies"))
 
             if not leading:
                 time.sleep(2)
@@ -816,7 +842,11 @@ def dispatch_thread_loop():
             if time.time() - last_sweep >= DISPATCH_SWEEP_SECONDS:
                 last_sweep = time.time()
                 requeued, failed = recover_open_tasks(fail_in_flight=just_acquired)
-                just_acquired = False
+                # Only a pass that read the table has done the first-pass job. A failed read
+                # used to clear the flag anyway, so the corpses of the previous dispatcher's
+                # `processing` tasks were never failed.
+                if LAST_RECOVERY_READ_OK:
+                    just_acquired = False
                 if requeued or failed:
                     print(f"[Catalyst] Recovered tasks: {requeued} re-queued, "
                           f"{failed} failed with a reason.")
