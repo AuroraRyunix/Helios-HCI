@@ -21,6 +21,7 @@
 //! clock, so two sites that disagree about the time cannot disagree about a snapshot.
 
 pub mod export;
+pub mod hydra_sink;
 pub mod import;
 pub mod throttle;
 
