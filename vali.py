@@ -1164,7 +1164,32 @@ def normalise_graphics(value):
     return "spice" if str(value or "").strip().lower() == "spice" else "vnc"
 
 
-def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc"):
+# vCPU headroom for hot-add. A domain's maximum vCPU count is fixed when it is defined, so a VM that
+# is to be able to gain vCPUs while it runs has to be defined with room for them -- and the CPU
+# topology has to cover the maximum, which is guest-visible (the guest sees the extra CPUs as
+# possible but offline). It is therefore opt-in, by the cluster setting `vm_hotplug_headroom`, and
+# takes effect at the VM's next start. See docs/vm_lifecycle.md.
+HOTPLUG_MAX_VCPUS = 16
+
+
+def hotplug_vcpu_limit(vcpu):
+    """The maximum vCPU count a domain with `vcpu` online is defined with when headroom is on."""
+    return max(int(vcpu), min(HOTPLUG_MAX_VCPUS, int(vcpu) * 4))
+
+
+def hotplug_headroom_enabled():
+    """Whether new domain definitions reserve vCPU headroom (cluster setting, default off)."""
+    rc, out, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'vm_hotplug_headroom';")
+    if rc != 0:
+        return False
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("(") and not line.startswith("-") and line != "value":
+            return line.lower() == "true"
+    return False
+
+
+def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc", hotplug_max_vcpus=None):
     primary_container = get_default_container()
     if disks_list and disks_list != "NONE":
         first_entry = disks_list.split(",")[0]
@@ -1317,22 +1342,28 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
             pass
 
     domain_type = "kvm" if has_kvm else "qemu"
+
+    # With headroom the domain is defined for `max_vcpus` and starts with `vcpu` online; the
+    # topology covers the maximum. Without it the two are the same and the XML is what it always was.
+    max_vcpus = max(int(vcpu), int(hotplug_max_vcpus)) if hotplug_max_vcpus else int(vcpu)
+    vcpu_element = (f"<vcpu placement='static' current='{vcpu}'>{max_vcpus}</vcpu>"
+                    if max_vcpus != int(vcpu) else f"<vcpu placement='static'>{vcpu}</vcpu>")
     
     actual_cpu = cpu_model if cpu_model else ("host-model" if is_vmware else "host-passthrough")
     
     if actual_cpu == "host-passthrough" and is_vmware:
         cpu_xml = f"""<cpu mode='host-passthrough'>
-    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
+    <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
     <feature policy='disable' name='vmx'/>
   </cpu>"""
     elif actual_cpu in ["host-model", "host-passthrough"]:
         cpu_xml = f"""<cpu mode='{actual_cpu}'>
-    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
+    <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
   </cpu>"""
     else:
         cpu_xml = f"""<cpu mode='custom' match='exact'>
     <model>{actual_cpu}</model>
-    <topology sockets='1' dies='1' cores='{vcpu}' threads='1'/>
+    <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
   </cpu>"""
 
     if is_vmware:
@@ -1467,7 +1498,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
   <name>{name}</name>
   {uuid_xml}
   <memory unit='MiB'>{memory}</memory>
-  <vcpu placement='static'>{vcpu}</vcpu>
+  {vcpu_element}
   <iothreads>1</iothreads>
   <os>
     {os_boot_xml}
@@ -1719,7 +1750,8 @@ def process_queue_task(task):
             # 3. Compile XML
             audio_enabled = bool(vm_data.get("audio_enabled", False))
             vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled,
-                                     graphics=vm_data.get("graphics"))
+                                     graphics=vm_data.get("graphics"),
+                                     hotplug_max_vcpus=hotplug_vcpu_limit(vcpu) if hotplug_headroom_enabled() else None)
             import base64
             b64_xml = base64.b64encode(vm_xml.encode("utf-8")).decode("utf-8")
             
@@ -2036,6 +2068,9 @@ def process_queue_task(task):
                 elif not applied_u:
                     sys.stderr.write(f"VM {vm_name}: migration failed, but the lock is no longer this migration's to release (status = {current_u.get('status')!r}); left alone.\n")
                 return False, f"Migration failed: {str(migrate_err)}"
+
+        elif action == "live_change":
+            return run_live_change(vm_name, payload)
 
         elif action == "host_maintenance_enter":
             hostname = payload.get("hostname")
@@ -2706,6 +2741,305 @@ def finish_maintenance_exit(hostname, target_ip, wait=None, poll=None, sleep=Non
     return True, ""
 
 
+# -- live changes to a running VM -----------------------------------------------------------------
+#
+# A change to a VM while it runs is applied by the spark-daemon of the host it runs on (to the
+# running domain and its persistent definition, `POST /api/v1/vm/<name>/live`), after Vali has done
+# the storage and network preparation that needs the cluster, and the VM's row is updated to match,
+# because the domain definition is rebuilt from the row at every start. One change at a time per
+# VM: it takes the same status lock a migration does. What cannot be done live is refused with the
+# reason. Table: docs/vm_lifecycle.md.
+
+LIVE_CHANGE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk")
+# The sata letters and virtio letters a VM's CD-ROMs and data disks use (`sda...`, `vdb...`).
+_LIVE_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+
+
+def vm_nic_mac(vm_name, index):
+    """The MAC generate_vm_xml gives a VM's Nth NIC. One definition, so a NIC attached live has
+    the address the domain would give it at its next start."""
+    import hashlib
+    h = hashlib.md5(f"{vm_name}_nic_{index}".encode()).hexdigest()
+    return f"52:54:00:{h[0:2]}:{h[2:4]}:{h[4:6]}"
+
+
+def vm_nic_entries(network_id):
+    """A VM's NICs as the list of "network" / "network:model" entries its row stores."""
+    raw = str(network_id or "").strip()
+    if not raw:
+        return ["7a68e0d6-11f8-4e89-9430-b3b44b8bc438"]
+    if raw.startswith("["):
+        try:
+            return [str(x) for x in json.loads(raw)]
+        except Exception:
+            return [raw]
+    return [raw]
+
+
+def network_bridge(net):
+    """(bridge, None) for a network a NIC can be hot-attached to, else (None, why)."""
+    if not net:
+        return None, "that network does not exist"
+    if net.get("type") == "vlan" and net.get("vlan_id") is not None:
+        return f"br-vlan-{net.get('vlan_id')}", None
+    if net.get("type") == "overlay" and net.get("vni") is not None:
+        return f"br-ov-{net.get('vni')}", None
+    return None, ("a direct (macvtap) network cannot be attached to a running VM; stop the VM, "
+                  "edit it and start it again")
+
+
+def vm_disk_entries(disks_list):
+    """A VM's disks as the list of entries its row stores ("20GB:container:bus")."""
+    if not disks_list or disks_list == "NONE":
+        return []
+    return [e for e in disks_list.split(",") if e]
+
+
+def _entry_size_gib(entry):
+    import re as _re
+    m = _re.match(r"\A\s*(\d+)\s*(T|TB|TIB|G|GB|GIB)?", entry.split(":")[0], _re.I)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * 1024 if (m.group(2) or "G").upper().startswith("T") else n
+
+
+def post_live_change(host_ip, vm_name, body):
+    """Ask the host the VM runs on to apply one change. Returns (ok, answer-or-error)."""
+    status, answer, err = run_mtls_spark_api_full(host_ip, f"/api/v1/vm/{vm_name}/live", body, timeout=120)
+    if status == 200:
+        return True, answer
+    detail = answer.get("error") if isinstance(answer, dict) else ""
+    return False, detail or err or f"spark-daemon answered {status}"
+
+
+def _set_row(vm_name, **columns):
+    """Update columns of the VM's row. Values are bound as typed literals here, never interpolated raw."""
+    assignments = []
+    for key, value in columns.items():
+        if key not in ("vcpu", "memory", "iso", "network_id", "disks_list", "disk_size"):
+            raise ValueError(f"not a column a live change may write: {key}")
+        # By column, not by the Python type of the value: a numeric column is always an integer
+        # literal (a quoted "4" is a type error in CQL), a text column always a quoted, escaped one.
+        if key in ("vcpu", "memory", "disk_size"):
+            assignments.append(f"{key} = {cql_int(value)}")
+        else:
+            assignments.append(f"{key} = '{cql_escape(value)}'")
+    rc, _, err = run_cql_query(
+        f"UPDATE hydra.vms SET {', '.join(assignments)} WHERE name = '{cql_escape(vm_name)}';")
+    return rc == 0, err
+
+
+def run_live_change(vm_name, payload):
+    """Apply one change to a running VM. Returns (ok, message)."""
+    op = payload.get("op")
+    if op not in LIVE_CHANGE_OPS:
+        return False, "op must be one of " + ", ".join(LIVE_CHANGE_OPS)
+    vm = get_vm_xml_specs(vm_name)
+    if not vm:
+        return False, "VM not found in metadata database."
+    host = vm.get("host_ip") or ""
+    if str(vm.get("state") or "").lower() != "running" or not host:
+        return False, (f"{vm_name} is not running ({vm.get('state') or 'unknown'}); live changes apply to "
+                       "a running VM. A stopped VM is edited in the console.")
+    ok, applied, current, err = run_lwt("/v1/vm/migrate-lock", {"name": vm_name})
+    if not ok:
+        return False, f"The VM's change lock could not be taken ({err}); nothing was changed."
+    if not applied:
+        return False, (f"{vm_name} is busy (status {current.get('status')!r}): a migration or another "
+                       "change is in progress. Nothing was changed.")
+    try:
+        return _live_change_locked(vm_name, vm, host, op, payload)
+    finally:
+        ok_u, applied_u, current_u, err_u = run_lwt("/v1/vm/migrate-unlock", {"name": vm_name})
+        if not ok_u:
+            sys.stderr.write(f"VM {vm_name}: live change finished but its lock could not be released ({err_u}).\n")
+
+
+def _live_change_locked(vm_name, vm, host, op, payload):
+    module = sidon_module()
+
+    if op == "vcpus":
+        count = payload.get("count")
+        ok, answer = post_live_change(host, vm_name, {"op": "vcpus", "count": count})
+        if not ok:
+            return False, answer
+        done, err = _set_row(vm_name, vcpu=count)
+        return True, f"{vm_name} now has {count} vCPUs" + ("" if done else f" (live; its record could not be updated: {err})")
+
+    if op == "memory":
+        ok, answer = post_live_change(host, vm_name, {"op": "memory", "mib": payload.get("mib")})
+        if not ok:
+            return False, answer
+        return True, (f"{vm_name}'s memory balloon is {payload.get('mib')} MiB. This is a runtime setting "
+                      "inside the configured memory; the VM's recorded memory, and so its next start, is unchanged.")
+
+    if op == "cdrom":
+        slot = payload.get("slot")
+        if not isinstance(slot, int) or isinstance(slot, bool) or not 0 <= slot < 26:
+            return False, "slot must be the number of the CD-ROM drive, starting at 0"
+        image = payload.get("image") or None
+        body = {"op": "cdrom", "target": "sd" + _LIVE_LETTERS[slot], "image_vdisk_id": None}
+        if image:
+            if not is_valid_object_name(image):
+                return False, f"Invalid image name: {OBJECT_NAME_ERROR}."
+            image_id = module.image_vdisk_id(image)
+            ok_a, _, detail = sidon_op(host, "attach", image_id)
+            if not ok_a:
+                return False, f"step 'attach image {image_id} on {host}' failed: {detail}"
+            body["image_vdisk_id"] = image_id
+        ok, answer = post_live_change(host, vm_name, body)
+        if not ok:
+            return False, answer
+        slots = [s.strip() for s in str(vm.get("iso") or "").split(",") if s.strip()] if vm.get("iso") else []
+        while len(slots) <= slot:
+            slots.append("__empty__")
+        slots[slot] = image or "__empty__"
+        while slots and slots[-1] == "__empty__":
+            slots.pop()
+        done, err = _set_row(vm_name, iso=",".join(slots))
+        return True, (f"drive {slot + 1} of {vm_name} now holds {image}" if image else f"drive {slot + 1} of {vm_name} is ejected") + (
+            "" if done else f" (live; its record could not be updated: {err})")
+
+    if op == "nic":
+        return _live_nic(vm_name, vm, host, payload)
+
+    return _live_disk(vm_name, vm, host, payload, module)
+
+
+def _live_nic(vm_name, vm, host, payload):
+    action = payload.get("action")
+    entries = vm_nic_entries(vm.get("network_id"))
+    if action == "attach":
+        net_id = str(payload.get("network_id") or "").strip()
+        model = payload.get("model") or "virtio"
+        if not net_id:
+            return False, "network_id is required"
+        bridge, why = network_bridge(get_network_by_id(net_id))
+        if not bridge:
+            return False, why
+        if len(entries) >= 8:
+            return False, "at most 8 network interfaces are supported"
+        index = len(entries)
+        ok, answer = post_live_change(host, vm_name, {
+            "op": "nic", "action": "attach", "mac": vm_nic_mac(vm_name, index),
+            "bridge": bridge, "model": model})
+        if not ok:
+            return False, answer
+        entries.append(f"{net_id}:{model}")
+        done, err = _set_row(vm_name, network_id=json.dumps(entries))
+        return True, f"{vm_name} has a new NIC on {bridge}" + ("" if done else f" (live; its record could not be updated: {err})")
+    index = payload.get("index")
+    if action == "detach" and index == -1:
+        index = len(entries) - 1          # the CLI's "the last one"
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
+        return False, "index must be the position of one of the VM's NICs, starting at 0"
+    if action == "detach":
+        if index != len(entries) - 1:
+            return False, ("only the last NIC can be removed live: the NICs' addresses are derived from their "
+                           "positions, so removing another would change the others' at the next start")
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": vm_nic_mac(vm_name, index)})
+        if not ok:
+            return False, answer
+        entries.pop()
+        done, err = _set_row(vm_name, network_id=json.dumps(entries))
+        return True, f"the last NIC of {vm_name} is removed" + ("" if done else f" (live; its record could not be updated: {err})")
+    if action == "link":
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "link",
+                                                      "mac": vm_nic_mac(vm_name, index),
+                                                      "state": payload.get("state")})
+        if not ok:
+            return False, answer
+        return True, (f"NIC {index + 1} of {vm_name} is {payload.get('state')}. The link state is not part of the "
+                      "VM's record, so it is up again after the VM next starts.")
+    return False, "action must be attach, detach or link"
+
+
+def _live_disk(vm_name, vm, host, payload, module):
+    action = payload.get("action")
+    disks = vm_disk_entries(vm.get("disks_list"))
+    if action == "attach":
+        size = payload.get("size_gib")
+        container = payload.get("container") or get_default_container()
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            return False, "size_gib must be a whole number of GiB, at least 1"
+        if not is_valid_object_name(container):
+            return False, f"Invalid container name: {OBJECT_NAME_ERROR}."
+        index = len(disks)
+        if not 1 <= index < 25:
+            return False, "a running VM can have at most 25 data disks after its boot disk"
+        vdisk_id = module.vdisk_id_for(vm_name, index)
+        ok_c, _, detail = sidon_op(host, "create", vdisk_id, size_bytes=size * 1024 ** 3, container=container)
+        if not ok_c:
+            return False, f"step 'create {vdisk_id}' failed: {detail}"
+        ok_a, _, detail = sidon_op(host, "attach", vdisk_id)
+        if not ok_a:
+            sidon_op(host, "delete", vdisk_id)
+            return False, f"step 'attach {vdisk_id} on {host}' failed: {detail}; the new vdisk was removed"
+        ok, answer = post_live_change(host, vm_name, {
+            "op": "disk", "action": "attach", "vdisk_id": vdisk_id, "target": "vd" + _LIVE_LETTERS[index]})
+        if not ok:
+            sidon_op(host, "detach", vdisk_id)
+            sidon_op(host, "delete", vdisk_id)
+            return False, f"{answer}; the new vdisk was removed"
+        disks.append(f"{size}GB:{container}:virtio")
+        done, err = _set_row(vm_name, disks_list=",".join(disks))
+        return True, f"{vdisk_id} ({size} GiB) is attached to {vm_name} as vd{_LIVE_LETTERS[index]}" + (
+            "" if done else f" (live; its record could not be updated: {err})")
+    index = payload.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(disks):
+        return False, "index must be the position of one of the VM's disks, starting at 0"
+    vdisk_id = module.vdisk_id_for(vm_name, index)
+    if action == "detach":
+        if index == 0:
+            return False, "the boot disk cannot be removed from a running VM"
+        if index != len(disks) - 1:
+            return False, ("only the last disk can be removed: a disk's vdisk is named after its position, so "
+                           "removing another would change the others' names")
+        if payload.get("confirm_delete") is not True:
+            return False, ("removing a disk deletes its data; pass confirm_delete to do it "
+                           f"({vdisk_id}, {_entry_size_gib(disks[index]) or '?'} GiB)")
+        ok, answer = post_live_change(host, vm_name, {"op": "disk", "action": "detach", "target": "vd" + _LIVE_LETTERS[index]})
+        if not ok:
+            return False, answer
+        disks.pop()
+        done, err = _set_row(vm_name, disks_list=",".join(disks) or "NONE")
+        # After the row no longer names it: a failure here leaves an orphan, never a row pointing at nothing.
+        sidon_op(host, "detach", vdisk_id)
+        ok_d, _, detail = sidon_op(host, "delete", vdisk_id)
+        note = "" if ok_d else f" The vdisk could not be deleted ({detail}) and is now an orphan."
+        return True, f"{vdisk_id} is removed from {vm_name}.{note}" + ("" if done else f" Its record could not be updated: {err}")
+    if action == "resize":
+        size = payload.get("size_gib")
+        old = _entry_size_gib(disks[index])
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            return False, "size_gib must be a whole number of GiB, at least 1"
+        if old is None:
+            return False, f"disk {index + 1}'s current size could not be read from the VM's record"
+        if size < old:
+            return False, f"disk {index + 1} is {old} GiB and can only grow ({size} GiB was asked for)"
+        if size == old:
+            return True, f"disk {index + 1} is already {old} GiB"
+        ok_r, _, detail = sidon_op(host, "resize", vdisk_id, size_bytes=size * 1024 ** 3)
+        if not ok_r:
+            return False, f"step 'resize {vdisk_id}' failed: {detail}"
+        parts = disks[index].split(":")
+        parts[0] = f"{size}GB"
+        disks[index] = ":".join(parts)
+        # The storage has grown, so the record follows it whether or not the guest was told.
+        columns = {"disks_list": ",".join(disks)}
+        if index == 0:
+            columns["disk_size"] = size
+        _set_row(vm_name, **columns)
+        ok, answer = post_live_change(host, vm_name, {
+            "op": "disk", "action": "resize", "target": "vd" + _LIVE_LETTERS[index], "size_bytes": size * 1024 ** 3})
+        if not ok:
+            return False, (f"{vdisk_id} was grown to {size} GiB and the record updated, but the running guest "
+                           f"could not be told: {answer}. It sees the new size after its next start.")
+        return True, f"{vdisk_id} is {size} GiB and the guest has been told"
+    return False, "action must be attach, detach or resize"
+
+
 def handle_maintenance_request(payload, send_json):
     """`POST /api/v1/hosts/maintenance`: enter or leave maintenance for a host.
 
@@ -3008,6 +3342,25 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(500, {"error": err_msg})
                 
+        elif self.path == "/api/v1/vms/live":
+            name = payload.get("name")
+            change = payload.get("change")
+            if not name or not isinstance(change, dict):
+                self.send_json(400, {"error": "Parameters name and change (an object with op) required."})
+                return
+            if not is_valid_object_name(name):
+                self.send_json(400, {"error": f"Invalid VM name: {OBJECT_NAME_ERROR}."})
+                return
+            if change.get("op") not in LIVE_CHANGE_OPS:
+                self.send_json(400, {"error": "change.op must be one of " + ", ".join(LIVE_CHANGE_OPS)})
+                return
+            body = dict(change)
+            body["vm_name"] = name
+            success, err_msg, detail = submit_and_wait_task("vali", "live_change", body, timeout_polls=MIGRATE_TIMEOUT_POLLS)
+            if success:
+                self.send_json(200, {"name": name, "status": "changed", "message": detail})
+            else:
+                self.send_json(409, {"error": err_msg})
         elif self.path == "/api/v1/vms/balance":
             aggressive = payload.get("aggressive", False)
             # Trigger DRS check in a background thread immediately

@@ -100,6 +100,16 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
    `virsh -c qemu:///system migrate --live --persistent --undefinesource <vm_name> qemu+ssh://root@<target_ip>/system tcp://<target_ip>` (after the storage steps below; `--unsafe` is not used)
     And updates the VM's `host_ip` in ScyllaDB on completion. To enable compatibility during live migrations, VM guest CPUs are defined with `<cpu mode='host-model'/>` when running under KVM.
 
+### Changes to a running VM
+
+`valcli vm.live` (`POST /api/v1/vms/live`, task `live_change`) applies one change to a running VM: vCPUs, the
+memory balloon, CD-ROM media, NICs and disks. Vali takes the VM's status lock (the one a migration takes, so a
+change and a migration never overlap), does the storage and network preparation (a new vdisk and its attach, an
+image attach, the bridge for a network), asks the host's spark-daemon to apply the change to the running domain and
+its persistent definition, and updates the row, because the domain is rebuilt from the row at every start. The table
+of what exists and what does not is in [vm_lifecycle.md](./vm_lifecycle.md). New domains reserve vCPU headroom when the
+cluster setting `vm_hotplug_headroom` is `true`.
+
 ### One path for moving a guest
 
 Manual migration, DRS, evacuation (maintenance) and the HA restart all end in a migrate or a start, so

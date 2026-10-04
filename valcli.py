@@ -3359,6 +3359,80 @@ def cmd_vm_edit():
         print(f"Error updating VM: {data}")
         sys.exit(1)
 
+LIVE_USAGE = """Usage: valcli vm.live <name> <change>
+  vcpus <count>                          Bring more vCPUs online (up to the VM's maximum)
+  memory <mib>                           Set the memory balloon (runtime only, within the configured memory)
+  cdrom <slot> <image>|eject             Put an image in CD-ROM drive <slot> (0 is the first), or eject it
+  nic attach <network_id> [model]        Add a NIC on a VLAN or overlay network
+  nic detach                             Remove the last NIC
+  nic link <index> up|down               Set a NIC's link state (until the VM next starts)
+  disk attach <size_gib> [container]     Create and attach a data disk
+  disk resize <index> <size_gib>         Grow a disk and tell the running guest
+  disk detach <index> --confirm-delete   Remove the last data disk and DELETE its data
+Changes apply to the running VM and to its record. A stopped VM is edited in the console."""
+
+
+def live_change_from_args(args):
+    """The change object `vm.live` sends, from its words. Raises SystemExit with the usage on a
+    word it does not understand, so a typo is an error and never a different change."""
+    def whole(word):
+        try:
+            return int(word)
+        except (TypeError, ValueError):
+            raise SystemExit(LIVE_USAGE)
+
+    words = list(args)
+    if not words:
+        raise SystemExit(LIVE_USAGE)
+    op = words.pop(0)
+    if op == "vcpus" and len(words) == 1:
+        return {"op": "vcpus", "count": whole(words[0])}
+    if op == "memory" and len(words) == 1:
+        return {"op": "memory", "mib": whole(words[0])}
+    if op == "cdrom" and len(words) == 2:
+        return {"op": "cdrom", "slot": whole(words[0]), "image": None if words[1] == "eject" else words[1]}
+    if op == "nic" and words:
+        action = words.pop(0)
+        if action == "attach" and len(words) in (1, 2):
+            change = {"op": "nic", "action": "attach", "network_id": words[0]}
+            if len(words) == 2:
+                change["model"] = words[1]
+            return change
+        if action == "detach" and not words:
+            return {"op": "nic", "action": "detach", "index": None}
+        if action == "link" and len(words) == 2 and words[1] in ("up", "down"):
+            return {"op": "nic", "action": "link", "index": whole(words[0]), "state": words[1]}
+    if op == "disk" and words:
+        action = words.pop(0)
+        if action == "attach" and len(words) in (1, 2):
+            change = {"op": "disk", "action": "attach", "size_gib": whole(words[0])}
+            if len(words) == 2:
+                change["container"] = words[1]
+            return change
+        if action == "resize" and len(words) == 2:
+            return {"op": "disk", "action": "resize", "index": whole(words[0]), "size_gib": whole(words[1])}
+        if action == "detach" and len(words) == 2 and words[1] == "--confirm-delete":
+            return {"op": "disk", "action": "detach", "index": whole(words[0]), "confirm_delete": True}
+    raise SystemExit(LIVE_USAGE)
+
+
+def cmd_vm_live(argv):
+    if len(argv) < 2:
+        raise SystemExit(LIVE_USAGE)
+    name, change = argv[0], live_change_from_args(argv[1:])
+    if change.get("op") == "nic" and change.get("action") == "detach" and change.get("index") is None:
+        change.pop("index")
+        change["index"] = -1     # resolved by Vali to the last NIC
+    print(f"Applying {change['op']} change to VM '{name}'...")
+    status, body, err = run_mtls_spark_api_full(
+        "127.0.0.1", "/api/v1/vm/live", {"name": name, "change": change}, timeout=300)
+    if status != 200 or not isinstance(body, dict):
+        detail = body.get("error") if isinstance(body, dict) and body.get("error") else err
+        print("Error: %s" % (detail or "HTTP %s" % status))
+        sys.exit(1)
+    print("Success: %s" % (body.get("message") or "the VM was changed."))
+
+
 SAGA_BIN = "/usr/local/bin/saga"
 
 
@@ -3417,6 +3491,7 @@ def print_usage():
     print("  valcli vm.create <name> <vc> <mem> Create a new VM configuration and disks")
     print("  valcli vm.delete <name>            Delete VM configuration and its disks")
     print("  valcli vm.edit <name> [options]    Modify VM CPU, memory, disks, network, or ISO")
+    print("  valcli vm.live <name> <change>     Change a RUNNING VM: vCPUs, CD-ROM, NICs, disks (valcli vm.live for the list)")
     print("  valcli vm.on <vm_name>             Power ON a virtual machine")
     print("  valcli vm.off <vm_name>            Power OFF (destroy) a virtual machine")
     print("  valcli vm.migrate <name> <host>    Migrate a running VM to another cluster node")
@@ -3509,6 +3584,8 @@ def main():
         cmd_vm_delete()
     elif cmd == "vm.edit":
         cmd_vm_edit()
+    elif cmd == "vm.live":
+        cmd_vm_live(sys.argv[2:])
     elif cmd == "vm.on":
         if len(sys.argv) < 3:
             print("Error: VM Name is required.")

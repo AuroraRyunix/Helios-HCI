@@ -1978,6 +1978,207 @@ def parse_virsh_domiflist(text):
     return interfaces
 
 
+# -- Live changes to a running VM (docs/vm_lifecycle.md) -------------------------------------
+#
+# Each change is applied to the running domain AND to its persistent definition (`--live
+# --config`), so the two cannot disagree after the next start; the memory balloon is the one runtime
+# -only setting (see below). The plan for a change is a pure
+# function of the request and what libvirt says the domain is (`plan_live_change`): it returns the
+# virsh invocations to run, or the reason the change is not possible. Nothing a caller sends is
+# interpolated into a command: names and targets are matched against fixed patterns, and device XML
+# is built here from validated fields (the disks' and CD-ROMs' through helios_sidon, the same
+# builders the domain is created from).
+
+LIVE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk")
+LIVE_NIC_MODELS = ("virtio", "e1000", "e1000e", "rtl8139")
+LIVE_MAC_RE = re.compile(r"\A[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}\Z")
+LIVE_BRIDGE_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,15}\Z")
+# vda is the boot disk and is never hot-removed; sda... are the CD-ROM drives.
+LIVE_DATA_DISK_RE = re.compile(r"\Avd[b-z]\Z")
+LIVE_ANY_DISK_RE = re.compile(r"\Avd[a-z]\Z")
+LIVE_CDROM_RE = re.compile(r"\Asd[a-z]\Z")
+LIVE_MIN_MEMORY_MIB = 128
+# The placeholder a step's argv uses for the temporary XML file its `xml` is written to.
+LIVE_XML_PATH = "{xml}"
+
+
+def _live_int(value):
+    """An integer, never a bool, never a string that merely looks like one."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def plan_live_change(name, payload, info):
+    """What to run to apply `payload` to the running domain `name`, or why it cannot be.
+
+    `info` is what libvirt reports: {"state", "vcpu_current", "vcpu_max", "mem_max_kib"}.
+    Returns (steps, error). A step is {"argv": [...], "xml": str or None, "what": str}; the
+    argv may contain LIVE_XML_PATH, replaced by the path of a temporary file holding `xml`.
+    An empty list of steps with no error means the domain already has what was asked for.
+    """
+    if not valid_name(name):
+        return None, "Invalid VM name"
+    if str(info.get("state") or "").lower() != "running":
+        return None, ("the VM is %s; live changes apply to a running VM (edit a stopped one "
+                      "through the console)" % (info.get("state") or "not running"))
+    op = payload.get("op")
+    if op not in LIVE_OPS:
+        return None, "op must be one of " + ", ".join(LIVE_OPS)
+
+    if op == "vcpus":
+        count = _live_int(payload.get("count"))
+        if count is None or count < 1:
+            return None, "count must be a whole number of vCPUs, at least 1"
+        current, maximum = info.get("vcpu_current"), info.get("vcpu_max")
+        if current is None or maximum is None:
+            return None, "the domain's vCPU counts could not be read"
+        if count == current:
+            return [], None
+        if count < current:
+            return None, ("removing vCPUs from a running guest is not supported (the guest "
+                          "OS has to release them); stop the VM to reduce %d to %d" % (current, count))
+        if count > maximum:
+            return None, ("%d vCPUs is above this domain's maximum of %d. The maximum is fixed when "
+                          "the domain is defined: enable vm_hotplug_headroom and restart the VM "
+                          "to raise it" % (count, maximum))
+        return [{"argv": VIRSH + ["setvcpus", name, str(count), "--live", "--config"],
+                 "xml": None, "what": "set vCPUs to %d" % count}], None
+
+    if op == "memory":
+        mib = _live_int(payload.get("mib"))
+        if mib is None or mib < LIVE_MIN_MEMORY_MIB:
+            return None, "mib must be a whole number of MiB, at least %d" % LIVE_MIN_MEMORY_MIB
+        maximum = info.get("mem_max_kib")
+        if maximum is None:
+            return None, "the domain's memory maximum could not be read"
+        if mib * 1024 > maximum:
+            return None, ("%d MiB is above this domain's maximum of %d MiB. The maximum is fixed "
+                          "when the domain is defined: enable vm_hotplug_headroom and restart the "
+                          "VM to raise it" % (mib, maximum // 1024))
+        # --live only: this is the balloon, a runtime target between the domain's floor and its
+        # configured memory. The persistent definition is rebuilt from the VM's record at every
+        # start, so a --config here would claim a persistence it does not have.
+        return [{"argv": VIRSH + ["setmem", name, str(mib * 1024), "--live"],
+                 "xml": None, "what": "set the memory balloon to %d MiB" % mib}], None
+
+    if op == "cdrom":
+        target = payload.get("target")
+        if not isinstance(target, str) or not LIVE_CDROM_RE.match(target):
+            return None, "target must be a CD-ROM drive such as sda"
+        image = payload.get("image_vdisk_id")
+        if image in (None, ""):
+            xml = ("<disk type='file' device='cdrom'><driver name='qemu' type='raw'/>"
+                   "<target dev='%s' bus='sata'/><readonly/></disk>" % target)
+            what = "eject the media from %s" % target
+        else:
+            if not valid_name(image):
+                return None, "Invalid image vdisk id"
+            xml = load_sidon_module().cdrom_xml(image, target[2])
+            what = "put %s in %s" % (image, target)
+        return [{"argv": VIRSH + ["update-device", name, LIVE_XML_PATH, "--live", "--config"],
+                 "xml": xml, "what": what}], None
+
+    if op == "nic":
+        action = payload.get("action")
+        mac = payload.get("mac")
+        if not isinstance(mac, str) or not LIVE_MAC_RE.match(mac):
+            return None, "mac must be a MAC address such as 52:54:00:aa:bb:cc"
+        if action == "attach":
+            bridge, model = payload.get("bridge"), payload.get("model", "virtio")
+            if not isinstance(bridge, str) or not LIVE_BRIDGE_RE.match(bridge):
+                return None, "bridge must be a bridge name (letters, digits, '.', '-', '_', at most 15)"
+            if model not in LIVE_NIC_MODELS:
+                return None, "model must be one of " + ", ".join(LIVE_NIC_MODELS)
+            xml = ("<interface type='bridge'><mac address='%s'/><source bridge='%s'/>"
+                   "<model type='%s'/></interface>" % (mac, bridge, model))
+            return [{"argv": VIRSH + ["attach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "attach a NIC on %s" % bridge}], None
+        if action == "detach":
+            xml = "<interface type='bridge'><mac address='%s'/></interface>" % mac
+            return [{"argv": VIRSH + ["detach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "detach the NIC %s" % mac}], None
+        if action == "link":
+            state = payload.get("state")
+            if state not in ("up", "down"):
+                return None, "state must be up or down"
+            return [
+                {"argv": VIRSH + ["domif-setlink", name, mac, state], "xml": None,
+                 "what": "set the link %s now" % state},
+                {"argv": VIRSH + ["domif-setlink", name, mac, state, "--config"], "xml": None,
+                 "what": "set the link %s in the definition" % state},
+            ], None
+        return None, "action must be attach, detach or link"
+
+    # op == "disk"
+    action = payload.get("action")
+    target = payload.get("target")
+    if action == "attach":
+        vdisk = payload.get("vdisk_id")
+        if not isinstance(target, str) or not LIVE_DATA_DISK_RE.match(target):
+            return None, "target must be a data disk such as vdb (vda is the boot disk)"
+        if not valid_name(vdisk):
+            return None, "Invalid vdisk id"
+        xml = load_sidon_module().disk_xml(vdisk, target[2], info.get("vcpu_current") or 1)
+        return [{"argv": VIRSH + ["attach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                 "xml": xml, "what": "attach %s as %s" % (vdisk, target)}], None
+    if action == "detach":
+        if not isinstance(target, str) or not LIVE_DATA_DISK_RE.match(target):
+            return None, "target must be a data disk such as vdb (the boot disk cannot be hot-removed)"
+        xml = ("<disk type='network' device='disk'><target dev='%s' bus='virtio'/></disk>" % target)
+        return [{"argv": VIRSH + ["detach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                 "xml": xml, "what": "detach %s" % target}], None
+    if action == "resize":
+        size = _live_int(payload.get("size_bytes"))
+        if not isinstance(target, str) or not LIVE_ANY_DISK_RE.match(target):
+            return None, "target must be a disk such as vdb"
+        if size is None or size < 1024 * 1024 or size % 1024:
+            return None, "size_bytes must be a whole number of KiB, at least 1 MiB"
+        return [{"argv": VIRSH + ["blockresize", name, target, str(size // 1024)],
+                 "xml": None, "what": "tell the guest's disk %s it is now %d bytes" % (target, size)}], None
+    return None, "action must be attach, detach or resize"
+
+
+def read_live_domain_info(name):
+    """The state, current and maximum vCPUs and maximum memory of a domain, or None if absent."""
+    rc, stdout, _ = run_argv(VIRSH + ["dominfo", name], timeout=20)
+    if rc != 0:
+        return None
+    info = parse_virsh_dominfo(stdout)
+    result = {"state": info.get("state"), "vcpu_current": info.get("vcpus"),
+              "vcpu_max": None, "mem_max_kib": info.get("memory_kib")}
+    rc, out, _ = run_argv(VIRSH + ["vcpucount", name, "--maximum", "--live"], timeout=20)
+    if rc == 0:
+        try:
+            result["vcpu_max"] = int(out.strip().split()[0])
+        except (IndexError, ValueError):
+            pass
+    return result
+
+
+def run_live_step(step):
+    """Run one planned step. Returns (ok, detail). Its XML goes through a temporary file that
+    exists only for the length of the call."""
+    argv = list(step["argv"])
+    path = None
+    try:
+        if step.get("xml") is not None:
+            import tempfile
+            handle = tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False)
+            handle.write(step["xml"])
+            handle.close()
+            path = handle.name
+            argv = [path if part == LIVE_XML_PATH else part for part in argv]
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        if rc != 0:
+            return False, (stderr or stdout).strip() or ("virsh exited %s" % rc)
+        return True, ""
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def parse_virsh_list(text):
     """Parse `virsh list --all` into [{"name", "state"}].
 
@@ -2021,10 +2222,19 @@ def parse_virsh_dominfo(text):
         except (IndexError, ValueError):
             memory_kib = None
 
+    used_kib = None
+    used_raw = fields.get("used memory", "")
+    if used_raw:
+        try:
+            used_kib = int(used_raw.split()[0])
+        except (IndexError, ValueError):
+            used_kib = None
+
     return {
         "state": fields.get("state", ""),
         "vcpus": vcpus,
         "memory_kib": memory_kib,
+        "used_memory_kib": used_kib,
         "autostart": fields.get("autostart", "").lower() == "enable",
     }
 
@@ -3069,6 +3279,11 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             return
         elif self.path == "/api/v1/vm/balance":
             self.forward_to_vali("/api/v1/vms/balance", method="POST")
+            return
+        elif self.path == "/api/v1/vm/live":
+            # A change to a running VM: Vali picks the host the VM is on, applies it through
+            # that host's spark-daemon and keeps the VM's row consistent.
+            self.forward_to_vali("/api/v1/vms/live", method="POST")
             return
         elif self.path == "/api/v1/host/maintenance":
             self.forward_to_vali("/api/v1/hosts/maintenance", method="POST")
@@ -4157,6 +4372,13 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                 return True
             self.handle_vm_power(name)
             return True
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "live":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_live(name)
+            return True
 
         return False
 
@@ -4272,6 +4494,34 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                         virsh_status_for(stderr))
             return
         self.send_json_response(200, {"undefined": True})
+
+    def handle_vm_live(self, name):
+        """Apply one live change to a running VM and to its persistent definition.
+
+        409 with the reason when the change is not possible or libvirt refused a step, naming
+        the step; nothing is half-reported as done: the steps that ran are listed either way.
+        """
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        info = read_live_domain_info(name)
+        if info is None:
+            self.reject("Domain %s was not found on this host" % name, 404)
+            return
+        steps, problem = plan_live_change(name, payload, info)
+        if problem:
+            self.send_json_response(409, {"error": problem, "applied": []})
+            return
+        applied = []
+        for step in steps:
+            ok, detail = run_live_step(step)
+            if not ok:
+                self.send_json_response(409, {
+                    "error": "failed to %s: %s" % (step["what"], detail), "applied": applied})
+                return
+            applied.append(step["what"])
+        self.send_json_response(200, {"applied": applied, "state": info.get("state")})
 
     def handle_vm_power(self, name):
         payload, error = self.read_json_payload()

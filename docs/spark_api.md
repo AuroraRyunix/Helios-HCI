@@ -68,6 +68,9 @@ All are mTLS on `:9099`, JSON in and out. Errors return
 | GET | `/api/v1/vm/{name}/info` | -- | `{"state","vcpus","memory_kib","autostart"}` |
 | POST | `/api/v1/vm/define` | `{"name","xml_b64"}` | `{"defined":true}` |
 | POST | `/api/v1/vm/undefine` | `{"name","keep_nvram":bool}` | `{"undefined":true}` |
+| POST | `/api/v1/vm/{name}/live` | `{"op":"vcpus"\|"memory"\|"cdrom"\|"nic"\|"disk", ...}` (fields per op in [vm_lifecycle.md](./vm_lifecycle.md)) | `{"applied":[...],"state"}`, or 409 `{"error","applied"}` naming the step that failed |
+| POST | `/api/v1/vm/live` | `{"name","change":{...}}` | forwarded to Vali: apply the change on the host the VM runs on and update its record |
+| GET | `/api/v1/host/domains` | -- | `{"domains":[{"name","state"}]}` (every libvirt domain on the host; what a rejoining host is reconciled against) |
 | POST | `/api/v1/vm/{name}/power` | `{"action":"start"\|"destroy"\|"reboot"\|"shutdown"\|"reset"}` | `{"state":str}` |
 
 `xml_b64` is base64 so domain XML never passes through a shell. The daemon decodes it to a

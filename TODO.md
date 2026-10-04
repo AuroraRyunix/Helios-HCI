@@ -104,11 +104,8 @@ Raised from using the lab; the owner asked for each of these to be thought throu
 * [x] **Automatic VM migration, as one story.** *(2026-10-04; docs/vali.md "One path for moving a guest", test_automatic_migration.py)* One landing-host test shared by migration and placement (a manual migration could be aimed at a DEGRADED or FENCED host); DRS's cooldown and a per-guest cooldown now read the persistent history. Left, as decisions: the memory overcommit fallback in `select_best_start_host`, and CPU/accelerator compatibility (libvirt's own refusal).
 * [x] **How Mipha heals a host that rejoins.** *(2026-10-04; see the host-states item above and docs/host_states.md)*
 * **A full review of every service:** changes, endpoints, who calls them, what is unused.
-* **VM changes while running, and ESXi parity.** A list of what can be changed on a running VM today
-  (CPU/memory hot-add, disk add/grow/remove, NIC add/remove, CD-ROM insert/eject, boot order, console
-  type, name, annotations, snapshots, resource limits/shares) against what ESXi allows, and a plan.
-* [x] **`test2` hangs at the boot options screen** although it was given a valid CD-ROM. *(2026-10-04; the cause is by reading: the domain used `<os><boot dev>`, which UEFI ignores; per-device boot orders now, see docs/vm_lifecycle.md. Needs a boot of the lab's ISO to confirm.)*
-* **A VM cannot be edited after it is created** in Phoenix.
+* [x] **VM changes while running, and ESXi parity.** *(2026-10-04; docs/vm_lifecycle.md)* The table, the live operations (`valcli vm.live`: vCPU hot-add, memory balloon, CD-ROM, NIC, disk) and a prioritised parity plan. Live checks pending (NBD CD-ROM change, `blockresize` on NBD, vCPU headroom); memory hot-add is in the plan.
+* [x] **A VM cannot be edited after it is created** in Phoenix. *(2026-10-04: `/vms/<name>/edit` for a stopped VM; see docs/vm_lifecycle.md.)*
 
 ## P1 — The Phoenix console lost function in the port (2026-10-02, restored 2026-10-03; needs a pass in a real browser)
 

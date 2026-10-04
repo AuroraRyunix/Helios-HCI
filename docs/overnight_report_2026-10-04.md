@@ -187,9 +187,44 @@ a 30-minute per-guest cooldown. Documented in `docs/vali.md` ("One path for movi
 overcommit); CPU/accelerator compatibility is libvirt's refusal.
 Status: **done**.
 
+### B. Editing VMs, the running-VM change list and ESXi parity: stopped-VM edit built and tested; live changes built (commands and XML tested, not run on a host)
+
+*Environment.* Elixir/Erlang were not installed; Erlang/OTP 25 came from apt and Elixir 1.17.3 from its release archive, so `mix test`
+ran: 934 tests at the baseline, 972 now, 0 failures.
+
+*Stopped VM (console).* `/vms/<name>/edit` is the creation page in edit mode: `Form.from_vm`, `Vms.update_vm/2`, `Vms.edit_errors/2`.
+Everything but the name is editable; disks only grow, keep their container, and only the last can be removed; storage is changed in the
+order that leaves least behind and the row is written by compare-and-swap on the VM still being stopped. The VM's page offers Edit only
+when stopped. Network (PXE) is offered as a boot device again. Tests: `vms_edit_test.exs` (29), `edit_live_test.exs` (9), one updated.
+*Not exercised against a cluster:* the row's compare-and-swap (statement and parameter order are asserted).
+
+*Running VM.* New: spark `POST /api/v1/vm/<name>/live` (`plan_live_change`, a pure planner; `--live --config` for everything except the
+memory balloon), Vali task `live_change` (status lock, storage and network preparation, row update), `POST /api/v1/vms/live`,
+`valcli vm.live`. Ops: vCPU hot-add, memory balloon, CD-ROM insert/change/eject, NIC add/remove/link, disk add/grow/remove. Create-time
+vCPU headroom behind the cluster setting `vm_hotplug_headroom` (default off, unchanged XML). A real find on the way: the legacy
+`/api/vms/update` drives CD-ROMs through a stale path, writes unescaped values into CQL, and ignores every `virsh` return code.
+*Tests:* `test_vm_live_change.py` (30), `test_vm_live_vali.py` (40, including an integer column that would have been written as a string).
+*Not verified, and said so in `docs/vm_lifecycle.md`:* that `update-device` swaps an NBD-backed CD-ROM, that `blockresize` makes qemu re-read an
+NBD disk's size, and vCPU headroom on a real guest. Memory hot-add was deliberately not built (a balloon above the booted memory boots the
+guest with the larger amount if it has no balloon driver); it is in the plan.
+
+*Documents.* `docs/vm_lifecycle.md`: the edit rules, the live operations, the attribute-by-attribute table against ESXi (the ESXi column is from
+general knowledge, labelled as unverified), and a prioritised parity plan (nine items with effort and dependencies).
+
+Status: **done in code and tests; live verification needed**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification
+
+- B. Stopped-VM edit: in the console, create a VM with an ISO, stop it, open Edit, grow the disk, add a second disk, change vCPU, save; start it.
+  Pass: `valcli vm.list` shows the new vCPU; `valcli storage.list` shows the grown and the new vdisk; the guest boots with them. Remove the second
+  disk again: its vdisk is gone from `storage.list`.
+- B. Live changes (set `INSERT INTO hydra.cluster_settings (key, value) VALUES ('vm_hotplug_headroom', 'true');`, restart the VM first for vCPUs):
+  `valcli vm.live <vm> vcpus 4` (pass: `nproc` in the guest shows 4 after onlining; `virsh dumpxml --inactive` shows `current='4'`);
+  `valcli vm.live <vm> cdrom 0 <image>` then `eject` (pass: the guest sees the medium change; `virsh domblklist` shows the socket);
+  `valcli vm.live <vm> disk attach 5` then `disk resize 1 10` (pass: `lsblk` in the guest shows the disk and then 10G: if the guest keeps the
+  old size, `blockresize` does not refresh NBD disks: report it) then `disk detach 1 --confirm-delete`.
 
 - E. Rejoin reconcile, on the lab: with a VM running on `.43`, stop spark-daemon on `.43` (not the VM) until Mipha marks it DOWN
   and restarts the VM elsewhere, then start spark-daemon again. Pass: the leader's log (`journalctl -u mipha | grep rejoining`)
@@ -224,6 +259,11 @@ Status: **done**.
   and check the order swaps.
 
 ## Decisions for the owner
+
+- **vCPU headroom default** (`vm_hotplug_headroom`): off, because it changes guest-visible hardware (the guest sees up to 4x its vCPUs as
+  possible-but-offline). Turn on for the lab to exercise hot-add, or make it the default?
+- **Rename and removal from the middle** need a stable id per VM and per disk instead of ids derived from names and positions: a
+  migration of every vdisk id. Worth doing, and when? (parity plan item 7)
 
 - Memory overcommit on placement: `select_best_start_host` returns the first healthy host when no host has enough free
   memory, so a start or evacuation can land on a host that cannot hold the guest. Keep, or refuse?
