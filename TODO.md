@@ -115,7 +115,7 @@ Raised from using the lab; the owner asked for each of these to be thought throu
 * **VM changes while running, and ESXi parity.** A list of what can be changed on a running VM today
   (CPU/memory hot-add, disk add/grow/remove, NIC add/remove, CD-ROM insert/eject, boot order, console
   type, name, annotations, snapshots, resource limits/shares) against what ESXi allows, and a plan.
-* **`test2` hangs at the boot options screen** although it was given a valid CD-ROM.
+* [x] **`test2` hangs at the boot options screen** although it was given a valid CD-ROM. *(2026-10-04; the cause is by reading: the domain used `<os><boot dev>`, which UEFI ignores; per-device boot orders now, see docs/vm_lifecycle.md. Needs a boot of the lab's ISO to confirm.)*
 * **A VM cannot be edited after it is created** in Phoenix.
 
 ## P1 — The Phoenix console lost function in the port (2026-10-02, restored 2026-10-03; needs a pass in a real browser)

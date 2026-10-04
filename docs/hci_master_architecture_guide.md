@@ -738,7 +738,7 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 To ensure compatibility across all hypervisor nodes:
 - **Video Model**: VMs use the standard VGA video model (`<model type='vga' vram='16384' heads='1' primary='yes'/>`). Other video drivers like `qxl` are avoided because QEMU ROM files (such as `vgabios-qxl.bin`) are missing on standard EL 10.2 hypervisor repositories. The VGA BIOS binary `/usr/share/seavgabios/vgabios-stdvga.bin` is pre-installed on every hypervisor node.
 - **Dual Display Console**: Both VNC and SPICE graphic displays are enabled concurrently with automatic ports, offering high performance and smooth VM console interactivity. A VirtIO-serial spicevmc channel target is mapped to `com.redhat.spice.0` for SPICE guest communication.
-- **Explicit Boot Devices**: The generated XML explicitly specifies both CD-ROM (`<boot dev='cdrom'/>`) and Hard Disk (`<boot dev='hd'/>`) boot elements to prevent guest boot loops after OS installations.
+- **Explicit Boot Devices**: The generated XML gives each boot device its own order (`<boot order='N'/>` on the disk, the CD-ROMs and, for network boot, the NIC) and carries no domain-level `<os><boot dev=...>` list, which UEFI firmware ignores. The CD-ROM is first when there is an image (or `boot_device` is `cdrom`); the disk stays in the list after it. See [vm_lifecycle.md](./vm_lifecycle.md#boot-order).
 - **UEFI Boot Menu**: Boot menu options are enabled via `<bootmenu enable='yes' timeout='3000'/>` allowing direct boot path configuration.
 
 

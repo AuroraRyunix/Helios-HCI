@@ -2127,14 +2127,10 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         if ":" in first_entry:
             primary_container = first_entry.split(":")[1]
 
-    # OS / Boot configuration (UEFI vs BIOS)
-    if boot_device:
-        boot_devices = f"<boot dev='{boot_device}'/>"
-    else:
-        has_iso = False
-        if iso:
-            has_iso = any(x.strip() and x.strip() != "__empty__" for x in iso.split(","))
-        boot_devices = "<boot dev='cdrom'/>\n    <boot dev='hd'/>" if has_iso else "<boot dev='hd'/>"
+    # OS / Boot configuration (UEFI vs BIOS). What boots first is a per-device boot order on the
+    # disks and CD-ROMs below, because UEFI ignores the domain-level `<os><boot dev>` list; see
+    # helios_sidon.boot_orders for the semantics, which are the same as vali's.
+    boot_devices = ""
 
     if firmware == "uefi":
         nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
@@ -2201,13 +2197,17 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
     # touches a block device, so there is no /dev node to promote, demote or leak, and no
     # kernel client in the path.
     module = sidon_module()
+    cdrom_specs = [x.strip() for x in iso.split(",") if x.strip()] if iso else []
+    orders = module.boot_orders(
+        boot_device, disk_count, len([s for s in cdrom_specs if s != "__empty__"]))
     for idx in range(disk_count):
         disk_devices_xml += module.disk_xml(
-            module.vdisk_id_for(name, idx), letters[idx % 26], vcpu)
+            module.vdisk_id_for(name, idx), letters[idx % 26], vcpu,
+            boot_order=orders["disk"].get(idx))
 
     # CD-ROM device XML
-    if iso:
-        cdrom_specs = [x.strip() for x in iso.split(",") if x.strip()]
+    if cdrom_specs:
+        cd_index = 0
         for idx, spec in enumerate(cdrom_specs):
             sata_letter = letters[idx % 26]
             if spec != "__empty__":
@@ -2218,7 +2218,9 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
                 # moment images moved from DRBD devices to Sidon sockets. Every call fell
                 # through to the slugified fallback, so the query was cost without effect.
                 disk_devices_xml += module.cdrom_xml(
-                    module.image_vdisk_id(spec), sata_letter)
+                    module.image_vdisk_id(spec), sata_letter,
+                    boot_order=orders["cdrom"].get(cd_index))
+                cd_index += 1
 
     has_kvm = False
     try:

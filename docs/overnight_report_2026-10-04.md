@@ -77,6 +77,28 @@ Stop/start semantics (order, gates, error latching, state store stopped last) ar
 
 Status: **done in code; live verification needed**.
 
+### C. test2 hangs at the boot options screen: generator fixed and tested, needs a live boot
+
+*Root cause (by reading the code and firmware behaviour; not reproduced on hardware).* Vali's
+`generate_vm_xml` expressed the boot order as `<os><boot dev='cdrom'/><boot dev='hd'/></os>`. That
+is a legacy BIOS setting: OVMF, the UEFI firmware that the console's form defaults to, ignores it and
+boots in its own default order, so a VM created with an ISO and an empty disk did not reliably boot
+the CD-ROM and could stop at the firmware boot menu. The console tier's own builder was worse: it
+emitted only the one `boot_device` entry (no fallback) and interpolated the value into the XML
+unescaped. The Phoenix form's default (`boot_device` empty) and its `iso`/`disks_list` strings were
+checked by reading `form.ex`/`vm.ex`: the image reaches `iso` as a comma-separated list and disks as
+`size:container:bus`; nothing was found wrong there. Separately, the Sidon disk path ignores the bus
+chosen for a disk (always virtio): noted under "found but not fixed".
+
+*Change.* `helios_sidon.boot_orders` plans per-device orders; `disk_xml`/`cdrom_xml` take `boot_order`;
+Vali and the console tier's builder emit `<boot order='N'/>` and no `<os><boot>`; NIC boot is
+supported for `network`. Semantics are documented in the new `docs/vm_lifecycle.md` (Boot order).
+
+*Tests.* `test_vm_boot_order.py`, 14 tests (ISO plus empty disk, `cdrom`, `hd`, `network`, UEFI and BIOS,
+empty drives, several disks, none, markup injection); 8 fail against the old Vali.
+
+Status: **done in code; live verification needed**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification
@@ -95,6 +117,12 @@ Status: **done in code; live verification needed**.
   (a guest that ignores ACPI is powered off after 20 s). Then `cluster start` must still bring everything
   back in order (hydra-db, daruk, then the rest): the start path shares the loop that was changed.
 
+- C. Boot order, on the lab: create a VM in the console with the lab's ISO and a new empty disk (default
+  boot device), start it, open its console. Pass: it boots the installer without stopping at the boot
+  options screen. `ssh root@<host> virsh dumpxml <vm> | grep -n "boot order"` shows `order='1'` on the
+  cdrom and `order='2'` on the disk, and no `<boot dev=` under `<os>`. Then set the boot device to `hd`
+  and check the order swaps.
+
 ## Decisions for the owner
 
 (none yet)
@@ -103,4 +131,7 @@ Status: **done in code; live verification needed**.
 
 - Rust test `vdisk::tests::group_commit::with_two_replicas_a_repair_makes_both_identical_to_the_owner` failed
   once in a full parallel `cargo test` and passed on every rerun alone; timing-dependent.
+- The Sidon disk path in `generate_vm_xml` ignores the bus recorded for a disk (every disk is virtio,
+  `vdX`), although the form offers other buses. Not changed: it is a behaviour decision (and the editing
+  flow in item B has to say what a bus change means).
 - `test_sidon_owns_its_mounts` fails 8 ways in this container (environment), unrelated to this work.

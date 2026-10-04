@@ -1117,16 +1117,24 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         if ":" in first_entry:
             primary_container = first_entry.split(":")[1]
 
-    if boot_device:
-        if boot_device == "cdrom":
-            boot_devices = "<boot dev='cdrom'/>\n    <boot dev='hd'/>"
-        else:
-            boot_devices = "<boot dev='hd'/>\n    <boot dev='cdrom'/>"
+    # What boots first. Per-device boot orders (`<boot order='N'/>`) are what both firmwares
+    # honour; the domain-level `<os><boot dev=.../>` list is a legacy BIOS setting that UEFI
+    # ignores, so a UEFI guest given an install image booted whatever OVMF's own default order
+    # found first and stopped at its boot menu when that was an empty disk. The two cannot be
+    # mixed in one domain, so the legacy list is emitted only for the (dead) non-Sidon disk
+    # path below. Semantics: Sidon's `boot_orders` and docs/vm_lifecycle.md.
+    cdrom_specs = [x.strip() for x in (iso or "").split(",")
+                   if x.strip() and x.strip() != "__empty__"]
+    orders = sidon_module().boot_orders(
+        boot_device,
+        0 if disks_list == "NONE" else (len(disks_list.split(",")) if disks_list else 1),
+        len(cdrom_specs))
+    if using_sidon():
+        boot_devices = ""
+    elif boot_device == "cdrom" or (not boot_device and cdrom_specs):
+        boot_devices = "<boot dev='cdrom'/>\n    <boot dev='hd'/>"
     else:
-        has_iso = False
-        if iso:
-            has_iso = any(x.strip() and x.strip() != "__empty__" for x in iso.split(","))
-        boot_devices = "<boot dev='cdrom'/>\n    <boot dev='hd'/>" if has_iso else "<boot dev='hd'/>"
+        boot_devices = "<boot dev='hd'/>\n    <boot dev='cdrom'/>"
 
     if firmware == "uefi":
         nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
@@ -1204,7 +1212,8 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
             # opens a block device, so there is no /dev node to promote, demote or leak --
             # which is also why the start path attaches instead of running drbdadm.
             disk_devices_xml += sidon.disk_xml(
-                sidon.vdisk_id_for(name, idx), dev_letter, vcpu)
+                sidon.vdisk_id_for(name, idx), dev_letter, vcpu,
+                boot_order=orders["disk"].get(idx))
             continue
         if bus == "virtio":
             driver_opts = f"name='qemu' type='raw' cache='none' io='native' queues='{vcpu}' iothread='1'"
@@ -1218,6 +1227,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     </disk>"""
 
     if iso:
+        cd_index = 0
         for idx, spec in enumerate(iso.split(",")):
             if spec.strip() and spec.strip() != "__empty__":
                 sata_letter = letters[idx % 26]
@@ -1225,7 +1235,9 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
                 # path contained "/dev/", so it stopped matching when images became Sidon
                 # sockets and every call fell through to the slug anyway.
                 disk_devices_xml += sidon_module().cdrom_xml(
-                    sidon_module().image_vdisk_id(spec.strip()), sata_letter)
+                    sidon_module().image_vdisk_id(spec.strip()), sata_letter,
+                    boot_order=orders["cdrom"].get(cd_index))
+                cd_index += 1
 
     global KVM_CACHE, VMWARE_CACHE
     has_kvm = False
@@ -1340,6 +1352,8 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         net_id = parts[0]
         nic_model = parts[1] if len(parts) > 1 else "virtio"
         
+        nic_boot = sidon_module().boot_element(orders["nic"].get(idx))
+
         net = get_network_by_id(net_id)
         if net:
             if net.get("type") == "direct":
@@ -1361,7 +1375,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     <interface type='direct'>
       <mac address='{mac_addr}'/>
       <source dev='{uplink_dev}' mode='bridge'/>
-      <model type='{nic_model}'/>
+      <model type='{nic_model}'/>{nic_boot}
     </interface>"""
             elif net.get("type") == "vlan" and net.get("vlan_id") is not None:
                 vlan_id = net.get("vlan_id")
@@ -1369,7 +1383,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     <interface type='bridge'>
       <mac address='{mac_addr}'/>
       <source bridge='br-vlan-{vlan_id}'/>
-      <model type='{nic_model}'/>
+      <model type='{nic_model}'/>{nic_boot}
     </interface>"""
             elif net.get("type") == "overlay" and net.get("vni") is not None:
                 vni = net.get("vni")
@@ -1377,14 +1391,14 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     <interface type='bridge'>
       <mac address='{mac_addr}'/>
       <source bridge='br-ov-{vni}'/>
-      <model type='{nic_model}'/>
+      <model type='{nic_model}'/>{nic_boot}
     </interface>"""
         else:
             interfaces_xml += f"""
     <interface type='bridge'>
       <mac address='{mac_addr}'/>
       <source bridge='virbr0'/>
-      <model type='{nic_model}'/>
+      <model type='{nic_model}'/>{nic_boot}
     </interface>"""
 
     if audio_enabled:

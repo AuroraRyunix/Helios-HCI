@@ -505,7 +505,52 @@ def image_vdisk_id(name):
     return "img-" + slug.strip("-")[:28]
 
 
-def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR):
+def boot_element(order):
+    """The per-device boot entry, or nothing. A boot order on a device is what both firmwares
+    honour: SeaBIOS reads it, and OVMF reads *only* that -- the domain-level `<os><boot dev>`
+    list is a legacy BIOS setting that UEFI ignores, so a VM that relied on it booted whatever
+    the firmware's own default order picked, and stopped at the boot menu when that was an
+    empty disk."""
+    return "\n      <boot order='%d'/>" % order if order else ""
+
+
+def boot_orders(boot_device, disk_count, cdrom_count, nic_count=1):
+    """Who boots first, as per-device boot orders (1 is first).
+
+    Returns {"disk": {index: n}, "cdrom": {index: n}, "nic": {index: n}}. `boot_device` is
+    the VM's recorded choice, `hd`, `cdrom` or `network`; empty (or anything else) is the
+    default.
+
+    * `cdrom`: every CD-ROM that has an image, then the boot disk.
+    * `hd`: the boot disk, then the CD-ROMs, so an installer is still reachable if the disk
+      turns out to be empty.
+    * `network`: the first NIC, then the boot disk, then the CD-ROMs.
+    * default: CD-ROMs first when there are any -- a new VM with an install image is meant to
+      boot the installer and its disk is empty -- and the boot disk when there are none.
+
+    The boot disk is the first disk; the other disks are left to the firmware. Whichever device
+    is first, the others stay in the list after it, so a medium that is not bootable falls
+    through to the next instead of stopping at a menu.
+    """
+    first_disk = ("disk", 0) if disk_count > 0 else None
+    cdroms = [("cdrom", i) for i in range(cdrom_count)]
+    nic = [("nic", 0)] if nic_count > 0 else []
+    disks = [first_disk] if first_disk else []
+    if boot_device == "network":
+        sequence = nic + disks + cdroms
+    elif boot_device == "hd":
+        sequence = disks + cdroms
+    elif boot_device == "cdrom" or cdroms:
+        sequence = cdroms + disks
+    else:
+        sequence = disks
+    orders = {"disk": {}, "cdrom": {}, "nic": {}}
+    for position, (kind, index) in enumerate(sequence, start=1):
+        orders[kind][index] = position
+    return orders
+
+
+def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None):
     """The libvirt <disk> element for an image-backed CD-ROM.
 
     The same NBD-over-unix shape as `disk_xml`, because an image is an ordinary vdisk that
@@ -526,11 +571,12 @@ def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR):
         "      </source>",
         "      <target dev='sd%s' bus='sata'/>" % dev_letter,
         "      <readonly/>",
+    ] + ([boot_element(boot_order).strip("\n")] if boot_order else []) + [
         "    </disk>",
     ])
 
 
-def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR):
+def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR, boot_order=None):
     """The libvirt <disk> element for a Sidon-backed vdisk.
 
     `type='network'` with a unix transport: qemu speaks NBD to the local daemon over the
@@ -544,5 +590,7 @@ def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR):
         "\n        <host transport='unix' socket='%s'/>"
         "\n      </source>"
         "\n      <target dev='vd%s' bus='virtio'/>"
+        "%s"
         "\n    </disk>"
-    ) % (max(1, int(vcpu)), vdisk_id, nbd_socket(vdisk_id, nbd_dir), dev_letter)
+    ) % (max(1, int(vcpu)), vdisk_id, nbd_socket(vdisk_id, nbd_dir), dev_letter,
+         boot_element(boot_order))
