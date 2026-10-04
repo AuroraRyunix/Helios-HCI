@@ -732,6 +732,12 @@ def cmd_renew(args):
     config = cluster_config()
     vip = args.vip or config.get("vip")
     hosts = cluster_hosts(config)
+    if args.nodes and args.rotate_ca:
+        # Rotation prunes the old CA at the end. On a subset that strands every node left out,
+        # which still trusts only the CA that was just removed from the others.
+        print("refusing --nodes with --rotate-ca: a CA rotation covers every node or none.",
+              file=sys.stderr)
+        return 1
     if args.nodes:
         wanted = set(part.strip() for part in args.nodes.split(",") if part.strip())
         hosts = [host for host in hosts if host["ip"] in wanted]

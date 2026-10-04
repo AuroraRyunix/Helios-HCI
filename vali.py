@@ -3361,6 +3361,57 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
+class ReloadingServerContext(object):
+    """Mutual-TLS server context that picks up renewed certificates without a restart.
+
+    The context used to be built once at start, so a certificate renewed on disk (docs/mtls_lifecycle.md
+    restarts only spark-daemon) went on being presented from memory until the old one expired, and a
+    rotated CA kept being checked against the old one. The files' modification times are compared at
+    each accepted connection and the context rebuilt when any changed; a rebuild that fails keeps the
+    working context and says so.
+    """
+
+    def __init__(self, cert, key, ca):
+        self.paths = (cert, key, ca)
+        self._stamp = None
+        self._context = None
+        self._lock = threading.Lock()
+        self._refresh()
+
+    def _stat(self):
+        return tuple(os.stat(p).st_mtime_ns for p in self.paths)
+
+    def _build(self):
+        cert, key, ca = self.paths
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.load_cert_chain(certfile=cert, keyfile=key)
+        context.load_verify_locations(cafile=ca)
+        context.verify_mode = ssl.CERT_REQUIRED
+        return context
+
+    def _refresh(self):
+        with self._lock:
+            try:
+                stamp = self._stat()
+            except OSError:
+                return
+            if stamp == self._stamp:
+                return
+            try:
+                self._context = self._build()
+                self._stamp = stamp
+            except (OSError, ssl.SSLError) as exc:
+                if self._context is None:
+                    raise
+                sys.stderr.write("[tls] certificate files changed but could not be loaded (%s); "
+                                 "keeping the ones in use\n" % exc)
+                self._stamp = stamp
+
+    def wrap_socket(self, sock, **kwargs):
+        self._refresh()
+        return self._context.wrap_socket(sock, **kwargs)
+
+
 def main():
     print("Vali VM Manager service daemon starting...")
     init_db_schema()
@@ -3384,10 +3435,7 @@ def main():
                   f"listen without authentication.")
             sys.exit(1)
 
-    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_context.load_cert_chain(certfile=node_cert, keyfile=node_key)
-    ssl_context.load_verify_locations(cafile=ca_cert)
-    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    ssl_context = ReloadingServerContext(node_cert, node_key, ca_cert)
 
     server_address = ("0.0.0.0", 9095)
     httpd = ThreadingHTTPServer(server_address, ValiAPIHandler)

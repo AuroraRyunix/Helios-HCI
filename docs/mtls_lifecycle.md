@@ -112,6 +112,16 @@ wraps the listening socket, so it must be restarted before it will present a new
 `node.crt`. `impa` restarts one node at a time and verifies it before moving on, so at no
 point is more than one node's 9099 listener down.
 
+**Other long-lived servers (audit, 2026-10-04).** Spark-daemon is not the only one. Catalyst (9091) and Vali
+(9095) now reload their certificate files when the modification time changes (checked at each accepted
+connection; a file that cannot be loaded keeps the working context and says so), so a renewal reaches them
+with no restart. **Sidon's replication port (9105) and Agahnim's console listener still load their material once
+at start.** A renewed `node.crt` therefore reaches them only at their next restart, and a rotated CA is not
+trusted by a Sidon that started before it. Restarting Sidon detaches the NBD sockets of running guests (it does
+not re-attach on start), so it cannot be added to `impa`'s restart step; do it in a maintenance window, one node
+at a time, with the guests moved off, and before the old certificate expires. `--rotate-ca` with `--nodes` is
+refused: a rotation covers every node or none.
+
 Existing TLS sessions are unaffected; they finish on the certificate they started with.
 
 ### Order of operations — leaf renewal (the common case)

@@ -193,5 +193,95 @@ class AgahnimDoesNotLogTheConsoleToken(unittest.TestCase):
         self.assertIn("a_log_line_never_carries_the_whole_token", src)
 
 
+class LanayruDestroyTouchesOnlyItsOwnGuests(unittest.TestCase):
+    def test_exact_names_only(self):
+        lanayru = load("lanayru.py", "lanayru_h")
+        self.assertTrue(lanayru.owns_vm("web", "web-control-01"))
+        self.assertTrue(lanayru.owns_vm("web", "web-control-03"))
+        for other in ("webapp-1", "web", "web-control-1", "web-control-010", "web-controller-01",
+                      "xweb-control-01", "", None):
+            self.assertFalse(lanayru.owns_vm("web", other), other)
+
+    def test_a_name_with_regex_characters_is_literal(self):
+        lanayru = load("lanayru.py", "lanayru_h2")
+        self.assertFalse(lanayru.owns_vm("a.c", "abc-control-01"))
+        self.assertTrue(lanayru.owns_vm("a.c", "a.c-control-01"))
+
+    def test_the_delete_loop_uses_it(self):
+        self.assertNotIn("vm_name.startswith(cluster_name)", read("lanayru.py"))
+
+
+class TheAPIServersReloadRenewedCertificates(unittest.TestCase):
+    """impa renews certificates and restarts only spark-daemon. Catalyst and Vali built their TLS
+    context once, so they kept presenting the old certificate from memory until it expired."""
+
+    def make_certs(self, directory, name):
+        import subprocess
+        key, crt = os.path.join(directory, name + ".key"), os.path.join(directory, name + ".crt")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                        "-nodes", "-keyout", key, "-out", crt, "-subj", "/CN=" + name, "-days", "2"],
+                       check=True, stdin=subprocess.DEVNULL, capture_output=True)
+        return crt, key
+
+    def test_a_changed_file_rebuilds_the_context_and_a_bad_one_keeps_the_old(self):
+        import shutil
+        import tempfile
+        if shutil.which("openssl") is None:
+            self.skipTest("openssl is needed to make throwaway certificates")
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        for name in ("catalyst.py", "vali.py"):
+            crt, key = self.make_certs(directory, "one")
+            module = load(name, "reload_" + name[:-3])
+            ctx = module.ReloadingServerContext(crt, key, crt)
+            first = ctx._context
+            ctx._refresh()
+            self.assertIs(ctx._context, first, "rebuilt with nothing changed")
+            crt2, key2 = self.make_certs(directory, "two")
+            shutil.copy(crt2, crt)
+            shutil.copy(key2, key)
+            os.utime(crt, ns=(1, 2 * 10 ** 18))
+            ctx._refresh()
+            self.assertIsNot(ctx._context, first, name + " kept the old certificate in memory")
+            kept = ctx._context
+            with open(crt, "w") as handle:
+                handle.write("not a certificate")
+            os.utime(crt, ns=(1, 3 * 10 ** 18))
+            ctx._refresh()
+            self.assertIs(ctx._context, kept, "a corrupt file replaced the working context")
+
+    def test_both_servers_use_it(self):
+        for name in ("catalyst.py", "vali.py"):
+            self.assertIn("ssl_context = ReloadingServerContext(", read(name))
+
+
+class LogosCountsEachByteOnce(unittest.TestCase):
+    def test_only_physical_nics_count_toward_host_throughput(self):
+        import tempfile
+        logos = load("logos.py", "logos_net")
+        root = tempfile.mkdtemp()
+        sysfs = os.path.join(root, "sys")
+        for iface, physical in (("eth0", True), ("eth0.20", False), ("br0", False), ("tap1", False)):
+            os.makedirs(os.path.join(sysfs, iface))
+            if physical:
+                os.makedirs(os.path.join(sysfs, iface, "device"))
+        header = "h1\nh2\n"
+        row = "%s: %d 0 0 0 0 0 0 0 %d 0 0 0 0 0 0 0\n"
+        proc = os.path.join(root, "dev")
+        with open(proc, "w") as handle:
+            handle.write(header + row % ("lo", 999, 999) + row % ("eth0", 100, 200)
+                         + row % ("eth0.20", 100, 200) + row % ("br0", 100, 200) + row % ("tap1", 100, 200))
+        self.assertEqual(logos.get_net_stats(proc, sysfs), (100, 200))
+
+    def test_when_sysfs_cannot_say_nothing_is_zeroed(self):
+        import tempfile
+        logos = load("logos.py", "logos_net2")
+        root = tempfile.mkdtemp()
+        proc = os.path.join(root, "dev")
+        with open(proc, "w") as handle:
+            handle.write("h1\nh2\n" + "eth0: 5 0 0 0 0 0 0 0 7 0 0 0 0 0 0 0\n")
+        self.assertEqual(logos.get_net_stats(proc, os.path.join(root, "absent")), (5, 7))
+
+
 if __name__ == "__main__":
     unittest.main()

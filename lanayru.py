@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 import time
 import json
 import uuid
@@ -9,6 +10,15 @@ import socket
 import ssl
 import hashlib
 import base64
+
+def owns_vm(cluster_name, vm_name):
+    """True only for a VM this module created for `cluster_name`: `<cluster>-control-0N`.
+
+    Destroy used to match on a name prefix, so destroying a cluster called `web` also deleted a
+    guest called `webapp-1`, its vdisk and its rows.
+    """
+    return re.fullmatch(re.escape(cluster_name) + r"-control-0[0-9]", vm_name or "") is not None
+
 
 def load_schema_module():
     """Import the ordered cluster schema, wherever this process is running from.
@@ -461,7 +471,7 @@ def destroy_lanayru_worker(task_id, cluster_name, created_at):
                     try:
                         vm_info = json.loads(line)
                         vm_name = vm_info.get("name", "")
-                        if vm_name.startswith(cluster_name):
+                        if owns_vm(cluster_name, vm_name):
                             vms_to_delete.append(vm_info)
                     except Exception:
                         pass

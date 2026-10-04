@@ -129,11 +129,21 @@ def get_disk_stats():
         pass
     return 0, 0
 
-def get_net_stats():
-    rx_bytes = 0
-    tx_bytes = 0
+def is_physical_nic(iface, sysfs="/sys/class/net"):
+    """True for a device backed by hardware (it has a `device` link in sysfs).
+
+    Host throughput used to sum every interface but `lo`, so a frame crossing a NIC, its VLAN
+    sub-interface, the bridge over it and a guest's tap was counted three or four times.
+    Bridges, VLANs, taps, vxlan and veth devices have no `device` link; bond masters do not
+    either, and their member NICs are counted instead, which is the same bytes once.
+    """
+    return os.path.exists(os.path.join(sysfs, iface, "device"))
+
+
+def get_net_stats(proc="/proc/net/dev", sysfs="/sys/class/net"):
+    totals = {}
     try:
-        with open("/proc/net/dev", "r") as f:
+        with open(proc, "r") as f:
             lines = f.readlines()
         for line in lines[2:]:
             if ":" in line:
@@ -143,11 +153,14 @@ def get_net_stats():
                     continue
                 stats = parts[1].split()
                 if len(stats) >= 9:
-                    rx_bytes += int(stats[0])
-                    tx_bytes += int(stats[8])
+                    totals[iface] = (int(stats[0]), int(stats[8]))
     except Exception:
         pass
-    return rx_bytes, tx_bytes
+    physical = [i for i in totals if is_physical_nic(i, sysfs)]
+    # A host where sysfs cannot say (a container, an odd kernel) gets the old, over-counting
+    # answer and not a zero.
+    chosen = physical or list(totals)
+    return sum(totals[i][0] for i in chosen), sum(totals[i][1] for i in chosen)
 
 def get_interface_stats():
     stats = {}

@@ -347,3 +347,26 @@ Status: **built in isolation; the real work (a second site) not possible here**.
   commits, `vhost-user-blk`, the replication listener and driver) stay open; see each section for what is missing.
 - Mimir's checks (quarantine age, maintenance consistency, the replication-factor rule) and the Phoenix items in TODO.md under "console lost
   function" were not reached; nothing was changed there.
+
+### Second audit pass (read-only agents over every service; findings checked before acting)
+
+Fixed (tests added): Catalyst and Vali pick up renewed certificates (impa restarted only spark-daemon); `lanayru` destroy deleted every VM
+whose name merely started with the cluster name, vdisks included; `impa --rotate-ca --nodes` is refused; and the items listed in
+`docs/service_review.md` 4.1/4.2.
+Found and **not fixed** (each is a design or a larger piece of work; none is a one-line change):
+- **Lanayru cannot produce a working guest cluster, and reports success.** The overlay branch runs only for a segment id starting with `ov-`, which nothing
+  produces; the VM disk XML is hand-built (a block device pointing at a socket) instead of `sidon.disk_xml`; every `virsh define/start`, cloud-init write and
+  `genisoimage` result is unchecked; steps 4 to 6 are log lines and sleeps with no code behind them; the cluster is then marked `active`. Also: cloud-init
+  hard-codes gateway `172.16.10.254` for nodes on `172.16.11.x`; static node IPs sit inside the DHCP range; VNIs and subnets are hard-coded with no uniqueness
+  check, so a second deploy collides; `network_id` is stored as a name so Vali regenerates the VM on `virbr0`; the DHCP-refresh submission lacks `service` and is
+  refused. Needs the owner's decision on whether Lanayru is a supported feature before it is rebuilt.
+- Urbosa: a tier-1 router namespace gets its uplink only on the node holding the VIP, so north-south traffic from other nodes is broken or random; per-host dnsmasq
+  with no shared lease store; veth names exceed 15 characters for VNI >= 10,000,000 (no range check); the VXLAN MTU is set to 1500 and silently rejected on a 1500 underlay.
+- Console token: it comes from the unauthenticated WebSocket query string and reaches a CQL statement unescaped (injection when the cqlsh fallback runs);
+  `console_sessions` has no TTL and nothing deletes rows; Traefik's access log may record the token in the URL, which undoes Agahnim's redaction.
+- Logos: host throughput now counts physical NICs only (it summed every interface, so the same bytes were counted three or four times; fixed, tested). Still open: one
+  failing table fails the whole batch including host CPU and memory samples.
+- Impa: rollback restores node certificates but not the staged CA directory; a failed rotation deletes the staged new CA key so it can only be rolled back.
+- Sidon (9105) and Agahnim load their certificates once at start; see `docs/mtls_lifecycle.md`.
+- Agahnim: an `accept()` error ends the whole accept loop; no timeout on the first read; the whole `Sec-WebSocket-Protocol` list is echoed.
+- Hard-coded guest root password in `lanayru.py` (two places, in git history): needs rotating and moving to a generated per-cluster secret. Value deliberately not repeated here.
