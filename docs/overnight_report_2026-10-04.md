@@ -336,3 +336,14 @@ Status: **built in isolation; the real work (a second site) not possible here**.
   `vdX`), although the form offers other buses. Not changed: it is a behaviour decision (and the editing
   flow in item B has to say what a bus change means).
 - `test_sidon_owns_its_mounts` fails 8 ways in this container (environment), unrelated to this work.
+- The rollout (`deploy_updates.py`) never writes the Sidon unit file, so a change to the unit's text reaches a node only through
+  provisioning; every other service's unit is written by both. Not changed: it needs the unit text moved into one place first.
+- `static/app.js` still names Sidon's metrics `aether_*` (`aether_storage_pools`, `aether_heal_pending`, `aether_split_brain`, ...).
+  They are the metric names the exporter emits, so renaming is a coordinated change in the exporter and the page, and component
+  naming is the owner's decision.
+- The Rust tests that build certificates (`replicate::site_tls`) need the `openssl` command, and fail loudly without it rather than
+  skipping.
+- Items from the earlier sections of this report that are listed as "not built" (re-attach of NBD sockets at Sidon start, overlapped
+  commits, `vhost-user-blk`, the replication listener and driver) stay open; see each section for what is missing.
+- Mimir's checks (quarantine age, maintenance consistency, the replication-factor rule) and the Phoenix items in TODO.md under "console lost
+  function" were not reached; nothing was changed there.
