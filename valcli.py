@@ -170,7 +170,7 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
         return -1, {}, str(e)
 
 
-def run_mtls_spark_api_full(ip, path, payload, method="POST"):
+def run_mtls_spark_api_full(ip, path, payload, method="POST", timeout=120):
     """Like run_mtls_spark_api, but says which HTTP status the body came with.
 
     `run_mtls_spark_api` returns rc 0 for any answer that has a JSON body, including a 503
@@ -188,7 +188,7 @@ def run_mtls_spark_api_full(ip, path, payload, method="POST"):
     req = urllib.request.Request(f"https://{ip}:9099{path}", data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8")), ""
     except urllib.error.HTTPError as e:
         try:
@@ -1712,6 +1712,35 @@ def cmd_storage_move(egroup_id, disk, node):
     print("Moved %s to disk %s (%d bytes, %s)." % (
         body.get("egroup_id"), body.get("to"), body.get("bytes") or 0, body.get("hash")))
     print("The old copy stays until the sweep has seen it surplus on two passes.")
+
+
+def cmd_storage_takeover(vdisk_id, host):
+    """Finish a live migration's storage handover by hand.
+
+    A migration that moved the guest but could not finish the handover leaves its disks
+    served through the destination's forwarder; this runs the takeover on that node again.
+    It is safe to repeat: it reads Hydra afresh, asks the owner to let go if it still serves
+    the disk, wins the claim and fences the replicas, and does nothing if the node already
+    owns the disk. Run it on the node the guest is running on.
+    """
+    target = None
+    for h in _storage_hosts():
+        if host in (h.get("ip"), h.get("hostname")):
+            target = h.get("ip")
+    if not target:
+        print("Error: no node %r in the cluster." % host)
+        sys.exit(1)
+    status, body, err = run_mtls_spark_api_full(
+        target, "/api/v1/dfs/vdisk", {"op": "takeover", "vdisk_id": vdisk_id}, timeout=330)
+    if status != 200 or not isinstance(body, dict):
+        detail = body.get("error") if isinstance(body, dict) and body.get("error") else err
+        print("Error: %s" % (detail or "HTTP %s" % status))
+        sys.exit(1)
+    if body.get("already_owned"):
+        print("%s is already owned by %s." % (vdisk_id, host))
+        return
+    print("%s: %s took over from %s at epoch %s." % (
+        vdisk_id, host, body.get("previous_owner") or "nobody", body.get("epoch")))
 
 
 def _compact_request(argv):
@@ -3425,6 +3454,7 @@ def print_usage():
     print("  valcli storage.placement [N]            Which disk of each node holds which extent groups")
     print("  valcli storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
     print("  valcli storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
+    print("  valcli storage.takeover <vdisk> <node>  Finish a migration's storage handover on the node the guest runs on (safe to repeat)")
     print("  valcli storage.sweep                    Reclaim unreferenced extent groups on every node; says what is waiting")
     print("  valcli storage.scrub                    Re-hash every sealed extent group against its seal hash")
     print("  valcli storage.compact [--apply]        Plan (or with --apply, make) compaction of sparse sealed groups")
@@ -3620,6 +3650,11 @@ def main():
         cmd_storage_compact(sys.argv[2:])
     elif cmd == "storage.dedup.estimate":
         cmd_storage_dedup_estimate(sys.argv[2:])
+    elif cmd == "storage.takeover":
+        if len(sys.argv) < 4:
+            print("Usage: valcli storage.takeover <vdisk> <node>")
+            sys.exit(1)
+        cmd_storage_takeover(sys.argv[2], sys.argv[3])
     elif cmd == "storage.move":
         if len(sys.argv) != 5:
             print("Usage: valcli storage.move <egroup_id> <disk> <node>")

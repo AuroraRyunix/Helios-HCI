@@ -176,6 +176,38 @@ cutover instant: a VM resumes on the destination before its storage has moved, a
 ownership follows at leisure. It is deliberately not a special case — it is the same path
 a post-failover VM uses before locality catches up, so it is exercised constantly.
 
+**Handover (`attach` with `forward`, then `takeover`).** The destination of a live migration
+attaches the disk with `forward: true` *before* `virsh migrate`: when another node owns the disk
+the export is served by a forwarder behind a switch (`sidon/src/handover.rs`), so the destination
+qemu has a socket to open and the writer stays the source. (When nobody owns it, or this node
+already does, there is nothing to forward to and it is an ordinary attach.) After the guest has
+resumed, `takeover` flips the switch under the NBD session the guest already holds, in this order
+(`handover::handover`, pure over a `Steps` trait so every step is fault-injected in the tests):
+
+1. **stall** guest I/O at the switch and let what was admitted finish, so every write the owner
+   acknowledged is on every replica before it is asked to let go;
+2. **release** — ask the owner (`OP_RELEASE`, wire opcode 12) to drain its journal, stop serving and
+   drop its socket. It refuses while a client is still connected to its socket (the source qemu on
+   its way out; it waits `SIDON_RELEASE_WAIT`, 30 s) and keeps serving if the drain fails. A refusal,
+   an unreachable owner or an older Sidon that does not know the opcode ends the handover here;
+3. **claim and fence** — the ownership compare-and-swap (e to e+1, owner and epoch together), the
+   fence of every reachable replica, the journal tail adopted — exactly the takeover above;
+4. **install** the opened vdisk behind the switch and release the stall.
+
+A failure before step 2 changes nothing. A failure after the owner released leaves guest I/O on
+the destination failing (the owner says it no longer serves the disk) until `takeover` is run
+again, and running it again is safe: it reads Hydra afresh, skips the release when Hydra already
+names this node, and the claim is conditional on what it just read. `SIDON_HANDOVER_TIMEOUT` (120 s)
+bounds the wait for the owner's drain. The error names the step and says what was left. Design:
+[dfs/ownership.md §5](./dfs/ownership.md), decision D-34.
+
+**Restarting Sidon removes the NBD sockets of the disks it serves.** Sidon does not re-attach on
+start, so every VM using a disk on a node must be stopped or migrated away before that node's
+Sidon is restarted. A
+Sidon restart under a running guest ends that guest's disk with I/O errors; restoring the sockets
+at start is listed in TODO.md because it needs the claim, fence and journal recovery done at
+start-up, which is not a small change.
+
 ## 4. Purah
 
 The curator, running inside Sidon. Three jobs, all background, none on the guest's path:

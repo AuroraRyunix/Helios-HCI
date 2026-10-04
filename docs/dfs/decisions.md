@@ -859,3 +859,30 @@ that nothing held or referenced is ever reclaimed and nothing is reclaimed on fi
 vdisk is gone. **Not addressed:** an open group that rows *do* reference (its vdisk detached after
 committing extents into it) stays open for ever and so is never scrubbed or compacted, which both
 require a sealed group; sealing such a group needs the vdisk's drain excluded and is its own change.
+
+**D-34 — a live migration hands a vdisk over by stall, release, claim, fence, install, under the
+guest's own NBD session.** The migration of a VM with Sidon-served disks failed because the
+destination qemu opened a socket nobody served. Attaching on the destination fixes that, but
+attaching *as owner* before the guest moves would fence the running source out, and attaching
+*after* the migration is too late for qemu. **Taken:** attach in forwarding mode first (the writer
+stays the source, §5 of ownership.md), migrate, then `takeover` on the destination: hold guest I/O
+at a switch (admit nothing, let admitted requests finish), ask the owner to drain and stop serving
+(`OP_RELEASE`, opcode 12 -- 11 was taken by the replica-drop request), win the owner-and-epoch
+compare-and-swap, fence the replicas and adopt the journal, install the local vdisk behind the same
+session and release the stall. The sequence is `handover::handover`, a function of injectable steps,
+and the tests run a fake cluster through every step failing, concurrent handovers and writes racing
+the change. **Rejected:** *quiescing the guest and reattaching qemu* (a pause the guest sees, and
+libvirt cannot reopen a disk under a running domain); *taking ownership before the migration* (the
+source is fenced out while it still runs the guest); *a lock around every request instead of a
+stall* (cost on the hot path, and no instant at which nothing is in flight); *skipping the release
+and relying on the fence alone* (safe, but the owner would keep serving a disk it no longer owns
+until its next append fails, and its journal would be left holding data the new owner has to adopt
+from a replica instead of finding in groups). **Consequences:** a failure before the owner releases
+changes nothing and vali detaches the destination's forwarders; after it, the destination's I/O fails
+until `takeover` is run again, which is safe to repeat (it re-reads Hydra, skips the release when Hydra
+names this node, and the claim is conditional on what it read), and each re-claim moves the epoch up,
+never down. The guest on the destination does not notice a successful handover. **Not addressed:**
+Sidon does not re-attach on start, so a Sidon restart removes the sockets of running VMs' disks and
+such VMs must be moved or stopped first; the release path against a real journal is covered by the
+live check in the overnight report, not by a unit test, because it needs Hydra.
+

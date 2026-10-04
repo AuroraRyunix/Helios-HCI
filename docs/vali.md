@@ -97,8 +97,46 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
 2. **Overload Trigger**: A host is considered overloaded if its memory usage exceeds `85%` or if its usage is more than `15%` higher than the average cluster node utilization.
 3. **Rebalancing Action**: If an overloaded node is detected, Vali selects a running VM on that host and queues a `migrate` task to live-migrate it to the node with the highest available memory.
 4. **Live Migration**: Vali executes live migrations via libvirt:
-   `virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe <vm_name> qemu+ssh://root@<target_ip>/system`
+   `virsh -c qemu:///system migrate --live --persistent --undefinesource <vm_name> qemu+ssh://root@<target_ip>/system tcp://<target_ip>` (after the storage steps below; `--unsafe` is not used)
     And updates the VM's `host_ip` in ScyllaDB on completion. To enable compatibility during live migrations, VM guest CPUs are defined with `<cpu mode='host-model'/>` when running under KVM.
+
+### What a migration does to the storage
+
+The destination qemu opens an NBD socket per disk as the migration starts, so the destination's
+Sidon must be serving those sockets before `virsh migrate` runs. (Until this was wired the migration
+attached nothing and every `host.maintenance.enter`, evacuation and DRS move failed with
+`Failed to connect ... .sock: No such file or directory`; the start and HA paths attached before
+they defined the domain and the migration did not.) The order is:
+
+1. **pre-clean** the stale definition on the target and restore the NVRAM;
+2. **attach** each disk the domain XML names on the target (`domain_vdisk_ids`, the rule
+   `generate_vm_xml` uses): data disks in forwarding mode, so the writer stays the source; image
+   (CD-ROM) vdisks ordinarily;
+3. **`virsh migrate`**, with a long timeout (the daemon's default of 45 s would kill any migration
+   that takes longer to copy memory);
+4. **commit** the placement and drop the lock, conditionally (`/v1/vm/migrate-commit`);
+5. **takeover** on the target for each data disk (Sidon: stall, release by the old owner, claim and
+   fence, install — [dfs/ownership.md §5](./dfs/ownership.md)), retried three times.
+
+Failure, by step; every error message names the step:
+
+| Fails at | Left behind | What vali does |
+|---|---|---|
+| attach | nothing on the source; earlier forwarders on the target | detaches the forwarders it created, aborts, releases the lock |
+| virsh migrate | forwarders on the target; the source owns every disk and no epoch moved | detaches the forwarders it created (never images — they are shared), releases the lock |
+| commit | the guest runs on the target, the row says the source | reports it as a record to repair, not a failed migration |
+| takeover | the guest runs on the target; its disks are served through the forwarder, or fail until retried | the task fails with `step 'takeover'`, the reason, and `valcli storage.takeover <vdisk> <node>` (safe to repeat) |
+
+An attach that would make the target the *owner* (Hydra names no other owner) is refused: the guest
+is running on the source, and taking the disk would fence the source out.
+
+Not a storage matter, but the same boundary: cross-host live migration also needs the two hosts to
+agree on CPU and accelerator. The lab's `.41` has KVM and `.42`/`.43` are nested TCG, so a migration
+between them can be refused by libvirt for that reason; that is separate from the storage steps above
+and is reported by libvirt's own error.
+
+Restarting a node's Sidon removes the sockets of the disks it serves (it does not re-attach on start):
+move or stop every VM on a node before restarting its Sidon.
 
 ### The migration lock
 
@@ -221,8 +259,10 @@ conditioning them too would wedge a host the first time the two crossed.
 ### B. Live Migration Command Syntax (libvirt)
 To execute manual VM live migrations outside `valcli` (useful for troubleshooting):
 ```bash
-# Live migrate 'my-linux-vm' to host 10.10.102.223 securely without shared storage requirement checks
-virsh -c qemu:///system migrate --live --persistent --undefinesource --unsafe my-linux-vm qemu+ssh://root@10.10.102.223/system
+# Live migrate 'my-linux-vm' to host 10.10.102.223. The destination's Sidon must already serve each
+# disk's NBD socket (attach with forward=true on that node), and `valcli storage.takeover` finishes it:
+# prefer `valcli vm.migrate`, which does all of it.
+virsh -c qemu:///system migrate --live --persistent --undefinesource my-linux-vm qemu+ssh://root@10.10.102.223/system tcp://10.10.102.223
 ```
 
 ### C. Direct Database Task Querying

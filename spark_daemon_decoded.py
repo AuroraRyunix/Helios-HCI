@@ -4354,7 +4354,15 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
     # migration capacity gate read unknown and refused every migration, and the console
     # rendered a cluster with no storage in it.
     DFS_VDISK_OPS = ("create", "attach", "detach", "delete", "status", "flush",
-                     "seal", "resize", "snapshot", "clone", "rollback")
+                     "seal", "resize", "snapshot", "clone", "rollback",
+                     # Turns a disk this node forwards into a disk it owns, once the guest
+                     # that migrated here is running. The second half of a live migration.
+                     "takeover")
+
+    # How long each operation may take before the control socket is given up on. A takeover
+    # waits for the previous owner to drain its journal (SIDON_HANDOVER_TIMEOUT, 120 s) and
+    # then claims and fences, so the 60 s default would abandon one that is working.
+    DFS_OP_TIMEOUTS = {"takeover": 300}
     DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
                     "purah-sweep", "purah-scrub", "purah-heal",
                     # Ranks this node's extent groups by how hot they are. A node
@@ -4406,7 +4414,13 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             self.reject("helios_sidon is unavailable: %s" % exc, 500)
             return
 
-        params = {k: v for k, v in payload.items() if k != "op"}
+        # `timeout` and `socket_path` are parameters of the Python client, not of the control
+        # protocol: passed through, a caller could point the call at another socket or hold
+        # this handler's thread for as long as it liked.
+        params = {k: v for k, v in payload.items()
+                  if k not in ("op", "timeout", "socket_path")}
+        if op in self.DFS_OP_TIMEOUTS:
+            params["timeout"] = self.DFS_OP_TIMEOUTS[op]
         try:
             result = sidon.call(op, **params)
         except sidon.SidonError as exc:

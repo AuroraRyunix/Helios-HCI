@@ -21,6 +21,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |
 | [add_ons_design.md](./add_ons_design.md) | Forward-looking design blueprint for four scale-out add-ons (Helios Portal, Helios Files, Helios Horizon, Scale-Out Urbosa) — none implemented yet. |
+| [overnight_report_2026-10-04.md](./overnight_report_2026-10-04.md) | Running log of the 2026-10-04 overnight work: per item, root cause, change, tests, status; plus what needs live verification, decisions for the owner, and what was found but not fixed. |
 
 ## Per-Daemon Docs
 

@@ -101,8 +101,14 @@ Raised from using the lab; the owner asked for each of these to be thought throu
   probes and (until 2026-10-04) never lifted it after a restart; the orphan reconcile is the first fix.
   Review the whole lifecycle: what degrades a host, what each state stops (placement, HA, DRS,
   maintenance), what brings it back, and whether the thresholds are right.
-* **Automatic VM migration.** Live migration fails for Sidon-served disks (the destination has no NBD
-  socket): being fixed on a branch. Then review evacuation, DRS moves and HA restarts as one story.
+* [x] **Live migration of Sidon-served disks** *(2026-10-04, branch overnight/2026-10-04; needs a live check
+  in the lab, see docs/overnight_report_2026-10-04.md)*: the destination now attaches each disk in
+  forwarding mode before `virsh migrate`, and takes ownership after it (`handover::handover`, D-34);
+  `valcli storage.takeover` finishes one by hand. Still open: Sidon does not re-attach on start, so a
+  Sidon restart removes the NBD sockets of running VMs' disks (move or stop them first); the owner's
+  release path against a real journal has no unit test (it needs Hydra).
+* **Automatic VM migration, as one story.** Review evacuation, DRS moves and HA restarts so they share the
+  safe path.
 * **How Mipha heals a host that rejoins.** Fencing ladder, rejoin, re-attaching vdisks, reclaiming
   ownership, restarting its VMs or leaving them where HA put them: write it down and test it.
 * **A full review of every service:** changes, endpoints, who calls them, what is unused.

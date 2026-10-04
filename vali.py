@@ -118,17 +118,28 @@ def spark_endpoint(ip):
     return ip, True
 
 
-def run_remote_spark(ip, command):
+def run_remote_spark(ip, command, timeout=None):
+    """Run a shell command on a node through its spark-daemon.
+
+    The daemon applies 45 seconds to a command whose caller names no timeout, so anything
+    that can legitimately take longer (a live migration of a large guest) must say so; the
+    HTTP wait is kept longer than the command's so the command's own timeout is what reports.
+    """
     ip, verify_identity = spark_endpoint(ip)
     context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
     context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
     context.check_hostname = verify_identity
 
     url = f"https://{ip}:9099/api/v1/execute"
-    data = json.dumps({"command": command}).encode("utf-8")
+    body = {"command": command}
+    wait = 120
+    if timeout:
+        body["timeout"] = timeout
+        wait = max(wait, timeout + 30)
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=wait) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res["returncode"], res["stdout"], res["stderr"]
     except Exception as e:
@@ -152,7 +163,7 @@ def run_mtls_spark_api(ip, path, payload, method="POST"):
     except Exception as e:
         return -1, {}, str(e)
 
-def run_mtls_spark_api_full(ip, path, payload=None, method="POST"):
+def run_mtls_spark_api_full(ip, path, payload=None, method="POST", timeout=120):
     """Like run_mtls_spark_api, but keeps the status code and the 4xx body.
 
     The typed API answers a refused parameter with 400 and a sentence naming it, and
@@ -175,7 +186,7 @@ def run_mtls_spark_api_full(ip, path, payload=None, method="POST"):
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, context=context, timeout=120) as response:
+        with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8")), ""
     except urllib.error.HTTPError as exc:
         try:
@@ -184,6 +195,137 @@ def run_mtls_spark_api_full(ip, path, payload=None, method="POST"):
             return exc.code, {}, str(exc)
     except Exception as e:
         return 0, {}, str(e)
+
+# A live migration of a large guest runs for as long as its memory takes to copy, and the
+# daemon's default of 45 seconds for a command is far shorter. A ceiling on a hung migration,
+# not a budget for a healthy one.
+MIGRATION_COMMAND_TIMEOUT = 3600
+
+# What Sidon's takeover may take on the destination: the owner drains its journal (bounded by
+# SIDON_HANDOVER_TIMEOUT, 120 s) and the claim and fence follow. Longer than either.
+SIDON_TAKEOVER_TIMEOUT = 300
+
+
+class MigrationStepError(Exception):
+    """A migration step failed. `step` names it, so the task error says where it stopped."""
+
+    def __init__(self, step, detail):
+        super().__init__(f"step '{step}' failed: {detail}")
+        self.step = step
+        self.detail = detail
+
+
+def domain_vdisk_ids(vm_name, disks_list):
+    """The vdisks a VM's domain XML names as disks, by the rule generate_vm_xml uses.
+
+    One rule, because a migration that attaches a different set from the one the XML names
+    starts the destination qemu against a socket that does not exist.
+    """
+    module = sidon_module()
+    if disks_list and disks_list != "NONE":
+        return [module.vdisk_id_for(vm_name, i) for i, _ in enumerate(disks_list.split(","))]
+    if disks_list == "NONE":
+        return []
+    return [module.vdisk_id_for(vm_name, 0)]
+
+
+def domain_image_ids(iso):
+    """The image vdisks a VM's CD-ROMs are backed by."""
+    module = sidon_module()
+    ids = []
+    for spec in (iso or "").split(","):
+        spec = spec.strip()
+        if spec and spec != "__empty__":
+            ids.append(module.image_vdisk_id(spec))
+    return ids
+
+
+def sidon_op(ip, op, vdisk_id, timeout=120, **extra):
+    """One DFS vdisk operation on a node. Returns (ok, body, detail); detail is the refusal
+    text Sidon gave (a 409 or 503 body), which run_mtls_spark_api would reduce to a status."""
+    payload = {"op": op, "vdisk_id": vdisk_id}
+    payload.update(extra)
+    status, body, err = run_mtls_spark_api_full(ip, "/api/v1/dfs/vdisk", payload, timeout=timeout)
+    if status == 200 and isinstance(body, dict):
+        return True, body, ""
+    detail = body.get("error") if isinstance(body, dict) else ""
+    return False, body if isinstance(body, dict) else {}, detail or err or f"HTTP {status}"
+
+
+def prepare_destination_storage(target_ip, data_ids, image_ids):
+    """Attach a VM's disks on the migration target before the domain is started there.
+
+    Data disks are attached in forwarding mode: the destination qemu opens a socket whose
+    Sidon relays to the node that still owns the disk, so the single writer does not change
+    while two qemu processes have the export open. Images are attached ordinarily (they are
+    immutable and have no owner to forward to).
+
+    Returns the data disks this call attached, which are the ones to detach if the migration
+    fails. Images are never detached on a failure: an immutable image is shared, and may be
+    the CD-ROM of a guest that is running fine. Raises MigrationStepError, having already
+    detached what it attached.
+    """
+    created = []
+    try:
+        for vdisk_id in data_ids:
+            ok, body, detail = sidon_op(target_ip, "attach", vdisk_id, forward=True)
+            if not ok:
+                raise MigrationStepError(
+                    f"attach {vdisk_id} on the target", detail)
+            if not body.get("already_attached"):
+                created.append(vdisk_id)
+            if not body.get("forwarding_to"):
+                # No other node owns it, so this attach took it. The guest is running on
+                # the source, whose Sidon is now fenced out: the disk is not safe to migrate.
+                raise MigrationStepError(
+                    f"attach {vdisk_id} on the target",
+                    "the target would own the disk while the guest still runs on the source; "
+                    "Hydra names no other owner for it")
+        for vdisk_id in image_ids:
+            ok, body, detail = sidon_op(target_ip, "attach", vdisk_id)
+            if not ok:
+                raise MigrationStepError(f"attach image {vdisk_id} on the target", detail)
+    except MigrationStepError:
+        detach_destination_forwarders(target_ip, created)
+        raise
+    return created
+
+
+def detach_destination_forwarders(target_ip, vdisk_ids):
+    """Remove the forwarders a failed migration left on the target. The source never changed
+    owner, so there is nothing to give back; a detach that itself fails is reported."""
+    problems = []
+    for vdisk_id in vdisk_ids:
+        ok, _, detail = sidon_op(target_ip, "detach", vdisk_id)
+        if not ok:
+            problems.append(f"{vdisk_id}: {detail}")
+            sys.stderr.write(f"Could not detach {vdisk_id} on {target_ip} after a failed migration: {detail}\n")
+    return problems
+
+
+def hand_over_storage(target_ip, data_ids, attempts=3, pause=5.0, sleep=None):
+    """Make the target the owner of each disk, after the guest has resumed there.
+
+    Sidon's takeover is idempotent and safe to repeat, so a failure is retried: the usual
+    cause is the source's qemu not having let go of its socket yet. Returns the failures as
+    (vdisk_id, step-named detail); empty means every disk is owned by the target.
+    """
+    sleep = sleep or time.sleep
+    failures = []
+    for vdisk_id in data_ids:
+        detail = ""
+        for attempt in range(attempts):
+            ok, _, detail = sidon_op(target_ip, "takeover", vdisk_id,
+                                     timeout=SIDON_TAKEOVER_TIMEOUT)
+            if ok:
+                detail = ""
+                break
+            if attempt + 1 < attempts:
+                sleep(pause)
+        if detail:
+            failures.append((vdisk_id, detail))
+    return failures
+
 
 def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
     """Act on systemd units on a host. Returns (ok, detail).
@@ -1692,6 +1834,21 @@ def process_queue_task(task):
                 # 3. Pre-clean stale definition on target host
                 run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {q_vm} --keep-nvram || true")
 
+                # 3b. Attach the guest's disks on the target. The domain XML names an NBD
+                # socket per disk and the destination qemu opens it as the migration starts;
+                # without this step it fails with "Failed to connect ... No such file or
+                # directory". The start and HA paths attach before defining the domain, and
+                # this path never did. Data disks are attached in forwarding mode so the
+                # writer stays the source until `takeover` below.
+                data_ids = domain_vdisk_ids(vm_name, vm_data.get("disks_list", ""))
+                image_ids = domain_image_ids(vm_data.get("iso", ""))
+                try:
+                    destination_forwarders = prepare_destination_storage(target_ip, data_ids, image_ids)
+                except MigrationStepError as step_err:
+                    raise Exception(
+                        f"{step_err}. Nothing changed on {src_host}: it still owns every disk "
+                        f"and the guest keeps running there.")
+
                 # 4. Live migrate command
                 # --unsafe was needed when VM disks carried --allow-two-primaries permanently:
                 # libvirt refuses a live migration it believes is cache-incoherent. The
@@ -1699,9 +1856,16 @@ def process_queue_task(task):
                 # itself, so the check libvirt performs is the one we actually want, and
                 # suppressing it would only hide a genuinely unsafe migration.
                 cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource {q_vm} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
-                rc, stdout, stderr = run_remote_spark(src_host, cmd)
+                rc, stdout, stderr = run_remote_spark(src_host, cmd, timeout=MIGRATION_COMMAND_TIMEOUT)
                 if rc != 0:
-                    raise Exception(f"Migration command failed: {stderr.strip() or stdout.strip()}")
+                    leftovers = detach_destination_forwarders(target_ip, destination_forwarders)
+                    note = (f" The forwarders on {target_ip} could not all be removed ({'; '.join(leftovers)})."
+                            if leftovers else
+                            f" The forwarders on {target_ip} were removed.")
+                    raise Exception(
+                        f"Migration command failed at step 'virsh migrate': "
+                        f"{stderr.strip() or stdout.strip()}. {src_host} still owns every disk "
+                        f"and no epoch moved.{note}")
 
                 # 5. Clean up local NVRAM file on source host after successful migration
                 run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{q_vm}_vars.fd")
@@ -1729,6 +1893,12 @@ def process_queue_task(task):
                         f"The guest is running on {target_ip} while Hydra still places it on {src_host}; "
                         f"repair the row before starting or stopping this VM.")
 
+                # The guest is running on the target, and its I/O is being relayed to the
+                # source. Make the target the owner of each disk (docs/dfs/ownership.md
+                # section 5). Retried inside; a failure here leaves the guest running and
+                # its disks served through the forwarder, and is reported as exactly that.
+                handover_failures = hand_over_storage(target_ip, data_ids)
+
                 # Insert record in history
                 now = int(time.time() * 1000)
                 reason = task.get("error_msg", "Manual VM migration request") # Re-use error_msg for trigger reason
@@ -1738,6 +1908,13 @@ def process_queue_task(task):
                 VALUES ({now}, '{vm_name}', '{src_host}', '{target_ip}', '{clean_reason}');
                 """
                 run_cql_query(cql_history)
+                if handover_failures:
+                    named = "; ".join(f"{v}: {d}" for v, d in handover_failures)
+                    return False, (
+                        f"{vm_name} migrated to {target_ip} and is running there, but the storage "
+                        f"handover did not finish at step 'takeover' ({named}). Its disks are still "
+                        f"served by the previous owner through {target_ip}; run the takeover again "
+                        f"(it is safe to repeat) with: valcli storage.takeover <vdisk> {target_ip}")
                 return True, target_ip
             except Exception as migrate_err:
                 print(f"Migration error caught: {migrate_err}. Releasing the migration lock...")
