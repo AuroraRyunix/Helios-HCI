@@ -21,6 +21,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |
 | [add_ons_design.md](./add_ons_design.md) | Forward-looking design blueprint for four scale-out add-ons (Helios Portal, Helios Files, Helios Horizon, Scale-Out Urbosa) — none implemented yet. |
+| [service_review.md](./service_review.md) | A review of every service: purpose, entry points, endpoints and their callers, state in Hydra and ZooKeeper, leadership, failure behaviour, tests, and the dead code, duplication and risks found (with evidence and greps). Written by a read-only pass; the Logos question and the shell-string audit are answered there. |
 | [host_states.md](./host_states.md) | Every host state (NORMAL, DEGRADED, FENCED, DOWN, RECOVERING, maintenance): what sets it, what it stops, what clears it, the thresholds, how split brain is avoided and how a returning host is reconciled, with the transition table. |
 | [maintenance.md](./maintenance.md) | Host maintenance: what a host in maintenance keeps running and why, every step of entering and leaving, what each failure leaves behind, the lock, and what happens on a reboot. |
 | [vm_lifecycle.md](./vm_lifecycle.md) | What a VM is made of, how its boot order is decided, which attributes can be changed while it is stopped or running, and how that compares with ESXi. |

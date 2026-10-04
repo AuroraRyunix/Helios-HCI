@@ -405,7 +405,21 @@ class StorageFenceTests(FenceTestCase):
             self.claims.append(payload)
             return responder(payload)
 
-        self.patch(mipha, "run_mtls_spark_api_full", fake_claim)
+        def as_lwt(endpoint, params, timeout=15):
+            assert endpoint == "/v1/dfs/claim", endpoint
+            rc, body, err = fake_claim("daruk", endpoint, params)
+            body = body if isinstance(body, dict) else {}
+            return rc == 0, body.get("applied") is True, body.get("current") or {}, err
+
+        self.patch(mipha, "run_lwt", as_lwt)
+
+    def test_the_claim_goes_to_daruk_and_not_to_spark_daemon(self):
+        """spark-daemon has no /v1 routes: posted there, every claim was a 404 and no fence
+        could ever be confirmed by this rung."""
+        src = open(os.path.join(HERE, "mipha.py"), encoding="utf-8").read()
+        body = src[src.index("def storage_fence_assert"):src.index("def fence_host")]
+        self.assertIn('run_lwt("/v1/dfs/claim", payload)', body)
+        self.assertNotIn("run_mtls_spark_api_full", body)
 
     def test_raising_the_epoch_on_every_owned_vdisk_is_a_fence(self):
         self.arrange_map([owned("vm-disk0", "node-b", 4), owned("vm-disk1", "node-b", 1)])

@@ -213,6 +213,21 @@ general knowledge, labelled as unverified), and a prioritised parity plan (nine 
 
 Status: **done in code and tests; live verification needed**.
 
+### H. Per-service review: document written (read-only pass), one high-severity finding fixed and verified, the rest listed
+
+`docs/service_review.md` (about 1250 lines): every service's entry points, endpoints and callers, Hydra/ZooKeeper state, leadership,
+failure behaviour, tests, and dead code/duplication/risks with evidence. It was produced by a read-only subagent; I re-read the claim
+below before acting on it, and spot-checked nothing else, so treat the rest as a lead list with evidence to check, not as verified.
+*Logos question:* each node writes only its own host's rows (keyed `(node_ip, timestamp)`), no election, no duplicate writes; the exception is a
+missing `LOCAL_HYPERVISOR_IP`, which collapses every node onto 127.0.0.1. `docs/logos.md` is stale (it describes 30 s polling through Spark).
+*Fixed:* Mipha's storage-fence rung posted `/v1/dfs/claim` (a Daruk route) to spark-daemon, which has no `/v1` routes, so the rung could never
+confirm a fence. It now uses `run_lwt`; `test_fencing.py` pins it (the old tests patched the call, which is why nothing saw it).
+*Listed, not fixed (see the document):* the shell-string guard covers six files only (`valcli.py:3050` builds `systemctl restart bifrost` as a
+shell string); a second hard-coded watchdog list in spark-daemon with no ordering; protection-domain snapshots are never scheduled; Phoenix submits
+tasks to the ZooKeeper leader not the Catalyst queue holder; a Phoenix page with no Slate rule; Catalyst's scheduler queues without checking
+`holds_dispatch()`, and `/api/v1/tasks/status/<id>` splices an unvalidated id into CQL; about 30 disagreeing service lists; dead code with greps.
+Status: **document done; one fix; remainder open**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification

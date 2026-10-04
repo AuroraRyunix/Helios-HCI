@@ -926,15 +926,16 @@ def storage_fence_assert(dead_hostname, dead_ip, hosts):
             "expected_owner": owner,
             "expected_epoch": epoch,
         }
-        rc_c, body, err = run_mtls_spark_api_full("127.0.0.1", "/v1/dfs/claim", payload)
-        if isinstance(body, dict) and body.get("applied") is True:
+        # Daruk's typed compare-and-swap, which is where /v1/dfs/claim lives. This used to be
+        # posted to spark-daemon on :9099, which has no /v1 routes, so every claim was a 404 and
+        # the one rung of the ladder that is meant to be able to confirm a fence never could.
+        ok_c, applied, current, err = run_lwt("/v1/dfs/claim", payload)
+        if ok_c and applied:
             fenced.append(vdisk_id)
             continue
         # A refused claim means somebody else already moved it on, which fences the dead
         # host just as thoroughly -- provided the owner it names is not the dead host.
-        current_owner = ""
-        if isinstance(body, dict):
-            current_owner = str((body.get("current") or {}).get("owner") or "")
+        current_owner = str((current or {}).get("owner") or "") if ok_c else ""
         if current_owner and current_owner not in (dead_hostname, dead_ip):
             fenced.append(vdisk_id)
         else:
