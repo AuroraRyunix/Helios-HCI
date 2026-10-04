@@ -18,6 +18,7 @@ mod err;
 mod extent;
 mod extent_id_map;
 mod extent_resolve;
+mod handover;
 mod heat;
 mod journal;
 mod meta;
@@ -229,6 +230,7 @@ fn main() {
         // of them, so fencing any one is already sufficient.
         peer_timeout: Duration::from_secs(env_bytes("SIDON_PEER_TIMEOUT", 20)),
         fence_timeout: Duration::from_secs(env_bytes("SIDON_FENCE_TIMEOUT", 5)),
+        handover_timeout: Duration::from_secs(env_bytes("SIDON_HANDOVER_TIMEOUT", 120)),
         // How many copies a create makes when nothing in the request says. Read here
         // rather than per-create so it is printed at startup beside the peer list: the
         // two together are this node's placement policy, and an operator wondering why a

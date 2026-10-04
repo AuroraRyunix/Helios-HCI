@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -27,6 +27,7 @@ use crate::meta::{
     block_map_batches, cql_str, json_params, now_ms, Daruk, CLASS_FORMING, CLASS_IMMUTABLE,
     CLASS_RW, MAP_BATCH,
 };
+use crate::handover::Switch;
 use crate::heat::AccessLog;
 use crate::nbd::{self, Export, LocalVdisk};
 use crate::peer::{self, Forwarder, Owned, PeerClient, ReplicaStore};
@@ -50,6 +51,9 @@ pub struct DaemonConfig {
     pub peers: Vec<(String, String)>,
     pub peer_timeout: Duration,
     pub fence_timeout: Duration,
+    /// How long a handover waits for the owner to drain its journal and let go. Longer than
+    /// any append timeout, because the work is a drain and not an append.
+    pub handover_timeout: Duration,
     /// The cluster's `redundancy_factor` from `cluster.json`, when it could be read.
     ///
     /// The fallback for a create whose container says nothing, and the reason a vdisk
@@ -74,6 +78,12 @@ struct Attached {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
     forwarding_to: Option<String>,
+    /// How many NBD sessions are open on the socket. A handover refuses to give a disk away
+    /// while a local client still holds it open.
+    sessions: Arc<AtomicUsize>,
+    /// Present for a disk attached in forwarding mode: the backend behind the socket, which
+    /// `takeover` flips from forwarding to serving without the guest's session noticing.
+    switch: Option<Arc<Switch>>,
 }
 
 pub struct Daemon {
@@ -344,6 +354,7 @@ impl Daemon {
             "create" => self.op_create(req),
             "attach" => self.op_attach(req),
             "detach" => self.op_detach(req),
+            "takeover" => self.op_takeover(req),
             "delete" => self.op_delete(req),
             "list" => self.op_list(),
             "status" => self.op_status(req),
@@ -470,7 +481,8 @@ impl Daemon {
                 return Ok(json!({
                     "vdisk_id": id,
                     "socket": a.socket.to_string_lossy(),
-                    "already_attached": true
+                    "already_attached": true,
+                    "forwarding_to": a.forwarding_to,
                 }));
             }
         }
@@ -510,13 +522,13 @@ impl Daemon {
         // What a live migration uses. The guest resumes on this host and its I/O is
         // relayed to whoever still owns the disk, so there is no instant where storage
         // must hand over synchronously with the VM. Ownership follows later, at leisure.
-        if req.get("forward").and_then(Value::as_bool).unwrap_or(false) {
-            if cur_owner.is_empty() || cur_owner == self.cfg.node {
-                return Err(Error::refused(format!(
-                    "vdisk {id} is owned by {}; forwarding needs another node to forward to",
-                    if cur_owner.is_empty() { "nobody" } else { "this node" }
-                )));
-            }
+        //
+        // Only when another node owns it. A disk nobody owns, or this node already owns, has
+        // nothing to forward to, and asking to forward it means "have it reachable here",
+        // which is what an ordinary attach is: the migration's destination therefore does
+        // not have to know which of the three it is looking at.
+        let forward_wanted = req.get("forward").and_then(Value::as_bool).unwrap_or(false);
+        if forward_wanted && !cur_owner.is_empty() && cur_owner != self.cfg.node {
             let owner_client = self.peers.get(&cur_owner).ok_or_else(|| {
                 Error::refused(format!(
                     "vdisk {id} is owned by {cur_owner}, which this daemon has no address for"
@@ -524,13 +536,16 @@ impl Daemon {
             })?;
             let size = row.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
             let class = row.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
-            let backend = Arc::new(Forwarder {
+            let forwarder = Arc::new(Forwarder {
                 vdisk: id.clone(),
                 size,
                 read_only: class == CLASS_IMMUTABLE,
                 owner: Arc::clone(owner_client),
             });
-            let socket = self.serve_socket(&id, backend)?;
+            // Behind a switch, so that a later `takeover` can start serving the disk
+            // locally underneath the NBD session qemu opens on this socket.
+            let switch = Arc::new(Switch::new(forwarder));
+            let socket = self.serve_socket(&id, Arc::clone(&switch) as Arc<dyn nbd::Backend>)?;
             self.attached.lock().expect("attached mutex poisoned").insert(
                 id.clone(),
                 Attached {
@@ -538,6 +553,8 @@ impl Daemon {
                     socket: socket.0.clone(),
                     stop: socket.1,
                     forwarding_to: Some(cur_owner.clone()),
+                    sessions: socket.2,
+                    switch: Some(switch),
                 },
             );
             return Ok(json!({
@@ -548,6 +565,48 @@ impl Daemon {
             }));
         }
 
+        let (vdisk, replica_nodes, fenced) =
+            self.claim_and_open(&id, row, &cur_owner, cur_epoch)?;
+        let (socket, stop, sessions) =
+            self.serve_socket(&id, Arc::new(LocalVdisk(Arc::clone(&vdisk))))?;
+        self.attached.lock().expect("attached mutex poisoned").insert(
+            id.clone(),
+            Attached {
+                vdisk: Some(vdisk),
+                socket: socket.clone(),
+                stop,
+                forwarding_to: None,
+                sessions,
+                switch: None,
+            },
+        );
+
+        Ok(json!({
+            "vdisk_id": id,
+            "socket": socket.to_string_lossy(),
+            "epoch": new_epoch,
+            "previous_owner": cur_owner,
+            "replicas": replica_nodes,
+            "replicas_fenced": fenced,
+        }))
+    }
+
+    /// Win the ownership compare-and-swap for `id` and open the vdisk at the epoch won:
+    /// steps 1 to 3 of the takeover in docs/dfs/ownership.md. Shared by `attach` and by
+    /// `takeover`, which differ only in what they serve the opened vdisk through.
+    ///
+    /// Returns the opened vdisk, the replica set the map names, and how many replicas were
+    /// fenced.
+    fn claim_and_open(
+        &self,
+        id: &str,
+        row: &Value,
+        cur_owner: &str,
+        cur_epoch: i64,
+    ) -> Result<(Arc<Mutex<Vdisk>>, Vec<String>, usize)> {
+        let id = id.to_string();
+        let new_epoch = cur_epoch + 1;
+        let daruk = self.daruk();
         // The claim is conditional on *both* the owner and the epoch as they were read.
         // Conditioning on owner alone would let a node that held this disk two takeovers
         // ago re-take it after a round trip it never noticed losing.
@@ -610,27 +669,8 @@ impl Daemon {
         // won, then rebuild from one of them. Done before a single byte is served, so a
         // guest never reads a state the previous owner could still add to.
         let fenced = vdisk.fence_and_recover(&fence_clients)?;
-        let vdisk = Arc::new(Mutex::new(vdisk));
 
-        let (socket, stop) = self.serve_socket(&id, Arc::new(LocalVdisk(Arc::clone(&vdisk))))?;
-        self.attached.lock().expect("attached mutex poisoned").insert(
-            id.clone(),
-            Attached {
-                vdisk: Some(vdisk),
-                socket: socket.clone(),
-                stop,
-                forwarding_to: None,
-            },
-        );
-
-        Ok(json!({
-            "vdisk_id": id,
-            "socket": socket.to_string_lossy(),
-            "epoch": new_epoch,
-            "previous_owner": cur_owner,
-            "replicas": replica_nodes,
-            "replicas_fenced": fenced,
-        }))
+        Ok((Arc::new(Mutex::new(vdisk)), replica_nodes, fenced))
     }
 
     /// The vdisk this node owns under `id`, or a refusal that says why not.
@@ -659,7 +699,7 @@ impl Daemon {
         &self,
         id: &str,
         backend: Arc<dyn nbd::Backend>,
-    ) -> Result<(PathBuf, Arc<AtomicBool>)> {
+    ) -> Result<(PathBuf, Arc<AtomicBool>, Arc<AtomicUsize>)> {
         let socket = self.cfg.root.join("nbd").join(format!("{id}.sock"));
         let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)
@@ -678,6 +718,8 @@ impl Daemon {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
+        let sessions = Arc::new(AtomicUsize::new(0));
+        let sessions_thread = Arc::clone(&sessions);
         let export = Export { backend, name: id.to_string() };
         let stop_thread = Arc::clone(&stop);
         thread::spawn(move || {
@@ -687,11 +729,13 @@ impl Daemon {
                 }
                 match conn {
                     Ok(s) => {
+                        sessions_thread.fetch_add(1, Ordering::SeqCst);
                         if let Err(e) = nbd::serve(s, &export) {
                             // A guest closing its disk shows up as a read error on the
                             // next header; that is a disconnect, not a fault.
                             eprintln!("sidon: nbd session for {} ended: {e}", export.name);
                         }
+                        sessions_thread.fetch_sub(1, Ordering::SeqCst);
                     }
                     Err(e) => {
                         eprintln!("sidon: nbd accept failed: {e}");
@@ -700,7 +744,191 @@ impl Daemon {
                 }
             }
         });
-        Ok((socket, stop))
+        Ok((socket, stop, sessions))
+    }
+
+    /// Turn a disk this node is forwarding into a disk this node owns, underneath the NBD
+    /// session the guest already has open. The second half of a live migration; see
+    /// docs/dfs/ownership.md section 5.
+    ///
+    /// Everything that can fail does so in a stated step, and the steps are ordered so that
+    /// a failure before the last two changes nothing:
+    ///
+    /// 1. `stall`: guest I/O on this node is held at the switch. Nothing is dropped; it waits.
+    /// 2. `release`: the current owner drains its journal into extent groups and stops serving
+    ///    the disk. A refusal or an unreachable owner ends the handover here, with the
+    ///    owner still serving and this node still forwarding to it.
+    /// 3. `claim`: compare-and-swap in Hydra, owner and epoch together, epoch e to e+1.
+    /// 4. `fence`: every reachable journal replica is fenced at e+1 and the journal tail is
+    ///    adopted from one of them (the owner drained, so it is normally empty).
+    /// 5. `install`: the opened vdisk becomes the backend behind the socket and I/O resumes.
+    ///
+    /// A failure in steps 3 to 5 comes after the owner stopped serving, so guest I/O on this
+    /// node errors until the handover is run again, and it is safe to run again: the claim
+    /// is conditional on the owner and epoch as they are then read, and a second attempt
+    /// finds the row wherever the first one left it.
+    fn op_takeover(self: &Arc<Self>, req: &Value) -> Result<Value> {
+        let id = str_field(req, "vdisk_id")?;
+        let (switch, forwarding_to) = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            let a = map.get(&id).ok_or_else(|| {
+                Error::refused(format!(
+                    "vdisk {id} is not attached on this node; attach it with forward first"
+                ))
+            })?;
+            if a.vdisk.is_some() {
+                return Ok(json!({"vdisk_id": id, "already_owned": true}));
+            }
+            let switch = a.switch.clone().ok_or_else(|| {
+                Error::refused(format!("vdisk {id} is attached here without a switch"))
+            })?;
+            (switch, a.forwarding_to.clone().unwrap_or_default())
+        };
+
+        let step = |name: &str, e: Error| -> Error {
+            let wrap = |m: String| format!("handover of {id} failed at step '{name}': {m}");
+            match e {
+                Error::Io(m) => Error::Io(wrap(m)),
+                Error::Corrupt(m) => Error::Corrupt(wrap(m)),
+                Error::Meta(m) => Error::Meta(wrap(m)),
+                Error::Refused(m) => Error::Refused(wrap(m)),
+            }
+        };
+
+        let daruk = self.daruk();
+        let rows = daruk
+            .query(&format!(
+                "SELECT owner, epoch, replicas, size_bytes, class FROM hydra.dfs_vdisks \
+                 WHERE vdisk_id = {}",
+                cql_str(&id)
+            ))
+            .map_err(|e| step("read ownership", e))?;
+        let row = rows.first().ok_or_else(|| {
+            step("read ownership", Error::refused(format!("vdisk {id} does not exist")))
+        })?;
+        let cur_owner = row.get("owner").and_then(Value::as_str).unwrap_or("").to_string();
+        let cur_epoch = row.get("epoch").and_then(Value::as_i64).unwrap_or(0);
+
+        let stall = switch.stall();
+
+        // Step 2. Skipped only when Hydra already names this node (an earlier handover won
+        // the claim and failed after it) or names nobody; there is then no owner to ask.
+        let mut released = false;
+        if !cur_owner.is_empty() && cur_owner != self.cfg.node {
+            let client = self.peers.get(&cur_owner).ok_or_else(|| {
+                step("release", Error::refused(format!(
+                    "owner {cur_owner} is not a peer this daemon has an address for"
+                )))
+            })?;
+            let long = client.derive(self.cfg.handover_timeout, 1);
+            let resp = long
+                .call(&peer::Request {
+                    opcode: peer::OP_RELEASE,
+                    vdisk: id.clone(),
+                    epoch: 0,
+                    seq: 0,
+                    offset: 0,
+                    flags: 0,
+                    data: Vec::new(),
+                })
+                .map_err(|e| step("release", Error::io(format!(
+                    "owner {cur_owner} could not be asked to hand the disk over ({e}); it is \
+                     still the owner and this node is still forwarding to it"
+                ))))?;
+            match resp.status {
+                peer::ST_OK => released = true,
+                // Not serving it: it already let go, or it restarted and holds nothing. The
+                // fence in step 4 is what makes proceeding safe in either case.
+                peer::ST_NOT_FOUND => {}
+                peer::ST_REFUSED => {
+                    let why = String::from_utf8_lossy(&resp.data).to_string();
+                    let why = if why.is_empty() {
+                        "an older Sidon that does not know the handover request".to_string()
+                    } else {
+                        why
+                    };
+                    return Err(step("release", Error::refused(format!(
+                        "owner {cur_owner} refused to hand the disk over ({why}); it is still \
+                         the owner and this node is still forwarding to it"
+                    ))));
+                }
+                other => {
+                    return Err(step("release", Error::io(format!(
+                        "owner {cur_owner} answered the handover request with status {other}"
+                    ))))
+                }
+            }
+        }
+
+        // Steps 3 and 4.
+        let (vdisk, replica_nodes, fenced) = self
+            .claim_and_open(&id, row, &cur_owner, cur_epoch)
+            .map_err(|e| step(if released { "claim and fence (the owner has already released the disk)" } else { "claim and fence" }, e))?;
+
+        // Step 5.
+        switch
+            .install(&stall, Arc::new(LocalVdisk(Arc::clone(&vdisk))))
+            .map_err(|e| step("install", e))?;
+        {
+            let mut map = self.attached.lock().expect("attached mutex poisoned");
+            if let Some(a) = map.get_mut(&id) {
+                a.vdisk = Some(vdisk);
+                a.forwarding_to = None;
+            }
+        }
+        drop(stall);
+        eprintln!(
+            "sidon: vdisk {id}: took over from {forwarding_to} at epoch {}",
+            cur_epoch + 1
+        );
+        Ok(json!({
+            "vdisk_id": id,
+            "epoch": cur_epoch + 1,
+            "previous_owner": cur_owner,
+            "released": released,
+            "replicas": replica_nodes,
+            "replicas_fenced": fenced,
+        }))
+    }
+
+    /// The owner's half of a handover: drain, stop serving, let go of the socket.
+    ///
+    /// Refuses while a client is still connected to the socket here, because a guest that is
+    /// still using the disk on this node is exactly the second writer the handover must not
+    /// create. Waits a bounded time for one that is on its way out: libvirt finishes
+    /// tearing the source qemu down a moment after the migration command returns.
+    fn release_for_handover(&self, id: &str) -> Option<Result<()>> {
+        let (handle, sessions) = {
+            let map = self.attached.lock().expect("attached mutex poisoned");
+            let a = map.get(id)?;
+            (a.vdisk.clone()?, Arc::clone(&a.sessions))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while sessions.load(Ordering::SeqCst) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return Some(Err(Error::refused(format!(
+                    "a client is still connected to {id} on this node; the guest has not \
+                     stopped using the disk here"
+                ))));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Drain first, and keep serving if it fails: a release that cannot leave an empty
+        // journal has not released anything.
+        if let Err(e) = crate::vdisk::drain_all(&handle) {
+            return Some(Err(Error::refused(format!("the journal could not be drained: {e}"))));
+        }
+        let a = {
+            let mut map = self.attached.lock().expect("attached mutex poisoned");
+            map.remove(id)
+        };
+        if let Some(a) = a {
+            a.stop.store(true, Ordering::SeqCst);
+            let _ = UnixStream::connect(&a.socket);
+            let _ = std::fs::remove_file(&a.socket);
+        }
+        eprintln!("sidon: vdisk {id}: released to another node");
+        Some(Ok(()))
     }
 
     fn op_detach(&self, req: &Value) -> Result<Value> {
@@ -1860,6 +2088,10 @@ impl Owned for Daemon {
             map.get(vdisk).and_then(|a| a.vdisk.clone())?
         };
         Some(crate::vdisk::write_through(&handle, offset, data))
+    }
+
+    fn owned_release(&self, vdisk: &str) -> Option<Result<()>> {
+        self.release_for_handover(vdisk)
     }
 }
 
