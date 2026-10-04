@@ -69,6 +69,21 @@ any node. "Fault tolerance + 1" is the right count for a guest's disk, which nee
 copy, and the wrong one here. The Settings page used to derive it that way, called a correct RF=3 a
 mismatch and offered 2; it now expects the 2F+1 value and refuses to lower the factor below it.
 
+**Where the factor is chosen, and how those places agree.** `metadata_replication_factor(ftt, nodes)` is
+the *minimum* that survives `ftt` failures. The places that pick a factor for a keyspace that does not
+exist yet, or reconcile one when no setting says otherwise, use `default_metadata_replication_factor`,
+which is that minimum with a floor of `min(3, nodes)` (the default has always been three, and a default
+should not lower a live database), so a cluster that asked for more is not held at three. They are:
+the keyspace creation and the start-up reconcile in `spectrum_server.init_db` (they used a flat 3, so a
+five-node `ftt=2` cluster was lowered to three at every start), the `ALTER KEYSPACE` that `cluster
+add-node` prints, and Mimir's audit and the Phoenix Settings page, which compare against the minimum.
+Guest data is a different count (`ftt + 1` copies per vdisk) and is not touched by any of this.
+
+**Two replicas.** At RF=2, which is what a two-node cluster gets, the database needs both nodes. `cluster
+create` (with two nodes), `cluster add-node` (when the ring becomes two) and the `remove-node` plan (when
+two remain) print a warning that says so. Whether to give a two-node cluster a tie-breaker is an open
+decision and is deliberately not made here (TODO.md, "Two-node clusters have no quorum tie-breaker").
+
 If it cannot be read, the gate **refuses**. A plausible-looking default of 3 on a cluster
 actually running RF=1 waves through the stop that takes the only copy of the metadata
 offline — which is exactly the single-node case. `spectrum_server.get_actual_replication_factor()`

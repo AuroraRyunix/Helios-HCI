@@ -24,6 +24,7 @@ Bootstrap a new cluster across a set of physical hosts.
 Every host is a **full member**: a hypervisor, a storage node, a ScyllaDB (Hydra) node, and
 it runs every control-plane daemon. There is no lightweight or diskless role.
 - **1 node**: no replication; the redundancy factor is forced to 0.
+- **2 nodes** also means a metadata database at RF=2, which needs both nodes for QUORUM; `cluster create` warns about it (see [ring_lifecycle.md](./ring_lifecycle.md#what-the-factor-should-be)).
 - **2 nodes**: both hosts are ZooKeeper voters, so the ensemble needs **both** up -- it has no
   tie-breaker and tolerates no failure. See *What there is not* below.
 - **3 nodes**: all three vote in ZooKeeper, which tolerates the loss of one host. With `-r 1`

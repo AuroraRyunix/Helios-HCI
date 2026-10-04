@@ -260,6 +260,42 @@ def metadata_replication_factor(ftt, nodes):
     return min(nodes, 2 * ftt + 1)
 
 
+def default_metadata_replication_factor(ftt, nodes):
+    """What the keyspace is created with, and reconciled to when nothing says otherwise.
+
+    The rule above is the *minimum* that survives `ftt` failures. A cluster of three or more nodes
+    is never created below three replicas even when it asked for no fault tolerance, because the
+    default has always been three and lowering a live database is not something a default should
+    do; and a cluster that asked for more (ftt 2 on five nodes wants five) is not held at three,
+    which is where this used to stop whatever the factor said. Capped by the node count.
+    """
+    needed = metadata_replication_factor(ftt, nodes)
+    try:
+        nodes = max(int(nodes), 1)
+    except (TypeError, ValueError):
+        nodes = 1
+    return max(needed, min(3, nodes))
+
+
+def two_replica_warning(replication_factor):
+    """Lines saying what RF=2 means for the metadata database, or [] for any other factor.
+
+    The keyspace is read and written at QUORUM, a strict majority. At two replicas a majority is
+    both of them, so losing either node stops every read and write in the cluster: a two-node
+    cluster has exactly the fault tolerance of one node, and not the one its redundancy factor
+    suggests. Whether to give it a tie-breaker is an open decision (TODO.md, "Two-node clusters
+    have no quorum tie-breaker"); this only says so, where the operator is looking.
+    """
+    if replication_factor != 2:
+        return []
+    return [
+        "[WARNING] The metadata database will have 2 replicas (RF=2). Reads and writes need a",
+        "[WARNING] majority, which at RF=2 is both of them: losing EITHER node stops the database",
+        "[WARNING] and everything that depends on it. A two-node cluster has no tie-breaker.",
+        "[WARNING] See docs/ring_lifecycle.md ('Replication factor') before relying on it.",
+    ]
+
+
 def parse_replication_factor(text):
     """The number of replicas the hydra keyspace declares, or None if it cannot be read.
 

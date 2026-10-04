@@ -99,6 +99,26 @@ empty drives, several disks, none, markup injection); 8 fail against the old Val
 
 Status: **done in code; live verification needed**.
 
+### G. Hydra replication factor consistency: done (code and tests); nothing live to check beyond a read
+
+*Audit.* Places that pick or compare a keyspace RF: `helios_cql.metadata_replication_factor` (2F+1,
+the rule), Mimir's audit and Phoenix's Settings (already the rule), but `spectrum_server.init_db` created
+the keyspace at a flat `min(3, nodes)` and its start-up reconcile defaulted a missing setting to a flat 3,
+so a five-node `ftt=2` cluster (needs 5) was lowered to 3 at every start; `cluster add-node` printed
+`min(3, nodes)` as the factor to ALTER to. Guest-data copy counts (`ftt + 1`) in valcli/spectrum are a
+different quantity and correct.
+
+*Change.* `helios_cql.default_metadata_replication_factor` (the rule, floored at `min(3, nodes)` so a default
+never lowers a live database) and `two_replica_warning`; used by `init_db` (create and reconcile),
+`cluster create`, `cluster add-node` advice and the `remove-node` plan. A warning is printed whenever the
+database would be at two replicas. The two-node tie-breaker decision is not made. Docs:
+`docs/ring_lifecycle.md`, `docs/cluster.md`.
+
+*Tests.* `test_metadata_replication_rule.py` (+7). The init/reconcile and CLI call sites are asserted as
+source text because `spectrum_server` opens a database on import.
+
+Status: **done**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification

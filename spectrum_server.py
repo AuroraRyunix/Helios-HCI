@@ -31,6 +31,7 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     ConditionalStatementError,
     cql_escape,
     cql_int,
+    default_metadata_replication_factor,
     is_conditional_cql,
     parse_replication_factor,
     run_conditional_cql_query,
@@ -1769,12 +1770,21 @@ def load_schema_module():
         "it; reinstall the Helios components.")
 
 
+def cluster_fault_tolerance():
+    """The cluster's redundancy factor (failures to survive) from cluster.json, or None."""
+    try:
+        with open("/etc/hci/cluster.json", "r") as handle:
+            return int(json.load(handle).get("redundancy_factor"))
+    except Exception:
+        return None
+
+
 def init_db():
     """Attempts to initialize the ScyllaDB keyspace and table on startup."""
     print("Connecting to ScyllaDB and creating keyspace/table if not exists...")
     nodes = get_cluster_nodes()
     node_count = len(nodes) if nodes else 1
-    desired_rf = min(3, node_count)
+    desired_rf = default_metadata_replication_factor(cluster_fault_tolerance(), node_count)
     create_keyspace = ("CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = %s;"
                        % replication_map(desired_rf))
     
@@ -1973,7 +1983,12 @@ def init_db():
                 try:
                     cql_rf = "SELECT value FROM hydra.cluster_settings WHERE key = 'replication_factor';"
                     rc_rf, out_rf, _ = run_cql_query(cql_rf)
-                    configured_rf = 3
+                    # With no stored setting the default is what the cluster's fault tolerance
+                    # calls for. It was a flat 3, which for a cluster that asked for more
+                    # (ftt 2 on five nodes wants five) meant this reconcile quietly lowered a
+                    # correct keyspace to three at every start.
+                    configured_rf = default_metadata_replication_factor(
+                        cluster_fault_tolerance(), len(get_cluster_nodes()) if get_cluster_nodes() else 1)
                     if rc_rf == 0:
                         lines = [l.strip() for l in out_rf.splitlines() if l.strip()]
                         rf_lines = [l for l in lines if not l.startswith('(') and not l.startswith('-') and l != 'value' and l != '']

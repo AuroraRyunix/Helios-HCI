@@ -20,10 +20,13 @@ from helios_cql import (  # noqa: F401  (re-exported for modules that import fro
     ConditionalStatementError,
     cql_escape,
     cql_int,
+    default_metadata_replication_factor,
     is_conditional_cql,
+    metadata_replication_factor,
     parse_replication_factor,
     run_conditional_cql_query,
     run_cql_query,
+    two_replica_warning,
 )
 
 # Carve the extent store's first volume out of the thin pool, give it a filesystem, register
@@ -2203,11 +2206,14 @@ def cmd_add_node(args):
     print()
     print("Still to do, and deliberately not automatic:")
     print("  - Raise the keyspace replication factor now that there are %d nodes:" % len(ips))
+    wanted = default_metadata_replication_factor(config.get("redundancy_factor"), len(ips))
     print("      ALTER KEYSPACE hydra WITH replication = "
-          "{'class': 'NetworkTopologyStrategy', '<datacenter>': %d};" % min(3, len(ips)))
+          "{'class': 'NetworkTopologyStrategy', '<datacenter>': %d};" % wanted)
     print("    then 'nodetool repair -pr hydra' on every node. ALTER changes the strategy")
     print("    only; the data is not on the new replicas until a repair has run, and until")
     print("    then the cluster reports a redundancy it does not have.")
+    for line in two_replica_warning(wanted):
+        print("    " + line)
     print("  - Storage needs nothing: Purah places replicas onto the new node as vdisks")
     print("    come to need them.")
     return 0
@@ -2519,6 +2525,8 @@ def main():
             if rf > 0:
                 print(f"[WARNING] Single-node cluster detected. Forcing redundancy factor (FTT) from {rf} to 0 (no replication). Adding nodes later will not raise it: 'cluster add-node --node <ip> -r N' does.")
             rf = 0
+        for line in two_replica_warning(default_metadata_replication_factor(rf, len(ips))):
+            print(line)
         vip = args.vip if args.vip else ""
 
         acquire_cluster_lock(ips)
@@ -3949,6 +3957,9 @@ print("--- Local wipe completed ---", flush=True)
                 else:
                     print(f"  3. Replication factor {replication_factor} still fits a "
                           f"{remaining}-node ring; no ALTER KEYSPACE needed.")
+                # Either way the database ends up on two replicas when two nodes remain.
+                for line in two_replica_warning(min(replication_factor, remaining)):
+                    print("     " + line)
             else:
                 print("  3. Check the keyspace replication factor still fits the smaller ring.")
             if ring_member is not None and ring_member["available"]:
