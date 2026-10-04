@@ -89,6 +89,29 @@ same duplication, and the same risk -- it is how `cluster start` came to restart
 months after the unit was deleted. And the volume group is still named `vg_aether`, a name left over
 from the DRBD design that nothing but history explains.
 
+## P1 — Host lifecycle, VM editing and ESXi parity: review requested (2026-10-04, not started)
+
+Raised from using the lab; the owner asked for each of these to be thought through, not patched.
+
+* **Maintenance flow.** A host in maintenance still shows ZooKeeper, HydraDB, Daruk, Spark and Hylia
+  UP while everything else is DOWN (Sidon included). Decide what "in maintenance" should keep running
+  and why: ZooKeeper, Hydra and Daruk presumably stay (the quorum gate exists so they can), but Hylia
+  and Sidon's state needs a stated rule, and `cluster status` should label what is kept up on purpose.
+* **Hosts becoming degraded, and leaving it.** Mipha quarantines a host after three failed storage
+  probes and (until 2026-10-04) never lifted it after a restart; the orphan reconcile is the first fix.
+  Review the whole lifecycle: what degrades a host, what each state stops (placement, HA, DRS,
+  maintenance), what brings it back, and whether the thresholds are right.
+* **Automatic VM migration.** Live migration fails for Sidon-served disks (the destination has no NBD
+  socket): being fixed on a branch. Then review evacuation, DRS moves and HA restarts as one story.
+* **How Mipha heals a host that rejoins.** Fencing ladder, rejoin, re-attaching vdisks, reclaiming
+  ownership, restarting its VMs or leaving them where HA put them: write it down and test it.
+* **A full review of every service:** changes, endpoints, who calls them, what is unused.
+* **VM changes while running, and ESXi parity.** A list of what can be changed on a running VM today
+  (CPU/memory hot-add, disk add/grow/remove, NIC add/remove, CD-ROM insert/eject, boot order, console
+  type, name, annotations, snapshots, resource limits/shares) against what ESXi allows, and a plan.
+* **`test2` hangs at the boot options screen** although it was given a valid CD-ROM.
+* **A VM cannot be edited after it is created** in Phoenix.
+
 ## P1 — The Phoenix console lost function in the port (2026-10-02, restored 2026-10-03; needs a pass in a real browser)
 
 Reported from using it. The pages exist and render, which is what "every page is Phoenix"
