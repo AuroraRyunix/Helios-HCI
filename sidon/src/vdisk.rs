@@ -1014,6 +1014,44 @@ impl Vdisk {
         result
     }
 
+    /// Seal the open extent group of a vdisk with no drain running.
+    ///
+    /// The replicas already hold the whole group: a drain waits for every replica to answer
+    /// everything it sent before it writes a map row, so after one has completed there is
+    /// nothing in flight to wait for, which is what `DrainJob::seal_open_egroup` waits on while
+    /// the drain is still running. Otherwise the same three steps: sync, hash, compare-and-swap
+    /// the row from open to sealed.
+    fn seal_idle_open_group(&mut self) -> Result<String> {
+        let mut eg = self.open_eg.take().expect("caller checked");
+        let sealed = (|| {
+            self.store.sync(&mut eg)?;
+            let hash = self.store.seal_hash(&eg.id)?;
+            let cas = self.daruk.cas(
+                "/v1/dfs/egroup-state",
+                json_params(vec![
+                    ("egroup_id", json!(eg.id)),
+                    ("state", json!("sealed")),
+                    ("seal_hash", json!(hash)),
+                    ("size", json!(eg.size as i64)),
+                    ("expected_state", json!("open")),
+                ]),
+            )?;
+            if !cas.applied {
+                return Err(Error::meta(format!(
+                    "extent group {} could not be sealed: it is in state {}",
+                    eg.id,
+                    cas.current_str("state")
+                )));
+            }
+            Ok(eg.id.clone())
+        })();
+        if sealed.is_err() {
+            // Still the group the next drain appends to; nothing was lost by trying.
+            self.open_eg = Some(eg);
+        }
+        sealed
+    }
+
     /// Called at detach. Drains what is left so a clean shutdown leaves an empty journal.
     pub fn close(&mut self) -> Result<()> {
         if !self.needs_drain() {
@@ -1838,6 +1876,28 @@ pub fn drain_all(handle: &Arc<Mutex<Vdisk>>) -> Result<()> {
     lock_idle(handle).close()
 }
 
+/// Drain a vdisk completely and seal the extent group it was appending to, for a vdisk that is
+/// being detached or handed over.
+///
+/// `drain_all` leaves the group open, which is right for a vdisk that carries on. For one that
+/// stops, an open group is a group nothing will ever adopt again (a restart, a detach or a
+/// failover starts a new one), yet rows already point into it -- and scrub and compaction only
+/// look at sealed groups, so the data in it was never verified or compacted. Sealing it here
+/// puts it in the state everything else expects. An empty group is left alone: it holds nothing
+/// to verify and the sweep reclaims it.
+pub fn drain_and_seal(handle: &Arc<Mutex<Vdisk>>) -> Result<Option<String>> {
+    let mut v = lock_idle(handle);
+    v.close()?;
+    match v.open_eg.as_ref() {
+        Some(eg) if eg.size > 0 => {
+            let id = v.seal_idle_open_group()?;
+            eprintln!("sidon: vdisk {}: sealed extent group {id} on detach", v.id);
+            Ok(Some(id))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Append a guest write and queue it for the next commit, without waiting for it.
 ///
 /// The write's records are in the journal, in the order writes were submitted, when this
@@ -2074,6 +2134,7 @@ mod tests {
         log: Mutex<Vec<String>>,
         fail_commit: AtomicBool,
         fail_batch: AtomicBool,
+        refuse_seal: AtomicBool,
         hold: Mutex<bool>,
         cv: Condvar,
         arrived: AtomicUsize,
@@ -2144,6 +2205,9 @@ mod tests {
                     json!({"status": "success", "rows": []})
                 }
                 "/v1/dfs/egroup-state" => {
+                    if st.refuse_seal.load(Ordering::SeqCst) {
+                        return json!({"status": "success", "applied": false, "current": {"state": "dead"}});
+                    }
                     st.log.lock().unwrap().push("seal".to_string());
                     json!({"status": "success", "applied": true, "current": {}})
                 }
@@ -2413,6 +2477,48 @@ mod tests {
         drop(v);
         // Now every byte comes from extent groups, and the overwritten middle is the new one.
         assert_eq!(r.read(0, 8 * MIB as u32), model.slice(0, 8 * MIB), "read from extents only");
+    }
+
+    /// A vdisk that is detached after committing into an open group used to leave that group
+    /// open for ever: nothing adopts it, rows point into it, and scrub and compaction only look
+    /// at sealed groups. Detach now seals it; a plain drain still does not (a vdisk that carries
+    /// on keeps appending to it).
+    #[test]
+    fn detaching_a_vdisk_seals_the_group_its_rows_point_into() {
+        let r = rig("seal-on-detach", 1, 64 * MIB as u64, 256 * MIB as u64);
+        r.write(0, &fill(7, 3 * MIB)).unwrap();
+        drain_all(&r.vd).unwrap();
+        assert!(r.vd.lock().unwrap().open_eg.is_some(), "a drain leaves the group open");
+        assert!(!r.hydra.log().contains(&"seal".to_string()));
+
+        let sealed = drain_and_seal(&r.vd).unwrap();
+        assert!(sealed.is_some());
+        assert!(r.vd.lock().unwrap().open_eg.is_none());
+        assert_eq!(r.hydra.log().iter().filter(|l| *l == "seal").count(), 1);
+        // Every row still reads, and a second detach has nothing to seal.
+        assert_eq!(r.read(0, 3 * MIB as u32), fill(7, 3 * MIB));
+        assert_eq!(drain_and_seal(&r.vd).unwrap(), None);
+    }
+
+    #[test]
+    fn detaching_a_vdisk_that_never_wrote_seals_nothing() {
+        let r = rig("seal-on-detach-empty", 0, 64 * MIB as u64, 256 * MIB as u64);
+        assert_eq!(drain_and_seal(&r.vd).unwrap(), None);
+        assert!(!r.hydra.log().contains(&"seal".to_string()));
+    }
+
+    /// If Hydra will not take the seal, the group stays the one the vdisk appends to: a failed
+    /// detach must not strand it.
+    #[test]
+    fn a_seal_hydra_refuses_leaves_the_group_open_for_the_next_drain() {
+        let r = rig("seal-refused", 0, 64 * MIB as u64, 256 * MIB as u64);
+        r.write(0, &fill(9, MIB)).unwrap();
+        drain_all(&r.vd).unwrap();
+        r.hydra.st.refuse_seal.store(true, Ordering::SeqCst);
+        assert!(drain_and_seal(&r.vd).is_err());
+        assert!(r.vd.lock().unwrap().open_eg.is_some());
+        r.hydra.st.refuse_seal.store(false, Ordering::SeqCst);
+        assert!(drain_and_seal(&r.vd).unwrap().is_some());
     }
 
     #[test]

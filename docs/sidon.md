@@ -201,6 +201,15 @@ names this node, and the claim is conditional on what it just read. `SIDON_HANDO
 bounds the wait for the owner's drain. The error names the step and says what was left. Design:
 [dfs/ownership.md §5](./dfs/ownership.md), decision D-34.
 
+**Journal ceiling.** A vdisk's writes wait for a drain once its journal reaches `SIDON_HARD_CEILING` (default 0,
+meaning twice `SIDON_HIGH_WATER`, 128 MiB). A value at or below the high-water mark is replaced and the log says so. At
+startup Sidon warns when the journal volume has less room than eight busy vdisks' ceilings: each may fill its journal to
+the ceiling and replicas hold copies of the journals they replicate.
+
+**Detach seals.** Detaching a vdisk (and the owner's release in a handover) drains its journal and then seals the extent
+group it was appending to, so rows that point into it are in a sealed group that scrub and compaction will visit. A drain
+alone leaves the group open, because a vdisk that carries on keeps appending to it.
+
 **Restarting Sidon removes the NBD sockets of the disks it serves.** Sidon does not re-attach on
 start, so every VM using a disk on a node must be stopped or migrated away before that node's
 Sidon is restarted. A

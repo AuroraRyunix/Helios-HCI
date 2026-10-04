@@ -253,6 +253,9 @@ pub struct ReplicaStore {
     volume: PathBuf,
     /// vdisk -> highest fenced epoch. Cached, but the file is the truth.
     fenced: Mutex<HashMap<String, u64>>,
+    /// vdisk -> (journal length, record bytes, checksum) after the last append this process
+    /// made. What lets a retried append be recognised as one that already landed.
+    last_append: Mutex<HashMap<String, (u64, usize, u32)>>,
     /// The node's extent-group access tally, when the daemon has one to share.
     ///
     /// A read served from here never goes through `Vdisk::read`, which is where the tally
@@ -270,6 +273,7 @@ impl ReplicaStore {
         Ok(ReplicaStore {
             volume: volume.to_path_buf(),
             fenced: Mutex::new(HashMap::new()),
+            last_append: Mutex::new(HashMap::new()),
             access: None,
         })
     }
@@ -435,6 +439,40 @@ impl ReplicaStore {
         }
         let path = self.journal_path(vdisk);
         let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
+        let length = file.metadata()?.len();
+        let checksum = crate::crc::crc32c(0, record);
+
+        // Idempotent against a retried request. `PeerClient::call` sends again when the reply
+        // is lost, and by then the first attempt may already have landed: appending the same
+        // bytes twice would leave a duplicate record on this replica that the owner's journal
+        // does not have, found only at the next takeover. Journal records carry their own
+        // sequence numbers, so an append whose bytes are exactly what the journal ends with --
+        // and, from this process's own record of its last append, ended with *this* request --
+        // is the same request again and is acknowledged without being written twice.
+        let remembered = self.last_append.lock().expect("append mutex poisoned").get(vdisk).copied();
+        let already = match remembered {
+            Some((len, n, crc)) => len == length && n == record.len() && crc == checksum,
+            // Nothing remembered (this process has not appended to it yet): read the tail once.
+            None => !record.is_empty() && length >= record.len() as u64 && {
+                use std::io::{Seek, SeekFrom};
+                let mut tail = vec![0u8; record.len()];
+                match File::open(&path) {
+                    Ok(mut reader) => reader
+                        .seek(SeekFrom::Start(length - record.len() as u64))
+                        .and_then(|_| reader.read_exact(&mut tail))
+                        .map(|_| tail == record)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                }
+            },
+        };
+        if already {
+            if !defer_sync {
+                file.sync_data()?;
+            }
+            return Ok(());
+        }
+
         file.write_all(record)?;
         // The guest's write is acknowledged only after every replica has synced, so this
         // is on the critical path by design -- it is what "durable on RF nodes" means. For
@@ -442,6 +480,10 @@ impl ReplicaStore {
         if !defer_sync {
             file.sync_data()?;
         }
+        self.last_append
+            .lock()
+            .expect("append mutex poisoned")
+            .insert(vdisk.to_string(), (length + record.len() as u64, record.len(), checksum));
         Ok(())
     }
 
@@ -1529,6 +1571,71 @@ mod tests {
             Err(Error::Refused(m)) => assert!(m.contains("plaintext"), "{m}"),
             other => panic!("a routable bind without certificates must be refused, got {other:?}"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reply lost after the append landed makes `PeerClient::call` send it again. The replica
+    /// must not hold the record twice: the owner's journal has it once, and the difference is
+    /// only found at the next takeover.
+    #[test]
+    fn a_retried_append_is_not_written_twice() {
+        let dir = tmpdir("retry-append");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.append("vd", 3, b"record-0001").unwrap();
+        store.append("vd", 3, b"record-0001").unwrap();
+        assert_eq!(store.read_tail("vd").unwrap(), b"record-0001");
+        store.append("vd", 3, b"record-0002").unwrap();
+        store.append("vd", 3, b"record-0002").unwrap();
+        assert_eq!(store.read_tail("vd").unwrap(), b"record-0001record-0002");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same, when the replica restarted between the first attempt and the retry: nothing is
+    /// remembered, so the tail of the journal is what says it already landed.
+    #[test]
+    fn a_retry_that_reaches_a_restarted_replica_is_still_recognised() {
+        let dir = tmpdir("retry-after-restart");
+        ReplicaStore::new(&dir).unwrap().append("vd", 3, b"record-0001").unwrap();
+        let restarted = ReplicaStore::new(&dir).unwrap();
+        restarted.append("vd", 3, b"record-0001").unwrap();
+        assert_eq!(restarted.read_tail("vd").unwrap(), b"record-0001");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Different records, and the same records in a different order, are never mistaken for a
+    /// retry.
+    #[test]
+    fn distinct_appends_all_land() {
+        let dir = tmpdir("distinct-append");
+        let store = ReplicaStore::new(&dir).unwrap();
+        for r in [&b"aaaa"[..], b"bbbb", b"aaaa"] {
+            store.append("vd", 3, r).unwrap();
+        }
+        assert_eq!(store.read_tail("vd").unwrap(), b"aaaabbbbaaaa");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A retry is still refused when the replica was fenced in between: recognising a duplicate
+    /// is not a way past the epoch.
+    #[test]
+    fn a_retry_from_a_fenced_epoch_is_still_refused() {
+        let dir = tmpdir("retry-fenced");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.append("vd", 3, b"record-0001").unwrap();
+        store.fence("vd", 4).unwrap();
+        assert!(store.append("vd", 3, b"record-0001").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// After the journal is emptied (a drain), an identical payload is new data again.
+    #[test]
+    fn a_payload_after_a_truncate_is_not_taken_for_a_retry() {
+        let dir = tmpdir("retry-truncate");
+        let store = ReplicaStore::new(&dir).unwrap();
+        store.append("vd", 3, b"record-0001").unwrap();
+        store.truncate("vd", 3).unwrap();
+        store.append("vd", 3, b"record-0001").unwrap();
+        assert_eq!(store.read_tail("vd").unwrap(), b"record-0001");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

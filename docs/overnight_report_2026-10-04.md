@@ -228,6 +228,20 @@ tasks to the ZooKeeper leader not the Catalyst queue holder; a Phoenix page with
 `holds_dispatch()`, and `/api/v1/tasks/status/<id>` splices an unvalidated id into CQL; about 30 disagreeing service lists; dead code with greps.
 Status: **document done; one fix; remainder open**.
 
+### I. Sidon / DFS open items: three built and tested, the rest documented
+
+*Done (D-35, 24 new Rust tests including the earlier handover ones; 402 pass).* (1) **Idempotent appends**: a retried append is recognised by the replica
+(bytes equal the journal's tail, via its own record or one tail comparison after a restart) and not written twice; the fence is still checked
+first. (2) **Seal on detach**: `drain_and_seal`, used by detach and the handover's release; stays open (and the vdisk usable) if Hydra refuses; an empty
+group is left to the sweep. (3) **`SIDON_HARD_CEILING`** with a startup warning when the journal volume could not hold eight busy vdisks' ceilings, and a
+ceiling at or below the high-water mark replaced and said so.
+*Documented, not built:* overlapped commits (the safe shape and the proof required first are in `docs/dfs/group_commit.md` section 6);
+re-attach of NBD sockets at start (needs the claim, fence and journal recovery at start-up, which is not simple; the restart rule is documented);
+`vhost-user-blk` already has its measurement plan in `docs/dfs/vhost_user_blk.md` section 5, unchanged. `docs/dfs/compaction.md` was re-read against
+D-33: no stale text found. Reads outside the vdisk lock: not attempted.
+*Not run:* the new seal and retry paths against a live cluster (they are covered by the fake-Hydra rig and the replica store tests).
+Status: **done for the three; the rest not built**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification

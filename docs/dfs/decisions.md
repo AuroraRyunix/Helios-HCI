@@ -886,3 +886,19 @@ Sidon does not re-attach on start, so a Sidon restart removes the sockets of run
 such VMs must be moved or stopped first; the release path against a real journal is covered by the
 live check in the overnight report, not by a unit test, because it needs Hydra.
 
+**D-35 — a replica recognises a retried append; a detach seals the open group; the journal ceiling is a setting.**
+Three small changes to Sidon's edges, each with fault-injection tests. *Retried append:* `PeerClient::call` resends
+when a reply is lost and the first attempt may already have landed, which left a duplicate record on the replica that
+the owner's journal did not have. **Taken:** the replica acknowledges an append whose bytes are exactly what its journal
+ends with (its own record of the last append in memory; one tail comparison after a restart), without writing it twice;
+the fence is checked first and durability still honoured. **Rejected:** *a per-record sequence check in the replica* (it
+would have to parse the journal framing on the critical path of every append; byte-identity of a record that carries its
+own sequence number is the same fact for one memcmp); *an offset in the request* (a protocol change with a rolling-upgrade
+story, for the same result). *Open group at detach:* a vdisk detached after committing into its open group left it open for
+ever (nothing adopts it, rows point into it, scrub and compaction look only at sealed groups). **Taken:** detach and the
+handover's release seal it after the drain, using the same compare-and-swap, and leave it open if Hydra refuses; an empty
+group is left to the sweep. *Ceiling:* the hard drain ceiling was twice `SIDON_HIGH_WATER` with no setting and no check that
+the journal volume could hold it. **Taken:** `SIDON_HARD_CEILING` (0 = the default), a ceiling at or below the high-water
+mark is replaced and said so, and startup warns when the volume could not hold eight busy vdisks' ceilings. **Not
+addressed:** Sidon still does not re-attach on start.
+

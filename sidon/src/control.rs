@@ -46,6 +46,9 @@ pub struct DaemonConfig {
     pub daruk_addr: String,
     pub node: String,
     pub high_water: u64,
+    /// The most journal a vdisk may hold before its writes wait for a drain; 0 means twice the
+    /// high-water mark (`SIDON_HARD_CEILING`). See [`journal_ceiling`].
+    pub hard_ceiling: u64,
     pub daruk_timeout: Duration,
     pub purah_interval: Duration,
     pub purah_grace: Duration,
@@ -275,7 +278,7 @@ impl Daemon {
             root: self.cfg.root.clone(),
             node: self.cfg.node.clone(),
             high_water: self.cfg.high_water,
-            hard_ceiling: 0,
+            hard_ceiling: self.cfg.hard_ceiling,
             access: Arc::clone(&self.access),
         }
     }
@@ -842,7 +845,7 @@ impl Daemon {
         let put_back = |entry: Attached| {
             self.attached.lock().expect("attached mutex poisoned").insert(id.to_string(), entry);
         };
-        if let Err(e) = crate::vdisk::drain_all(&handle) {
+        if let Err(e) = crate::vdisk::drain_and_seal(&handle).map(|_| ()) {
             put_back(entry);
             return Some(Err(Error::refused(format!("the journal could not be drained: {e}"))));
         }
@@ -873,7 +876,7 @@ impl Daemon {
         let drain_result = match &a.vdisk {
             // Waits for a background drain first, then drains whatever is left under the
             // lock, so the journal is empty when this returns.
-            Some(handle) => crate::vdisk::drain_all(handle),
+            Some(handle) => crate::vdisk::drain_and_seal(handle).map(|_| ()),
             // Forwarding: nothing local to drain. The owner still holds the journal, and
             // draining is its business.
             None => Ok(()),
@@ -2181,6 +2184,51 @@ impl handover::Steps for DaemonSteps<'_> {
     }
 }
 
+/// The journal ceiling a vdisk will use, and a warning when what was asked for cannot work.
+///
+/// The ceiling is where guest writes stop being admitted until a drain makes room; it was
+/// always twice the high-water mark, with no setting. 0 means that default. A configured
+/// value at or below the high-water mark would make writes wait before a drain even starts,
+/// so it is raised to the default and said so.
+pub fn journal_ceiling(high_water: u64, configured: u64) -> (u64, Option<String>) {
+    let default = high_water.saturating_mul(2);
+    if configured == 0 {
+        (default, None)
+    } else if configured <= high_water {
+        (
+            default,
+            Some(format!(
+                "SIDON_HARD_CEILING={configured} is not above SIDON_HIGH_WATER={high_water}, so \
+                 writes would wait before a drain could start; using {default}"
+            )),
+        )
+    } else {
+        (configured, None)
+    }
+}
+
+/// A warning when the journal volume could not hold the ceiling for even a few vdisks.
+///
+/// Each attached vdisk may fill its journal to the ceiling, and every replica holds a copy
+/// of every journal it replicates, so the volume has to hold the ceiling times the vdisks
+/// that can be active on this node at once. Nothing used to check that the volume could hold
+/// even one. Eight is the number the warning is written for: fewer than eight ceilings of
+/// room is a node that fills its journal volume under a burst on a handful of busy disks.
+pub fn ceiling_capacity_warning(ceiling: u64, available: u64) -> Option<String> {
+    const VDISKS: u64 = 8;
+    if ceiling.saturating_mul(VDISKS) <= available {
+        return None;
+    }
+    Some(format!(
+        "the journal ceiling is {} MiB per vdisk and the journal volume has {} MiB free: it \
+         could not hold the ceiling of {VDISKS} busy vdisks (and replicas add the copies they \
+         hold). Lower SIDON_HIGH_WATER or SIDON_HARD_CEILING, or give the journal volume more \
+         room",
+        ceiling >> 20,
+        available >> 20
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2251,5 +2299,31 @@ mod tests {
     #[test]
     fn an_absurd_fault_tolerance_clamps_instead_of_wrapping() {
         assert_eq!(copies_for_ftt(u64::MAX, 3), 3);
+    }
+
+    #[test]
+    fn the_ceiling_defaults_to_twice_the_high_water_mark() {
+        assert_eq!(journal_ceiling(64 << 20, 0), (128 << 20, None));
+    }
+
+    #[test]
+    fn a_configured_ceiling_above_the_high_water_mark_is_used() {
+        assert_eq!(journal_ceiling(64 << 20, 512 << 20), (512 << 20, None));
+    }
+
+    #[test]
+    fn a_ceiling_that_would_stall_writes_before_a_drain_is_replaced_and_said() {
+        for configured in [1u64, 64 << 20] {
+            let (used, why) = journal_ceiling(64 << 20, configured);
+            assert_eq!(used, 128 << 20);
+            assert!(why.unwrap().contains("SIDON_HARD_CEILING"));
+        }
+    }
+
+    #[test]
+    fn a_volume_too_small_for_the_ceiling_is_warned_about() {
+        assert!(ceiling_capacity_warning(128 << 20, 512 << 20).unwrap().contains("could not hold"));
+        assert!(ceiling_capacity_warning(128 << 20, 1 << 30).is_none());
+        assert!(ceiling_capacity_warning(128 << 20, 0).is_some());
     }
 }

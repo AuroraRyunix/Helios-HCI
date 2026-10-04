@@ -203,6 +203,10 @@ fn main() {
         // 64 MiB of journal before a drain. Large enough that a burst of guest writes
         // never waits on one, small enough that replay after a crash is seconds.
         high_water: env_bytes("SIDON_HIGH_WATER", 64 << 20),
+        // The most journal a vdisk may hold before its writes wait for a drain. 0 (the default)
+        // is twice the high-water mark. Raise it to ride out a longer burst; the journal volume
+        // has to hold it for every busy vdisk, which the startup check below says if it cannot.
+        hard_ceiling: env_bytes("SIDON_HARD_CEILING", 0),
         daruk_timeout: Duration::from_secs(env_bytes("SIDON_DARUK_TIMEOUT", 15)),
         // Purah runs every 5 minutes and will not reclaim anything it has not seen
         // unreferenced for 10 -- and never on first sight, whatever the grace, because
@@ -257,6 +261,20 @@ fn main() {
         access_flush: Duration::from_secs(env_bytes("SIDON_ACCESS_FLUSH", 60)),
         access_capacity: env_bytes("SIDON_ACCESS_CAPACITY", 200_000) as usize,
     };
+
+    let mut cfg = cfg;
+    let (ceiling, why) = control::journal_ceiling(cfg.high_water, cfg.hard_ceiling);
+    if let Some(why) = why {
+        eprintln!("sidon: WARNING: {why}");
+    }
+    cfg.hard_ceiling = ceiling;
+    if let Ok(volume) = mounts::journal_dir(&cfg.root) {
+        if let Some((_, available)) = extent::disk_space(&volume) {
+            if let Some(warning) = control::ceiling_capacity_warning(ceiling, available) {
+                eprintln!("sidon: WARNING: {warning}");
+            }
+        }
+    }
 
     println!(
         "sidon: node={} root={} control={} daruk={} peer_bind={} peers=[{}] ftt={}",

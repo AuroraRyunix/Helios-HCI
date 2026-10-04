@@ -288,7 +288,15 @@ are reached on purpose by holding the first batch's sync until the test says so.
 
 ## 6. Not done, and why
 
-* **Overlapped commits.** One batch commits at a time. Two in flight (the next batch's sync
+* **Overlapped commits (design, not built).** The safe shape is: a batch is *begun* (its records are in the
+  journal in the reader's order) before the previous one has been *acknowledged*, but only one batch is ever
+  on the wire to a given replica, and a batch is acknowledged to its guests strictly in begin order. What
+  makes it unsafe to build now is the failure rule: if batch N fails after batch N+1's records are in the
+  journal, N+1 contains records that follow a hole, and the repair (which rebuilds the replica from the
+  owner's journal) has to be proven to treat N+1 as unacknowledged and re-send it in order. That proof, and
+  a test that fails a replica at every point between the two batches, come before any code. The replica
+  protocol does not need to pipeline for this shape, which is what keeps it small. Not implemented: no
+  measurement shows the linger leaves a rate worth the risk. One batch commits at a time. Two in flight (the next batch's sync
   while the previous one's replies are processed) could roughly double the rate again when a
   commit is much longer than a client's turnaround, but it needs the replica protocol to pipeline
   requests (the replica serves a connection one request at a time, and a client holds the
@@ -299,8 +307,11 @@ are reached on purpose by holding the first batch's sync until the test says so.
   a node that does not yet own its vdisk sees queue depth 1 until ownership follows.
 * **Reads are serialised by the vdisk lock** (they hold it across the extent read). They run on
   workers, but one at a time per vdisk. Reading outside the lock is a separate change.
-* **A peer call retries once on a transport failure**, and a retried append whose first
-  attempt had reached the replica would leave a duplicate record there. Pre-existing and
-  unchanged (a reply timeout is the only way to hit it, and the same hazard applied per write
-  before); the repair above would clear it on the next break, but nothing detects it first.
+* **A peer call retries once on a transport failure** (fixed, D-35): a retried append whose first
+  attempt had reached the replica used to leave a duplicate record there, found only at the next takeover.
+  The replica now recognises a retry -- bytes identical to what its journal ends with, checked against its
+  own record of its last append, or once against the journal's tail after a restart -- and acknowledges it
+  without writing it twice (it still syncs if the request asked for durability, and a fenced epoch is
+  still refused first). Records carry their own sequence numbers, so two different appends can never be
+  byte-identical. Tests: `a_retried_append_is_not_written_twice` and four more in `peer.rs`.
 * **Multiple NBD connections to one export** are still served one at a time.
