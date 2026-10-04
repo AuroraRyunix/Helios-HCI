@@ -94,6 +94,11 @@ defmodule SpectrumPhx.Vms do
   # something else claimed and started in the meantime, which is a live VM's row.
   @delete_cql "DELETE FROM hydra.vms WHERE name = ? IF state = ? AND host_ip = ?"
 
+  # An edit of a stopped VM. Conditional on the row still being the stopped, unplaced one the edit
+  # was planned against: a start that claimed it in the meantime wins, and the edit is refused
+  # (and the storage it created is given back) rather than rewriting a running VM's definition.
+  @update_cql "UPDATE hydra.vms SET vcpu = ?, memory = ?, disk_path = ?, disk_size = ?, disks_list = ?, firmware = ?, iso = ?, boot_device = ?, network_id = ?, cpu_model = ?, audio_enabled = ?, graphics = ? WHERE name = ? IF state = ? AND host_ip = ?"
+
   @migration_lock "migrating"
   @unlocked_status "running"
 
@@ -126,6 +131,9 @@ defmodule SpectrumPhx.Vms do
 
   @doc "CQL used by `create_vm/1` to undo its row when storage allocation fails."
   def delete_cql, do: @delete_cql
+
+  @doc "The compare-and-swap an edit of a stopped VM writes with."
+  def update_cql, do: @update_cql
 
   @doc "The value written into the `status` column while a migration is in flight."
   def migration_lock, do: @migration_lock
@@ -395,6 +403,280 @@ defmodule SpectrumPhx.Vms do
           end
       end
     end
+  end
+
+  @doc """
+  Edit a stopped VM.
+
+  Everything is editable while the VM is stopped except its name: vCPU, memory, firmware, boot
+  device, CPU model, console, audio, NICs, CD-ROMs and disks. For disks the rules are the ones a
+  vdisk can honour:
+
+    * a disk keeps its position (its vdisk is `<vm>-disk<N>`), so only the **last** disks can be
+      removed and new ones are appended;
+    * an existing disk can only **grow**, and cannot change container;
+    * a changed bus is recorded but, as at creation, Sidon serves every disk as virtio.
+
+  The order is the one that leaves the least behind when something fails: grow existing vdisks
+  (harmless, and not undone), create new ones (undone if anything later fails), write the row
+  by compare-and-swap on `state = Stopped AND host_ip = ""`, and only then delete the vdisks
+  the row no longer names (a failure there leaves an orphan, logged, never a row pointing at
+  storage that is gone).
+
+  `params` is the same map `create_vm/1` takes (`Form.to_attrs/1` output); a `"name"` in it is
+  ignored. A structured form also carries `"disk_indices"`, which is how a removal from the
+  middle is told apart from one at the end.
+
+  Returns `{:ok, vm}`, `{:error, [field: message]}` for what the form can show,
+  `{:error, :not_found | :not_stopped | :changed}` or `{:error, {:storage, message}}`.
+  """
+  @spec update_vm(String.t(), map()) ::
+          {:ok, Vm.t()}
+          | {:error,
+             keyword()
+             | :not_found
+             | :not_stopped
+             | :changed
+             | :invalid_name
+             | {:storage, String.t()}
+             | term()}
+  def update_vm(name, params) when is_map(params) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = current} <- get_vm(name),
+         :ok <- require_stopped(current),
+         {:ok, %Vm{} = edited} <- Vm.new(Map.put(params, "name", name)),
+         {:ok, plan} <- plan_disk_edit(current, edited, params["disk_indices"]) do
+      edited = %{
+        edited
+        | disk_path: edited |> Vm.disks() |> List.first() |> then(&(&1 && &1.path)) || "",
+          state: current.state,
+          host_ip: current.host_ip || "",
+          status: current.status
+      }
+
+      apply_edit(current, edited, plan)
+    end
+  end
+
+  @doc """
+  The errors an edit would be refused with, without doing anything: what a form shows while the
+  operator is still typing. `[]` when the edit is allowed.
+  """
+  @spec edit_errors(Vm.t(), map()) :: keyword()
+  def edit_errors(%Vm{} = current, params) when is_map(params) do
+    case Vm.new(Map.put(params, "name", current.name)) do
+      {:ok, edited} ->
+        case plan_disk_edit(current, edited, params["disk_indices"]) do
+          {:ok, _plan} -> []
+          {:error, errors} -> errors
+        end
+
+      {:error, errors} ->
+        errors
+    end
+  end
+
+  @doc "Whether a VM can be edited now: stopped, unplaced and not migrating."
+  @spec editable?(Vm.t()) :: boolean()
+  def editable?(%Vm{} = vm), do: require_stopped(vm) == :ok
+
+  defp require_stopped(%Vm{} = vm) do
+    cond do
+      Vm.running?(vm) -> {:error, :not_stopped}
+      Vm.migrating?(vm) -> {:error, :not_stopped}
+      vm.host_ip not in [nil, ""] -> {:error, :not_stopped}
+      true -> :ok
+    end
+  end
+
+  # What the edit does to storage. Returns {:ok, %{grow: [...], add: [...], remove: [...]}} or
+  # {:error, [disks: message]}. Pure: it reads two structs and a list of indices.
+  defp plan_disk_edit(%Vm{} = current, %Vm{} = edited, indices) do
+    old = Vm.disks(current)
+    new = Vm.disks(edited)
+    kept = min(length(old), length(new))
+
+    cond do
+      is_list(indices) and indices != Enum.to_list(0..(length(new) - 1)//1) ->
+        {:error,
+         [
+           disks:
+             "a disk keeps its position, so only the last disks can be removed " <>
+               "(its vdisk is named after the position)"
+         ]}
+
+      true ->
+        problems =
+          old
+          |> Enum.zip(new)
+          |> Enum.flat_map(fn {o, n} -> disk_problem(o, n) end)
+
+        case problems do
+          [message | _] ->
+            {:error, [disks: message]}
+
+          [] ->
+            {:ok,
+             %{
+               grow:
+                 old
+                 |> Enum.zip(new)
+                 |> Enum.filter(fn {o, n} -> n.size_gib > o.size_gib end)
+                 |> Enum.map(fn {_o, n} -> n end),
+               add: Enum.drop(new, kept),
+               remove: Enum.drop(old, kept)
+             }}
+        end
+    end
+  end
+
+  defp disk_problem(old, new) do
+    cond do
+      is_nil(old.size_gib) or is_nil(new.size_gib) ->
+        ["disk #{old.index + 1} has no usable size"]
+
+      new.size_gib < old.size_gib ->
+        [
+          "disk #{old.index + 1} is #{old.size_gib} GiB and can only grow " <>
+            "(#{new.size_gib} GiB was asked for)"
+        ]
+
+      (new.container || "") != (old.container || "") ->
+        ["disk #{old.index + 1} cannot be moved to another container"]
+
+      true ->
+        []
+    end
+  end
+
+  defp apply_edit(%Vm{} = current, %Vm{} = edited, plan) do
+    # Containers of the disks to be created are checked before anything is touched, so a typo in
+    # the third one is refused with nothing to roll back (the same order create_vm uses).
+    added = Enum.map(plan.add, &name_a_container/1)
+
+    with :ok <- check_containers(added),
+         :ok <- grow_disks(plan.grow),
+         {:ok, created} <- create_disks(edited, added),
+         :ok <- write_edit(current, edited, created) do
+      delete_removed(current, plan.remove)
+      broadcast({:vm_updated, edited.name})
+      {:ok, edited}
+    else
+      {:error, :changed} -> {:error, :changed}
+      {:error, message} when is_binary(message) -> {:error, {:storage, message}}
+      other -> other
+    end
+  end
+
+  defp grow_disks(disks) do
+    Enum.reduce_while(disks, :ok, fn disk, :ok ->
+      case resize_disk(disk) do
+        {:ok, _response} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, describe_disk_failure(disk, reason)}}
+      end
+    end)
+  end
+
+  defp resize_disk(%{resource: resource, size_gib: gib}) do
+    case storage_client() do
+      nil ->
+        on_a_spark_node(fn ip -> Spark.dfs_resize(ip, resource, gib * 1024 * 1024 * 1024) end)
+
+      fun when is_function(fun, 3) ->
+        fun.(:resize, resource, %{size_gib: gib})
+    end
+  end
+
+  defp create_disks(_vm, []), do: {:ok, []}
+
+  defp create_disks(%Vm{} = vm, disks) do
+    disks
+    |> Enum.reduce_while({:ok, []}, fn disk, {:ok, created} ->
+      case allocate_disk(disk) do
+        {:ok, %{"created" => false}} ->
+          # Adopting a vdisk that already exists under a name this VM was never given is a
+          # leftover of an earlier VM; refused rather than reused with someone else's data.
+          release_disks(created)
+
+          {:halt,
+           {:error,
+            describe_disk_failure(
+              disk,
+              "a vdisk of that name already exists and was not created here"
+            )}}
+
+        {:ok, _response} ->
+          {:cont, {:ok, [disk.resource | created]}}
+
+        {:error, reason} ->
+          release_disks(created)
+          Logger.error("Editing VM #{vm.name}: #{inspect(reason)}")
+          {:halt, {:error, describe_disk_failure(disk, reason)}}
+      end
+    end)
+  end
+
+  defp write_edit(%Vm{} = current, %Vm{} = edited, created) do
+    case source() do
+      {:static, _vms} ->
+        :ok
+
+      :hydra ->
+        params = update_params(edited, current)
+
+        case Hydra.apply_lwt(@update_cql, params) do
+          {:ok, true} ->
+            :ok
+
+          {:ok, false} ->
+            release_disks(created)
+            {:error, :changed}
+
+          {:error, reason} ->
+            release_disks(created)
+            {:error, {:storage, "the VM row could not be written: " <> inspect(reason)}}
+        end
+    end
+  end
+
+  @doc false
+  def update_params(%Vm{} = edited, %Vm{} = current) do
+    [
+      {"int", edited.vcpu},
+      {"int", edited.memory},
+      {"text", edited.disk_path},
+      {"int", edited.disk_size},
+      {"text", edited.disks_list},
+      {"text", edited.firmware},
+      {"text", edited.iso},
+      {"text", edited.boot_device},
+      {"text", edited.network_id},
+      {"text", edited.cpu_model},
+      {"boolean", edited.audio_enabled},
+      {"text", edited.graphics},
+      {"text", edited.name},
+      {"text", current.state},
+      {"text", current.host_ip || ""}
+    ]
+  end
+
+  # After the row no longer names them. A failure is an orphan to remove by hand, said loudly,
+  # because the alternative -- deleting before the row changes -- risks a VM whose row points at
+  # a vdisk that is gone.
+  defp delete_removed(%Vm{} = vm, disks) do
+    Enum.each(disks, fn disk ->
+      case release_disk(disk.resource) do
+        {:ok, _response} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error(
+            "VM #{vm.name}: disk #{disk.index + 1} was removed from its definition but its " <>
+              "vdisk #{disk.resource} could not be deleted (#{inspect(reason)}). It is now an " <>
+              "orphan and has to be removed by hand."
+          )
+      end
+    end)
   end
 
   # Under a static source there is no row to write and no row to undo, so a create is

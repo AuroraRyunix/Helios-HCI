@@ -17,11 +17,18 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   `SpectrumPhx.Vms.Options` -- not free text. `SpectrumPhx.Vms.Form` says how the rows
   become the strings `hydra.vms` stores.
 
-  Two things the old form showed are deliberately not here. *Network (PXE)* as a boot
-  device: Vali only distinguishes `cdrom` from everything else, so choosing it booted the
-  disk, and a control that does nothing is not offered. And *Secure Boot*: nothing in the
-  VM record or in `generate_vm_xml` expresses it, so a checkbox would be a lie. Adding it
-  is a change to Vali and to the schema, not to this page.
+  One thing the old form showed is deliberately not here: *Secure Boot*. Nothing in the VM
+  record or in `generate_vm_xml` expresses it, so a checkbox would be a lie. Adding it is a
+  change to Vali and to the schema, not to this page. (*Network (PXE)* as a boot device was
+  left out for the same reason until the domain gave each device its own boot order.)
+
+  ## Editing
+
+  The same page edits a stopped VM at `/vms/:name/edit` (`live_action :edit`): the form starts
+  as `Form.from_vm/1`, the name is fixed, and saving is `Vms.update_vm/2`. Everything but the
+  name is editable; a disk can only grow, keeps its container and position, and only the last
+  disks can be removed (their vdisks are named after the position). A VM that is not stopped is
+  not editable here, and the page says what can be changed while it runs.
   """
   use SpectrumPhxWeb, :live_view
 
@@ -31,6 +38,39 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   alias SpectrumPhx.Vms.Vm
 
   @impl true
+  def mount(%{"name" => name}, _session, %{assigns: %{live_action: :edit}} = socket) do
+    case Vms.get_vm(name) do
+      {:ok, vm} ->
+        if Vms.editable?(vm) do
+          options = Options.load(probe_hosts: connected?(socket))
+          params = Form.from_vm(vm)
+
+          {:ok,
+           socket
+           |> assign(
+             page_title: "Edit #{vm.name}",
+             options: options,
+             params: params,
+             vm: vm,
+             mode: :edit,
+             existing_disks: length(Vm.disks(vm))
+           )
+           |> assign_form([])}
+        else
+          {:ok,
+           socket
+           |> put_flash(:error, not_stopped_message(vm))
+           |> push_navigate(to: ~p"/vms/#{vm.name}")}
+        end
+
+      {:error, _reason} ->
+        {:ok,
+         socket
+         |> put_flash(:error, "VM #{name} was not found.")
+         |> push_navigate(to: ~p"/vms")}
+    end
+  end
+
   def mount(_params, _session, socket) do
     # Hosts are probed for SPICE only once the socket is connected: the static render that
     # precedes it would otherwise block on every node twice.
@@ -44,13 +84,62 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
 
     {:ok,
      socket
-     |> assign(page_title: "New VM", options: options, params: params)
+     |> assign(
+       page_title: "New VM",
+       options: options,
+       params: params,
+       vm: nil,
+       mode: :new,
+       existing_disks: 0
+     )
      |> assign_form([])}
+  end
+
+  defp not_stopped_message(%Vm{} = vm) do
+    "#{vm.name} is #{String.downcase(vm.state || "not stopped")}; stop it to edit it. " <>
+      "(While a VM runs, only its CD-ROM, NICs, vCPUs, memory and disk size can change, " <>
+      "and those are not offered here yet: see docs/vm_lifecycle.md.)"
   end
 
   @impl true
   def handle_event("validate", %{"vm" => params}, socket) do
-    {:noreply, socket |> assign(params: params) |> assign_form(validate(params))}
+    {:noreply, socket |> assign(params: params) |> assign_form(validate(params, socket))}
+  end
+
+  def handle_event("save", %{"vm" => params}, %{assigns: %{mode: :edit, vm: vm}} = socket) do
+    case Vms.update_vm(vm.name, Form.to_attrs(params)) do
+      {:ok, _vm} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "VM #{vm.name} updated. Changes apply the next time it starts.")
+         |> push_navigate(to: ~p"/vms/#{vm.name}")}
+
+      {:error, errors} when is_list(errors) ->
+        {:noreply, socket |> assign(params: params) |> assign_form(errors)}
+
+      {:error, :not_stopped} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "#{vm.name} is no longer stopped, so it cannot be edited.")
+         |> push_navigate(to: ~p"/vms/#{vm.name}")}
+
+      {:error, :changed} ->
+        {:noreply,
+         socket
+         |> assign(params: params)
+         |> assign_form([])
+         |> put_flash(
+           :error,
+           "#{vm.name} changed while it was being edited (it was started?). Nothing was saved."
+         )}
+
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> assign(params: params)
+         |> assign_form([])
+         |> put_flash(:error, error_message(reason))}
+    end
   end
 
   def handle_event("save", %{"vm" => params}, socket) do
@@ -74,7 +163,8 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   end
 
   def handle_event("add_row", %{"kind" => kind}, socket) do
-    {:noreply, socket |> change_rows(&Form.add_row(&1, kind, new_row(kind, socket.assigns.options)))}
+    {:noreply,
+     socket |> change_rows(&Form.add_row(&1, kind, new_row(kind, socket.assigns.options)))}
   end
 
   def handle_event("remove_row", %{"kind" => kind, "index" => index}, socket) do
@@ -85,14 +175,20 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   # becomes a map key in the form, so an unknown one is ignored rather than stored.
   defp new_row("disk_rows", options), do: Form.disk_row(List.first(options.containers), "20")
   defp new_row("cdrom_rows", _options), do: Form.cdrom_row()
-  defp new_row("nic_rows", options), do: Form.nic_row(options.networks |> List.first() |> Map.get(:id))
+
+  defp new_row("nic_rows", options),
+    do: Form.nic_row(options.networks |> List.first() |> Map.get(:id))
 
   defp change_rows(socket, fun) do
     params = fun.(socket.assigns.params)
-    socket |> assign(params: params) |> assign_form(validate(params))
+    socket |> assign(params: params) |> assign_form(validate(params, socket))
   end
 
-  defp validate(params) do
+  defp validate(params, %{assigns: %{mode: :edit, vm: vm}}) do
+    Vms.edit_errors(vm, Form.to_attrs(params))
+  end
+
+  defp validate(params, _socket) do
     case params |> Form.to_attrs() |> Vm.new() do
       {:ok, _vm} -> []
       {:error, errors} -> errors
@@ -112,7 +208,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
 
   defp error_message({:storage, message}), do: "Storage could not be allocated: #{message}"
   defp error_message(:already_exists), do: "A VM with that name already exists."
-  defp error_message(other), do: "The VM could not be created: #{inspect(other)}"
+  defp error_message(other), do: "The VM could not be saved: #{inspect(other)}"
 
   @impl true
   def render(assigns) do
@@ -120,7 +216,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
 
     ~H"""
     <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:vms}>
-      <.header>
+      <.header :if={@mode == :new}>
         New virtual machine
         <:subtitle>
           Creates the VM and allocates its disks. If disk allocation fails, the VM is removed again rather than left without storage.
@@ -129,8 +225,22 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
           <.button navigate={~p"/vms"}>Cancel</.button>
         </:actions>
       </.header>
+      <.header :if={@mode == :edit}>
+        Edit {@vm.name}
+        <:subtitle>
+          The VM is stopped, so everything but its name can change. Changes take effect the next time it starts.
+          A disk can only grow and keeps its container; only the last disks can be removed, and removing one deletes its data.
+        </:subtitle>
+        <:actions>
+          <.button navigate={~p"/vms/#{@vm.name}"}>Cancel</.button>
+        </:actions>
+      </.header>
 
-      <p :for={note <- @options.notes} class="alert alert-warning alert-soft text-sm" id="options-note">
+      <p
+        :for={note <- @options.notes}
+        class="alert alert-warning alert-soft text-sm"
+        id="options-note"
+      >
         {note}
       </p>
 
@@ -147,10 +257,11 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                 label="Name"
                 autocomplete="off"
                 placeholder="web-01"
+                readonly={@mode == :edit}
               />
               <p class="-mt-1 mb-3 text-xs opacity-60">
-                1-63 characters, starting with a letter or digit, then letters, digits,
-                <code>.</code>, <code>-</code>
+                1-63 characters, starting with a letter or digit, then letters, digits, <code>.</code>,
+                <code>-</code>
                 or <code>_</code>. The name is used verbatim on the hypervisor, so it is rejected
                 rather than corrected.
               </p>
@@ -182,7 +293,8 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                   options={[
                     {"Default (CD-ROM if an ISO is attached, else disk)", ""},
                     {"Hard disk", "hd"},
-                    {"CD-ROM / ISO", "cdrom"}
+                    {"CD-ROM / ISO", "cdrom"},
+                    {"Network (PXE)", "network"}
                   ]}
                 />
                 <.input
@@ -263,12 +375,20 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                   <select
                     name={"vm[disk_rows][#{index}][container]"}
                     class="select select-bordered select-sm w-full"
+                    disabled={existing_disk?(@mode, index, @existing_disks)}
                   >
                     {Phoenix.HTML.Form.options_for_select(
                       choices(@options.containers, row["container"]),
                       row["container"]
                     )}
                   </select>
+                  <%!-- A disabled control is not submitted, and an existing disk keeps its container. --%>
+                  <input
+                    :if={existing_disk?(@mode, index, @existing_disks)}
+                    type="hidden"
+                    name={"vm[disk_rows][#{index}][container]"}
+                    value={row["container"]}
+                  />
                 </label>
                 <label class="form-control">
                   <span class="label-text text-xs opacity-70">Bus</span>
@@ -280,6 +400,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                   </select>
                 </label>
                 <button
+                  :if={@mode == :new or position == length(@rows.disks) - 1}
                   type="button"
                   class="btn btn-ghost btn-sm text-error"
                   phx-click="remove_row"
@@ -289,6 +410,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                 >
                   <.icon name="hero-trash" class="size-4" />
                 </button>
+                <span :if={@mode == :edit and position != length(@rows.disks) - 1} />
               </div>
 
               <p :if={@rows.disks == []} class="text-sm opacity-60" id="no-disks">
@@ -303,7 +425,9 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
               <div class="flex items-start justify-between gap-3 mb-3">
                 <div>
                   <h2 class="panel-title">CD-ROM drives</h2>
-                  <p class="text-xs opacity-55 mt-0.5">One image per drive, from the image catalogue.</p>
+                  <p class="text-xs opacity-55 mt-0.5">
+                    One image per drive, from the image catalogue.
+                  </p>
                 </div>
                 <button
                   type="button"
@@ -416,15 +540,28 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
         </div>
 
         <div class="flex items-center gap-3 pt-2">
-          <.button id="create-vm" variant="primary" phx-disable-with="Creating...">
+          <.button :if={@mode == :new} id="create-vm" variant="primary" phx-disable-with="Creating...">
             Create VM
           </.button>
-          <.button navigate={~p"/vms"}>Cancel</.button>
+          <.button :if={@mode == :edit} id="save-vm" variant="primary" phx-disable-with="Saving...">
+            Save changes
+          </.button>
+          <.button navigate={if @mode == :edit, do: ~p"/vms/#{@vm.name}", else: ~p"/vms"}>Cancel</.button>
         </div>
       </.form>
     </Layouts.app>
     """
   end
+
+  # An existing disk of a VM being edited: its vdisk exists, so its container cannot change.
+  defp existing_disk?(:edit, index, existing) do
+    case Integer.parse(to_string(index)) do
+      {n, _} -> n < existing
+      :error -> false
+    end
+  end
+
+  defp existing_disk?(_mode, _index, _existing), do: false
 
   defp rows(params) do
     %{

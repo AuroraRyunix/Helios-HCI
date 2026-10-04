@@ -138,6 +138,17 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
         >
           Stop
         </.button>
+        <%!--
+          Editing is for a stopped VM: its definition is rebuilt at every start, so a change made
+          while it runs would not reach the running domain, and disks are rewritten on storage.
+          A running VM gets no button and the reason, rather than one that fails when pressed.
+        --%>
+        <.button :if={Vms.editable?(@vm)} id="edit" navigate={~p"/vms/#{@vm.name}/edit"}>
+          Edit
+        </.button>
+        <span :if={Vm.running?(@vm)} id="edit-hint" class="self-center text-xs text-zinc-500">
+          Stop the VM to edit it.
+        </span>
         <.button
           :if={Vm.running?(@vm)}
           id="reboot"

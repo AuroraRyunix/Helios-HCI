@@ -51,6 +51,7 @@ defmodule SpectrumPhxWeb.Router do
       # Before "/vms/:name", which would otherwise match "new" as a VM name.
       live "/vms/new", Vms.NewLive, :new
       live "/vms/:name", Vms.ShowLive, :show
+      live "/vms/:name/edit", Vms.NewLive, :edit
 
       live "/tasks", Tasks.IndexLive, :index
       live "/metrics", Metrics.IndexLive, :index

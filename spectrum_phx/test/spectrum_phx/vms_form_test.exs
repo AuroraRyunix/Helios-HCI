@@ -158,8 +158,11 @@ defmodule SpectrumPhx.VmsFormTest do
       assert {:ok, %Vm{boot_device: "cdrom", cpu_model: "Haswell-noTSX"}} =
                build(structured(%{"boot_device" => "cdrom", "cpu_model" => "Haswell-noTSX"}))
 
-      # The old form offered "Network (PXE)"; Vali treats anything but cdrom as disk-first.
-      assert {:error, errors} = build(structured(%{"boot_device" => "network"}))
+      # "Network (PXE)" was refused while Vali treated anything but cdrom as disk-first. The domain
+      # now gives each device its own boot order and puts the first NIC first for it, so it is
+      # accepted; anything else is still refused.
+      assert {:ok, %Vm{boot_device: "network"}} = build(structured(%{"boot_device" => "network"}))
+      assert {:error, errors} = build(structured(%{"boot_device" => "floppy"}))
       assert errors[:boot_device]
       assert {:error, errors} = build(structured(%{"cpu_model" => "pentium"}))
       assert errors[:cpu_model]

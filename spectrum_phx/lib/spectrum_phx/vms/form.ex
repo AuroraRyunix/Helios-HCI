@@ -106,12 +106,96 @@ defmodule SpectrumPhx.Vms.Form do
   def to_attrs(%{"structured" => "true"} = params) do
     params
     |> Map.put("disks", Enum.map(rows(params, "disk_rows"), &disk_entry/1))
+    # The positions the disk rows carry, for an edit: a row keeps the index of the vdisk it
+    # describes, so a gap means a disk was removed from the middle, which cannot be honoured.
+    |> Map.put(
+      "disk_indices",
+      Enum.map(rows(params, "disk_rows"), fn {index, _row} -> integer(index) end)
+    )
     |> Map.put("iso", Enum.map(rows(params, "cdrom_rows"), fn {_i, row} -> row["image"] end))
     |> Map.put("network_id", Enum.map(rows(params, "nic_rows"), &nic_entry/1))
     |> Map.put("memory", memory_mib(params["memory"], params["memory_unit"]))
   end
 
   def to_attrs(params), do: params
+
+  @doc """
+  The form an existing VM starts as, for editing it: `to_attrs/1`'s inverse.
+
+  Disk rows are keyed by the disk's position, which is also its vdisk's number; that identity is
+  what `Vms.update_vm/2` relies on, so a row added later takes the next number and a row removed
+  from the middle leaves a gap that is refused. Memory is shown in GB when it is a whole number
+  of them, and a disk in TB when it is a whole number of those.
+  """
+  def from_vm(%SpectrumPhx.Vms.Vm{} = vm) do
+    {memory, memory_unit} = memory_fields(vm.memory)
+
+    %{
+      "structured" => "true",
+      "name" => vm.name,
+      "vcpu" => to_string(vm.vcpu),
+      "memory" => memory,
+      "memory_unit" => memory_unit,
+      "firmware" => vm.firmware || "uefi",
+      "boot_device" => vm.boot_device || "",
+      "cpu_model" => vm.cpu_model || "",
+      "graphics" => vm.graphics || "vnc",
+      "audio_enabled" => to_string(vm.audio_enabled == true),
+      "disk_rows" =>
+        vm |> SpectrumPhx.Vms.Vm.disks() |> Enum.map(&disk_form_row/1) |> index_rows(),
+      "cdrom_rows" =>
+        (vm.iso || "")
+        |> String.split(",", trim: true)
+        |> Enum.map(&%{"image" => String.trim(&1)})
+        |> Enum.reject(&(&1["image"] in ["", "__empty__"]))
+        |> index_rows(),
+      "nic_rows" => vm.network_id |> nic_rows() |> index_rows()
+    }
+  end
+
+  defp index_rows(rows) do
+    rows |> Enum.with_index() |> Map.new(fn {row, index} -> {Integer.to_string(index), row} end)
+  end
+
+  defp memory_fields(mib) when is_integer(mib) and mib >= 1024 and rem(mib, 1024) == 0,
+    do: {Integer.to_string(div(mib, 1024)), "GB"}
+
+  defp memory_fields(mib), do: {to_string(mib), "MB"}
+
+  defp disk_form_row(disk) do
+    gib = disk.size_gib || 0
+
+    {size, unit} =
+      if gib >= 1024 and rem(gib, 1024) == 0, do: {div(gib, 1024), "TB"}, else: {gib, "GB"}
+
+    %{
+      "size" => Integer.to_string(size),
+      "unit" => unit,
+      "container" => disk.container || "",
+      "bus" => disk.bus
+    }
+  end
+
+  # `network_id` is a JSON list of "network:model" entries, a single "network" or "network:model",
+  # or empty (the default network).
+  defp nic_rows(nil), do: [nic_row(SpectrumPhx.Vms.Vm.default_network_id())]
+  defp nic_rows(""), do: [nic_row(SpectrumPhx.Vms.Vm.default_network_id())]
+
+  defp nic_rows("[" <> _ = json) do
+    case Jason.decode(json) do
+      {:ok, entries} when is_list(entries) -> Enum.map(entries, &nic_from_entry/1)
+      _ -> []
+    end
+  end
+
+  defp nic_rows(single), do: [nic_from_entry(single)]
+
+  defp nic_from_entry(entry) do
+    case entry |> to_string() |> String.split(":") do
+      [network] -> nic_row(network)
+      [network, model | _] -> %{"network" => network, "model" => model}
+    end
+  end
 
   defp disk_entry({_index, row}) do
     size = String.trim(to_string(row["size"]))

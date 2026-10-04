@@ -77,11 +77,11 @@ defmodule SpectrumPhx.Vms.Vm do
 
   @firmwares ~w(uefi bios)
 
-  # What the old console's create form offered, and what Vali actually does with each.
-  # `network` is deliberately absent from the boot devices: the old form listed "Network
-  # (PXE)", but `generate_vm_xml` only distinguishes `cdrom` from everything else, so
-  # choosing it booted the disk. A control that does nothing is not offered.
-  @boot_devices ~w(hd cdrom)
+  # What the old console's create form offered, and what Vali does with each. `network` (PXE)
+  # was left out while the domain only distinguished `cdrom` from everything else, so that
+  # choosing it booted the disk; the domain now gives each device its own boot order and puts the
+  # first NIC first for `network` (docs/vm_lifecycle.md, "Boot order"), so it is offered again.
+  @boot_devices ~w(hd cdrom network)
   @cpu_models ~w(host-model host-passthrough Haswell-noTSX Denverton)
   @buses ~w(virtio sata scsi)
   @nic_models ~w(virtio e1000 e1000e vmxnet3 rtl8139)
