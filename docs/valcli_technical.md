@@ -68,3 +68,16 @@ place an operator looks without duplicating any of that.
 and buffering it until the end makes a slow run indistinguishable from a hung one.
 
 See [backup_restore.md](./backup_restore.md).
+
+## When this node's database is down
+
+`valcli` reads and writes the cluster's state through Daruk, which fronts the `hydra-db` on the same host, so a node whose
+database was down could run no command that reads the cluster -- including the ones needed to see why. After a failure that is
+about *reaching* the database (`NoHostAvailable`, connection refused, no such container, a timeout), `run_cql_query` now asks
+each other node of `/etc/hci/cluster.json` in turn, through that node's spark-daemon (`cqlsh` against it from its own
+container), and the first answer wins; the answer says on stderr which node gave it. A statement the database rejected is not
+retried elsewhere, a conditional statement still raises, and a single-node cluster has no peer to ask. Output is cqlsh's text,
+the same shape the existing cqlsh fallback gave callers. Tests: `test_valcli_peer_fallback.py`.
+
+Other commands: `valcli vm.live` (changes to a running VM), `valcli storage.takeover` (finish a migration's storage handover).
+

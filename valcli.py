@@ -18,11 +18,12 @@ import threading
 # of them -- see helios_cql for what that cost.
 from helios_cql import (  # noqa: F401  (re-exported for modules that import from here)
     ConditionalStatementError,
+    HYDRA_DB_CONTAINER,
     cql_escape,
     cql_int,
     is_conditional_cql,
     run_conditional_cql_query,
-    run_cql_query,
+    run_cql_query as _local_run_cql_query,
 )
 
 LOCAL_IP = "127.0.0.1"
@@ -54,6 +55,71 @@ def spark_endpoint(ip):
             return local, True
         return ip, False
     return ip, True
+
+
+# What a failed query says when the database on THIS node is what is unreachable, as opposed to
+# the statement being wrong. Only these are worth asking another node about: a syntax error would
+# fail identically everywhere and waiting for every peer to say so is a slower way to the same error.
+_DATABASE_DOWN_MARKERS = (
+    "nohostavailable", "connection refused", "unable to connect", "could not connect",
+    "is not running", "no such container", "cannot connect", "timed out", "timeout",
+    "unavailable", "connection error", "database query execution error", "no route",
+    "connection reset", "operation timed out", "no container with name",
+)
+
+
+def database_looks_down(rc, stderr):
+    """True when a failed query's error is about reaching the database, not about the query."""
+    if rc == 0:
+        return False
+    text = (stderr or "").lower()
+    return any(marker in text for marker in _DATABASE_DOWN_MARKERS)
+
+
+def cluster_peer_ips(path="/etc/hci/cluster.json"):
+    """Every other host in the cluster document, in its order. [] when it cannot be read."""
+    try:
+        with open(path, "r") as handle:
+            hosts = [h.get("ip") for h in json.load(handle).get("hosts", []) if h.get("ip")]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+    return [ip for ip in hosts if ip not in (LOCAL_IP, "127.0.0.1")]
+
+
+def run_cql_query_via_peers(cql_query, *args, peers=None, remote=None, **kwargs):
+    """The shared CQL runner, with one addition: when this node's own database is down, ask a
+    live peer instead of failing.
+
+    Daruk and the cqlsh fallback both talk to the database on this host, so a node whose
+    `hydra-db` is down could run no `valcli` command that reads the cluster -- including the
+    ones needed to see why. After a local failure that is about reaching the database, each
+    other node is tried in turn through its spark-daemon (`cqlsh` against that node, from its own
+    container), and the first answer wins. A statement the database refused is not retried
+    elsewhere, and a conditional statement still raises, as it does everywhere.
+    """
+    rc, out, err = _local_run_cql_query(cql_query, *args, **kwargs)
+    if not database_looks_down(rc, err):
+        return rc, out, err
+    import base64
+    remote = remote or run_remote_spark
+    encoded = base64.b64encode(cql_query.encode("utf-8")).decode("utf-8")
+    tried = []
+    for peer in (cluster_peer_ips() if peers is None else peers):
+        command = "echo %s | base64 -d | podman exec -i %s cqlsh %s" % (
+            encoded, HYDRA_DB_CONTAINER, peer)
+        prc, pout, perr = remote(peer, command)
+        if prc == 0:
+            sys.stderr.write("[valcli] this node's database did not answer (%s); answered by %s.\n"
+                             % ((err or "no detail").strip().splitlines()[-1][:120] if err else "no detail", peer))
+            return 0, (pout or "").strip(), ""
+        tried.append("%s: %s" % (peer, (perr or "no answer").strip()[:80]))
+    if tried:
+        err = (err or "").rstrip() + " (and no peer answered either: " + "; ".join(tried) + ")"
+    return rc, out, err
+
+
+# An assignment, not a def: helios_cql stays the only module that defines the query layer.
+run_cql_query = run_cql_query_via_peers
 
 
 def run_remote_spark(ip, command):

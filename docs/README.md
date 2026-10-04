@@ -52,6 +52,7 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Urbosa Bootstrap (`urbosa_bootstrap.py`) | — | [urbosa_bootstrap_technical.md](./urbosa_bootstrap_technical.md) |
 | Vali (`vali.py`) | [vali.md](./vali.md) | [vali_technical.md](./vali_technical.md) |
 | Valcli (`valcli.py`) | — | [valcli_technical.md](./valcli_technical.md) |
+| Impa (`impa.py`, cluster certificate lifecycle) | [mtls_lifecycle.md](./mtls_lifecycle.md) | — |
 | Saga (`saga.py`) | [backup_restore.md](./backup_restore.md) | — (the narrative doc covers the internals too) |
 | Provision (`provision.py`) | — | [provision_technical.md](./provision_technical.md) |
 | Sync Provision (`sync_provision.py`) | — | [sync_provision_technical.md](./sync_provision_technical.md) |

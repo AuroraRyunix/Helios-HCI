@@ -230,7 +230,7 @@ Status: **document done; one fix; remainder open**.
 
 ### I. Sidon / DFS open items: three built and tested, the rest documented
 
-*Done (D-35, 24 new Rust tests including the earlier handover ones; 402 pass).* (1) **Idempotent appends**: a retried append is recognised by the replica
+*Done (D-35, 31 Rust tests added or revived since the baseline of 371, 402 pass).* (1) **Idempotent appends**: a retried append is recognised by the replica
 (bytes equal the journal's tail, via its own record or one tail comparison after a restart) and not written twice; the fence is still checked
 first. (2) **Seal on detach**: `drain_and_seal`, used by detach and the handover's release; stays open (and the vdisk usable) if Hydra refuses; an empty
 group is left to the sweep. (3) **`SIDON_HARD_CEILING`** with a startup warning when the journal volume could not hold eight busy vdisks' ceilings, and a
