@@ -100,20 +100,9 @@ Raised from using the lab; the owner asked for each of these to be thought throu
   hosts that were not in maintenance; a marker file that could not be written still recorded the host as in
   maintenance. The rule itself (Sidon and Hylia kept; Mipha and Logos stopped) is the author's call, listed for
   the owner.
-* **Hosts becoming degraded, and leaving it.** Mipha quarantines a host after three failed storage
-  probes and (until 2026-10-04) never lifted it after a restart; the orphan reconcile is the first fix.
-  Review the whole lifecycle: what degrades a host, what each state stops (placement, HA, DRS,
-  maintenance), what brings it back, and whether the thresholds are right.
-* [x] **Live migration of Sidon-served disks** *(2026-10-04, branch overnight/2026-10-04; needs a live check
-  in the lab, see docs/overnight_report_2026-10-04.md)*: the destination now attaches each disk in
-  forwarding mode before `virsh migrate`, and takes ownership after it (`handover::handover`, D-34);
-  `valcli storage.takeover` finishes one by hand. Still open: Sidon does not re-attach on start, so a
-  Sidon restart removes the NBD sockets of running VMs' disks (move or stop them first); the owner's
-  release path against a real journal has no unit test (it needs Hydra).
-* **Automatic VM migration, as one story.** Review evacuation, DRS moves and HA restarts so they share the
-  safe path.
-* **How Mipha heals a host that rejoins.** Fencing ladder, rejoin, re-attaching vdisks, reclaiming
-  ownership, restarting its VMs or leaving them where HA put them: write it down and test it.
+* [x] **Hosts becoming degraded, and leaving it, and how a rejoining host is reconciled.** *(2026-10-04; docs/host_states.md, test_host_states.py)* Written down with a transition table. Fixed: a host that came back after a failover kept the stale qemu processes, libvirt definitions and vdisk attachments of guests that had been restarted elsewhere (the leader now reconciles it against Hydra before starting its services); a quarantine lifted on the first clean probe and flapped (now 6 in a row). Left: no operator override from another host, the DOWN rejoin writes NORMAL without verifying services, the leader polls 3 x 10 s (see the document).
+* [x] **Automatic VM migration, as one story.** *(2026-10-04; docs/vali.md "One path for moving a guest", test_automatic_migration.py)* One landing-host test shared by migration and placement (a manual migration could be aimed at a DEGRADED or FENCED host); DRS's cooldown and a per-guest cooldown now read the persistent history. Left, as decisions: the memory overcommit fallback in `select_best_start_host`, and CPU/accelerator compatibility (libvirt's own refusal).
+* [x] **How Mipha heals a host that rejoins.** *(2026-10-04; see the host-states item above and docs/host_states.md)*
 * **A full review of every service:** changes, endpoints, who calls them, what is unused.
 * **VM changes while running, and ESXi parity.** A list of what can be changed on a running VM today
   (CPU/memory hot-add, disk add/grow/remove, NIC add/remove, CD-ROM insert/eject, boot order, console

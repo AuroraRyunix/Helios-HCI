@@ -100,6 +100,30 @@ The Vali Leader runs a periodic DRS loop (every 30 seconds):
    `virsh -c qemu:///system migrate --live --persistent --undefinesource <vm_name> qemu+ssh://root@<target_ip>/system tcp://<target_ip>` (after the storage steps below; `--unsafe` is not used)
     And updates the VM's `host_ip` in ScyllaDB on completion. To enable compatibility during live migrations, VM guest CPUs are defined with `<cpu mode='host-model'/>` when running under KVM.
 
+### One path for moving a guest
+
+Manual migration, DRS, evacuation (maintenance) and the HA restart all end in a migrate or a start, so
+they share what makes a move safe:
+
+* **Where it may land** — `host_ineligible_reason(ip)`: the host's recorded state is `NORMAL` (not
+  DEGRADED, FENCED, DOWN, RECOVERING or any maintenance state) *and* it answers with every managed
+  service UP and not in maintenance. Starts (HA restart, evacuation's start fallback) choose their host
+  with `select_best_start_host`, which applies the same two tests; migrations apply them to the named
+  target, then the memory gate (the guest's RAM against the target's free memory) and the storage gate (the
+  guest's disk against the target's free extent-store space, refused when either is unknown).
+* **One migration per guest** — the `status` lock (`/v1/vm/migrate-lock`), taken before anything is touched
+  and released on every path.
+* **Not too often** — DRS acts only when the load deviation exceeds 0.15 and a move improves it by 0.03,
+  at most one move per 300 s *cluster-wide*, and never picks a guest that moved in the last 30 minutes. Both
+  limits read `hydra.vali_drs_history`, which every successful migration writes (manual and evacuation moves
+  included), so a Vali restart or a change of leader does not forget them. An "aggressive" run is the
+  operator's explicit request and ignores the history.
+* **Visible** — a migration is a Catalyst task; its error names the step that failed (see below).
+
+Not unified: the "fallback to any online host" in `select_best_start_host` returns the first healthy host when
+no host has the memory a guest needs (an overcommit); whether that is wanted is a decision, recorded in
+TODO.md. CPU and accelerator compatibility between hosts is left to libvirt's own refusal at `virsh migrate`.
+
 ### What a migration does to the storage
 
 The destination qemu opens an NBD socket per disk as the migration starts, so the destination's

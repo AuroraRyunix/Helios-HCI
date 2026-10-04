@@ -150,9 +150,51 @@ stays up (a maintenance host is the one that is rebooted and upgraded); whether 
 
 Status: **done in code; live verification needed**.
 
+### E. Host degraded / quarantined / rejoin: documented, two gaps fixed; needs a live check of the rejoin
+
+*Deliverable.* `docs/host_states.md`: every state, what sets and clears it, what each stops (placement, DRS, migration,
+maintenance entry, HA), thresholds with a verdict, how split brain is avoided, how a host rejoins, and an executable
+transition table.
+
+*Gaps found and fixed (by reading).* (1) A host marked DOWN while only partitioned still has the qemu processes of
+guests that were restarted elsewhere; after it came back nothing stopped them or removed their libvirt definitions and
+vdisk attachments. The leader now runs `reconcile_returning_host` before starting the host's services: destroys and
+undefines domains Hydra places on another host (or none), detaches `<vm>-disk<N>` vdisks for such guests, leaves
+alone anything placed here or unknown, and does nothing if Hydra or the domain list cannot be read. New typed endpoint
+`GET /api/v1/host/domains`. (2) A quarantine lifted on the first clean probe, so a flapping host oscillated between
+DEGRADED and NORMAL at probe speed; it now needs 6 clean passes in a row (`quarantine_lift_after_clean_passes`).
+
+*Left (listed in the document).* No operator override from another host (`valcli host.clear` would be the addition);
+the DOWN rejoin writes NORMAL after 10 s without checking services (placement still refuses a host with a service down);
+the leader's 30 s detection window is short but safe because the fence precedes the failover.
+
+*Tests.* `test_host_states.py`, 31 tests: the plan and its I/O with stubs (including unreadable inputs), hysteresis,
+and a decision table over `self_fence_decide`. The reconcile and hysteresis tests fail on the old code (the functions
+did not exist; the old loop lifted on one pass).
+
+Status: **done in code; live verification needed for the rejoin**.
+
+### F. Automatic VM migration as one story: done; tests; documented
+
+*Found.* A manual or DRS migration checked only the target's own maintenance flag, so it could be aimed at a host
+recorded DEGRADED, FENCED, DOWN or RECOVERING (start-time placement already refused them). DRS's cooldown lived in
+process memory (lost at every Vali restart or leader change) and nothing stopped it picking the guest it had just moved.
+*Change.* `host_ineligible_reason` is the one landing test (state NORMAL, answering, all services UP, not in maintenance;
+unreadable inputs refuse); the migrate task uses it. DRS reads `hydra.vali_drs_history` for the global 300 s cooldown and
+a 30-minute per-guest cooldown. Documented in `docs/vali.md` ("One path for moving a guest").
+*Tests.* `test_automatic_migration.py`, 20 tests; 7 fail against the old Vali.
+*Left, as decisions.* `select_best_start_host` falls back to the first healthy host when no host has the memory (an
+overcommit); CPU/accelerator compatibility is libvirt's refusal.
+Status: **done**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification
+
+- E. Rejoin reconcile, on the lab: with a VM running on `.43`, stop spark-daemon on `.43` (not the VM) until Mipha marks it DOWN
+  and restarts the VM elsewhere, then start spark-daemon again. Pass: the leader's log (`journalctl -u mipha | grep rejoining`)
+  shows `destroy <vm>` and `undefine <vm>` for `.43`, and `virsh list --all` on `.43` no longer shows the VM; a guest placed on `.43`
+  by Hydra is untouched.
 
 - D. Maintenance, on the lab: `valcli host.maintenance.enter <host>` (a host with at least one running VM), then
   `cluster status`. Pass: the task succeeds; the host shows `[IN MAINTENANCE]`; ZooKeeper, HydraDB, Daruk, Sidon,
@@ -182,6 +224,11 @@ Status: **done in code; live verification needed**.
   and check the order swaps.
 
 ## Decisions for the owner
+
+- Memory overcommit on placement: `select_best_start_host` returns the first healthy host when no host has enough free
+  memory, so a start or evacuation can land on a host that cannot hold the guest. Keep, or refuse?
+- A `valcli host.clear <host>` to clear a DEGRADED/FENCED status from anywhere (today only `mipha --clear-self-fence` on the
+  host itself does)?
 
 - **What a host in maintenance keeps running** (item D). I decided it so the flow is consistent: kept up =
   spark-daemon, zookeeper, hydra-db, daruk, sidon, hylia; stopped = everything else (Mipha and Logos included).

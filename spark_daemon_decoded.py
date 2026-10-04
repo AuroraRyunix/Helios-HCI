@@ -1978,6 +1978,26 @@ def parse_virsh_domiflist(text):
     return interfaces
 
 
+def parse_virsh_list(text):
+    """Parse `virsh list --all` into [{"name", "state"}].
+
+    Columns are Id, Name, State, and the state can be two words ("shut off", "in shutdown"), so
+    the state is everything after the name. The header and the dashed separator are skipped.
+    """
+    domains = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or set(line) <= set("- "):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if parts[0].lower() == "id" and parts[1].lower() == "name":
+            continue
+        domains.append({"name": parts[1], "state": " ".join(parts[2:])})
+    return domains
+
+
 def parse_virsh_dominfo(text):
     """Parse `virsh dominfo` into {"state","vcpus","memory_kib","autostart"}."""
     fields = {}
@@ -4045,6 +4065,9 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/host/capabilities":
             self.handle_host_capabilities()
             return True
+        if path == "/api/v1/host/domains":
+            self.handle_host_domains()
+            return True
         if path == "/api/v1/host/units":
             self.handle_host_units(parsed)
             return True
@@ -4860,6 +4883,15 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
 
     def handle_host_capabilities(self):
         self.send_json_response(200, read_host_capabilities())
+
+    def handle_host_domains(self):
+        """Every libvirt domain on this host and its state: what a returning host is
+        reconciled against (docs/host_states.md)."""
+        rc, stdout, stderr = run_argv(VIRSH + ["list", "--all"], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh list failed", 503)
+            return
+        self.send_json_response(200, {"domains": parse_virsh_list(stdout)})
 
     def handle_host_dhcp_leases(self):
         self.send_json_response(200, {"leases": read_dhcp_leases()})

@@ -775,6 +775,35 @@ def get_node_utilization(ip, fetch_cpu=False):
     return u_cpu, u_mem, mem_total, mem_used
 
 # Core DRS Algorithm
+DRS_VM_COOLDOWN_SECONDS = 1800
+
+
+def recent_drs_migrations(now, window=DRS_VM_COOLDOWN_SECONDS):
+    """{vm name: when it last moved, in seconds} for every migration in the last `window`.
+
+    From hydra.vali_drs_history, which every successful migration writes (the table is called
+    DRS but the migrate task fills it for manual moves and evacuations too). Empty when the
+    table cannot be read: DRS then behaves as it always did, with its in-memory cooldown.
+    """
+    rc, stdout, _ = run_cql_query("SELECT JSON vm_name, event_time FROM hydra.vali_drs_history;")
+    if rc != 0:
+        return {}
+    moved = {}
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            row = json.loads(line)
+            when = float(row.get("event_time") or 0) / 1000.0
+        except Exception:
+            continue
+        name = row.get("vm_name")
+        if name and 0 < now - when < window:
+            moved[name] = max(moved.get(name, 0.0), when)
+    return moved
+
+
 def run_drs_loop(aggressive=False):
     global last_migration_time
     now = time.time()
@@ -894,6 +923,12 @@ def run_drs_loop(aggressive=False):
     cooldown = 0.0 if aggressive else 300.0
     
     if std_dev > threshold:
+        # What this process remembers is lost at every restart and every change of leader, and
+        # a migration anyone made -- DRS, an operator, an evacuation -- is in the history table.
+        # Read from there, so the cooldown holds across both, and so a VM that was just moved
+        # is not picked again straight away (which is how a pair of hosts trade one guest).
+        recent = {} if aggressive else recent_drs_migrations(now)
+        last_migration_time = max(last_migration_time, max(recent.values(), default=0.0))
         if now - last_migration_time < cooldown:
             print(f"[DRS] Cluster imbalance detected (σ={std_dev:.3f}, Score={balance_score}%), but in cooldown.")
             return
@@ -926,7 +961,10 @@ def run_drs_loop(aggressive=False):
         for vm in running_vms:
             vm_name = vm.get("name")
             vm_mem = float(vm.get("memory", 1024))
-            
+
+            if vm_name in recent and now - recent[vm_name] < DRS_VM_COOLDOWN_SECONDS:
+                continue
+
             # Predict standard deviation post-migration
             # source host loses memory, target host gains memory
             src_mem_used = host_mem_stats[overloaded_ip]["used"] - vm_mem
@@ -1454,6 +1492,52 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
 """
     return vm_xml
 
+def read_node_rows():
+    """{ip: {"status", "maintenance_mode"}} from hydra.nodes, or None when it cannot be read."""
+    rc, stdout, _ = run_cql_query("SELECT JSON ip, status, maintenance_mode FROM hydra.nodes;")
+    if rc != 0:
+        return None
+    rows = {}
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("ip"):
+                rows[row["ip"]] = row
+    return rows
+
+
+def host_ineligible_reason(ip, node_rows=None):
+    """Why `ip` may not be given a guest right now, or None when it may.
+
+    One definition for every path that puts a guest on a host -- manual migration, DRS,
+    evacuation and failover restart all end in a migrate or a start, and the start picks its
+    host with select_best_start_host, which applies the same two tests: the host's recorded state
+    is NORMAL, and it answers with every managed service UP and not in maintenance. An unreadable
+    database or an unreachable host is a reason, not a pass: a guest is not sent to a host on the
+    strength of not having been able to ask.
+    """
+    node_rows = read_node_rows() if node_rows is None else node_rows
+    if node_rows is None:
+        return "hydra.nodes could not be read, so its recorded state is unknown"
+    row = node_rows.get(ip)
+    if row is not None and (row.get("maintenance_mode") or (row.get("status") or "NORMAL") != "NORMAL"):
+        return f"its recorded state is {row.get('status') or 'in maintenance'}, not NORMAL"
+    rc, status, err = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
+    if rc != 0 or not isinstance(status, dict):
+        return f"it is not answering ({err or 'no status'})"
+    if status.get("maintenance_status", "NORMAL") != "NORMAL":
+        return f"it is in maintenance ({status.get('maintenance_status')})"
+    down = sorted(name for name, data in (status.get("services") or {}).items()
+                  if (data or {}).get("status") != "UP")
+    if down:
+        return "these services are not up: " + ", ".join(down)
+    return None
+
+
 def select_best_start_host(memory_needed):
     # Query nodes in maintenance mode
     maintenance_ips = set()
@@ -1796,21 +1880,15 @@ def process_queue_task(task):
             if src_host == target_ip:
                 return True, target_ip
                 
-            # Perform basic target host checks: check all services are up, host not in maintenance mode
-            rc_st, status_data, stderr_st = run_mtls_spark_api(target_ip, "/api/v1/node/status", None, method="GET")
-            if rc_st != 0:
-                return False, f"Target host {target_host} is not responding or spark-daemon is offline: {stderr_st}"
-            try:
-                maint = status_data.get("maintenance_status", "NORMAL")
-                if maint != "NORMAL":
-                    return False, f"Target host {target_host} is in maintenance mode ({maint})."
-                
-                services = status_data.get("services", {})
-                offline_svcs = [sname for sname, sdata in services.items() if sdata.get("status") != "UP"]
-                if offline_svcs:
-                    return False, f"Target host {target_host} has offline services: {', '.join(offline_svcs)}."
-            except Exception as e:
-                return False, f"Failed to parse target host status: {e}"
+            # The same test every other way of placing a guest uses (docs/vali.md, "One path for
+            # moving a guest"): the host's recorded state must be NORMAL -- not DEGRADED,
+            # FENCED, DOWN, RECOVERING or any maintenance state, which is what a quarantine
+            # and a failover write -- and it must answer with every service up. This used to
+            # read only the daemon's own maintenance flag, so a migration could be aimed at a
+            # host that had quarantined or fenced itself.
+            why_not = host_ineligible_reason(target_ip)
+            if why_not:
+                return False, f"Target host {target_host} cannot take guests: {why_not}"
 
             # Memory availability check on target host
             memory_needed = int(vm_data.get("ram", 1024))

@@ -483,6 +483,12 @@ DEFAULT_FENCING_CONFIG = {
         # automatically is how one flapping host takes VMs and drops them repeatedly, so
         # 0 means "an operator runs `mipha --clear-self-fence`".
         "auto_recover_after_clean_seconds": 0,
+        # A quarantine (DEGRADED: no new placement, running guests kept) is lifted only after
+        # this many consecutive clean passes, 60 s at the default interval. It used to lift on
+        # the first clean pass, so a host whose storage came and went every few seconds flipped
+        # between DEGRADED and NORMAL as fast as it was probed, and was schedulable in each
+        # NORMAL window.
+        "quarantine_lift_after_clean_passes": 6,
         # Stopping ZooKeeper hands leadership -- Mipha's, Purah's, Bifrost's
         # VIP -- to a node that can still serve. Refused below three nodes, where the
         # remaining ensemble could not form a quorum anyway.
@@ -1065,6 +1071,7 @@ SELF_FENCE_STATE = {
     "at": 0,
     "announced": False,
     "report": {},
+    "clean_passes": 0,
 }
 
 
@@ -1528,6 +1535,17 @@ def clear_orphaned_quarantine():
     return False
 
 
+def quarantine_may_lift(state, clean, needed):
+    """Count a pass toward lifting a quarantine; True once `needed` clean passes in a row have
+    been seen. A pass that is not clean resets the count, so a flapping host stays quarantined
+    until it has been well for the whole stretch."""
+    if not clean:
+        state["clean_passes"] = 0
+        return False
+    state["clean_passes"] = state.get("clean_passes", 0) + 1
+    return state["clean_passes"] >= max(1, int(needed))
+
+
 def self_fence_loop():
     """The per-host watchdog. Runs everywhere, leader or not."""
     started = time.time()
@@ -1580,6 +1598,7 @@ def self_fence_loop():
             if action == "fence":
                 execute_self_fence(reason, hosts=hosts, config=config)
             elif action == "quarantine":
+                SELF_FENCE_STATE["clean_passes"] = 0
                 if not SELF_FENCE_STATE.get("quarantined"):
                     print(f"[Mipha Self-Fence] Quarantining this host: {reason}. It keeps "
                           "its running VMs; it stops receiving new ones.")
@@ -1592,12 +1611,17 @@ def self_fence_loop():
                 if not SELF_FENCE_STATE.get("announced"):
                     SELF_FENCE_STATE["announced"] = announce_node_status(NODE_STATUS_DEGRADED)
             elif SELF_FENCE_STATE.get("quarantined"):
-                if announce_node_status("NORMAL"):
+                if not quarantine_may_lift(
+                        SELF_FENCE_STATE, local_health_is_clean(probe),
+                        settings.get("quarantine_lift_after_clean_passes", 6)):
+                    pass
+                elif announce_node_status("NORMAL"):
                     print("[Mipha Self-Fence] Local subsystems are healthy again; this "
                           "host has left quarantine.")
                     SELF_FENCE_STATE["quarantined"] = False
                     SELF_FENCE_STATE["announced"] = False
                     SELF_FENCE_STATE["reason"] = ""
+                    SELF_FENCE_STATE["clean_passes"] = 0
             elif local_health_is_clean(probe):
                 since_orphan_check += 1
                 if since_orphan_check >= ORPHAN_CHECK_EVERY:
@@ -1778,6 +1802,116 @@ def renew_maintenance_lock_for(hostname):
         sys.stderr.write(
             f"[Mipha HA] Could not renew the cluster maintenance lock for {hostname}: {error}\n")
     return applied
+
+
+# libvirt states in which a domain still has (or may still have) a qemu process.
+LIVE_DOMAIN_STATES_EXCLUDED = ("shut off",)
+
+
+def stale_guest_plan(domains, rows, ip):
+    """What a host that has come back must drop, given what it runs and what Hydra says.
+
+    `domains` is [{"name", "state"}] as libvirt reports them on the host; `rows` is
+    {vm name: {"host_ip", "state"}} from hydra.vms; `ip` is the host. A domain that Hydra places
+    on a *different* host, or on none, is a guest that was restarted elsewhere (or is being)
+    while this host was away: if it is still running here it is the second copy of a guest,
+    its vdisks are already fenced out by the epoch the new owner took (so it can write nothing),
+    and nothing else would ever stop it. A defined-but-stopped one is a stale definition: Vali
+    redefines the domain at every start, so the leftover only misleads.
+
+    A domain Hydra has no row for is not a cluster VM and is left alone, as is every domain
+    Hydra places here. Returns {"destroy": [...], "undefine": [...], "left": [...]}.
+    """
+    plan = {"destroy": [], "undefine": [], "left": []}
+    for domain in domains:
+        name, state = domain.get("name"), (domain.get("state") or "").strip().lower()
+        row = rows.get(name)
+        if row is None or (row.get("host_ip") or "") == ip:
+            plan["left"].append(name)
+            continue
+        if state not in LIVE_DOMAIN_STATES_EXCLUDED:
+            plan["destroy"].append(name)
+        plan["undefine"].append(name)
+    return plan
+
+
+_VDISK_OF_VM = re.compile(r"\A(?P<vm>.+)-disk\d+\Z")
+
+
+def stale_vdisks(attached, rows, ip):
+    """Vdisks attached on a returning host for VMs Hydra places somewhere else.
+
+    Only `<vm>-disk<N>` names are considered (images and anything else are shared or not a
+    guest's), and only when the VM has a row that does not name this host. Detaching is how a
+    host gives a disk up: it drains what it can and removes the socket, so the next time this
+    host is asked for the disk it claims it afresh at the then-current epoch instead of serving
+    from a view that has been fenced out.
+    """
+    stale = []
+    for item in attached:
+        vdisk_id = item.get("vdisk_id") or ""
+        match = _VDISK_OF_VM.match(vdisk_id)
+        if not match:
+            continue
+        row = rows.get(match.group("vm"))
+        if row is not None and (row.get("host_ip") or "") != ip:
+            stale.append(vdisk_id)
+    return stale
+
+
+def read_vm_rows():
+    """{name: {"host_ip", "state"}} for every VM in Hydra, or None when it cannot be read."""
+    rc, stdout, _ = run_cql_query("SELECT JSON name, host_ip, state FROM hydra.vms;")
+    if rc != 0:
+        return None
+    rows = {}
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            if row.get("name"):
+                rows[row["name"]] = row
+    return rows
+
+
+def reconcile_returning_host(hostname, ip, request=None, read_rows=None):
+    """Drop what a host that came back still holds of guests that live elsewhere now.
+
+    Run by the Mipha leader when a host leaves DOWN, before its services are started. Every
+    step is skipped, not guessed at, when its input cannot be read: a guest is never destroyed
+    on the strength of a database that did not answer. Returns a list of what was done (or
+    attempted), for the log, or None when nothing could be established.
+    """
+    request = request or run_mtls_spark_api_full
+    read_rows = read_rows or read_vm_rows
+    status, body, err = request(ip, "/api/v1/host/domains", None, method="GET")
+    if status != 200 or not isinstance(body, dict):
+        print(f"[Mipha HA] Could not list the domains on {hostname}: {err or status}; "
+              "not reconciling its guests.")
+        return None
+    rows = read_rows()
+    if rows is None:
+        print(f"[Mipha HA] Could not read hydra.vms; not reconciling the guests on {hostname}.")
+        return None
+    done = []
+    plan = stale_guest_plan(body.get("domains") or [], rows, ip)
+    for name in plan["destroy"]:
+        s, _, e = request(ip, f"/api/v1/vm/{name}/power", {"action": "destroy"})
+        done.append(f"destroy {name}" + ("" if s == 200 else f" (failed: {e or s})"))
+    for name in plan["undefine"]:
+        s, _, e = request(ip, "/api/v1/vm/undefine", {"name": name, "keep_nvram": False})
+        done.append(f"undefine {name}" + ("" if s == 200 else f" (failed: {e or s})"))
+    s, listed, e = request(ip, "/api/v1/dfs/vdisk", {"op": "list"})
+    if s == 200 and isinstance(listed, dict):
+        for vdisk_id in stale_vdisks(listed.get("attached") or [], rows, ip):
+            s2, _, e2 = request(ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id})
+            done.append(f"detach {vdisk_id}" + ("" if s2 == 200 else f" (failed: {e2 or s2})"))
+    for line in done:
+        print(f"[Mipha HA] {hostname} rejoining: {line}")
+    return done
 
 
 def release_orphaned_vm(vm_name, dead_host_ip):
@@ -2093,6 +2227,16 @@ def main():
                         cql_recovering = f"UPDATE hydra.nodes SET status = 'RECOVERING' WHERE hostname = '{hostname}';"
                         run_cql_query(cql_recovering)
                         
+                        # A1b. Drop what the host still holds of guests that live elsewhere
+                        # now. It was away long enough to be failed over, so its VMs were
+                        # restarted on other hosts; if it was only partitioned their old qemu
+                        # processes are still running here, writing nothing (the new owner
+                        # fenced their vdisks) and never to be stopped by anything else.
+                        try:
+                            reconcile_returning_host(hostname, ip)
+                        except Exception as exc:
+                            print(f"[Mipha HA] Reconciling the guests on {hostname} failed: {exc}")
+
                         # A2. Create parent join task in Catalyst
                         parent_task_id = str(uuid.uuid4())
                         now_ms = int(time.time() * 1000)
