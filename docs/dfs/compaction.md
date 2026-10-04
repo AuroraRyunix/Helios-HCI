@@ -10,6 +10,7 @@ runs either on a timer.
 valcli storage.compact                       # plan: what would be copied, and what it would free
 valcli storage.compact --apply               # do it, within the limits below
 valcli storage.dedup.estimate [--sample F]   # how much dedup would share beyond clone sharing
+valcli storage.sweep                         # frees the old groups, here and on the replicas (D-33)
 ```
 
 ## 1. Why compaction exists
@@ -37,7 +38,7 @@ extents were.
 | 0 | **Scan.** One pass over the block map (and the extent map if any row names an extent) gives, per sealed group this node created, which extents are live and which rows point at each. Candidates are groups below the threshold (default 50% live). Read-only. | Nothing changed. |
 | 1 | **Read and verify** every live extent of every source: the group against its seal hash, each extent's footer (CRC, vdisk identity, index) against **every** row that points at it. A source that fails is left out; the pass is not the repair tool and does not launder damage into a new, clean-looking file. | Nothing changed. |
 | 2 | **Stage** the new group as `<id>.eg.moving`, which no directory scan treats as a group. fsync, drop the cache, read it back from the disk, require the same hash. Same mechanics as `storage.move`. | A stale temporary, removed by the sweep's existing temporary reaper. |
-| 3 | **Replicate** to the replica nodes of the vdisks that point at the extents, extent by extent at the same offsets (the drain's own `EGROUP_PUT`), then read the **whole group back** from each and compare. Write-all: one refusal or one mismatch abandons the batch and removes the temporary. | Replica copies of an id nothing references (the same orphan an abandoned drain leaves). |
+| 3 | **Replicate** to the replica nodes of the vdisks that point at the extents, extent by extent at the same offsets (the drain's own `EGROUP_PUT`), then read the **whole group back** from each and compare. Write-all: one refusal or one mismatch abandons the batch and removes the temporary. | Replica copies of an id nothing references (the same orphan an abandoned drain leaves); each replica's own orphan scan drops them once they are old enough (D-33). |
 | 4 | **Register** the group in Hydra, already `sealed`, with its hash (`egroup-create`, `IF NOT EXISTS`). Before the rename, so a crash between leaves a *row* the sweep reclaims rather than a *file* nothing names. | A sealed, unreferenced group row with no file: young, then swept after the grace. |
 | 5 | **Publish** by rename and fsync of the directory. Re-hash the published file and read each extent through its footer. | A complete, registered, unreferenced group: swept like any orphan. |
 | 6 | **Hold** the drains of every attached vdisk that points here (section 3) and check that each one's in-memory map still says what the scan saw. | Same. |
@@ -130,9 +131,10 @@ The first line of each node's output is the status line, for example:
 
 ```
 n1: compaction plan: 3 group(s) below 50% live; this pass would copy 6291456 byte(s) into new
-    group(s) and leave 18874368 byte(s) for the sweep; nothing was changed
+    group(s) and leave 18874368 byte(s) here and 18874368 on replicas for the sweep; nothing was changed
 n1: compaction: 2 batch(es) done, 7 row(s) repointed, 1 lost to an overwrite, 0 failed; the
-    old group(s) are left for the sweep (12582912 byte(s) here once it has run)
+    old group(s) are left for the sweep (12582912 byte(s) here and 12582912 on replicas once it
+    has run twice)
 ```
 
 A plan changes nothing: it takes no hold, makes no peer call, and issues no write. The next run
@@ -140,14 +142,21 @@ shows the previous run's status line as `previous_run`.
 
 ## 6. What it does not do
 
-* **It does not reclaim space on replicas, and it adds some there.** A replica's copy of a
-  group lives in its replica store, and nothing in Sidon removes one today, whether the group
-  was swept, compacted or deleted with its vdisk. Compaction puts the live extents into a new
-  group on every replica and frees nothing there. The plan prints `added_on_replicas` beside
-  `freed_here_after_sweep` so that the net is visible, and until a replica-side reclaim exists
-  (an opcode to drop a replica's copy, sent by the node that swept the group) a cluster at
-  ftt>=1 trades space on the creator for space on its replicas. This is the largest limit and
-  is why the command is opt-in.
+* **It does not itself free anything, on this node or on a replica.** It copies and repoints;
+  the old group is left for the sweep. The sweep frees it here and, since D-33, asks every peer
+  to drop its replica copy (`OP_EGROUP_DROP`), so **at ftt>=1 compaction does give the space back
+  on the replicas, after the sweep's two scans** -- by the amount the plan prints as
+  `freed_on_replicas_after_sweep`, because a replica holds a whole copy of each source group, dead
+  extents included. Until the sweep has run twice the replicas hold *more* than before (the
+  old group and the new one, `added_on_replicas`), so a plan is a net saving only over time.
+  `net_freed_on_replicas` is the difference. A Rust test runs it end to end (compact, sweep twice,
+  list the replica's directory) and checks the replica ends smaller than it began, by exactly the
+  figure the plan gave. **Two cases keep the replica figure as growth:** a replica running a build
+  from before D-33 refuses the drop request and keeps its copy until it is upgraded (the sweep's
+  report says which peers did, `unsupported`), and a replica that was down when the sweep asked
+  is cleaned by its own orphan scan, which takes two more scans past the grace. Neither loses
+  data. This was the largest limit on compaction and is no longer the reason it is opt-in; D-22's
+  reason (nobody has watched it on this cluster's data) is.
 * **It does not touch groups it cannot exclude a drain from** (section 3): writable vdisks not
   attached on this node, in particular a clone running on another node. Run it where the group
   lives, with the VM there; a node compacts only the groups it created.
@@ -204,6 +213,7 @@ alignments), which at 1 MiB granularity it cannot see.
 | Which extents of which groups are live, through both map levels, failing closed | `sidon/src/purah/occupancy.rs` |
 | Analysis, packing, one batch, the pass, the status line | `sidon/src/purah/compact.rs` |
 | Failure-injection tests (stop at every step, concurrent overwrite, shared extents, replica refusal, random convergence) | `sidon/src/purah/compact/tests.rs` |
+| Compact, sweep twice and list the replica's directory: the end-to-end proof of section 6's first bullet | `sidon/src/purah/reclaim/tests.rs` (`compaction_at_ftt_one_frees_the_old_group_on_the_replica_after_the_sweep`) |
 | The estimator and its tests | `sidon/src/purah/dedup.rs` |
 | The model of Hydra and the fake daemon the tests use | `sidon/src/purah/testkit.rs` |
 | The drain hold, the in-memory repoint, the group set a drain is making | `sidon/src/vdisk.rs` (`try_hold_drains`, `repoint_extent`, `drain_groups`) |

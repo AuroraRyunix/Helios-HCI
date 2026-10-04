@@ -457,8 +457,10 @@ is exercised there. Neither is a performance result.
 rewrote what they held, copies the live extents into a new group, verifies and replicates it, repoints
 the map by compare-and-swap, and leaves the old groups to the sweep. It plans unless `--apply`, is
 bounded by groups, bytes, rate and time, and never runs on a timer. It leaves alone any group a writable
-vdisk not attached on that node still points into, and it does not free a replica's copy of the old
-group (nothing does yet), so the plan prints what it would add on replicas beside what it would free.
+vdisk not attached on that node still points into. The old groups are freed by the sweep, here and (D-33)
+on every replica, so at ftt>=1 compaction does give space back on the replicas once the sweep has run twice;
+the plan prints, per batch, what it adds on the replicas now, what they get back after the sweep, and the
+net. A replica still running a build from before D-33 keeps its copy and is named by `storage.sweep`.
 `storage.dedup.estimate` hashes a sample of sealed extents and reports, per container, what dedup would
 share beyond what clones and snapshots already share; it writes nothing. Both are described in
 [dfs/compaction.md](./dfs/compaction.md).

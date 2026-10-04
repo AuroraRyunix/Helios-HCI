@@ -1694,8 +1694,10 @@ def cmd_storage_compact(argv):
     a number of groups, a number of bytes, a rate and a time, and prints which bound it hit; run
     it again to continue. Per node: a node compacts the groups it created.
 
-    It also says what it cannot do. Replicas keep their copy of an old group, so the figure for
-    what is added on replicas has no matching saving until a replica-side reclaim exists.
+    The old groups are freed by the sweep, here and (D-33) on every replica, which the sweep asks
+    to drop its copy. Each plan step prints what is added on the replicas and what they get back
+    once the sweep has run twice; a replica still running a build from before D-33 keeps its copy,
+    and for that replica the added figure is growth with no saving until it is upgraded.
     """
     request = _compact_request(argv)
     apply = request["apply"]
@@ -1724,11 +1726,16 @@ def cmd_storage_compact(argv):
         for skip in body.get("skipped") or []:
             print("  skipped %s: %s" % (skip.get("egroup_id"), skip.get("reason")))
         for step in body.get("plan") or []:
-            print("  %s: copy %d bytes from %s to a new group; %d bytes freed here once swept; "
-                  "%d bytes added on %s"
-                  % ("would" if not apply else "plan", step.get("bytes_to_copy") or 0,
-                     ", ".join(step.get("sources") or []), step.get("freed_here_after_sweep") or 0,
-                     step.get("added_on_replicas") or 0, ", ".join(step.get("replicas") or []) or "no replicas"))
+            replicas = ", ".join(step.get("replicas") or [])
+            line = ("  %s: copy %d bytes from %s to a new group; %d bytes freed here once swept"
+                    % ("would" if not apply else "plan", step.get("bytes_to_copy") or 0,
+                       ", ".join(step.get("sources") or []), step.get("freed_here_after_sweep") or 0))
+            if replicas:
+                line += ("; on %s %d bytes added now and %d freed once swept (net %d)"
+                         % (replicas, step.get("added_on_replicas") or 0,
+                            step.get("freed_on_replicas_after_sweep") or 0,
+                            step.get("net_freed_on_replicas") or 0))
+            print(line)
         for done in body.get("executed") or []:
             print("  done: %s (%d bytes) from %s; %d row(s) repointed, %d lost to an overwrite"
                   % (done.get("new_group"), done.get("bytes") or 0, ", ".join(done.get("sources") or []),

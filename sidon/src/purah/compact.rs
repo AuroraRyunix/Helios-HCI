@@ -46,9 +46,14 @@
 //!
 //! # What this does not do
 //!
-//! Reclaim space on replicas. A replica's copy of a group lives in the replica store, and
-//! nothing in Sidon removes one today (see D-32), so compaction *adds* a group's live bytes to
-//! each replica and frees nothing there. The plan reports both numbers.
+//! Free anything itself. It never deletes: the old groups are left for the sweep, which frees
+//! them here and, since D-33, asks every replica to drop its copy too, so at ftt>=1 the space
+//! comes back on the replicas as well -- but only once **each replica runs a build that knows the
+//! drop request**, and only after the sweep's two scans; until then compaction has added the new
+//! group's bytes to every replica and freed nothing there. The plan reports what it would add on
+//! replicas and what it would free there, so the net is visible. A replica from before D-33 keeps
+//! its copy of an old group; that is safe, and it is the one case in which the replica figure is
+//! growth with no matching saving.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -525,6 +530,9 @@ pub struct BinResult {
     /// Set when a statement to Hydra failed part way. Everything before it stands.
     pub stopped: Option<String>,
     pub freed_if_swept: u64,
+    /// What the sources occupied, which is what each replica gets back when it drops its copy of
+    /// them (a replica holds a whole copy of a group, dead extents included).
+    pub source_bytes: u64,
 }
 
 struct Placed<'a> {
@@ -745,6 +753,7 @@ pub fn execute_bin<D: Db>(ctx: &Ctx<D>, bin: &Bin, seq: u64) -> Result<BinResult
         sources: sources.iter().map(|(c, _)| c.id.clone()).collect(),
         unusable,
         freed_if_swept: sources.iter().map(|(c, _)| c.size).sum::<u64>().saturating_sub(total),
+        source_bytes: sources.iter().map(|(c, _)| c.size).sum::<u64>(),
         ..BinResult::default()
     };
 
@@ -858,9 +867,15 @@ fn bin_json(b: &Bin) -> Value {
         "bytes_to_copy": b.live_bytes(),
         "source_bytes": b.source_bytes(),
         "freed_here_after_sweep": b.net_freed(),
-        // Copies of the new group on peers. Nothing removes a replica's copy of an old group
-        // today, so this is the cost on the other nodes and there is no matching saving.
+        // Copies of the new group on peers, and what the peers get back when the sweep has
+        // reclaimed the old groups and asked them to drop their copies (D-33). A replica holds a
+        // whole copy of each source, so the saving per replica is the sources' size; it is an
+        // estimate in that a replica that never held one (the replica set changed since the
+        // group was written) frees nothing, and one running a build from before D-33 keeps it.
         "added_on_replicas": b.live_bytes() * b.replicas.len() as u64,
+        "freed_on_replicas_after_sweep": b.source_bytes() * b.replicas.len() as u64,
+        "net_freed_on_replicas": (b.source_bytes() * b.replicas.len() as u64)
+            .saturating_sub(b.live_bytes() * b.replicas.len() as u64),
     })
 }
 
@@ -878,19 +893,23 @@ pub fn status_line(r: &Value) -> String {
         }
         return format!(
             "compaction plan: {candidates} group(s) below {pct:.0}% live; this pass would copy {} \
-             byte(s) into new group(s) and leave {} byte(s) for the sweep; nothing was changed",
+             byte(s) into new group(s) and leave {} byte(s) here and {} on replicas for the \
+             sweep; nothing was changed",
             n("selected_bytes_to_copy"),
-            r["estimate"]["freed_here_after_sweep"].as_u64().unwrap_or(0)
+            r["estimate"]["freed_here_after_sweep"].as_u64().unwrap_or(0),
+            r["estimate"]["freed_on_replicas_after_sweep"].as_u64().unwrap_or(0)
         );
     }
     let done = r["executed"].as_array().map(Vec::len).unwrap_or(0);
     let failed = r["failed"].as_array().map(Vec::len).unwrap_or(0);
     format!(
         "compaction: {done} batch(es) done, {} row(s) repointed, {} lost to an overwrite, {failed} \
-         failed; the old group(s) are left for the sweep ({} byte(s) here once it has run)",
+         failed; the old group(s) are left for the sweep ({} byte(s) here and {} on replicas once \
+         it has run twice)",
         n("rows_repointed"),
         n("lost_races"),
-        r["estimate"]["freed_here_after_sweep"].as_u64().unwrap_or(0)
+        r["estimate"]["freed_here_after_sweep"].as_u64().unwrap_or(0),
+        r["estimate"]["freed_on_replicas_after_sweep"].as_u64().unwrap_or(0)
     )
 }
 
@@ -947,6 +966,7 @@ pub fn run<D: Db>(
     let mut repointed = 0usize;
     let mut freed_if_swept = 0u64;
     let mut added_on_replicas = 0u64;
+    let mut freed_on_replicas = 0u64;
     let mut anomalies: Vec<String> = Vec::new();
     let mut stopped_by: Option<&str> = if cut.by_groups {
         Some("max_groups")
@@ -971,6 +991,7 @@ pub fn run<D: Db>(
                     repointed += r.repointed;
                     freed_if_swept += r.freed_if_swept;
                     added_on_replicas += r.new_bytes * r.replicas.len() as u64;
+                    freed_on_replicas += r.source_bytes * r.replicas.len() as u64;
                     anomalies.extend(r.anomalies.iter().cloned());
                     let stop = r.stopped.clone();
                     executed.push(json!({
@@ -1022,6 +1043,8 @@ pub fn run<D: Db>(
 
     let planned_freed: u64 = selected.iter().map(Bin::net_freed).sum();
     let planned_replica: u64 = selected.iter().map(|b| b.live_bytes() * b.replicas.len() as u64).sum();
+    let planned_replica_freed: u64 =
+        selected.iter().map(|b| b.source_bytes() * b.replicas.len() as u64).sum();
     let mut report = json!({
         "applied": opts.apply,
         "node": node,
@@ -1053,9 +1076,12 @@ pub fn run<D: Db>(
         "estimate": {
             "freed_here_after_sweep": if opts.apply { freed_if_swept } else { planned_freed },
             "added_on_replicas": if opts.apply { added_on_replicas } else { planned_replica },
+            "freed_on_replicas_after_sweep":
+                if opts.apply { freed_on_replicas } else { planned_replica_freed },
             "note": "Freed bytes come back on this node when the sweep has seen the old groups \
-                     unreferenced on two passes. Nothing frees a replica's copy of an old group, so \
-                     the replica figure is growth with no matching saving.",
+                     unreferenced on two passes, and on each replica when the sweep then asks it to \
+                     drop its copy (D-33). Until that has happened, and for ever on a replica \
+                     running a build from before D-33, the replica figure is growth.",
         },
     });
     let line = status_line(&report);

@@ -1056,3 +1056,112 @@ fn random_histories_never_reclaim_what_a_drain_holds_or_the_map_points_at() {
     assert!(reclaimed_total > 20, "the histories reclaimed only {reclaimed_total} group(s)");
     assert!(reclaimed_open > 5, "the histories reclaimed only {reclaimed_open} open group(s)");
 }
+
+// --- Compaction at ftt>=1 (D-32, revisited by D-33) -------------------------------------------
+
+/// Compaction's environment with real replica directories behind the peers, so that what the
+/// replicas hold can be listed before and after. Holds and attached vdisks are the fake's.
+struct ReplicaEnv<'a> {
+    inner: crate::purah::testkit::FakeEnv,
+    replicas: &'a BTreeMap<String, Replica>,
+}
+
+impl crate::purah::compact::Env for ReplicaEnv<'_> {
+    fn put(&self, node: &str, group: &str, offset: u64, data: &[u8], defer_sync: bool) -> Result<()> {
+        self.replicas[node].store.put_egroup_deferring(group, offset, data, defer_sync)
+    }
+    fn get(&self, node: &str, group: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.replicas[node].store.get_egroup(group, offset, len)
+    }
+    fn attached_here(&self, vdisk: &str) -> bool {
+        self.inner.attached_here(vdisk)
+    }
+    fn hold(&self, vdisk: &str) -> Result<Box<dyn crate::purah::compact::Hold + '_>> {
+        self.inner.hold(vdisk)
+    }
+    fn drain_groups(&self) -> HashSet<String> {
+        self.inner.drain_groups()
+    }
+}
+
+fn replica_files(rep: &Replica) -> Vec<String> {
+    let mut v: Vec<String> = rep.store.list_egroups().unwrap().into_iter().map(|g| g.id).collect();
+    v.sort();
+    v
+}
+
+/// The question D-32 left open: does compaction at ftt>=1 give space back on the replicas? With
+/// the sweep asking them to drop what it reclaims, it does -- after the sweep's two scans, and by
+/// the amount the plan said -- and every row still reads the same bytes from the owner and from
+/// the replica throughout.
+#[test]
+fn compaction_at_ftt_one_frees_the_old_group_on_the_replica_after_the_sweep() {
+    use crate::purah::compact::{run, NoProbe, Options};
+    use crate::replicate::throttle::tests::FakeClock;
+    const LEN: usize = 16 * 1024;
+
+    let rig = Rig::new("compact-ftt1");
+    rig.vdisk("v1", "rw", &["n1", "n2"]);
+    let old: Vec<Vec<u8>> = (0..4).map(|i| data(10 + i as u8, LEN)).collect();
+    let new: Vec<Vec<u8>> = (0..4).map(|i| data(50 + i as u8, LEN)).collect();
+    let a = rig.group("eg-a", "v1", &(0..4).map(|i| (i as u64, old[i].clone())).collect::<Vec<_>>());
+    let b = rig.group("eg-b", "v1", &(1..4).map(|i| (i as u64, new[i].clone())).collect::<Vec<_>>());
+    rig.point("v1", 0, "eg-a", (a[0].1, a[0].2), "v1", &old[0]);
+    for i in 1..4usize {
+        rig.point("v1", i as u64, "eg-b", (b[i - 1].1, b[i - 1].2), "v1", &new[i]);
+    }
+
+    // The drain replicated both groups to n2, whole, as it always does.
+    let peers = FakePeers::new(&rig, &["n2"]);
+    for id in ["eg-a", "eg-b"] {
+        let bytes = std::fs::read(rig.store.path_for(id)).unwrap();
+        peers.r("n2").put(id, &bytes, 99_999);
+    }
+    let a_bytes = std::fs::metadata(rig.store.path_for("eg-a")).unwrap().len();
+    let before: u64 = peers.r("n2").store.list_egroups().unwrap().iter().map(|g| g.size).sum();
+    assert_eq!(replica_files(peers.r("n2")), vec!["eg-a".to_string(), "eg-b".to_string()]);
+
+    // Compaction, applied, with n2 behind the peer calls.
+    let inner = crate::purah::testkit::FakeEnv::default();
+    inner.attach(&rig, "v1");
+    let env = ReplicaEnv { inner, replicas: &peers.replicas };
+    let opts = Options { apply: true, rate: 0, ..Options::default() };
+    let report = run(&rig.model, &rig.store, "n1", Duration::ZERO, &env, &opts, &NoProbe, &FakeClock::new(), &|_| None, 1_000_000_000)
+        .unwrap();
+    let executed = report["executed"].as_array().unwrap();
+    assert_eq!(executed.len(), 1, "{report}");
+    let new_group = executed[0]["new_group"].as_str().unwrap().to_string();
+    let added = report["estimate"]["added_on_replicas"].as_u64().unwrap();
+    let freed = report["estimate"]["freed_on_replicas_after_sweep"].as_u64().unwrap();
+    assert_eq!(freed, a_bytes, "the plan says what the replica gets back: the old group's size");
+
+    // Straight after compaction the replica holds MORE: the old group and the new one.
+    assert_eq!(
+        replica_files(peers.r("n2")),
+        vec!["eg-a".to_string(), "eg-b".to_string(), new_group.clone()]
+    );
+    let after_compaction: u64 = peers.r("n2").store.list_egroups().unwrap().iter().map(|g| g.size).sum();
+    assert_eq!(after_compaction, before + added, "the figure the plan printed is the growth");
+    rig.assert_every_row_reads_correctly();
+
+    // The sweep, twice: the old group is dead on the owner and on the replica.
+    let mut w = World::new(&rig, &peers);
+    let first = w.sweep_at(0, &HashSet::new());
+    assert!(first.reclaimed.is_empty(), "{first:?}");
+    let second = w.sweep_at(601, &HashSet::new());
+    assert_eq!(second.reclaimed, vec!["eg-a".to_string()], "{second:?}");
+    assert_eq!(second.replica_drops[0].dropped, 1, "{second:?}");
+
+    assert_eq!(replica_files(peers.r("n2")), vec!["eg-b".to_string(), new_group.clone()]);
+    let finally: u64 = peers.r("n2").store.list_egroups().unwrap().iter().map(|g| g.size).sum();
+    assert_eq!(finally + freed, after_compaction, "the replica got back exactly what the plan said");
+    assert!(finally < before, "net: the replica holds less than before compaction ({finally} < {before})");
+
+    // Nothing live was lost, here or there: every row reads from the owner, and the compacted
+    // extent reads back from the replica's copy of the new group.
+    rig.assert_every_row_reads_correctly();
+    let moved = rig.model.st.borrow().block.iter().find(|r| r.idx == 0).unwrap().clone();
+    assert_eq!(moved.egroup.as_deref(), Some(new_group.as_str()));
+    let replica_copy = peers.r("n2").store.get_egroup(&new_group, 0, std::fs::metadata(rig.store.path_for(&new_group)).unwrap().len() as usize).unwrap();
+    assert_eq!(replica_copy, std::fs::read(rig.store.path_for(&new_group)).unwrap());
+}

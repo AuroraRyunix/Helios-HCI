@@ -359,7 +359,7 @@ The stack has been enhanced with enterprise-grade resiliency and health-based ro
 ## 9. Documentation
 
 * [docs/README.md](./docs/README.md) - Index of every document in `docs/`, grouped by category.
-* [docs/dfs/compaction.md](./docs/dfs/compaction.md) - Compaction of sparse extent groups and the read-only dedup estimator: mechanism, what each refuses to touch, what is not reclaimed (D-32).
+* [docs/dfs/compaction.md](./docs/dfs/compaction.md) - Compaction of sparse extent groups and the read-only dedup estimator: mechanism, what each refuses to touch, and how the old groups' space comes back, on replicas too (D-32, D-33).
 * [docs/sidon.md](./docs/sidon.md) - The storage data path: what a write does, where the bytes live, how ownership moves, what Purah does, and how to operate it.
 * [docs/dfs/](./docs/dfs/README.md) - The reasoning behind it: architecture, the invariants everything else exists to satisfy, the data path, ownership and fencing, the metadata schema, the Ganon harness, the build order, the `vhost-user-blk` design and its benchmark plan, the ADR list with every rejected alternative, and the [extent ID map rollout](./docs/dfs/extent_id_map.md) (D-23), whose first stage is the one to deploy and soak before anything else.
 * [docs/AGENTS.md](./docs/AGENTS.md) - Deep technical reference for AI coding agents working in this repo (daemon map, boot sequence, the `provision.py`/`sync_provision.py` embedding relationship, build/test commands).

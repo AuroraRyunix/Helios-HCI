@@ -172,8 +172,10 @@ every footer, replicates it, repoints each row by compare-and-swap, and leaves t
 for the sweep's two-scan grace. It never deletes, so a stop at any step leaves a map that reads
 correctly (I-3); it rewrites a writable vdisk's rows only while that vdisk's drains are held, so
 the single-writer rule of the block map (I-4, [metadata.md](./metadata.md) section 3) is kept;
-and it is operator-invoked, bounded by groups, bytes, rate and time. It does not reclaim a
-replica's copy of the old group; nothing does yet.
+and it is operator-invoked, bounded by groups, bytes, rate and time. It frees nothing itself:
+the sweep frees the old group here and, since D-33, on every replica, so at ftt>=1 compaction
+returns space on the replicas too, after the sweep's two scans (the plan prints what each replica
+gets back beside what it is first given).
 
 ## 6. Numbers, and why these numbers
 

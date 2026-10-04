@@ -741,12 +741,19 @@ the cost is space.
 convergence is structural (a new group is all live; a half-moved group is a smaller candidate).
 Ids `0018`/`0019`/`0024`/`0026`-`0029`/`0033`/`0034` are untouched and `0035` is not taken.
 
-*The cost it does not remove.* A replica's copy of a group sits in its replica store and nothing
-in Sidon removes one, whether the group was swept, compacted or deleted. Compaction adds the live
-extents to each replica and frees nothing there, so at ftt>=1 it moves space from the creator to
-its replicas until a replica-side reclaim exists (an opcode, sent by the node that swept a group,
-to drop that group). **Not built**, and not hidden: the plan prints the growth beside the saving.
-Pre-existing, found while reading, and the reason this is opt-in rather than a default.
+*The cost it did not remove, and D-33 did.* A replica's copy of a group sat in its replica store
+and nothing in Sidon removed one, whether the group was swept, compacted or deleted. Compaction
+adds the live extents to each replica, so at ftt>=1 it moved space from the creator to its
+replicas. **Resolved by D-33:** the sweep now asks every peer to drop its copy of a group it
+reclaims, each replica re-checking Hydra and the map itself, and each node scans for orphaned
+replica copies besides. Compaction's old groups are swept like any other, so at ftt>=1 the replicas
+get the old group's space back after the sweep's two scans, by the amount the plan prints
+(`freed_on_replicas_after_sweep`); a Rust test runs compact, sweep, sweep and lists the replica's
+directory. It holds for replicas that run the D-33 build: an older replica refuses the request
+and keeps its copy (safe, and reported), and a replica that was down is cleaned by its own scan.
+The plan still prints the growth beside the saving, because until the sweep has run twice the
+replicas hold both groups. This no longer argues against `--apply` at ftt>=1; it stays opt-in for
+D-22's reason.
 
 *Opt-in.* `storage.compact` plans unless `--apply`; a pass is bounded by groups, bytes, rate and
 wall clock and says which bound it hit; nothing runs it on a timer, D-22's reason unchanged.

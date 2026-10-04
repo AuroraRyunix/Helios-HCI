@@ -366,6 +366,70 @@ class AbandonedOpenGroupsAreReclaimedUnderTheSameRules(unittest.TestCase):
         self.assertIn("Nothing adopts an open group", entry.replace("\n", " ").replace("  ", " "))
 
 
+class CompactionAccountsForReplicaReclamation(unittest.TestCase):
+    """D-32's caveat -- compaction at ftt>=1 moves space onto the replicas and nothing frees it --
+    was resolved by D-33. The behaviour is proved in Rust (an end-to-end test compacts, sweeps
+    twice and lists a replica's directory); these pin that the plan says so and the documents
+    no longer claim the opposite."""
+
+    def plan_answer(self):
+        return {
+            "candidate_count": 1, "candidates": [], "skipped": [], "executed": [], "failed": [],
+            "anomalies": [], "status": "compaction plan: ...",
+            "plan": [{"sources": ["eg-a"], "bytes_to_copy": 100, "freed_here_after_sweep": 300,
+                      "replicas": ["n2"], "added_on_replicas": 100,
+                      "freed_on_replicas_after_sweep": 400, "net_freed_on_replicas": 300}],
+        }
+
+    def test_the_plan_step_prints_what_replicas_are_given_and_what_they_get_back(self):
+        tree = ast.parse(read("valcli.py"))
+        names = ("_compact_request", "cmd_storage_compact")
+        fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
+        ns = {"sys": sys}
+        ns.update(cluster({"10.0.0.1": self.plan_answer()})[0])
+        exec(compile(ast.Module(body=fns, type_ignores=[]), "valcli.py", "exec"), ns)
+        out, _ = run(ns, "cmd_storage_compact", [])
+        self.assertIn("on n2 100 bytes added now and 400 freed once swept (net 300)", out)
+
+    def test_a_plan_with_no_replicas_does_not_mention_any(self):
+        answer = self.plan_answer()
+        answer["plan"][0].update(replicas=[], added_on_replicas=0, freed_on_replicas_after_sweep=0,
+                                 net_freed_on_replicas=0)
+        tree = ast.parse(read("valcli.py"))
+        fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+               and n.name in ("_compact_request", "cmd_storage_compact")]
+        ns = {"sys": sys}
+        ns.update(cluster({"10.0.0.1": answer})[0])
+        exec(compile(ast.Module(body=fns, type_ignores=[]), "valcli.py", "exec"), ns)
+        out, _ = run(ns, "cmd_storage_compact", [])
+        self.assertNotIn("added now", out)
+
+    def test_the_plan_json_carries_the_replica_saving(self):
+        compact = rust("purah", "compact.rs")
+        for field in ('"freed_on_replicas_after_sweep"', '"net_freed_on_replicas"'):
+            self.assertIn(field, compact)
+        self.assertIn("freed_on_replicas_after_sweep", read("valcli.py"))
+
+    def test_the_documents_no_longer_say_nothing_frees_a_replicas_copy(self):
+        for rel in (("docs", "dfs", "compaction.md"), ("docs", "dfs", "data-path.md"),
+                    ("docs", "sidon.md"), ("docs", "dfs", "README.md")):
+            text = read(*rel)
+            self.assertNotIn("nothing does yet", text, rel)
+            self.assertNotIn("neither reclaims space on replicas", text, rel)
+        compaction = read("docs", "dfs", "compaction.md")
+        self.assertIn("D-33", compaction)
+        self.assertIn("freed_on_replicas_after_sweep", compaction)
+        self.assertIn("from before D-33", compaction.replace("\n", " "))
+
+    def test_the_end_to_end_proof_exists_and_d32_points_at_d33(self):
+        tests = rust("purah", "reclaim", "tests.rs")
+        self.assertIn("fn compaction_at_ftt_one_frees_the_old_group_on_the_replica_after_the_sweep", tests)
+        decisions = read("docs", "dfs", "decisions.md")
+        d32 = decisions[decisions.index("**D-32"):decisions.index("**D-33")]
+        self.assertIn("Resolved by D-33", d32)
+        self.assertNotIn("**Not built**", d32)
+
+
 def production(source):
     """Everything before the unit tests."""
     return source.split("#[cfg(test)]")[0]

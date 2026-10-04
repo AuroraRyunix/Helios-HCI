@@ -216,6 +216,10 @@ The notes themselves are deliberately not in this repository.
   new Daruk swaps (`/v1/dfs/block-map-repoint`, `/v1/dfs/extent-repoint`); **no migration**. Rust tests
   stop a batch at every step, overwrite mid-pass, share extents across clones and snapshots, refuse at
   a replica, and run random maps to a fixed point; `test_compaction.py` pins the wiring and the rules.
+  **Update (D-33):** with replica reclamation, compaction at ftt>=1 now returns the old group's space on
+  the replicas after the sweep's two scans (the plan prints `freed_on_replicas_after_sweep` and the net;
+  a Rust test compacts, sweeps twice and lists a replica's directory). It does so only on replicas that
+  run the D-33 build. Still nothing has run on the live cluster.
   **Not built / known:**
   * ~~**Replica copies of a dead group are never reclaimed**~~ **Built (D-33):** the sweep asks every
     peer to drop its copy (`OP_EGROUP_DROP`), each replica re-checks Hydra and the map itself, and each

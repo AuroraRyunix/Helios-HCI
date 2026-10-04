@@ -32,7 +32,8 @@ Extent-group **compaction** (copy the live extents of sparse sealed groups into 
 repoint by compare-and-swap, leave the old group to the sweep) and a read-only **dedup
 estimator** are built and operator-invoked (`valcli storage.compact`,
 `valcli storage.dedup.estimate`; D-32, [compaction.md](./compaction.md)). Neither runs on a
-timer, and neither reclaims space on replicas.
+timer. Compaction's old groups are freed by the sweep, which since D-33 also frees the replicas'
+copies, so at ftt>=1 it does give space back on the replicas (after the sweep's two scans).
 
 Scheduled snapshots with a retention policy, and in-place rollback of a detached vdisk, are
 built -- see [snapshots.md](./snapshots.md). Rolling back an *attached* vdisk is designed and
