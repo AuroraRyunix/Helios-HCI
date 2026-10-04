@@ -999,8 +999,24 @@ def run_unit_commands(action, units):
     return results
 
 
+CONVERGE_LOCK = threading.Lock()
+
+
 def converge_to_desired_state(desired, full=False):
     """Bring local services into line with the desired cluster state, in order.
+
+    Serialised: the ZooKeeper reconcile loop and the boot-time autostart/watchdog thread both
+    call this, and two passes interleaving would each read the same snapshot and each issue the
+    same start. The second caller waits for the first and then finds nothing to do.
+    """
+    with CONVERGE_LOCK:
+        return _converge_locked(desired, full)
+
+
+def _converge_locked(desired, full=False):
+    """The body of `converge_to_desired_state`; see it for why this is behind a lock.
+
+    Bring local services into line with the desired cluster state, in order.
 
     One batched `systemctl is-active` over the declared inventory, and then only the units
     that are not already in the intended state are touched -- so the common case issues no
@@ -5261,9 +5277,9 @@ def check_cluster_and_autostart():
         if not os.path.exists("/etc/hci/cluster.json"):
             if not _stopped_for_no_cluster:
                 print("[AUTOSTART] No cluster configuration found (/etc/hci/cluster.json). Ensuring workloads are stopped.")
-                services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
-                for svc in services_to_stop:
-                    subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # The declared inventory, in reverse start order, and not a copy of it: the
+                # copy that stood here named 18 units in no dependency order.
+                converge_to_desired_state("stopped", full=True)
                 _stopped_for_no_cluster = True
             time.sleep(10)
             continue
@@ -5340,26 +5356,15 @@ def check_cluster_and_autostart():
 
     if cluster_state == "stopped":
         print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
-        services_to_stop = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "daruk", "hydra-db", "agahnim", "slate"]
-        for svc in services_to_stop:
-            subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        converge_to_desired_state("stopped", full=True)
     else:
-        # Autostarting local database, storage, and UI workloads...
-        services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
-        for svc in services:
-            res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
-            if res.stdout.decode().strip() != "active":
-                print(f"[AUTOSTART] Starting local service {svc}...")
-                subprocess.run(f"systemctl start {svc}", shell=True)
-                if svc == "hydra-db":
-                    # Give it a second to initialize connections
-                    time.sleep(2)
-        if check_urbosa_enabled():
-            res = subprocess.run("systemctl is-active urbosa", shell=True, stdout=subprocess.PIPE)
-            if res.stdout.decode().strip() != "active":
-                print("[AUTOSTART] Starting local service urbosa...")
-                subprocess.run("systemctl start urbosa", shell=True)
-                
+        # Through the declared inventory, in dependency order and with its readiness gates, and
+        # not through a copy of it. The copy that stood here named 13 of the 19 declared
+        # services (no Phoenix, Slate, Agahnim or Hylia), started them in a fixed order with
+        # no gate, and treated a unit that was stopping as one to start.
+        print("[AUTOSTART] Starting local database, storage, and UI workloads...")
+        converge_to_desired_state("started", full=True)
+
         # Wait for Daruk query proxy to accept queries and run settings sync
         print("[AUTOSTART] Attempting local settings sync...")
         for _ in range(30):
@@ -5413,19 +5418,9 @@ def check_cluster_and_autostart():
                 pass
                 
             if cluster_state == "started":
-                services = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
-                for svc in services:
-                    res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
-                    status_str = res.stdout.decode().strip()
-                    if status_str not in ["active", "activating"]:
-                        print(f"[WATCHDOG] Restarting failed/stopped service {svc} (current status: {status_str})...")
-                        subprocess.run(f"systemctl start {svc}", shell=True)
-                if check_urbosa_enabled():
-                    res = subprocess.run("systemctl is-active urbosa", shell=True, stdout=subprocess.PIPE)
-                    status_str = res.stdout.decode().strip()
-                    if status_str not in ["active", "activating"]:
-                        print(f"[WATCHDOG] Restarting failed/stopped service urbosa (current status: {status_str})...")
-                        subprocess.run("systemctl start urbosa", shell=True)
+                # The same pass the ZooKeeper reconcile loop runs: ordered, gated on readiness,
+                # skipping a unit that is mid-transition, and including every declared service.
+                converge_to_desired_state("started")
         except Exception as wex:
             print(f"[WATCHDOG] Error in service watchdog: {wex}")
 

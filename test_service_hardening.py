@@ -8,6 +8,7 @@ import importlib.util
 import os
 import re
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -127,6 +128,53 @@ class BifrostResignsItsBallotOnSigterm(unittest.TestCase):
         src = read("bifrost.py")
         handler = src[src.index("def signal_handler"):src.index("def is_local_ingress_listening")]
         self.assertLess(handler.index("withdraw_ballot("), handler.index("ip addr del"))
+
+
+class TheWatchdogCheckAgreesWithTheDeclaredTable(unittest.TestCase):
+    """mcli-runner's idea of what the watchdog restarts must be what it restarts. It was
+    thirteen names and a three-name maintenance list after the watchdog had become the
+    declared-table pass, so a dead Phoenix or Slate was not seen and a maintenance host's
+    Daruk and Hylia were not checked."""
+
+    def test_the_lists(self):
+        import ast
+        daemon = load("spark_daemon_decoded.py", "spark_h")
+        tree = ast.parse(read("mcli-runner"))
+        found = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name) \
+                    and node.targets[0].id in ("WATCHDOG_SERVICES", "WATCHDOG_MAINTENANCE_SERVICES"):
+                found[node.targets[0].id] = ast.literal_eval(node.value)
+        declared = [e["unit"] for e in daemon.MANAGED_SERVICES if "setting" not in e]
+        self.assertEqual(sorted(found["WATCHDOG_SERVICES"]), sorted(declared))
+        self.assertEqual(sorted(found["WATCHDOG_MAINTENANCE_SERVICES"]),
+                         sorted(daemon.maintenance_watchdog_units()))
+
+
+class TheClusterCliVerifiesTheDaemonItCalls(unittest.TestCase):
+    def test_no_unverified_context_and_no_one_machines_path(self):
+        src = read("cluster_new.py")
+        self.assertNotIn("_create_unverified_context", src)
+        self.assertNotIn("AuraFlight", src)
+
+    def test_without_the_ca_it_says_so_and_does_not_connect(self):
+        import tempfile
+        cluster = load("cluster_new.py", "cluster_h")
+        os.environ["HCI_CERT_DIR"] = tempfile.mkdtemp()
+        self.addCleanup(os.environ.pop, "HCI_CERT_DIR", None)
+        opened = []
+        # urllib.request is one shared module: patch it for this test only.
+        patcher = mock.patch.object(cluster.urllib.request, "urlopen",
+                                    lambda *a, **k: opened.append(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        rc, out, err = cluster.run_remote_spark("10.0.0.2", "true")
+        self.assertEqual(rc, -1)
+        self.assertIn("ca.crt", err)
+        status, body, err = cluster.run_mtls_spark_api_full("10.0.0.2", "/api/v1/host/units")
+        self.assertEqual(status, 0)
+        self.assertIn("ca.crt", err)
+        self.assertEqual(opened, [])
 
 
 if __name__ == "__main__":

@@ -147,12 +147,16 @@ WATCHDOG_JOURNAL_WINDOW = 3600
 # Every probe this check makes is bounded. A wedged ZooKeeper container or a very large
 # journal must not turn a diagnostic into the thing that hangs.
 WATCHDOG_PROBE_TIMEOUT = 30
-# Exactly the units spark-daemon's watchdog restarts. This check is about that loop's
-# behaviour, so a unit it does not supervise (zookeeper, libvirtd, sidon)
-# must not appear here -- their absence is somebody else's verdict.
-WATCHDOG_SERVICES = ["hydra-db", "daruk", "sidon", "spectrum", "bifrost", "dagur",
-                     "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha"]
-WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "sidon"]
+# Exactly the units spark-daemon's watchdog restarts: every declared service (MANAGED_SERVICES in
+# spark_daemon_decoded.py, which the watchdog now walks through the reconcile pass), with urbosa
+# added below when it is enabled. A unit it does not supervise (zookeeper outside maintenance,
+# libvirtd) must not appear here -- their absence is somebody else's verdict.
+WATCHDOG_SERVICES = ["hydra-db", "daruk", "sidon", "spectrum", "spectrum-phx", "slate", "agahnim",
+                     "catalyst", "vali", "bifrost", "dagur", "mimir", "rauru", "logos", "mipha",
+                     "gatoway", "hylia"]
+# What a host in maintenance keeps running and the watchdog therefore keeps up: ZooKeeper plus the
+# units marked "keep" in MANAGED_SERVICES (docs/maintenance.md).
+WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "daruk", "sidon", "hylia"]
 
 # `cluster_new.py` touches this on every node before a cluster operation and removes it
 # after. spark-daemon's watchdog skips every pass while it exists -- and returns before

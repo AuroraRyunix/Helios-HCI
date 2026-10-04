@@ -216,10 +216,11 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
 
         scope = load(
             SPARK,
-            functions=("converge_to_desired_state", "unit_active_states", "service_entry",
+            functions=("converge_to_desired_state", "_converge_locked", "unit_active_states", "service_entry",
                        "service_is_disabled", "service_is_ready", "listening_ports",
                        "convergence_gate", "run_unit_commands"),
             scope={"MANAGED_SERVICE_ORDER": list(self.ORDER),
+                   "CONVERGE_LOCK": __import__("threading").Lock(),
                    "CONVERGE_PARALLELISM": 8,
                    "UNIT_DOWN_STATES": ("inactive", "failed", ""),
                    "MANAGED_SERVICES": self.TABLE,

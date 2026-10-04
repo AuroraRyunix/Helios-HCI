@@ -128,11 +128,22 @@ class AutostartNamesServicesThatExist(unittest.TestCase):
         for marker in ('for svc in maintenance_watchdog_units():',
                        '"unit": "sidon", "display": "Sidon", "requires": ("daruk",), '
                        '"drain_before_stop": True, "maintenance": "keep"',
-                       '["hydra-db", "daruk", "sidon", "spectrum"'):
+                       'converge_to_desired_state("started", full=True)',
+                       'converge_to_desired_state("started")'):
             self.assertIn(
                 marker, self.source,
                 "sidon is missing from a service list, so nothing autostarts or restarts "
                 "the daemon that serves every guest disk")
+
+    def test_autostart_and_the_watchdog_carry_no_service_list_of_their_own(self):
+        """They used to: 18, 18, 13 and 13 names, in no dependency order, missing Phoenix, Slate,
+        Agahnim and Hylia from the start lists, and treating a unit that was stopping as one to
+        start. They call the declared-table reconciler now."""
+        body = self.source[self.source.index("def check_cluster_and_autostart"):
+                           self.source.index("\ndef main():")]
+        for stale in ('services_to_stop = [', 'services = ["hydra-db"'):
+            self.assertNotIn(stale, body)
+        self.assertEqual(body.count("converge_to_desired_state("), 4)
 
     def test_the_volumes_path_is_left_alone(self):
         """The *directory* is still called aether and renaming it is a data migration,
@@ -261,11 +272,12 @@ class TheReconcilerDoesNotFightAStopInProgress(unittest.TestCase):
                 return FakeCompleted(b"")
 
         scope = load_functions(
-            SPARK, {"converge_to_desired_state", "unit_active_states", "service_entry",
+            SPARK, {"converge_to_desired_state", "_converge_locked", "unit_active_states", "service_entry",
                     "service_is_disabled", "service_is_ready", "listening_ports",
                     "convergence_gate", "run_unit_commands",
                     "drain_local_storage"},
             {"MANAGED_SERVICE_ORDER": list(self.ORDER),
+             "CONVERGE_LOCK": __import__("threading").Lock(),
              "CONVERGE_PARALLELISM": 8,
              "UNIT_DOWN_STATES": ("inactive", "failed", ""),
              # Two services with nothing to wait on, so what is asserted below is the

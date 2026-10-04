@@ -429,17 +429,13 @@ REGISTRIES = [
              }),
     Registry("spark_daemon_decoded.py", "handle_cluster_destroy", "services",
              name="spark-daemon: cluster destroy"),
-    Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services_to_stop", nth=0,
-             name="autostart: no cluster document, stop the workloads"),
-    # The host-in-maintenance branch used to carry a list here. It stops
-    # maintenance_stopped_units() now -- derived from the `maintenance` column of MANAGED_SERVICES,
-    # which test_maintenance_flow holds against vali's MAINTENANCE_STOP_UNITS.
-    Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services_to_stop", nth=1,
-             name="autostart: cluster is stopped, stop the workloads"),
-    Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services", nth=0,
-             name="autostart: start the local workloads", exempt=LEGACY_WATCHDOG),
-    Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services", nth=1,
-             name="watchdog: restart failed workloads", exempt=LEGACY_WATCHDOG),
+    # check_cluster_and_autostart and its watchdog carried four lists here (stop with no cluster,
+    # stop when the cluster is stopped, start, restart-if-down). They now call
+    # converge_to_desired_state, which walks MANAGED_SERVICES, so there is no list left to
+    # register; test_rollout_safety pins that they call it and carry no list.
+    # The host-in-maintenance branch stops maintenance_stopped_units() -- derived from the
+    # `maintenance` column of MANAGED_SERVICES, which test_maintenance_flow holds against vali's
+    # MAINTENANCE_STOP_UNITS.
 
     # -- the daemons that start and stop other hosts' services ---------------------------------
     Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance",
@@ -456,7 +452,8 @@ REGISTRIES = [
     Registry("mcli", "<module>", "CHECK_ID_TO_FUNC", flavour="status"),
     Registry("mcli", "update_progress", "checks_map", flavour="status"),
     Registry("mcli-runner", "<module>", "WATCHDOG_SERVICES",
-             name="mcli-runner: the units spark-daemon's watchdog restarts", exempt=LEGACY_WATCHDOG),
+             name="mcli-runner: the units spark-daemon's watchdog restarts",
+             exempt={"urbosa": SETTING_NOT_READ_HERE}),
     Registry("mcli-runner", "check_services", "svcs", name="mcli-runner: per-service status checks"),
     Registry("mcli-runner", "check_services", "managed", name="mcli-runner: flapping check"),
 ]

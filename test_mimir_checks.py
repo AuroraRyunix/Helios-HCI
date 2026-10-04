@@ -219,10 +219,11 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("7", message)
 
     def test_maintenance_uses_the_smaller_supervised_set(self):
-        # In maintenance spark-daemon supervises only consensus and storage; reporting
-        # the compute services as unrestarted there would fire on every window.
+        # In maintenance spark-daemon supervises only what the declared table keeps up
+        # (consensus, metadata, storage, the upgrade orchestrator); reporting the compute
+        # services as unrestarted there would fire on every window.
         self.assertEqual(runner.WATCHDOG_MAINTENANCE_SERVICES,
-                         ["zookeeper", "hydra-db", "sidon"])
+                         ["zookeeper", "hydra-db", "daruk", "sidon", "hylia"])
         for name in ("spectrum", "vali", "catalyst"):
             self.assertNotIn(name, runner.WATCHDOG_MAINTENANCE_SERVICES)
 
@@ -230,9 +231,12 @@ class WatchdogTests(unittest.TestCase):
         # This check is about the watchdog's own behaviour, so a unit the loop does not
         # touch must not appear: reporting zookeeper here would blame the watchdog for
         # something it was never asked to restart.
-        for name in ("zookeeper", "libvirtd", "slate", "hylia"):
+        # The watchdog is the declared-table pass now, so Phoenix, Slate, Agahnim and Hylia are
+        # supervised like the rest; ZooKeeper and libvirt are not in that table.
+        for name in ("zookeeper", "libvirtd"):
             self.assertNotIn(name, runner.WATCHDOG_SERVICES)
-        for name in ("hydra-db", "spectrum", "vali", "catalyst", "mipha"):
+        for name in ("hydra-db", "spectrum", "vali", "catalyst", "mipha",
+                     "spectrum-phx", "slate", "agahnim", "hylia"):
             self.assertIn(name, runner.WATCHDOG_SERVICES)
 
 

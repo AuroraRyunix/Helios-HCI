@@ -85,6 +85,11 @@ class ACallerCanNameATimeout(unittest.TestCase):
         original_open = module.urllib.request.urlopen
         original_ctx = module.ssl.create_default_context
         module.urllib.request.urlopen = fake_urlopen
+        if hasattr(module, "spark_client_material"):
+            # A node has the CA; the machine running this test does not.
+            original_material = module.spark_client_material
+            module.spark_client_material = lambda: ("/ca", "/cert", "/key")
+            self.addCleanup(setattr, module, "spark_client_material", original_material)
         module.ssl.create_default_context = lambda *a, **k: Context()
         self.addCleanup(setattr, module.urllib.request, "urlopen", original_open)
         self.addCleanup(setattr, module.ssl, "create_default_context", original_ctx)

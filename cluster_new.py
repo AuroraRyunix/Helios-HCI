@@ -719,21 +719,46 @@ def get_dfs_engine():
 # healthy one, so it is generous.
 STORAGE_PREP_TIMEOUT = 900
 
-def run_remote_spark(ip, command, timeout=None):
-    cert_paths = [
-        ("C:/Users/AuraFlight/.hci_temp_certs/ca.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.key"),
-        ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
-    ]
-    ca_path, cert_path, key_path = None, None, None
-    for ca, cert, key in cert_paths:
-        if os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key):
-            ca_path, cert_path, key_path = ca, cert, key
-            break
-            
-    context = ssl._create_unverified_context()
+def spark_client_material():
+    """(ca, client certificate, client key) for talking to spark-daemon, or None for each that
+    is absent. `HCI_CERT_DIR` relocates the directory (for running the CLI away from a node);
+    the default is where provisioning puts them."""
+    directory = os.environ.get("HCI_CERT_DIR") or "/root/.certs"
+    found = []
+    for name in ("ca.crt", "client.crt", "client.key"):
+        path = os.path.join(directory, name)
+        found.append(path if os.path.exists(path) else None)
+    return tuple(found)
+
+
+def spark_client_context(ip):
+    """A TLS context that verifies the daemon it is about to call, and the address to call.
+
+    Raises ValueError, saying what is missing, when the cluster CA is not there: the previous
+    behaviour was to connect without verifying anything, which let any host that answered on
+    9099 receive a root-capable command and return whatever output it liked. Verification is
+    the same as every other client's (`spark_endpoint`): the node certificate names the node's
+    IP, so addressing the node by that IP is what ties the connection to it.
+    """
+    ca_path, cert_path, key_path = spark_client_material()
+    if not ca_path:
+        raise ValueError("the cluster CA certificate is not at %s; run this on a cluster node, "
+                         "or point HCI_CERT_DIR at a directory holding ca.crt, client.crt and "
+                         "client.key" % os.path.join(os.environ.get("HCI_CERT_DIR") or "/root/.certs", "ca.crt"))
+    address, verify_identity = spark_endpoint(ip)
+    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_path)
+    context.check_hostname = verify_identity
     if cert_path and key_path:
         context.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    
+    return context, address
+
+
+def run_remote_spark(ip, command, timeout=None):
+    try:
+        context, ip = spark_client_context(ip)
+    except (ValueError, OSError, ssl.SSLError) as e:
+        return -1, "", str(e)
+
     url = f"https://{ip}:9099/api/v1/execute"
     body = {"command": command}
     wait = 120
@@ -766,19 +791,10 @@ def run_mtls_spark_api_full(ip, path, payload=None, method="POST", timeout=120):
 
     Returns (status, body, error). status is 0 when the request could not be made.
     """
-    cert_paths = [
-        ("C:/Users/AuraFlight/.hci_temp_certs/ca.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.crt", "C:/Users/AuraFlight/.hci_temp_certs/client.key"),
-        ("/root/.certs/ca.crt", "/root/.certs/client.crt", "/root/.certs/client.key")
-    ]
-    cert_path, key_path = None, None
-    for ca, cert, key in cert_paths:
-        if os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key):
-            cert_path, key_path = cert, key
-            break
-
-    context = ssl._create_unverified_context()
-    if cert_path and key_path:
-        context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    try:
+        context, ip = spark_client_context(ip)
+    except (ValueError, OSError, ssl.SSLError) as e:
+        return 0, {}, str(e)
 
     url = f"https://{ip}:9099{path}"
     data = None
