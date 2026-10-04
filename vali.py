@@ -201,6 +201,22 @@ def run_mtls_spark_api_full(ip, path, payload=None, method="POST", timeout=120):
 # not a budget for a healthy one.
 MIGRATION_COMMAND_TIMEOUT = 3600
 
+# The managed units a host in maintenance stops, in the order they are started. What stays up
+# (ZooKeeper, HydraDB, Daruk, Sidon, Hylia, and spark-daemon) and why is spark_daemon_decoded's
+# MAINTENANCE_* block and docs/maintenance.md; test_maintenance_flow asserts this equals the
+# declared table's complement, so the two cannot drift.
+# What leaving maintenance starts: ZooKeeper, then the units the host kept (a no-op for those
+# still up, and the repair for one that died during the window), then everything it stopped.
+# Hylia was missing from the list that used to stand here, which only worked because maintenance
+# never stopped it.
+MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon", "hylia")
+LEAVABLE_HOST_STATES = ("IN_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING")
+MAINTENANCE_STOP_UNITS = (
+    "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
+    "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa",
+)
+MAINTENANCE_EXIT_START_UNITS = MAINTENANCE_EXIT_START_UNITS + MAINTENANCE_STOP_UNITS
+
 # What Sidon's takeover may take on the destination: the owner drains its journal (bounded by
 # SIDON_HANDOVER_TIMEOUT, 120 s) and the claim and fence follow. Longer than either.
 SIDON_TAKEOVER_TIMEOUT = 300
@@ -2052,13 +2068,24 @@ def process_queue_task(task):
                 # maintenance window that lasts hours.
                 renew_maintenance_lock(hostname, lock_token, f"{hostname} is in maintenance")
 
-                # Write state file and stop all cluster services on the target host (except spark-daemon)
-                run_remote_spark(target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
-                # Every cluster service except spark-daemon, which has to survive to
-                # be told to start them again.
-                maintenance_units = ["spectrum", "spectrum-phx", "catalyst", "bifrost", "dagur", "mimir", "rauru",
-                                     "vali", "sidon", "hydra-db", "gatoway", "urbosa",
-                                     "logos", "mipha", "daruk", "agahnim", "slate"]
+                # The state file is what the host's own daemons read: spark's loop ignores the
+                # desired state while it exists, Mipha exempts the host, and a reboot comes back
+                # into maintenance. If it cannot be written nothing has been stopped yet, so the
+                # entry is abandoned and the host put back, instead of recorded in the database
+                # as in maintenance while the host does not know it.
+                rc_state, _, err_state = run_remote_spark(
+                    target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
+                if rc_state != 0:
+                    run_cql_query(f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';")
+                    release_maintenance_lock(lock_token)
+                    print(f"[Maintenance Catalyst Task] Could not write the maintenance marker on {hostname}: {err_state}. Host status reverted to NORMAL.")
+                    return False, (f"Could not enter maintenance mode: the marker file could not be "
+                                   f"written on {hostname} ({err_state.strip() or 'no detail'}). "
+                                   "Its VMs have already been evacuated; DRS will rebalance them.")
+                # What maintenance stops: every managed unit that is not one of the ones kept
+                # up on purpose (docs/maintenance.md). The same list spark's autostart stops
+                # after a reboot in maintenance; test_maintenance_flow checks they agree.
+                maintenance_units = list(MAINTENANCE_STOP_UNITS)
 
                 # Update task progress to 100 before running the stop command, so the task status is marked completed in ScyllaDB
                 call_catalyst_api("/api/v1/tasks/update", {
@@ -2075,6 +2102,11 @@ def process_queue_task(task):
                 if not ok:
                     print(f"[Maintenance Catalyst Task] Could not stop services on "
                           f"{hostname}: {detail}")
+                    return False, (
+                        f"{hostname} is recorded as in maintenance and its VMs are evacuated, but "
+                        f"its services could not be stopped ({detail}). `cluster status` marks what "
+                        f"is still up that should not be. Run 'valcli host.maintenance.leave "
+                        f"{hostname}' to undo it.")
                 return True, target_ip
             else:
                 # Revert node status to NORMAL
@@ -2102,9 +2134,7 @@ def process_queue_task(task):
             }, method="POST")
             
             print(f"[Maintenance Catalyst Task] Starting services on host {hostname}...")
-            start_units = ["zookeeper", "hydra-db", "sidon", "spectrum", "spectrum-phx", "bifrost",
-                           "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa",
-                           "logos", "mipha", "daruk", "agahnim", "slate"]
+            start_units = list(MAINTENANCE_EXIT_START_UNITS)
             ok, detail = spark_unit_action(target_ip, "start", start_units)
             if not ok:
                 print(f"[Maintenance Catalyst Task] Could not start services on "
@@ -2121,21 +2151,21 @@ def process_queue_task(task):
             print(f"[Maintenance Catalyst Task] Waiting 10 seconds for services on host {hostname} to stabilize...")
             time.sleep(10)
             
-            # Set status to RECOVERING in ScyllaDB (not NORMAL yet!)
+            # RECOVERING, not NORMAL yet: the host is not schedulable until its services are
+            # answering. Nothing used to take it from here to NORMAL -- the lock was released
+            # at this point and the row stayed RECOVERING for ever, which is what a rolling
+            # upgrade waiting for NORMAL after its leave timed out on.
             cql_up = f"UPDATE hydra.nodes SET status = 'RECOVERING', maintenance_mode = false WHERE hostname = '{hostname}';"
             run_cql_query(cql_up)
-            
 
-
-            # Nothing to wait for, so the lock comes off here. This used to announce a
-            # satellite auto-heal, create a child Catalyst task and poll
-            # get_linstor_pending_sync() every three seconds until DRBD had finished
-            # copying -- and hold the maintenance lock through all of it, because a node
-            # whose replicas were still catching up could not be trusted with a guest.
-            # Extent groups are immutable, so a returning node's copies are correct or
-            # absent and Purah replaces the absent ones in the background. There is no
-            # in-between state to wait out, and so no failure branch either.
-            release_maintenance_lock_for_host(hostname)
+            # There is no storage resync to wait for (extent groups are immutable and Purah
+            # replaces absent copies in the background), but there are services to wait for.
+            # NORMAL, and the lock, come when the host answers with every service up; if it
+            # does not, the host stays RECOVERING with the lock held (Mipha renews it) and
+            # this task fails naming what is down. Running leave again retries from here.
+            back, why = finish_maintenance_exit(hostname, target_ip)
+            if not back:
+                return False, why
 
             # Spawn subtask to run Mimir Health Check
             print(f"[Maintenance Catalyst Task] Spawning Mimir health checks subtask for host {hostname}...")
@@ -2542,6 +2572,232 @@ def release_maintenance_lock_for_host(hostname):
 
 
 # REST HTTP Handlers
+MAINTENANCE_EXIT_WAIT_SECONDS = 180
+MAINTENANCE_EXIT_POLL_SECONDS = 5
+
+
+def services_down_on(target_ip):
+    """The managed services not UP on a host, or None when its status cannot be read."""
+    rc, status, _ = run_mtls_spark_api(target_ip, "/api/v1/node/status", None, method="GET")
+    if rc != 0 or not isinstance(status, dict):
+        return None
+    if status.get("maintenance_status", "NORMAL") != "NORMAL":
+        return None
+    services = status.get("services") or {}
+    return sorted(name for name, data in services.items()
+                  if (data or {}).get("status") != "UP")
+
+
+def finish_maintenance_exit(hostname, target_ip, wait=None, poll=None, sleep=None):
+    """Wait for a host that left maintenance to be fully up, then make it NORMAL and free the lock.
+
+    Returns (True, "") once every service the host publishes is UP, the row is NORMAL (a
+    compare-and-swap from RECOVERING, so a status somebody changed meanwhile is not
+    overwritten) and the cluster maintenance lock is released. Otherwise (False, reason) with
+    the host left RECOVERING and the lock still held, which is what makes a failed exit
+    retryable by running leave again.
+    """
+    wait = MAINTENANCE_EXIT_WAIT_SECONDS if wait is None else wait
+    poll = MAINTENANCE_EXIT_POLL_SECONDS if poll is None else poll
+    sleep = sleep or time.sleep
+    deadline = time.time() + wait
+    down = None
+    while True:
+        down = services_down_on(target_ip)
+        if down == []:
+            break
+        if time.time() >= deadline:
+            what = ("its status could not be read" if down is None
+                    else "these services are not up: " + ", ".join(down))
+            return False, (f"Host {hostname} left maintenance but is not fully back after {wait}s "
+                           f"({what}). It stays RECOVERING with the maintenance lock held; run "
+                           f"'valcli host.maintenance.leave {hostname}' again to retry.")
+        sleep(poll)
+    ok, applied, current, err = run_lwt("/v1/node/maintenance", {
+        "hostname": hostname, "status": "NORMAL", "maintenance_mode": False,
+        "expected_status": "RECOVERING"})
+    if not ok:
+        return False, (f"Host {hostname} is back but its status could not be set to NORMAL "
+                       f"({err}). It stays RECOVERING with the lock held; run leave again.")
+    if not applied:
+        # Somebody moved it (an operator, or Mipha fencing it): their state wins, and holding
+        # a lock for a host that is no longer recovering would block every other host.
+        print(f"[Maintenance Catalyst Task] {hostname} is '{current.get('status')}', not RECOVERING; "
+              "left as it is.")
+    release_maintenance_lock_for_host(hostname)
+    return True, ""
+
+
+def handle_maintenance_request(payload, send_json):
+    """`POST /api/v1/hosts/maintenance`: enter or leave maintenance for a host.
+
+    A function of the request and a reply callback, rather than a block in the HTTP handler, so
+    the state transitions can be tested with the database, the lock and Catalyst stubbed. The
+    rule for what a host in maintenance keeps running, and every step and failure of this
+    flow, is in docs/maintenance.md.
+    """
+    hostname = payload.get("hostname")
+    action = payload.get("action")
+    force_stop = payload.get("force_stop", False)
+    
+    if not hostname or not action:
+        send_json(400, {"error": "Parameters hostname and action required."})
+        return
+    if not is_valid_object_name(hostname):
+        send_json(400, {"error": f"Invalid hostname: {OBJECT_NAME_ERROR}."})
+        return
+
+    # Query host info from ScyllaDB
+    rc, stdout, _ = run_cql_query(f"SELECT JSON hostname, ip, status, maintenance_mode FROM hydra.nodes WHERE hostname = '{hostname}';")
+    host_info = None
+    if rc == 0 and stdout:
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    host_info = json.loads(line)
+                    break
+                except:
+                    pass
+                    
+    if not host_info:
+        send_json(404, {"error": f"Host '{hostname}' not found in cluster database."})
+        return
+        
+    target_ip = host_info.get("ip")
+    
+    if action == "enter":
+        # Without an address there is no way to ask the ring about this host, and
+        # the quorum gate would find no matching ring member and read that as
+        # "holds no replicas" -- waving through the one case it exists to catch.
+        if not target_ip:
+            send_json(409, {"error": f"Host '{hostname}' has no IP recorded in hydra.nodes, so its effect on the ScyllaDB ring cannot be established."})
+            return
+
+        # Refuse before evacuating anything if the database this host carries is
+        # one the cluster cannot lose. Entering maintenance stops hydra-db, and
+        # on a cluster already missing a replica that stop is what takes the
+        # metadata layer below quorum -- after which the maintenance workflow
+        # cannot even record what it did. The gate runs again immediately before
+        # the stop, because an evacuation can take long enough for a second node
+        # to die in the middle of it.
+        quorum_ok, quorum_reason = check_stop_preserves_quorum(target_ip)
+        if not quorum_ok:
+            send_json(409, {
+                "error": f"Host '{hostname}' cannot enter maintenance mode: {quorum_reason}",
+                "reason": "quorum",
+            })
+            return
+
+        # Exclude every other host's transition, cluster-wide, in one Paxos round.
+        #
+        # What was here before scanned every hydra.nodes row for a host already in
+        # maintenance and then wrote. Two hosts entering a second apart both read
+        # "nobody" and both proceeded -- a lightweight transaction cannot span
+        # partitions, so the check and the claim were never one operation. A
+        # single lock row is the shape that can be: see hydra.cluster_locks.
+        lock_ok, lock_token, lock_current, lock_err = acquire_maintenance_lock(
+            hostname, f"maintenance entry on {hostname}")
+        if not lock_ok:
+            send_json(500, {"error": f"Could not take the cluster maintenance lock: {lock_err}"})
+            return
+        if not lock_token:
+            holder = lock_current.get("holder") or "another host"
+            send_json(409, {
+                "error": f"Host '{holder}' already holds the cluster maintenance lock "
+                         f"({lock_current.get('reason') or 'no reason recorded'}). "
+                         "Only one host may transition at a time, to preserve quorum.",
+                "reason": "locked",
+                "holder": lock_current.get("holder", ""),
+            })
+            return
+
+        # Claim the transition rather than announce it. Draining a host is a lock
+        # on that host: two requests -- a double click, or a leave racing an enter
+        # that is still evacuating -- both used to write a status and both went on
+        # to submit an evacuation task for the same VMs.
+        #
+        # Only this first transition is conditional. The ones that follow it are
+        # made by the workflow that already holds the claim, and `hydra.nodes`
+        # status is also written by mipha's health loop, so conditioning them too
+        # would wedge a host in ENTERING_MAINTENANCE the first time the two
+        # crossed.
+        ok, applied, current, err = run_lwt("/v1/node/maintenance", {
+            "hostname": hostname,
+            "status": "ENTERING_MAINTENANCE",
+            "maintenance_mode": False,
+            "expected_status": "NORMAL",
+        })
+        # Every exit from here on has to give the lock back. Leaving it held on a
+        # request that never started a transition blocks maintenance cluster-wide
+        # until the TTL runs out.
+        if not ok:
+            release_maintenance_lock(lock_token)
+            send_json(500, {"error": f"Could not begin the maintenance transition for '{hostname}': {err}"})
+            return
+        if not applied:
+            release_maintenance_lock(lock_token)
+            send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not NORMAL, so it cannot enter maintenance mode now."})
+            return
+
+        # Submit Catalyst task. The lock token travels with it: the task renews
+        # the lock while it evacuates and releases it if the transition fails.
+        status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
+            "service": "vali",
+            "action": "host_maintenance_enter",
+            "payload": {
+                "hostname": hostname,
+                "target_ip": target_ip,
+                "force_stop": force_stop,
+                "lock_token": lock_token
+            }
+        }, method="POST")
+
+        if status_api == 200:
+            task_id = res_api.get("task_id")
+            send_json(200, {"status": "transitioning", "task_id": task_id, "message": f"Entering maintenance mode task submitted (Task ID: {task_id})."})
+        else:
+            # Nothing is going to run, so put the host and the lock back.
+            run_lwt("/v1/node/maintenance", {
+                "hostname": hostname,
+                "status": "NORMAL",
+                "maintenance_mode": False,
+                "expected_status": "ENTERING_MAINTENANCE",
+            })
+            release_maintenance_lock(lock_token)
+            send_json(500, {"error": f"Failed to submit host maintenance task to Catalyst: {res_api}"})
+
+    elif action == "leave":
+        # Leave is also how a transition that did not finish is put right (an enter whose task
+        # died leaves ENTERING_MAINTENANCE; a leave whose services did not all start leaves
+        # RECOVERING), so those are allowed. A host that is NORMAL is not in maintenance: running
+        # the sequence on it would restart its services and set a healthy host RECOVERING.
+        current_state = host_info.get("status")
+        if current_state not in LEAVABLE_HOST_STATES:
+            send_json(409, {"error": f"Host '{hostname}' is in state '{current_state}', not in "
+                                     "maintenance, so there is nothing to leave.",
+                            "reason": "not_in_maintenance"})
+            return
+        # Submit Catalyst task
+        status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
+            "service": "vali",
+            "action": "host_maintenance_leave",
+            "payload": {
+                "hostname": hostname,
+                "target_ip": target_ip
+            }
+        }, method="POST")
+        
+        if status_api == 200:
+            task_id = res_api.get("task_id")
+            send_json(200, {"status": "transitioning", "task_id": task_id, "message": f"Leaving maintenance mode task submitted (Task ID: {task_id})."})
+        else:
+            send_json(500, {"error": f"Failed to submit host maintenance leave task to Catalyst: {res_api}"})
+        
+    else:
+        send_json(400, {"error": f"Invalid action '{action}'."})
+
+
 class ValiAPIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass # Disable logging to prevent stdout clutter
@@ -2680,156 +2936,7 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             threading.Thread(target=run_drs_loop, args=(aggressive,), daemon=True).start()
             self.send_json(200, {"status": "triggered"})
         elif self.path == "/api/v1/hosts/maintenance":
-            hostname = payload.get("hostname")
-            action = payload.get("action")
-            force_stop = payload.get("force_stop", False)
-            
-            if not hostname or not action:
-                self.send_json(400, {"error": "Parameters hostname and action required."})
-                return
-            if not is_valid_object_name(hostname):
-                self.send_json(400, {"error": f"Invalid hostname: {OBJECT_NAME_ERROR}."})
-                return
-
-            # Query host info from ScyllaDB
-            rc, stdout, _ = run_cql_query(f"SELECT JSON hostname, ip, status, maintenance_mode FROM hydra.nodes WHERE hostname = '{hostname}';")
-            host_info = None
-            if rc == 0 and stdout:
-                for line in stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            host_info = json.loads(line)
-                            break
-                        except:
-                            pass
-                            
-            if not host_info:
-                self.send_json(404, {"error": f"Host '{hostname}' not found in cluster database."})
-                return
-                
-            target_ip = host_info.get("ip")
-            
-            if action == "enter":
-                # Without an address there is no way to ask the ring about this host, and
-                # the quorum gate would find no matching ring member and read that as
-                # "holds no replicas" -- waving through the one case it exists to catch.
-                if not target_ip:
-                    self.send_json(409, {"error": f"Host '{hostname}' has no IP recorded in hydra.nodes, so its effect on the ScyllaDB ring cannot be established."})
-                    return
-
-                # Refuse before evacuating anything if the database this host carries is
-                # one the cluster cannot lose. Entering maintenance stops hydra-db, and
-                # on a cluster already missing a replica that stop is what takes the
-                # metadata layer below quorum -- after which the maintenance workflow
-                # cannot even record what it did. The gate runs again immediately before
-                # the stop, because an evacuation can take long enough for a second node
-                # to die in the middle of it.
-                quorum_ok, quorum_reason = check_stop_preserves_quorum(target_ip)
-                if not quorum_ok:
-                    self.send_json(409, {
-                        "error": f"Host '{hostname}' cannot enter maintenance mode: {quorum_reason}",
-                        "reason": "quorum",
-                    })
-                    return
-
-                # Exclude every other host's transition, cluster-wide, in one Paxos round.
-                #
-                # What was here before scanned every hydra.nodes row for a host already in
-                # maintenance and then wrote. Two hosts entering a second apart both read
-                # "nobody" and both proceeded -- a lightweight transaction cannot span
-                # partitions, so the check and the claim were never one operation. A
-                # single lock row is the shape that can be: see hydra.cluster_locks.
-                lock_ok, lock_token, lock_current, lock_err = acquire_maintenance_lock(
-                    hostname, f"maintenance entry on {hostname}")
-                if not lock_ok:
-                    self.send_json(500, {"error": f"Could not take the cluster maintenance lock: {lock_err}"})
-                    return
-                if not lock_token:
-                    holder = lock_current.get("holder") or "another host"
-                    self.send_json(409, {
-                        "error": f"Host '{holder}' already holds the cluster maintenance lock "
-                                 f"({lock_current.get('reason') or 'no reason recorded'}). "
-                                 "Only one host may transition at a time, to preserve quorum.",
-                        "reason": "locked",
-                        "holder": lock_current.get("holder", ""),
-                    })
-                    return
-
-                # Claim the transition rather than announce it. Draining a host is a lock
-                # on that host: two requests -- a double click, or a leave racing an enter
-                # that is still evacuating -- both used to write a status and both went on
-                # to submit an evacuation task for the same VMs.
-                #
-                # Only this first transition is conditional. The ones that follow it are
-                # made by the workflow that already holds the claim, and `hydra.nodes`
-                # status is also written by mipha's health loop, so conditioning them too
-                # would wedge a host in ENTERING_MAINTENANCE the first time the two
-                # crossed.
-                ok, applied, current, err = run_lwt("/v1/node/maintenance", {
-                    "hostname": hostname,
-                    "status": "ENTERING_MAINTENANCE",
-                    "maintenance_mode": False,
-                    "expected_status": "NORMAL",
-                })
-                # Every exit from here on has to give the lock back. Leaving it held on a
-                # request that never started a transition blocks maintenance cluster-wide
-                # until the TTL runs out.
-                if not ok:
-                    release_maintenance_lock(lock_token)
-                    self.send_json(500, {"error": f"Could not begin the maintenance transition for '{hostname}': {err}"})
-                    return
-                if not applied:
-                    release_maintenance_lock(lock_token)
-                    self.send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not NORMAL, so it cannot enter maintenance mode now."})
-                    return
-
-                # Submit Catalyst task. The lock token travels with it: the task renews
-                # the lock while it evacuates and releases it if the transition fails.
-                status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
-                    "service": "vali",
-                    "action": "host_maintenance_enter",
-                    "payload": {
-                        "hostname": hostname,
-                        "target_ip": target_ip,
-                        "force_stop": force_stop,
-                        "lock_token": lock_token
-                    }
-                }, method="POST")
-
-                if status_api == 200:
-                    task_id = res_api.get("task_id")
-                    self.send_json(200, {"status": "transitioning", "task_id": task_id, "message": f"Entering maintenance mode task submitted (Task ID: {task_id})."})
-                else:
-                    # Nothing is going to run, so put the host and the lock back.
-                    run_lwt("/v1/node/maintenance", {
-                        "hostname": hostname,
-                        "status": "NORMAL",
-                        "maintenance_mode": False,
-                        "expected_status": "ENTERING_MAINTENANCE",
-                    })
-                    release_maintenance_lock(lock_token)
-                    self.send_json(500, {"error": f"Failed to submit host maintenance task to Catalyst: {res_api}"})
-
-            elif action == "leave":
-                # Submit Catalyst task
-                status_api, res_api = call_catalyst_api("/api/v1/tasks/submit", {
-                    "service": "vali",
-                    "action": "host_maintenance_leave",
-                    "payload": {
-                        "hostname": hostname,
-                        "target_ip": target_ip
-                    }
-                }, method="POST")
-                
-                if status_api == 200:
-                    task_id = res_api.get("task_id")
-                    self.send_json(200, {"status": "transitioning", "task_id": task_id, "message": f"Leaving maintenance mode task submitted (Task ID: {task_id})."})
-                else:
-                    self.send_json(500, {"error": f"Failed to submit host maintenance leave task to Catalyst: {res_api}"})
-                
-            else:
-                self.send_json(400, {"error": f"Invalid action '{action}'."})
+            handle_maintenance_request(payload, self.send_json)
         else:
             self.send_json(404, {"error": "Not Found"})
 

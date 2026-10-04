@@ -148,7 +148,7 @@ curl --cacert /root/.certs/ca.crt \
 When `spark-daemon` starts up (e.g. during host boot), it spawns a background thread to orchestrate starting local workloads:
 
 1. **ZooKeeper Startup**: Starts the local ZooKeeper instance (`systemctl start zookeeper`) if it is not already active. (This executes unconditionally, even in maintenance mode, to preserve cluster quorum).
-2. **Maintenance Mode Check**: Checks if `/etc/hci/maintenance.state` exists. If the host is in maintenance mode, it halts the autostart thread here, leaving all other database, storage, and UI workloads stopped.
+2. **Maintenance Mode Check**: Checks if `/etc/hci/maintenance.state` exists. If the host is in maintenance mode, it stops every managed unit the declared table does not mark `maintenance: keep`, starts ZooKeeper and the kept units (HydraDB, Daruk, Sidon, Hylia), and runs the maintenance watchdog, which restarts a kept unit that dies; it does not continue to the steps below. See [maintenance.md](./maintenance.md).
 3. **Quorum Consensus Verification**: Polls local ZooKeeper port `2181` until a quorum mode (`follower`, `leader`, or `standalone`) is established.
 4. **Cluster State Verification**: Queries the ZooKeeper database for `/cluster_state`. If the cluster state is set to `stopped` (e.g. administrator manually stopped the cluster), it skips starting the workloads.
 5. **Workload Autostart**: Starts the following local cluster services sequentially:

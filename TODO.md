@@ -93,10 +93,13 @@ from the DRBD design that nothing but history explains.
 
 Raised from using the lab; the owner asked for each of these to be thought through, not patched.
 
-* **Maintenance flow.** A host in maintenance still shows ZooKeeper, HydraDB, Daruk, Spark and Hylia
-  UP while everything else is DOWN (Sidon included). Decide what "in maintenance" should keep running
-  and why: ZooKeeper, Hydra and Daruk presumably stay (the quorum gate exists so they can), but Hylia
-  and Sidon's state needs a stated rule, and `cluster status` should label what is kept up on purpose.
+* [x] **Maintenance flow.** *(2026-10-04; docs/maintenance.md, test_maintenance_flow.py; needs a live check)* One declared
+  rule (`maintenance: keep` on hydra-db, daruk, sidon, hylia, plus zookeeper and spark-daemon) replaces three lists
+  that disagreed; `cluster status` labels what is up on purpose. Found and fixed on the way: nothing took a host
+  from RECOVERING to NORMAL after `leave` (the lock was released and the row stayed RECOVERING); `leave` ran on
+  hosts that were not in maintenance; a marker file that could not be written still recorded the host as in
+  maintenance. The rule itself (Sidon and Hylia kept; Mipha and Logos stopped) is the author's call, listed for
+  the owner.
 * **Hosts becoming degraded, and leaving it.** Mipha quarantines a host after three failed storage
   probes and (until 2026-10-04) never lifted it after a restart; the orphan reconcile is the first fix.
   Review the whole lifecycle: what degrades a host, what each state stops (placement, HA, DRS,

@@ -122,7 +122,12 @@ class AutostartNamesServicesThatExist(unittest.TestCase):
             "a service list still names aether, which no longer exists as a unit")
 
     def test_the_storage_daemon_is_in_the_lists_that_keep_services_up(self):
-        for marker in ('["zookeeper", "hydra-db", "sidon"]',
+        # The maintenance lists are derived from the declared table now (docs/maintenance.md):
+        # sidon is kept up in maintenance, so the watchdog that supervises the kept units
+        # restarts it, and the table row says so.
+        for marker in ('for svc in maintenance_watchdog_units():',
+                       '"unit": "sidon", "display": "Sidon", "requires": ("daruk",), '
+                       '"drain_before_stop": True, "maintenance": "keep"',
                        '["hydra-db", "daruk", "sidon", "spectrum"'):
             self.assertIn(
                 marker, self.source,

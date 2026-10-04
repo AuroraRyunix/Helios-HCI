@@ -348,6 +348,9 @@ HYLIA_THROUGH_MAINTENANCE = (
     "upgrade that puts hosts in and out of maintenance, and its unit carries no "
     "ConditionPathExists=!/etc/hci/maintenance.state, so entering maintenance never stops it "
     "and leaving it has nothing to start")
+KEPT_UP_IN_MAINTENANCE = (
+    "kept up in maintenance on purpose (the `maintenance: keep` column of MANAGED_SERVICES, "
+    "docs/maintenance.md): the metadata and storage planes stay so the cluster's margins hold")
 SETTING_NOT_READ_HERE = (
     "urbosa is switched on by the `urbosa_enabled` setting; this code does not read that "
     "setting, so naming the unit would start it on a cluster where it is off")
@@ -428,14 +431,10 @@ REGISTRIES = [
              name="spark-daemon: cluster destroy"),
     Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services_to_stop", nth=0,
              name="autostart: no cluster document, stop the workloads"),
+    # The host-in-maintenance branch used to carry a list here. It stops
+    # maintenance_stopped_units() now -- derived from the `maintenance` column of MANAGED_SERVICES,
+    # which test_maintenance_flow holds against vali's MAINTENANCE_STOP_UNITS.
     Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services_to_stop", nth=1,
-             name="autostart: host in maintenance, stop the workloads", exempt={
-                 "hydra-db": ("this branch brings the database up and keeps it up -- the lines "
-                              "after the list start hydra-db and the watchdog supervises it"),
-                 "daruk": "daruk is the database's query proxy and stays with it",
-                 "hylia": HYLIA_THROUGH_MAINTENANCE,
-             }),
-    Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services_to_stop", nth=2,
              name="autostart: cluster is stopped, stop the workloads"),
     Registry("spark_daemon_decoded.py", "check_cluster_and_autostart", "services", nth=0,
              name="autostart: start the local workloads", exempt=LEGACY_WATCHDOG),
@@ -443,10 +442,13 @@ REGISTRIES = [
              name="watchdog: restart failed workloads", exempt=LEGACY_WATCHDOG),
 
     # -- the daemons that start and stop other hosts' services ---------------------------------
-    Registry("vali.py", "process_queue_task", "maintenance_units", name="vali: enter maintenance",
-             exempt={"hylia": HYLIA_THROUGH_MAINTENANCE}),
-    Registry("vali.py", "process_queue_task", "start_units", name="vali: leave maintenance",
-             exempt={"hylia": HYLIA_THROUGH_MAINTENANCE}),
+    Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance",
+             exempt={
+                 "hydra-db": KEPT_UP_IN_MAINTENANCE,
+                 "daruk": KEPT_UP_IN_MAINTENANCE,
+                 "sidon": KEPT_UP_IN_MAINTENANCE,
+                 "hylia": HYLIA_THROUGH_MAINTENANCE,
+             }),
     Registry("mipha.py", "main", "start_units", name="mipha: rejoin a returned host",
              exempt={"urbosa": SETTING_NOT_READ_HERE}),
 

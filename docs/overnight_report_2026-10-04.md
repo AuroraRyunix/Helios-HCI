@@ -119,9 +119,47 @@ source text because `spectrum_server` opens a database on import.
 
 Status: **done**.
 
+### D. Host maintenance flow: rule defined, bugs fixed, documented and tested; needs a live check
+
+*What was wrong (by reading the code).* Three definitions of what maintenance keeps running: Vali stopped
+every unit but ZooKeeper (hydra-db, daruk and sidon included, not hylia); spark's boot-time maintenance branch
+stopped a different list, started zookeeper and hydra-db, and its watchdog restarted zookeeper, hydra-db and
+sidon (which that branch had just stopped); the zk reconcile loop ignores the desired state. Hence the mixture
+the owner saw. Also: (1) **nothing took a host from RECOVERING to NORMAL after `leave`** (the lock was released at
+RECOVERING and the row stayed there; Mipha's rejoin sets NORMAL only for hosts that were DOWN; Hylia waits for NORMAL
+for 120 s and then fails the upgrade); (2) `leave` ran on any host, including a NORMAL one (restarting its services and
+setting it RECOVERING); (3) the leave start list omitted Hylia; (4) a marker file that could not be written still
+left the host recorded as IN_MAINTENANCE; (5) a stop that spark refused was logged and the task still reported success.
+
+*Change.* The rule (see `docs/maintenance.md`): kept up = spark-daemon, zookeeper, hydra-db, daruk, sidon, hylia;
+stopped = the other 14 managed units. One column (`maintenance: keep`) in `MANAGED_SERVICES`; spark's autostart and
+watchdogs derive from it, Vali's stop list is held equal by a test, `cluster status` labels what is up on purpose or
+should have been stopped. `handle_maintenance_request` is now a function (it was a block in the HTTP handler) so every
+transition is testable. New `finish_maintenance_exit`: wait for every service UP, then RECOVERING to NORMAL by
+compare-and-swap, then release the lock; on timeout the host stays RECOVERING with the lock held and the task names the
+services. `leave` is refused with 409 unless the host is IN_MAINTENANCE, ENTERING_MAINTENANCE or RECOVERING.
+Docs: new `docs/maintenance.md`; `cluster.md`, `spark.md` and the architecture guide corrected.
+
+*Tests.* `test_maintenance_flow.py`, 37 tests: the rule's single source, the status labels, every enter and leave
+transition and failure with the cluster stubbed (quorum, lock, claim, evacuation, marker, stop, services not up, retry,
+a status changed meanwhile), and the boot path. The behavioural ones fail against the old Vali (it never wrote NORMAL).
+
+*Not done.* Enforcing the rule continuously (the loop stays out of maintenance, so an operator can still start a unit
+by hand; `cluster status` says when one is up that should not be). The quorum gate is kept although the database now
+stays up (a maintenance host is the one that is rebooted and upgraded); whether to drop it is an owner decision.
+
+Status: **done in code; live verification needed**.
+
 (Further items are added below as they are finished.)
 
 ## Needs live verification
+
+- D. Maintenance, on the lab: `valcli host.maintenance.enter <host>` (a host with at least one running VM), then
+  `cluster status`. Pass: the task succeeds; the host shows `[IN MAINTENANCE]`; ZooKeeper, HydraDB, Daruk, Sidon,
+  Hylia and Spark are UP and labelled `(kept up in maintenance)`; the other 14 units are DOWN; nothing is labelled
+  `expected to be stopped`. Then `valcli host.maintenance.leave <host>`: pass = the task succeeds, `valcli host.list`
+  shows NORMAL (it used to stay RECOVERING) and `hydra.cluster_locks` is empty. Also run `leave` on a NORMAL host:
+  pass = a 409 saying there is nothing to leave.
 
 - A. Live migration, on the lab after a rollout:
   `ssh -i ~/.ssh/id_rsa_hci root@10.10.102.41 valcli vm.migrate <vm> 10.10.102.42` (or `host.maintenance.enter`).
@@ -145,7 +183,13 @@ Status: **done**.
 
 ## Decisions for the owner
 
-(none yet)
+- **What a host in maintenance keeps running** (item D). I decided it so the flow is consistent: kept up =
+  spark-daemon, zookeeper, hydra-db, daruk, sidon, hylia; stopped = everything else (Mipha and Logos included).
+  It is one column in `MANAGED_SERVICES`; say if it should differ (the likeliest argument is Sidon: kept so vdisks
+  with a replica on the host stay fully replicated, but a disk or kernel job on the host needs it stopped by hand).
+- Keep the quorum gate for maintenance entry although the database now stays up? Kept (rolling upgrades restart it).
+- (Not mine to decide, untouched) the console Quadlet --privileged question; a two-node tie-breaker; dedup beyond
+  the estimator; erasure coding; component naming.
 
 ## Found but not fixed
 

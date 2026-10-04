@@ -332,9 +332,16 @@ def render_node_block(ip, data, use_color=True):
         # is printed next to the service rather than left in a journal on that host.
         error = str(svc.get("last_error") or "").strip().splitlines()
         err_str = f" {r}{error[0][:160]}{x}" if error else ""
+        # In maintenance, a unit that is up either stays up on purpose (the node says which) or
+        # is something the maintenance sequence should have stopped, and neither is left for the
+        # reader to work out.
+        maint_note = ""
+        if maint != "NORMAL" and status == "UP":
+            maint_note = (f" {gr}(kept up in maintenance){x}" if svc.get("kept_in_maintenance")
+                          else f" {y}(expected to be stopped in maintenance){x}")
         if status == "UP":
             note = f" {y}({restarts} restarts){x}" if restarts else ""
-            lines.append(f"                    {name:<16}   {g}UP{x}       {pid_str}{note}{err_str}")
+            lines.append(f"                    {name:<16}   {g}UP{x}       {pid_str}{note}{maint_note}{err_str}")
         elif status == "FLAPPING":
             lines.append(f"                    {name:<16}   {y}FLAPPING{x} {gr}restarting, {restarts} restarts{x}{err_str}")
         else:

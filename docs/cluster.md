@@ -317,8 +317,10 @@ exits non-zero before the cluster lock is taken and before any phase has started
 * **Optimal Scheduling**: The **Vali** scheduler picks up the tasks and immediately schedules the VMs to boot on the healthiest remaining hosts based on available RAM and DRS rules, restoring VM availability automatically.
 
 ### C. Maintenance Mode and Quorum
-Entering maintenance mode stops the host's `hydra-db` along with everything else, so it is
-refused when the remaining ScyllaDB replicas could not form a quorum without it — derived
+Maintenance keeps the host's ZooKeeper, `hydra-db`, Daruk, Sidon, Hylia and spark-daemon up and stops
+the rest (see [maintenance.md](./maintenance.md)); it is nevertheless refused when the remaining
+ScyllaDB replicas could not form a quorum without this host, because a host in maintenance is the one that
+gets rebooted and upgraded, and a rolling upgrade restarts its `hydra-db` — derived
 from the keyspace's actual replication factor and the actual ring, not assumed. Only one
 host may transition at a time, enforced by a single-row lock in `hydra.cluster_locks` with
 a holder token and a TTL rather than by a scan of node rows. A single-node cluster can

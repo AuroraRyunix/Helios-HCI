@@ -639,9 +639,9 @@ CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
 # started before convergence can begin and stopped after it has finished. `spark-daemon`
 # is absent for a similar reason -- it is the process running this loop.
 MANAGED_SERVICES = (
-    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042},
-    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043},
-    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True},
+    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042, "maintenance": "keep"},
+    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043, "maintenance": "keep"},
+    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True, "maintenance": "keep"},
     {"unit": "spectrum", "display": "Spectrum", "requires": ("daruk",)},
     # The Phoenix console, on 8444 behind Slate. Slate's console backend points here, and
     # Bifrost's health guard will not bind the VIP while that backend is down, so a cluster
@@ -664,9 +664,43 @@ MANAGED_SERVICES = (
     {"unit": "mipha", "display": "Mipha", "requires": ("daruk",)},
     {"unit": "gatoway", "display": "Gatoway", "requires": ("daruk",)},
     {"unit": "urbosa", "display": "Urbosa", "requires": ("daruk",), "setting": "urbosa_enabled"},
-    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",)},
+    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",), "maintenance": "keep"},
 )
 MANAGED_SERVICE_ORDER = [entry["unit"] for entry in MANAGED_SERVICES]
+
+# What a host in maintenance keeps running, and why (docs/maintenance.md). Maintenance moves the
+# guests off a host and silences everything that places, serves or acts on guests; it does not
+# take the host out of the metadata and storage planes, because the cluster's own margins are
+# built from them:
+#
+#   * ZooKeeper is a voter in the ensemble that holds the desired state and every election;
+#   * HydraDB is a replica of the metadata, and Daruk is the only way anything on the host (the
+#     leave sequence included) reaches it;
+#   * Sidon holds replicas of other hosts' vdisks -- stopping it degrades every vdisk with a copy
+#     here and gains nothing when the point is to empty the host of guests;
+#   * Hylia is the rolling upgrade's orchestrator, and an upgrade is what puts a host in
+#     maintenance in the first place, so stopping it would stop the operation that asked;
+#   * spark-daemon is the agent that is told to leave.
+#
+# The rows above carry `"maintenance": "keep"` for the managed ones; ZooKeeper and spark-daemon are
+# not in the table (they are not converged by the loop) and are named here.
+MAINTENANCE_UNMANAGED_KEPT = ("zookeeper", "spark-daemon")
+
+
+def maintenance_kept_units():
+    """Managed units that stay up in maintenance, in start order."""
+    return [e["unit"] for e in MANAGED_SERVICES if e.get("maintenance") == "keep"]
+
+
+def maintenance_stopped_units():
+    """Managed units that are stopped in maintenance, in table (start) order."""
+    return [e["unit"] for e in MANAGED_SERVICES if e.get("maintenance") != "keep"]
+
+
+def maintenance_watchdog_units():
+    """What the maintenance watchdog restarts if it dies, in start order."""
+    return ["zookeeper"] + maintenance_kept_units()
+
 
 # Cluster settings that gate a declared service, and how to read them.
 SERVICE_SETTING_PROBES = {"urbosa_enabled": "check_urbosa_enabled"}
@@ -1518,6 +1552,10 @@ def build_node_status():
                                   result=results.get(svc, ""),
                                   converging=converging)
 
+    # Published on every row so the CLI can say a unit is up on purpose (docs/maintenance.md)
+    # without carrying a copy of the rule that could drift from this one.
+    kept_in_maintenance = set(maintenance_kept_units()) | set(MAINTENANCE_UNMANAGED_KEPT)
+
     for svc in services:
         n_restarts = restarts.get(svc, 0)
         if services_active[svc]:
@@ -1529,14 +1567,16 @@ def build_node_status():
                 "status": "FLAPPING" if flapping else "UP",
                 "pids": svc_pids,
                 "restarts": n_restarts,
-                "last_error": service_error(svc, True)
+                "last_error": service_error(svc, True),
+                "kept_in_maintenance": svc in kept_in_maintenance
             }
         else:
             result["services"][svc_map[svc]] = {
                 "status": "DOWN",
                 "pids": [],
                 "restarts": n_restarts,
-                "last_error": service_error(svc, False)
+                "last_error": service_error(svc, False),
+                "kept_in_maintenance": svc in kept_in_maintenance
             }
 
     # This node's own answer to "are you done?", for a caller to loop on instead of
@@ -4986,11 +5026,14 @@ def check_cluster_and_autostart():
         
     if os.path.exists("/etc/hci/maintenance.state"):
         print("[AUTOSTART] Host is in maintenance mode. Ensuring compute workloads are stopped while consensus/DB workloads start...")
-        services_to_stop = ["rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "sidon", "agahnim", "slate"]
-        for svc in services_to_stop:
+        # The lists come from the declared table's `maintenance` column (see
+        # maintenance_kept_units), so what a rebooted host in maintenance runs is what a host
+        # that was just put there runs. It used to stop sidon here and its watchdog restarted
+        # it, and to start hydra-db without daruk or hylia.
+        for svc in maintenance_stopped_units():
             subprocess.run(f"systemctl stop {svc}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        subprocess.run("systemctl start zookeeper", shell=True)
-        subprocess.run("systemctl start hydra-db", shell=True)
+        for svc in maintenance_watchdog_units():
+            subprocess.run(f"systemctl start {svc}", shell=True)
         
         # Start periodic watchdog loop directly to keep database/storage running during maintenance
         print("[WATCHDOG] Starting service health watchdog in maintenance mode...")
@@ -5002,7 +5045,7 @@ def check_cluster_and_autostart():
                 if not os.path.exists("/etc/hci/maintenance.state"):
                     print("[WATCHDOG] Host left maintenance mode. Exiting maintenance watchdog loop to resume normal checks.")
                     break
-                for svc in ["zookeeper", "hydra-db", "sidon"]:
+                for svc in maintenance_watchdog_units():
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()
                     if status_str not in ["active", "activating"]:
@@ -5092,7 +5135,7 @@ def check_cluster_and_autostart():
             if not os.path.exists("/etc/hci/cluster.json"):
                 continue
             if os.path.exists("/etc/hci/maintenance.state"):
-                for svc in ["zookeeper", "hydra-db", "sidon"]:
+                for svc in maintenance_watchdog_units():
                     res = subprocess.run(f"systemctl is-active {svc}", shell=True, stdout=subprocess.PIPE)
                     status_str = res.stdout.decode().strip()
                     if status_str not in ["active", "activating"]:
