@@ -1310,7 +1310,10 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         try:
             rc, _, _ = run_remote_spark(host_ip, "test -e /dev/kvm")
             has_kvm = (rc == 0)
-            KVM_CACHE[host_ip] = has_kvm
+            # run_remote_spark reports a transport failure as rc -1, not by raising. Caching that
+            # as "no KVM" defined every later domain as plain qemu until Vali restarted.
+            if rc >= 0:
+                KVM_CACHE[host_ip] = has_kvm
         except Exception:
             pass
 
@@ -1321,7 +1324,8 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         try:
             rc, stdout, _ = run_remote_spark(host_ip, "systemd-detect-virt")
             is_vmware = (rc == 0 and "vmware" in stdout.strip().lower())
-            VMWARE_CACHE[host_ip] = is_vmware
+            if rc >= 0:
+                VMWARE_CACHE[host_ip] = is_vmware
         except Exception:
             pass
 
@@ -1839,7 +1843,13 @@ def process_queue_task(task):
             backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=True)
             q_vm = shlex.quote(vm_name)
             cmd = f"virsh -c qemu:///system destroy {q_vm} || true && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true && {backup_cmd}"
-            run_remote_spark(host_ip, cmd)
+            rc_stop, _out_stop, err_stop = run_remote_spark(host_ip, cmd)
+            if rc_stop == -1:
+                # The host did not answer, so nothing is known about the guest. Releasing the
+                # placement now would let the next start attach and fence its disks while qemu
+                # may still be writing to them.
+                return False, (f"{vm_name} could not be stopped: {host_ip} did not answer "
+                               f"({err_stop}). The placement was left as it is.")
 
             # Releasing the placement is what lets the VM be started somewhere else, so it
             # is conditional on this task still being the one that owns it. An
@@ -1907,7 +1917,7 @@ def process_queue_task(task):
                 return False, f"Target host {target_host} cannot take guests: {why_not}"
 
             # Memory availability check on target host
-            memory_needed = int(vm_data.get("ram", 1024))
+            memory_needed = int(vm_data.get("memory") or 1024)
             _, _, total_mb, used_mb = get_node_utilization(target_ip, fetch_cpu=False)
             avail_mb = total_mb - used_mb
             if avail_mb < memory_needed:

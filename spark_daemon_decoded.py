@@ -1513,11 +1513,11 @@ def build_node_status():
         res_nr = subprocess.run(
             "systemctl show -p NRestarts --value " + " ".join(services),
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        nr_lines = res_nr.stdout.decode().splitlines()
-        for idx, svc in enumerate(services):
-            if idx < len(nr_lines):
+        nr_values = show_values_by_unit(res_nr.stdout.decode(), services)
+        for svc in services:
+            if svc in nr_values:
                 try:
-                    restarts[svc] = int(nr_lines[idx].strip() or 0)
+                    restarts[svc] = int(nr_values[svc] or 0)
                 except ValueError:
                     restarts[svc] = 0
     except Exception:
@@ -1535,10 +1535,7 @@ def build_node_status():
         res_rs = subprocess.run(
             "systemctl show -p Result --value " + " ".join(services),
             shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        rs_lines = res_rs.stdout.decode().splitlines()
-        for idx, svc in enumerate(services):
-            if idx < len(rs_lines):
-                results[svc] = rs_lines[idx].strip()
+        results.update(show_values_by_unit(res_rs.stdout.decode(), services))
     except Exception:
         pass
 
@@ -2460,6 +2457,20 @@ def parse_ip_addr_json(text):
                 "scope": addr.get("scope"),
             })
     return addresses
+
+
+def show_values_by_unit(text, units):
+    """{unit: value} from `systemctl show -p <Property> --value u1 u2 ...`.
+
+    systemd prints one block per unit with a blank line between blocks, so reading line N as
+    unit N put a restart count or a failure reason on the wrong service's row as soon as there
+    was more than one unit. Blank lines are dropped, and when the number of values is not the
+    number of units nothing is attributed at all: no answer is better than another unit's.
+    """
+    values = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(values) != len(units):
+        return {}
+    return dict(zip(units, values))
 
 
 def parse_systemctl_show(text):
@@ -5342,20 +5353,30 @@ def check_cluster_and_autostart():
             break
         time.sleep(2)
             
-    # 3. Quorum established! Now query ZooKeeper for cluster state
-    cluster_state = "stopped"
+    # 3. Quorum established? Now query ZooKeeper for cluster state.
+    #
+    # "unknown" is its own answer and nothing is stopped on it. This used to default to "stopped",
+    # so a restart of this daemon during a ZooKeeper outage or election (every rollout restarts
+    # it) stopped Sidon and drained the node's vdisks out from under running guests. The
+    # reconcile loop already treats an unreadable desired state as "change nothing"; so does this.
+    cluster_state = "unknown"
     if quorum_established:
         try:
-            res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state", 
+            res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state",
                                        shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             out_state = res_state.stdout.decode("utf-8", errors="ignore")
             if "started" in out_state:
                 cluster_state = "started"
+            elif "stopped" in out_state:
+                cluster_state = "stopped"
         except Exception as e:
             print(f"[AUTOSTART] Error querying cluster state from ZooKeeper: {e}")
 
-    if cluster_state == "stopped":
-        print("[AUTOSTART] Cluster state is 'stopped' or uninitialized. Ensuring database, storage, and UI workloads are stopped...")
+    if cluster_state == "unknown":
+        print("[AUTOSTART] The desired cluster state could not be read, so nothing is started or "
+              "stopped now; the reconcile loop acts when it can.")
+    elif cluster_state == "stopped":
+        print("[AUTOSTART] Cluster state is 'stopped'. Ensuring database, storage, and UI workloads are stopped...")
         converge_to_desired_state("stopped", full=True)
     else:
         # Through the declared inventory, in dependency order and with its readiness gates, and
@@ -5372,7 +5393,7 @@ def check_cluster_and_autostart():
             if success:
                 break
             time.sleep(1)
-            
+
     print("[AUTOSTART] Autostart completed successfully.")
     
     # Start periodic watchdog loop

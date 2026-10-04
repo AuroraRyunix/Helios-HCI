@@ -982,7 +982,7 @@ def hylia_rolling_upgrade(job_id):
                         rc_s, res_s, err_s = run_mtls_spark_api(node_ip, "/api/v1/node/status", None, method="GET")
                         if rc_s == 0:
                             services = res_s.get("services", {})
-                            critical_services = ["ZooKeeper", "HydraDB", "Aether", "Spark"]
+                            critical_services = ["ZooKeeper", "HydraDB", "Sidon", "Spark"]
                             all_up = True
                             down_services = []
                             for svc in critical_services:

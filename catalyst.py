@@ -582,12 +582,18 @@ class CatalystAPIHandler(BaseHTTPRequestHandler):
             payload_str = json.dumps(task_payload)
             component = component or service or DEFAULT_COMPONENT
 
-            run_cql_query(schema_module().task_insert_statement(
+            rc_insert, _out_insert, err_insert = run_cql_query(schema_module().task_insert_statement(
                 task_id, service, action, payload_str, now_ms,
                 component=component,
                 task_type=task_type,
                 sequence_id=next_sequence_id(component),
                 parent_task_id=parent_task_id))
+            if rc_insert != 0:
+                # No row means no task anywhere: on a node without the queues nothing would ever
+                # replay it, so "pending" with an id would be a promise nobody can keep.
+                self.send_json(500, {"error": "the task could not be recorded: %s"
+                                              % ((err_insert or "database error").strip()[:200])})
+                return
 
             # The row is written before anything is queued, and on every node whether or not
             # it holds the dispatch candidacy. A submission that reached the wrong Catalyst

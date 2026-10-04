@@ -283,5 +283,83 @@ class LogosCountsEachByteOnce(unittest.TestCase):
         self.assertEqual(logos.get_net_stats(proc, os.path.join(root, "absent")), (5, 7))
 
 
+class TheQueryLayerDoesNotSayAStatementTwice(unittest.TestCase):
+    def setUp(self):
+        import io
+        import json
+        import socket
+        import urllib.error
+        import urllib.request
+        self.cql = load("helios_cql.py", "cql_h")
+        self.fallbacks = []
+        self.cql._cqlsh_fallback = lambda q: self.fallbacks.append(q) or (0, "fallback", "")
+        self.errors = (io, json, socket, urllib.error)
+        self.urlopen = urllib.request.urlopen
+        self.addCleanup(setattr, urllib.request, "urlopen", self.urlopen)
+
+    def raising(self, exc):
+        import urllib.request
+
+        def fake(*a, **k):
+            raise exc
+        urllib.request.urlopen = fake
+
+    def test_a_database_refusal_is_returned_and_not_retried_through_cqlsh(self):
+        io, json, socket, urlerr = self.errors
+        self.raising(urlerr.HTTPError("u", 400, "Bad", {}, io.BytesIO(json.dumps({"error": "Unavailable"}).encode())))
+        rc, out, err = self.cql.run_cql_query("UPDATE hydra.t SET a = 1 WHERE b = 2;")
+        self.assertEqual((rc, err), (1, "Unavailable"))
+        self.assertEqual(self.fallbacks, [])
+
+    def test_a_timeout_after_the_request_was_sent_is_not_retried(self):
+        io, json, socket, urlerr = self.errors
+        self.raising(socket.timeout("timed out"))
+        rc, out, err = self.cql.run_cql_query("INSERT INTO hydra.t (a) VALUES (1);")
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.fallbacks, [])
+
+    def test_a_daruk_that_is_not_there_still_falls_back(self):
+        io, json, socket, urlerr = self.errors
+        self.raising(urlerr.URLError(ConnectionRefusedError(111, "refused")))
+        rc, out, err = self.cql.run_cql_query("SELECT now() FROM system.local;")
+        self.assertEqual((rc, out), (0, "fallback"))
+        self.assertEqual(len(self.fallbacks), 1)
+
+
+class SystemctlShowValuesAreAttributedToTheRightUnit(unittest.TestCase):
+    def test_blank_separated_blocks(self):
+        daemon = load("spark_daemon_decoded.py", "spark_show")
+        out = "0\n\n3\n\n0\n"
+        self.assertEqual(daemon.show_values_by_unit(out, ["a", "b", "c"]), {"a": "0", "b": "3", "c": "0"})
+
+    def test_a_count_that_does_not_match_attributes_nothing(self):
+        daemon = load("spark_daemon_decoded.py", "spark_show2")
+        self.assertEqual(daemon.show_values_by_unit("0\n\n3\n", ["a", "b", "c"]), {})
+        self.assertEqual(daemon.show_values_by_unit("", ["a"]), {})
+
+    def test_the_status_publisher_uses_it_for_restarts_and_results(self):
+        src = read("spark_daemon_decoded.py")
+        self.assertEqual(src.count("show_values_by_unit("), 3)  # the definition and two uses
+
+
+class AnUnknownDesiredStateStopsNothingAtBoot(unittest.TestCase):
+    def test_autostart_has_an_unknown_state_that_changes_nothing(self):
+        src = read("spark_daemon_decoded.py")
+        body = src[src.index("def check_cluster_and_autostart"):src.index("Autostart completed successfully")]
+        self.assertIn('cluster_state = "unknown"', body)
+        self.assertNotIn('cluster_state = "stopped"\n    if quorum_established', body)
+        self.assertLess(body.index('if cluster_state == "unknown":'),
+                        body.index('converge_to_desired_state("stopped", full=True)\n    else:'))
+
+
+class SidonKeepsRunningInMaintenance(unittest.TestCase):
+    def test_its_unit_has_no_maintenance_condition(self):
+        src = read("provision.py")
+        unit = src[src.index("Description=Sidon DFS Data Path Daemon"):]
+        unit = unit[:unit.index("[Service]")]
+        self.assertNotIn("ConditionPathExists=!/etc/hci/maintenance.state", unit)
+        self.assertIn("ConditionPathExists=/etc/hci/cluster.json", unit)
+
+
 if __name__ == "__main__":
     unittest.main()

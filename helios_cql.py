@@ -177,6 +177,20 @@ def run_conditional_cql_query(cql_query, *args, **kwargs):
         if body.get("status") == "success":
             return 0, "\n".join(_render_rows(body.get("rows", []))), ""
         return 1, "", body.get("error", "Database query execution error")
+    except urllib.error.HTTPError as exc:
+        # Daruk answered, with a 400 whose body is the database's own refusal. That is an answer,
+        # not an outage: re-running the statement through cqlsh would execute a statement Daruk
+        # deliberately did not retry (it refuses to retry a failed write at a weaker consistency
+        # level), and a lock INSERT that timed out would read as a lost race.
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error")
+        except Exception:
+            detail = None
+        return 1, "", detail or "Daruk refused the statement (HTTP %s)" % exc.code
+    except (socket.timeout, TimeoutError) as exc:
+        # The request was delivered and may have been applied; it is not safe to say it again
+        # through another door.
+        return 1, "", "Daruk did not answer within %ds: %s" % (QUERY_TIMEOUT_S, exc)
     except Exception:
         return _cqlsh_fallback(cql_query)
 
