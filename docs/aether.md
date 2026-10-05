@@ -1,18 +1,15 @@
-# Aether (Distributed Storage I/O Engine - Linstor/DRBD)
+# [DEPRECATED / ARCHIVED] Aether (Legacy Linstor/DRBD Substrate)
 
-> [!NOTE]
-> **This describes a storage layer that has been removed.** Aether — Linstor and
-> DRBD — was replaced by [Sidon](./sidon.md). No code in this tree speaks to it:
-> provisioning does not install `drbd9x-utils` or `kmod-drbd9x`, does not write the
-> satellite or controller Quadlets, and removes both from nodes upgraded from a
-> DRBD cluster.
+> [!CAUTION]
+> **THIS COMPONENT HAS BEEN PERMANENTLY RETIRED AND REMOVED FROM HELIOS-HCI.**
+> 
+> The legacy storage layer (Aether, built on Linstor and DRBD9) has been completely replaced by **[Sidon](./sidon.md)**.
+> For the authoritative implementation, architecture, and protocols of the active distributed storage engine, see:
+> - **[Sidon Operator Overview](./sidon.md)**
+> - **[Helios DFS Technical Guide](./dfs/technical_guide.md)**
+> - **[DFS Architecture & Invariants](./dfs/README.md)**
 >
-> It is kept because the reasoning is still worth having. The 191-volume ceiling,
-> the dual-primary hazard, the fencing that could only *infer* that a dead host had
-> stopped writing — those are the problems Sidon was built to solve, and a design
-> whose predecessor's failures are forgotten gets to repeat them.
-
-Aether is the cluster storage controller and block path manager. It is the direct equivalent of Nutanix **Stargate**.
+> No active codebase components use Linstor or DRBD: provisioning does not install `drbd9x-utils` or `kmod-drbd9x`, and Secure Boot is fully supported. This document is retained solely as an architectural archive to record why device-level synchronous replication (the 191-volume ceiling, dual-primary hazards, static placement) was abandoned.
 
 > [!WARNING]
 > **Secure Boot Requirement:** 

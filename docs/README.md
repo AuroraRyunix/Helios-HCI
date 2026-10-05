@@ -95,9 +95,10 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/protection_domains.md](./dfs/protection_domains.md) | Protection domains: VMs and vdisks snapshotted together under one policy, the crash-consistency story (and what it is not), set retention and restore, and the interface for the Rauru daemon. |
 | [dfs/replication.md](./dfs/replication.md) | Replicating snapshot sets to another site: how sites trust each other, what is shipped and verified, how a transfer resumes and never shows half a snapshot, failure modes. Designed; the data plane is built and tested only against a local simulation of a second site. |
 | [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
+| [dfs/technical_guide.md](./dfs/technical_guide.md) | Comprehensive technical deep dive: storage architecture, NBD Unix sockets, write-all journal replication, group commit, epoch fencing, live migration handover, and Purah curation. |
 | [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |
 
-Status: **designed, not building** — implementation begins with the harness, not the filesystem.
+Status: **Built and running** — Sidon, Purah, and Ganon are fully implemented in Rust and production-tested across the cluster.
 
 ## Audit / Backlog
 

@@ -86,31 +86,32 @@ property of the data path itself (see [ownership.md](./ownership.md)).
 
 **Sidon, Purah and Ganon are settled** — these are the names, they are what the code will be called, and later documents may use them without hedging. Three further questions:
 
-- *Aether keeps its name and its meaning.* It is the Linstor/DRBD substrate, and it is not renamed into this. The two run side by side through the migration and Aether stays afterwards for anything that chooses it, exactly as the GlusterFS-to-Aether transition went. Reusing the name would have made every sentence in every older document ambiguous about which storage layer it meant.
-- *The volume group stays `vg_aether`.* Both substrates carve from the same thin pool, so the name is now historical rather than descriptive. Renaming a VG under live data to fix a naming aesthetic is not a trade worth making; the capacity consequence is real and is handled in [architecture.md](./architecture.md) §4.
-- *The CLI has no name yet.* The pattern is `valcli` / `mcli` / `catcli`, and none of the obvious derivations are good. It is not needed until milestone 7, so it is left blank rather than filled in badly — an unnamed slot is honest; a placeholder that leaks into code is not.
+- *Aether is retired.* Aether refers strictly to the legacy Linstor/DRBD substrate. It has been completely decommissioned and removed from the tree. All storage workloads are served natively by Sidon.
+- *The volume group name `vg_aether`* remains on upgraded nodes where the physical LVM pool was originally created under that name, housing the thin pool for Sidon.
+- *The CLI interface:* Sidon management and diagnostics are exposed via `valcli storage.*` (e.g., `valcli storage.list`, `valcli storage.status`, `valcli storage.tier`, `valcli storage.compact`).
 
 ## Read these in order
 
-1. [architecture.md](./architecture.md) — the shape, the data model, what is deliberately out.
-2. [invariants.md](./invariants.md) — the contract. Everything else exists to satisfy this file.
-3. [data-path.md](./data-path.md) — journal, drain, extent store, checksums, GC.
-4. [ownership.md](./ownership.md) — leases, epochs, fencing, live migration.
-5. [metadata.md](./metadata.md) — schema, Daruk endpoints, exactly-once drain, load arithmetic.
-6. [ganon.md](./ganon.md) — the harness, and why it runs against DRBD first.
-7. [milestones.md](./milestones.md) — build order, gates, and what each step is worth if abandoned.
-8. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
-9. [multi_disk.md](./multi_disk.md) — using more than one disk per node, why pooling
+1. [technical_guide.md](./technical_guide.md) — The comprehensive end-to-end technical guide to the Sidon distributed storage engine.
+2. [architecture.md](./architecture.md) — the shape, the data model, what is deliberately out.
+3. [invariants.md](./invariants.md) — the contract. Everything else exists to satisfy this file.
+4. [data-path.md](./data-path.md) — journal, drain, extent store, checksums, GC.
+5. [ownership.md](./ownership.md) — leases, epochs, fencing, live migration.
+6. [metadata.md](./metadata.md) — schema, Daruk endpoints, exactly-once drain, load arithmetic.
+7. [ganon.md](./ganon.md) — the harness, and why it runs against DRBD first.
+8. [milestones.md](./milestones.md) — build order, gates, and what each step is worth if abandoned.
+9. [decisions.md](./decisions.md) — the ADR list: every choice, its alternatives, and why.
+10. [multi_disk.md](./multi_disk.md) — using more than one disk per node, why pooling
    them into one volume group is the wrong answer, and how sidon mounts them itself (D-27).
-10. [snapshots.md](./snapshots.md) — scheduled snapshots, retention that never prunes what
+11. [snapshots.md](./snapshots.md) — scheduled snapshots, retention that never prunes what
     something depends on, and rollback of a detached vdisk.
-11. [rollback_attached.md](./rollback_attached.md) — the ownership and epoch reasoning for
+12. [rollback_attached.md](./rollback_attached.md) — the ownership and epoch reasoning for
     rolling back a vdisk a guest is reading. A design; nothing in it is built.
-12. [protection_domains.md](./protection_domains.md) — groups of VMs and vdisks snapshotted
+13. [protection_domains.md](./protection_domains.md) — groups of VMs and vdisks snapshotted
     together: the consistency story, set retention, restore.
-13. [replication.md](./replication.md) — replicating snapshot sets to another site: trust,
+14. [replication.md](./replication.md) — replicating snapshot sets to another site: trust,
     what is shipped and verified, resume, failure modes. A design with a simulated data plane.
-14. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
+15. [vhost_user_blk.md](./vhost_user_blk.md) — what NBD costs per request, what
     `vhost-user-blk` would and would not remove, the invariants it endangers, and the
     benchmark that decides whether to build it.
 15. [compaction.md](./compaction.md) — reclaiming dead extents inside sealed groups, the read-only
