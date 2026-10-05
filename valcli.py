@@ -3332,6 +3332,8 @@ def cmd_vm_create():
     network_id = ""
     disks = ["10G"]
     cpu_model = "host-passthrough"
+    graphics = "vnc"
+    audio_enabled = False
     
     idx = 5
     while idx < len(sys.argv):
@@ -3354,6 +3356,12 @@ def cmd_vm_create():
         elif arg == "--cpu-model" and idx + 1 < len(sys.argv):
             cpu_model = sys.argv[idx+1]
             idx += 2
+        elif arg == "--graphics" and idx + 1 < len(sys.argv):
+            graphics = sys.argv[idx+1]
+            idx += 2
+        elif arg == "--audio" and idx + 1 < len(sys.argv):
+            audio_enabled = sys.argv[idx+1].lower() in ("true", "1", "yes", "on")
+            idx += 2
         else:
             print(f"Error: Unknown or malformed option '{arg}'")
             sys.exit(1)
@@ -3367,7 +3375,9 @@ def cmd_vm_create():
         "boot_device": boot_device,
         "network_id": network_id,
         "disks": disks,
-        "cpu_model": cpu_model
+        "cpu_model": cpu_model,
+        "graphics": graphics,
+        "audio_enabled": audio_enabled
     }
     
     print(f"Creating VM '{name}' ({vcpus} vCPUs, {memory}MB RAM)...")
@@ -3381,14 +3391,32 @@ def cmd_vm_create():
 def cmd_vm_delete():
     if len(sys.argv) < 3:
         print("Error: VM Name is required.")
-        print("Usage: valcli vm.delete <vm_name>")
+        print("Usage: valcli vm.delete <vm_name> [--force] [--keep-disks]")
         sys.exit(1)
         
     name = sys.argv[2]
-    print(f"Deleting VM '{name}'...")
-    rc, data = run_spectrum_api("/api/vms/delete", method="POST", payload={"name": name})
+    force = False
+    keep_disks = False
+    for arg in sys.argv[3:]:
+        if arg in ("--force", "-f"):
+            force = True
+        elif arg == "--keep-disks":
+            keep_disks = True
+        else:
+            print(f"Error: Unknown option '{arg}'")
+            print("Usage: valcli vm.delete <vm_name> [--force] [--keep-disks]")
+            sys.exit(1)
+
+    print(f"Deleting VM '{name}' (force={force}, keep_disks={keep_disks})...")
+    rc, data = run_spectrum_api("/api/vms/delete", method="POST", payload={
+        "name": name,
+        "force": force,
+        "keep_disks": keep_disks
+    })
     if rc == 0:
-        print(f"Success: {data.get('message', 'VM deletion task scheduled.')}")
+        print(f"Success: {data.get('message', 'VM deletion completed.')}")
+        if data.get("detail"):
+            print(f"Detail: {data['detail']}")
     else:
         print(f"Error deleting VM: {data}")
         sys.exit(1)
@@ -3437,6 +3465,12 @@ def cmd_vm_edit():
             idx += 2
         elif arg == "--cpu-model" and idx + 1 < len(sys.argv):
             payload["cpu_model"] = sys.argv[idx+1]
+            idx += 2
+        elif arg == "--graphics" and idx + 1 < len(sys.argv):
+            payload["graphics"] = sys.argv[idx+1]
+            idx += 2
+        elif arg == "--audio" and idx + 1 < len(sys.argv):
+            payload["audio_enabled"] = sys.argv[idx+1].lower() in ("true", "1", "yes", "on")
             idx += 2
         else:
             print(f"Error: Unknown or malformed option '{arg}'")
@@ -3584,7 +3618,7 @@ def print_usage():
     print("Usage:")
     print("  valcli vm.list                     List all virtual machines in the cluster")
     print("  valcli vm.create <name> <vc> <mem> Create a new VM configuration and disks")
-    print("  valcli vm.delete <name>            Delete VM configuration and its disks")
+    print("  valcli vm.delete <name> [flags]    Delete VM configuration and its disks (--force, --keep-disks)")
     print("  valcli vm.edit <name> [options]    Modify VM CPU, memory, disks, network, or ISO")
     print("  valcli vm.live <name> <change>     Change a RUNNING VM: vCPUs, CD-ROM, NICs, disks (valcli vm.live for the list)")
     print("  valcli vm.on <vm_name>             Power ON a virtual machine")

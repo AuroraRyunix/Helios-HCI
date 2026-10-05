@@ -423,6 +423,8 @@ def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
     attempts = {ip: 0 for ip in expected_ips}
     waiting = set(expected_ips)
     last_line = None
+    if poll > 0:
+        time.sleep(poll)
     while time.time() < deadline:
         state = zk_read_cluster_state()
         if state is None:

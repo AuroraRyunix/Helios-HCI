@@ -94,18 +94,40 @@ defmodule SpectrumPhxWeb.CoreComponents do
       <.button phx-click="go" variant="primary">Send!</.button>
       <.button navigate={~p"/"}>Home</.button>
   """
-  attr :rest, :global, include: ~w(href navigate patch method download name value disabled)
-  attr :class, :any
-  attr :variant, :string, values: ~w(primary)
+  attr :rest, :global, include: ~w(href navigate patch method download name value disabled type)
+  attr :class, :any, default: nil
+  attr :variant, :string, default: nil
+  attr :size, :string, default: nil
   slot :inner_block, required: true
 
   def button(%{rest: rest} = assigns) do
-    variants = %{"primary" => "btn-primary", nil => "btn-primary btn-soft"}
+    variants = %{
+      "primary" => "btn-primary text-white shadow-sm hover:shadow",
+      "secondary" => "btn-secondary text-base-content shadow-sm hover:shadow",
+      "danger" => "btn-error text-white shadow-sm hover:shadow",
+      "error" => "btn-error text-white shadow-sm hover:shadow",
+      "warning" => "btn-warning text-zinc-950 font-semibold shadow-sm hover:shadow",
+      "success" => "btn-success text-white shadow-sm hover:shadow",
+      "info" => "btn-info text-white shadow-sm hover:shadow",
+      "ghost" => "btn-ghost",
+      "outline" => "btn-outline",
+      "soft" => "btn-primary btn-soft",
+      nil => "btn-secondary text-base-content"
+    }
 
-    assigns =
-      assign_new(assigns, :class, fn ->
-        ["btn", Map.fetch!(variants, assigns[:variant])]
-      end)
+    variant_class = Map.get(variants, assigns[:variant], variants[nil])
+    size_class = if assigns[:size], do: "btn-#{assigns[:size]}", else: nil
+    custom_class = assigns[:class]
+
+    classes =
+      ["btn", variant_class, size_class, custom_class]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join(" ")
+      |> String.split()
+      |> Enum.uniq()
+      |> Enum.join(" ")
+
+    assigns = assign(assigns, :class, classes)
 
     if rest[:href] || rest[:navigate] || rest[:patch] do
       ~H"""

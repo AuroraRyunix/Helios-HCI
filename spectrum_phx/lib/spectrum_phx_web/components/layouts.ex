@@ -59,6 +59,11 @@ defmodule SpectrumPhxWeb.Layouts do
   @doc "The navigation entries still served by the Python console."
   def legacy_nav_items, do: Enum.filter(@nav, fn {_, _, _, tier} -> tier == :legacy end)
 
+  @doc "The label the section dropdown shows for the current page."
+  def active_label(active) do
+    Enum.find_value(@nav, "Home", fn {id, label, _, _} -> if id == active, do: label end)
+  end
+
   @doc """
   Renders the console layout: navigation, the signed-in operator, and the page itself.
 
@@ -95,27 +100,37 @@ defmodule SpectrumPhxWeb.Layouts do
         </.link>
       </div>
 
-      <nav class="flex-1 overflow-x-auto" aria-label="Console">
-        <ul class="menu menu-horizontal gap-1 flex-nowrap">
-          <li :for={{id, label, path, tier} <- nav_items()}>
-            <.link
-              :if={tier == :live}
-              navigate={path}
-              aria-current={if @active == id, do: "page"}
-              class={["font-medium whitespace-nowrap", @active == id && "menu-active"]}
-            >
-              {label}
-            </.link>
-            <.link
-              :if={tier == :legacy}
-              href={path}
-              aria-current={if @active == id, do: "page"}
-              class={["font-medium whitespace-nowrap", @active == id && "menu-active"]}
-            >
-              {label}
-            </.link>
-          </li>
-        </ul>
+      <%!-- Prism-style: one section switcher instead of fifteen links across the bar. --%>
+      <nav class="flex-1" aria-label="Console">
+        <div class="dropdown dropdown-bottom">
+          <div tabindex="0" role="button" class="btn btn-ghost btn-sm gap-2 font-semibold text-base">
+            {active_label(@active)}
+            <.icon name="hero-chevron-down-micro" class="size-4 opacity-70" />
+          </div>
+          <ul
+            tabindex="0"
+            class="dropdown-content menu z-50 mt-2 w-52 rounded-md bg-neutral text-neutral-content p-1 shadow-xl"
+          >
+            <li :for={{id, label, path, tier} <- nav_items()}>
+              <.link
+                :if={tier == :live}
+                navigate={path}
+                aria-current={if @active == id, do: "page"}
+                class={["py-1.5", @active == id && "menu-active"]}
+              >
+                {label}
+              </.link>
+              <.link
+                :if={tier == :legacy}
+                href={path}
+                aria-current={if @active == id, do: "page"}
+                class={["py-1.5", @active == id && "menu-active"]}
+              >
+                {label}
+              </.link>
+            </li>
+          </ul>
+        </div>
       </nav>
 
       <div class="flex-none flex items-center gap-2">

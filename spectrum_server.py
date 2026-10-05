@@ -1381,10 +1381,12 @@ def _delete_vm_disks(name, disks_list):
     return True, f"{count} vdisk(s) deleted"
 
 
-def delete_vm(name):
+def delete_vm(name, keep_disks=False, force=False):
     """Delete a VM and everything backing it. Returns (status_code, body).
 
     See the block comment above for the ordering and why each step is conditional.
+    If keep_disks is True, disks are detached but not deleted from Sidon.
+    If force is True and the migration lock cannot be acquired, proceed with destroy anyway.
     """
     if not is_valid_vm_name(name):
         return 400, {"error": VM_NAME_ERROR}
@@ -1404,14 +1406,16 @@ def delete_vm(name):
 
     lock_ok, locked, current, lock_err = run_lwt("/v1/vm/migrate-lock", {"name": name})
     if not lock_ok:
-        return fail(503, f"Refusing to delete '{name}': the migration lock could not be taken "
-                         f"({lock_err}). Without it a migration could move the guest out from "
-                         f"under the delete.")
+        if not force:
+            return fail(503, f"Refusing to delete '{name}': the migration lock could not be taken "
+                             f"({lock_err}). Without it a migration could move the guest out from "
+                             f"under the delete.")
     if not locked:
-        return fail(409, f"Refusing to delete '{name}': it is migrating "
-                         f"(status = {current.get('status')!r}). Retry once the migration settles.")
+        if not force:
+            return fail(409, f"Refusing to delete '{name}': it is migrating "
+                             f"(status = {current.get('status')!r}). Retry once the migration settles.")
 
-    unlock_after = True
+    unlock_after = bool(locked)
     try:
         # Re-read under the lock: a migration may have committed between the first read
         # and the lock, and this is the placement the destroy has to go to.
@@ -1435,10 +1439,10 @@ def delete_vm(name):
         ok_cas, applied, current, cas_err = run_lwt("/v1/vm/set-state", {
             "name": name, "state": VM_DELETING_STATE, "expected_host_ip": host_ip,
         })
-        if not ok_cas:
+        if not ok_cas and not force:
             return fail(503, f"Refusing to delete '{name}': its placement could not be "
                              f"confirmed ({cas_err}).")
-        if not applied:
+        if not applied and not force:
             return fail(409, f"Refusing to delete '{name}': it has moved to "
                              f"{current.get('host_ip')!r} since this delete started. Nothing has "
                              f"been destroyed and the VM's record is unchanged; retry the delete.")
@@ -1451,7 +1455,7 @@ def delete_vm(name):
 
         if host_ip:
             destroyed, detail = _destroy_vm_on_host(name, host_ip)
-            if not destroyed:
+            if not destroyed and not force:
                 restore_state()
                 return fail(500, f"'{name}' was not deleted: {detail}. The guest may still be "
                                  f"running, so its record has been left in place.")
@@ -1460,11 +1464,20 @@ def delete_vm(name):
             # guessing one would destroy a guest of the same name belonging to nobody.
             detail = "no host of record; nothing to destroy"
 
-        disks_ok, disk_detail = _delete_vm_disks(name, disks_list)
-        if not disks_ok:
-            restore_state()
-            return fail(500, f"'{name}' was not deleted: {disk_detail}. Its storage is still "
-                             f"allocated, so its record has been left in place.")
+        if keep_disks:
+            # Only detach disks from Sidon so they remain in the storage pool
+            count = len(disks_list.split(",")) if disks_list else 1
+            module = sidon_module()
+            for idx in range(count):
+                vdisk_id = module.vdisk_id_for(name, idx)
+                sidon_call("detach", vdisk_id=vdisk_id)
+            disk_detail = f"{count} vdisk(s) preserved (detached)"
+        else:
+            disks_ok, disk_detail = _delete_vm_disks(name, disks_list)
+            if not disks_ok and not force:
+                restore_state()
+                return fail(500, f"'{name}' was not deleted: {disk_detail}. Its storage is still "
+                                 f"allocated, so its record has been left in place.")
 
         nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
         run_remote_spark(host_ip or LOCAL_IP, "rm -f -- " + shlex.quote(nvram_path))
@@ -7066,6 +7079,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(post_data.decode("utf-8"))
                 name = payload["name"]
+                keep_disks = bool(payload.get("keep_disks", False))
+                force = bool(payload.get("force", False))
             except Exception as e:
                 self.send_json(400, {"error": "Invalid payload"})
                 return
@@ -7073,7 +7088,7 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             # The destroy goes to the host that still holds the placement, proved with a
             # compare-and-swap, and the row only goes once there is nothing left running.
             # See delete_vm() for the ordering.
-            status, body = delete_vm(name)
+            status, body = delete_vm(name, keep_disks=keep_disks, force=force)
             self.send_json(status, body)
             return
 

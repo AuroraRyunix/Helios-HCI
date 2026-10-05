@@ -109,7 +109,7 @@ defmodule SpectrumPhxWeb.Vms.IndexLiveTest do
       html = view |> element("#start-db\\.prod") |> render_click()
 
       assert_received {:task, "vali", "start", %{"vm_name" => "db.prod"}}
-      assert html =~ "Start requested for db.prod"
+      refute html =~ "rejected"
     end
 
     test "stopping a running VM submits a stop task", %{conn: conn} do
@@ -118,7 +118,7 @@ defmodule SpectrumPhxWeb.Vms.IndexLiveTest do
       html = view |> element("#stop-web-01") |> render_click()
 
       assert_received {:task, "vali", "stop", %{"vm_name" => "web-01"}}
-      assert html =~ "Stop requested for web-01"
+      refute html =~ "rejected"
     end
 
     test "rebooting a running VM submits a reboot task", %{conn: conn} do

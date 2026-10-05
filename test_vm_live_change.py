@@ -133,6 +133,24 @@ class CdRom(unittest.TestCase):
             self.assertIsNone(plan({"op": "cdrom", "target": target, "image_vdisk_id": "img-x"})[0], target)
         self.assertIn("Invalid image", plan({"op": "cdrom", "target": "sda", "image_vdisk_id": "a b"})[1])
 
+    def test_a_missing_drive_is_attached_on_scsi_not_updated(self):
+        """update-device on an absent target fails with "target sda doesn't exist"."""
+        info = dict(RUNNING, block_buses={"vda": "virtio"})
+        steps, error = plan({"op": "cdrom", "target": "sda", "image_vdisk_id": "img-x"}, info)
+        self.assertIsNone(error)
+        self.assertIn("attach-device", steps[0]["argv"])
+        self.assertEqual(ET.fromstring(steps[0]["xml"]).find("target").get("bus"), "scsi")
+
+    def test_an_existing_drive_keeps_its_bus(self):
+        info = dict(RUNNING, block_buses={"vda": "virtio", "sda": "sata"})
+        steps, _ = plan({"op": "cdrom", "target": "sda", "image_vdisk_id": "img-x"}, info)
+        self.assertIn("update-device", steps[0]["argv"])
+        self.assertEqual(ET.fromstring(steps[0]["xml"]).find("target").get("bus"), "sata")
+
+    def test_ejecting_a_missing_drive_is_a_no_op(self):
+        info = dict(RUNNING, block_buses={"vda": "virtio"})
+        self.assertEqual(plan({"op": "cdrom", "target": "sda", "image_vdisk_id": None}, info), ([], None))
+
 
 class Nic(unittest.TestCase):
     MAC = "52:54:00:aa:bb:cc"
@@ -244,10 +262,13 @@ class RunningAStep(unittest.TestCase):
         outputs = {
             "dominfo": "Id: 3\nName: web-01\nState: running\nCPU(s): 2\nMax memory: 8388608 KiB\nUsed memory: 2097152 KiB\n",
             "vcpucount": "8\n",
+            "dumpxml": "<domain><devices><disk><target dev='vda' bus='virtio'/></disk>"
+                       "<disk device='cdrom'><target dev='sda' bus='sata'/></disk></devices></domain>",
         }
         daemon.run_argv = lambda argv, timeout=45: (0, outputs[argv[3]], "")
         info = daemon.read_live_domain_info("web-01")
-        self.assertEqual(info, {"state": "running", "vcpu_current": 2, "vcpu_max": 8, "mem_max_kib": 8388608})
+        self.assertEqual(info, {"state": "running", "vcpu_current": 2, "vcpu_max": 8, "mem_max_kib": 8388608,
+                                "block_buses": {"vda": "virtio", "sda": "sata"}})
 
     def test_an_absent_domain_is_none(self):
         daemon.run_argv = lambda argv, timeout=45: (1, "", "error: failed to get domain")

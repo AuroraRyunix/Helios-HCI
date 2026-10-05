@@ -543,7 +543,8 @@ class TheNvramBackupDeletesTheLocalCopyOnlyAfterItIsSaved(unittest.TestCase):
         path = os.path.join(directory, "vm1_vars.fd")
         with open(path, "wb") as handle:
             handle.write(b"x" * 100)
-        code = code.replace("/var/lib/hci/aether/nvram/{vm_name}_vars.fd", path.replace("vm1_vars.fd", "{vm_name}_vars.fd"))
+        target_template = path.replace("\\", "/").replace("vm1_vars.fd", "{vm_name}_vars.fd")
+        code = code.replace("/var/lib/hci/aether/nvram/{vm_name}_vars.fd", target_template)
         calls = []
 
         class Resp(object):
@@ -611,6 +612,9 @@ class TheSettingsSaveReallyUpdatesClusterJson(unittest.TestCase):
         scope = {"updates_b64": updates_b64}
         exec(block.replace("rc_json", "_"), scope)
         command = scope["update_json_cmd"].replace("/etc/hci/cluster.json", path)
+        import shutil
+        if not shutil.which("bash"):
+            self.skipTest("bash is not installed on this system")
         done = subprocess.run(["bash", "-c", command], capture_output=True, stdin=subprocess.DEVNULL)
         self.assertEqual(done.returncode, 0, done.stderr)
         merged = json.load(open(path))

@@ -1045,12 +1045,19 @@ def _converge_locked(desired, full=False):
     states = unit_active_states(order)
     targets = []
     for svc in order:
-        # A disabled service is not drift. It is declared, reported, and left alone.
-        if service_is_disabled(svc):
-            errors.pop(svc, None)
-            continue
         state = states.get(svc, "")
         is_active = state == "active"
+        # A disabled service is not drift to be started, but if it is running when
+        # disabled or when the cluster is stopped, it must be stopped so it does not
+        # hold its requirements.
+        if service_is_disabled(svc):
+            errors.pop(svc, None)
+            if not running and is_active:
+                targets.append(svc)
+            elif running and is_active:
+                run_unit_commands("stop", [svc])
+                states[svc] = "inactive"
+            continue
         # "activating" and "deactivating" are both in-flight, not drift: the unit is
         # already on its way somewhere and the next poll sees where it landed.
         #
@@ -2060,16 +2067,25 @@ def plan_live_change(name, payload, info):
         if not isinstance(target, str) or not LIVE_CDROM_RE.match(target):
             return None, "target must be a CD-ROM drive such as sda"
         image = payload.get("image_vdisk_id")
+        # `block_buses` is {target: bus} from the live definition, or None if unread. A drive
+        # that does not exist cannot be updated ("target sda doesn't exist"): it is attached,
+        # on virtio-scsi, the one CD bus QEMU can hotplug. One that exists keeps its bus.
+        buses = info.get("block_buses")
+        present = buses is None or target in buses
+        bus = (buses or {}).get(target) or "scsi"
         if image in (None, ""):
+            if not present:
+                return [], None
             xml = ("<disk type='file' device='cdrom'><driver name='qemu' type='raw'/>"
-                   "<target dev='%s' bus='sata'/><readonly/></disk>" % target)
+                   "<target dev='%s' bus='%s'/><readonly/></disk>" % (target, bus))
             what = "eject the media from %s" % target
         else:
             if not valid_name(image):
                 return None, "Invalid image vdisk id"
-            xml = load_sidon_module().cdrom_xml(image, target[2])
+            xml = load_sidon_module().cdrom_xml(image, target[2], bus=bus)
             what = "put %s in %s" % (image, target)
-        return [{"argv": VIRSH + ["update-device", name, LIVE_XML_PATH, "--live", "--config"],
+        verb = "update-device" if present else "attach-device"
+        return [{"argv": VIRSH + [verb, name, LIVE_XML_PATH, "--live", "--config"],
                  "xml": xml, "what": what}], None
 
     if op == "nic":
@@ -2146,7 +2162,25 @@ def read_live_domain_info(name):
             result["vcpu_max"] = int(out.strip().split()[0])
         except (IndexError, ValueError):
             pass
+    rc, out, _ = run_argv(VIRSH + ["dumpxml", name], timeout=20)
+    if rc == 0:
+        result["block_buses"] = parse_domain_block_buses(out)
     return result
+
+
+def parse_domain_block_buses(xml_text):
+    """{target_dev: bus} for every <disk> in a domain definition, or None if unparseable."""
+    import xml.etree.ElementTree as _ET
+    try:
+        root = _ET.fromstring(xml_text)
+    except _ET.ParseError:
+        return None
+    buses = {}
+    for disk in root.iter("disk"):
+        tgt = disk.find("target")
+        if tgt is not None and tgt.get("dev"):
+            buses[tgt.get("dev")] = tgt.get("bus") or ""
+    return buses
 
 
 def run_live_step(step):

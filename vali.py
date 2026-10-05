@@ -2956,7 +2956,26 @@ def _live_nic(vm_name, vm, host, payload):
             return False, answer
         return True, (f"NIC {index + 1} of {vm_name} is {payload.get('state')}. The link state is not part of the "
                       "VM's record, so it is up again after the VM next starts.")
-    return False, "action must be attach, detach or link"
+    if action == "change":
+        net_id = str(payload.get("network_id") or "").strip()
+        model = payload.get("model") or (entries[index].split(":")[1] if ":" in entries[index] else "virtio")
+        bridge, why = network_bridge(get_network_by_id(net_id))
+        if not bridge:
+            return False, why
+        mac = vm_nic_mac(vm_name, index)
+        # libvirt cannot retarget an interface in place (and not at all for macvtap), so the
+        # same MAC is unplugged and plugged back on the new bridge: same adapter to the guest.
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": mac})
+        if not ok:
+            return False, answer
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "attach", "mac": mac,
+                                                      "bridge": bridge, "model": model})
+        if not ok:
+            return False, f"NIC {index + 1} was unplugged but could not be re-plugged on {bridge}: {answer}"
+        entries[index] = f"{net_id}:{model}"
+        done, err = _set_row(vm_name, network_id=json.dumps(entries))
+        return True, f"NIC {index + 1} of {vm_name} is now on {bridge}" + ("" if done else f" (live; its record could not be updated: {err})")
+    return False, "action must be attach, detach, link or change"
 
 
 def _live_disk(vm_name, vm, host, payload, module):

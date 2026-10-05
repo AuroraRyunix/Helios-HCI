@@ -53,15 +53,21 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
     {:noreply, act(socket, name, "Reboot requested for", fn -> Vms.reboot(name) end)}
   end
 
+  def handle_event("delete_vm", %{"name" => name} = params, socket) do
+    force = params["force"] == "true"
+    keep_disks = params["keep_disks"] == "true"
+    {:noreply, act(socket, name, "Deletion completed for", fn -> Vms.delete_vm(name, force: force, keep_disks: keep_disks) end)}
+  end
+
   # Every power control funnels through here so that a refusal is surfaced to the operator
   # rather than logged and forgotten. A refused start is the interesting case: it means
   # something else owns the VM.
   defp act(socket, name, verb, fun) do
     case fun.() do
       {:ok, _result} ->
-        socket
-        |> put_flash(:info, "#{verb} #{name}.")
-        |> load_vms()
+        # No success toast: the task ring in the header announces "#{verb} #{name}" itself.
+        _ = verb
+        load_vms(socket)
 
       {:error, reason} ->
         socket
@@ -142,8 +148,10 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
               phx-value-name={vm.name}
               phx-disable-with="Starting..."
               disabled={Vm.migrating?(vm)}
+              variant="success"
+              size="sm"
             >
-              Start
+              <.icon name="hero-play-solid" class="size-3.5" /> Start
             </.button>
             <.button
               :if={Vm.running?(vm)}
@@ -152,8 +160,10 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
               phx-value-name={vm.name}
               phx-disable-with="Stopping..."
               disabled={Vm.migrating?(vm)}
+              variant="warning"
+              size="sm"
             >
-              Stop
+              <.icon name="hero-stop-solid" class="size-3.5" /> Stop
             </.button>
             <.button
               :if={Vm.running?(vm)}
@@ -162,8 +172,45 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
               phx-value-name={vm.name}
               phx-disable-with="Rebooting..."
               disabled={Vm.migrating?(vm)}
+              variant="secondary"
+              size="sm"
             >
-              Reboot
+              <.icon name="hero-arrow-path-solid" class="size-3.5" /> Reboot
+            </.button>
+            <.button
+              id={"update-" <> vm.name}
+              navigate={~p"/vms/#{vm.name}/edit"}
+              variant="primary"
+              size="sm"
+            >
+              <.icon name="hero-pencil-square-solid" class="size-3.5" /> Update
+            </.button>
+            <a
+              :if={Vm.running?(vm)}
+              id={"console-" <> vm.name}
+              href={"/#{console_page(vm)}?name=#{URI.encode_www_form(vm.name)}"}
+              target="_blank"
+              rel="noopener"
+              class="btn btn-info btn-sm shadow-sm hover:shadow"
+            >
+              <.icon name="hero-computer-desktop-solid" class="size-3.5" />
+              {console_label(vm)}
+            </a>
+            <.button
+              id={"delete-" <> vm.name}
+              phx-click="delete_vm"
+              phx-value-name={vm.name}
+              phx-value-force={if Vm.running?(vm), do: "true", else: "false"}
+              phx-value-keep_disks="false"
+              data-confirm={if Vm.running?(vm),
+                do: "VM #{vm.name} is RUNNING! Are you sure you want to FORCE DESTROY and delete it and its storage?",
+                else: "Delete VM #{vm.name} and all its virtual disks?"}
+              phx-disable-with="Deleting..."
+              disabled={Vm.migrating?(vm)}
+              variant="danger"
+              size="sm"
+            >
+              <.icon name="hero-trash-solid" class="size-3.5" />
             </.button>
           </div>
         </li>

@@ -830,10 +830,28 @@ defmodule SpectrumPhx.Vms do
   defp on_a_spark_node(fun) do
     Enum.reduce_while(spark_ips(), {:error, :no_spark_nodes}, fn ip, _last ->
       case fun.(ip) do
-        {:ok, response} -> {:halt, {:ok, response}}
-        {:error, {status, _message}} = answer when is_integer(status) -> {:halt, answer}
-        {:error, {:http, _status}} = answer -> {:halt, answer}
-        {:error, _transport} = failure -> {:cont, failure}
+        {:ok, response} ->
+          {:halt, {:ok, response}}
+
+        {:error, {409, message}} = answer when is_binary(message) ->
+          # "not attached": this node is not the owner. "resized by someone else": this node
+          # still holds an attachment from an earlier epoch (a guest that ran here before it
+          # ran elsewhere) and its size is stale. The write is a compare-and-swap, so asking
+          # the next node cannot overwrite anything; only the owner's answer is the real one.
+          if String.contains?(message, ["not attached", "was resized by someone else"]) do
+            {:cont, answer}
+          else
+            {:halt, answer}
+          end
+
+        {:error, {status, _message}} = answer when is_integer(status) ->
+          {:halt, answer}
+
+        {:error, {:http, _status}} = answer ->
+          {:halt, answer}
+
+        {:error, _transport} = failure ->
+          {:cont, failure}
       end
     end)
   end
@@ -921,9 +939,6 @@ defmodule SpectrumPhx.Vms do
 
   @doc """
   Ask Vali to reboot a VM in place.
-
-  `reboot` is an ACPI request to the guest and keeps the current placement; the VM must
-  already be running for it to mean anything.
   """
   @spec reboot(String.t()) :: {:ok, map()} | {:error, term()}
   def reboot(name) do
@@ -932,6 +947,145 @@ defmodule SpectrumPhx.Vms do
          :ok <- refuse_if_migrating(vm),
          :ok <- require_running(vm) do
       submit_task("reboot", name, nil)
+    end
+  end
+
+  @doc """
+  Apply a live change to a running VM via spark-daemon.
+  Change is a map like %{"op" => "vcpus", "count" => 4} or %{"op" => "memory", "mib" => 4096}.
+  """
+  @spec live_change(String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def live_change(name, change) when is_map(change) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, vm} <- get_vm(name),
+         :ok <- refuse_if_migrating(vm),
+         :ok <- require_running(vm) do
+      payload = %{"name" => name, "change" => change}
+      case Spark.post_json("127.0.0.1", "/api/v1/vm/live", payload, timeout: 60) do
+        {:ok, body} ->
+          broadcast({:vm_updated, name})
+          {:ok, body}
+
+        {:error, {status, message}} ->
+          {:error, "#{message} (HTTP #{status})"}
+
+        {:error, reason} ->
+          {:error, inspect(reason)}
+      end
+    end
+  end
+
+  @doc """
+  Delete a VM and its storage through Spectrum's delete API.
+  Supports `force: true` and `keep_disks: true`.
+  """
+  @spec delete_vm(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def delete_vm(name, opts \\ []) do
+    with {:ok, name} <- validate_name(name) do
+      force = Keyword.get(opts, :force, false)
+      keep_disks = Keyword.get(opts, :keep_disks, false)
+      payload = %{name: name, force: force, keep_disks: keep_disks}
+      
+      url = "http://127.0.0.1:8080/api/vms/delete"
+      case Req.post(url, json: payload, receive_timeout: 30_000) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          broadcast({:vm_updated, name})
+          {:ok, body}
+        {:ok, %Req.Response{status: status, body: %{"error" => err}}} ->
+          {:error, "#{err} (status #{status})"}
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, "Delete failed with status #{status}: #{inspect(body)}"}
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Update a running VM through Spectrum's update API.
+  Handles live vCPU, memory ballooning, CD-ROM change, disk resize/attach/detach,
+  NIC hotplug, and metadata persistence in ScyllaDB.
+  """
+  @spec update_running_vm(String.t(), map()) :: {:ok, map()} | {:error, term()}
+  def update_running_vm(name, attrs) when is_map(attrs) do
+    with {:ok, name} <- validate_name(name) do
+      vcpus =
+        case attrs["vcpu"] do
+          v when is_integer(v) -> v
+          v when is_binary(v) -> String.to_integer(v)
+          _ -> 2
+        end
+
+      memory =
+        case attrs["memory"] do
+          m when is_integer(m) -> m
+          m when is_binary(m) -> String.to_integer(m)
+          _ -> 4096
+        end
+
+      iso_val =
+        case attrs["iso"] do
+          list when is_list(list) ->
+            list |> Enum.reject(&(&1 in [nil, "", "__empty__"])) |> Enum.join(",")
+
+          str when is_binary(str) ->
+            str
+
+          _ ->
+            ""
+        end
+
+      network_id_val =
+        case attrs["network_id"] do
+          list when is_list(list) -> Jason.encode!(list)
+          str when is_binary(str) -> str
+          _ -> "[]"
+        end
+
+      disks_val =
+        case attrs["disks"] do
+          list when is_list(list) -> list
+          str when is_binary(str) -> String.split(str, ",", trim: true)
+          _ -> []
+        end
+
+      audio_enabled =
+        case attrs["audio_enabled"] do
+          true -> true
+          "true" -> true
+          _ -> false
+        end
+
+      payload = %{
+        "name" => name,
+        "vcpus" => vcpus,
+        "memory" => memory,
+        "firmware" => attrs["firmware"] || "uefi",
+        "boot_device" => attrs["boot_device"] || "",
+        "cpu_model" => attrs["cpu_model"] || "",
+        "graphics" => attrs["graphics"] || "vnc",
+        "audio_enabled" => audio_enabled,
+        "disks" => disks_val,
+        "iso" => iso_val,
+        "network_id" => network_id_val
+      }
+
+      url = "http://127.0.0.1:8080/api/vms/update"
+
+      case Req.post(url, json: payload, receive_timeout: 45_000) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          broadcast({:vm_updated, name})
+          {:ok, body}
+
+        {:ok, %Req.Response{status: status, body: %{"error" => err}}} ->
+          {:error, "#{err} (status #{status})"}
+
+        {:ok, %Req.Response{status: status, body: body}} ->
+          {:error, "Update failed with status #{status}: #{inspect(body)}"}
+
+        {:error, reason} ->
+          {:error, inspect(reason)}
+      end
     end
   end
 

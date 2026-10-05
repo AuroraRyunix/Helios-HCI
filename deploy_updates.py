@@ -3,6 +3,7 @@ import os
 import sys
 
 fast_mode = "--fast" in sys.argv
+phx_only = "--phx-only" in sys.argv
 
 def put_text_file(sftp, local_path, remote_path):
     with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -660,8 +661,9 @@ if not nodes:
 
 username = "root"
 
+key_path = os.path.expanduser('~/.ssh/id_rsa_hci')
 password = os.environ.get("HELIOS_PASSWORD")
-if not password:
+if not password and not os.path.exists(key_path):
     import getpass
     try:
         password = getpass.getpass("Enter cluster root password: ").strip()
@@ -1113,6 +1115,7 @@ RestartSec=3
 User=root
 Environment=PYTHONUNBUFFERED=1
 CPUWeight=200
+SuccessExitStatus=1 143
 
 [Install]
 WantedBy=multi-user.target
@@ -1128,6 +1131,7 @@ Restart=always
 CPUWeight=500
 MemoryMax=1.0G
 MemoryHigh=800M
+SuccessExitStatus=137 143
 
 [Container]
 Image=localhost/spectrum:latest
@@ -1225,6 +1229,56 @@ def deploy_to_node(ip):
                 ssh.exec_command("rm -rf /tmp/spectrum_build && mkdir -p /tmp/spectrum_build/static")
             
             sftp = ssh.open_sftp()
+            
+            if phx_only:
+                print(f"[{ip}] Uploading spectrum-phx build context...")
+                if upload_spectrum_phx(ssh, sftp, local_dir) != 0:
+                    raise RuntimeError(
+                        "the spectrum-phx build context could not be extracted on %s" % ip)
+                if shared_phx_secret:
+                    _, stdout_env, _ = ssh.exec_command(
+                        "install -d -m 0755 /etc/hci/spectrum && "
+                        "test -f /etc/hci/spectrum/spectrum-phx.env || { "
+                        "printf 'SECRET_KEY_BASE=%s\\nPHX_HOST=%s\\nPHX_EXTRA_ORIGINS=%s\\n' "
+                        "> /etc/hci/spectrum/spectrum-phx.env && "
+                        "chmod 600 /etc/hci/spectrum/spectrum-phx.env; }"
+                        % (shared_phx_secret, ip, ",".join(nodes)))
+                    stdout_env.channel.recv_exit_status()
+                import base64 as _b64
+                script = _b64.b64encode(
+                    RECONCILE_PHX_ORIGINS.encode("utf-8")).decode("ascii")
+                _, stdout_org, _ = ssh.exec_command(
+                    "echo %s | base64 -d | NODE_IP=%s bash" % (script, ip))
+                origins_said = stdout_org.read().decode("utf-8", "replace")
+                stdout_org.channel.recv_exit_status()
+                for line in origins_said.splitlines():
+                    said = line.strip()
+                    if said and said != "phx origins: ok":
+                        print(f"[{ip}] {said}")
+                sftp = live_sftp(ssh, sftp)
+                put_text_file(
+                    sftp,
+                    os.path.join(local_dir, "spectrum_phx", "quadlet", "spectrum-phx.container"),
+                    "/etc/containers/systemd/spectrum-phx.container")
+                print(f"[{ip}] Rebuilding spectrum-phx container image...")
+                stdin, stdout, stderr = ssh.exec_command(
+                    "podman build -t localhost/spectrum-phx:latest /tmp/spectrum_phx_build")
+                exit_code = stdout.channel.recv_exit_status()
+                if exit_code != 0:
+                    raise RuntimeError(
+                        "the spectrum-phx image failed to build on %s: %s"
+                        % (ip, stderr.read().decode().strip()[:600]))
+                print(f"[{ip}] Restarting spectrum-phx...")
+                _, stdout_phx, _ = ssh.exec_command(
+                    "systemctl daemon-reload && "
+                    "systemctl stop spectrum-phx 2>/dev/null; "
+                    "podman rm -f spectrum-phx 2>/dev/null; "
+                    "systemctl start spectrum-phx")
+                if stdout_phx.channel.recv_exit_status() != 0:
+                    print(f"[{ip}] Warning: spectrum-phx did not start.")
+                else:
+                    print(f"[{ip}] spectrum-phx updated and restarted successfully.\n")
+                return
             
             # 1a. Copy Spark CLI
             print(f"[{ip}] Uploading spark CLI to /usr/local/bin/spark...")
@@ -2025,7 +2079,7 @@ WantedBy=multi-user.target
                 # section is what the generator acts on), so reload and restart only.
                 "systemctl daemon-reload && systemctl restart slate || true",
                 "systemctl enable gatoway && systemctl restart gatoway || true",
-                "systemctl enable urbosa && systemctl restart urbosa || true",
+                "systemctl enable urbosa; systemctl is-active urbosa && systemctl restart urbosa || true",
                 "systemctl enable logos && systemctl restart logos || true",
                 "systemctl enable mipha && systemctl restart mipha || true",
                 "systemctl enable hylia && systemctl restart hylia || true",

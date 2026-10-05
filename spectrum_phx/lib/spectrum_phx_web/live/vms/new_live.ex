@@ -97,8 +97,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
 
   defp not_stopped_message(%Vm{} = vm) do
     "#{vm.name} is #{String.downcase(vm.state || "not stopped")}; stop it to edit it. " <>
-      "(While a VM runs, only its CD-ROM, NICs, vCPUs, memory and disk size can change, " <>
-      "and those are not offered here yet: see docs/vm_lifecycle.md.)"
+      "(While a VM runs, live updates are performed directly on the VM details page.)"
   end
 
   @impl true
@@ -107,11 +106,25 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
   end
 
   def handle_event("save", %{"vm" => params}, %{assigns: %{mode: :edit, vm: vm}} = socket) do
-    case Vms.update_vm(vm.name, Form.to_attrs(params)) do
-      {:ok, _vm} ->
+    save_fun =
+      if Vm.running?(vm) do
+        fn -> Vms.update_running_vm(vm.name, Form.to_attrs(params)) end
+      else
+        fn -> Vms.update_vm(vm.name, Form.to_attrs(params)) end
+      end
+
+    case save_fun.() do
+      {:ok, _result} ->
+        msg =
+          if Vm.running?(vm) do
+            "VM #{vm.name} updated. Live changes applied to the running guest; cold changes apply at next reboot."
+          else
+            "VM #{vm.name} updated. Changes apply the next time it starts."
+          end
+
         {:noreply,
          socket
-         |> put_flash(:info, "VM #{vm.name} updated. Changes apply the next time it starts.")
+         |> put_flash(:info, msg)
          |> push_navigate(to: ~p"/vms/#{vm.name}")}
 
       {:error, errors} when is_list(errors) ->
@@ -120,7 +133,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
       {:error, :not_stopped} ->
         {:noreply,
          socket
-         |> put_flash(:error, "#{vm.name} is no longer stopped, so it cannot be edited.")
+         |> put_flash(:error, "#{vm.name} is not stopped.")
          |> push_navigate(to: ~p"/vms/#{vm.name}")}
 
       {:error, :changed} ->
@@ -130,7 +143,7 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
          |> assign_form([])
          |> put_flash(
            :error,
-           "#{vm.name} changed while it was being edited (it was started?). Nothing was saved."
+           "#{vm.name} changed while it was being edited. Nothing was saved."
          )}
 
       {:error, reason} ->
@@ -228,11 +241,16 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
       <.header :if={@mode == :edit}>
         Edit {@vm.name}
         <:subtitle>
-          The VM is stopped, so everything but its name can change. Changes take effect the next time it starts.
-          A disk can only grow and keeps its container; only the last disks can be removed, and removing one deletes its data.
+          <span :if={Vm.running?(@vm)} class="text-info font-medium block">
+            Running guest: Live changes (vCPUs, Memory, CD-ROMs, Disks, NICs) take effect immediately. Cold properties apply on reboot.
+          </span>
+          <span :if={not Vm.running?(@vm)} class="block">
+            The VM is stopped, so everything but its name can change. Changes take effect the next time it starts.
+            A disk can only grow and keeps its container; only the last disks can be removed, and removing one deletes its data.
+          </span>
         </:subtitle>
         <:actions>
-          <.button navigate={~p"/vms/#{@vm.name}"}>Cancel</.button>
+          <.button navigate={~p"/vms/#{@vm.name}"} variant="secondary">Cancel</.button>
         </:actions>
       </.header>
 

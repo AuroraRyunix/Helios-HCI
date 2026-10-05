@@ -550,7 +550,7 @@ def boot_orders(boot_device, disk_count, cdrom_count, nic_count=1):
     return orders
 
 
-def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None):
+def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None, bus="scsi"):
     """The libvirt <disk> element for an image-backed CD-ROM.
 
     The same NBD-over-unix shape as `disk_xml`, because an image is an ordinary vdisk that
@@ -561,6 +561,10 @@ def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None):
 
     Read-only at both ends: `<readonly/>` here, and the vdisk's immutable class refuses
     writes at the NBD layer regardless of what the guest tries.
+
+    On virtio-scsi by default: QEMU cannot hotplug a SATA device, so a drive defined on
+    SATA could never be added to a running guest. `bus` is overridable so a live swap can
+    match a drive an older definition put on SATA.
     """
     return "\n".join([
         "",
@@ -569,7 +573,7 @@ def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None):
         "      <source protocol='nbd' name='%s'>" % vdisk_id,
         "        <host transport='unix' socket='%s'/>" % nbd_socket(vdisk_id, nbd_dir),
         "      </source>",
-        "      <target dev='sd%s' bus='sata'/>" % dev_letter,
+        "      <target dev='sd%s' bus='%s'/>" % (dev_letter, bus),
         "      <readonly/>",
     ] + ([boot_element(boot_order).strip("\n")] if boot_order else []) + [
         "    </disk>",

@@ -63,6 +63,12 @@ defmodule SpectrumPhxWeb.Vms.Components do
     """
   end
 
+  def console_page(%{graphics: "spice"}), do: "spice_auto.html"
+  def console_page(_vm), do: "vnc_auto.html"
+
+  def console_label(%{graphics: "spice"}), do: "SPICE Console"
+  def console_label(_vm), do: "Console"
+
   @doc """
   Turn a context error into something an operator can act on.
 

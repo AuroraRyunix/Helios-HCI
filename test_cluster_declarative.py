@@ -185,7 +185,8 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
              {"unit": "daruk", "requires": ("hydra-db",), "ready_port": 9043},
              {"unit": "sidon", "requires": ("daruk",), "drain_before_stop": True})
 
-    def converge(self, states, desired="started", ports=(), failing=(), stale=None):
+    def converge(self, states, desired="started", ports=(), failing=(), stale=None,
+                 order=None, table=None, probes=None):
         """One pass over `states`, returning (issued commands, scope)."""
         issued = []
         drained = []
@@ -219,12 +220,12 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
             functions=("converge_to_desired_state", "_converge_locked", "unit_active_states", "service_entry",
                        "service_is_disabled", "service_is_ready", "listening_ports",
                        "convergence_gate", "run_unit_commands"),
-            scope={"MANAGED_SERVICE_ORDER": list(self.ORDER),
+            scope={"MANAGED_SERVICE_ORDER": list(order or self.ORDER),
                    "CONVERGE_LOCK": __import__("threading").Lock(),
                    "CONVERGE_PARALLELISM": 8,
                    "UNIT_DOWN_STATES": ("inactive", "failed", ""),
-                   "MANAGED_SERVICES": self.TABLE,
-                   "SERVICE_SETTING_PROBES": {},
+                   "MANAGED_SERVICES": table or self.TABLE,
+                   "SERVICE_SETTING_PROBES": dict(probes or {}),
                    "SERVICE_ERRORS": dict(stale or {}),
                    "drain_local_storage": lambda: drained.append(True),
                    "subprocess": FakeSubprocess,
@@ -291,6 +292,23 @@ class TheLoopConvergesInDependencyOrder(unittest.TestCase):
             "each service is stopped only after the ones that use it, and the whole chain "
             "in one pass: this used to stop one layer per pass, and the passes were a "
             "drift interval (30 s) apart, which is why `cluster stop` was slow")
+
+    def test_a_disabled_service_that_is_active_is_stopped_when_stopping(self):
+        """A disabled service (e.g. Urbosa when urbosa_enabled is false) must not be left
+        running when the cluster is stopped, because it holds Daruk and prevents Daruk and
+        the database from ever stopping."""
+        order = ["hydra-db", "daruk", "sidon", "urbosa"]
+        table = ({"unit": "hydra-db", "requires": (), "ready_port": 9042},
+                 {"unit": "daruk", "requires": ("hydra-db",), "ready_port": 9043},
+                 {"unit": "sidon", "requires": ("daruk",), "drain_before_stop": True},
+                 {"unit": "urbosa", "requires": ("daruk",), "setting": "urbosa_enabled"})
+        probes = {"urbosa_enabled": lambda: False}
+        issued, _ = self.converge(["active", "active", "active", "active"],
+                                  desired="stopped", order=order, table=table, probes=probes)
+        self.assertEqual(
+            sorted(issued[:2]) + issued[2:],
+            ["systemctl stop sidon", "systemctl stop urbosa", "systemctl stop daruk", "systemctl stop hydra-db"],
+            "Urbosa was not stopped, leaving Daruk and the database held and wedging cluster stop")
 
     def test_a_service_that_will_not_stop_keeps_what_it_uses_up(self):
         """The reason the order exists. With sidon refusing to stop, Daruk and the database

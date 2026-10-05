@@ -213,6 +213,23 @@ def in_maintenance():
 def get_local_ip():
     import socket as _socket
     try:
+        if os.path.exists("/etc/hci/cluster.json"):
+            with open("/etc/hci/cluster.json", "r") as f:
+                cdata = json.load(f)
+            hosts = [h.get("ip") for h in cdata.get("hosts", []) if h.get("ip") and h.get("ip") != "127.0.0.1"]
+            for target in hosts:
+                try:
+                    s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                    s.connect((target, 80))
+                    ip = s.getsockname()[0]
+                    s.close()
+                    if ip and ip in hosts:
+                        return ip
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
         s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
@@ -1719,69 +1736,71 @@ def check_services(category):
                 bound_locally = (vip in out_ip)
                 
                 # Use the exact same leadership logic as bifrost.py to find expected VIP owner
-                # 1. Find raw ZooKeeper leader
-                zk_leader_ip = None
-                for ip in ips:
+                expected_vip_holder = None
+                zkmod = load_helios_zk()
+                if zkmod:
                     try:
-                        import socket
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.2)
-                        s.connect((ip, 2181))
-                        s.sendall(b"stat")
-                        resp = s.recv(1024).decode('utf-8', errors='ignore')
-                        s.close()
-                        if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
-                            zk_leader_ip = ip
-                            break
+                        c = zkmod.Candidacy(zkmod.SERVICE_BIFROST_VIP, hosts=ips or ["127.0.0.1"])
+                        lid = c.leader_identity()
+                        if lid:
+                            expected_vip_holder = lid.decode("utf-8") if isinstance(lid, bytes) else str(lid)
                     except Exception:
                         pass
-                        
-                # 2. Check if ZK leader is active on port 8443 (Spectrum)
-                leader_active = False
-                if zk_leader_ip:
-                    try:
-                        import socket
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.2)
-                        s.connect((zk_leader_ip, 8443))
-                        s.close()
-                        leader_active = True
-                    except Exception:
-                        leader_active = False
-                        
-                expected_vip_holder = None
-                if leader_active:
-                    expected_vip_holder = zk_leader_ip
-                else:
-                    # Fallback to candidates with port 8443 open
-                    candidates = []
+
+                if not expected_vip_holder:
+                    # 1. Find raw ZooKeeper leader
+                    zk_leader_ip = None
                     for ip in ips:
                         try:
                             import socket
                             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                             s.settimeout(0.2)
-                            s.connect((ip, 8443))
+                            s.connect((ip, 2181))
+                            s.sendall(b"stat")
+                            resp = s.recv(1024).decode('utf-8', errors='ignore')
                             s.close()
-                            candidates.append(ip)
+                            if "mode: leader" in resp.lower() or "mode: standalone" in resp.lower():
+                                zk_leader_ip = ip
+                                break
                         except Exception:
                             pass
-                    if candidates:
-                        candidates.sort()
-                        expected_vip_holder = candidates[0]
+                            
+                    # 2. Check if ZK leader is active on port 8443 (Spectrum)
+                    leader_active = False
+                    if zk_leader_ip:
+                        try:
+                            import socket
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.settimeout(0.2)
+                            s.connect((zk_leader_ip, 8443))
+                            s.close()
+                            leader_active = True
+                        except Exception:
+                            leader_active = False
+                            
+                    if leader_active:
+                        expected_vip_holder = zk_leader_ip
                     else:
-                        expected_vip_holder = zk_leader_ip if zk_leader_ip else "127.0.0.1"
+                        # Fallback to candidates with port 8443 open
+                        candidates = []
+                        for ip in ips:
+                            try:
+                                import socket
+                                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                s.settimeout(0.2)
+                                s.connect((ip, 8443))
+                                s.close()
+                                candidates.append(ip)
+                            except Exception:
+                                pass
+                        if candidates:
+                            candidates.sort()
+                            expected_vip_holder = candidates[0]
+                        else:
+                            expected_vip_holder = zk_leader_ip if zk_leader_ip else "127.0.0.1"
                         
                 # Find local IP
-                local_ip = "127.0.0.1"
-                try:
-                    import socket
-                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    s.connect(("8.8.8.8", 80))
-                    local_ip = s.getsockname()[0]
-                    s.close()
-                except Exception:
-                    pass
-                    
+                local_ip = get_local_ip()
                 is_expected_holder = (local_ip == expected_vip_holder)
                 
                 if is_expected_holder:
