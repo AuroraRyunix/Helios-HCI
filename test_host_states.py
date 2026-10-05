@@ -151,6 +151,14 @@ class TheReturningHost(unittest.TestCase):
         self.assertLess(rejoin.index("reconcile_returning_host(hostname, ip)"),
                         rejoin.index("# B. Start all hypervisor services on the returning host"))
 
+    def test_the_rejoin_sequence_verifies_services_up_before_normal(self):
+        src = open(os.path.join(HERE, "mipha.py"), encoding="utf-8").read()
+        rejoin = src[src.index("# B. Start all hypervisor services on the returning host"):]
+        self.assertIn("all_services_up = False", rejoin)
+        self.assertIn("status_data.get(\"services\")", rejoin)
+        self.assertLess(rejoin.index("if all_services_up:"),
+                        rejoin.index("status = 'NORMAL'"))
+
 
 class AQuarantineIsLiftedSlowly(unittest.TestCase):
     def test_it_takes_the_whole_stretch_of_clean_passes(self):

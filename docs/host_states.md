@@ -77,11 +77,10 @@ host's services are started, the leader reconciles it against Hydra (`mipha.reco
 ## How a host rejoins
 
 * **Mipha leader, host was DOWN** (spark answering again): `DOWN -> RECOVERING`; reconcile the host's guests
-  (above); start `zookeeper, hydra-db, daruk, sidon` and every other unit; 10 s; `RECOVERING -> NORMAL`.
-  Storage needs no resync: extent groups are immutable and Purah restores replica counts in the background.
-  **Gap, not changed:** NORMAL is written after the 10 s whatever the services did (the maintenance leave, by
-  contrast, now waits for every service UP). A host that rejoined with a service down is NORMAL; `cluster
-  status` and Mimir show it, and placement refuses it while any service is down, so it receives nothing.
+  (above); start `zookeeper, hydra-db, daruk, sidon` and every other unit; poll status for up to 60s verifying every
+  service is UP; `RECOVERING -> NORMAL`. If services fail to become UP, the host remains in `RECOVERING` rather than
+  prematurely becoming schedulable. Storage needs no resync: extent groups are immutable and Purah restores replica
+  counts in the background.
 * **ZooKeeper** rejoins by starting (the ensemble's voters are static, in the Quadlet). **ScyllaDB** rejoins by
   gossip unless the operator ran `nodetool removenode`; the leader prints the ring candidate but never removes a
   node (see ring_lifecycle.md).

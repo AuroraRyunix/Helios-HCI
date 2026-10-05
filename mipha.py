@@ -2289,23 +2289,35 @@ def main():
                         cql_up = f"UPDATE hydra.catalyst_tasks SET progress = 20, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
                         run_cql_query(cql_up)
                         
-                        # C. There is no resync to wait for.
-                        #
-                        # This used to create a child Catalyst task, poll
-                        # get_linstor_pending_sync() every three seconds, and hold the
-                        # rejoin open until DRBD had finished copying. Extent groups are
-                        # immutable and re-replicated by Purah in the background, so a
-                        # returning node has nothing to catch up on before it is usable: it
-                        # can serve any vdisk it is given the moment it is up, and
-                        # under-replicated groups are restored off the hot path.
+                        # C. Wait for services to be verified UP before setting status to NORMAL.
+                        # Extent groups are immutable and Purah restores replica counts in the background,
+                        # but the host must not be declared NORMAL while any service is still down or starting.
+                        all_services_up = False
+                        deadline = time.time() + 60
+                        while time.time() < deadline:
+                            rc_st, status_data, _ = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
+                            if rc_st == 0 and isinstance(status_data, dict):
+                                svcs = status_data.get("services") or {}
+                                unready = [s for s, d in svcs.items() if (d or {}).get("status") != "UP"]
+                                if not unready:
+                                    all_services_up = True
+                                    break
+                            time.sleep(3)
+
                         now_ms_end = int(time.time() * 1000)
-                        run_cql_query(schema_module().task_update_statement(
-                            parent_task_id, "completed", 100, now_ms_end))
-                        run_cql_query(
-                            f"UPDATE hydra.nodes SET status = 'NORMAL' "
-                            f"WHERE hostname = '{hostname}';")
-                        print(f"[Mipha HA] Host {hostname} rejoined; Purah will restore "
-                              f"replica counts in the background.")
+                        if all_services_up:
+                            run_cql_query(schema_module().task_update_statement(
+                                parent_task_id, "completed", 100, now_ms_end))
+                            run_cql_query(
+                                f"UPDATE hydra.nodes SET status = 'NORMAL' "
+                                f"WHERE hostname = '{hostname}';")
+                            print(f"[Mipha HA] Host {hostname} rejoined with all services UP; Purah will restore "
+                                  f"replica counts in the background.")
+                        else:
+                            run_cql_query(schema_module().task_update_statement(
+                                parent_task_id, "failed", 50, now_ms_end))
+                            print(f"[Mipha HA] Host {hostname} services could not be verified UP within 60s; "
+                                  f"leaving host in RECOVERING.")
 
                 # 3. Trigger failover.
                 #
