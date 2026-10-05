@@ -8580,7 +8580,7 @@ def db_reconcile_loop():
                             pass
 
             # 2. Fetch metadata from ScyllaDB
-            cql = "SELECT JSON name, state, host_ip FROM hydra.vms;"
+            cql = "SELECT JSON name, state, host_ip, status FROM hydra.vms;"
             rc, stdout, stderr = run_cql_query(cql)
             if rc == 0:
                 for line in stdout.splitlines():
@@ -8591,7 +8591,12 @@ def db_reconcile_loop():
                             name = vm["name"]
                             db_state = vm.get("state")
                             host_ip = vm.get("host_ip", "")
-                            
+                            status = (vm.get("status") or "").strip().lower()
+
+                            # Never touch a VM that is actively migrating
+                            if status == "migrating":
+                                continue
+
                             # Only reconcile VMs assigned to this node
                             is_local = (host_ip == LOCAL_IP or host_ip == "127.0.0.1")
                             if is_local:

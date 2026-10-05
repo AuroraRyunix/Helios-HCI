@@ -1834,6 +1834,19 @@ def deploy_to_node(ip):
                 "firewall-cmd --permanent --add-port=49152-49215/tcp && "
                 "firewall-cmd --reload || true")
 
+            # Ensure all cluster node hostnames are in /etc/hosts so inter-node libvirt/QEMU migration
+            # and TLS resolution work reliably across nodes.
+            reconcile_hosts_cmd = (
+                "python3 -c \""
+                "import json, os; "
+                "p = '/etc/hci/cluster.json'; "
+                "data = json.load(open(p)) if os.path.exists(p) else {}; "
+                "lines = open('/etc/hosts').read().splitlines() if os.path.exists('/etc/hosts') else []; "
+                "entries = [f'{h[\\\"ip\\\"]} {h[\\\"hostname\\\"]}' for h in data.get('hosts', []) if h.get('ip') and h.get('hostname') and not any(h['hostname'] in l for l in lines)]; "
+                "entries and open('/etc/hosts', 'a').write('\\n' + '\\n'.join(entries) + '\\n')\" 2>/dev/null || true"
+            )
+            ssh.exec_command(reconcile_hosts_cmd)
+
             if not fast_mode:
                 # Ensure clang and lld are installed on target host
                 stdin_chk, stdout_chk, stderr_chk = ssh.exec_command("which clang && which lld")

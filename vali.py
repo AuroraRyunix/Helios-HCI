@@ -2050,7 +2050,7 @@ def process_queue_task(task):
                 # two-primaries window is now opened and closed around the migration
                 # itself, so the check libvirt performs is the one we actually want, and
                 # suppressing it would only hide a genuinely unsafe migration.
-                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource {q_vm} qemu+ssh://root@{target_ip}/system tcp://{target_ip}"
+                cmd = f"virsh -c qemu:///system migrate --live --persistent --undefinesource --listen-address {target_ip} {q_vm} qemu+ssh://root@{target_ip}/system"
                 rc, stdout, stderr = run_remote_spark(src_host, cmd, timeout=MIGRATION_COMMAND_TIMEOUT)
                 if rc != 0:
                     leftovers = detach_destination_forwarders(target_ip, destination_forwarders)
