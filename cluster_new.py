@@ -423,15 +423,18 @@ def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
     attempts = {ip: 0 for ip in expected_ips}
     waiting = set(expected_ips)
     last_line = None
+    last_printed_at = 0.0
     if poll > 0:
         time.sleep(poll)
     while time.time() < deadline:
+        now = time.time()
         state = zk_read_cluster_state()
         if state is None:
             line = "Waiting for ZooKeeper to become reachable..."
-            if line != last_line:
-                print(f"  {line}")
+            if line != last_line or (now - last_printed_at >= 4.0):
+                print(f"\n  {line}")
                 last_line = line
+                last_printed_at = now
             time.sleep(poll)
             continue
 
@@ -485,9 +488,10 @@ def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
         for ip in sorted(pending):
             parts.append(f"{ip}: {', '.join(pending[ip])}")
         line = "Waiting for " + ("; ".join(parts) or "nodes to finish converging")
-        if line != last_line:
-            print(f"  {line}")
+        if line != last_line or (now - last_printed_at >= 4.0):
+            print(f"\n  {line}")
             last_line = line
+            last_printed_at = now
         time.sleep(poll)
 
     print(f"  {YELLOW}Timed out after {timeout}s waiting for convergence.{RESET}")
@@ -2492,6 +2496,34 @@ def confirm_destroy(ips, assume_yes=False, read=input, interactive=None):
     return True
 
 
+def confirm_stop(assume_yes=False, read=input, interactive=None):
+    """Prompt the operator before stopping all cluster services and virtual machines."""
+    if assume_yes:
+        print("[--yes] Skipping the confirmation prompt.")
+        return True
+
+    if interactive is None:
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:
+            interactive = False
+
+    if not interactive:
+        print("Refusing to stop the cluster with no one at the keyboard to confirm it.")
+        print("Run it from a terminal, or pass --yes if a script really means it.")
+        return False
+
+    try:
+        answer = read("This will stop all cluster services and virtual machines. Confirm [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return False
+    if answer not in ("y", "yes"):
+        print("Not confirmed. Nothing was changed.")
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="HCI Cluster Management Utility")
     parser.add_argument("-s", "--servers", required=False, help="Comma-separated list of host IPs")
@@ -2509,7 +2541,7 @@ def main():
                              "opposite role in the same change, so a vote is handed over "
                              "rather than added or dropped")
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="Skip the confirmation prompt of 'destroy', for scripts")
+                        help="Skip the confirmation prompt of 'stop' or 'destroy', for scripts")
     parser.add_argument("--finalize", action="store_true", help="Perform the bookkeeping half of a decommission or rejoin, once the ring work is done")
     parser.add_argument("command", choices=["create", "status", "start", "stop", "destroy",
                                             "ring", "decommission", "rejoin",
@@ -3123,6 +3155,23 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print("Lockdown mode: Disabled")
             print(f"{GRAY}Source: ZooKeeper via {zk_state['via']}{RESET}")
 
+            # If desired state is stopped and no nodes are running cluster services,
+            # suppress printing the service matrix since the cluster is down anyway.
+            desired_state = (zk_state["desired"] or "").strip().lower()
+            if desired_state in ("stopped", "stop"):
+                any_service_running = False
+                for node_data in zk_state["nodes"].values():
+                    services = node_data.get("services", {})
+                    for svc in services.values():
+                        if svc.get("pids"):
+                            any_service_running = True
+                            break
+                    if any_service_running:
+                        break
+                if not any_service_running:
+                    print("==========================================================")
+                    sys.exit(0)
+
             print("\n--- Cluster Services Status ---")
             configured = set(get_cluster_ips())
             for ip in sorted(zk_state["nodes"], key=lambda a: [int(p) for p in a.split(".")] if a.count(".") == 3 and all(p.isdigit() for p in a.split(".")) else [999]):
@@ -3309,6 +3358,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         print("==========================================================")
         print("                 Stopping HCI Cluster                     ")
         print("==========================================================")
+
+        if not confirm_stop(assume_yes=args.yes):
+            sys.exit(1)
 
         ips = get_cluster_ips()
         acquire_cluster_lock(ips)

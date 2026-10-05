@@ -12,6 +12,8 @@ import urllib.error
 import time
 import os
 import threading
+import cmd
+import shlex
 
 # The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
 # of them identical, and the guard against conditional statements had reached only three
@@ -3746,238 +3748,354 @@ def print_usage():
     print("  valcli db.query \"<query>\"          Execute raw CQL query and display formatted output")
     print("\nAvailable tables: vms, storage_containers, dagur_schedules, dagur_runs")
 
-def main():
-    if len(sys.argv) < 2:
-        print_usage()
-        sys.exit(1)
-        
-    cmd = sys.argv[1]
-    if cmd in ["--version", "-v", "-version", "version"]:
-        print("Valkyrie CLI (valcli) v1.2.0")
-        sys.exit(0)
-        
-    if cmd == "vm.list":
-        cmd_vm_list()
-    elif cmd == "vm.create":
-        cmd_vm_create()
-    elif cmd == "vm.delete":
-        cmd_vm_delete()
-    elif cmd == "vm.edit":
-        cmd_vm_edit()
-    elif cmd == "vm.live":
-        cmd_vm_live(sys.argv[2:])
-    elif cmd == "vm.on":
-        if len(sys.argv) < 3:
-            print("Error: VM Name is required.")
-            print("Usage: valcli vm.on <vm_name>")
-            sys.exit(1)
-        cmd_vm_on(sys.argv[2])
-    elif cmd == "vm.off":
-        if len(sys.argv) < 3:
-            print("Error: VM Name is required.")
-            print("Usage: valcli vm.off <vm_name>")
-            sys.exit(1)
-        cmd_vm_off(sys.argv[2])
-    elif cmd == "vm.migrate":
-        if len(sys.argv) < 4:
-            print("Error: VM Name and Target Host are required.")
-            print("Usage: valcli vm.migrate <vm_name> <target_host>")
-            sys.exit(1)
-        cmd_vm_migrate(sys.argv[2], sys.argv[3])
-    elif cmd == "vm.balance":
-        cmd_vm_balance()
-    elif cmd == "drs.status":
-        cmd_drs_status()
-    elif cmd == "host.list":
-        cmd_host_list()
-    elif cmd == "host.maintenance.enter":
-        args = sys.argv[2:]
-        if not args or (len(args) == 1 and args[0] == "--force-stop"):
-            print("Error: Hostname is required.")
-            print("Usage: valcli host.maintenance.enter <hostname> [--force-stop]")
-            sys.exit(1)
-        
-        force_stop = "--force-stop" in args
-        hostname = None
-        for arg in args:
-            if arg != "--force-stop":
-                hostname = arg
-                break
-                
-        if not hostname:
-            print("Error: Hostname is required.")
-            sys.exit(1)
-            
-        cmd_host_maintenance_enter(hostname, force_stop)
-    elif cmd == "host.maintenance.leave":
-        if len(sys.argv) < 3:
-            print("Error: Hostname is required.")
-            print("Usage: valcli host.maintenance.leave <hostname>")
-            sys.exit(1)
-        cmd_host_maintenance_leave(sys.argv[2])
-    elif cmd == "cluster.vip.set":
-        if len(sys.argv) < 3:
-            print("Error: VIP IP address is required.")
-            print("Usage: valcli cluster.vip.set <vip_ip>")
-            sys.exit(1)
-        cmd_cluster_vip_set(sys.argv[2])
-    elif cmd == "storage.list":
-        cmd_storage_list()
-    elif cmd == "storage.container.create":
-        cmd_storage_container_create(sys.argv)
-    elif cmd == "storage.container.update":
-        cmd_storage_container_update(sys.argv)
-    elif cmd == "storage.container.delete":
-        cmd_storage_container_delete(sys.argv)
-    elif cmd == "storage.benchmark":
-        if len(sys.argv) < 3:
-            print("Error: Storage container name is required.")
-            print("Usage: valcli storage.benchmark <container_name>")
-            sys.exit(1)
-        cmd_storage_benchmark(sys.argv[2])
-    elif cmd == "storage.cleanup_orphaned":
-        cmd_storage_cleanup_orphaned()
-    elif cmd == "storage.snapshot":
-        if len(sys.argv) < 4:
-            print("Usage: valcli storage.snapshot <vdisk_id> <snapshot_name>")
-            sys.exit(1)
-        cmd_storage_derive(sys.argv[2], sys.argv[3], "snapshot")
-    elif cmd == "storage.clone":
-        if len(sys.argv) < 4:
-            print("Usage: valcli storage.clone <vdisk_id> <clone_name>")
-            sys.exit(1)
-        cmd_storage_derive(sys.argv[2], sys.argv[3], "clone")
-    elif cmd == "storage.children":
-        if len(sys.argv) < 3:
-            print("Usage: valcli storage.children <vdisk_id>")
-            sys.exit(1)
-        cmd_storage_children(sys.argv[2])
-    elif cmd == "storage.snapshots":
-        if len(sys.argv) < 3:
-            print("Usage: valcli storage.snapshots <vdisk_id>")
-            sys.exit(1)
-        cmd_storage_snapshots(sys.argv[2])
-    elif cmd == "storage.snapshot-policy":
-        cmd_storage_snapshot_policy()
-    elif cmd == "storage.snapshot-policy.set":
-        cmd_storage_snapshot_policy_set(sys.argv)
-    elif cmd == "storage.snapshot-policy.delete":
-        cmd_storage_snapshot_policy_delete(sys.argv)
-    elif cmd == "storage.snapshot-run":
-        cmd_storage_snapshot_run(sys.argv)
-    elif cmd == "storage.rollback":
-        cmd_storage_rollback(sys.argv)
-    elif cmd.startswith("storage.domain"):
-        cmd_storage_domain(sys.argv)
-    elif cmd == "storage.heat":
-        limit = 10
-        if len(sys.argv) > 2:
-            try:
-                limit = max(1, min(1000, int(sys.argv[2])))
-            except ValueError:
-                print("Usage: valcli storage.heat [N]")
-                sys.exit(1)
-        cmd_storage_heat(limit)
-    elif cmd == "storage.placement":
-        limit = 10
-        if len(sys.argv) > 2:
-            try:
-                limit = max(1, min(100000, int(sys.argv[2])))
-            except ValueError:
-                print("Usage: valcli storage.placement [N]")
-                sys.exit(1)
-        cmd_storage_placement(limit)
-    elif cmd == "storage.tier":
-        extra = sys.argv[2:]
-        if extra not in ([], ["--apply"]):
-            print("Usage: valcli storage.tier [--apply]")
-            sys.exit(1)
-        cmd_storage_tier(apply=bool(extra))
-    elif cmd == "storage.sweep":
-        if sys.argv[2:]:
-            print("Usage: valcli storage.sweep")
-            sys.exit(1)
-        cmd_storage_sweep()
-    elif cmd == "storage.scrub":
-        if sys.argv[2:]:
-            print("Usage: valcli storage.scrub")
-            sys.exit(1)
-        cmd_storage_scrub()
-    elif cmd == "storage.compact":
-        cmd_storage_compact(sys.argv[2:])
-    elif cmd == "storage.dedup.estimate":
-        cmd_storage_dedup_estimate(sys.argv[2:])
-    elif cmd == "storage.takeover":
-        if len(sys.argv) < 4:
-            print("Usage: valcli storage.takeover <vdisk> <node>")
-            sys.exit(1)
-        cmd_storage_takeover(sys.argv[2], sys.argv[3])
-    elif cmd == "storage.move":
-        if len(sys.argv) != 5:
-            print("Usage: valcli storage.move <egroup_id> <disk> <node>")
-            sys.exit(1)
-        cmd_storage_move(sys.argv[2], sys.argv[3], sys.argv[4])
-    elif cmd == "storage.replication":
-        cmd_storage_replication()
-    elif cmd == "storage.replicate":
-        if len(sys.argv) < 3:
-            print("Usage: valcli storage.replicate <vdisk_id>")
-            print("       valcli storage.replicate --all")
-            sys.exit(1)
-        if sys.argv[2] == "--all":
-            cmd_storage_replicate(None, everything=True)
+def execute_command(args):
+    """Execute a single valcli command with the given argument list (e.g. ['vm.list'])."""
+    old_argv = sys.argv
+    try:
+        sys.argv = ["valcli"] + list(args)
+        if not args:
+            print_usage()
+            return 1
+
+        cmd = args[0]
+        if cmd in ["--version", "-v", "-version", "version"]:
+            print("Valkyrie CLI (valcli) v1.2.0")
+            return 0
+
+        if cmd == "vm.list":
+            cmd_vm_list()
+        elif cmd == "vm.create":
+            cmd_vm_create()
+        elif cmd == "vm.delete":
+            cmd_vm_delete()
+        elif cmd == "vm.edit":
+            cmd_vm_edit()
+        elif cmd == "vm.live":
+            cmd_vm_live(args[1:])
+        elif cmd == "vm.on":
+            if len(args) < 2:
+                print("Error: VM Name is required.")
+                print("Usage: valcli vm.on <vm_name>")
+                return 1
+            cmd_vm_on(args[1])
+        elif cmd == "vm.off":
+            if len(args) < 2:
+                print("Error: VM Name is required.")
+                print("Usage: valcli vm.off <vm_name>")
+                return 1
+            cmd_vm_off(args[1])
+        elif cmd == "vm.migrate":
+            if len(args) < 3:
+                print("Error: VM Name and Target Host are required.")
+                print("Usage: valcli vm.migrate <vm_name> <target_host>")
+                return 1
+            cmd_vm_migrate(args[1], args[2])
+        elif cmd == "vm.balance":
+            cmd_vm_balance()
+        elif cmd == "drs.status":
+            cmd_drs_status()
+        elif cmd == "host.list":
+            cmd_host_list()
+        elif cmd == "host.maintenance.enter":
+            sub_args = args[1:]
+            if not sub_args or (len(sub_args) == 1 and sub_args[0] == "--force-stop"):
+                print("Error: Hostname is required.")
+                print("Usage: valcli host.maintenance.enter <hostname> [--force-stop]")
+                return 1
+
+            force_stop = "--force-stop" in sub_args
+            hostname = None
+            for arg in sub_args:
+                if arg != "--force-stop":
+                    hostname = arg
+                    break
+
+            if not hostname:
+                print("Error: Hostname is required.")
+                return 1
+
+            cmd_host_maintenance_enter(hostname, force_stop)
+        elif cmd == "host.maintenance.leave":
+            if len(args) < 2:
+                print("Error: Hostname is required.")
+                print("Usage: valcli host.maintenance.leave <hostname>")
+                return 1
+            cmd_host_maintenance_leave(args[1])
+        elif cmd == "cluster.vip.set":
+            if len(args) < 2:
+                print("Error: VIP IP address is required.")
+                print("Usage: valcli cluster.vip.set <vip_ip>")
+                return 1
+            cmd_cluster_vip_set(args[1])
+        elif cmd == "storage.list":
+            cmd_storage_list()
+        elif cmd == "storage.container.create":
+            cmd_storage_container_create(["valcli"] + list(args))
+        elif cmd == "storage.container.update":
+            cmd_storage_container_update(["valcli"] + list(args))
+        elif cmd == "storage.container.delete":
+            cmd_storage_container_delete(["valcli"] + list(args))
+        elif cmd == "storage.benchmark":
+            if len(args) < 2:
+                print("Error: Storage container name is required.")
+                print("Usage: valcli storage.benchmark <container_name>")
+                return 1
+            cmd_storage_benchmark(args[1])
+        elif cmd == "storage.cleanup_orphaned":
+            cmd_storage_cleanup_orphaned()
+        elif cmd == "storage.snapshot":
+            if len(args) < 3:
+                print("Usage: valcli storage.snapshot <vdisk_id> <snapshot_name>")
+                return 1
+            cmd_storage_derive(args[1], args[2], "snapshot")
+        elif cmd == "storage.clone":
+            if len(args) < 3:
+                print("Usage: valcli storage.clone <vdisk_id> <clone_name>")
+                return 1
+            cmd_storage_derive(args[1], args[2], "clone")
+        elif cmd == "storage.children":
+            if len(args) < 2:
+                print("Usage: valcli storage.children <vdisk_id>")
+                return 1
+            cmd_storage_children(args[1])
+        elif cmd == "storage.snapshots":
+            if len(args) < 2:
+                print("Usage: valcli storage.snapshots <vdisk_id>")
+                return 1
+            cmd_storage_snapshots(args[1])
+        elif cmd == "storage.snapshot-policy":
+            cmd_storage_snapshot_policy()
+        elif cmd == "storage.snapshot-policy.set":
+            cmd_storage_snapshot_policy_set(["valcli"] + list(args))
+        elif cmd == "storage.snapshot-policy.delete":
+            cmd_storage_snapshot_policy_delete(["valcli"] + list(args))
+        elif cmd == "storage.snapshot-run":
+            cmd_storage_snapshot_run(["valcli"] + list(args))
+        elif cmd == "storage.rollback":
+            cmd_storage_rollback(["valcli"] + list(args))
+        elif cmd.startswith("storage.domain"):
+            cmd_storage_domain(["valcli"] + list(args))
+        elif cmd == "storage.heat":
+            limit = 10
+            if len(args) > 1:
+                try:
+                    limit = max(1, min(1000, int(args[1])))
+                except ValueError:
+                    print("Usage: valcli storage.heat [N]")
+                    return 1
+            cmd_storage_heat(limit)
+        elif cmd == "storage.placement":
+            limit = 10
+            if len(args) > 1:
+                try:
+                    limit = max(1, min(100000, int(args[1])))
+                except ValueError:
+                    print("Usage: valcli storage.placement [N]")
+                    return 1
+            cmd_storage_placement(limit)
+        elif cmd == "storage.tier":
+            extra = args[1:]
+            if extra not in ([], ["--apply"]):
+                print("Usage: valcli storage.tier [--apply]")
+                return 1
+            cmd_storage_tier(apply=bool(extra))
+        elif cmd == "storage.sweep":
+            if args[1:]:
+                print("Usage: valcli storage.sweep")
+                return 1
+            cmd_storage_sweep()
+        elif cmd == "storage.scrub":
+            if args[1:]:
+                print("Usage: valcli storage.scrub")
+                return 1
+            cmd_storage_scrub()
+        elif cmd == "storage.compact":
+            cmd_storage_compact(args[1:])
+        elif cmd == "storage.dedup.estimate":
+            cmd_storage_dedup_estimate(args[1:])
+        elif cmd == "storage.takeover":
+            if len(args) < 3:
+                print("Usage: valcli storage.takeover <vdisk> <node>")
+                return 1
+            cmd_storage_takeover(args[1], args[2])
+        elif cmd == "storage.move":
+            if len(args) != 4:
+                print("Usage: valcli storage.move <egroup_id> <disk> <node>")
+                return 1
+            cmd_storage_move(args[1], args[2], args[3])
+        elif cmd == "storage.replication":
+            cmd_storage_replication()
+        elif cmd == "storage.replicate":
+            if len(args) < 2:
+                print("Usage: valcli storage.replicate <vdisk_id>")
+                print("       valcli storage.replicate --all")
+                return 1
+            if args[1] == "--all":
+                cmd_storage_replicate(None, everything=True)
+            else:
+                cmd_storage_replicate(args[1])
+        elif cmd == "image.list":
+            cmd_image_list()
+        elif cmd == "image.delete":
+            if len(args) < 2:
+                print("Error: Image name is required.")
+                print("Usage: valcli image.delete <image_name>")
+                return 1
+            cmd_image_delete(args[1])
+        elif cmd == "disk.list":
+            cmd_disk_list()
+        elif cmd == "disk.delete":
+            if len(args) < 2:
+                print("Error: Disk name is required.")
+                print("Usage: valcli disk.delete <disk_name>")
+                return 1
+            cmd_disk_delete(args[1])
+        elif cmd == "health.check":
+            cmd_health_check()
+        elif cmd == "db.print":
+            cmd_db_print()
+        elif cmd == "db.query":
+            cmd_db_query()
+        elif cmd == "scheduler.list":
+            cmd_scheduler_list()
+        elif cmd == "scheduler.history":
+            cmd_scheduler_history()
+        elif cmd == "system.cleanup":
+            cmd_system_cleanup()
+        elif cmd == "backup.run":
+            cmd_backup_run()
+        elif cmd == "backup.list":
+            cmd_backup_list()
+        elif cmd == "backup.verify":
+            cmd_backup_verify()
+        elif cmd == "backup.restore":
+            cmd_backup_restore()
+        elif cmd == "backup.prune":
+            cmd_backup_prune()
+        elif cmd == "backup.target":
+            cmd_backup_target()
+        elif cmd == "scheduler.trigger":
+            if len(args) < 2:
+                print("Error: Job name is required.")
+                print("Usage: valcli scheduler.trigger <job_name>")
+                return 1
+            cmd_scheduler_trigger(args[1])
         else:
-            cmd_storage_replicate(sys.argv[2])
-    elif cmd == "image.list":
-        cmd_image_list()
-    elif cmd == "image.delete":
-        if len(sys.argv) < 3:
-            print("Error: Image name is required.")
-            print("Usage: valcli image.delete <image_name>")
-            sys.exit(1)
-        cmd_image_delete(sys.argv[2])
-    elif cmd == "disk.list":
-        cmd_disk_list()
-    elif cmd == "disk.delete":
-        if len(sys.argv) < 3:
-            print("Error: Disk name is required.")
-            print("Usage: valcli disk.delete <disk_name>")
-            sys.exit(1)
-        cmd_disk_delete(sys.argv[2])
-    elif cmd == "health.check":
-        cmd_health_check()
-    elif cmd == "db.print":
-        cmd_db_print()
-    elif cmd == "db.query":
-        cmd_db_query()
-    elif cmd == "scheduler.list":
-        cmd_scheduler_list()
-    elif cmd == "scheduler.history":
-        cmd_scheduler_history()
-    elif cmd == "system.cleanup":
-        cmd_system_cleanup()
-    elif cmd == "backup.run":
-        cmd_backup_run()
-    elif cmd == "backup.list":
-        cmd_backup_list()
-    elif cmd == "backup.verify":
-        cmd_backup_verify()
-    elif cmd == "backup.restore":
-        cmd_backup_restore()
-    elif cmd == "backup.prune":
-        cmd_backup_prune()
-    elif cmd == "backup.target":
-        cmd_backup_target()
-    elif cmd == "scheduler.trigger":
-        if len(sys.argv) < 3:
-            print("Error: Job name is required.")
-            print("Usage: valcli scheduler.trigger <job_name>")
-            sys.exit(1)
-        cmd_scheduler_trigger(sys.argv[2])
-    else:
-        print(f"Error: Unknown command '{cmd}'")
+            print(f"Error: Unknown command '{cmd}'")
+            print_usage()
+            return 1
+        return 0
+    finally:
+        sys.argv = old_argv
+
+
+CLI_COMMAND_LIST = [
+    "vm.list", "vm.create", "vm.delete", "vm.edit", "vm.live", "vm.on", "vm.off",
+    "vm.migrate", "vm.balance", "drs.status", "host.list", "host.maintenance.enter",
+    "host.maintenance.leave", "cluster.vip.set", "storage.list", "storage.container.create",
+    "storage.container.update", "storage.container.delete", "storage.benchmark",
+    "storage.cleanup_orphaned", "storage.snapshot", "storage.clone", "storage.children",
+    "storage.snapshots", "storage.snapshot-policy", "storage.snapshot-policy.set",
+    "storage.snapshot-policy.delete", "storage.snapshot-run", "storage.rollback",
+    "storage.domain", "storage.heat", "storage.placement", "storage.tier",
+    "storage.sweep", "storage.scrub", "storage.compact", "storage.dedup.estimate",
+    "storage.takeover", "storage.move", "storage.replication", "storage.replicate",
+    "image.list", "image.delete", "disk.list", "disk.delete", "health.check",
+    "db.print", "db.query", "scheduler.list", "scheduler.history", "scheduler.trigger",
+    "system.cleanup", "backup.run", "backup.list", "backup.verify", "backup.restore",
+    "backup.prune", "backup.target", "help", "exit", "quit", "clear", "version",
+]
+
+
+class ValcliShell(cmd.Cmd):
+    intro = "Valkyrie CLI (valcli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+    prompt = "valcli> "
+
+    def __init__(self, prog_name="valcli"):
+        super().__init__()
+        self.prog_name = prog_name
+        self.prompt = f"{prog_name}> "
+        self.intro = f"Interactive {prog_name} Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+        # Enable readline autocompletion across delimiters like dots
+        try:
+            import readline
+            readline.set_completer_delims(" \t\n")
+        except Exception:
+            pass
+
+    def default(self, line):
+        raw = line.strip()
+        if not raw:
+            return
+        if raw in ("exit", "quit", "q"):
+            return True
+        if raw == "clear":
+            os.system("cls" if os.name == "nt" else "clear")
+            return
+        parts = shlex.split(raw)
+        if not parts:
+            return
+        if parts[0] in (self.prog_name, "valcli", "acli", "ncli"):
+            parts = parts[1:]
+        if not parts:
+            return
+        try:
+            execute_command(parts)
+        except SystemExit:
+            pass
+        except Exception as e:
+            print(f"Error executing command: {e}")
+
+    def emptyline(self):
+        pass
+
+    def do_help(self, arg):
+        if arg:
+            self.default(f"help {arg}")
+        else:
+            print_usage()
+
+    def do_exit(self, arg):
+        """Exit the interactive shell."""
+        return True
+
+    def do_quit(self, arg):
+        """Exit the interactive shell."""
+        return True
+
+    def completedefault(self, text, line, begidx, endidx):
+        # Complete subcommands or arguments
+        tokens = line.lstrip().split()
+        if not tokens or (len(tokens) == 1 and not line.endswith(" ")):
+            prefix = tokens[0] if tokens else ""
+            return [c for c in CLI_COMMAND_LIST if c.startswith(prefix)]
+        return []
+
+    def completenames(self, text, *ignored):
+        return [c for c in CLI_COMMAND_LIST if c.startswith(text)]
+
+
+def main():
+    prog_name = os.path.basename(sys.argv[0])
+    if prog_name.endswith(".py"):
+        prog_name = "valcli"
+
+    if len(sys.argv) < 2:
+        try:
+            if sys.stdin.isatty():
+                shell = ValcliShell(prog_name=prog_name)
+                shell.cmdloop()
+                sys.exit(0)
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            sys.exit(0)
         print_usage()
         sys.exit(1)
+
+    cmd_args = sys.argv[1:]
+    rc = execute_command(cmd_args)
+    sys.exit(rc if rc is not None else 0)
+
 
 if __name__ == "__main__":
     main()
