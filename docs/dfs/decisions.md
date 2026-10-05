@@ -917,3 +917,9 @@ next state and the actions to take; it never decides to fail over by itself, bec
 the other site is down, and a guest reported running at the original site moves the set to `split_brain`, which only an
 operator's `resolve` leaves. **Not addressed:** everything that needs a second cluster (the listener, the wire
 operations, the driver); see the status table in replication.md section 9.
+
+**D-37 — Multi-client NBD sockets; Spectrum never destroys or undefines domains.**
+Two reliability fixes on the VM migration and storage paths:
+*Multi-client NBD sockets:* Sidon's `serve_socket` previously served NBD connections sequentially on a single accept thread. When a read-only vdisk (e.g. an installation ISO attached to multiple guests) was opened by one guest, subsequent connections from other guests or incoming live migrations blocked indefinitely in the socket accept backlog. Wrapping `Export` in `Arc<Export>` and spawning a worker thread per connection allows concurrent sessions across multiple guests on the same node.
+*Spectrum hypervisor isolation:* `spectrum_server` (the web console / API tier) ran an uncoordinated 30-second reconciler that attempted split-brain cleanup by issuing `virsh destroy` and `virsh undefine --keep-nvram` whenever a locally defined domain had a foreign or unassigned `host_ip` in ScyllaDB. During live migration, destination hypervisors temporarily host incoming domains before database commit, leading to lock contention and aborted migrations. Destructive operations were completely removed from Spectrum. Authoritative domain lifecycle belongs exclusively to Mipha (HA leader fencing and node rejoin reconciliation) and Vali (orchestrated migration and shutdown).
+

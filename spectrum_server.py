@@ -3534,8 +3534,6 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if is_local and virsh_read_ok:
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
-                        if name in libvirt_vms:
-                            run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
                             if reconcile_local_vm(name, host_ip, "Stopped"):
                                 vm["state"] = "Stopped"
@@ -4109,8 +4107,6 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if is_local and virsh_read_ok:
                     live_state = libvirt_vms.get(name, "Stopped")
                     if live_state == "Stopped":
-                        if name in libvirt_vms:
-                            run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                         if vm.get("state") != "Stopped" or host_ip != "":
                             if reconcile_local_vm(name, host_ip, "Stopped"):
                                 vm["state"] = "Stopped"
@@ -8560,25 +8556,6 @@ def db_reconcile_loop():
                             state = "Stopped"
                         libvirt_vms[name] = state
 
-            # 1.5. Fetch active tasks from ScyllaDB to protect VMs undergoing operations
-            active_task_vms = set()
-            rc_tasks, stdout_tasks, stderr_tasks = run_cql_query("SELECT JSON * FROM hydra.catalyst_tasks;")
-            if rc_tasks == 0:
-                for line in stdout_tasks.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            task = json.loads(line)
-                            if task.get("status") in ("running", "pending", "processing"):
-                                payload_str = task.get("payload", "{}")
-                                if payload_str:
-                                    payload = json.loads(payload_str)
-                                    vname = payload.get("vm_name") or payload.get("name")
-                                    if vname:
-                                        active_task_vms.add(vname)
-                        except Exception:
-                            pass
-
             # 2. Fetch metadata from ScyllaDB
             cql = "SELECT JSON name, state, host_ip, status FROM hydra.vms;"
             rc, stdout, stderr = run_cql_query(cql)
@@ -8593,8 +8570,8 @@ def db_reconcile_loop():
                             host_ip = vm.get("host_ip", "")
                             status = (vm.get("status") or "").strip().lower()
 
-                            # Never touch a VM that is actively migrating
-                            if status == "migrating":
+                            # Never touch a VM that is in a transient state
+                            if status in ("migrating", "evacuating", "starting", "stopping"):
                                 continue
 
                             # Only reconcile VMs assigned to this node
@@ -8602,25 +8579,19 @@ def db_reconcile_loop():
                             if is_local:
                                 live_state = libvirt_vms.get(name, "Stopped")
                                 if live_state == "Stopped":
-                                    if name in libvirt_vms:
-                                        run_mtls_spark_api("127.0.0.1", "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
                                     if db_state != "Stopped" or host_ip != "":
                                         reconcile_local_vm(name, host_ip, "Stopped")
                                 elif db_state != live_state:
                                     reconcile_local_vm(name, host_ip, live_state)
                             else:
                                 # This VM is assigned to another node in the database.
-                                # If it exists locally (defined or running), we must clean it up to prevent split-brain.
-                                # BUT we protect it if there is an active task running for this VM!
-                                if name in libvirt_vms and name not in active_task_vms:
+                                # Spectrum is a management interface, NOT the HA coordinator.
+                                # Destructive operations (destroy / undefine) must never be executed
+                                # here; domain cleanup across hosts is handled authoritatively by
+                                # Mipha on node rejoin or Vali during migration/fencing.
+                                if name in libvirt_vms:
                                     live_state = libvirt_vms[name]
-                                    print(f"[Reconcile] VM '{name}' is running/defined locally (state: {live_state}) but database assigns it to remote host {host_ip or 'None'}. Cleaning up locally to prevent split-brain...")
-                                    if live_state == "Running":
-                                        run_mtls_spark_api(
-                                            LOCAL_IP,
-                                            "/api/v1/vm/" + urllib.parse.quote(name, safe="") + "/power",
-                                            {"action": "destroy"})
-                                    run_mtls_spark_api(LOCAL_IP, "/api/v1/vm/undefine", {"name": name, "keep_nvram": True})
+                                    print(f"[Reconcile] VM '{name}' exists locally (state: {live_state}) but database assigns it to {host_ip or 'None'}; leaving domain lifecycle to Mipha/Vali.")
                         except Exception:
                             pass
         except Exception:

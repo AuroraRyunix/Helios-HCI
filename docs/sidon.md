@@ -217,6 +217,12 @@ Sidon restart under a running guest ends that guest's disk with I/O errors; rest
 at start is listed in TODO.md because it needs the claim, fence and journal recovery done at
 start-up, which is not a small change.
 
+**Multi-client NBD sockets.** An export socket serves multiple concurrent client sessions (wrapping
+`Export` in `Arc<Export>` and spawning a worker thread per connection). This allows shared read-only
+vdisks (such as installation ISOs) to be mounted by multiple virtual machines on the same host
+simultaneously, and allows incoming live migrations to connect to existing image sockets without
+blocking in the socket accept backlog (D-37).
+
 ## 4. Purah
 
 The curator, running inside Sidon. Three jobs, all background, none on the guest's path:

@@ -736,7 +736,7 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let sessions = Arc::new(AtomicUsize::new(0));
         let sessions_thread = Arc::clone(&sessions);
-        let export = Export { backend, name: id.to_string() };
+        let export = Arc::new(Export { backend, name: id.to_string() });
         let stop_thread = Arc::clone(&stop);
         thread::spawn(move || {
             for conn in listener.incoming() {
@@ -745,13 +745,17 @@ impl Daemon {
                 }
                 match conn {
                     Ok(s) => {
-                        sessions_thread.fetch_add(1, Ordering::SeqCst);
-                        if let Err(e) = nbd::serve(s, &export) {
-                            // A guest closing its disk shows up as a read error on the
-                            // next header; that is a disconnect, not a fault.
-                            eprintln!("sidon: nbd session for {} ended: {e}", export.name);
-                        }
-                        sessions_thread.fetch_sub(1, Ordering::SeqCst);
+                        let exp = Arc::clone(&export);
+                        let sess = Arc::clone(&sessions_thread);
+                        sess.fetch_add(1, Ordering::SeqCst);
+                        thread::spawn(move || {
+                            if let Err(e) = nbd::serve(s, &exp) {
+                                // A guest closing its disk shows up as a read error on the
+                                // next header; that is a disconnect, not a fault.
+                                eprintln!("sidon: nbd session for {} ended: {e}", exp.name);
+                            }
+                            sess.fetch_sub(1, Ordering::SeqCst);
+                        });
                     }
                     Err(e) => {
                         eprintln!("sidon: nbd accept failed: {e}");

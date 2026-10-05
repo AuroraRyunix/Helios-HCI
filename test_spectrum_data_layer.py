@@ -21,6 +21,7 @@ write sequence, not just on its result.
 Run with:  python -m unittest test_spectrum_data_layer
 """
 
+import ast
 import importlib.util
 import io
 import json
@@ -840,6 +841,41 @@ class UpdateDecisionTests(unittest.TestCase):
             "1.3.0-b5000", "1.3.0-b5000",
             {"spark": check_updates.FALLBACK_BUILD}, inventory)
         self.assertFalse(available)
+
+
+class SpectrumReconciliationPolicyTests(unittest.TestCase):
+    """Guard against rogue out-of-band domain destruction in the web/management tier.
+
+    Spectrum is a management and API interface, not the HA coordinator or VM placement
+    scheduler. Hypervisor domain lifecycle (destroy, undefine) belongs authoritatively to
+    Mipha (HA fencing/reconciliation) and Vali (VM lifecycle/migration). Spectrum's
+    reconciliation loop and GET handlers must never destroy or undefine domains.
+    """
+
+    def setUp(self):
+        with open(os.path.join(HERE, "spectrum_server.py"), "r", encoding="utf-8") as f:
+            self.source = f.read()
+        self.tree = ast.parse(self.source)
+
+    def test_db_reconcile_loop_does_not_issue_destructive_commands(self):
+        fn = next((n for n in self.tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "db_reconcile_loop"), None)
+        self.assertIsNotNone(fn, "db_reconcile_loop not found")
+        fn_source = ast.get_source_segment(self.source, fn)
+        self.assertNotIn("/api/v1/vm/undefine", fn_source)
+        self.assertNotIn('"action": "destroy"', fn_source)
+        self.assertNotIn("'action': 'destroy'", fn_source)
+
+    def test_get_vm_list_handlers_do_not_undefine_domains(self):
+        # GET handlers must be strictly read-only and never issue mutating undefine calls.
+        handler = next((n for n in self.tree.body
+                        if isinstance(n, ast.ClassDef) and n.name == "SpectrumHandler"), None)
+        self.assertIsNotNone(handler, "SpectrumHandler not found")
+        do_get = next((n for n in handler.body
+                       if isinstance(n, ast.FunctionDef) and n.name == "do_GET"), None)
+        self.assertIsNotNone(do_get, "do_GET not found")
+        get_source = ast.get_source_segment(self.source, do_get)
+        self.assertNotIn("/api/v1/vm/undefine", get_source)
 
 
 if __name__ == "__main__":
