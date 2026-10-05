@@ -3701,18 +3701,14 @@ ALL_COMMANDS = VALCLI_COMMANDS | NCLI_COMMANDS | COMMON_COMMANDS
 def get_command_list(prog_name="valcli"):
     """Return the allowed commands for a given CLI program name."""
     p = os.path.basename(prog_name).replace(".py", "").lower()
-    if p in ("valcli", "acli"):
-        return sorted(VALCLI_COMMANDS | COMMON_COMMANDS)
-    elif p == "ncli":
+    if p == "ncli":
         return sorted(NCLI_COMMANDS | COMMON_COMMANDS)
-    return sorted(ALL_COMMANDS)
+    return sorted(VALCLI_COMMANDS | COMMON_COMMANDS)
 
 
 def print_usage(prog_name="valcli"):
     p = os.path.basename(prog_name).replace(".py", "").lower()
-    if p in ("valcli", "acli"):
-        title = "Valkyrie CLI (valcli) v1.2.0 - Workload & VM Manager"
-    elif p == "ncli":
+    if p == "ncli":
         title = "Nutanix Cluster CLI (ncli) v1.2.0 - Infrastructure & Cluster Manager"
     else:
         p = "valcli"
@@ -3721,7 +3717,7 @@ def print_usage(prog_name="valcli"):
     print(f"{title}\n")
     print("Usage:")
 
-    if p in ("valcli", "acli"):
+    if p == "valcli":
         print(f"  {p} vm.list                     List all virtual machines in the cluster")
         print(f"  {p} vm.create <name> <vc> <mem> Create a new VM configuration and disks")
         print(f"  {p} vm.delete <name> [flags]    Delete VM configuration and its disks (--force, --keep-disks)")
@@ -3736,7 +3732,7 @@ def print_usage(prog_name="valcli"):
         print(f"  {p} disk.list                   List all active and orphaned virtual disks")
         print(f"  {p} disk.delete <name>          Delete virtual disk (fails if disk is attached to a VM)")
 
-    if p in ("ncli", "valcli"):
+    if p == "ncli":
         print(f"  {p} drs.status                  Print cluster balance score and recent DRS migrations")
         print(f"  {p} host.list                   List all hosts and their maintenance state")
         print(f"  {p} host.maintenance.enter <h>  Put host (or '--all') into maintenance mode and evacuate VMs")
@@ -3807,7 +3803,7 @@ def print_usage(prog_name="valcli"):
 def execute_command(args, prog_name="valcli"):
     """Execute a single command with the given argument list (e.g. ['vm.list'])."""
     p = os.path.basename(prog_name).replace(".py", "").lower()
-    if p not in ("acli", "ncli"):
+    if p != "ncli":
         p = "valcli"
 
     old_argv = sys.argv
@@ -3819,9 +3815,7 @@ def execute_command(args, prog_name="valcli"):
 
         cmd = args[0]
         if cmd in ["--version", "-v", "-version", "version"]:
-            if p == "acli":
-                print("Acropolis CLI (acli) v1.2.0")
-            elif p == "ncli":
+            if p == "ncli":
                 print("Nutanix Cluster CLI (ncli) v1.2.0")
             else:
                 print("Valkyrie CLI (valcli) v1.2.0")
@@ -3835,7 +3829,7 @@ def execute_command(args, prog_name="valcli"):
         is_vm_cmd = (cmd in VALCLI_COMMANDS) or (cmd.startswith("vm.") or cmd.startswith("image.") or cmd.startswith("disk."))
         is_infra_cmd = (cmd in NCLI_COMMANDS) or (cmd.startswith("storage.") or cmd.startswith("host.") or cmd.startswith("cluster.") or cmd.startswith("scheduler.") or cmd.startswith("backup.") or cmd.startswith("db.") or cmd.startswith("health.") or cmd.startswith("drs.") or cmd.startswith("system."))
 
-        if p in ("valcli", "acli") and not is_vm_cmd and is_infra_cmd:
+        if p == "valcli" and not is_vm_cmd and is_infra_cmd:
             print(f"Error: '{cmd}' is a cluster infrastructure command. Use ncli: ncli {cmd}")
             return 1
         elif p == "ncli" and not is_infra_cmd and is_vm_cmd:
@@ -4079,13 +4073,11 @@ class ValcliShell(cmd.Cmd):
     def __init__(self, prog_name="valcli"):
         super().__init__()
         p = os.path.basename(prog_name).replace(".py", "").lower()
-        if p not in ("acli", "ncli"):
+        if p != "ncli":
             p = "valcli"
         self.prog_name = p
         self.prompt = f"{p}> "
-        if p == "acli":
-            self.intro = "Acropolis CLI (acli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
-        elif p == "ncli":
+        if p == "ncli":
             self.intro = "Nutanix Cluster CLI (ncli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
         else:
             self.intro = "Valkyrie CLI (valcli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
@@ -4111,7 +4103,7 @@ class ValcliShell(cmd.Cmd):
         parts = shlex.split(raw)
         if not parts:
             return
-        if parts[0] in (self.prog_name, "valcli", "acli", "ncli"):
+        if parts[0] in (self.prog_name, "valcli", "ncli"):
             parts = parts[1:]
         if not parts:
             return
