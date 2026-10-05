@@ -4139,13 +4139,155 @@ class ValcliShell(cmd.Cmd):
         """Exit the interactive shell."""
         return True
 
+    identchars = cmd.Cmd.identchars + ".-"
+
+    def _get_hostnames(self):
+        """Fetch list of hostnames from cluster.json, local cache or DB."""
+        hosts = []
+        try:
+            if os.path.exists("/etc/hci/cluster.json"):
+                with open("/etc/hci/cluster.json", "r") as f:
+                    cdata = json.load(f)
+                    for h in cdata.get("hosts", []):
+                        if h.get("hostname"):
+                            hosts.append(h["hostname"])
+        except Exception:
+            pass
+        return hosts
+
+    def _get_vm_names(self):
+        """Fetch list of VM names from hydra.vms."""
+        vms = []
+        try:
+            rc, out, _ = run_cql_query("SELECT name FROM hydra.vms;")
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("---") and not line.lower().startswith("name"):
+                        vms.append(line.split()[0])
+        except Exception:
+            pass
+        return vms
+
+    def _get_storage_containers(self):
+        """Fetch list of storage container names."""
+        containers = []
+        try:
+            rc, out, _ = run_cql_query("SELECT name FROM hydra.storage_containers;")
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("---") and not line.lower().startswith("name"):
+                        containers.append(line.split()[0])
+        except Exception:
+            pass
+        return containers
+
+    def _get_vdisk_ids(self):
+        """Fetch list of vdisk IDs."""
+        vdisks = []
+        try:
+            rc, out, _ = run_cql_query("SELECT id FROM hydra.vdisks;")
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("---") and not line.lower().startswith("id"):
+                        vdisks.append(line.split()[0])
+        except Exception:
+            pass
+        return vdisks
+
+    def _get_images(self):
+        """Fetch list of registered images."""
+        images = []
+        try:
+            rc, out, _ = run_cql_query("SELECT name FROM hydra.images;")
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("---") and not line.lower().startswith("name"):
+                        images.append(line.split()[0])
+        except Exception:
+            pass
+        return images
+
     def completedefault(self, text, line, begidx, endidx):
-        # Complete subcommands or arguments
         tokens = line.lstrip().split()
-        if not tokens or (len(tokens) == 1 and not line.endswith(" ")):
+        trailing_space = line.endswith(" ")
+        num_tokens = len(tokens)
+
+        # 0 or 1 token being typed: complete command name
+        if num_tokens == 0 or (num_tokens == 1 and not trailing_space):
             prefix = tokens[0] if tokens else ""
             return [c for c in self.allowed_commands if c.startswith(prefix)]
+
+        command = tokens[0]
+        arg_index = num_tokens if trailing_space else num_tokens - 1
+        prefix = "" if trailing_space else tokens[-1]
+
+        # Host completions
+        if command in ("host.maintenance.enter", "host.maintenance.leave"):
+            if arg_index == 1:
+                options = self._get_hostnames() + ["--all"]
+                return [h for h in options if h.startswith(prefix)]
+
+        if command == "vm.migrate":
+            if arg_index == 1:
+                return [v for v in self._get_vm_names() if v.startswith(prefix)]
+            elif arg_index == 2:
+                return [h for h in self._get_hostnames() if h.startswith(prefix)]
+
+        if command == "storage.takeover":
+            if arg_index == 1:
+                return [d for d in self._get_vdisk_ids() if d.startswith(prefix)]
+            elif arg_index == 2:
+                return [h for h in self._get_hostnames() if h.startswith(prefix)]
+
+        # VM name completions
+        if command in ("vm.on", "vm.off", "vm.delete", "vm.edit", "vm.live"):
+            if arg_index == 1:
+                return [v for v in self._get_vm_names() if v.startswith(prefix)]
+
+        # Storage container completions
+        if command in ("storage.container.update", "storage.container.delete", "storage.benchmark"):
+            if arg_index == 1:
+                return [c for c in self._get_storage_containers() if c.startswith(prefix)]
+
+        # Vdisk ID completions
+        if command in ("storage.snapshot", "storage.clone", "storage.children", "storage.snapshots", "storage.replicate", "storage.rollback"):
+            if arg_index == 1:
+                options = self._get_vdisk_ids() + (["--all"] if command == "storage.replicate" else [])
+                return [v for v in options if v.startswith(prefix)]
+
+        # Image completions
+        if command == "image.delete":
+            if arg_index == 1:
+                return [img for img in self._get_images() if img.startswith(prefix)]
+
         return []
+
+    def complete(self, text, state):
+        """Custom complete to cleanly handle dot-separated commands and argument completion."""
+        if state == 0:
+            import readline
+            origline = readline.get_line_buffer()
+            line = origline.lstrip()
+            stripped = len(origline) - len(line)
+            begidx = readline.get_begidx() - stripped
+            endidx = readline.get_endidx() - stripped
+
+            cmd_name, args, _ = self.parseline(line)
+            if not cmd_name or begidx <= len(cmd_name):
+                # Typing the command itself
+                compfunc = self.completenames
+            else:
+                compfunc = self.completedefault
+
+            self.completion_matches = compfunc(text, line, begidx, endidx)
+        try:
+            return self.completion_matches[state]
+        except (IndexError, TypeError):
+            return None
 
     def completenames(self, text, *ignored):
         return [c for c in self.allowed_commands if c.startswith(text)]
