@@ -424,7 +424,33 @@ class HeadroomAtDefineTime(unittest.TestCase):
     def test_the_start_path_asks_for_headroom_only_when_the_setting_is_on(self):
         src = open(os.path.join(HERE, "vali.py"), encoding="utf-8").read()
         self.assertIn("hotplug_max_vcpus=hotplug_vcpu_limit(vcpu) if hotplug_headroom_enabled() else None", src)
+        self.assertIn("hotplug_max_memory=hotplug_memory_limit(memory) if hotplug_headroom_enabled() else None", src)
+
+    def test_memory_headroom_emits_max_memory_and_current_memory(self):
+        xml_without = self.build()
+        root_without = ET.fromstring(xml_without)
+        self.assertIsNone(root_without.find("maxMemory"))
+        self.assertEqual(root_without.find("memory").text, "2048")
+        self.assertEqual(root_without.find("currentMemory").text, "2048")
+
+        limit = vali.hotplug_memory_limit(2048)
+        self.assertEqual(limit, 8192)
+        xml_with = self.build(hotplug_max_memory=limit)
+        root_with = ET.fromstring(xml_with)
+        max_mem = root_with.find("maxMemory")
+        self.assertIsNotNone(max_mem)
+        self.assertEqual(max_mem.text, "8192")
+        self.assertEqual(max_mem.get("slots"), "16")
+        self.assertEqual(max_mem.get("unit"), "MiB")
+        self.assertEqual(root_with.find("memory").text, "2048")
+        self.assertEqual(root_with.find("currentMemory").text, "2048")
+
+    def test_the_memory_limit(self):
+        limit = vali.hotplug_memory_limit
+        self.assertEqual([limit(m) for m in (1024, 2048, 4096, 32768, 65536, 131072, 262144)],
+                         [4096, 8192, 16384, 131072, 131072, 131072, 262144])
 
 
 if __name__ == "__main__":
     unittest.main()
+

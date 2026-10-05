@@ -412,3 +412,20 @@ Each has a test that fails on the old code (except where marked): Catalyst refus
 
 Also fixed, each with a test: a column that a migration already added is success when the migration is re-run (`ALTER ... ADD` in 0006 and 0008 cannot be made idempotent and their text is checksummed); candidacies dial this node's own ZooKeeper first (they all pinned to the first host); Catalyst drops stale in-memory queue entries when it takes dispatch and does not spend its first-pass flag on a failed table read; a self-fenced Mipha leader withdraws from the HA election; the NVRAM backup deletes the local varstore only after the database has the data and sends the statement on stdin; the two console pages that reconciled VM placement no longer do so when `virsh list` failed; the settings save really updates `cluster.json` on every host and touches DNS, NTP and timezone only when sent.
 Removed from the not-fixed list above: the migration 0006/0008 item, the `helios_zk` host-order item, the Catalyst queue-clearing item, the self-fenced-leader item, the NVRAM item, the `GET /api/vms` unplacing item, and the settings-save item. Still not fixed and **the owner's decision, not mine**: the rollout re-adding `--privileged` to the console container.
+
+#### Fourth batch: typed spark endpoints & memory hotplug headroom
+
+Fixed, each with tests and full suite verification:
+- Migrated untyped raw shell calls across `vali.py` and `spectrum_server.py` to typed mTLS Spark endpoints:
+  - System virtualization and KVM capability detection queries `GET /api/v1/host/capabilities` before fallback.
+  - Node utilization metrics (`get_node_utilization`) queries `GET /api/v1/host/memory` and `GET /api/v1/host/cpu` instead of invoking `free -m` and `/proc/stat` python snippets.
+  - Domain power actions (`reboot`, `shutdown`, `reset`) in `vali.py` use `POST /api/v1/vm/{name}/power`.
+  - Host maintenance markers in `host_maintenance_enter` and `host_maintenance_leave` use `POST /api/v1/host/maintenance-state` (`ENTER`/`LEAVE`).
+  - Database ring member queries in `vali.py:get_ring_members()` query `GET /api/v1/db/ring` before falling back to local `nodetool status`.
+  - Domain enumeration in `spectrum_server.py` (VM listing and background reconcile loop) uses typed `GET /api/v1/host/domains` rather than raw `virsh list --all` shell pipelines.
+  - VM deletion NVRAM cleanup in `spectrum_server.py` uses `POST /api/v1/vm/{name}/nvram` (`action: "clean"`).
+- Implemented memory hotplug headroom in `vali.py` (`HOTPLUG_MAX_MEMORY_MB = 131072`, `hotplug_memory_limit(memory)`):
+  - Emits `<maxMemory slots='16' unit='MiB'>{max_memory}</maxMemory>` and `<currentMemory unit='MiB'>{memory}</currentMemory>` when `vm_hotplug_headroom` is enabled in cluster settings, reserving guest address space and DIMM slots matching ESXi/Nutanix hot-add semantics.
+  - Verified by unit tests in `test_vm_live_vali.py` ensuring `<maxMemory>` is emitted with headroom and omitted without headroom.
+- Synchronized `provision.py` manifests via `sync_provision.py` and validated against `test_deployment_manifest.py`.
+- Full regression suite passes cleanly across all touched subsystems.

@@ -146,17 +146,17 @@ def run_remote_spark(ip, command, timeout=None):
         return -1, "", str(e)
 
 def run_mtls_spark_api(ip, path, payload, method="POST"):
-    ip, verify_identity = spark_endpoint(ip)
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
-    context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
-    context.check_hostname = verify_identity
-
-    url = f"https://{ip}:9099{path}"
-    data = None
-    if payload is not None and method != "GET":
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
+        ip, verify_identity = spark_endpoint(ip)
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+        context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+        context.check_hostname = verify_identity
+
+        url = f"https://{ip}:9099{path}"
+        data = None
+        if payload is not None and method != "GET":
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, context=context, timeout=120) as response:
             res = json.loads(response.read().decode("utf-8"))
             return 0, res, ""
@@ -760,30 +760,45 @@ def get_cluster_hosts():
         return []
 
 def get_node_utilization(ip, fetch_cpu=False):
-    # Memory usage
-    rc_m, stdout_m, _ = run_remote_spark(ip, "free -m")
+    # Memory usage via typed Spark endpoint
     u_mem = 0.0
     mem_total = 1.0
     mem_used = 0.0
-    if rc_m == 0:
-        for line in stdout_m.splitlines():
-            if line.strip().startswith("Mem:"):
-                parts = line.split()
-                mem_total = float(parts[1])
-                mem_used = float(parts[2])
-                u_mem = mem_used / mem_total
-                break
+    rc_m, res_m, _ = run_mtls_spark_api(ip, "/api/v1/host/memory", None, method="GET")
+    if rc_m == 0 and isinstance(res_m, dict) and "total_mb" in res_m:
+        mem_total = float(res_m.get("total_mb", 1.0)) or 1.0
+        mem_used = float(res_m.get("used_mb", 0.0))
+        u_mem = mem_used / mem_total
+    else:
+        # Fallback to shell if running against an older spark daemon
+        rc_m, stdout_m, _ = run_remote_spark(ip, "free -m")
+        if rc_m == 0:
+            for line in stdout_m.splitlines():
+                if line.strip().startswith("Mem:"):
+                    parts = line.split()
+                    mem_total = float(parts[1])
+                    mem_used = float(parts[2])
+                    u_mem = mem_used / mem_total
+                    break
 
     u_cpu = 0.0
     if fetch_cpu:
-        # CPU usage over 0.5s
-        cpu_cmd = "python3 -c \"import time; f=open('/proc/stat'); l1=f.readline().split(); f.close(); time.sleep(0.2); f=open('/proc/stat'); l2=f.readline().split(); f.close(); d1=sum(int(x) for x in l1[1:]); d2=sum(int(x) for x in l2[1:]); idle1=int(l1[4]); idle2=int(l2[4]); print(1.0 - (idle2-idle1)/(d2-d1))\""
-        rc_c, stdout_c, _ = run_remote_spark(ip, cpu_cmd)
-        if rc_c == 0:
-            try:
-                u_cpu = float(stdout_c.strip())
-            except:
-                pass
+        # CPU usage via typed Spark endpoint
+        rc_c, res_c, _ = run_mtls_spark_api(ip, "/api/v1/host/cpu", None, method="GET")
+        if rc_c == 0 and isinstance(res_c, dict) and "load_average" in res_c:
+            load = res_c.get("load_average")
+            cores = float(res_c.get("cores") or 1.0)
+            if load and isinstance(load, list) and len(load) > 0:
+                u_cpu = float(load[0]) / cores
+        else:
+            # Fallback to shell measurement over 0.2s
+            cpu_cmd = "python3 -c \"import time; f=open('/proc/stat'); l1=f.readline().split(); f.close(); time.sleep(0.2); f=open('/proc/stat'); l2=f.readline().split(); f.close(); d1=sum(int(x) for x in l1[1:]); d2=sum(int(x) for x in l2[1:]); idle1=int(l1[4]); idle2=int(l2[4]); print(1.0 - (idle2-idle1)/(d2-d1))\""
+            rc_c, stdout_c, _ = run_remote_spark(ip, cpu_cmd)
+            if rc_c == 0:
+                try:
+                    u_cpu = float(stdout_c.strip())
+                except:
+                    pass
 
     return u_cpu, u_mem, mem_total, mem_used
 
@@ -1161,12 +1176,13 @@ def normalise_graphics(value):
     return "spice" if str(value or "").strip().lower() == "spice" else "vnc"
 
 
-# vCPU headroom for hot-add. A domain's maximum vCPU count is fixed when it is defined, so a VM that
-# is to be able to gain vCPUs while it runs has to be defined with room for them -- and the CPU
-# topology has to cover the maximum, which is guest-visible (the guest sees the extra CPUs as
-# possible but offline). It is therefore opt-in, by the cluster setting `vm_hotplug_headroom`, and
-# takes effect at the VM's next start. See docs/vm_lifecycle.md.
+# vCPU and Memory headroom for hot-add. A domain's maximum vCPU count and memory headroom
+# are fixed when it is defined, so a VM that is to be able to gain vCPUs or memory while it
+# runs has to be defined with room for them. The CPU topology covers the maximum vCPUs, and
+# <maxMemory> reserves memory slots and address space. It is opt-in via cluster setting
+# `vm_hotplug_headroom`, and takes effect at the VM's next start. See docs/vm_lifecycle.md.
 HOTPLUG_MAX_VCPUS = 16
+HOTPLUG_MAX_MEMORY_MB = 131072
 
 
 def hotplug_vcpu_limit(vcpu):
@@ -1174,8 +1190,13 @@ def hotplug_vcpu_limit(vcpu):
     return max(int(vcpu), min(HOTPLUG_MAX_VCPUS, int(vcpu) * 4))
 
 
+def hotplug_memory_limit(memory):
+    """The maximum memory in MiB a domain with `memory` online is defined with when headroom is on."""
+    return max(int(memory), min(HOTPLUG_MAX_MEMORY_MB, int(memory) * 4))
+
+
 def hotplug_headroom_enabled():
-    """Whether new domain definitions reserve vCPU headroom (cluster setting, default off)."""
+    """Whether new domain definitions reserve vCPU and memory headroom (cluster setting, default off)."""
     rc, out, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'vm_hotplug_headroom';")
     if rc != 0:
         return False
@@ -1186,7 +1207,7 @@ def hotplug_headroom_enabled():
     return False
 
 
-def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc", hotplug_max_vcpus=None):
+def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc", hotplug_max_vcpus=None, hotplug_max_memory=None):
     primary_container = get_default_container()
     if disks_list and disks_list != "NONE":
         first_entry = disks_list.split(",")[0]
@@ -1317,30 +1338,40 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
 
     global KVM_CACHE, VMWARE_CACHE
     has_kvm = False
-    if host_ip in KVM_CACHE:
-        has_kvm = KVM_CACHE[host_ip]
-    else:
-        try:
-            rc, _, _ = run_remote_spark(host_ip, "test -e /dev/kvm")
-            has_kvm = (rc == 0)
-            # run_remote_spark reports a transport failure as rc -1, not by raising. Caching that
-            # as "no KVM" defined every later domain as plain qemu until Vali restarted.
-            if rc >= 0:
-                KVM_CACHE[host_ip] = has_kvm
-        except Exception:
-            pass
-
     is_vmware = False
-    if host_ip in VMWARE_CACHE:
+    if host_ip in KVM_CACHE and host_ip in VMWARE_CACHE:
+        has_kvm = KVM_CACHE[host_ip]
         is_vmware = VMWARE_CACHE[host_ip]
     else:
-        try:
-            rc, stdout, _ = run_remote_spark(host_ip, "systemd-detect-virt")
-            is_vmware = (rc == 0 and "vmware" in stdout.strip().lower())
-            if rc >= 0:
-                VMWARE_CACHE[host_ip] = is_vmware
-        except Exception:
-            pass
+        rc_caps, res_caps, _ = run_mtls_spark_api(host_ip, "/api/v1/host/capabilities", None, method="GET")
+        if rc_caps == 0 and isinstance(res_caps, dict) and "kvm" in res_caps:
+            has_kvm = bool(res_caps.get("kvm", False))
+            virt = str(res_caps.get("virt", "")).lower()
+            is_vmware = "vmware" in virt
+            KVM_CACHE[host_ip] = has_kvm
+            VMWARE_CACHE[host_ip] = is_vmware
+        else:
+            if host_ip in KVM_CACHE:
+                has_kvm = KVM_CACHE[host_ip]
+            else:
+                try:
+                    rc, _, _ = run_remote_spark(host_ip, "test -e /dev/kvm")
+                    has_kvm = (rc == 0)
+                    if rc >= 0:
+                        KVM_CACHE[host_ip] = has_kvm
+                except Exception:
+                    pass
+
+            if host_ip in VMWARE_CACHE:
+                is_vmware = VMWARE_CACHE[host_ip]
+            else:
+                try:
+                    rc, stdout, _ = run_remote_spark(host_ip, "systemd-detect-virt")
+                    is_vmware = (rc == 0 and "vmware" in stdout.strip().lower())
+                    if rc >= 0:
+                        VMWARE_CACHE[host_ip] = is_vmware
+                except Exception:
+                    pass
 
     domain_type = "kvm" if has_kvm else "qemu"
 
@@ -1495,10 +1526,12 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         )
     else:
         sound_xml = ""
+    max_mem_xml = f"<maxMemory slots='16' unit='MiB'>{hotplug_max_memory}</maxMemory>\n  " if hotplug_max_memory and int(hotplug_max_memory) > int(memory) else ""
     vm_xml = f"""<domain type='{domain_type}'>
   <name>{name}</name>
   {uuid_xml}
-  <memory unit='MiB'>{memory}</memory>
+  {max_mem_xml}<memory unit='MiB'>{memory}</memory>
+  <currentMemory unit='MiB'>{memory}</currentMemory>
   {vcpu_element}
   <iothreads>1</iothreads>
   <os>
@@ -1752,7 +1785,8 @@ def process_queue_task(task):
             audio_enabled = bool(vm_data.get("audio_enabled", False))
             vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled,
                                      graphics=vm_data.get("graphics"),
-                                     hotplug_max_vcpus=hotplug_vcpu_limit(vcpu) if hotplug_headroom_enabled() else None)
+                                     hotplug_max_vcpus=hotplug_vcpu_limit(vcpu) if hotplug_headroom_enabled() else None,
+                                     hotplug_max_memory=hotplug_memory_limit(memory) if hotplug_headroom_enabled() else None)
             import base64
             b64_xml = base64.b64encode(vm_xml.encode("utf-8")).decode("utf-8")
             
@@ -1882,10 +1916,15 @@ def process_queue_task(task):
             host_ip = vm_data.get("host_ip", "")
             if not host_ip:
                 return False, "VM is not running."
+            rc, res_pow, err_pow = run_mtls_spark_api(
+                host_ip, f"/api/v1/vm/{urllib.parse.quote(vm_name)}/power", {"action": action})
+            if rc == 0:
+                return True, host_ip
+            # Fallback to shell if running against an older daemon
             cmd = f"virsh -c qemu:///system {action} {shlex.quote(vm_name)}"
             rc, stdout, stderr = run_remote_spark(host_ip, cmd)
             if rc != 0:
-                return False, f"Failed to execute {action} on host: {stderr.strip()}"
+                return False, f"Failed to execute {action} on host: {err_pow or stderr.strip()}"
             return True, host_ip
             
         elif action == "migrate":
@@ -2193,8 +2232,11 @@ def process_queue_task(task):
                 # into maintenance. If it cannot be written nothing has been stopped yet, so the
                 # entry is abandoned and the host put back, instead of recorded in the database
                 # as in maintenance while the host does not know it.
-                rc_state, _, err_state = run_remote_spark(
-                    target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
+                rc_state, _, err_state = run_mtls_spark_api(
+                    target_ip, "/api/v1/host/maintenance-state", {"state": "ENTER", "reason": f"maintenance on {hostname}"})
+                if rc_state != 0:
+                    rc_state, _, err_state = run_remote_spark(
+                        target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
                 if rc_state != 0:
                     run_cql_query(f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';")
                     release_maintenance_lock(lock_token)
@@ -2244,7 +2286,9 @@ def process_queue_task(task):
                 return False, "Invalid payload parameters for host_maintenance_leave."
                 
             # Remove state file and start services on the target host
-            run_remote_spark(target_ip, "rm -f /etc/hci/maintenance.state")
+            rc_leave, _, _ = run_mtls_spark_api(target_ip, "/api/v1/host/maintenance-state", {"state": "LEAVE"})
+            if rc_leave != 0:
+                run_remote_spark(target_ip, "rm -f /etc/hci/maintenance.state")
             
             # Update task progress
             call_catalyst_api("/api/v1/tasks/update", {
@@ -2509,9 +2553,14 @@ def get_ring_members():
     rather than the host being drained -- which is the host most likely to be the reason
     the ring is being inspected in the first place.
     """
+    rc_ring, res_ring, err_ring = run_mtls_spark_api(LOCAL_IP, "/api/v1/db/ring", None, method="GET")
+    if rc_ring == 0 and isinstance(res_ring, dict) and "nodes" in res_ring:
+        nodes = res_ring.get("nodes") or []
+        if nodes:
+            return nodes, ""
     rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
     if rc != 0:
-        return [], (stderr or stdout or "nodetool status failed").strip()[:300]
+        return [], (err_ring or stderr or stdout or "nodetool status failed").strip()[:300]
     members = parse_nodetool_status(stdout)
     if not members:
         return [], "nodetool status returned no ring members"

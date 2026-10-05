@@ -194,6 +194,19 @@ class Cluster:
         return (True, "") if self.unit_action_ok else (False, "spark refused")
 
     def node_status(self, ip, path, payload=None, method="POST"):
+        if path == "/api/v1/host/maintenance-state":
+            state = (payload or {}).get("state")
+            if state == "ENTER":
+                if self.marker_write_rc == 0:
+                    self.marker = True
+                    self.events.append(("remote", ip, "touch /etc/hci/maintenance.state"))
+                    return 0, {"written": True}, ""
+                return -1, {}, "read-only file system"
+            elif state == "LEAVE":
+                self.marker = False
+                self.events.append(("remote", ip, "rm -f /etc/hci/maintenance.state"))
+                return 0, {"cleared": True}, ""
+            return -1, {}, "invalid state"
         if path == "/api/v1/node/status":
             self.events.append(("status-poll",))
             reply = self.node_status_replies[0] if len(self.node_status_replies) == 1 else (

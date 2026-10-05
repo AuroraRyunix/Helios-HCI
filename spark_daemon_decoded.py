@@ -3,6 +3,7 @@ __build__ = "1.2.3"
 import sys
 import os
 import ssl
+import shutil
 
 # Line-buffer the log. Under systemd stdout is a pipe, so Python block-buffers it and a line such as
 # "[WATCHDOG] Starting service health watchdog" can sit in memory for minutes. Mimir's watchdog
@@ -3040,7 +3041,15 @@ def read_host_capabilities():
     except OSError:
         secure_boot = False
 
-    return {"kvm": kvm, "secure_boot": secure_boot, "graphics": read_graphics_support()}
+    virt = "none"
+    try:
+        rc, out, _ = run_argv(["systemd-detect-virt"], timeout=5)
+        if rc == 0:
+            virt = out.strip().lower()
+    except Exception:
+        pass
+
+    return {"kvm": kvm, "secure_boot": secure_boot, "graphics": read_graphics_support(), "virt": virt}
 
 
 # Which console protocols this hypervisor can actually serve.
@@ -4373,6 +4382,9 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/cluster/state":
             self.handle_cluster_state_action()
             return True
+        if path == "/api/v1/host/maintenance-state":
+            self.handle_host_maintenance_state()
+            return True
 
         segments = [segment for segment in path.split("/") if segment]
         if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "power":
@@ -4388,6 +4400,20 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                 self.reject("Invalid VM name")
                 return True
             self.handle_vm_live(name)
+            return True
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "nvram":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_nvram(name)
+            return True
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "migrate":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_migrate(name)
             return True
 
         return False
@@ -4556,6 +4582,144 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             self.send_json_response(409, {"state": state or "", "error": message})
             return
         self.send_json_response(200, {"state": state or ""})
+
+    def handle_vm_nvram(self, name):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        action = payload.get("action", "")
+        delete_local = bool(payload.get("delete_local", False))
+        nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
+        template_paths = ["/usr/share/edk2/ovmf/OVMF_VARS.fd", "/usr/share/OVMF/OVMF_VARS.fd"]
+
+        if action == "backup":
+            if os.path.exists(nvram_path):
+                try:
+                    with open(nvram_path, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode("ascii")
+                    cql = f"INSERT INTO hydra.vm_nvram (vm_name, nvram_data) VALUES ('{name}', '{b64_data}');"
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:9043/query",
+                        data=cql.encode("utf-8"),
+                        headers={"Content-Type": "text/plain"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        pass
+                    if delete_local:
+                        try:
+                            os.remove(nvram_path)
+                        except OSError:
+                            pass
+                    self.send_json_response(200, {"backed_up": True})
+                    return
+                except Exception as exc:
+                    self.reject(f"Failed to backup NVRAM: {exc}", 500)
+                    return
+            else:
+                self.send_json_response(200, {"backed_up": False, "reason": "no_local_nvram"})
+                return
+
+        elif action == "restore":
+            os.makedirs(os.path.dirname(nvram_path), exist_ok=True)
+            nvram_data = None
+            try:
+                cql = f"SELECT nvram_data FROM hydra.vm_nvram WHERE vm_name = '{name}';"
+                req = urllib.request.Request(
+                    "http://127.0.0.1:9043/query",
+                    data=cql.encode("utf-8"),
+                    headers={"Content-Type": "text/plain"}
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    if res.get("rows"):
+                        nvram_data = res["rows"][0].get("nvram_data")
+            except Exception:
+                pass
+
+            if nvram_data:
+                try:
+                    with open(nvram_path, "wb") as f:
+                        f.write(base64.b64decode(nvram_data))
+                    os.chmod(nvram_path, 0o666)
+                    self.send_json_response(200, {"restored": True, "source": "database"})
+                    return
+                except Exception as exc:
+                    self.reject(f"Failed to write restored NVRAM: {exc}", 500)
+                    return
+            else:
+                for tmpl in template_paths:
+                    if os.path.exists(tmpl) and not os.path.exists(nvram_path):
+                        try:
+                            shutil.copy(tmpl, nvram_path)
+                            os.chmod(nvram_path, 0o666)
+                            self.send_json_response(200, {"restored": True, "source": "template"})
+                            return
+                        except Exception as exc:
+                            self.reject(f"Failed to copy NVRAM template: {exc}", 500)
+                            return
+                self.send_json_response(200, {"restored": False, "source": "existing"})
+                return
+
+        elif action in ("clean", "delete"):
+            if os.path.exists(nvram_path):
+                try:
+                    os.remove(nvram_path)
+                except OSError:
+                    pass
+            self.send_json_response(200, {"cleaned": True})
+            return
+
+        else:
+            self.reject("action must be backup, restore, or clean", 400)
+
+    def handle_vm_migrate(self, name):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        target_ip = payload.get("target_ip")
+        if not target_ip:
+            self.reject("target_ip is required", 400)
+            return
+
+        argv = VIRSH + ["migrate", "--live", "--persistent", "--undefinesource", name,
+                       f"qemu+ssh://root@{target_ip}/system", f"tcp://{target_ip}"]
+        rc, stdout, stderr = run_argv(argv, timeout=1800)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh migrate failed", 500)
+            return
+        self.send_json_response(200, {"migrated": True})
+
+    def handle_host_maintenance_state(self):
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+
+        state = payload.get("state")
+        state_file = "/etc/hci/maintenance.state"
+        if state == "ENTER":
+            reason = payload.get("reason", "maintenance")
+            try:
+                os.makedirs(os.path.dirname(state_file), exist_ok=True)
+                with open(state_file, "w", encoding="utf-8") as f:
+                    f.write(f"{reason}\n")
+                self.send_json_response(200, {"written": True})
+            except Exception as exc:
+                self.reject(f"Failed to write maintenance state: {exc}", 500)
+        elif state == "LEAVE":
+            if os.path.exists(state_file):
+                try:
+                    os.remove(state_file)
+                except OSError as exc:
+                    self.reject(f"Failed to remove maintenance state: {exc}", 500)
+                    return
+            self.send_json_response(200, {"cleared": True})
+        else:
+            self.reject("state must be ENTER or LEAVE", 400)
 
     # -- Storage -------------------------------------------------------
 

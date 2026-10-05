@@ -1479,8 +1479,11 @@ def delete_vm(name, keep_disks=False, force=False):
                 return fail(500, f"'{name}' was not deleted: {disk_detail}. Its storage is still "
                                  f"allocated, so its record has been left in place.")
 
-        nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
-        run_remote_spark(host_ip or LOCAL_IP, "rm -f -- " + shlex.quote(nvram_path))
+        nvram_target = host_ip or LOCAL_IP
+        rc_nv, _, _ = run_mtls_spark_api(nvram_target, f"/api/v1/vm/{urllib.parse.quote(name)}/nvram", {"action": "clean"})
+        if rc_nv != 0:
+            nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
+            run_remote_spark(nvram_target, "rm -f -- " + shlex.quote(nvram_path))
         run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
 
         rc_del, _, stderr_del = run_cql_query(f"DELETE FROM hydra.vms WHERE name = '{name}';")
@@ -3475,20 +3478,33 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             # leave this empty and every VM on this node was unplaced by a page load.
             virsh_read_ok = False
             try:
-                rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
-                if rc == 0:
+                rc_doms, res_doms, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/domains", None, method="GET")
+                if rc_doms == 0 and isinstance(res_doms, dict) and "domains" in res_doms:
                     virsh_read_ok = True
-                    lines = stdout.splitlines()
-                    for line in lines[2:]:
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            name = parts[1]
-                            state_val = " ".join(parts[2:])
-                            if state_val == "running":
-                                state_val = "Running"
-                            elif state_val == "shut off":
-                                state_val = "Stopped"
-                            libvirt_vms[name] = state_val
+                    for d in res_doms.get("domains") or []:
+                        d_name = d.get("name")
+                        d_state = d.get("state")
+                        if d_state == "running":
+                            d_state = "Running"
+                        elif d_state == "shut off":
+                            d_state = "Stopped"
+                        if d_name:
+                            libvirt_vms[d_name] = d_state
+                else:
+                    rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
+                    if rc == 0:
+                        virsh_read_ok = True
+                        lines = stdout.splitlines()
+                        for line in lines[2:]:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                name = parts[1]
+                                state_val = " ".join(parts[2:])
+                                if state_val == "running":
+                                    state_val = "Running"
+                                elif state_val == "shut off":
+                                    state_val = "Stopped"
+                                libvirt_vms[name] = state_val
             except Exception:
                 pass
 
@@ -4037,20 +4053,33 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             # leave this empty and every VM on this node was unplaced by a page load.
             virsh_read_ok = False
             try:
-                rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
-                if rc == 0:
+                rc_doms, res_doms, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/domains", None, method="GET")
+                if rc_doms == 0 and isinstance(res_doms, dict) and "domains" in res_doms:
                     virsh_read_ok = True
-                    lines = stdout.splitlines()
-                    for line in lines[2:]:
-                        parts = line.split()
-                        if len(parts) >= 3:
-                            name = parts[1]
-                            state = " ".join(parts[2:])
-                            if state == "running":
-                                state = "Running"
-                            elif state == "shut off":
-                                state = "Stopped"
-                            libvirt_vms[name] = state
+                    for d in res_doms.get("domains") or []:
+                        d_name = d.get("name")
+                        d_state = d.get("state")
+                        if d_state == "running":
+                            d_state = "Running"
+                        elif d_state == "shut off":
+                            d_state = "Stopped"
+                        if d_name:
+                            libvirt_vms[d_name] = d_state
+                else:
+                    rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
+                    if rc == 0:
+                        virsh_read_ok = True
+                        lines = stdout.splitlines()
+                        for line in lines[2:]:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                name = parts[1]
+                                state = " ".join(parts[2:])
+                                if state == "running":
+                                    state = "Running"
+                                elif state == "shut off":
+                                    state = "Stopped"
+                                libvirt_vms[name] = state
             except Exception:
                 pass
 
@@ -8495,22 +8524,34 @@ def db_reconcile_loop():
         try:
             # 1. Fetch local VMs list from libvirt
             libvirt_vms = {}
-            rc, stdout, stderr = run_remote_spark(LOCAL_IP, "virsh -c qemu:///system list --all")
-            if rc != 0:
-                time.sleep(30)
-                continue
-                
-            lines = stdout.splitlines()
-            for line in lines[2:]:
-                parts = line.split()
-                if len(parts) >= 3:
-                    name = parts[1]
-                    state = " ".join(parts[2:])
-                    if state == "running":
-                        state = "Running"
-                    elif state == "shut off":
-                        state = "Stopped"
-                    libvirt_vms[name] = state
+            rc_doms, res_doms, _ = run_mtls_spark_api(LOCAL_IP, "/api/v1/host/domains", None, method="GET")
+            if rc_doms == 0 and isinstance(res_doms, dict) and "domains" in res_doms:
+                for d in res_doms.get("domains") or []:
+                    d_name = d.get("name")
+                    d_state = d.get("state")
+                    if d_state == "running":
+                        d_state = "Running"
+                    elif d_state == "shut off":
+                        d_state = "Stopped"
+                    if d_name:
+                        libvirt_vms[d_name] = d_state
+            else:
+                rc, stdout, stderr = run_remote_spark(LOCAL_IP, "virsh -c qemu:///system list --all")
+                if rc != 0:
+                    time.sleep(30)
+                    continue
+                    
+                lines = stdout.splitlines()
+                for line in lines[2:]:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        name = parts[1]
+                        state = " ".join(parts[2:])
+                        if state == "running":
+                            state = "Running"
+                        elif state == "shut off":
+                            state = "Stopped"
+                        libvirt_vms[name] = state
 
             # 1.5. Fetch active tasks from ScyllaDB to protect VMs undergoing operations
             active_task_vms = set()
