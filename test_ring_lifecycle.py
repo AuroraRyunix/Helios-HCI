@@ -507,6 +507,31 @@ class QuorumGateRefusalTests(RingTestCase):
         self.assertFalse(allowed)
         self.assertIn("Refusing", reason)
 
+    def test_ring_endpoint_parsed_with_availability_schema(self):
+        vali.run_cql_query = lambda cql, *a, **k: (0, "{'class': 'SimpleStrategy', 'replication_factor': '3'}", "")
+        vali.run_mtls_spark_api = lambda ip, path, payload, method="POST": (
+            0,
+            {"nodes": [
+                {"address": "10.0.0.1", "status": "Up", "state": "Normal"},
+                {"address": "10.0.0.2", "status": "Up", "state": "Normal"},
+                {"address": "10.0.0.3", "status": "Down", "state": "Normal"},
+            ]},
+            ""
+        )
+        try:
+            members, err = vali.get_ring_members()
+            self.assertEqual(err, "")
+            self.assertEqual(len(members), 3)
+            self.assertTrue(members[0]["available"])
+            self.assertTrue(members[1]["available"])
+            self.assertFalse(members[2]["available"])
+            allowed, reason = vali.check_stop_preserves_quorum("10.0.0.1")
+            self.assertFalse(allowed)
+            self.assertIn("would leave", reason)
+        finally:
+            if "run_mtls_spark_api" in vars(vali):
+                del vars(vali)["run_mtls_spark_api"]
+
 
 # -- the lock endpoints ------------------------------------------------------------------
 

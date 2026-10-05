@@ -2557,7 +2557,24 @@ def get_ring_members():
     if rc_ring == 0 and isinstance(res_ring, dict) and "nodes" in res_ring:
         nodes = res_ring.get("nodes") or []
         if nodes:
-            return nodes, ""
+            members = []
+            for n in nodes:
+                addr = n.get("address", "")
+                st = n.get("status", "")
+                st_code = "U" if st.lower().startswith("u") else "D"
+                state = n.get("state", "")
+                state_code = "N" if state.lower().startswith("n") else ("L" if state.lower().startswith("l") else ("J" if state.lower().startswith("j") else "M"))
+                is_available = n.get("available")
+                if is_available is None:
+                    is_available = (st_code == "U" and state_code == "N")
+                members.append({
+                    "address": addr,
+                    "status": st_code,
+                    "state": state_code,
+                    "available": bool(is_available),
+                    "host_id": n.get("host_id", ""),
+                })
+            return members, ""
     rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
     if rc != 0:
         return [], (err_ring or stderr or stdout or "nodetool status failed").strip()[:300]
