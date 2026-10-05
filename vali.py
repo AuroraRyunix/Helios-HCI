@@ -291,6 +291,15 @@ def prepare_destination_storage(target_ip, data_ids, image_ids):
             if not ok:
                 raise MigrationStepError(
                     f"attach {vdisk_id} on the target", detail)
+            if body.get("already_attached") and not body.get("forwarding_to"):
+                # The target previously had this disk directly attached (e.g. from an earlier run
+                # before the VM migrated to the current source), so its in-memory attachment had
+                # forwarding_to=None. Detach it so we can re-attach cleanly in forwarding mode.
+                sidon_op(target_ip, "detach", vdisk_id)
+                ok, body, detail = sidon_op(target_ip, "attach", vdisk_id, forward=True)
+                if not ok:
+                    raise MigrationStepError(
+                        f"attach {vdisk_id} on the target (retry after clearing stale attachment)", detail)
             if not body.get("already_attached"):
                 created.append(vdisk_id)
             if not body.get("forwarding_to"):
