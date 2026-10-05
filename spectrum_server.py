@@ -2189,10 +2189,12 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
         os_boot_xml = f"""<type arch='x86_64' machine='q35'>hvm</type>
     <loader readonly='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.fd</loader>
     <nvram template='/usr/share/edk2/ovmf/OVMF_VARS.fd'>{nvram_path}</nvram>
-    {boot_devices}"""
+    {boot_devices}
+    <bootmenu enable='yes' timeout='3000'/>"""
     else:
         os_boot_xml = f"""<type arch='x86_64' machine='q35'>hvm</type>
-    {boot_devices}"""
+    {boot_devices}
+    <bootmenu enable='yes' timeout='3000'/>"""
 
     # The console device, and the video model that has to match it.
     #
@@ -7041,6 +7043,11 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 graphics_changed = graphics != normalise_graphics(vm_data.get("graphics"))
                 cql_upd = f"UPDATE hydra.vms SET vcpu = {vcpu}, memory = {memory}, firmware = '{firmware}', iso = '{iso}', boot_device = '{boot_device}', disks_list = '{disks_list}', disk_path = '{primary_path}', disk_size = {primary_size_gb}, network_id = '{network_id}', cpu_model = '{cpu_model}', audio_enabled = {audio_enabled_str}, graphics = '{graphics}' WHERE name = '{name}';"
                 run_cql_query(cql_upd)
+
+                if bool(payload.get("reset_nvram")) or (firmware != vm_data.get("firmware")):
+                    nvram_target = host_ip or LOCAL_IP
+                    run_mtls_spark_api(nvram_target, f"/api/v1/vm/{urllib.parse.quote(name)}/nvram", {"action": "clean"})
+                    run_cql_query(f"DELETE FROM hydra.vm_nvram WHERE vm_name = '{name}';")
 
                 if graphics_changed and vm_data.get("state") == "Running":
                     EVENT_LOGS.append({

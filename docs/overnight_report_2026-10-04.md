@@ -429,3 +429,20 @@ Fixed, each with tests and full suite verification:
   - Verified by unit tests in `test_vm_live_vali.py` ensuring `<maxMemory>` is emitted with headroom and omitted without headroom.
 - Synchronized `provision.py` manifests via `sync_provision.py` and validated against `test_deployment_manifest.py`.
 - Full regression suite passes cleanly across all touched subsystems.
+
+#### Fifth batch: CD-ROM boot hang fix, VM edit flow, and acli vs ncli CLI split
+
+Fixed and verified:
+- **CD-ROM UEFI Boot Hang (`test2` / `test5` VMs)**:
+  - Root cause: Extent groups replicated between nodes were stored under `replica-egroups/`. When a VM ran on a replica node and attached the vdisk, Sidon's `EgroupStore` in `sidon/src/extent.rs` only scanned `egroups/`, causing sector 16 El-Torito boot descriptor reads to fail with `EIO (errno 5)`. Furthermore, `ReplicaStore::get_egroup` in `sidon/src/peer.rs` did not fall back to `egroups/` if an extent was locally primary.
+  - Fix: `EgroupStore` in `sidon/src/extent.rs` now indexes and resolves extent groups from both `egroups/` and `replica-egroups/`. `ReplicaStore::get_egroup` in `sidon/src/peer.rs` falls back to `egroups/` if not present in `replica-egroups/`.
+  - Added XML `<bootmenu enable='yes' timeout='3000'/>` in `spectrum_server.py`, fixed `valcli.py` default `boot_device = ""` so attached ISOs boot first without requiring manual boot device override. Added `--reset-nvram` flag to `valcli vm.edit`.
+  - Live verification: Powered on `test5` with Debian Edu installer ISO on Node 42; verified via screenshot that OVMF UEFI firmware successfully booted directly into the Debian installer GRUB menu.
+- **Logical CLI Separation (`acli` vs `ncli`)**:
+  - Partitioned commands into clear domains matching Nutanix conventions:
+    - `acli` for guest workloads: `vm.*` (list, create, delete, edit, live, on, off, migrate, balance), `image.*`, and `disk.*`.
+    - `ncli` for infrastructure and cluster operations: `cluster.*`, `host.*`, `storage.*` (containers, pools, snapshots, clones, tiering, compact, sweep, scrub, replication), `health.*`, `backup.*`, `scheduler.*`, `db.*`, `drs.*`, and `system.*`.
+    - `valcli` retains access to all commands.
+  - Interactive shell (`ValcliShell`), `--help`, and tab autocompletion now filter specifically based on the binary name (`acli` vs `ncli` vs `valcli`).
+  - Added mutual command guardrails: running an infrastructure command in `acli` directs the user to `ncli`, and running a workload command in `ncli` directs the user to `acli`.
+- Synchronized `provision.py` with `sync_provision.py` and deployed across all cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`).

@@ -158,7 +158,16 @@ class TheSharedPlanner(unittest.TestCase):
         self.assertIn("module.boot_orders(", body)
         self.assertIn("boot_order=orders[\"disk\"]", body)
         self.assertIn("boot_order=orders[\"cdrom\"]", body)
+        self.assertIn("<bootmenu enable='yes' timeout='3000'/>", body)
         self.assertNotIn("<boot dev=", body)
+
+    def test_valcli_create_defaults_to_automatic_boot_device(self):
+        """valcli vm.create must not hard-code boot_device to 'hd' so ISOs can boot first."""
+        with open(os.path.join(HERE, "valcli.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        body = source[source.index("def cmd_vm_create"):source.index("def cmd_vm_create") + 2000]
+        self.assertIn('boot_device = ""', body)
+        self.assertNotIn('boot_device = "hd"', body)
 
 
 if __name__ == "__main__":

@@ -3381,7 +3381,7 @@ def cmd_vm_create():
         
     firmware = "uefi"
     iso = ""
-    boot_device = "hd"
+    boot_device = ""
     network_id = ""
     disks = ["10G"]
     cpu_model = "host-passthrough"
@@ -3525,6 +3525,9 @@ def cmd_vm_edit():
         elif arg == "--audio" and idx + 1 < len(sys.argv):
             payload["audio_enabled"] = sys.argv[idx+1].lower() in ("true", "1", "yes", "on")
             idx += 2
+        elif arg == "--reset-nvram":
+            payload["reset_nvram"] = True
+            idx += 1
         else:
             print(f"Error: Unknown or malformed option '{arg}'")
             sys.exit(1)
@@ -3666,101 +3669,178 @@ def cmd_backup_target():
     run_saga(["target"] + sys.argv[2:])
 
 
-def print_usage():
-    print("Valkyrie CLI (valcli) v1.2.0 - Helios HCI command-line manager\n")
-    print("Usage:")
-    print("  valcli vm.list                     List all virtual machines in the cluster")
-    print("  valcli vm.create <name> <vc> <mem> Create a new VM configuration and disks")
-    print("  valcli vm.delete <name> [flags]    Delete VM configuration and its disks (--force, --keep-disks)")
-    print("  valcli vm.edit <name> [options]    Modify VM CPU, memory, disks, network, or ISO")
-    print("  valcli vm.live <name> <change>     Change a RUNNING VM: vCPUs, CD-ROM, NICs, disks (valcli vm.live for the list)")
-    print("  valcli vm.on <vm_name>             Power ON a virtual machine")
-    print("  valcli vm.off <vm_name>            Power OFF (destroy) a virtual machine")
-    print("  valcli vm.migrate <name> <host>    Migrate a running VM to another cluster node")
-    print("  valcli vm.balance                  Manually trigger aggressive cluster DRS load balancing")
-    print("  valcli drs.status                  Print cluster balance score and recent DRS migrations")
-    print("  valcli host.list                   List all hosts and their maintenance state")
-    print("  valcli host.maintenance.enter <h>  Put host (or '--all') into maintenance mode and evacuate VMs")
-    print("      Options:")
-    print("        --force-stop                 Forcefully stop/suspend VMs that fail migration")
-    print("  valcli host.maintenance.leave <h>  Take host (or '--all') out of maintenance mode")
-    print("  valcli cluster.vip.set <vip>       Configure cluster-wide Virtual IP (VIP)")
-    print("  valcli storage.list                List storage containers, per-node extent stores and vdisks")
-    print("  valcli storage.container.create <name> [--tier T] [--quota-gb N] [--ftt N] [--compression none|lz4]")
-    print("                                     Create a storage container")
-    print("  valcli storage.container.update <name> [same options]  Change a container's policy")
-    print("  valcli storage.container.delete <name>  Delete a container (refused while in use)")
-    print("  valcli storage.benchmark <name>    Run safe read/write performance benchmark")
-    print("  valcli storage.cleanup_orphaned    Delete orphaned virtual disk and NVRAM files")
-    print("  valcli storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
-    print("  valcli storage.clone <vdisk> <name>     Writable copy of a vdisk or snapshot")
-    print("  valcli storage.children <vdisk>         Snapshots and clones taken from a vdisk")
-    print("  valcli storage.snapshots <vdisk>        Snapshots of a vdisk, who took them, what depends on them")
-    print("  valcli storage.snapshot-policy          Scheduled snapshot policies and what each covers")
-    print("  valcli storage.snapshot-policy.set cluster|container:<n>|vdisk:<id> --every-hours N --keep N [--disable]")
-    print("  valcli storage.snapshot-policy.delete cluster|container:<n>|vdisk:<id>")
-    print("  valcli storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (Rauru does this hourly)")
-    print("  valcli storage.rollback <vdisk> <snapshot> [--no-keep]  Put a stopped VM's disk back to a snapshot")
-    print("  valcli storage.domain                   Protection domains: VMs and vdisks snapshotted together")
-    print("  valcli storage.domain.create|delete|add|remove|snapshot|run|sets|restore|recover ...")
-    print("                                          (run valcli storage.domain.help for each form)")
-    print("  valcli storage.replication              Per vdisk: copies policy asks for, rf it")
-    print("                                          asked for, copies it actually has")
-    print("  valcli storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
-    print("  valcli storage.heat [N]                 Hottest and coldest extent groups per node")
-    print("  valcli storage.placement [N]            Which disk of each node holds which extent groups")
-    print("  valcli storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
-    print("  valcli storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
-    print("  valcli storage.takeover <vdisk> <node>  Finish a migration's storage handover on the node the guest runs on (safe to repeat)")
-    print("  valcli storage.sweep                    Reclaim unreferenced extent groups on every node; says what is waiting")
-    print("  valcli storage.scrub                    Re-hash every sealed extent group against its seal hash")
-    print("  valcli storage.compact [--apply]        Plan (or with --apply, make) compaction of sparse sealed groups")
-    print("                                          [--threshold F] [--max-groups N] [--max-bytes N] [--seconds N] [--rate B/s]")
-    print("  valcli storage.dedup.estimate [--sample F]  Bytes dedup would share beyond clones (read-only)")
-    print("  valcli image.list                  List registered images and whether each has a sealed vdisk")
-    print("  valcli image.delete <name>         Demote and delete image from storage and database")
-    print("  valcli disk.list                   List all active and orphaned virtual disks")
-    print("  valcli disk.delete <name>          Delete virtual disk (fails if disk is attached to a VM)")
-    print("  valcli health.check                Run parallel Mimir diagnostics with progress bar")
-    print("  valcli scheduler.list              List all Dagur scheduled policies")
-    print("  valcli scheduler.history           List past executions of Dagur jobs")
-    print("  valcli scheduler.trigger <name>    Manually trigger execution of a Dagur job")
-    print("  valcli system.cleanup              Prune execution history tables older than 3 days")
-    print("  valcli backup.target [<dir>]       Show or set where metadata backups are written")
-    print("  valcli backup.run                  Back up the hydra keyspace and /etc/hci")
-    print("      Options:")
-    print("        --all-nodes                  Also run on every peer, in parallel")
-    print("        --include-ca                 Also capture the cluster CA and node private keys")
-    print("        --allow-same-filesystem      Accept a target on the database's own disk")
-    print("  valcli backup.list                 List artefacts at the backup target")
-    print("  valcli backup.verify [<file>]      Check an artefact against its manifest (default: latest)")
-    print("  valcli backup.restore [<file>]     Load an artefact back into this cluster")
-    print("      Options:")
-    print("        --tables a,b                 Restore only these tables")
-    print("        --extract-only <dir>         Unpack the artefact without touching the cluster")
-    print("        --force                      Proceed despite a schema-version mismatch")
-    print("  valcli backup.prune                Apply the retention policy now (--dry-run to preview)")
-    print("      Note: backups cover cluster METADATA only. Guest data inside")
-    print("      vdisks is not backed up by any of this -- see docs/backup_restore.md.")
-    print("  valcli db.print <table_name>       Print ScyllaDB table contents as ASCII table")
-    print("      Options:")
-    print("        --columns c1,c2              Specify a comma-separated list of columns to print")
-    print("  valcli db.query \"<query>\"          Execute raw CQL query and display formatted output")
-    print("\nAvailable tables: vms, storage_containers, dagur_schedules, dagur_runs")
+ACLI_COMMANDS = {
+    "vm.list", "vm.create", "vm.delete", "vm.edit", "vm.live", "vm.on", "vm.off",
+    "vm.migrate", "vm.balance",
+    "image.list", "image.delete",
+    "disk.list", "disk.delete",
+}
 
-def execute_command(args):
-    """Execute a single valcli command with the given argument list (e.g. ['vm.list'])."""
+NCLI_COMMANDS = {
+    "drs.status",
+    "host.list", "host.maintenance.enter", "host.maintenance.leave",
+    "cluster.vip.set",
+    "storage.list", "storage.container.create", "storage.container.update", "storage.container.delete",
+    "storage.benchmark", "storage.cleanup_orphaned", "storage.snapshot", "storage.clone",
+    "storage.children", "storage.snapshots", "storage.snapshot-policy", "storage.snapshot-policy.set",
+    "storage.snapshot-policy.delete", "storage.snapshot-run", "storage.rollback", "storage.domain",
+    "storage.heat", "storage.placement", "storage.tier", "storage.sweep", "storage.scrub",
+    "storage.compact", "storage.dedup.estimate", "storage.takeover", "storage.move",
+    "storage.replication", "storage.replicate",
+    "health.check",
+    "db.print", "db.query",
+    "scheduler.list", "scheduler.history", "scheduler.trigger",
+    "system.cleanup",
+    "backup.run", "backup.list", "backup.verify", "backup.restore", "backup.prune", "backup.target",
+}
+
+COMMON_COMMANDS = {"help", "exit", "quit", "clear", "version"}
+ALL_COMMANDS = ACLI_COMMANDS | NCLI_COMMANDS | COMMON_COMMANDS
+
+
+def get_command_list(prog_name="valcli"):
+    """Return the allowed commands for a given CLI program name."""
+    p = os.path.basename(prog_name).replace(".py", "").lower()
+    if p == "acli":
+        return sorted(ACLI_COMMANDS | COMMON_COMMANDS)
+    elif p == "ncli":
+        return sorted(NCLI_COMMANDS | COMMON_COMMANDS)
+    return sorted(ALL_COMMANDS)
+
+
+def print_usage(prog_name="valcli"):
+    p = os.path.basename(prog_name).replace(".py", "").lower()
+    if p == "acli":
+        title = "Acropolis CLI (acli) v1.2.0 - Workload & VM Manager"
+    elif p == "ncli":
+        title = "Nutanix Cluster CLI (ncli) v1.2.0 - Infrastructure & Cluster Manager"
+    else:
+        p = "valcli"
+        title = "Valkyrie CLI (valcli) v1.2.0 - Helios HCI command-line manager"
+
+    print(f"{title}\n")
+    print("Usage:")
+
+    if p in ("acli", "valcli"):
+        print(f"  {p} vm.list                     List all virtual machines in the cluster")
+        print(f"  {p} vm.create <name> <vc> <mem> Create a new VM configuration and disks")
+        print(f"  {p} vm.delete <name> [flags]    Delete VM configuration and its disks (--force, --keep-disks)")
+        print(f"  {p} vm.edit <name> [options]    Modify VM CPU, memory, disks, network, or ISO")
+        print(f"  {p} vm.live <name> <change>     Change a RUNNING VM: vCPUs, CD-ROM, NICs, disks ({p} vm.live for the list)")
+        print(f"  {p} vm.on <vm_name>             Power ON a virtual machine")
+        print(f"  {p} vm.off <vm_name>            Power OFF (destroy) a virtual machine")
+        print(f"  {p} vm.migrate <name> <host>    Migrate a running VM to another cluster node")
+        print(f"  {p} vm.balance                  Manually trigger aggressive cluster DRS load balancing")
+        print(f"  {p} image.list                  List registered images and whether each has a sealed vdisk")
+        print(f"  {p} image.delete <name>         Demote and delete image from storage and database")
+        print(f"  {p} disk.list                   List all active and orphaned virtual disks")
+        print(f"  {p} disk.delete <name>          Delete virtual disk (fails if disk is attached to a VM)")
+
+    if p in ("ncli", "valcli"):
+        print(f"  {p} drs.status                  Print cluster balance score and recent DRS migrations")
+        print(f"  {p} host.list                   List all hosts and their maintenance state")
+        print(f"  {p} host.maintenance.enter <h>  Put host (or '--all') into maintenance mode and evacuate VMs")
+        print("      Options:")
+        print("        --force-stop                 Forcefully stop/suspend VMs that fail migration")
+        print(f"  {p} host.maintenance.leave <h>  Take host (or '--all') out of maintenance mode")
+        print(f"  {p} cluster.vip.set <vip>       Configure cluster-wide Virtual IP (VIP)")
+        print(f"  {p} storage.list                List storage containers, per-node extent stores and vdisks")
+        print(f"  {p} storage.container.create <name> [--tier T] [--quota-gb N] [--ftt N] [--compression none|lz4]")
+        print("                                     Create a storage container")
+        print(f"  {p} storage.container.update <name> [same options]  Change a container's policy")
+        print(f"  {p} storage.container.delete <name>  Delete a container (refused while in use)")
+        print(f"  {p} storage.benchmark <name>    Run safe read/write performance benchmark")
+        print(f"  {p} storage.cleanup_orphaned    Delete orphaned virtual disk and NVRAM files")
+        print(f"  {p} storage.snapshot <vdisk> <name>  Point-in-time read-only copy of a vdisk")
+        print(f"  {p} storage.clone <vdisk> <name>     Writable copy of a vdisk or snapshot")
+        print(f"  {p} storage.children <vdisk>         Snapshots and clones taken from a vdisk")
+        print(f"  {p} storage.snapshots <vdisk>        Snapshots of a vdisk, who took them, what depends on them")
+        print(f"  {p} storage.snapshot-policy          Scheduled snapshot policies and what each covers")
+        print(f"  {p} storage.snapshot-policy.set cluster|container:<n>|vdisk:<id> --every-hours N --keep N [--disable]")
+        print(f"  {p} storage.snapshot-policy.delete cluster|container:<n>|vdisk:<id>")
+        print(f"  {p} storage.snapshot-run [--dry-run] Take what is due and prune what is not kept (Rauru does this hourly)")
+        print(f"  {p} storage.rollback <vdisk> <snapshot> [--no-keep]  Put a stopped VM's disk back to a snapshot")
+        print(f"  {p} storage.domain                   Protection domains: VMs and vdisks snapshotted together")
+        print(f"  {p} storage.domain.create|delete|add|remove|snapshot|run|sets|restore|recover ...")
+        print(f"                                          (run {p} storage.domain.help for each form)")
+        print(f"  {p} storage.replication              Per vdisk: copies policy asks for, rf it")
+        print("                                          asked for, copies it actually has")
+        print(f"  {p} storage.replicate <vdisk>|--all  Add a copy to vdisks short of their rf")
+        print(f"  {p} storage.heat [N]                 Hottest and coldest extent groups per node")
+        print(f"  {p} storage.placement [N]            Which disk of each node holds which extent groups")
+        print(f"  {p} storage.tier [--apply]           Plan (or with --apply, make) disk-to-disk moves")
+        print(f"  {p} storage.move <egroup> <disk> <node>  Move one sealed extent group to another disk")
+        print(f"  {p} storage.takeover <vdisk> <node>  Finish a migration's storage handover on the node the guest runs on (safe to repeat)")
+        print(f"  {p} storage.sweep                    Reclaim unreferenced extent groups on every node; says what is waiting")
+        print(f"  {p} storage.scrub                    Re-hash every sealed extent group against its seal hash")
+        print(f"  {p} storage.compact [--apply]        Plan (or with --apply, make) compaction of sparse sealed groups")
+        print("                                          [--threshold F] [--max-groups N] [--max-bytes N] [--seconds N] [--rate B/s]")
+        print(f"  {p} storage.dedup.estimate [--sample F]  Bytes dedup would share beyond clones (read-only)")
+        print(f"  {p} health.check                Run parallel Mimir diagnostics with progress bar")
+        print(f"  {p} scheduler.list              List all Dagur scheduled policies")
+        print(f"  {p} scheduler.history           List past executions of Dagur jobs")
+        print(f"  {p} scheduler.trigger <name>    Manually trigger execution of a Dagur job")
+        print(f"  {p} system.cleanup              Prune execution history tables older than 3 days")
+        print(f"  {p} backup.target [<dir>]       Show or set where metadata backups are written")
+        print(f"  {p} backup.run                  Back up the hydra keyspace and /etc/hci")
+        print("      Options:")
+        print("        --all-nodes                  Also run on every peer, in parallel")
+        print("        --include-ca                 Also capture the cluster CA and node private keys")
+        print("        --allow-same-filesystem      Accept a target on the database's own disk")
+        print(f"  {p} backup.list                 List artefacts at the backup target")
+        print(f"  {p} backup.verify [<file>]      Check an artefact against its manifest (default: latest)")
+        print(f"  {p} backup.restore [<file>]     Load an artefact back into this cluster")
+        print("      Options:")
+        print("        --tables a,b                 Restore only these tables")
+        print("        --extract-only <dir>         Unpack the artefact without touching the cluster")
+        print("        --force                      Proceed despite a schema-version mismatch")
+        print(f"  {p} backup.prune                Apply the retention policy now (--dry-run to preview)")
+        print("      Note: backups cover cluster METADATA only. Guest data inside")
+        print("      vdisks is not backed up by any of this -- see docs/backup_restore.md.")
+        print(f"  {p} db.print <table_name>       Print ScyllaDB table contents as ASCII table")
+        print("      Options:")
+        print("        --columns c1,c2              Specify a comma-separated list of columns to print")
+        print(f"  {p} db.query \"<query>\"          Execute raw CQL query and display formatted output")
+        print("\nAvailable tables: vms, storage_containers, dagur_schedules, dagur_runs")
+
+
+def execute_command(args, prog_name="valcli"):
+    """Execute a single command with the given argument list (e.g. ['vm.list'])."""
+    p = os.path.basename(prog_name).replace(".py", "").lower()
+    if p not in ("acli", "ncli"):
+        p = "valcli"
+
     old_argv = sys.argv
     try:
-        sys.argv = ["valcli"] + list(args)
+        sys.argv = [p] + list(args)
         if not args:
-            print_usage()
+            print_usage(p)
             return 1
 
         cmd = args[0]
         if cmd in ["--version", "-v", "-version", "version"]:
-            print("Valkyrie CLI (valcli) v1.2.0")
+            if p == "acli":
+                print("Acropolis CLI (acli) v1.2.0")
+            elif p == "ncli":
+                print("Nutanix Cluster CLI (ncli) v1.2.0")
+            else:
+                print("Valkyrie CLI (valcli) v1.2.0")
             return 0
+
+        if cmd in ["--help", "-h", "-help", "help", "?"]:
+            print_usage(p)
+            return 0
+
+        # Scope enforcement based on prog_name
+        is_acli_cmd = (cmd in ACLI_COMMANDS) or (cmd.startswith("vm.") or cmd.startswith("image.") or cmd.startswith("disk."))
+        is_ncli_cmd = (cmd in NCLI_COMMANDS) or (cmd.startswith("storage.") or cmd.startswith("host.") or cmd.startswith("cluster.") or cmd.startswith("scheduler.") or cmd.startswith("backup.") or cmd.startswith("db.") or cmd.startswith("health.") or cmd.startswith("drs.") or cmd.startswith("system."))
+
+        if p == "acli" and not is_acli_cmd and is_ncli_cmd:
+            print(f"Error: '{cmd}' is a cluster infrastructure command. Use ncli: ncli {cmd}")
+            return 1
+        elif p == "ncli" and not is_ncli_cmd and is_acli_cmd:
+            print(f"Error: '{cmd}' is a VM/workload command. Use acli: acli {cmd}")
+            return 1
 
         if cmd == "vm.list":
             cmd_vm_list()
@@ -3775,19 +3855,19 @@ def execute_command(args):
         elif cmd == "vm.on":
             if len(args) < 2:
                 print("Error: VM Name is required.")
-                print("Usage: valcli vm.on <vm_name>")
+                print(f"Usage: {p} vm.on <vm_name>")
                 return 1
             cmd_vm_on(args[1])
         elif cmd == "vm.off":
             if len(args) < 2:
                 print("Error: VM Name is required.")
-                print("Usage: valcli vm.off <vm_name>")
+                print(f"Usage: {p} vm.off <vm_name>")
                 return 1
             cmd_vm_off(args[1])
         elif cmd == "vm.migrate":
             if len(args) < 3:
                 print("Error: VM Name and Target Host are required.")
-                print("Usage: valcli vm.migrate <vm_name> <target_host>")
+                print(f"Usage: {p} vm.migrate <vm_name> <target_host>")
                 return 1
             cmd_vm_migrate(args[1], args[2])
         elif cmd == "vm.balance":
@@ -3800,7 +3880,7 @@ def execute_command(args):
             sub_args = args[1:]
             if not sub_args or (len(sub_args) == 1 and sub_args[0] == "--force-stop"):
                 print("Error: Hostname is required.")
-                print("Usage: valcli host.maintenance.enter <hostname> [--force-stop]")
+                print(f"Usage: {p} host.maintenance.enter <hostname> [--force-stop]")
                 return 1
 
             force_stop = "--force-stop" in sub_args
@@ -3818,70 +3898,70 @@ def execute_command(args):
         elif cmd == "host.maintenance.leave":
             if len(args) < 2:
                 print("Error: Hostname is required.")
-                print("Usage: valcli host.maintenance.leave <hostname>")
+                print(f"Usage: {p} host.maintenance.leave <hostname>")
                 return 1
             cmd_host_maintenance_leave(args[1])
         elif cmd == "cluster.vip.set":
             if len(args) < 2:
                 print("Error: VIP IP address is required.")
-                print("Usage: valcli cluster.vip.set <vip_ip>")
+                print(f"Usage: {p} cluster.vip.set <vip_ip>")
                 return 1
             cmd_cluster_vip_set(args[1])
         elif cmd == "storage.list":
             cmd_storage_list()
         elif cmd == "storage.container.create":
-            cmd_storage_container_create(["valcli"] + list(args))
+            cmd_storage_container_create([p] + list(args))
         elif cmd == "storage.container.update":
-            cmd_storage_container_update(["valcli"] + list(args))
+            cmd_storage_container_update([p] + list(args))
         elif cmd == "storage.container.delete":
-            cmd_storage_container_delete(["valcli"] + list(args))
+            cmd_storage_container_delete([p] + list(args))
         elif cmd == "storage.benchmark":
             if len(args) < 2:
                 print("Error: Storage container name is required.")
-                print("Usage: valcli storage.benchmark <container_name>")
+                print(f"Usage: {p} storage.benchmark <container_name>")
                 return 1
             cmd_storage_benchmark(args[1])
         elif cmd == "storage.cleanup_orphaned":
             cmd_storage_cleanup_orphaned()
         elif cmd == "storage.snapshot":
             if len(args) < 3:
-                print("Usage: valcli storage.snapshot <vdisk_id> <snapshot_name>")
+                print(f"Usage: {p} storage.snapshot <vdisk_id> <snapshot_name>")
                 return 1
             cmd_storage_derive(args[1], args[2], "snapshot")
         elif cmd == "storage.clone":
             if len(args) < 3:
-                print("Usage: valcli storage.clone <vdisk_id> <clone_name>")
+                print(f"Usage: {p} storage.clone <vdisk_id> <clone_name>")
                 return 1
             cmd_storage_derive(args[1], args[2], "clone")
         elif cmd == "storage.children":
             if len(args) < 2:
-                print("Usage: valcli storage.children <vdisk_id>")
+                print(f"Usage: {p} storage.children <vdisk_id>")
                 return 1
             cmd_storage_children(args[1])
         elif cmd == "storage.snapshots":
             if len(args) < 2:
-                print("Usage: valcli storage.snapshots <vdisk_id>")
+                print(f"Usage: {p} storage.snapshots <vdisk_id>")
                 return 1
             cmd_storage_snapshots(args[1])
         elif cmd == "storage.snapshot-policy":
             cmd_storage_snapshot_policy()
         elif cmd == "storage.snapshot-policy.set":
-            cmd_storage_snapshot_policy_set(["valcli"] + list(args))
+            cmd_storage_snapshot_policy_set([p] + list(args))
         elif cmd == "storage.snapshot-policy.delete":
-            cmd_storage_snapshot_policy_delete(["valcli"] + list(args))
+            cmd_storage_snapshot_policy_delete([p] + list(args))
         elif cmd == "storage.snapshot-run":
-            cmd_storage_snapshot_run(["valcli"] + list(args))
+            cmd_storage_snapshot_run([p] + list(args))
         elif cmd == "storage.rollback":
-            cmd_storage_rollback(["valcli"] + list(args))
+            cmd_storage_rollback([p] + list(args))
         elif cmd.startswith("storage.domain"):
-            cmd_storage_domain(["valcli"] + list(args))
+            cmd_storage_domain([p] + list(args))
         elif cmd == "storage.heat":
             limit = 10
             if len(args) > 1:
                 try:
                     limit = max(1, min(1000, int(args[1])))
                 except ValueError:
-                    print("Usage: valcli storage.heat [N]")
+                    print(f"Usage: {p} storage.heat [N]")
                     return 1
             cmd_storage_heat(limit)
         elif cmd == "storage.placement":
@@ -3890,23 +3970,23 @@ def execute_command(args):
                 try:
                     limit = max(1, min(100000, int(args[1])))
                 except ValueError:
-                    print("Usage: valcli storage.placement [N]")
+                    print(f"Usage: {p} storage.placement [N]")
                     return 1
             cmd_storage_placement(limit)
         elif cmd == "storage.tier":
             extra = args[1:]
             if extra not in ([], ["--apply"]):
-                print("Usage: valcli storage.tier [--apply]")
+                print(f"Usage: {p} storage.tier [--apply]")
                 return 1
             cmd_storage_tier(apply=bool(extra))
         elif cmd == "storage.sweep":
             if args[1:]:
-                print("Usage: valcli storage.sweep")
+                print(f"Usage: {p} storage.sweep")
                 return 1
             cmd_storage_sweep()
         elif cmd == "storage.scrub":
             if args[1:]:
-                print("Usage: valcli storage.scrub")
+                print(f"Usage: {p} storage.scrub")
                 return 1
             cmd_storage_scrub()
         elif cmd == "storage.compact":
@@ -3915,20 +3995,20 @@ def execute_command(args):
             cmd_storage_dedup_estimate(args[1:])
         elif cmd == "storage.takeover":
             if len(args) < 3:
-                print("Usage: valcli storage.takeover <vdisk> <node>")
+                print(f"Usage: {p} storage.takeover <vdisk> <node>")
                 return 1
             cmd_storage_takeover(args[1], args[2])
         elif cmd == "storage.move":
             if len(args) != 4:
-                print("Usage: valcli storage.move <egroup_id> <disk> <node>")
+                print(f"Usage: {p} storage.move <egroup_id> <disk> <node>")
                 return 1
             cmd_storage_move(args[1], args[2], args[3])
         elif cmd == "storage.replication":
             cmd_storage_replication()
         elif cmd == "storage.replicate":
             if len(args) < 2:
-                print("Usage: valcli storage.replicate <vdisk_id>")
-                print("       valcli storage.replicate --all")
+                print(f"Usage: {p} storage.replicate <vdisk_id>")
+                print(f"       {p} storage.replicate --all")
                 return 1
             if args[1] == "--all":
                 cmd_storage_replicate(None, everything=True)
@@ -3939,7 +4019,7 @@ def execute_command(args):
         elif cmd == "image.delete":
             if len(args) < 2:
                 print("Error: Image name is required.")
-                print("Usage: valcli image.delete <image_name>")
+                print(f"Usage: {p} image.delete <image_name>")
                 return 1
             cmd_image_delete(args[1])
         elif cmd == "disk.list":
@@ -3947,7 +4027,7 @@ def execute_command(args):
         elif cmd == "disk.delete":
             if len(args) < 2:
                 print("Error: Disk name is required.")
-                print("Usage: valcli disk.delete <disk_name>")
+                print(f"Usage: {p} disk.delete <disk_name>")
                 return 1
             cmd_disk_delete(args[1])
         elif cmd == "health.check":
@@ -3977,34 +4057,19 @@ def execute_command(args):
         elif cmd == "scheduler.trigger":
             if len(args) < 2:
                 print("Error: Job name is required.")
-                print("Usage: valcli scheduler.trigger <job_name>")
+                print(f"Usage: {p} scheduler.trigger <job_name>")
                 return 1
             cmd_scheduler_trigger(args[1])
         else:
             print(f"Error: Unknown command '{cmd}'")
-            print_usage()
+            print_usage(p)
             return 1
         return 0
     finally:
         sys.argv = old_argv
 
 
-CLI_COMMAND_LIST = [
-    "vm.list", "vm.create", "vm.delete", "vm.edit", "vm.live", "vm.on", "vm.off",
-    "vm.migrate", "vm.balance", "drs.status", "host.list", "host.maintenance.enter",
-    "host.maintenance.leave", "cluster.vip.set", "storage.list", "storage.container.create",
-    "storage.container.update", "storage.container.delete", "storage.benchmark",
-    "storage.cleanup_orphaned", "storage.snapshot", "storage.clone", "storage.children",
-    "storage.snapshots", "storage.snapshot-policy", "storage.snapshot-policy.set",
-    "storage.snapshot-policy.delete", "storage.snapshot-run", "storage.rollback",
-    "storage.domain", "storage.heat", "storage.placement", "storage.tier",
-    "storage.sweep", "storage.scrub", "storage.compact", "storage.dedup.estimate",
-    "storage.takeover", "storage.move", "storage.replication", "storage.replicate",
-    "image.list", "image.delete", "disk.list", "disk.delete", "health.check",
-    "db.print", "db.query", "scheduler.list", "scheduler.history", "scheduler.trigger",
-    "system.cleanup", "backup.run", "backup.list", "backup.verify", "backup.restore",
-    "backup.prune", "backup.target", "help", "exit", "quit", "clear", "version",
-]
+CLI_COMMAND_LIST = sorted(ALL_COMMANDS)
 
 
 class ValcliShell(cmd.Cmd):
@@ -4013,9 +4078,20 @@ class ValcliShell(cmd.Cmd):
 
     def __init__(self, prog_name="valcli"):
         super().__init__()
-        self.prog_name = prog_name
-        self.prompt = f"{prog_name}> "
-        self.intro = f"Interactive {prog_name} Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+        p = os.path.basename(prog_name).replace(".py", "").lower()
+        if p not in ("acli", "ncli"):
+            p = "valcli"
+        self.prog_name = p
+        self.prompt = f"{p}> "
+        if p == "acli":
+            self.intro = "Acropolis CLI (acli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+        elif p == "ncli":
+            self.intro = "Nutanix Cluster CLI (ncli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+        else:
+            self.intro = "Valkyrie CLI (valcli) Interactive Shell. Type 'help' or '?' for commands, 'exit' to quit.\n"
+
+        self.allowed_commands = get_command_list(self.prog_name)
+
         # Enable readline autocompletion across delimiters like dots
         try:
             import readline
@@ -4040,7 +4116,7 @@ class ValcliShell(cmd.Cmd):
         if not parts:
             return
         try:
-            execute_command(parts)
+            execute_command(parts, prog_name=self.prog_name)
         except SystemExit:
             pass
         except Exception as e:
@@ -4053,7 +4129,7 @@ class ValcliShell(cmd.Cmd):
         if arg:
             self.default(f"help {arg}")
         else:
-            print_usage()
+            print_usage(self.prog_name)
 
     def do_exit(self, arg):
         """Exit the interactive shell."""
@@ -4068,11 +4144,11 @@ class ValcliShell(cmd.Cmd):
         tokens = line.lstrip().split()
         if not tokens or (len(tokens) == 1 and not line.endswith(" ")):
             prefix = tokens[0] if tokens else ""
-            return [c for c in CLI_COMMAND_LIST if c.startswith(prefix)]
+            return [c for c in self.allowed_commands if c.startswith(prefix)]
         return []
 
     def completenames(self, text, *ignored):
-        return [c for c in CLI_COMMAND_LIST if c.startswith(text)]
+        return [c for c in self.allowed_commands if c.startswith(text)]
 
 
 def main():
@@ -4089,13 +4165,14 @@ def main():
         except (KeyboardInterrupt, EOFError):
             print("")
             sys.exit(0)
-        print_usage()
+        print_usage(prog_name=prog_name)
         sys.exit(1)
 
     cmd_args = sys.argv[1:]
-    rc = execute_command(cmd_args)
+    rc = execute_command(cmd_args, prog_name=prog_name)
     sys.exit(rc if rc is not None else 0)
 
 
 if __name__ == "__main__":
     main()
+

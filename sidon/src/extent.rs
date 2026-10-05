@@ -484,6 +484,17 @@ impl EgroupStore {
                     }
                 }
             }
+            if let Some(parent) = disk.root.parent() {
+                let rep_dir = parent.join("replica-egroups");
+                if let Ok(entries) = std::fs::read_dir(&rep_dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if let Some(id) = name.strip_suffix(".eg") {
+                            index.entry(id.to_string()).or_insert(slot);
+                        }
+                    }
+                }
+            }
             usable.push(disk);
         }
         if usable.is_empty() {
@@ -506,7 +517,17 @@ impl EgroupStore {
         let file = format!("{id}.eg");
         if let Ok(index) = self.index.lock() {
             if let Some(&slot) = index.get(id) {
-                return self.disks[slot].root.join(&file);
+                let primary = self.disks[slot].root.join(&file);
+                if primary.exists() {
+                    return primary;
+                }
+                if let Some(parent) = self.disks[slot].root.parent() {
+                    let replica = parent.join("replica-egroups").join(&file);
+                    if replica.exists() {
+                        return replica;
+                    }
+                }
+                return primary;
             }
         }
         // Not indexed. Look for it, so a group that appeared after startup -- a repair
@@ -518,6 +539,15 @@ impl EgroupStore {
                     index.insert(id.to_string(), slot);
                 }
                 return candidate;
+            }
+            if let Some(parent) = disk.root.parent() {
+                let rep_candidate = parent.join("replica-egroups").join(&file);
+                if rep_candidate.exists() {
+                    if let Ok(mut index) = self.index.lock() {
+                        index.insert(id.to_string(), slot);
+                    }
+                    return rep_candidate;
+                }
             }
         }
         // Genuinely absent. Answer with a path on the disk it would be created on, so the
@@ -1087,5 +1117,28 @@ mod tests {
     fn vdisk_hash_is_stable_and_distinguishing() {
         assert_eq!(vdisk_hash("vd-1"), vdisk_hash("vd-1"));
         assert_ne!(vdisk_hash("vd-1"), vdisk_hash("vd-2"));
+    }
+
+    #[test]
+    fn extent_group_in_replica_egroups_is_found_and_readable() {
+        let dir = tmpdir("rep-find");
+        let rep_dir = dir.join("replica-egroups");
+        std::fs::create_dir_all(&rep_dir).unwrap();
+        let eg_path = rep_dir.join("eg-rep.eg");
+        let vh = vdisk_hash("vd-rep");
+        let data = vec![0x42u8; 512];
+        let (stored, codec) = encode_extent(&data, false);
+        let footer = footer_with(&stored, vh, 0, codec, data.len() as u64);
+        let mut f = File::create(&eg_path).unwrap();
+        f.write_all(&stored).unwrap();
+        f.write_all(&footer).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let store = EgroupStore::new(&dir.join("egroups"), 1 << 20).unwrap();
+        assert_eq!(store.path_for("eg-rep"), eg_path);
+        let read = store.read_extent("eg-rep", 0, stored.len() as u32, vh, 0).unwrap();
+        assert_eq!(read, data);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

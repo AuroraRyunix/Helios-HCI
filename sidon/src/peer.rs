@@ -636,7 +636,30 @@ impl ReplicaStore {
 
     pub fn get_egroup(&self, egroup: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::{Seek, SeekFrom};
-        let mut file = File::open(self.egroup_path(egroup))
+        let rep_path = self.egroup_path(egroup);
+        let path = if rep_path.exists() {
+            rep_path
+        } else {
+            let local_egroup = self.volume.join("egroups").join(format!("{egroup}.eg"));
+            if local_egroup.exists() {
+                local_egroup
+            } else if let Some(disks_dir) = self.volume.parent() {
+                let mut found = None;
+                if let Ok(entries) = std::fs::read_dir(disks_dir) {
+                    for entry in entries.flatten() {
+                        let candidate = entry.path().join("egroups").join(format!("{egroup}.eg"));
+                        if candidate.exists() {
+                            found = Some(candidate);
+                            break;
+                        }
+                    }
+                }
+                found.unwrap_or(rep_path)
+            } else {
+                rep_path
+            }
+        };
+        let mut file = File::open(&path)
             .map_err(|e| Error::io(format!("replica extent group {egroup}: {e}")))?;
         let mut buf = vec![0u8; len];
         file.seek(SeekFrom::Start(offset))?;
@@ -1292,6 +1315,18 @@ mod tests {
         let (id, counts) = &sample.rows[0];
         assert_eq!(id, "eg-a");
         assert_eq!((counts.reads, counts.bytes_read), (1, 4096));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_egroup_falls_back_to_local_egroups_directory() {
+        let dir = tmpdir("egroup-fallback");
+        let eg_dir = dir.join("egroups");
+        std::fs::create_dir_all(&eg_dir).unwrap();
+        std::fs::write(eg_dir.join("eg-local.eg"), b"extent-data-from-primary").unwrap();
+        let store = ReplicaStore::new(&dir).unwrap();
+        let read = store.get_egroup("eg-local", 0, 24).unwrap();
+        assert_eq!(&read, b"extent-data-from-primary");
         std::fs::remove_dir_all(&dir).ok();
     }
 
