@@ -48,11 +48,11 @@ def read(name):
 
 
 class TheRuleIsOneColumn(unittest.TestCase):
-    KEPT = {"hydra-db", "daruk", "sidon", "hylia"}
+    KEPT = set()
 
     def test_the_declared_table_keeps_exactly_the_documented_units(self):
         self.assertEqual(set(spark.maintenance_kept_units()), self.KEPT)
-        self.assertEqual(set(spark.MAINTENANCE_UNMANAGED_KEPT), {"zookeeper", "spark-daemon"})
+        self.assertEqual(set(spark.MAINTENANCE_UNMANAGED_KEPT), {"spark-daemon"})
 
     def test_every_managed_unit_is_either_kept_or_stopped_never_both_never_neither(self):
         managed = [e["unit"] for e in spark.MANAGED_SERVICES]
@@ -65,16 +65,12 @@ class TheRuleIsOneColumn(unittest.TestCase):
         self.assertEqual(len(vali.MAINTENANCE_STOP_UNITS), len(set(vali.MAINTENANCE_STOP_UNITS)))
 
     def test_nothing_kept_is_stopped_by_maintenance(self):
-        for unit in self.KEPT | {"zookeeper", "spark-daemon"}:
+        for unit in self.KEPT | {"spark-daemon"}:
             self.assertNotIn(unit, vali.MAINTENANCE_STOP_UNITS)
 
     def test_the_watchdog_restarts_what_is_kept_in_start_order(self):
         order = spark.maintenance_watchdog_units()
-        self.assertEqual(order[0], "zookeeper")
-        self.assertEqual(set(order), {"zookeeper"} | self.KEPT)
-        # Daruk after the database it fronts, and Sidon after Daruk.
-        self.assertLess(order.index("hydra-db"), order.index("daruk"))
-        self.assertLess(order.index("daruk"), order.index("sidon"))
+        self.assertEqual(order, [])
 
     def test_the_hardcoded_lists_that_disagreed_are_gone(self):
         src = read("spark_daemon_decoded.py")

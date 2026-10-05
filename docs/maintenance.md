@@ -1,44 +1,24 @@
 # Host maintenance
 
-Maintenance mode empties a host of guests so it can be worked on, without taking it out of the
-cluster's metadata and storage planes. This document is the whole flow: what a host in maintenance
-runs and why, every step in order, what each failure leaves behind and how it recovers, and what
-happens if the host reboots meanwhile. The code is `vali.py` (`handle_maintenance_request`, the
-`host_maintenance_enter` / `host_maintenance_leave` tasks, `finish_maintenance_exit`),
-`spark_daemon_decoded.py` (the `maintenance` column of `MANAGED_SERVICES`, autostart and watchdog) and
-`mipha.py` (lock renewal); `test_maintenance_flow.py` runs every transition with the cluster stubbed.
+Maintenance mode empties a host of guests and fully evacuates its storage and service roles so physical hardware (SSDs, memory, boards) can be safely serviced or the host rebooted, without risking cluster corruption or uncoordinated operations. This document describes the whole flow: what a host in maintenance runs and why, every step in order, what each failure leaves behind and how it recovers, and what happens if the host reboots meanwhile. The code is `vali.py` (`handle_maintenance_request`, the `host_maintenance_enter` / `host_maintenance_leave` tasks, `finish_maintenance_exit`), `spark_daemon_decoded.py` (the `MANAGED_SERVICES` inventory, autostart and watchdog), `valcli.py` (`wait_for_catalyst_task`), and `mipha.py` (lock renewal); `test_maintenance_flow.py` runs every transition with the cluster stubbed.
 
 ## What a host in maintenance runs
 
+In hyperconverged infrastructure (such as Nutanix AOS), node maintenance means the physical node is taken down or serviced. Hence, all cluster services, database replicas, and storage engines are fully stopped and evacuated from the node:
+
 | Unit | In maintenance | Why |
 |---|---|---|
-| `spark-daemon` | **up** | The agent that is told to leave. Not a managed service: the reconcile loop does not touch it. |
-| `zookeeper` | **up** | A voter in the ensemble that holds the desired cluster state and every leader election. Stopping it shrinks the ensemble's margin for no benefit. |
-| `hydra-db` | **up** | A replica of the metadata. The cluster's quorum margin is made of these. |
-| `daruk` | **up** | The only way anything on the host, the leave sequence included, reaches the database. |
-| `sidon` | **up** | Holds replicas of other hosts' vdisks. Stopping it degrades every vdisk with a copy here (writes need every replica) and gains nothing when the point is to empty the host of guests. The guests are gone, so no NBD socket here is in use. |
-| `hylia` | **up** | The rolling upgrade's orchestrator. An upgrade is what puts a host in maintenance in the first place, so stopping it would stop the operation that asked for the maintenance. |
-| `vali`, `catalyst`, `mipha`, `bifrost`, `dagur`, `mimir`, `rauru`, `logos`, `gatoway`, `urbosa` | stopped | Everything that places, schedules, restarts, serves the VIP for, collects for or acts on guests and the cluster. A host being drained must not take part in HA decisions, hold the VIP, or accept work. |
-| `spectrum`, `spectrum-phx`, `slate`, `agahnim` | stopped | The console and its proxies. They are reachable through the other hosts. |
+| `spark-daemon` | **up** | The local host agent that executes node lifecycle tasks and receives the leave instruction. |
+| `hydra-db`, `daruk` | stopped | Drained and stopped. ScyllaDB on this node does not accept queries during physical maintenance. |
+| `sidon` | stopped | Drained and stopped. Storage journals are flushed and extents sealed prior to stopping. |
+| `zookeeper` | stopped | Local ZooKeeper container is stopped; consensus is sustained by remaining ensemble quorum. |
+| `vali`, `catalyst`, `mipha`, `bifrost`, `dagur`, `mimir`, `rauru`, `logos`, `gatoway`, `urbosa`, `hylia` | stopped | All scheduling, HA, VIP, task management, and monitoring roles on this host are silenced. |
+| `spectrum`, `spectrum-phx`, `slate`, `agahnim` | stopped | Console and HTTP reverse proxies are stopped; access is served via healthy peer nodes. |
 
-The rule is one declared column, `"maintenance": "keep"` on the rows of `MANAGED_SERVICES`
-(hydra-db, daruk, sidon, hylia) plus the two units named in `MAINTENANCE_UNMANAGED_KEPT`
-(zookeeper, spark-daemon). Everything else derives from it: spark's autostart stops
-`maintenance_stopped_units()` and starts and watches `maintenance_watchdog_units()`; Vali's
-`MAINTENANCE_STOP_UNITS` is held equal to the complement by a test; `cluster status` prints
-`(kept up in maintenance)` for a unit the node says is kept and `(expected to be stopped in
-maintenance)` for any other unit that is up on a host in maintenance, which is how a stop that did not
-finish shows itself.
+**The Quorum Gate:**
+Before a host enters maintenance and stops `hydra-db` / `sidon`, Vali checks quorum (`check_stop_preserves_quorum`). The cluster must retain sufficient replicas to survive the loss of the host. If quorum cannot be maintained, maintenance mode entry is refused.
 
-Before this was one rule, Vali stopped everything but ZooKeeper, spark's boot path stopped a
-different list and started the database, and its watchdog restarted the database and Sidon that Vali
-had just stopped. The mixture an operator saw (ZooKeeper, HydraDB, Daruk, Spark and Hylia up, Sidon
-down) was an accident of those lists.
-
-**Why the quorum gate still exists** although the database stays up: maintenance is the state in
-which a host is rebooted, upgraded and has its services restarted, and a rolling upgrade restarts
-`hydra-db` on it. The gate asks whether the cluster could lose this host's replica *now*, so that
-entering maintenance is never what makes a later restart fatal. See [ring_lifecycle.md](./ring_lifecycle.md).
+Upon leaving maintenance (`valcli host.maintenance.leave <host>`), the host agent removes the `/etc/hci/maintenance.state` marker, bootstraps core consensus/storage services (`zookeeper` -> `hydra-db` -> `daruk` -> `sidon`), brings up the remaining cluster services, verifies that every service is `UP` via `services_down_on`, transitions the node status to `NORMAL`, releases the cluster maintenance lock, and triggers background DRS rebalancing and health checks.
 
 ## Entering
 

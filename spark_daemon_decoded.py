@@ -621,9 +621,9 @@ CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
 # started before convergence can begin and stopped after it has finished. `spark-daemon`
 # is absent for a similar reason -- it is the process running this loop.
 MANAGED_SERVICES = (
-    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042, "maintenance": "keep"},
-    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043, "maintenance": "keep"},
-    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True, "maintenance": "keep"},
+    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042},
+    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043},
+    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True},
     {"unit": "spectrum", "display": "Spectrum", "requires": ("daruk",)},
     # The Phoenix console, on 8444 behind Slate. Slate's console backend points here, and
     # Bifrost's health guard will not bind the VIP while that backend is down, so a cluster
@@ -646,27 +646,13 @@ MANAGED_SERVICES = (
     {"unit": "mipha", "display": "Mipha", "requires": ("daruk",)},
     {"unit": "gatoway", "display": "Gatoway", "requires": ("daruk",)},
     {"unit": "urbosa", "display": "Urbosa", "requires": ("daruk",), "setting": "urbosa_enabled"},
-    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",), "maintenance": "keep"},
+    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",)},
 )
 MANAGED_SERVICE_ORDER = [entry["unit"] for entry in MANAGED_SERVICES]
 
-# What a host in maintenance keeps running, and why (docs/maintenance.md). Maintenance moves the
-# guests off a host and silences everything that places, serves or acts on guests; it does not
-# take the host out of the metadata and storage planes, because the cluster's own margins are
-# built from them:
-#
-#   * ZooKeeper is a voter in the ensemble that holds the desired state and every election;
-#   * HydraDB is a replica of the metadata, and Daruk is the only way anything on the host (the
-#     leave sequence included) reaches it;
-#   * Sidon holds replicas of other hosts' vdisks -- stopping it degrades every vdisk with a copy
-#     here and gains nothing when the point is to empty the host of guests;
-#   * Hylia is the rolling upgrade's orchestrator, and an upgrade is what puts a host in
-#     maintenance in the first place, so stopping it would stop the operation that asked;
-#   * spark-daemon is the agent that is told to leave.
-#
-# The rows above carry `"maintenance": "keep"` for the managed ones; ZooKeeper and spark-daemon are
-# not in the table (they are not converged by the loop) and are named here.
-MAINTENANCE_UNMANAGED_KEPT = ("zookeeper", "spark-daemon")
+# In full host maintenance, all workloads and managed cluster services on the host are stopped.
+# The host agent (spark-daemon) remains alive to receive commands such as leave maintenance.
+MAINTENANCE_UNMANAGED_KEPT = ("spark-daemon",)
 
 
 def maintenance_kept_units():
@@ -681,7 +667,7 @@ def maintenance_stopped_units():
 
 def maintenance_watchdog_units():
     """What the maintenance watchdog restarts if it dies, in start order."""
-    return ["zookeeper"] + maintenance_kept_units()
+    return maintenance_kept_units()
 
 
 # Cluster settings that gate a declared service, and how to read them.

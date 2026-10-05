@@ -2952,50 +2952,101 @@ def catalyst_client_context():
     return context
 
 
-def wait_for_catalyst_task(task_id):
-    leader_ip = get_zookeeper_leader_ip()
-    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+def wait_for_catalyst_task(task_id, timeout_seconds=600):
     print(f"Waiting for Catalyst task {task_id} to finish...")
-    
+    deadline = time.time() + timeout_seconds
     last_progress = -1
-    while True:
+
+    def _cluster_ips():
+        ips = []
         try:
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(
-                    req, context=catalyst_client_context(), timeout=35) as response:
-                if response.status == 200:
-                    res = json.loads(response.read().decode("utf-8"))
-                    status = res.get("status")
-                    progress = res.get("progress", 0)
-                    error_msg = res.get("error_msg", "")
-                    
-                    if progress != last_progress:
-                        print(f"Task status: {status} | Progress: {progress}%")
-                        last_progress = progress
-                        
-                    if status == "completed":
-                        print("Task completed successfully.")
-                        return True
-                    elif status == "failed":
-                        print(f"Task failed: {error_msg}")
-                        sys.exit(1)
-                elif response.status == 204:
-                    # Long polling timeout, update leader IP and keep waiting
-                    leader_ip = get_zookeeper_leader_ip()
-                    url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
-                    continue
-                else:
-                    print(f"Unexpected response status from Catalyst: {response.status}")
-                    time.sleep(2)
-        except Exception as e:
+            with open("/etc/hci/cluster.json", "r") as f:
+                ips = [h.get("ip") for h in json.load(f).get("hosts", []) if h.get("ip")]
+        except Exception:
+            pass
+        if not ips:
+            ips = [LOCAL_IP] if LOCAL_IP else ["127.0.0.1"]
+        return ips
+
+    def _try_cql_fallback():
+        try:
+            clean_tid = str(task_id).replace("'", "").strip()
+            cql = f"SELECT JSON status, progress, error_msg FROM hydra.catalyst_tasks WHERE task_id = {clean_tid};"
+            rc, stdout, _err = run_cql_query_via_peers(cql)
+            if rc == 0 and stdout:
+                for line in stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("{") and line.endswith("}"):
+                        rec = json.loads(line)
+                        return rec.get("status"), rec.get("progress", 0), rec.get("error_msg", "")
+        except Exception:
+            pass
+        return None, None, None
+
+    while time.time() < deadline:
+        # 1. Try contacting Catalyst leader or candidate nodes via HTTP
+        target_ips = []
+        leader = get_zookeeper_leader_ip()
+        if leader:
+            target_ips.append(leader)
+        for ip in _cluster_ips():
+            if ip not in target_ips:
+                target_ips.append(ip)
+
+        http_answered = False
+        for ip in target_ips:
+            url = f"https://{ip}:9091/api/v1/tasks/status/{task_id}"
+            try:
+                req = urllib.request.Request(url, method="GET")
+                with urllib.request.urlopen(
+                        req, context=catalyst_client_context(), timeout=5) as response:
+                    if response.status == 200:
+                        res = json.loads(response.read().decode("utf-8"))
+                        status = res.get("status")
+                        progress = res.get("progress", 0)
+                        error_msg = res.get("error_msg", "")
+                        http_answered = True
+
+                        if progress != last_progress:
+                            print(f"Task status: {status} | Progress: {progress}%")
+                            last_progress = progress
+
+                        if status == "completed":
+                            print("Task completed successfully.")
+                            return True
+                        elif status == "failed":
+                            print(f"Task failed: {error_msg}")
+                            sys.exit(1)
+                        break
+                    elif response.status == 204:
+                        http_answered = True
+                        break
+            except Exception:
+                continue
+
+        # 2. If HTTP could not be reached on any node, fall back directly to ScyllaDB
+        if not http_answered:
             # Check if this host has entered maintenance mode locally
             if os.path.exists("/etc/hci/maintenance.state"):
                 print("Host has successfully entered maintenance mode. Catalyst is offline. Exiting wait loop.")
                 return True
-            # Maybe leader is switching/rebooting, try to find new leader IP
-            time.sleep(2)
-            leader_ip = get_zookeeper_leader_ip()
-            url = f"https://{leader_ip}:9091/api/v1/tasks/status/{task_id}"
+
+            db_status, db_prog, db_err = _try_cql_fallback()
+            if db_status:
+                if db_prog is not None and db_prog != last_progress:
+                    print(f"Task status (via DB): {db_status} | Progress: {db_prog}%")
+                    last_progress = db_prog
+                if db_status == "completed":
+                    print("Task completed successfully (verified via database).")
+                    return True
+                elif db_status == "failed":
+                    print(f"Task failed: {db_err}")
+                    sys.exit(1)
+
+        time.sleep(2)
+
+    print(f"Task wait timed out after {timeout_seconds}s for task {task_id}.")
+    sys.exit(1)
 
 def cmd_host_maintenance_enter(hostname, force_stop=False):
     if hostname == "--all":

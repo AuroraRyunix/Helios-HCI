@@ -438,13 +438,7 @@ REGISTRIES = [
     # MAINTENANCE_STOP_UNITS.
 
     # -- the daemons that start and stop other hosts' services ---------------------------------
-    Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance",
-             exempt={
-                 "hydra-db": KEPT_UP_IN_MAINTENANCE,
-                 "daruk": KEPT_UP_IN_MAINTENANCE,
-                 "sidon": KEPT_UP_IN_MAINTENANCE,
-                 "hylia": HYLIA_THROUGH_MAINTENANCE,
-             }),
+    Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance"),
     Registry("mipha.py", "main", "start_units", name="mipha: rejoin a returned host",
              exempt={"urbosa": SETTING_NOT_READ_HERE}),
 

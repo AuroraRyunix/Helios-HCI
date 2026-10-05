@@ -13,6 +13,7 @@ Run with:  python -m unittest test_valcli_peer_fallback
 import base64
 import importlib.util
 import io
+import json
 import os
 import sys
 import unittest
@@ -126,6 +127,37 @@ class TheClassifier(unittest.TestCase):
         self.assertFalse(valcli.database_looks_down(0, "NoHostAvailable"))
         self.assertFalse(valcli.database_looks_down(1, "SyntaxException"))
         self.assertFalse(valcli.database_looks_down(1, None))
+
+
+class TheCatalystTaskWaiter(unittest.TestCase):
+    def test_wait_for_catalyst_task_succeeds_via_http_on_candidate_node(self):
+        tid = "52adb8e1-adb6-413b-af4e-256c3fddaf3c"
+        mock_resp = mock.MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({"status": "completed", "progress": 100}).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.__exit__.return_value = None
+
+        with mock.patch("urllib.request.urlopen", return_value=mock_resp), \
+             mock.patch.object(valcli, "get_zookeeper_leader_ip", return_value="10.0.0.1"), \
+             mock.patch.object(valcli, "catalyst_client_context", return_value=None), \
+             mock.patch("sys.stdout", io.StringIO()):
+            res = valcli.wait_for_catalyst_task(tid, timeout_seconds=10)
+            self.assertTrue(res)
+
+    def test_wait_for_catalyst_task_falls_back_to_scylladb_when_http_fails(self):
+        tid = "52adb8e1-adb6-413b-af4e-256c3fddaf3c"
+        # HTTP raises exception
+        def urlopen_fail(*args, **kwargs):
+            raise Exception("Connection refused on port 9091")
+
+        cql_row = json.dumps({"status": "completed", "progress": 100, "error_msg": ""})
+        with mock.patch("urllib.request.urlopen", side_effect=urlopen_fail), \
+             mock.patch.object(valcli, "get_zookeeper_leader_ip", return_value="10.0.0.1"), \
+             mock.patch.object(valcli, "run_cql_query_via_peers", return_value=(0, cql_row, "")), \
+             mock.patch("sys.stdout", io.StringIO()):
+            res = valcli.wait_for_catalyst_task(tid, timeout_seconds=10)
+            self.assertTrue(res)
 
 
 if __name__ == "__main__":

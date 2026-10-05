@@ -209,13 +209,16 @@ MIGRATION_COMMAND_TIMEOUT = 3600
 # still up, and the repair for one that died during the window), then everything it stopped.
 # Hylia was missing from the list that used to stand here, which only worked because maintenance
 # never stopped it.
-MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon", "hylia")
+MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon")
 LEAVABLE_HOST_STATES = ("IN_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING")
 MAINTENANCE_STOP_UNITS = (
     "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
-    "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa",
+    "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa", "hylia",
+    "sidon", "daruk", "hydra-db",
 )
-MAINTENANCE_EXIT_START_UNITS = MAINTENANCE_EXIT_START_UNITS + MAINTENANCE_STOP_UNITS
+MAINTENANCE_EXIT_START_UNITS = MAINTENANCE_EXIT_START_UNITS + tuple(
+    u for u in MAINTENANCE_STOP_UNITS if u not in MAINTENANCE_EXIT_START_UNITS
+)
 
 # What Sidon's takeover may take on the destination: the owner drains its journal (bounded by
 # SIDON_HANDOVER_TIMEOUT, 120 s) and the claim and fence follow. Longer than either.
@@ -2697,8 +2700,6 @@ def services_down_on(target_ip):
     """The managed services not UP on a host, or None when its status cannot be read."""
     rc, status, _ = run_mtls_spark_api(target_ip, "/api/v1/node/status", None, method="GET")
     if rc != 0 or not isinstance(status, dict):
-        return None
-    if status.get("maintenance_status", "NORMAL") != "NORMAL":
         return None
     services = status.get("services") or {}
     return sorted(name for name, data in services.items()
