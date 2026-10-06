@@ -401,7 +401,7 @@ def print_cluster_table(nodes, ips):
             print(f"\n        Host: {BOLD}{ip}{RESET} {RED}Down{RESET} {GRAY}(no ZooKeeper registration){RESET}")
 
 
-def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
+def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=2.5):
     """Watch the cluster converge toward the state that was declared, or stop at an error.
 
     The CLI issues no service commands: it declared an intent, and each node's reconcile
@@ -431,7 +431,7 @@ def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
         state = zk_read_cluster_state()
         if state is None:
             line = "Waiting for ZooKeeper to become reachable..."
-            if line != last_line or (now - last_printed_at >= 4.0):
+            if line != last_line or (now - last_printed_at >= 2.5):
                 print(f"\n  {line}")
                 last_line = line
                 last_printed_at = now
@@ -488,7 +488,7 @@ def wait_until_error_or_done(expected_ips, op="start", timeout=600, poll=3):
         for ip in sorted(pending):
             parts.append(f"{ip}: {', '.join(pending[ip])}")
         line = "Waiting for " + ("; ".join(parts) or "nodes to finish converging")
-        if line != last_line or (now - last_printed_at >= 4.0):
+        if line != last_line or (now - last_printed_at >= 2.5):
             print(f"\n  {line}")
             last_line = line
             last_printed_at = now
