@@ -446,3 +446,14 @@ Fixed and verified:
   - Interactive shell (`ValcliShell`), `--help`, and tab autocompletion now filter specifically based on the binary name (`acli` vs `ncli` vs `valcli`).
   - Added mutual command guardrails: running an infrastructure command in `acli` directs the user to `ncli`, and running a workload command in `ncli` directs the user to `acli`.
 - Synchronized `provision.py` with `sync_provision.py` and deployed across all cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`).
+
+#### Sixth batch: Phoenix VM deletion/update API endpoint routing fix
+
+Fixed and verified:
+- **Phoenix Console VM Force Destroy & Delete 405 Error**:
+  - Root cause: `Vms.delete_vm/2` and `Vms.update_running_vm/2` in `spectrum_phx/lib/spectrum_phx/vms.ex` made HTTP requests to `http://127.0.0.1:8080/api/vms/delete` and `/api/vms/update`. Port 8080 is ZooKeeper's embedded Jetty AdminServer, which rejected POST requests with HTTP 405 (`HTTP method POST is not supported by this URL`).
+  - Fix: Redirected requests to Spectrum Server's loopback HTTPS service on `https://127.0.0.1:8443` with `verify: :verify_none` transport options (Spectrum authenticates direct loopback requests as `local-admin`).
+  - Added test seam `spectrum_api_poster` in `spectrum_phx/lib/spectrum_phx/vms.ex` with test coverage in `spectrum_phx/test/spectrum_phx/vms_test.exs`.
+  - Deployed updated `spectrum-phx` container image across all cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`) via `deploy_updates.py --phx-only`.
+  - Live verification confirmed `SpectrumPhx.Vms.delete_vm` successfully dispatches to Spectrum on `https://127.0.0.1:8443/api/vms/delete`.
+

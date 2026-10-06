@@ -986,15 +986,17 @@ defmodule SpectrumPhx.Vms do
       keep_disks = Keyword.get(opts, :keep_disks, false)
       payload = %{name: name, force: force, keep_disks: keep_disks}
       
-      url = "http://127.0.0.1:8080/api/vms/delete"
-      case Req.post(url, json: payload, receive_timeout: 30_000) do
+      case post_spectrum_api("/api/vms/delete", payload, 30_000) do
         {:ok, %Req.Response{status: 200, body: body}} ->
           broadcast({:vm_updated, name})
           {:ok, body}
+
         {:ok, %Req.Response{status: status, body: %{"error" => err}}} ->
           {:error, "#{err} (status #{status})"}
+
         {:ok, %Req.Response{status: status, body: body}} ->
           {:error, "Delete failed with status #{status}: #{inspect(body)}"}
+
         {:error, reason} ->
           {:error, reason}
       end
@@ -1070,9 +1072,7 @@ defmodule SpectrumPhx.Vms do
         "network_id" => network_id_val
       }
 
-      url = "http://127.0.0.1:8080/api/vms/update"
-
-      case Req.post(url, json: payload, receive_timeout: 45_000) do
+      case post_spectrum_api("/api/vms/update", payload, 45_000) do
         {:ok, %Req.Response{status: 200, body: body}} ->
           broadcast({:vm_updated, name})
           {:ok, body}
@@ -1185,7 +1185,33 @@ defmodule SpectrumPhx.Vms do
           nil | (atom(), String.t(), map() -> {:ok, map()} | {:error, term()})
   def storage_client, do: Application.get_env(:spectrum_phx, :vms_storage_client)
 
+  @doc """
+  Override for Spectrum API posts: `nil` (post over loopback HTTPS :8443) or a 3-arity
+  function receiving `(path, payload, timeout)`. Tests set the function so delete and update
+  actions can be asserted on without a running Spectrum daemon.
+  """
+  @spec spectrum_api_poster() ::
+          nil | (String.t(), map(), non_neg_integer() -> {:ok, Req.Response.t()} | {:error, term()})
+  def spectrum_api_poster, do: Application.get_env(:spectrum_phx, :vms_spectrum_api_poster)
+
   # -- internals -------------------------------------------------------------------
+
+  defp post_spectrum_api(path, payload, timeout) do
+    case spectrum_api_poster() do
+      fun when is_function(fun, 3) ->
+        fun.(path, payload, timeout)
+
+      _ ->
+        base = Application.get_env(:spectrum_phx, :spectrum_api_base_url, "https://127.0.0.1:8443")
+        url = base <> path
+
+        Req.post(url,
+          json: payload,
+          connect_options: [transport_opts: [verify: :verify_none]],
+          receive_timeout: timeout
+        )
+    end
+  end
 
   defp validate_name(name) do
     case Vm.validate_name(name) do

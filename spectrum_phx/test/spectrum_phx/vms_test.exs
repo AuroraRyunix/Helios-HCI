@@ -616,4 +616,82 @@ defmodule SpectrumPhx.VmsTest do
       assert {:error, :not_found} = Vms.get_vm("no-such-vm")
     end
   end
+
+  describe "spectrum api operations (delete and update)" do
+    test "delete_vm validates name before making any request" do
+      assert {:error, :invalid_name} = Vms.delete_vm("invalid; name")
+      assert {:error, :invalid_name} = Vms.delete_vm("../traversal")
+    end
+
+    test "delete_vm posts to /api/vms/delete with force and keep_disks options" do
+      test_pid = self()
+
+      Application.put_env(:spectrum_phx, :vms_spectrum_api_poster, fn path, payload, timeout ->
+        send(test_pid, {:spectrum_api_post, path, payload, timeout})
+        {:ok, %Req.Response{status: 200, body: %{"message" => "VM deleted successfully."}}}
+      end)
+
+      on_exit(fn ->
+        Application.delete_env(:spectrum_phx, :vms_spectrum_api_poster)
+      end)
+
+      assert {:ok, %{"message" => "VM deleted successfully."}} =
+               Vms.delete_vm("web-01", force: true, keep_disks: false)
+
+      assert_received {:spectrum_api_post, "/api/vms/delete",
+                       %{name: "web-01", force: true, keep_disks: false}, 30_000}
+    end
+
+    test "delete_vm surfaces API errors properly" do
+      Application.put_env(:spectrum_phx, :vms_spectrum_api_poster, fn _path, _payload, _timeout ->
+        {:ok, %Req.Response{status: 409, body: %{"error" => "Refusing to delete 'web-01': it is migrating"}}}
+      end)
+
+      on_exit(fn ->
+        Application.delete_env(:spectrum_phx, :vms_spectrum_api_poster)
+      end)
+
+      assert {:error, "Refusing to delete 'web-01': it is migrating (status 409)"} =
+               Vms.delete_vm("web-01")
+    end
+
+    test "update_running_vm validates name before making request" do
+      assert {:error, :invalid_name} = Vms.update_running_vm("invalid; name", %{})
+    end
+
+    test "update_running_vm posts to /api/vms/update with formatted payload" do
+      test_pid = self()
+
+      Application.put_env(:spectrum_phx, :vms_spectrum_api_poster, fn path, payload, timeout ->
+        send(test_pid, {:spectrum_api_post, path, payload, timeout})
+        {:ok, %Req.Response{status: 200, body: %{"message" => "VM updated"}}}
+      end)
+
+      on_exit(fn ->
+        Application.delete_env(:spectrum_phx, :vms_spectrum_api_poster)
+      end)
+
+      attrs = %{
+        "vcpu" => 4,
+        "memory" => 8192,
+        "firmware" => "uefi",
+        "boot_device" => "hd",
+        "cpu_model" => "host-passthrough",
+        "graphics" => "vnc",
+        "audio_enabled" => true,
+        "disks" => ["20G", "40G:pool2"],
+        "iso" => ["debian.iso"],
+        "network_id" => "net-1"
+      }
+
+      assert {:ok, %{"message" => "VM updated"}} = Vms.update_running_vm("web-01", attrs)
+
+      assert_received {:spectrum_api_post, "/api/vms/update", payload, 45_000}
+      assert payload["name"] == "web-01"
+      assert payload["vcpus"] == 4
+      assert payload["memory"] == 8192
+      assert payload["iso"] == "debian.iso"
+      assert payload["audio_enabled"] == true
+    end
+  end
 end
