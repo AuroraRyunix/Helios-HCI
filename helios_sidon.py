@@ -572,6 +572,7 @@ def cdrom_xml(vdisk_id, dev_letter, nbd_dir=NBD_DIR, boot_order=None, bus="scsi"
         "      <driver name='qemu' type='raw'/>",
         "      <source protocol='nbd' name='%s'>" % vdisk_id,
         "        <host transport='unix' socket='%s'/>" % nbd_socket(vdisk_id, nbd_dir),
+        "        <reconnect delay='60'/>",
         "      </source>",
         "      <target dev='sd%s' bus='%s'/>" % (dev_letter, bus),
         "      <readonly/>",
@@ -586,12 +587,15 @@ def disk_xml(vdisk_id, dev_letter, vcpu=1, nbd_dir=NBD_DIR, boot_order=None):
     `type='network'` with a unix transport: qemu speaks NBD to the local daemon over the
     socket, never to a block device. There is no `/dev/` node to leak, no kernel client
     in the path, and nothing to promote or demote before a guest can start.
+    `<reconnect delay='60'/>` ensures QEMU pauses guest I/O in RAM and reconnects if the
+    local Sidon unix socket temporarily restarts or forwards to an autopathing peer.
     """
     return (
         "\n    <disk type='network' device='disk'>"
         "\n      <driver name='qemu' type='raw' cache='none' io='native' queues='%d' iothread='1'/>"
         "\n      <source protocol='nbd' name='%s'>"
         "\n        <host transport='unix' socket='%s'/>"
+        "\n        <reconnect delay='60'/>"
         "\n      </source>"
         "\n      <target dev='vd%s' bus='virtio'/>"
         "%s"

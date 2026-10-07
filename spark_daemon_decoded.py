@@ -1365,6 +1365,13 @@ def build_node_status():
     maint_status = "NORMAL"
     if os.path.exists("/etc/hci/maintenance.state"):
         maint_status = "IN_MAINTENANCE"
+        try:
+            with open("/etc/hci/maintenance.state", "r", encoding="utf-8") as _mf:
+                _content = _mf.read().strip()
+                if "SERVICE_MAINTENANCE" in _content:
+                    maint_status = "SERVICE_MAINTENANCE"
+        except Exception:
+            pass
         
     global NODE_DISKS_CACHE
     if 'NODE_DISKS_CACHE' not in globals():
@@ -3448,6 +3455,8 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     maint_str = ""
                     if maint_status == "IN_MAINTENANCE":
                         maint_str = f" {YELLOW}[MAINTENANCE]{RESET}"
+                    elif maint_status == "SERVICE_MAINTENANCE":
+                        maint_str = f" {YELLOW}[SERVICE MAINTENANCE]{RESET}"
                     elif maint_status == "ENTERING_MAINTENANCE":
                         maint_str = f" {YELLOW}[ENTERING MAINTENANCE]{RESET}"
                     

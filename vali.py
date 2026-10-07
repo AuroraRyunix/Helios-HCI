@@ -210,7 +210,7 @@ MIGRATION_COMMAND_TIMEOUT = 3600
 # Hylia was missing from the list that used to stand here, which only worked because maintenance
 # never stopped it.
 MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon")
-LEAVABLE_HOST_STATES = ("IN_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING")
+LEAVABLE_HOST_STATES = ("IN_MAINTENANCE", "SERVICE_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING")
 MAINTENANCE_STOP_UNITS = (
     "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
     "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa", "hylia",
@@ -2131,6 +2131,7 @@ def process_queue_task(task):
             hostname = payload.get("hostname")
             target_ip = payload.get("target_ip")
             force_stop = payload.get("force_stop", False)
+            preserve_vms = bool(payload.get("preserve_vms", False))
             # Taken by the API handler before this task was submitted; renewed below for
             # as long as the evacuation runs, and given back on every failure path.
             lock_token = payload.get("lock_token", "")
@@ -2139,20 +2140,26 @@ def process_queue_task(task):
                 release_maintenance_lock(lock_token)
                 return False, "Invalid payload parameters for host_maintenance_enter."
 
-            # Perform VM evacuation
-            rc_v, stdout_v, _ = run_cql_query("SELECT JSON name, host_ip, state, memory FROM hydra.vms;")
-            vms = []
-            if rc_v == 0 and stdout_v:
-                for line in stdout_v.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            vms.append(json.loads(line))
-                        except:
-                            pass
-            
-            # Filter VMs that are running on target_ip
-            running_vms = [v for v in vms if v.get("state") == "Running" and v.get("host_ip") == target_ip]
+            if preserve_vms:
+                # Service maintenance: running VMs remain on the host with virtqemud running.
+                # Only storage and cluster management services are serviced/restarted.
+                print(f"[Maintenance Catalyst Task] Service maintenance requested for host {hostname} ({target_ip}); preserving running VMs.")
+                running_vms = []
+            else:
+                # Perform VM evacuation
+                rc_v, stdout_v, _ = run_cql_query("SELECT JSON name, host_ip, state, memory FROM hydra.vms;")
+                vms = []
+                if rc_v == 0 and stdout_v:
+                    for line in stdout_v.splitlines():
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                vms.append(json.loads(line))
+                            except:
+                                pass
+                
+                # Filter VMs that are running on target_ip
+                running_vms = [v for v in vms if v.get("state") == "Running" and v.get("host_ip") == target_ip]
             
             success = True
             failed_vm = ""
@@ -2222,13 +2229,16 @@ def process_queue_task(task):
                     run_cql_query(cql)
                     release_maintenance_lock(lock_token)
                     print(f"[Maintenance Catalyst Task] REFUSED to stop services on {hostname}: {quorum_reason}")
-                    print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL. Its VMs have already been evacuated; DRS will rebalance them.")
+                    if preserve_vms:
+                        print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL.")
+                    else:
+                        print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL. Its VMs have already been evacuated; DRS will rebalance them.")
                     return False, f"Refused to enter maintenance mode: {quorum_reason}"
 
-                # Mark node status as IN_MAINTENANCE in DB
-                cql = f"UPDATE hydra.nodes SET status = 'IN_MAINTENANCE', maintenance_mode = true WHERE hostname = '{hostname}';"
+                target_status = 'SERVICE_MAINTENANCE' if preserve_vms else 'IN_MAINTENANCE'
+                cql = f"UPDATE hydra.nodes SET status = '{target_status}', maintenance_mode = true WHERE hostname = '{hostname}';"
                 run_cql_query(cql)
-                print(f"[Maintenance Catalyst Task] Host {hostname} successfully entered maintenance mode. {quorum_reason}")
+                print(f"[Maintenance Catalyst Task] Host {hostname} successfully entered {target_status} mode. {quorum_reason}")
 
                 # The lock stays held for as long as the host is in maintenance, and is
                 # renewed from here on by Mipha's control loop -- this task is about to
@@ -2241,18 +2251,19 @@ def process_queue_task(task):
                 # into maintenance. If it cannot be written nothing has been stopped yet, so the
                 # entry is abandoned and the host put back, instead of recorded in the database
                 # as in maintenance while the host does not know it.
+                marker_reason = "SERVICE_MAINTENANCE" if preserve_vms else f"maintenance on {hostname}"
                 rc_state, _, err_state = run_mtls_spark_api(
-                    target_ip, "/api/v1/host/maintenance-state", {"state": "ENTER", "reason": f"maintenance on {hostname}"})
+                    target_ip, "/api/v1/host/maintenance-state", {"state": "ENTER", "reason": marker_reason})
                 if rc_state != 0:
                     rc_state, _, err_state = run_remote_spark(
-                        target_ip, "mkdir -p /etc/hci && touch /etc/hci/maintenance.state")
+                        target_ip, f"mkdir -p /etc/hci && echo '{marker_reason}' > /etc/hci/maintenance.state")
                 if rc_state != 0:
                     run_cql_query(f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';")
                     release_maintenance_lock(lock_token)
                     print(f"[Maintenance Catalyst Task] Could not write the maintenance marker on {hostname}: {err_state}. Host status reverted to NORMAL.")
+                    undo_detail = "Running VMs were preserved." if preserve_vms else "Its VMs have already been evacuated; DRS will rebalance them."
                     return False, (f"Could not enter maintenance mode: the marker file could not be "
-                                   f"written on {hostname} ({err_state.strip() or 'no detail'}). "
-                                   "Its VMs have already been evacuated; DRS will rebalance them.")
+                                   f"written on {hostname} ({err_state.strip() or 'no detail'}). {undo_detail}")
                 # What maintenance stops: every managed unit that is not one of the ones kept
                 # up on purpose (docs/maintenance.md). The same list spark's autostart stops
                 # after a reboot in maintenance; test_maintenance_flow checks they agree.
@@ -3150,6 +3161,7 @@ def handle_maintenance_request(payload, send_json):
     hostname = payload.get("hostname")
     action = payload.get("action")
     force_stop = payload.get("force_stop", False)
+    preserve_vms = bool(payload.get("preserve_vms", False))
     
     if not hostname or not action:
         send_json(400, {"error": "Parameters hostname and action required."})
@@ -3260,6 +3272,7 @@ def handle_maintenance_request(payload, send_json):
                 "hostname": hostname,
                 "target_ip": target_ip,
                 "force_stop": force_stop,
+                "preserve_vms": preserve_vms,
                 "lock_token": lock_token
             }
         }, method="POST")

@@ -1717,7 +1717,7 @@ MAINTENANCE_LOCK_TTL_SECONDS = 300
 # included because a host that has left maintenance but has not finished resyncing its
 # storage is not yet a replica anyone should count on, and no second host should start
 # draining until it is.
-MAINTENANCE_LOCK_STATES = ("ENTERING_MAINTENANCE", "IN_MAINTENANCE", "RECOVERING")
+MAINTENANCE_LOCK_STATES = ("ENTERING_MAINTENANCE", "IN_MAINTENANCE", "SERVICE_MAINTENANCE", "RECOVERING")
 
 DARUK_URL = "http://127.0.0.1:9043"
 
@@ -2210,7 +2210,7 @@ def main():
                 if db_status in MAINTENANCE_LOCK_STATES:
                     renew_maintenance_lock_for(hostname)
 
-                if db_status in ["IN_MAINTENANCE", "ENTERING_MAINTENANCE"]:
+                if db_status in ["IN_MAINTENANCE", "SERVICE_MAINTENANCE", "ENTERING_MAINTENANCE"]:
                     consecutive_failures[ip] = 0
                     continue
 
@@ -2222,7 +2222,7 @@ def main():
                 rc, res, _ = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
                 if rc == 0 and res.get("ip") == ip:
                     # Verify if host is in maintenance mode
-                    if res.get("maintenance_status") == "IN_MAINTENANCE":
+                    if res.get("maintenance_status") in ("IN_MAINTENANCE", "SERVICE_MAINTENANCE"):
                         # If in maintenance, skip monitoring
                         consecutive_failures[ip] = 0
                         continue

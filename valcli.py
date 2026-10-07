@@ -3050,7 +3050,7 @@ def wait_for_catalyst_task(task_id, timeout_seconds=600):
     print(f"Task wait timed out after {timeout_seconds}s for task {task_id}.")
     sys.exit(1)
 
-def cmd_host_maintenance_enter(hostname, force_stop=False):
+def cmd_host_maintenance_enter(hostname, force_stop=False, preserve_vms=False):
     if hostname == "--all":
         rc_hosts, res_hosts, err_hosts = run_mtls_api("127.0.0.1", "/api/v1/hosts", {}, method="GET")
         if rc_hosts != 0 or "error" in res_hosts:
@@ -3070,10 +3070,11 @@ def cmd_host_maintenance_enter(hostname, force_stop=False):
             print("No hosts found.")
             sys.exit(1)
             
-        print(f"Requesting all hosts to enter maintenance mode sequentially: {', '.join(hostnames)}...")
+        maint_type = "service maintenance (preserving VMs)" if preserve_vms else "full maintenance"
+        print(f"Requesting all hosts to enter {maint_type} sequentially: {', '.join(hostnames)}...")
         for hn in hostnames:
             print(f"\n--- Processing host '{hn}' ---")
-            payload = {"hostname": hn, "action": "enter", "force_stop": force_stop}
+            payload = {"hostname": hn, "action": "enter", "force_stop": force_stop, "preserve_vms": preserve_vms}
             rc, res, err = run_mtls_api("127.0.0.1", "/api/v1/host/maintenance", payload, method="POST")
             if rc != 0:
                 print(f"Failed to communicate with spark-daemon for {hn}: {err}")
@@ -3087,8 +3088,9 @@ def cmd_host_maintenance_enter(hostname, force_stop=False):
                     print(f"Success for {hn}: {res.get('message', 'Maintenance mode transition initiated.')}")
         return
 
-    print(f"Requesting host '{hostname}' to enter maintenance mode (force_stop={force_stop})...")
-    payload = {"hostname": hostname, "action": "enter", "force_stop": force_stop}
+    maint_type = "service maintenance (preserving VMs)" if preserve_vms else "full maintenance"
+    print(f"Requesting host '{hostname}' to enter {maint_type} (force_stop={force_stop})...")
+    payload = {"hostname": hostname, "action": "enter", "force_stop": force_stop, "preserve_vms": preserve_vms}
     rc, res, err = run_mtls_api("127.0.0.1", "/api/v1/host/maintenance", payload, method="POST")
     if rc != 0:
         print(f"Failed to communicate with spark-daemon: {err}")
@@ -3104,7 +3106,125 @@ def cmd_host_maintenance_enter(hostname, force_stop=False):
     else:
         print(f"Success: {res.get('message', 'Maintenance mode transition initiated.')}")
 
-def cmd_host_maintenance_leave(hostname):
+def run_ssh_command(target_ip, command):
+    """Executes a command directly over SSH using cluster root SSH keys.
+
+    Used as an out-of-band emergency fallback when spark-daemon is crashed, unresponsive,
+    or wedged during upgrades or maintenance transitions.
+    """
+    key_candidates = [
+        os.path.expanduser("~/.ssh/id_rsa_hci"),
+        os.path.expanduser("~/.ssh/id_rsa"),
+        "/root/.ssh/id_rsa",
+    ]
+    # Check if paramiko is available
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Try finding valid private key
+        key_file = None
+        for kp in key_candidates:
+            if os.path.exists(kp):
+                key_file = kp
+                break
+        
+        password = os.environ.get("HELIOS_PASSWORD")
+        kwargs = {"username": "root", "timeout": 15}
+        if key_file:
+            kwargs["key_filename"] = key_file
+        elif password:
+            kwargs["password"] = password
+            
+        client.connect(target_ip, **kwargs)
+        stdin, stdout, stderr = client.exec_command(command)
+        rc = stdout.channel.recv_exit_status()
+        out_str = stdout.read().decode("utf-8")
+        err_str = stderr.read().decode("utf-8")
+        client.close()
+        return rc, out_str, err_str
+    except Exception as ex_paramiko:
+        # Fallback to local OpenSSH CLI if paramiko fails or is not installed
+        try:
+            cmd_args = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            for kp in key_candidates:
+                if os.path.exists(kp):
+                    cmd_args.extend(["-i", kp])
+                    break
+            cmd_args.extend([f"root@{target_ip}", command])
+            proc = subprocess.run(cmd_args, capture_output=True, text=True, timeout=25)
+            return proc.returncode, proc.stdout, proc.stderr
+        except Exception as ex_sub:
+            return -1, "", f"SSH connection failed (paramiko: {ex_paramiko}, ssh CLI: {ex_sub})"
+
+
+def execute_ssh_rescue(hostname, target_ip):
+    """Out-of-band host rescue via SSH to revive uncontactable or wedged hosts."""
+    print(f"[SSH Rescue] Initiating out-of-band recovery for {hostname} ({target_ip})...")
+    rescue_cmd = (
+        "rm -f /etc/hci/maintenance.state && "
+        "systemctl restart spark-daemon && "
+        "systemctl start zookeeper hydra-db daruk sidon && "
+        "echo RESCUE_SUCCESS"
+    )
+    rc, out, err = run_ssh_command(target_ip, rescue_cmd)
+    if rc != 0 or "RESCUE_SUCCESS" not in out:
+        print(f"[SSH Rescue] Failed to run rescue command on {target_ip}: {err or out}")
+        return False
+    print(f"[SSH Rescue] Host marker removed and core services (spark-daemon, zookeeper, hydra-db, daruk, sidon) started.")
+    
+    # Update cluster database node status if reachable
+    try:
+        run_cql_query(f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';")
+        print(f"[SSH Rescue] Updated cluster database record for {hostname} to NORMAL.")
+    except Exception as db_err:
+        print(f"[SSH Rescue] Note: Could not update database directly ({db_err}); watchdog/Mipha will reconcile.")
+    return True
+
+
+def cmd_host_rescue(hostname):
+    """Emergency out-of-band recovery for a host that is wedged, crashed, or unresponsive."""
+    print(f"=== Emergency Rescue for Host '{hostname}' ===")
+    target_ip = None
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            for h in cdata.get("hosts", []):
+                if h.get("hostname") == hostname or h.get("ip") == hostname:
+                    target_ip = h.get("ip")
+                    hostname = h.get("hostname", hostname)
+                    break
+    except Exception:
+        pass
+
+    if not target_ip:
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", hostname):
+            target_ip = hostname
+        else:
+            print(f"Error: Host '{hostname}' could not be resolved from cluster configuration.")
+            sys.exit(1)
+
+    ok = execute_ssh_rescue(hostname, target_ip)
+    if ok:
+        print(f"Success: Host '{hostname}' ({target_ip}) rescued successfully.")
+    else:
+        print(f"Error: Emergency rescue failed for '{hostname}' ({target_ip}).")
+        sys.exit(1)
+
+
+def cmd_host_maintenance_leave(hostname, use_ssh=False):
+    target_ip = None
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            for h in cdata.get("hosts", []):
+                if h.get("hostname") == hostname or h.get("ip") == hostname:
+                    target_ip = h.get("ip")
+                    break
+    except Exception:
+        pass
+
     if hostname == "--all":
         rc_hosts, res_hosts, err_hosts = run_mtls_api("127.0.0.1", "/api/v1/hosts", {}, method="GET")
         if rc_hosts != 0 or "error" in res_hosts:
@@ -3128,9 +3248,17 @@ def cmd_host_maintenance_leave(hostname):
         for hn in hostnames:
             print(f"\n--- Processing host '{hn}' ---")
             payload = {"hostname": hn, "action": "leave"}
+            if use_ssh:
+                hn_ip = next((h.get("ip") for h in hosts if h.get("hostname") == hn), None)
+                if hn_ip:
+                    execute_ssh_rescue(hn, hn_ip)
+                continue
             rc, res, err = run_mtls_api("127.0.0.1", "/api/v1/host/maintenance", payload, method="POST")
             if rc != 0:
                 print(f"Failed to communicate with spark-daemon for {hn}: {err}")
+                if target_ip:
+                    print(f"Attempting automatic emergency SSH fallback for {hn}...")
+                    execute_ssh_rescue(hn, target_ip)
             elif "error" in res:
                 print(f"Error for {hn}: {res['error']}")
             else:
@@ -3141,11 +3269,31 @@ def cmd_host_maintenance_leave(hostname):
                     print(f"Success for {hn}: {res.get('message', 'Host returned to normal status.')}")
         return
 
+    if use_ssh:
+        if not target_ip:
+            if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", hostname):
+                target_ip = hostname
+            else:
+                print(f"Error: Host '{hostname}' IP address could not be resolved for SSH leave.")
+                sys.exit(1)
+        ok = execute_ssh_rescue(hostname, target_ip)
+        if ok:
+            print(f"Success: Host '{hostname}' left maintenance mode via SSH out-of-band recovery.")
+        else:
+            print(f"Error: Failed to take '{hostname}' out of maintenance via SSH.")
+            sys.exit(1)
+        return
+
     print(f"Requesting host '{hostname}' to leave maintenance mode...")
     payload = {"hostname": hostname, "action": "leave"}
     rc, res, err = run_mtls_api("127.0.0.1", "/api/v1/host/maintenance", payload, method="POST")
     if rc != 0:
         print(f"Failed to communicate with spark-daemon: {err}")
+        if target_ip:
+            print(f"Attempting automatic emergency SSH fallback for {hostname} ({target_ip})...")
+            if execute_ssh_rescue(hostname, target_ip):
+                print(f"Success: Host '{hostname}' left maintenance mode via emergency SSH fallback.")
+                return
         sys.exit(1)
     if "error" in res:
         print(f"Error: {res['error']}")
@@ -3678,7 +3826,7 @@ VALCLI_COMMANDS = {
 
 NCLI_COMMANDS = {
     "drs.status",
-    "host.list", "host.maintenance.enter", "host.maintenance.leave",
+    "host.list", "host.maintenance.enter", "host.maintenance.leave", "host.rescue",
     "cluster.vip.set",
     "storage.list", "storage.container.create", "storage.container.update", "storage.container.delete",
     "storage.benchmark", "storage.cleanup_orphaned", "storage.snapshot", "storage.clone",
@@ -3735,10 +3883,15 @@ def print_usage(prog_name="valcli"):
     if p == "ncli":
         print(f"  {p} drs.status                  Print cluster balance score and recent DRS migrations")
         print(f"  {p} host.list                   List all hosts and their maintenance state")
-        print(f"  {p} host.maintenance.enter <h>  Put host (or '--all') into maintenance mode and evacuate VMs")
+        print(f"  {p} host.maintenance.enter <h>  Put host (or '--all') into maintenance mode")
         print("      Options:")
+        print("        --preserve-vms               Service maintenance: keep VMs running, stop/service daemons only")
+        print("        --storage-only               Alias for --preserve-vms")
         print("        --force-stop                 Forcefully stop/suspend VMs that fail migration")
         print(f"  {p} host.maintenance.leave <h>  Take host (or '--all') out of maintenance mode")
+        print("      Options:")
+        print("        --ssh                        Force emergency out-of-band revival via SSH (~/.ssh/id_rsa_hci)")
+        print(f"  {p} host.rescue <h>             Emergency out-of-band revival for wedged or crashed hosts via SSH")
         print(f"  {p} cluster.vip.set <vip>       Configure cluster-wide Virtual IP (VIP)")
         print(f"  {p} storage.list                List storage containers, per-node extent stores and vdisks")
         print(f"  {p} storage.container.create <name> [--tier T] [--quota-gb N] [--ftt N] [--compression none|lz4]")
@@ -3872,29 +4025,32 @@ def execute_command(args, prog_name="valcli"):
             cmd_host_list()
         elif cmd == "host.maintenance.enter":
             sub_args = args[1:]
-            if not sub_args or (len(sub_args) == 1 and sub_args[0] == "--force-stop"):
+            flags = {"--force-stop", "--preserve-vms", "--storage-only"}
+            non_flag_args = [a for a in sub_args if a not in flags]
+            if not non_flag_args:
                 print("Error: Hostname is required.")
-                print(f"Usage: {p} host.maintenance.enter <hostname> [--force-stop]")
+                print(f"Usage: {p} host.maintenance.enter <hostname> [--preserve-vms|--storage-only] [--force-stop]")
                 return 1
 
             force_stop = "--force-stop" in sub_args
-            hostname = None
-            for arg in sub_args:
-                if arg != "--force-stop":
-                    hostname = arg
-                    break
-
-            if not hostname:
-                print("Error: Hostname is required.")
-                return 1
-
-            cmd_host_maintenance_enter(hostname, force_stop)
+            preserve_vms = ("--preserve-vms" in sub_args) or ("--storage-only" in sub_args)
+            hostname = non_flag_args[0]
+            cmd_host_maintenance_enter(hostname, force_stop=force_stop, preserve_vms=preserve_vms)
         elif cmd == "host.maintenance.leave":
+            sub_args = args[1:]
+            use_ssh = "--ssh" in sub_args
+            non_flag_args = [a for a in sub_args if a != "--ssh"]
+            if not non_flag_args:
+                print("Error: Hostname is required.")
+                print(f"Usage: {p} host.maintenance.leave <hostname> [--ssh]")
+                return 1
+            cmd_host_maintenance_leave(non_flag_args[0], use_ssh=use_ssh)
+        elif cmd == "host.rescue":
             if len(args) < 2:
                 print("Error: Hostname is required.")
-                print(f"Usage: {p} host.maintenance.leave <hostname>")
+                print(f"Usage: {p} host.rescue <hostname>")
                 return 1
-            cmd_host_maintenance_leave(args[1])
+            cmd_host_rescue(args[1])
         elif cmd == "cluster.vip.set":
             if len(args) < 2:
                 print("Error: VIP IP address is required.")

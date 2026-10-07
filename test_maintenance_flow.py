@@ -138,6 +138,8 @@ class Cluster:
             self.status = "NORMAL"
         elif "SET status = 'IN_MAINTENANCE'" in query:
             self.status = "IN_MAINTENANCE"
+        elif "SET status = 'SERVICE_MAINTENANCE'" in query:
+            self.status = "SERVICE_MAINTENANCE"
         elif "SET status = 'RECOVERING'" in query:
             self.status = "RECOVERING"
         return 0, "", ""
@@ -181,7 +183,7 @@ class Cluster:
 
     def remote(self, ip, command, timeout=None):
         self.events.append(("remote", ip, command))
-        if "touch /etc/hci/maintenance.state" in command:
+        if "/etc/hci/maintenance.state" in command and ("touch" in command or "echo" in command):
             if self.marker_write_rc == 0:
                 self.marker = True
             return self.marker_write_rc, "", "read-only file system" if self.marker_write_rc else ""
@@ -280,7 +282,15 @@ class TheRequestToEnter(ValiTestCase):
         self.assertEqual(self.c.status, "ENTERING_MAINTENANCE")
         self.assertEqual(self.c.submitted[0]["action"], "host_maintenance_enter")
         self.assertEqual(self.c.submitted[0]["payload"]["lock_token"], "tok")
+        self.assertFalse(self.c.submitted[0]["payload"].get("preserve_vms", False))
         self.assertIsNotNone(self.c.lock, "the lock travels with the task")
+
+    def test_service_maintenance_request_passes_preserve_vms_to_catalyst(self):
+        status, body = self.request("enter", preserve_vms=True)
+        self.assertEqual((status, body["status"]), (200, "transitioning"))
+        self.assertEqual(self.c.status, "ENTERING_MAINTENANCE")
+        self.assertEqual(self.c.submitted[0]["action"], "host_maintenance_enter")
+        self.assertTrue(self.c.submitted[0]["payload"].get("preserve_vms", False))
 
     def test_the_quorum_gate_refuses_before_anything_is_taken(self):
         self.c.quorum = (False, "stopping n2 leaves 1 of 3 replicas")
@@ -340,6 +350,17 @@ class TheTaskThatEnters(ValiTestCase):
         self.assertEqual(set(stop[2]), set(spark.maintenance_stopped_units()))
         self.assertTrue(stop[3], "detached: vali is in the list and cannot wait for its own stop")
         self.assertIsNotNone(self.c.lock, "the lock stays held for the whole window")
+
+    def test_service_maintenance_preserves_running_vms(self):
+        self.c.vms = [{"name": "web", "host_ip": "10.0.0.2", "state": "Running", "memory": 1024}]
+        self.c.migrations_ok = False
+        ok, detail = self.task("host_maintenance_enter", preserve_vms=True)
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.c.status, "SERVICE_MAINTENANCE")
+        self.assertTrue(self.c.marker)
+        self.assertEqual(self.c.has("subtask", "vali", "migrate"), [], "no migrations attempted in service maintenance")
+        self.assertEqual(self.c.has("subtask", "vali", "stop"), [], "no force stops in service maintenance")
+        self.assertIsNotNone(self.c.lock)
 
     def test_the_marker_is_written_before_anything_is_stopped(self):
         self.task("host_maintenance_enter")
@@ -412,7 +433,7 @@ class TheRequestToLeave(ValiTestCase):
         self.assertEqual(self.c.status, "NORMAL")
 
     def test_every_state_a_transition_can_be_stuck_in_can_be_left(self):
-        for state in ("IN_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING"):
+        for state in ("IN_MAINTENANCE", "SERVICE_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING"):
             with self.subTest(state=state):
                 self.c.status = state
                 self.c.submitted.clear()

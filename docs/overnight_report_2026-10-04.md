@@ -447,13 +447,26 @@ Fixed and verified:
   - Added mutual command guardrails: running an infrastructure command in `acli` directs the user to `ncli`, and running a workload command in `ncli` directs the user to `acli`.
 - Synchronized `provision.py` with `sync_provision.py` and deployed across all cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`).
 
-#### Sixth batch: Phoenix VM deletion/update API endpoint routing fix
+#### Seventh batch: Service maintenance, Sidon storage autopathing & emergency SSH rescue
 
 Fixed and verified:
-- **Phoenix Console VM Force Destroy & Delete 405 Error**:
-  - Root cause: `Vms.delete_vm/2` and `Vms.update_running_vm/2` in `spectrum_phx/lib/spectrum_phx/vms.ex` made HTTP requests to `http://127.0.0.1:8080/api/vms/delete` and `/api/vms/update`. Port 8080 is ZooKeeper's embedded Jetty AdminServer, which rejected POST requests with HTTP 405 (`HTTP method POST is not supported by this URL`).
-  - Fix: Redirected requests to Spectrum Server's loopback HTTPS service on `https://127.0.0.1:8443` with `verify: :verify_none` transport options (Spectrum authenticates direct loopback requests as `local-admin`).
-  - Added test seam `spectrum_api_poster` in `spectrum_phx/lib/spectrum_phx/vms.ex` with test coverage in `spectrum_phx/test/spectrum_phx/vms_test.exs`.
-  - Deployed updated `spectrum-phx` container image across all cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`) via `deploy_updates.py --phx-only`.
-  - Live verification confirmed `SpectrumPhx.Vms.delete_vm` successfully dispatches to Spectrum on `https://127.0.0.1:8443/api/vms/delete`.
+- **Service Maintenance (`SERVICE_MAINTENANCE` / `--preserve-vms`)**:
+  - Implemented service-only maintenance in `vali.py`, `mipha.py`, `spark_daemon_decoded.py`, and `valcli.py` (`ncli`):
+    - `ncli host.maintenance.enter <host> --preserve-vms` (or `--storage-only`) puts the host into `SERVICE_MAINTENANCE` without evacuating running VMs.
+    - Preserves `virtqemud` and guest VMs while stopping cluster daemons for updates and maintenance.
+    - `hydra.nodes` status is set to `SERVICE_MAINTENANCE` and recorded in `/etc/hci/maintenance.state`.
+    - Mipha HA monitoring exempts `SERVICE_MAINTENANCE` from health failure fencing while renewing the cluster maintenance lock.
+    - `LEAVABLE_HOST_STATES` in `vali.py` includes `SERVICE_MAINTENANCE`, allowing seamless return to `NORMAL` via `host.maintenance.leave`.
+- **Sidon Storage Autopathing Support**:
+  - Added `<reconnect delay='60'/>` to `<source protocol='nbd'>` in `helios_sidon.py` for both `disk_xml` and `cdrom_xml`.
+  - Guarantees QEMU pauses guest I/O in RAM and reconnects to local Sidon unix sockets for up to 60 seconds without dropping I/O or crashing VMs during Sidon restarts or forwarding handovers.
+- **Emergency Out-of-Band SSH Fallback & Rescue (`host.rescue`)**:
+  - Added native SSH execution fallback (`~/.ssh/id_rsa_hci`, `~/.ssh/id_rsa`, `/root/.ssh/id_rsa`) to `valcli.py` (`ncli host.maintenance.leave <host> [--ssh]`).
+  - Added `ncli host.rescue <host>` for immediate one-command out-of-band recovery of wedged, crashed, or unresponsive nodes via SSH (removes maintenance marker, restarts spark-daemon, boots core services, and reconciles DB status).
+- **Testing & Cluster Deployment**:
+  - Added unit test cases to `test_maintenance_flow.py` for service maintenance flow, VM preservation, and leave transitions.
+  - Synchronized `provision.py` manifests via `sync_provision.py`.
+  - Deployed updates live across cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`) via `deploy_updates.py --fast`.
+  - Verified live on running VM `test`: entered `SERVICE_MAINTENANCE` on Node 42 without disrupting running VM, confirmed `SERVICE_MAINTENANCE` state in DB and marker, verified `host.maintenance.leave` restored node to `NORMAL`, and verified `host.rescue`.
+
 
