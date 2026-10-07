@@ -2144,6 +2144,43 @@ def process_queue_task(task):
                 # Service maintenance: running VMs remain on the host with virtqemud running.
                 # Only storage and cluster management services are serviced/restarted.
                 print(f"[Maintenance Catalyst Task] Service maintenance requested for host {hostname} ({target_ip}); preserving running VMs.")
+                rc_v, stdout_v, _ = run_cql_query("SELECT JSON name, host_ip, state, disks_list FROM hydra.vms;")
+                vms = []
+                if rc_v == 0 and stdout_v:
+                    for line in stdout_v.splitlines():
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                vms.append(json.loads(line))
+                            except:
+                                pass
+                running_vms_preserved = [v for v in vms if v.get("state") == "Running" and v.get("host_ip") == target_ip]
+                if running_vms_preserved:
+                    # Nutanix Storage Autopathing: find a healthy peer storage node to take over
+                    # ownership before local Sidon is stopped.
+                    cluster_hosts = get_cluster_hosts()
+                    peer_ip = None
+                    for h in cluster_hosts:
+                        hip = h.get("ip")
+                        if hip and hip != target_ip:
+                            # Verify peer is responsive and not in maintenance
+                            rc_st, status_st, _ = run_mtls_spark_api(hip, "/api/v1/node/status", None, method="GET")
+                            if rc_st == 0 and isinstance(status_st, dict):
+                                if status_st.get("maintenance_status", "NORMAL") == "NORMAL":
+                                    peer_ip = hip
+                                    break
+                    if peer_ip:
+                        print(f"[Maintenance Catalyst Task] Autopathing: transferring disk ownership for {len(running_vms_preserved)} preserved VMs to peer {peer_ip}...")
+                        for v in running_vms_preserved:
+                            v_name = v.get("name")
+                            v_disks = domain_vdisk_ids(v_name, v.get("disks_list", ""))
+                            for vd in v_disks:
+                                # Ensure peer has disk attached and can serve requests
+                                run_mtls_spark_api(peer_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vd})
+                                # Instruct peer to takeover epoch ownership
+                                ok_to, _, err_to = sidon_op(peer_ip, "takeover", vd, timeout=SIDON_TAKEOVER_TIMEOUT)
+                                if not ok_to:
+                                    print(f"[Maintenance Catalyst Task] Autopathing warning: peer {peer_ip} takeover of {vd} for {v_name}: {err_to}")
                 running_vms = []
             else:
                 # Perform VM evacuation
@@ -2350,6 +2387,35 @@ def process_queue_task(task):
             back, why = finish_maintenance_exit(hostname, target_ip)
             if not back:
                 return False, why
+
+            # Autopathing Reclaim: If any VMs are currently running on target_ip (e.g. from service maintenance),
+            # reclaim primary disk ownership locally now that Sidon is back up, restoring data locality.
+            try:
+                rc_vl, stdout_vl, _ = run_cql_query("SELECT JSON name, host_ip, state, disks_list FROM hydra.vms;")
+                if rc_vl == 0 and stdout_vl:
+                    local_vms = []
+                    for line in stdout_vl.splitlines():
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                v_info = json.loads(line)
+                                if v_info.get("state") == "Running" and v_info.get("host_ip") == target_ip:
+                                    local_vms.append(v_info)
+                            except:
+                                pass
+                    if local_vms:
+                        print(f"[Maintenance Catalyst Task] Autopathing: reclaiming local storage ownership for {len(local_vms)} VMs on {hostname}...")
+                        for lv in local_vms:
+                            lv_name = lv.get("name")
+                            lv_disks = domain_vdisk_ids(lv_name, lv.get("disks_list", ""))
+                            # Re-attach locally and takeover ownership
+                            for lvd in lv_disks:
+                                run_mtls_spark_api(target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": lvd})
+                            reclaim_errs = hand_over_storage(target_ip, lv_disks)
+                            if reclaim_errs:
+                                print(f"[Maintenance Catalyst Task] Autopathing warning: could not reclaim storage for {lv_name}: {reclaim_errs}")
+            except Exception as reclaim_ex:
+                print(f"[Maintenance Catalyst Task] Autopathing storage reclaim error on {hostname}: {reclaim_ex}")
 
             # Spawn subtask to run Mimir Health Check
             print(f"[Maintenance Catalyst Task] Spawning Mimir health checks subtask for host {hostname}...")

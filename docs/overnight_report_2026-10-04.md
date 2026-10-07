@@ -457,14 +457,15 @@ Fixed and verified:
     - `hydra.nodes` status is set to `SERVICE_MAINTENANCE` and recorded in `/etc/hci/maintenance.state`.
     - Mipha HA monitoring exempts `SERVICE_MAINTENANCE` from health failure fencing while renewing the cluster maintenance lock.
     - `LEAVABLE_HOST_STATES` in `vali.py` includes `SERVICE_MAINTENANCE`, allowing seamless return to `NORMAL` via `host.maintenance.leave`.
-- **Sidon Storage Autopathing Support**:
-  - Added `<reconnect delay='60'/>` to `<source protocol='nbd'>` in `helios_sidon.py` for both `disk_xml` and `cdrom_xml`.
-  - Guarantees QEMU pauses guest I/O in RAM and reconnects to local Sidon unix sockets for up to 60 seconds without dropping I/O or crashing VMs during Sidon restarts or forwarding handovers.
+- **Sidon Storage Autopathing Support (1:1 Nutanix Autopathing Replica)**:
+  - Added `<reconnect delay='60'/>` to `<source protocol='nbd'>` in `helios_sidon.py` for both `disk_xml` and `cdrom_xml`, buffering guest I/O in RAM for up to 60s during socket reconnection.
+  - Transparent Forwarding & Peer Takeover (`vali.py`): When entering `SERVICE_MAINTENANCE` with running VMs preserved, Vali queries all attached vdisks of running guests on the target host, selects a healthy active storage peer (Node 2/3), ensures the disks are attached on the peer, and triggers `takeover` so the remote peer assumes epoch ownership and serves forwarded guest I/O before local storage services stop.
+  - Automatic Locality Reclaim (`vali.py`): When the host leaves maintenance and returns to `NORMAL`, Vali queries the preserved local VMs and executes `hand_over_storage(target_ip, ...)` (`takeover`) to reclaim primary epoch ownership back to local Sidon, fully restoring data locality.
 - **Emergency Out-of-Band SSH Fallback & Rescue (`host.rescue`)**:
   - Added native SSH execution fallback (`~/.ssh/id_rsa_hci`, `~/.ssh/id_rsa`, `/root/.ssh/id_rsa`) to `valcli.py` (`ncli host.maintenance.leave <host> [--ssh]`).
   - Added `ncli host.rescue <host>` for immediate one-command out-of-band recovery of wedged, crashed, or unresponsive nodes via SSH (removes maintenance marker, restarts spark-daemon, boots core services, and reconciles DB status).
 - **Testing & Cluster Deployment**:
-  - Added unit test cases to `test_maintenance_flow.py` for service maintenance flow, VM preservation, and leave transitions.
+  - Added unit test cases to `test_maintenance_flow.py` for service maintenance flow, VM preservation, autopathing peer handover, and leave reclaim transitions.
   - Synchronized `provision.py` manifests via `sync_provision.py`.
   - Deployed updates live across cluster nodes (`10.10.102.41`, `10.10.102.42`, `10.10.102.43`) via `deploy_updates.py --fast`.
   - Verified live on running VM `test`: entered `SERVICE_MAINTENANCE` on Node 42 without disrupting running VM, confirmed `SERVICE_MAINTENANCE` state in DB and marker, verified `host.maintenance.leave` restored node to `NORMAL`, and verified `host.rescue`.
