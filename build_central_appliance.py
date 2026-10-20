@@ -1643,9 +1643,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button onclick="toggleSidebarMobile()" class="btn btn-ghost btn-xs btn-square" title="Toggle Sidebar">
           <svg class="size-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
         </button>
+        <button id="btnNavBack" onclick="navigateBack()" class="btn btn-ghost btn-xs btn-square text-base-content/60 hover:text-primary opacity-30 pointer-events-none transition-all" title="Back to previous view (Alt+Left)">
+          <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+        </button>
         <!-- Dynamic Breadcrumb -->
-        <div id="breadcrumbNav" class="text-xs flex items-center gap-1.5 font-medium">
-          <span id="bcGroup" class="opacity-50">Dashboard</span>
+        <div id="breadcrumbNav" class="text-xs flex items-center gap-1.5 font-medium ml-1">
+          <a id="bcGroup" onclick="navigateBackOrGroup()" class="opacity-70 hover:opacity-100 hover:text-primary hover:underline cursor-pointer transition-colors font-medium">Dashboard</a>
           <span class="opacity-30">/</span>
           <span id="bcItem" class="font-bold text-primary">Fleet Overview</span>
         </div>
@@ -4340,7 +4343,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       sb.classList.toggle('hidden');
     }
 
-    function showView(viewId, groupName, itemName) {
+    let viewHistory = [];
+    let isNavigatingHistory = false;
+
+    function showView(viewId, groupName, itemName, pushHistory = true) {
+      if (pushHistory && !isNavigatingHistory) {
+        if (viewHistory.length === 0 || viewHistory[viewHistory.length - 1].viewId !== viewId) {
+          viewHistory.push({ viewId, groupName, itemName });
+          try {
+            window.history.pushState({ viewId, groupName, itemName }, '', '#' + viewId);
+          } catch (e) {}
+        }
+      }
+
       activeView = viewId;
       document.querySelectorAll('.section-view').forEach(el => el.classList.add('hidden'));
       const target = document.getElementById('view-' + viewId);
@@ -4349,15 +4364,72 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const scrollArea = document.getElementById('mainScrollArea');
       if (scrollArea) scrollArea.scrollTop = 0;
 
-      document.getElementById('bcGroup').textContent = groupName || 'Console';
-      document.getElementById('bcItem').textContent = itemName || viewId;
+      const btnBack = document.getElementById('btnNavBack');
+      if (btnBack) {
+        if (viewHistory.length > 1) {
+          btnBack.classList.remove('opacity-30', 'pointer-events-none');
+        } else {
+          btnBack.classList.add('opacity-30', 'pointer-events-none');
+        }
+      }
+
+      const bcGroupEl = document.getElementById('bcGroup');
+      if (bcGroupEl) {
+        bcGroupEl.textContent = groupName || 'Console';
+        bcGroupEl.setAttribute('data-group', groupName || '');
+      }
+      const bcItemEl = document.getElementById('bcItem');
+      if (bcItemEl) bcItemEl.textContent = itemName || viewId;
 
       document.querySelectorAll('#sidebarNav a').forEach(a => a.classList.remove('active', 'bg-primary/20', 'text-primary', 'font-bold'));
       const activeNav = document.getElementById('nav-' + viewId);
-      if (activeNav) activeNav.classList.add('active', 'bg-primary/20', 'text-primary', 'font-bold');
+      if (activeNav) {
+        activeNav.classList.add('active', 'bg-primary/20', 'text-primary', 'font-bold');
+        const parentCollapse = activeNav.closest('.collapse');
+        if (parentCollapse) {
+          const chk = parentCollapse.querySelector('input[type="checkbox"]');
+          if (chk) chk.checked = true;
+        }
+      }
 
       refreshData(viewId);
     }
+
+    function navigateBack() {
+      if (viewHistory.length > 1) {
+        viewHistory.pop(); // Pop current view
+        const prev = viewHistory[viewHistory.length - 1];
+        isNavigatingHistory = true;
+        showView(prev.viewId, prev.groupName, prev.itemName, false);
+        try {
+          window.history.replaceState({ viewId: prev.viewId, groupName: prev.groupName, itemName: prev.itemName }, '', '#' + prev.viewId);
+        } catch (e) {}
+        isNavigatingHistory = false;
+      }
+    }
+
+    function navigateBackOrGroup() {
+      if (viewHistory.length > 1) {
+        navigateBack();
+      } else {
+        const curGroup = document.getElementById('bcGroup').getAttribute('data-group');
+        for (let g of NAV_DATA) {
+          if (g.title === curGroup && g.items.length > 0) {
+            showView(g.items[0].id, g.title, g.items[0].title);
+            return;
+          }
+        }
+        showView('fleet', 'Dashboard', 'Fleet Overview');
+      }
+    }
+
+    window.addEventListener('popstate', (e) => {
+      if (e.state && e.state.viewId) {
+        isNavigatingHistory = true;
+        showView(e.state.viewId, e.state.groupName, e.state.itemName, false);
+        isNavigatingHistory = false;
+      }
+    });
 
     async function refreshData(viewId) {
       try {
