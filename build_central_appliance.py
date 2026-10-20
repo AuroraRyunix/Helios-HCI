@@ -2001,7 +2001,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-customization">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Profile Name</th><th>Type (Cloud-Init / Sysprep)</th><th>Target OS</th><th>Created</th>
+                  <th>Profile Name</th><th>Profile Type</th><th>Created</th>
                 </tr>
               </thead>
               <tbody id="tbody-customization">
@@ -2043,7 +2043,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-storage_dash">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Metric</th><th>Value</th><th>Health</th><th>Runway</th>
+                  <th>Metric</th><th>Current Value</th><th>Health</th><th>Runway</th>
                 </tr>
               </thead>
               <tbody id="tbody-storage_dash">
@@ -2505,7 +2505,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-sec_policies">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Security Policy Name</th><th>Type</th><th>Enforcement Mode</th><th>Rules Count</th>
+                  <th>Security Policy Name</th><th>Policy Type</th><th>Enforcement Mode</th>
                 </tr>
               </thead>
               <tbody id="tbody-sec_policies">
@@ -2547,7 +2547,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-sec_dash">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Compliance Check</th><th>Status</th><th>Severity</th><th>Impacted Entity</th>
+                  <th>Security Diagnostic Check</th><th>Status</th><th>Impacted Node</th><th>Timestamp</th>
                 </tr>
               </thead>
               <tbody id="tbody-sec_dash">
@@ -2631,7 +2631,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-prot_summary">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Protection Metric</th><th>Current State</th><th>Compliance</th><th>Target SLA</th>
+                  <th>Protection Domain</th><th>Status</th><th>Schedule SLA</th>
                 </tr>
               </thead>
               <tbody id="tbody-prot_summary">
@@ -3303,7 +3303,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-audits">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Actor</th><th>Action</th><th>Cluster</th><th>Details</th><th>Timestamp</th>
+                  <th>Actor</th><th>Action</th><th>Details</th><th>Client IP</th><th>Timestamp</th>
                 </tr>
               </thead>
               <tbody id="tbody-audits">
@@ -3429,7 +3429,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-users">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Username</th><th>Role</th><th>Cluster</th><th>Status</th>
+                  <th>Username</th><th>Administrative Role</th><th>Created At</th>
                 </tr>
               </thead>
               <tbody id="tbody-users">
@@ -3681,7 +3681,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-settings_overview">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Setting Category</th><th>Configuration Item</th><th>Active Value</th><th>Status</th>
+                  <th>Setting Category</th><th>Configuration Key</th><th>Configured Value</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-settings_overview">
@@ -3765,7 +3765,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_federation">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Federation Endpoint</th><th>Registration Status</th><th>Mode</th><th>Last Heartbeat</th>
+                  <th>Cluster Name</th><th>Registration Status</th><th>Cluster VIP</th><th>Last Heartbeat</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_federation">
@@ -3807,7 +3807,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_policies">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Governance Policy</th><th>Scope</th><th>Enforcement Level</th><th>Status</th>
+                  <th>Configuration Item</th><th>Active Policy</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_policies">
@@ -3849,7 +3849,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_pulse">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Telemetry Component</th><th>Status</th><th>Frequency</th><th>Destination</th>
+                  <th>Configuration Item</th><th>Telemetry Mode</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_pulse">
@@ -3891,7 +3891,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_proxy">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Proxy Server</th><th>Port</th><th>Auth</th><th>Status</th>
+                  <th>Configuration Item</th><th>Proxy Routing</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_proxy">
@@ -3933,7 +3933,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_dns">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Resolver IP</th><th>Type</th><th>Response Time</th><th>Status</th>
+                  <th>Configuration Item</th><th>Configured Resolvers</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_dns">
@@ -3975,7 +3975,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_ntp">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>NTP Server</th><th>Stratum</th><th>Offset</th><th>Status</th>
+                  <th>Configuration Item</th><th>Configured NTP Servers</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_ntp">
@@ -4017,7 +4017,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_snmp">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Trap Receiver</th><th>Port</th><th>Version</th><th>Status</th>
+                  <th>Configuration Item</th><th>SNMP Status</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_snmp">
@@ -4059,7 +4059,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_lockdown">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Lockdown Control</th><th>Current Mode</th><th>SSH Root Access</th><th>Enforcement</th>
+                  <th>Configuration Item</th><th>Lockdown Mode</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_lockdown">
@@ -4101,7 +4101,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_ssl">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Certificate Domain</th><th>Issuer</th><th>Expires</th><th>Status</th>
+                  <th>Configuration Item</th><th>Certificate Mode</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_ssl">
@@ -4143,7 +4143,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_email">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Recipient Email</th><th>Min Severity</th><th>Active</th><th>Status</th>
+                  <th>Configuration Item</th><th>Alert Recipient</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_email">
@@ -4185,7 +4185,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_smtp">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>SMTP Host</th><th>Port</th><th>Encryption</th><th>Status</th>
+                  <th>Configuration Item</th><th>SMTP Gateway</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_smtp">
@@ -4227,7 +4227,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_syslog">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>Syslog Target</th><th>Protocol</th><th>Port</th><th>Status</th>
+                  <th>Configuration Item</th><th>Syslog Server</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_syslog">
@@ -4269,7 +4269,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <table class="table table-sm w-full font-mono text-xs" id="table-set_appearance">
               <thead>
                 <tr class="bg-base-300/60 text-base-content/70">
-                  <th>UI Preference</th><th>Current Value</th><th>Scope</th><th>Status</th>
+                  <th>Configuration Item</th><th>Configured Value</th><th>Category</th><th>Last Updated</th>
                 </tr>
               </thead>
               <tbody id="tbody-set_appearance">
@@ -5893,7 +5893,7 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
         cur = conn.cursor()
         now = int(time.time() * 1000)
 
-        # Map entities to tables
+        # Map entities to authentic tables (Zero Mocks / Real Live State)
         table_map = {
             "fleet": "SELECT name, status, vip, node_count, vm_count, cpu_cores, memory_total_mb, storage_total_bytes FROM clusters",
             "clusters": "SELECT name, status, vip, node_count, vm_count, memory_total_mb, storage_total_bytes FROM clusters",
@@ -5903,8 +5903,8 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             "ovas": "SELECT name, version, size_bytes, cluster_id, created_at FROM ovas",
             "images": "SELECT name, type, size_bytes, container, cluster_id FROM images",
             "repos": "SELECT name, repo_type, repo_url, sync_status, last_synced_at FROM content_repositories",
-            "customization": "SELECT name, profile_type, 'Linux/Windows' as os, created_at FROM guest_customization_profiles",
-            "storage_dash": "SELECT 'Sidon CoW Distributed Pool' as metric, '191 GB / 1.93 TB' as val, 'OPTIMAL' as health, '840 Days' as runway",
+            "customization": "SELECT name, profile_type, datetime(created_at/1000, 'unixepoch') FROM guest_customization_profiles",
+            "storage_dash": "SELECT metric, current_val, status, runway_days FROM operations_metrics WHERE metric LIKE '%storage%' OR metric LIKE '%sidon%'",
             "storage_containers": "SELECT name, cluster_id, tier, ftt, compression, quota_gb FROM storage_containers",
             "volume_groups": "SELECT name, cluster_id, size_gb, attached_vms, status FROM volume_groups",
             "storage_policies": "SELECT name, replication_factor, compression, dedup, encryption FROM storage_policies",
@@ -5916,14 +5916,14 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             "net_services": "SELECT name, service_type, status, config_json FROM network_services",
             "floating_ips": "SELECT ip_address, vpc_id, assigned_vm_id, status FROM floating_ips",
             "connectivity": "SELECT name, peer_type, remote_endpoint, status FROM connectivity_peering",
-            "sec_policies": "SELECT name, policy_type, enforcement_mode, '4 Rules' as count FROM security_policies",
-            "sec_dash": "SELECT 'STIG Compliance Baseline' as check_name, 'PASSED' as status, 'LOW' as sev, 'All Hypervisors' as entity",
+            "sec_policies": "SELECT name, policy_type, enforcement_mode FROM security_policies",
+            "sec_dash": "SELECT check_name, status, node_ip, datetime(timestamp/1000, 'unixepoch') FROM mimir_results WHERE check_name LIKE '%sec%' OR check_name LIKE '%privilege%' OR check_name LIKE '%auth%' OR check_name LIKE '%lockdown%'",
             "system_accounts": "SELECT name, auth_type, server_url, base_dn, status FROM system_accounts",
-            "prot_summary": "SELECT 'Hourly NearSync Snapshot SLA' as metric, '100% Compliant' as state, 'PASS' as comp, '< 60 mins' as sla",
+            "prot_summary": "SELECT name, printf('%d hours', schedule_hours), printf('%d snapshots', keep_count), members_count FROM protection_domains",
             "prot_policies": "SELECT name, snapshot_interval_minutes, retention_count, replication_target FROM protection_policies",
             "recovery_plans": "SELECT name, source_cluster, target_cluster, status FROM recovery_plans",
-            "vm_recovery_pts": "SELECT snapshot_name, entity_id, size_mb, created_at FROM recovery_points WHERE entity_type = 'VM'",
-            "vg_recovery_pts": "SELECT snapshot_name, entity_id, size_mb, created_at FROM recovery_points WHERE entity_type = 'VG'",
+            "vm_recovery_pts": "SELECT snapshot_name, entity_id, size_mb, datetime(created_at/1000, 'unixepoch') FROM recovery_points WHERE entity_type = 'VM'",
+            "vg_recovery_pts": "SELECT snapshot_name, entity_id, size_mb, datetime(created_at/1000, 'unixepoch') FROM recovery_points WHERE entity_type = 'VG'",
             "consistency_groups": "SELECT name, vm_ids_json, schedule_id, status FROM consistency_groups",
             "replication_details": "SELECT source_entity, target_entity, replication_type, rpo_seconds, sync_status FROM replication_details",
             "approval_policy": "SELECT name, action_type, approver_role, status FROM approval_policies",
@@ -5934,10 +5934,9 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             "alerts": "SELECT severity, title, cluster_id, message, created_at FROM alerts",
             "events": "SELECT severity, component, message, cluster_id, created_at FROM events",
             "tasks": "SELECT operation, target, status, progress, started_at FROM tasks",
-            "audits": "SELECT actor, action, 'hci-01' as cluster, details, datetime(timestamp/1000, 'unixepoch') as created_at FROM audit_logs ORDER BY timestamp DESC",
-            "operations": "SELECT 'Cluster CPU Headroom' as metric, '74% Free' as val, '> 365 Days' as runway, 'NORMAL' as status",
+            "audits": "SELECT actor, action, details, ip_address, datetime(timestamp/1000, 'unixepoch') as created_at FROM audit_logs ORDER BY timestamp DESC",
             "categories": "SELECT category_key, category_value, entity_count, created_at FROM categories",
-            "users": "SELECT username, role, 'hci-01' as cluster, 'Active' as status FROM users",
+            "users": "SELECT username, role, datetime(created_at/1000, 'unixepoch') FROM users",
             "roles": "SELECT name, description, permissions_json, CASE WHEN is_builtin=1 THEN 'Built-in' ELSE 'Custom' END as role_type FROM roles",
             "projects": "SELECT name, vcpu_quota, memory_quota_gb, storage_quota_gb, users_json FROM projects",
             "azs": "SELECT name, region, cluster_ids_json, status FROM availability_zones",
@@ -5945,21 +5944,21 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             "health": "SELECT check_name, category, status, output, datetime(timestamp/1000, 'unixepoch') FROM mimir_results ORDER BY timestamp DESC",
             "lcm": "SELECT component_name, current_version, available_version, severity, release_notes FROM lcm_updates",
             "operations": "SELECT metric, current_val, runway_days, status FROM operations_metrics",
-            "settings_overview": "SELECT category, key, value, 'Active' as status FROM system_settings",
+            "settings_overview": "SELECT category, key, value, datetime(updated_at/1000, 'unixepoch') FROM system_settings ORDER BY category, key",
             "set_app_log": "SELECT filename, size_str, datetime(created_at/1000, 'unixepoch'), 'READY' FROM generated_bundles",
-            "set_federation": "SELECT 'Self (Helios Central Primary)' as ep, 'Active' as st, 'Master Tier' as mode, 'Live' as hb",
-            "set_policies": "SELECT 'Zero Trust Isolation' as pol, 'Fleet-wide' as sc, 'Enforced' as lvl, 'Active' as st",
-            "set_pulse": "SELECT 'Diagnostic Telemetry' as comp, 'Enabled' as st, 'Hourly' as freq, 'Local Node' as dest",
-            "set_proxy": "SELECT 'Direct (No Proxy)' as srv, '8080' as pt, 'None' as auth, 'Connected' as st",
-            "set_dns": "SELECT '1.1.1.1' as ip, 'Primary Resolver' as tp, '1.2ms' as rt, 'ONLINE' as st",
-            "set_ntp": "SELECT '0.pool.ntp.org' as srv, 'Stratum 2' as st, '0.04ms' as off, 'SYNCHRONIZED' as stat",
-            "set_snmp": "SELECT 'Default Receiver' as rx, '162' as pt, 'v2c' as ver, 'Disabled' as st",
-            "set_lockdown": "SELECT 'SSH Key Enforcement' as ctrl, 'Standard' as md, 'Permitted' as root_acc, 'Active' as enf",
-            "set_ssl": "SELECT 'helios-central.local' as dom, 'Self-Signed CA' as iss, '2027-10-20' as exp, 'Valid' as st",
-            "set_email": "SELECT 'admin@helios.local' as em, 'WARNING' as sev, 'Enabled' as act, 'Ready' as st",
-            "set_smtp": "SELECT 'Internal Postfix' as host, '25' as pt, 'STARTTLS' as enc, 'Ready' as st",
-            "set_syslog": "SELECT 'Disabled' as tgt, 'UDP' as proto, '514' as pt, 'Inactive' as st",
-            "set_appearance": "SELECT 'Theme' as pref, 'Dark (Helios Native)' as val, 'System-wide' as sc, 'Active' as st"
+            "set_federation": "SELECT name, status, vip, datetime(last_seen_ms/1000, 'unixepoch') FROM clusters WHERE cluster_id = 'hci-01'",
+            "set_policies": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'policy_engine'",
+            "set_pulse": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'pulse_telemetry'",
+            "set_proxy": "SELECT key, CASE WHEN value = '' THEN 'Direct Connection (No Proxy)' ELSE value END, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key IN ('http_proxy', 'portal_proxy')",
+            "set_dns": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'name_servers'",
+            "set_ntp": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'ntp_servers'",
+            "set_snmp": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'snmp_status'",
+            "set_lockdown": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'cluster_lockdown'",
+            "set_ssl": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'ssl_cert_mode'",
+            "set_email": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'alert_email'",
+            "set_smtp": "SELECT key, CASE WHEN value = '' THEN 'Not Configured' ELSE value END, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'smtp_server'",
+            "set_syslog": "SELECT key, CASE WHEN value = '' THEN 'Disabled' ELSE value END, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE key = 'syslog_server'",
+            "set_appearance": "SELECT key, value, category, datetime(updated_at/1000, 'unixepoch') FROM system_settings WHERE category = 'appearance'"
         }
 
         query = table_map.get(eid)
