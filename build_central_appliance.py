@@ -1664,7 +1664,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Fleet Overview..." onkeyup="filterTable('fleet', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1707,7 +1706,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter VMs..." onkeyup="filterTable('vms', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1750,7 +1748,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Templates..." onkeyup="filterTable('templates', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1793,7 +1790,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Kubernetes Clusters..." onkeyup="filterTable('k8s', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1836,7 +1832,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter OVAs..." onkeyup="filterTable('ovas', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1879,7 +1874,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Images..." onkeyup="filterTable('images', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1922,7 +1916,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Content Repositories..." onkeyup="filterTable('repos', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -1965,7 +1958,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Guest Customization Profiles..." onkeyup="filterTable('customization', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2008,7 +2000,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Storage Dashboard..." onkeyup="filterTable('storage_dash', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2051,7 +2042,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Storage Containers..." onkeyup="filterTable('storage_containers', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2094,7 +2084,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Volume Groups..." onkeyup="filterTable('volume_groups', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2137,7 +2126,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Storage Policies..." onkeyup="filterTable('storage_policies', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2180,7 +2168,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter External Storage..." onkeyup="filterTable('external_storage', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2223,7 +2210,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Virtual Switches..." onkeyup="filterTable('vswitches', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2266,7 +2252,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Subnets..." onkeyup="filterTable('subnets', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2309,7 +2294,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Virtual Private Clouds..." onkeyup="filterTable('vpcs', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2352,7 +2336,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Network Services..." onkeyup="filterTable('net_services', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2395,7 +2378,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Floating IPs..." onkeyup="filterTable('floating_ips', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2438,7 +2420,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Connectivity..." onkeyup="filterTable('connectivity', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2481,7 +2462,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Security Policies..." onkeyup="filterTable('sec_policies', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2524,7 +2504,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Security Dashboard..." onkeyup="filterTable('sec_dash', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2567,7 +2546,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter System Accounts..." onkeyup="filterTable('system_accounts', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2610,7 +2588,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Protection Summary..." onkeyup="filterTable('prot_summary', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2653,7 +2630,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Protection Policies..." onkeyup="filterTable('prot_policies', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2696,7 +2672,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Recovery Plans..." onkeyup="filterTable('recovery_plans', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2739,7 +2714,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter VM Recovery Points..." onkeyup="filterTable('vm_recovery_pts', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2782,7 +2756,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter VG Recovery Points..." onkeyup="filterTable('vg_recovery_pts', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2825,7 +2798,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Consistency Groups..." onkeyup="filterTable('consistency_groups', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2868,7 +2840,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Replication Details..." onkeyup="filterTable('replication_details', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2911,7 +2882,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Approval Policy..." onkeyup="filterTable('approval_policy', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2954,7 +2924,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Clusters..." onkeyup="filterTable('clusters', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -2997,7 +2966,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Hosts..." onkeyup="filterTable('hosts', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3040,7 +3008,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Disks..." onkeyup="filterTable('disks', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3083,7 +3050,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter GPUs..." onkeyup="filterTable('gpus', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3126,7 +3092,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter NICs..." onkeyup="filterTable('nics', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3169,7 +3134,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Alerts..." onkeyup="filterTable('alerts', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3212,7 +3176,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Events..." onkeyup="filterTable('events', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3255,7 +3218,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Tasks..." onkeyup="filterTable('tasks', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3298,7 +3260,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Audits..." onkeyup="filterTable('audits', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3341,7 +3302,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Operations..." onkeyup="filterTable('operations', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3384,7 +3344,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Categories..." onkeyup="filterTable('categories', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3427,7 +3386,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Users..." onkeyup="filterTable('users', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3470,7 +3428,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Roles..." onkeyup="filterTable('roles', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3513,7 +3470,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Projects..." onkeyup="filterTable('projects', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3556,7 +3512,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Availability Zones..." onkeyup="filterTable('azs', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3599,7 +3554,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Entity Sync..." onkeyup="filterTable('entity_sync', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3642,7 +3596,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter LCM..." onkeyup="filterTable('lcm', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3685,7 +3638,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Settings Overview..." onkeyup="filterTable('settings_overview', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3728,7 +3680,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter App Log Archive..." onkeyup="filterTable('set_app_log', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3771,7 +3722,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Register to Helios Central..." onkeyup="filterTable('set_federation', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3814,7 +3764,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Policy Engine..." onkeyup="filterTable('set_policies', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3857,7 +3806,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Pulse & Telemetry..." onkeyup="filterTable('set_pulse', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3900,7 +3848,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Portal & HTTP Proxy..." onkeyup="filterTable('set_proxy', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3943,7 +3890,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Name Servers (DNS)..." onkeyup="filterTable('set_dns', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -3986,7 +3932,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter NTP Servers..." onkeyup="filterTable('set_ntp', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4029,7 +3974,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter SNMP..." onkeyup="filterTable('set_snmp', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4072,7 +4016,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Cluster Lockdown..." onkeyup="filterTable('set_lockdown', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4115,7 +4058,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter SSL Certificate..." onkeyup="filterTable('set_ssl', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4158,7 +4100,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Alert Email Configuration..." onkeyup="filterTable('set_email', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4201,7 +4142,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter SMTP Server..." onkeyup="filterTable('set_smtp', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4244,7 +4184,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Syslog Server..." onkeyup="filterTable('set_syslog', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
@@ -4287,7 +4226,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <!-- Filter bar -->
         <div class="flex items-center justify-between gap-2">
           <input type="text" placeholder="Filter Appearance & UI Settings..." onkeyup="filterTable('set_appearance', this.value)" class="input input-xs input-bordered w-64 font-mono text-xs" />
-          <div class="text-[11px] text-base-content/50 font-mono">Real live cluster telemetry</div>
         </div>
 
         <!-- Data Card / Table -->
