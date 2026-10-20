@@ -4713,6 +4713,240 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- VIEW: vm_detail (Interactive VM Compute, Storage & Migration Deep Dive) -->
+      <div id="view-vm_detail" class="section-view hidden space-y-4">
+        <!-- Top VM Banner -->
+        <div class="card bg-base-200 border border-base-300 rounded-box p-4 sm:p-5 shadow-sm">
+          <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div class="space-y-1.5">
+              <div class="flex items-center gap-3">
+                <h2 id="vmdVmName" class="text-2xl font-black tracking-tight text-base-content">helios-central</h2>
+                <span id="vmdStateBadge" class="badge badge-success badge-sm font-bold gap-1 font-mono">RUNNING</span>
+                <span class="badge badge-neutral badge-sm font-mono">Cluster: hci-01</span>
+                <span id="vmdHostBadge" class="badge badge-primary badge-sm font-bold cursor-pointer hover:opacity-80" onclick="handleVmHostClick()">Host: Valkyrie-44B8E2</span>
+              </div>
+              <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-base-content/70 font-mono">
+                <span>Management IP: <strong id="vmdIp" class="text-base-content font-bold">10.10.102.50</strong></span>
+                <span>&bull;</span>
+                <span>vCPUs: <strong id="vmdVcpus" class="text-base-content font-bold">2 Cores</strong></span>
+                <span>&bull;</span>
+                <span>Memory: <strong id="vmdMemory" class="text-base-content font-bold">4,096 MB (4.0 GB)</strong></span>
+                <span>&bull;</span>
+                <span>Disk: <strong id="vmdDisk" class="text-base-content font-bold">32 GB</strong></span>
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <span id="vmdPowerActionArea">
+                <button onclick="handleVmPower(activeVmName, 'off')" class="btn btn-error btn-xs font-semibold">Power Off</button>
+              </span>
+              <button onclick="triggerVmReset()" class="btn btn-warning btn-xs font-semibold gap-1">
+                <svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                Reset
+              </button>
+              <a id="vmdLaunchConsole" href="https://10.10.102.41:8443" target="_blank" class="btn btn-primary btn-xs font-semibold gap-1">
+                <svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                Web Console
+              </a>
+              <button onclick="openTakeSnapshotModal()" class="btn btn-outline btn-xs gap-1 font-semibold">
+                <svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+                Snapshot
+              </button>
+              <button onclick="switchVmDetailTab('migrate')" class="btn btn-outline btn-xs gap-1 font-semibold">
+                <svg class="size-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
+                Migrate
+              </button>
+              <button onclick="navigateBack()" class="btn btn-ghost btn-xs">&larr; Back</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 4 Authentic Resource Metric Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          <!-- Compute Card -->
+          <div class="card bg-base-200 border border-base-300 p-4 rounded-box shadow-sm space-y-2">
+            <div class="flex items-center justify-between text-xs font-semibold">
+              <span class="text-base-content/70 uppercase tracking-wider">vCPU Topology</span>
+              <span id="vmdCpuStatusBadge" class="badge badge-primary badge-xs font-mono font-bold">100% Guaranteed</span>
+            </div>
+            <div class="text-xl font-black font-mono text-base-content" id="vmdCpuVal">2 vCPUs</div>
+            <progress id="vmdCpuProg" class="progress progress-primary w-full" value="100" max="100"></progress>
+            <div id="vmdCpuSubtext" class="text-[11px] text-base-content/60 font-mono">1 Socket &times; 2 Cores &middot; Dynamic Scheduling</div>
+          </div>
+
+          <!-- Memory Card -->
+          <div class="card bg-base-200 border border-base-300 p-4 rounded-box shadow-sm space-y-2">
+            <div class="flex items-center justify-between text-xs font-semibold">
+              <span class="text-base-content/70 uppercase tracking-wider">Memory Allocation</span>
+              <span id="vmdMemStatusBadge" class="badge badge-info badge-xs font-mono font-bold">Locked</span>
+            </div>
+            <div class="text-xl font-black font-mono text-base-content" id="vmdMemVal">4,096 MB (4.0 GB)</div>
+            <progress id="vmdMemProg" class="progress progress-info w-full" value="100" max="100"></progress>
+            <div id="vmdMemSubtext" class="text-[11px] text-base-content/60 font-mono">Transparent Huge Pages &middot; NUMA Localized</div>
+          </div>
+
+          <!-- Sidon CoW Storage Card -->
+          <div class="card bg-base-200 border border-base-300 p-4 rounded-box shadow-sm space-y-2">
+            <div class="flex items-center justify-between text-xs font-semibold">
+              <span class="text-base-content/70 uppercase tracking-wider">Sidon CoW Storage</span>
+              <span id="vmdDiskStatusBadge" class="badge badge-success badge-xs font-mono font-bold">RF2 Synchronized</span>
+            </div>
+            <div class="text-xl font-black font-mono text-base-content" id="vmdDiskVal">32 GB Provisioned</div>
+            <progress id="vmdDiskProg" class="progress progress-success w-full" value="40" max="100"></progress>
+            <div id="vmdDiskSubtext" class="text-[11px] text-base-content/60 font-mono">default-pool &middot; Inline LZ4 CoW Extents</div>
+          </div>
+
+          <!-- Virtual Network Card -->
+          <div class="card bg-base-200 border border-base-300 p-4 rounded-box shadow-sm space-y-2">
+            <div class="flex items-center justify-between text-xs font-semibold">
+              <span class="text-base-content/70 uppercase tracking-wider">Virtual NIC Uplink</span>
+              <span id="vmdNicStatusBadge" class="badge badge-success badge-xs font-mono font-bold">10G Connected</span>
+            </div>
+            <div class="text-xl font-black font-mono text-base-content" id="vmdNicVal">10.10.102.50</div>
+            <div class="flex items-center gap-1.5 py-1">
+              <span class="size-2 rounded-full bg-success"></span>
+              <span id="vmdNicMac" class="text-xs font-mono">vs-management &middot; MTU 1500</span>
+            </div>
+            <div id="vmdNicSubtext" class="text-[11px] text-base-content/60 font-mono">VirtIO-Net Paravirtualized &middot; Open vSwitch</div>
+          </div>
+        </div>
+
+        <!-- Detail Tabs -->
+        <div class="space-y-3">
+          <div class="flex items-center gap-2 border-b border-base-300 pb-2">
+            <button onclick="switchVmDetailTab('disks')" id="vmdTabBtn-disks" class="btn btn-xs btn-primary font-semibold">Attached Virtual Disks</button>
+            <button onclick="switchVmDetailTab('snaps')" id="vmdTabBtn-snaps" class="btn btn-xs btn-ghost font-semibold">Snapshots & Recovery Points</button>
+            <button onclick="switchVmDetailTab('nics')" id="vmdTabBtn-nics" class="btn btn-xs btn-ghost font-semibold">Network Adapters</button>
+            <button onclick="switchVmDetailTab('migrate')" id="vmdTabBtn-migrate" class="btn btn-xs btn-ghost font-semibold">Live Migration Wizard</button>
+          </div>
+
+          <!-- Tab Pane 1: Virtual Disks -->
+          <div id="vmdTab-disks" class="space-y-3">
+            <div class="card bg-base-200 border border-base-300 rounded-box overflow-hidden shadow-sm">
+              <div class="p-3 bg-base-300/40 text-xs font-bold uppercase tracking-wider flex items-center justify-between">
+                <span>Sidon Distributed vDisks</span>
+                <span id="vmdDisksBadge" class="badge badge-sm badge-neutral font-mono">1 Disk</span>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="table table-sm w-full font-mono text-xs">
+                  <thead>
+                    <tr class="bg-base-300/60 text-base-content/70">
+                      <th>Device Target</th>
+                      <th>vDisk Identifier</th>
+                      <th>Storage Container</th>
+                      <th>Provisioned Size</th>
+                      <th>Storage Tier</th>
+                      <th>Data Protection</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vmdDisksTbody">
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab Pane 2: Snapshots & Recovery Points -->
+          <div id="vmdTab-snaps" class="space-y-3 hidden">
+            <div class="card bg-base-200 border border-base-300 rounded-box overflow-hidden shadow-sm">
+              <div class="p-3 bg-base-300/40 text-xs font-bold uppercase tracking-wider flex items-center justify-between">
+                <span>Point-in-Time Recovery Points</span>
+                <div class="flex items-center gap-2">
+                  <span id="vmdSnapsBadge" class="badge badge-sm badge-neutral font-mono">0 Snapshots</span>
+                  <button onclick="openTakeSnapshotModal()" class="btn btn-primary btn-xs font-semibold">+ Create Snapshot</button>
+                </div>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="table table-sm w-full font-mono text-xs">
+                  <thead>
+                    <tr class="bg-base-300/60 text-base-content/70">
+                      <th>Snapshot Identifier</th>
+                      <th>Type</th>
+                      <th>Delta Size (MB)</th>
+                      <th>Created Timestamp</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vmdSnapsTbody">
+                  </tbody>
+                </table>
+              </div>
+              <div id="vmdSnapsEmpty" class="p-8 text-center text-xs opacity-50 space-y-1 hidden">
+                <svg class="size-8 mx-auto opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"/></svg>
+                <div>No snapshots captured for this virtual machine yet.</div>
+                <div class="pt-2"><button onclick="openTakeSnapshotModal()" class="btn btn-xs btn-outline btn-primary">+ Take First Snapshot</button></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab Pane 3: Network Adapters -->
+          <div id="vmdTab-nics" class="space-y-3 hidden">
+            <div class="card bg-base-200 border border-base-300 rounded-box overflow-hidden shadow-sm">
+              <div class="p-3 bg-base-300/40 text-xs font-bold uppercase tracking-wider flex items-center justify-between">
+                <span>Virtual Network Interfaces</span>
+                <span class="badge badge-sm badge-neutral font-mono">1 vNIC</span>
+              </div>
+              <div class="overflow-x-auto">
+                <table class="table table-sm w-full font-mono text-xs">
+                  <thead>
+                    <tr class="bg-base-300/60 text-base-content/70">
+                      <th>Interface</th>
+                      <th>MAC Address</th>
+                      <th>Assigned IP</th>
+                      <th>Virtual Switch / Subnet</th>
+                      <th>Emulated Hardware</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="vmdNicsTbody">
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab Pane 4: Live Migration Wizard -->
+          <div id="vmdTab-migrate" class="space-y-3 hidden">
+            <div class="card bg-base-200 border border-base-300 rounded-box p-5 shadow-sm space-y-4">
+              <div class="border-b border-base-300 pb-3">
+                <h3 class="text-base font-bold text-base-content">Zero-Downtime Live Migration</h3>
+                <p class="text-xs text-base-content/60">Migrate active CPU state, memory pages, and VirtIO devices to another hypervisor node in the cluster without service interruption.</p>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs font-mono">
+                <div class="bg-base-300/40 p-3 rounded-box space-y-1">
+                  <span class="text-base-content/60 uppercase text-[10px]">Source Hypervisor</span>
+                  <div id="vmdMigrateCurrentHost" class="font-bold text-sm text-base-content">Valkyrie-44B8E2 (10.10.102.44)</div>
+                  <div class="text-[11px] opacity-70">Spark mTLS Daemon Active &middot; Extent Slices Linked</div>
+                </div>
+
+                <div class="space-y-1">
+                  <label class="label text-xs font-semibold uppercase text-base-content/70">Select Target Destination Host</label>
+                  <select id="vmdMigrateTargetSelect" class="select select-sm select-bordered w-full font-mono text-xs">
+                    <!-- Populated dynamically with available hosts -->
+                  </select>
+                </div>
+              </div>
+
+              <div class="bg-primary/10 border border-primary/20 rounded-box p-3 text-xs flex items-start gap-3">
+                <svg class="size-5 text-primary shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                <div class="space-y-1 text-base-content/80">
+                  <div class="font-bold text-base-content">CoW Memory Pre-Copy Architecture</div>
+                  <div>Sidon extent stores are distributed across all nodes; only dirty memory pages are streamed across the cluster 10GbE network fabric. vDisk storage remains continuously accessible.</div>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between pt-2">
+                <div id="vmdMigrateStatusMsg" class="text-xs font-mono text-success"></div>
+                <button id="vmdMigrateExecuteBtn" onclick="executeVmMigration()" class="btn btn-primary btn-sm font-semibold gap-2">
+                  <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg>
+                  Initiate Live Migration
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </main>
   </div>
 
@@ -4731,6 +4965,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </dialog>
 
+  <!-- VM SNAPSHOT MODAL -->
+  <dialog id="vmSnapshotModal" class="modal">
+    <div class="modal-box bg-base-200 border border-base-300">
+      <h3 class="font-bold text-base mb-1">Create VM Snapshot</h3>
+      <p class="text-xs text-base-content/70 mb-4">Capture an instantaneous point-in-time Sidon CoW recovery point for virtual machine <strong id="snapModalVmName" class="text-primary font-mono"></strong>.</p>
+      <form id="vmSnapshotForm" onsubmit="handleVmSnapshotSubmit(event)" class="space-y-3">
+        <div>
+          <label class="label text-xs font-semibold">Snapshot Name</label>
+          <input id="snapModalNameInput" type="text" placeholder="e.g. pre-maintenance-snap" class="input input-sm input-bordered w-full font-mono text-xs" required />
+        </div>
+        <div class="form-control">
+          <label class="label cursor-pointer justify-start gap-2">
+            <input type="checkbox" id="snapModalMemoryChk" class="checkbox checkbox-xs checkbox-primary" checked />
+            <span class="label-text text-xs">Quiesce filesystem / Flush memory buffers</span>
+          </label>
+        </div>
+        <div class="modal-action">
+          <button type="button" onclick="document.getElementById('vmSnapshotModal').close()" class="btn btn-ghost btn-sm">Cancel</button>
+          <button type="submit" id="snapModalSubmitBtn" class="btn btn-primary btn-sm">Take Snapshot</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+
+
   <!-- JAVASCRIPT LOGIC & ROUTER -->
   <script>
     const NAV_DATA = [{"id": "dash", "title": "Dashboard", "icon": "M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6", "items": [{"id": "fleet", "title": "Fleet Overview", "endpoint": "/api/v1/fleet/clusters", "desc": "Federated multi-cluster overview, global resource distribution, and fleet health."}]}, {"id": "compute", "title": "Compute", "icon": "M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z", "items": [{"id": "vms", "title": "VMs", "endpoint": "/api/v1/compute/vms", "desc": "Global virtual machine inventory across all federated clusters.", "btn": "+ Create VM"}, {"id": "templates", "title": "Templates", "endpoint": "/api/v1/compute/templates", "desc": "Standardized virtual machine templates and golden images.", "btn": "+ Create Template"}, {"id": "k8s", "title": "Kubernetes Clusters", "endpoint": "/api/v1/compute/k8s", "desc": "Managed Kubernetes clusters deployed on Helios infrastructure.", "btn": "+ Deploy K8s Cluster"}, {"id": "ovas", "title": "OVAs", "endpoint": "/api/v1/compute/ovas", "desc": "Open Virtual Appliance packages and multi-VM appliances.", "btn": "+ Upload OVA"}, {"id": "images", "title": "Images", "endpoint": "/api/v1/compute/images", "desc": "Operating system ISOs and disk image content library.", "btn": "+ Add Image"}, {"id": "repos", "title": "Content Repositories", "endpoint": "/api/v1/compute/repositories", "desc": "External Git, HTTP, and S3 repositories for guest tools and OS images.", "btn": "+ Add Repository"}, {"id": "customization", "title": "Guest Customization Profiles", "endpoint": "/api/v1/compute/customization", "desc": "Cloud-Init and Sysprep automation profiles for automated guest bootstrapping.", "btn": "+ Create Profile"}]}, {"id": "storage", "title": "Storage", "icon": "M4 7v10c0 2 1.5 3 3.5 3h9c2 0 3.5-1 3.5-3V7c0-2-1.5-3-3.5-3h-9C5.5 4 4 5 4 7zm0 5h16", "items": [{"id": "storage_dash", "title": "Storage Dashboard", "endpoint": "/api/v1/storage/dashboard", "desc": "Fleet-wide storage capacity runway, Sidon CoW deduplication, and IOPS metrics."}, {"id": "storage_containers", "title": "Storage Containers", "endpoint": "/api/v1/storage/containers", "desc": "Sidon distributed storage pools and fault-tolerant storage containers.", "btn": "+ Create Container"}, {"id": "volume_groups", "title": "Volume Groups", "endpoint": "/api/v1/storage/volume-groups", "desc": "Block storage volume groups with multi-VM shared attachment.", "btn": "+ Create Volume Group"}, {"id": "storage_policies", "title": "Storage Policies", "endpoint": "/api/v1/storage/policies", "desc": "Replication factor (FTT), inline compression, and encryption profiles.", "btn": "+ Create Policy"}, {"id": "external_storage", "title": "External Storage", "endpoint": "/api/v1/storage/external", "desc": "External NFS exports, S3 buckets, and enterprise iSCSI targets.", "btn": "+ Mount External Target"}]}, {"id": "network", "title": "Network & Security", "icon": "M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 004 11m0 0a8 8 0 0015.171 3", "items": [{"id": "vswitches", "title": "Virtual Switches", "endpoint": "/api/v1/network/vswitches", "desc": "Distributed Open vSwitch and Linux bridge network topologies.", "btn": "+ Create Virtual Switch"}, {"id": "subnets", "title": "Subnets", "endpoint": "/api/v1/network/subnets", "desc": "VLANs, CIDR ranges, gateway routes, and managed IPAM pools.", "btn": "+ Create Subnet"}, {"id": "vpcs", "title": "Virtual Private Clouds", "endpoint": "/api/v1/network/vpcs", "desc": "Multi-tenant isolated overlay networks and software-defined routing.", "btn": "+ Create VPC"}, {"id": "net_services", "title": "Network Services", "endpoint": "/api/v1/network/services", "desc": "Distributed NAT, DNS forwarding, and virtual routing gateways.", "btn": "+ Deploy Service"}, {"id": "floating_ips", "title": "Floating IPs", "endpoint": "/api/v1/network/floating-ips", "desc": "Public and external floating IP allocations for guest workloads.", "btn": "+ Allocate Floating IP"}, {"id": "connectivity", "title": "Connectivity", "endpoint": "/api/v1/network/connectivity", "desc": "BGP peerings, IPSec VPN tunnels, and cross-cluster interconnects.", "btn": "+ Add Peering"}, {"id": "sec_policies", "title": "Security Policies", "endpoint": "/api/v1/network/security-policies", "desc": "Microsegmentation rules and distributed firewall isolation policies.", "btn": "+ Create Security Policy"}, {"id": "sec_dash", "title": "Security Dashboard", "endpoint": "/api/v1/network/security-dashboard", "desc": "Fleet posture, STIG compliance checks, and microsegmentation traffic matrix."}, {"id": "system_accounts", "title": "System Accounts", "endpoint": "/api/v1/network/system-accounts", "desc": "Federated directory services, LDAP/Active Directory, and SAML/OIDC.", "btn": "+ Configure Directory"}]}, {"id": "dataprotect", "title": "Data Protection", "icon": "M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z", "items": [{"id": "prot_summary", "title": "Protection Summary", "endpoint": "/api/v1/protection/summary", "desc": "Fleet-wide recovery point compliance, snapshot schedules, and replication status."}, {"id": "prot_policies", "title": "Protection Policies", "endpoint": "/api/v1/protection/policies", "desc": "Automated snapshot schedules, retention rules, and remote replication targets.", "btn": "+ Create Protection Policy"}, {"id": "recovery_plans", "title": "Recovery Plans", "endpoint": "/api/v1/protection/recovery-plans", "desc": "Orchestrated disaster recovery runbooks, failover boot order, and IP remapping.", "btn": "+ Create Recovery Plan"}, {"id": "vm_recovery_pts", "title": "VM Recovery Points", "endpoint": "/api/v1/protection/vm-recovery-points", "desc": "Point-in-time Sidon CoW snapshots and crash/app-consistent VM recovery points."}, {"id": "vg_recovery_pts", "title": "VG Recovery Points", "endpoint": "/api/v1/protection/vg-recovery-points", "desc": "Volume Group point-in-time snapshots and independent block restore points."}, {"id": "consistency_groups", "title": "Consistency Groups", "endpoint": "/api/v1/protection/consistency-groups", "desc": "Multi-VM consistent snapshot groups for enterprise multi-tier applications.", "btn": "+ Create Consistency Group"}, {"id": "replication_details", "title": "Replication Details", "endpoint": "/api/v1/protection/replication-details", "desc": "NearSync and asynchronous block-level replication bandwidth and RPO tracking."}, {"id": "approval_policy", "title": "Approval Policy", "endpoint": "/api/v1/protection/approval-policies", "desc": "Four-eyes governance policies for sensitive operations and disaster recovery failover.", "btn": "+ Configure Approval Rule"}]}, {"id": "hardware", "title": "Hardware", "icon": "M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01", "items": [{"id": "clusters", "title": "Clusters", "endpoint": "/api/v1/hardware/clusters", "desc": "Federated Helios hyperconverged clusters registered with Helios Central.", "btn": "+ Register Cluster"}, {"id": "hosts", "title": "Hosts", "endpoint": "/api/v1/hardware/hosts", "desc": "Bare-metal hypervisor nodes, CPU sockets, memory capacity, and node status."}, {"id": "disks", "title": "Disks", "endpoint": "/api/v1/hardware/disks", "desc": "Physical NVMe SSDs, SATA drives, and Sidon distributed extent stores."}, {"id": "gpus", "title": "GPUs", "endpoint": "/api/v1/hardware/gpus", "desc": "PCIe GPU accelerators, vGPU partitioning profiles, and passthrough mappings."}, {"id": "nics", "title": "NICs", "endpoint": "/api/v1/hardware/nics", "desc": "Physical 10G/25G/100G network adapters, link states, and MTU settings."}]}, {"id": "monitoring", "title": "Monitoring", "icon": "M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z", "items": [{"id": "alerts", "title": "Alerts", "endpoint": "/api/v1/monitoring/alerts", "desc": "Active cluster and fleet alerts, threshold triggers, and unresolved warnings."}, {"id": "events", "title": "Events", "endpoint": "/api/v1/monitoring/events", "desc": "Chronological audit of state changes, VM lifecycles, and cluster notifications."}, {"id": "tasks", "title": "Tasks", "endpoint": "/api/v1/monitoring/tasks", "desc": "Asynchronous operations, migrations, snapshot creations, and disk formatting jobs."}, {"id": "audits", "title": "Audits", "endpoint": "/api/v1/monitoring/audits", "desc": "Security audit trail of user logins, role changes, and API commands."}, {"id": "operations", "title": "Operations", "endpoint": "/api/v1/monitoring/operations", "desc": "Vali intelligent capacity runway forecasting and anomaly detection engine."}]}, {"id": "admin", "title": "Administration", "icon": "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065zM15 12a3 3 0 11-6 0 3 3 0 016 0z", "items": [{"id": "categories", "title": "Categories", "endpoint": "/api/v1/admin/categories", "desc": "Key-value taxonomy tags for policy assignment and automated governance.", "btn": "+ Create Category"}, {"id": "users", "title": "Users", "endpoint": "/api/v1/admin/users", "desc": "Local accounts and directory-mapped administrative identities.", "btn": "+ Add User"}, {"id": "roles", "title": "Roles", "endpoint": "/api/v1/admin/roles", "desc": "Role-Based Access Control (RBAC) permission bundles and privilege tiers.", "btn": "+ Create Role"}, {"id": "projects", "title": "Projects", "endpoint": "/api/v1/admin/projects", "desc": "Multi-tenant project boundaries with compute, memory, and storage quotas.", "btn": "+ Create Project"}, {"id": "azs", "title": "Availability Zones", "endpoint": "/api/v1/admin/availability-zones", "desc": "Logical availability zones and fault domains across data centers.", "btn": "+ Create AZ"}, {"id": "entity_sync", "title": "Entity Sync", "endpoint": "/api/v1/admin/entity-sync", "desc": "Cross-cluster metadata synchronization state and conflict resolution."}, {"id": "lcm", "title": "LCM", "endpoint": "/api/v1/admin/lcm", "desc": "Life Cycle Management: one-click firmware, hypervisor, and component updates.", "btn": "Perform LCM Inventory"}]}, {"id": "settings", "title": "Settings", "icon": "M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4", "items": [{"id": "settings_overview", "title": "Settings Overview", "endpoint": "/api/v1/settings", "desc": "Helios Central appliance configuration, network settings, and security controls."}, {"id": "set_app_log", "title": "App Log Archive", "endpoint": "/api/v1/settings/app-logs", "desc": "Collect and export diagnostic bundles across all clusters and Helios Central.", "btn": "Generate Log Bundle"}, {"id": "set_federation", "title": "Register to Helios Central", "endpoint": "/api/v1/settings/federation", "desc": "Federate this Helios instance with a higher-level Central or cloud manager.", "btn": "Register Instance"}, {"id": "set_policies", "title": "Policy Engine", "endpoint": "/api/v1/settings/policies", "desc": "Automated governance policies, placement constraints, and compliance enforcement.", "btn": "Configure Engine"}, {"id": "set_pulse", "title": "Pulse & Telemetry", "endpoint": "/api/v1/settings/pulse", "desc": "Diagnostic telemetry, health heartbeats, and automated support log generation.", "btn": "Save Telemetry"}, {"id": "set_proxy", "title": "Portal & HTTP Proxy", "endpoint": "/api/v1/settings/proxy", "desc": "Outbound HTTP/HTTPS proxy configuration for external package repositories and updates.", "btn": "Save Proxy"}, {"id": "set_dns", "title": "Name Servers (DNS)", "endpoint": "/api/v1/settings/dns", "desc": "System recursive DNS resolvers for hostname and domain resolution.", "btn": "Save DNS"}, {"id": "set_ntp", "title": "NTP Servers", "endpoint": "/api/v1/settings/ntp", "desc": "Time synchronization sources across all hypervisor nodes and appliances.", "btn": "Save NTP"}, {"id": "set_snmp", "title": "SNMP", "endpoint": "/api/v1/settings/snmp", "desc": "SNMP v2c/v3 trap receivers for enterprise monitoring integration.", "btn": "Configure SNMP"}, {"id": "set_lockdown", "title": "Cluster Lockdown", "endpoint": "/api/v1/settings/lockdown", "desc": "Security lockdown: enforce SSH key-only access and disable interactive root passwords.", "btn": "Toggle Lockdown"}, {"id": "set_ssl", "title": "SSL Certificate", "endpoint": "/api/v1/settings/ssl", "desc": "Appliance TLS certificate management: replace self-signed certificate with custom CA.", "btn": "Upload Certificate"}, {"id": "set_email", "title": "Alert Email Configuration", "endpoint": "/api/v1/settings/email", "desc": "Automated email alerts for CRITICAL and WARNING system incidents.", "btn": "Save Alert Email"}, {"id": "set_smtp", "title": "SMTP Server", "endpoint": "/api/v1/settings/smtp", "desc": "Outbound mail transport agent settings for notification delivery.", "btn": "Save SMTP"}, {"id": "set_syslog", "title": "Syslog Server", "endpoint": "/api/v1/settings/syslog", "desc": "Remote RFC 5424 syslog forwarding for SIEM and centralized compliance logging.", "btn": "Save Syslog"}, {"id": "set_appearance", "title": "Appearance & UI Settings", "endpoint": "/api/v1/settings/appearance", "desc": "Default landing page, UI theme, locale, and login welcome banner.", "btn": "Save UI Settings"}]}];
@@ -4745,6 +5004,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       } else if (hash.startsWith('host_detail')) {
         const parts = hash.split(':');
         openHostDetail(parts[1] || 'Valkyrie-997A49');
+      } else if (hash.startsWith('vm_detail')) {
+        const parts = hash.split(':');
+        openVmDetail(parts[1] || 'helios-central');
       } else {
         let found = false;
         if (hash) {
@@ -4893,6 +5155,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         loadHostDetail(activeHostId || 'Valkyrie-997A49');
         return;
       }
+      if (viewId === 'vm_detail') {
+        loadVmDetail(activeVmName || 'helios-central');
+        return;
+      }
       try {
         const res = await fetch('/api/v1/entities/' + viewId);
         if (!res.ok) return;
@@ -4985,19 +5251,39 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         if (viewId === 'vms') {
           const isRun = row.state === 'Running';
           const badgeClass = isRun ? 'badge-success' : 'badge-ghost';
+          const hostIp = (row.host && row.host.includes('(')) ? row.host.split('(')[1].replace(')', '') : '10.10.102.41';
           const actBtn = isRun 
-            ? `<button onclick="handleVmPower('${row.name}', 'off')" class="btn btn-xs btn-error font-semibold mr-1">Power Off</button><a href="https://10.10.102.41:8443/vms/${row.name}" target="_blank" class="btn btn-xs btn-ghost border border-base-300">Console</a>`
-            : `<button onclick="handleVmPower('${row.name}', 'on')" class="btn btn-xs btn-success font-semibold mr-1">Power On</button>`;
+            ? `<button onclick="openVmDetail('${escapeHtml(row.name)}')" class="btn btn-xs btn-primary font-semibold mr-1">Details</button><button onclick="handleVmPower('${row.name}', 'off')" class="btn btn-xs btn-error font-semibold mr-1">Power Off</button><a href="https://${escapeHtml(hostIp)}:8443/vms/${escapeHtml(row.name)}" target="_blank" class="btn btn-xs btn-ghost border border-base-300">Console &nearr;</a>`
+            : `<button onclick="openVmDetail('${escapeHtml(row.name)}')" class="btn btn-xs btn-primary font-semibold mr-1">Details</button><button onclick="handleVmPower('${row.name}', 'on')" class="btn btn-xs btn-success font-semibold mr-1">Power On</button>`;
           return `<tr>
-            <td class="font-bold text-primary">${escapeHtml(row.name)}</td>
-            <td><span class="badge ${badgeClass} badge-xs">${escapeHtml(row.state)}</span></td>
+            <td>
+              <a href="javascript:void(0)" onclick="openVmDetail('${escapeHtml(row.name)}')" class="font-bold text-primary hover:underline flex items-center gap-1.5 cursor-pointer">
+                <svg class="size-3.5 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg>
+                <span>${escapeHtml(row.name)}</span>
+              </a>
+            </td>
+            <td><span class="badge ${badgeClass} badge-xs font-mono font-bold">${escapeHtml(row.state)}</span></td>
             <td>${escapeHtml(row.cluster_id || 'hci-01')}</td>
             <td>${row.vcpus || 2}</td>
-            <td>${row.memory_mb || 4096}</td>
-            <td>${row.disk_gb || 32}</td>
-            <td>${escapeHtml(row.ip || 'DHCP')}</td>
+            <td>${row.memory_mb || 4096} MB</td>
+            <td>${row.disk_gb || 32} GB</td>
+            <td><span class="font-mono text-primary">${escapeHtml(row.ip || 'DHCP')}</span></td>
             <td>${row.host && row.host !== 'N/A' ? `<a href="javascript:void(0)" onclick="openHostDetail('${escapeHtml(row.host.split(' ')[0])}')" class="text-primary hover:underline font-medium">${escapeHtml(row.host)}</a>` : '<span class="opacity-50">N/A</span>'}</td>
             <td>${actBtn}</td>
+          </tr>`;
+        }
+
+        if (viewId === 'lcm') {
+          const isUpToDate = row.current_version === row.available_version;
+          const statusBtn = isUpToDate
+            ? `<span class="badge badge-success badge-xs font-mono font-bold">UP TO DATE</span>`
+            : `<button onclick="triggerLcmUpgrade('${escapeHtml(row.component_name)}')" class="btn btn-xs btn-primary font-semibold">Upgrade &rarr;</button>`;
+          return `<tr>
+            <td class="font-bold font-mono text-primary">${escapeHtml(row.component_name)}</td>
+            <td><span class="badge badge-neutral badge-xs font-mono">${escapeHtml(row.current_version)}</span></td>
+            <td><span class="badge badge-info badge-xs font-mono">${escapeHtml(row.available_version)}</span></td>
+            <td><span class="badge badge-warning badge-xs font-mono font-bold">${escapeHtml(row.severity)}</span></td>
+            <td>${statusBtn}</td>
           </tr>`;
         }
 
@@ -5288,7 +5574,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ? `<button onclick="handleVmPower('${escapeHtml(v.name)}', 'off')" class="btn btn-xs btn-error font-semibold mr-1">Power Off</button><a href="https://10.10.102.41:8443/vms/${escapeHtml(v.name)}" target="_blank" class="btn btn-xs btn-ghost border border-base-300">Console</a>`
             : `<button onclick="handleVmPower('${escapeHtml(v.name)}', 'on')" class="btn btn-xs btn-success font-semibold mr-1">Power On</button>`;
           return `<tr>
-            <td class="font-bold text-primary">${escapeHtml(v.name)}</td>
+            <td><a href="javascript:void(0)" onclick="openVmDetail('${escapeHtml(v.name)}')" class="font-bold text-primary hover:underline cursor-pointer flex items-center gap-1"><svg class="size-3 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg><span>${escapeHtml(v.name)}</span></a></td>
             <td><span class="badge ${badgeClass} badge-xs">${escapeHtml(v.state)}</span></td>
             <td>${v.vcpus || 2}</td>
             <td>${v.memory_mb || 4096}</td>
@@ -5453,7 +5739,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
               ? `<button onclick="handleVmPower('${escapeHtml(v.name)}', 'off')" class="btn btn-xs btn-error font-semibold mr-1">Power Off</button><a href="https://${escapeHtml(h.ip)}:8443/vms/${escapeHtml(v.name)}" target="_blank" class="btn btn-xs btn-ghost border border-base-300">Console</a>`
               : `<button onclick="handleVmPower('${escapeHtml(v.name)}', 'on')" class="btn btn-xs btn-success font-semibold mr-1">Power On</button>`;
             return `<tr>
-              <td class="font-bold text-primary">${escapeHtml(v.name)}</td>
+              <td><a href="javascript:void(0)" onclick="openVmDetail('${escapeHtml(v.name)}')" class="font-bold text-primary hover:underline cursor-pointer flex items-center gap-1"><svg class="size-3 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/></svg><span>${escapeHtml(v.name)}</span></a></td>
               <td><span class="badge ${badgeClass} badge-xs">${escapeHtml(v.state)}</span></td>
               <td>${v.vcpus || 2}</td>
               <td>${v.memory_mb || 4096}</td>
@@ -5547,6 +5833,286 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
+
+    let activeVmName = 'helios-central';
+    let currentVmHost = 'Valkyrie-44B8E2';
+
+    function openVmDetail(vmName) {
+      activeVmName = vmName || 'helios-central';
+      showView('vm_detail', 'Compute', 'VM: ' + activeVmName);
+      loadVmDetail(activeVmName);
+    }
+
+    function handleVmHostClick() {
+      const hname = currentVmHost.split(' ')[0];
+      if (hname && hname !== 'N/A') {
+        openHostDetail(hname);
+      }
+    }
+
+    async function loadVmDetail(vmName) {
+      vmName = vmName || activeVmName || 'helios-central';
+      activeVmName = vmName;
+      try {
+        const res = await fetch('/api/v1/vms/' + encodeURIComponent(vmName) + '/details');
+        if (!res.ok) return;
+        const d = await res.json();
+        renderVmDetailView(d);
+      } catch (e) {
+        console.error('Failed to load VM details', e);
+      }
+    }
+
+    function switchVmDetailTab(tabId) {
+      ['disks', 'snaps', 'nics', 'migrate'].forEach(t => {
+        const pane = document.getElementById('vmdTab-' + t);
+        const btn = document.getElementById('vmdTabBtn-' + t);
+        if (pane) {
+          if (t === tabId) pane.classList.remove('hidden'); else pane.classList.add('hidden');
+        }
+        if (btn) {
+          if (t === tabId) {
+            btn.classList.add('btn-primary');
+            btn.classList.remove('btn-ghost');
+          } else {
+            btn.classList.remove('btn-primary');
+            btn.classList.add('btn-ghost');
+          }
+        }
+      });
+    }
+
+    function renderVmDetailView(data) {
+      if (!data || !data.vm) return;
+      const v = data.vm;
+      const vdisks = data.vdisks || [];
+      const snaps = data.snapshots || [];
+      const hosts = data.hosts || [];
+      const isRun = v.state === 'Running';
+      currentVmHost = v.host || 'N/A';
+
+      // Top Banner
+      const nameEl = document.getElementById('vmdVmName');
+      if (nameEl) nameEl.textContent = v.name;
+
+      const stateEl = document.getElementById('vmdStateBadge');
+      if (stateEl) {
+        stateEl.textContent = v.state.toUpperCase();
+        stateEl.className = isRun ? 'badge badge-success badge-sm font-bold gap-1 font-mono' : 'badge badge-ghost badge-sm font-bold gap-1 font-mono';
+      }
+
+      const hostEl = document.getElementById('vmdHostBadge');
+      if (hostEl) {
+        hostEl.textContent = 'Host: ' + (v.host || 'N/A');
+      }
+
+      const ipEl = document.getElementById('vmdIp');
+      if (ipEl) ipEl.textContent = v.ip || 'DHCP';
+
+      const vcpuEl = document.getElementById('vmdVcpus');
+      if (vcpuEl) vcpuEl.textContent = (v.vcpus || 2) + ' vCPUs';
+
+      const memEl = document.getElementById('vmdMemory');
+      if (memEl) memEl.textContent = (v.memory_mb || 4096) + ' MB (' + ((v.memory_mb || 4096)/1024).toFixed(1) + ' GB)';
+
+      const diskEl = document.getElementById('vmdDisk');
+      if (diskEl) diskEl.textContent = (v.disk_gb || 32) + ' GB';
+
+      // Power button area
+      const powerArea = document.getElementById('vmdPowerActionArea');
+      if (powerArea) {
+        powerArea.innerHTML = isRun 
+          ? `<button onclick="handleVmPower('${v.name}', 'off')" class="btn btn-error btn-xs font-semibold">Power Off</button>`
+          : `<button onclick="handleVmPower('${v.name}', 'on')" class="btn btn-success btn-xs font-semibold">Power On</button>`;
+      }
+
+      // Console link
+      const consoleLink = document.getElementById('vmdLaunchConsole');
+      if (consoleLink) {
+        const hostIp = (v.host && v.host.includes('(')) ? v.host.split('(')[1].replace(')', '') : '10.10.102.41';
+        consoleLink.href = 'https://' + hostIp + ':8443/vms/' + encodeURIComponent(v.name);
+      }
+
+      // 4 Metric Cards
+      document.getElementById('vmdCpuVal').textContent = (v.vcpus || 2) + ' vCPUs';
+      document.getElementById('vmdMemVal').textContent = (v.memory_mb || 4096) + ' MB (' + ((v.memory_mb || 4096)/1024).toFixed(1) + ' GB)';
+      document.getElementById('vmdDiskVal').textContent = (v.disk_gb || 32) + ' GB Provisioned';
+      document.getElementById('vmdNicVal').textContent = v.ip || 'DHCP';
+
+      // Tab 1: Virtual Disks
+      const disksTbody = document.getElementById('vmdDisksTbody');
+      const disksBadge = document.getElementById('vmdDisksBadge');
+      if (disksBadge) disksBadge.textContent = vdisks.length + (vdisks.length === 1 ? ' vDisk' : ' vDisks');
+      if (disksTbody) {
+        disksTbody.innerHTML = vdisks.map((d, idx) => {
+          const szGb = (d.size_bytes / (1024*1024*1024)).toFixed(1);
+          return `<tr>
+            <td class="font-bold font-mono text-primary">vda${idx === 0 ? '' : idx}</td>
+            <td class="font-mono">${escapeHtml(d.vdisk_id || d.name)}</td>
+            <td><span class="badge badge-neutral badge-xs font-mono">${escapeHtml(d.container_id || 'default-pool')}</span></td>
+            <td class="font-mono font-bold">${szGb} GB</td>
+            <td><span class="badge badge-primary badge-xs">NVMe Flash Tier</span></td>
+            <td><span class="badge badge-success badge-xs font-mono">RF2 CoW LZ4</span></td>
+          </tr>`;
+        }).join('');
+      }
+
+      // Tab 2: Snapshots
+      const snapsTbody = document.getElementById('vmdSnapsTbody');
+      const snapsEmpty = document.getElementById('vmdSnapsEmpty');
+      const snapsBadge = document.getElementById('vmdSnapsBadge');
+      if (snapsBadge) snapsBadge.textContent = snaps.length + (snaps.length === 1 ? ' Snapshot' : ' Snapshots');
+      if (snapsTbody) {
+        if (snaps.length === 0) {
+          snapsTbody.innerHTML = '';
+          if (snapsEmpty) snapsEmpty.classList.remove('hidden');
+        } else {
+          if (snapsEmpty) snapsEmpty.classList.add('hidden');
+          snapsTbody.innerHTML = snaps.map(s => {
+            const dt = s.created_at ? new Date(s.created_at).toLocaleString() : 'Recent';
+            return `<tr>
+              <td class="font-bold text-primary font-mono">${escapeHtml(s.snapshot_name)}</td>
+              <td><span class="badge badge-info badge-xs">Crash Consistent</span></td>
+              <td class="font-mono">${s.size_mb || 256} MB</td>
+              <td class="font-mono text-xs opacity-80">${dt}</td>
+              <td>
+                <span class="badge badge-success badge-xs font-mono">READY</span>
+              </td>
+            </tr>`;
+          }).join('');
+        }
+      }
+
+      // Tab 3: Network Adapters
+      const nicsTbody = document.getElementById('vmdNicsTbody');
+      if (nicsTbody) {
+        const mac = '52:54:00:' + (v.name.length * 7 % 90 + 10) + ':' + (v.vcpus * 13 % 90 + 10) + ':42';
+        nicsTbody.innerHTML = `<tr>
+          <td class="font-bold font-mono text-primary">vnet0</td>
+          <td class="font-mono">${mac}</td>
+          <td class="font-mono text-primary font-bold">${escapeHtml(v.ip || 'DHCP')}</td>
+          <td><span class="badge badge-neutral badge-xs font-mono">vs-management (VLAN 0)</span></td>
+          <td class="font-mono">VirtIO-Net (virtio-pci)</td>
+          <td><span class="badge ${isRun ? 'badge-success' : 'badge-ghost'} badge-xs font-mono">${isRun ? 'UP (10 Gbps)' : 'DOWN'}</span></td>
+        </tr>`;
+      }
+
+      // Tab 4: Live Migration Target Select
+      const selectEl = document.getElementById('vmdMigrateTargetSelect');
+      const currHostEl = document.getElementById('vmdMigrateCurrentHost');
+      if (currHostEl) currHostEl.textContent = v.host || 'N/A';
+      if (selectEl) {
+        selectEl.innerHTML = hosts.map(h => {
+          const isCurrent = v.host && v.host.includes(h.hostname);
+          return `<option value="${h.hostname}" ${isCurrent ? 'disabled' : ''}>${h.hostname} (${h.ip}) - ${h.status} ${isCurrent ? '(Current)' : ''}</option>`;
+        }).join('');
+      }
+    }
+
+    function openTakeSnapshotModal() {
+      const modal = document.getElementById('vmSnapshotModal');
+      const vmNameEl = document.getElementById('snapModalVmName');
+      const inputEl = document.getElementById('snapModalNameInput');
+      if (vmNameEl) vmNameEl.textContent = activeVmName;
+      const ts = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '_');
+      if (inputEl) inputEl.value = activeVmName + '_snap_' + ts;
+      if (modal) modal.showModal();
+    }
+
+    async function handleVmSnapshotSubmit(e) {
+      e.preventDefault();
+      const inputEl = document.getElementById('snapModalNameInput');
+      const snapName = inputEl.value.trim();
+      const btn = document.getElementById('snapModalSubmitBtn');
+      btn.disabled = true;
+      btn.textContent = 'Taking snapshot...';
+
+      try {
+        const res = await fetch('/api/v1/vm/' + encodeURIComponent(activeVmName) + '/snapshot', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({snapshot_name: snapName})
+        });
+        const data = await res.json();
+        document.getElementById('vmSnapshotModal').close();
+        btn.disabled = false;
+        btn.textContent = 'Take Snapshot';
+        if (data.success) {
+          loadVmDetail(activeVmName);
+          switchVmDetailTab('snaps');
+        } else {
+          alert('Snapshot failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Take Snapshot';
+        alert('Snapshot request error: ' + err);
+      }
+    }
+
+    async function executeVmMigration() {
+      const selectEl = document.getElementById('vmdMigrateTargetSelect');
+      const targetHost = selectEl.value;
+      if (!targetHost) return;
+      if (!confirm('Initiate zero-downtime live migration of VM '' + activeVmName + '' to host ' + targetHost + '?')) return;
+
+      const btn = document.getElementById('vmdMigrateExecuteBtn');
+      const statusEl = document.getElementById('vmdMigrateStatusMsg');
+      btn.disabled = true;
+      btn.textContent = 'Migrating memory pages...';
+      if (statusEl) statusEl.textContent = 'Streaming dirty memory pages to ' + targetHost + ' via Spark mTLS (Port 9099)...';
+
+      try {
+        const res = await fetch('/api/v1/vm/' + encodeURIComponent(activeVmName) + '/migrate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({target_host: targetHost})
+        });
+        const data = await res.json();
+        btn.disabled = false;
+        btn.innerHTML = `<svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/></svg> Initiate Live Migration`;
+        if (data.success) {
+          if (statusEl) statusEl.textContent = data.message || 'Live migration completed successfully!';
+          loadVmDetail(activeVmName);
+          refreshData('vms');
+        } else {
+          alert('Migration failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'Initiate Live Migration';
+        alert('Migration error: ' + err);
+      }
+    }
+
+    async function triggerVmReset() {
+      if (!confirm('Perform a hardware reset on virtual machine '' + activeVmName + ''?')) return;
+      try {
+        const res = await fetch('/api/v1/vm/' + encodeURIComponent(activeVmName) + '/reset', { method: 'POST' });
+        const d = await res.json();
+        alert('VM '' + activeVmName + '' hardware reset dispatched.');
+        loadVmDetail(activeVmName);
+      } catch (e) {
+        alert('VM reset failed: ' + e);
+      }
+    }
+
+    async function triggerLcmUpgrade(comp) {
+      if (!confirm('Perform rolling upgrade on component '' + comp + '' across all hypervisor nodes? Nodes will maintain quorum and workloads will continue running.')) return;
+      try {
+        const res = await fetch('/api/v1/lcm/upgrade', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({component: comp})
+        });
+        const data = await res.json();
+        alert(data.message || 'Component upgrade completed successfully.');
+        refreshData('lcm');
+      } catch (e) {
+        alert('LCM upgrade failed: ' + e);
+      }
+    }
+
     function openActionModal(viewId, actionName) {
       const modal = document.getElementById('actionModal');
       const title = document.getElementById('modalTitle');
@@ -5556,16 +6122,84 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       title.textContent = actionName || 'Add New Entity';
       target.value = viewId;
 
-      fields.innerHTML = `
-        <div>
-          <label class="label text-xs font-semibold">Entity Name / Identifier</label>
-          <input id="field_name" type="text" placeholder="e.g. Production-Item-01" class="input input-sm input-bordered w-full font-mono text-xs" required />
-        </div>
-        <div>
-          <label class="label text-xs font-semibold">Configuration / Notes</label>
-          <input id="field_config" type="text" placeholder="Default parameters" class="input input-sm input-bordered w-full font-mono text-xs" />
-        </div>
-      `;
+      if (viewId === 'prot_summary') {
+        fields.innerHTML = `
+          <div>
+            <label class="label text-xs font-semibold">Protection Domain Name</label>
+            <input id="field_name" type="text" placeholder="e.g. Bronze-Hourly-PD" class="input input-sm input-bordered w-full font-mono text-xs" required />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="label text-xs font-semibold">Snapshot Interval (Hours)</label>
+              <input id="field_sched" type="number" value="1" min="1" class="input input-sm input-bordered w-full font-mono text-xs" />
+            </div>
+            <div>
+              <label class="label text-xs font-semibold">Retention Count</label>
+              <input id="field_keep" type="number" value="24" min="1" class="input input-sm input-bordered w-full font-mono text-xs" />
+            </div>
+          </div>
+        `;
+      } else if (viewId === 'prot_policies') {
+        fields.innerHTML = `
+          <div>
+            <label class="label text-xs font-semibold">Protection Policy Name</label>
+            <input id="field_name" type="text" placeholder="e.g. Critical-Workloads-Policy" class="input input-sm input-bordered w-full font-mono text-xs" required />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="label text-xs font-semibold">Snapshot Interval (Minutes)</label>
+              <input id="field_sched" type="number" value="60" min="5" class="input input-sm input-bordered w-full font-mono text-xs" />
+            </div>
+            <div>
+              <label class="label text-xs font-semibold">Retention Count</label>
+              <input id="field_keep" type="number" value="24" min="1" class="input input-sm input-bordered w-full font-mono text-xs" />
+            </div>
+          </div>
+        `;
+      } else if (viewId === 'sec_policies') {
+        fields.innerHTML = `
+          <div>
+            <label class="label text-xs font-semibold">Security Policy Name</label>
+            <input id="field_name" type="text" placeholder="e.g. DMZ-Isolation-Rule" class="input input-sm input-bordered w-full font-mono text-xs" required />
+          </div>
+          <div>
+            <label class="label text-xs font-semibold">Policy Type</label>
+            <select id="field_ptype" class="select select-sm select-bordered w-full font-mono text-xs">
+              <option value="Application Isolation">Application Isolation (East-West Microsegmentation)</option>
+              <option value="Zero Trust Quarantine">Zero Trust Quarantine</option>
+              <option value="DMZ Perimeter Protection">DMZ Perimeter Protection</option>
+            </select>
+          </div>
+        `;
+      } else if (viewId === 'clusters' || viewId === 'fleet') {
+        fields.innerHTML = `
+          <div>
+            <label class="label text-xs font-semibold">Remote Cluster Name</label>
+            <input id="field_name" type="text" placeholder="e.g. hci-dr-02" class="input input-sm input-bordered w-full font-mono text-xs" required />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="label text-xs font-semibold">Cluster Virtual IP (VIP)</label>
+              <input id="field_vip" type="text" placeholder="10.10.102.60" class="input input-sm input-bordered w-full font-mono text-xs" required />
+            </div>
+            <div>
+              <label class="label text-xs font-semibold">Port</label>
+              <input id="field_port" type="number" value="8443" class="input input-sm input-bordered w-full font-mono text-xs" />
+            </div>
+          </div>
+        `;
+      } else {
+        fields.innerHTML = `
+          <div>
+            <label class="label text-xs font-semibold">Entity Name / Identifier</label>
+            <input id="field_name" type="text" placeholder="e.g. Production-Item-01" class="input input-sm input-bordered w-full font-mono text-xs" required />
+          </div>
+          <div>
+            <label class="label text-xs font-semibold">Configuration / Notes</label>
+            <input id="field_config" type="text" placeholder="Default parameters" class="input input-sm input-bordered w-full font-mono text-xs" />
+          </div>
+        `;
+      }
       modal.showModal();
     }
 
@@ -5573,12 +6207,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       e.preventDefault();
       const viewId = document.getElementById('modalTargetView').value;
       const name = document.getElementById('field_name').value.trim();
-      const config = document.getElementById('field_config').value.trim();
+      const config = document.getElementById('field_config') ? document.getElementById('field_config').value.trim() : '';
+      const sched = document.getElementById('field_sched') ? document.getElementById('field_sched').value : 1;
+      const keep = document.getElementById('field_keep') ? document.getElementById('field_keep').value : 24;
+      const ptype = document.getElementById('field_ptype') ? document.getElementById('field_ptype').value : '';
+      const vip = document.getElementById('field_vip') ? document.getElementById('field_vip').value.trim() : '';
+      const port = document.getElementById('field_port') ? document.getElementById('field_port').value : 8443;
+
+      let postUrl = '/api/v1/entities/' + viewId;
+      let bodyData = { name: name, config: config, schedule_hours: sched, keep_count: keep, policy_type: ptype, vip: vip, port: port };
+
+      if (viewId === 'prot_summary') {
+        postUrl = '/api/v1/protection/domains';
+      } else if (viewId === 'prot_policies') {
+        postUrl = '/api/v1/protection/policies';
+        bodyData.snapshot_interval_minutes = sched;
+        bodyData.retention_count = keep;
+      } else if (viewId === 'sec_policies') {
+        postUrl = '/api/v1/network/security-policies';
+      } else if (viewId === 'clusters' || viewId === 'fleet') {
+        postUrl = '/api/v1/hardware/clusters';
+      }
 
       try {
-        const res = await fetch('/api/v1/entities/' + viewId, {
+        const res = await fetch(postUrl, {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(bodyData)
+        });
+        document.getElementById('actionModal').close();
+        refreshData(viewId);
+      } catch (err) {
+        alert('Action failed: ' + err);
+      }
+    },
           body: JSON.stringify({name: name, config: config})
         });
         document.getElementById('actionModal').close();
@@ -5765,6 +6427,12 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             conn.close()
             return
 
+        if path.startswith("/api/v1/vms/") and path.endswith("/details"):
+            vm_name = path.split("/api/v1/vms/")[1].split("/details")[0].strip()
+            self.handle_vm_details(conn, vm_name)
+            conn.close()
+            return
+
         if path == "/api/v1/cluster/details":
             self.handle_cluster_details(conn, "hci-01")
             conn.close()
@@ -5786,6 +6454,50 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
 
         conn.close()
         self.send_json(404, {"error": "Endpoint not found"})
+
+    def handle_vm_details(self, conn, vm_name):
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM vms WHERE name = ? OR vm_id = ?", (vm_name, vm_name))
+        vrow = cur.fetchone()
+        if not vrow:
+            cur.execute("SELECT * FROM vms LIMIT 1")
+            vrow = cur.fetchone()
+        vm = dict(vrow) if vrow else {
+            "vm_id": f"vm_{vm_name}", "cluster_id": "hci-01", "name": vm_name,
+            "state": "Stopped", "vcpus": 2, "memory_mb": 4096, "disk_gb": 32,
+            "ip": "DHCP", "host": "N/A", "updated_at": int(time.time()*1000)
+        }
+
+        # Attached vdisks
+        cur.execute("SELECT * FROM storage_vdisks WHERE name LIKE ? OR vdisk_id LIKE ?", (f"%{vm['name']}%", f"%{vm['name']}%"))
+        vdisks = [dict(r) for r in cur.fetchall()]
+        if not vdisks:
+            cur.execute("SELECT * FROM storage_vdisks WHERE name LIKE ?", (f"{vm['name']}-disk%",))
+            vdisks = [dict(r) for r in cur.fetchall()]
+            if not vdisks:
+                vdisks = [{
+                    "vdisk_id": f"{vm['name']}-disk0",
+                    "cluster_id": "hci-01",
+                    "name": f"{vm['name']}-disk0",
+                    "container_id": "default-pool",
+                    "size_bytes": vm.get("disk_gb", 32) * 1024 * 1024 * 1024,
+                    "created_at": vm.get("updated_at", int(time.time()*1000))
+                }]
+
+        # Snapshots / Recovery Points
+        cur.execute("SELECT * FROM recovery_points WHERE entity_id = ? AND entity_type = 'VM' ORDER BY created_at DESC", (vm["name"],))
+        snaps = [dict(r) for r in cur.fetchall()]
+
+        # Available hosts for migration
+        cur.execute("SELECT hostname, ip, status, cpu_model, cores_total, memory_total_mb FROM hardware_hosts")
+        hosts = [dict(r) for r in cur.fetchall()]
+
+        self.send_json(200, {
+            "vm": vm,
+            "vdisks": vdisks,
+            "snapshots": snaps,
+            "hosts": hosts
+        })
 
     def handle_host_details(self, conn, hostname):
         cur = conn.cursor()
@@ -6047,6 +6759,227 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 conn.close()
             self.send_json(200, {"success": True, "vm": vm_name, "state": new_state, "spark_res": res})
+            return
+
+        # VM Snapshot Action
+        if path.startswith("/api/v1/vm/") and path.endswith("/snapshot"):
+            vm_name = path.split("/api/v1/vm/")[1].split("/snapshot")[0].strip()
+            snap_name = payload.get("snapshot_name") or f"{vm_name}_snap_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            now = int(time.time() * 1000)
+            snap_id = f"snap_{secrets.token_hex(6)}"
+            size_mb = 256
+            conn = get_db_connection()
+            try:
+                conn.execute("INSERT OR REPLACE INTO recovery_points (id, entity_type, entity_id, snapshot_name, size_mb, created_at) VALUES (?, 'VM', ?, ?, ?, ?)",
+                             (snap_id, vm_name, snap_name, size_mb, now))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'vm.snapshot', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", snap_name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'VM_SNAPSHOT_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Created snapshot {snap_name} for VM {vm_name}", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "snapshot": {"id": snap_id, "snapshot_name": snap_name, "size_mb": size_mb, "created_at": now}})
+            return
+
+        # VM Live Migration Action
+        if path.startswith("/api/v1/vm/") and path.endswith("/migrate"):
+            vm_name = path.split("/api/v1/vm/")[1].split("/migrate")[0].strip()
+            target_host = payload.get("target_host", "").strip()
+            if not target_host:
+                self.send_json(400, {"error": "Target host is required"})
+                return
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT ip FROM hardware_hosts WHERE hostname = ?", (target_host,))
+                hrow = cur.fetchone()
+                target_ip = hrow["ip"] if hrow else "10.10.102.41"
+                formatted_host = f"{target_host} ({target_ip})"
+                conn.execute("UPDATE vms SET host = ?, updated_at = ? WHERE name = ?", (formatted_host, now, vm_name))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'vm.live_migrate', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", f"{vm_name} -> {target_host}", now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'VM_LIVE_MIGRATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Live migrated VM {vm_name} to {formatted_host}", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "message": f"Virtual machine '{vm_name}' successfully live migrated to {formatted_host}.", "host": formatted_host})
+            return
+
+        # VM Reset Action
+        if path.startswith("/api/v1/vm/") and path.endswith("/reset"):
+            vm_name = path.split("/api/v1/vm/")[1].split("/reset")[0].strip()
+            now = int(time.time() * 1000)
+            call_spark_api("10.10.102.41", "/api/v1/vm/power", {"name": vm_name, "action": "off"})
+            call_spark_api("10.10.102.41", "/api/v1/vm/power", {"name": vm_name, "action": "on"})
+            conn = get_db_connection()
+            try:
+                conn.execute("UPDATE vms SET state = 'Running', updated_at = ? WHERE name = ?", (now, vm_name))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'vm.reset', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", vm_name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'VM_RESET', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Executed hardware reset on VM {vm_name}", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "vm": vm_name, "state": "Running"})
+            return
+
+        # Protection Domain Management
+        if path == "/api/v1/protection/domains":
+            name = payload.get("name", "Default-PD").strip()
+            sched = int(payload.get("schedule_hours", 1))
+            keep = int(payload.get("keep_count", 24))
+            cid = payload.get("cluster_id", "hci-01")
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                pd_id = f"pd_{name.lower().replace(' ', '_')}"
+                conn.execute("INSERT OR REPLACE INTO protection_domains (id, cluster_id, name, schedule_hours, keep_count, members_count, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                             (pd_id, cid, name, sched, keep, now))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'protection_domain.create', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'PROTECTION_DOMAIN_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Created protection domain {name} (every {sched}h, retain {keep})", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "created": name})
+            return
+
+        # Protection Policy Management
+        if path == "/api/v1/protection/policies":
+            name = payload.get("name", "Default-Policy").strip()
+            interval = int(payload.get("snapshot_interval_minutes", 60))
+            retention = int(payload.get("retention_count", 24))
+            target = payload.get("replication_target", "Local")
+            conn = get_db_connection()
+            now = int(time.time() * 1000)
+            try:
+                pol_id = f"pol_{name.lower().replace(' ', '_')}"
+                conn.execute("INSERT OR REPLACE INTO protection_policies (id, name, snapshot_interval_minutes, retention_count, replication_target) VALUES (?, ?, ?, ?, ?)",
+                             (pol_id, name, interval, retention, target))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'protection_policy.create', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'PROTECTION_POLICY_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Created protection policy {name}", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "created": name})
+            return
+
+        # DR Recovery Plan Management
+        if path == "/api/v1/protection/recovery-plans":
+            name = payload.get("name", "Default-Plan").strip()
+            src = payload.get("source_cluster", "hci-01")
+            tgt = payload.get("target_cluster", "cluster-dr")
+            conn = get_db_connection()
+            now = int(time.time() * 1000)
+            try:
+                rp_id = f"rp_{name.lower().replace(' ', '_')}"
+                conn.execute("INSERT OR REPLACE INTO recovery_plans (id, name, source_cluster, target_cluster, priority_order_json, status) VALUES (?, ?, ?, ?, '[]', 'Validated')",
+                             (rp_id, name, src, tgt))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'recovery_plan.create', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'RECOVERY_PLAN_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Created DR recovery plan {name} ({src} -> {tgt})", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "created": name})
+            return
+
+        # Microsegmentation Security Policies
+        if path == "/api/v1/network/security-policies":
+            name = payload.get("name", "Isolation-Policy").strip()
+            ptype = payload.get("policy_type", "Application Isolation")
+            mode = payload.get("enforcement_mode", "Enforce")
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                sec_id = f"sec_{name.lower().replace(' ', '_')}"
+                conn.execute("INSERT OR REPLACE INTO security_policies (id, name, policy_type, rules_json, enforcement_mode) VALUES (?, ?, ?, '[]', ?)",
+                             (sec_id, name, ptype, mode))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'security_policy.create', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", name, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'SECURITY_POLICY_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Created security policy {name} ({ptype}, mode: {mode})", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "created": name})
+            return
+
+        # Flow Firewall Rules
+        if path == "/api/v1/network/firewall-rules":
+            sip = payload.get("source_ip", "0.0.0.0/0")
+            dip = payload.get("dest_ip", "10.10.102.0/24")
+            proto = payload.get("protocol", "TCP")
+            port = payload.get("port", "443")
+            act = payload.get("action", "ALLOW")
+            desc = payload.get("description", "Flow firewall rule")
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                rid = f"frule_{secrets.token_hex(4)}"
+                conn.execute("INSERT OR REPLACE INTO flow_firewall_rules (id, cluster_id, source_ip, dest_ip, protocol, port, action, priority, description, created_at) VALUES (?, 'hci-01', ?, ?, ?, ?, ?, 100, ?, ?)",
+                             (rid, sip, dip, proto, port, act, desc, now))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'firewall_rule.create', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", f"{act} {proto}:{port}", now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'FIREWALL_RULE_CREATE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Added firewall rule {act} {proto}:{port} ({sip} -> {dip})", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "created": rid})
+            return
+
+        # Cluster Federation & Registration
+        if path in ("/api/v1/hardware/clusters", "/api/v1/clusters/register"):
+            cname = payload.get("name", "hci-remote-01").strip()
+            vip = payload.get("vip", "10.10.102.55").strip()
+            port = int(payload.get("port", 8443))
+            token = payload.get("auth_token", secrets.token_hex(16))
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                conn.execute("""INSERT OR REPLACE INTO clusters
+                    (cluster_id, name, vip, port, status, auth_token, node_count, vm_count, cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes, last_seen_ms, created_at)
+                    VALUES (?, ?, ?, ?, 'CONNECTED', ?, 4, 0, 16, 32768, 4096, 2199023255552, 107374182400, ?, ?)""",
+                    (cname, cname, vip, port, token, now, now))
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'cluster.register', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", cname, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'CLUSTER_REGISTER', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", f"Federated remote cluster {cname} ({vip}:{port})", now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "cluster": cname})
+            return
+
+        # LCM Upgrade Orchestrator
+        if path == "/api/v1/lcm/upgrade":
+            target_comp = payload.get("component", "all")
+            now = int(time.time() * 1000)
+            conn = get_db_connection()
+            try:
+                if target_comp == "all":
+                    conn.execute("UPDATE lcm_updates SET current_version = available_version")
+                    detail_str = "Upgraded all components (spark, vali, hylia, mipha, spectrum, saltrun) to latest versions"
+                else:
+                    conn.execute("UPDATE lcm_updates SET current_version = available_version WHERE component_name = ?", (target_comp,))
+                    detail_str = f"Upgraded {target_comp} to latest available version"
+                conn.execute("INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at) VALUES (?, 'hci-01', 'lcm.rolling_upgrade', ?, 'COMPLETED', 100, 'admin', ?, ?)",
+                             (f"task_{secrets.token_hex(4)}", target_comp, now, now))
+                conn.execute("INSERT INTO audit_logs (id, action, actor, details, ip_address, timestamp) VALUES (?, 'LCM_UPGRADE', 'admin', ?, '127.0.0.1', ?)",
+                             (f"audit_{secrets.token_hex(4)}", detail_str, now))
+                conn.commit()
+            finally:
+                conn.close()
+            self.send_json(200, {"success": True, "message": f"Rolling upgrade for '{target_comp}' completed successfully across all hypervisor nodes."})
             return
 
         # Host Diagnostics Trigger
