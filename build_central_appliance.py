@@ -556,8 +556,8 @@ CREATE TABLE IF NOT EXISTS projects (
 CREATE TABLE IF NOT EXISTS availability_zones (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    region TEXT DEFAULT 'Primary-Datacenter',
-    cluster_ids_json TEXT DEFAULT '["cluster-local"]',
+    region TEXT DEFAULT 'Local',
+    cluster_ids_json TEXT DEFAULT '["hci-01"]',
     status TEXT DEFAULT 'Active'
 );
 
@@ -672,6 +672,11 @@ CREATE TABLE IF NOT EXISTS generated_bundles (
                   (cname, ccur, cavail, csev, cnotes))
 
     c.execute("DELETE FROM vms WHERE vm_id LIKE 'cluster-local_%'")
+    c.execute("DELETE FROM availability_zones WHERE name LIKE 'Primary-Datacenter%' OR cluster_ids_json LIKE '%cluster-local%'")
+    c.execute("UPDATE volume_groups SET cluster_id = 'hci-01' WHERE cluster_id = 'cluster-local'")
+    c.execute("UPDATE networks SET cluster_id = 'hci-01' WHERE cluster_id = 'cluster-local'")
+    c.execute("UPDATE storage_extent_stores SET cluster_id = 'hci-01' WHERE cluster_id = 'cluster-local'")
+    c.execute("UPDATE mimir_results SET cluster_id = 'hci-01' WHERE cluster_id = 'cluster-local'")
     conn.commit()
     conn.close()
 
@@ -907,10 +912,6 @@ class ClusterConnector(threading.Thread):
                 (id, name, replication_factor, compression, dedup, encryption)
                 VALUES ('policy_default', 'Sidon Standard (FTT=1, CoW LZ4)', 2, 'lz4', 'Inline', 'Disabled')""")
 
-            # Seed Availability Zone
-            c.execute("""INSERT OR REPLACE INTO availability_zones
-                (id, name, region, cluster_ids_json, status)
-                VALUES ('az_primary', 'Primary-Datacenter-AZ1', 'Default Region', '["cluster-local"]', 'Active')""")
 
             # Update cluster stats
             c.execute("""UPDATE clusters SET 
