@@ -5677,13 +5677,21 @@ def cmd_central_deploy(argv):
 
     metrics = collect_cluster_fleet_metrics()
     local_vip = LOCAL_IP if LOCAL_IP != "127.0.0.1" else "10.10.102.45"
+    cluster_name = "hci-01"
+    if os.path.exists("/etc/hci/cluster.json"):
+        try:
+            with open("/etc/hci/cluster.json", "r") as f:
+                c_data = json.load(f)
+                cluster_name = c_data.get("cluster_name", "hci-01")
+        except Exception:
+            pass
     local_cql = (
         f"INSERT INTO hydra.central_clusters ("
         f"cluster_id, name, vip, port, status, node_count, vm_count, "
         f"cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes, "
         f"auth_token, last_seen_ms, enrolled_at_ms, metadata"
         f") VALUES ("
-        f"'cluster-local', 'Alpha-01 (Local)', '{cql_escape(local_vip)}', 8443, 'CONNECTED', "
+        f"'{cluster_name}', '{cql_escape(cluster_name)}', '{cql_escape(local_vip)}', 8443, 'CONNECTED', "
         f"{metrics['node_count']}, {metrics['vm_count']}, {metrics['cpu_cores']}, {metrics['memory_total_mb']}, {metrics['memory_used_mb']}, "
         f"{metrics['storage_total_bytes']}, {metrics['storage_used_bytes']}, "
         f"'local-mtls-token', {now}, {now}, '{{\"role\": \"primary\"}}'"

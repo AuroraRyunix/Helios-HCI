@@ -591,12 +591,12 @@ CREATE TABLE IF NOT EXISTS system_settings (
             c.execute("INSERT INTO roles (id, name, description, permissions_json, is_builtin) VALUES (?, ?, ?, ?, 1)",
                       (rname.lower().replace(" ", "-"), rname, rdesc, rperms))
 
-    # Pre-seed local cluster Alpha-01
-    c.execute("SELECT cluster_id FROM clusters WHERE cluster_id = 'cluster-local'")
+    # Pre-seed local cluster hci-01
+    c.execute("SELECT cluster_id FROM clusters WHERE cluster_id = 'hci-01'")
     if not c.fetchone():
         c.execute("""INSERT INTO clusters 
             (cluster_id, name, vip, port, status, auth_token, node_count, vm_count, cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes, last_seen_ms, created_at)
-            VALUES ('cluster-local', 'Alpha-01 (Local)', '10.10.102.45', 8443, 'CONNECTED', 'local-token', 4, 3, 16, 30720, 4096, 1931876289740, 191340793036, ?, ?)""",
+            VALUES ('hci-01', 'hci-01', '10.10.102.45', 8443, 'CONNECTED', 'local-token', 4, 3, 16, 30720, 4096, 1931876289740, 191340793036, ?, ?)""",
             (now, now))
 
     conn.commit()
@@ -696,7 +696,7 @@ class ClusterConnector(threading.Thread):
                         hid = f"host_{r.get('hostname')}"
                         c.execute("""INSERT OR REPLACE INTO hardware_hosts 
                             (id, cluster_id, hostname, ip, cpu_model, sockets, cores_total, memory_total_mb, status)
-                            VALUES (?, 'cluster-local', ?, ?, 'Intel Xeon / AMD EPYC', 1, 4, 8192, ?)""",
+                            VALUES (?, 'hci-01', ?, ?, 'Intel Xeon / AMD EPYC', 1, 4, 8192, ?)""",
                             (hid, r.get("hostname"), r.get("ip"), r.get("status", "NORMAL")))
             except Exception:
                 live_nodes = [
@@ -708,7 +708,7 @@ class ClusterConnector(threading.Thread):
                 for hname, hip, hstat in live_nodes:
                     c.execute("""INSERT OR REPLACE INTO hardware_hosts 
                         (id, cluster_id, hostname, ip, cpu_model, sockets, cores_total, memory_total_mb, status)
-                        VALUES (?, 'cluster-local', ?, ?, 'Intel Xeon / AMD EPYC', 1, 4, 8192, ?)""",
+                        VALUES (?, 'hci-01', ?, ?, 'Intel Xeon / AMD EPYC', 1, 4, 8192, ?)""",
                         (f"host_{hname}", hname, hip, hstat))
 
             # Query VMs
@@ -723,7 +723,7 @@ class ClusterConnector(threading.Thread):
                         vid = f"vm_{r.get('name')}"
                         c.execute("""INSERT OR REPLACE INTO vms 
                             (vm_id, cluster_id, name, state, vcpus, memory_mb, disk_gb, ip, host, updated_at)
-                            VALUES (?, 'cluster-local', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            VALUES (?, 'hci-01', ?, ?, ?, ?, ?, ?, ?, ?)""",
                             (vid, r.get("name"), r.get("state", "Stopped"), r.get("vcpus", 2),
                              r.get("memory_mb", 4096), r.get("disk_gb", 32), r.get("ip", "DHCP"),
                              r.get("host", "N/A"), now))
@@ -736,25 +736,25 @@ class ClusterConnector(threading.Thread):
                 for vname, vstate, vcpu, vmem, vdisk, vip, vhost in live_vms:
                     c.execute("""INSERT OR REPLACE INTO vms 
                         (vm_id, cluster_id, name, state, vcpus, memory_mb, disk_gb, ip, host, updated_at)
-                        VALUES (?, 'cluster-local', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        VALUES (?, 'hci-01', ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (f"vm_{vname}", vname, vstate, vcpu, vmem, vdisk, vip, vhost, now))
 
             # Seed Storage Containers
             try:
                 c.execute("""INSERT OR REPLACE INTO storage_containers
                     (id, cluster_id, name, quota_gb, compression, ftt, tier, updated_at)
-                    VALUES ('cont_default-pool', 'cluster-local', 'default-pool', 'Unlimited', 'lz4', 1, 'SSD', ?)""",
+                    VALUES ('cont_default-pool', 'hci-01', 'default-pool', 'Unlimited', 'lz4', 1, 'SSD', ?)""",
                     (now,))
             except Exception:
                 c.execute("""INSERT OR REPLACE INTO storage_containers
                     (container_id, cluster_id, name, quota_bytes, compression, ftt, tier)
-                    VALUES ('cont_default-pool', 'cluster-local', 'default-pool', 0, 'lz4', 1, 'SSD')""")
+                    VALUES ('cont_default-pool', 'hci-01', 'default-pool', 0, 'lz4', 1, 'SSD')""")
 
             # Seed Images
             try:
                 c.execute("""INSERT OR REPLACE INTO images
                     (id, cluster_id, name, type, size_bytes, container, status, updated_at)
-                    VALUES ('img_win2022', 'cluster-local', 'en-us_windows_server_2022_updated_sep_2026_x64_dvd.iso', 'iso', 6613043200, 'default-pool', 'Active', ?)""",
+                    VALUES ('img_win2022', 'hci-01', 'en-us_windows_server_2022_updated_sep_2026_x64_dvd.iso', 'iso', 6613043200, 'default-pool', 'Active', ?)""",
                     (now,))
             except Exception:
                 pass
@@ -770,7 +770,7 @@ class ClusterConnector(threading.Thread):
             for dh, dd, dt, ds, dm, dg in sample_disks:
                 c.execute("""INSERT OR REPLACE INTO hardware_disks
                     (id, cluster_id, host, device, model, serial, disk_type, size_gb, health)
-                    VALUES (?, 'cluster-local', ?, ?, ?, 'N/A', ?, ?, ?)""",
+                    VALUES (?, 'hci-01', ?, ?, ?, 'N/A', ?, ?, ?)""",
                     (f"disk_{dh}_{dd}", dh, dd, dm, dt, ds, dg))
 
             # Seed NICs
@@ -783,13 +783,13 @@ class ClusterConnector(threading.Thread):
             for nh, ni, ns, nm, nst in sample_nics:
                 c.execute("""INSERT OR REPLACE INTO hardware_nics
                     (id, cluster_id, host, interface_name, speed_mbps, mac_address, status)
-                    VALUES (?, 'cluster-local', ?, ?, ?, ?, ?)""",
+                    VALUES (?, 'hci-01', ?, ?, ?, ?, ?)""",
                     (f"nic_{nh}_{ni}", nh, ni, ns, nm, nst))
 
             # Seed Subnet
             c.execute("""INSERT OR REPLACE INTO subnets
                 (id, cluster_id, name, vlan_id, cidr, gateway, dhcp_enabled, ip_pool)
-                VALUES ('subnet_mgmt', 'cluster-local', 'Management-Network', 102, '10.10.102.0/24', '10.10.102.1', 1, '10.10.102.50-10.10.102.99')""")
+                VALUES ('subnet_mgmt', 'hci-01', 'Management-Network', 102, '10.10.102.0/24', '10.10.102.1', 1, '10.10.102.50-10.10.102.99')""")
 
             # Seed Storage Policies
             c.execute("""INSERT OR REPLACE INTO storage_policies
@@ -805,7 +805,7 @@ class ClusterConnector(threading.Thread):
             c.execute("""UPDATE clusters SET 
                 node_count = 4, vm_count = 3, cpu_cores = 16, memory_total_mb = 30720, memory_used_mb = 4096,
                 storage_total_bytes = 1931876289740, storage_used_bytes = 191340793036, last_seen_ms = ?
-                WHERE cluster_id = 'cluster-local'""", (now,))
+                WHERE cluster_id = 'hci-01'""", (now,))
 
             conn.commit()
         except Exception as err:
@@ -1519,7 +1519,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- Right Header Actions -->
       <div class="flex items-center gap-3">
-        <span class="badge badge-sm badge-success font-mono hidden sm:inline-flex">Alpha-01 Online</span>
+        <span class="badge badge-sm badge-success font-mono hidden sm:inline-flex">hci-01 Online</span>
         <button onclick="showView('alerts', 'Monitoring', 'Alerts')" class="btn btn-ghost btn-xs btn-square relative" title="Alerts">
           <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
           <span id="topAlertBadge" class="hidden badge badge-error badge-xs absolute -top-1 -right-1 font-mono">0</span>
@@ -4573,7 +4573,7 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             "audits": "SELECT actor, action, cluster_id, details, created_at FROM audit_logs",
             "operations": "SELECT 'Cluster CPU Headroom' as metric, '74% Free' as val, '> 365 Days' as runway, 'NORMAL' as status",
             "categories": "SELECT category_key, category_value, entity_count, created_at FROM categories",
-            "users": "SELECT username, role, 'cluster-local' as cluster, 'Active' as status FROM users",
+            "users": "SELECT username, role, 'hci-01' as cluster, 'Active' as status FROM users",
             "roles": "SELECT name, description, permissions_json, CASE WHEN is_builtin=1 THEN 'Built-in' ELSE 'Custom' END as role_type FROM roles",
             "projects": "SELECT name, vcpu_quota, memory_quota_gb, storage_quota_gb, users_json FROM projects",
             "azs": "SELECT name, region, cluster_ids_json, status FROM availability_zones",
@@ -4674,19 +4674,19 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
 
             # Insert into relevant table
             if eid == "vms":
-                c.execute("INSERT OR REPLACE INTO vms (vm_id, cluster_id, name, state, vcpus, memory_mb, disk_gb, updated_at) VALUES (?, 'cluster-local', ?, 'Stopped', 2, 4096, 32, ?)",
+                c.execute("INSERT OR REPLACE INTO vms (vm_id, cluster_id, name, state, vcpus, memory_mb, disk_gb, updated_at) VALUES (?, 'hci-01', ?, 'Stopped', 2, 4096, 32, ?)",
                           (f"vm_{name.lower().replace(' ', '_')}", name, now))
             elif eid == "templates":
-                c.execute("INSERT OR REPLACE INTO templates (id, cluster_id, name, os_type, created_at) VALUES (?, 'cluster-local', ?, 'Linux', ?)",
+                c.execute("INSERT OR REPLACE INTO templates (id, cluster_id, name, os_type, created_at) VALUES (?, 'hci-01', ?, 'Linux', ?)",
                           (f"tpl_{name.lower().replace(' ', '_')}", name, now))
             elif eid == "k8s":
-                c.execute("INSERT OR REPLACE INTO k8s_clusters (id, name, version, cluster_id, created_at) VALUES (?, ?, 'v1.30.2', 'cluster-local', ?)",
+                c.execute("INSERT OR REPLACE INTO k8s_clusters (id, name, version, cluster_id, created_at) VALUES (?, ?, 'v1.30.2', 'hci-01', ?)",
                           (f"k8s_{name.lower().replace(' ', '_')}", name, now))
             elif eid == "volume_groups":
-                c.execute("INSERT OR REPLACE INTO volume_groups (id, name, cluster_id, size_gb, created_at) VALUES (?, ?, 'cluster-local', 100, ?)",
+                c.execute("INSERT OR REPLACE INTO volume_groups (id, name, cluster_id, size_gb, created_at) VALUES (?, ?, 'hci-01', 100, ?)",
                           (f"vg_{name.lower().replace(' ', '_')}", name, now))
             elif eid == "subnets":
-                c.execute("INSERT OR REPLACE INTO subnets (id, cluster_id, name, vlan_id, cidr, gateway) VALUES (?, 'cluster-local', ?, 100, '192.168.100.0/24', '192.168.100.1')",
+                c.execute("INSERT OR REPLACE INTO subnets (id, cluster_id, name, vlan_id, cidr, gateway) VALUES (?, 'hci-01', ?, 100, '192.168.100.0/24', '192.168.100.1')",
                           (f"subnet_{name.lower().replace(' ', '_')}", name))
             elif eid == "categories":
                 c.execute("INSERT OR REPLACE INTO categories (id, category_key, category_value, created_at) VALUES (?, ?, 'Default', ?)",
@@ -4707,7 +4707,7 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
                 c.execute("INSERT OR REPLACE INTO protection_policies (id, name, snapshot_interval_minutes, retention_count) VALUES (?, ?, 60, 24)",
                           (f"prot_{name.lower().replace(' ', '_')}", name))
             elif eid == "recovery_plans":
-                c.execute("INSERT OR REPLACE INTO recovery_plans (id, name, source_cluster, target_cluster) VALUES (?, ?, 'cluster-local', 'cluster-dr')",
+                c.execute("INSERT OR REPLACE INTO recovery_plans (id, name, source_cluster, target_cluster) VALUES (?, ?, 'hci-01', 'cluster-dr')",
                           (f"rp_{name.lower().replace(' ', '_')}", name))
             elif eid == "consistency_groups":
                 c.execute("INSERT OR REPLACE INTO consistency_groups (id, name, vm_ids_json) VALUES (?, ?, '[]')",
@@ -4722,7 +4722,7 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
             # Record in tasks and audits
             try:
                 c.execute("""INSERT INTO tasks (id, cluster_id, operation, target, status, progress, actor, started_at, completed_at)
-                    VALUES (?, 'cluster-local', ?, ?, 'COMPLETED', 100, 'admin', ?, ?)""",
+                    VALUES (?, 'hci-01', ?, ?, 'COMPLETED', 100, 'admin', ?, ?)""",
                     (f"task_{secrets.token_hex(4)}", f"Create {eid}", name, now, now))
             except Exception:
                 pass

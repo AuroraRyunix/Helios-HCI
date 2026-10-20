@@ -117,8 +117,8 @@ defmodule SpectrumPhx.Central do
       end
 
     %{
-      cluster_id: "cluster-local",
-      name: Map.get(config, :cluster_name, "Alpha-01 (Local)"),
+      cluster_id: Map.get(config, :cluster_name, "hci-01"),
+      name: Map.get(config, :cluster_name, "hci-01"),
       vip: Config.vip() || "10.10.102.45",
       port: 8443,
       status: "CONNECTED",

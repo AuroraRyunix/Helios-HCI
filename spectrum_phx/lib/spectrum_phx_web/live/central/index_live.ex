@@ -169,7 +169,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           Enum.map(list, fn v ->
             %{
               name: v["name"],
-              cluster_name: "Alpha-01 (Local)",
+              cluster_name: Config.all()[:cluster_name] || "hci-01",
               cluster_vip: Config.vip() || "10.10.102.45",
               state: v["state"] || "stopped",
               vcpu: v["vcpu"] || 2,
