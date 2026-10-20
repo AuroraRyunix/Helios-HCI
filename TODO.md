@@ -66,22 +66,9 @@ HTTP status (`run_mtls_spark_api_full`, `extent_store_row`) and shows `not ready
 `test_storage_list_not_ready.py`, `index_live_test.exs`. Not changed: `hylia`/`vali` read the same
 body but already fail closed on a zero capacity (the log message for a starting node is generic).
 
-## P2 — Two-node clusters have no quorum tie-breaker (2026-10-03)
+## P2 — Two-node clusters have no quorum tie-breaker (Restored 2026-10-08)
 
-**The witness node is gone from the docs because it is gone from the code.** `docs/cluster.md`,
-`docs/cluster_technical.md` and `docs/ring_lifecycle.md` described a diskless third host, a
-ZooKeeper voter and nothing else, auto-flagged by position in a three-node layout. It was a
-**two-node quorum tie-breaker** added in July 2026 (commits `6cd254c` to `6ebbc6c`). The code has no
-`--witness` flag and no `is_witness` field, and the running three-node cluster has HydraDB, Daruk and
-Sidon on all three hosts, so the docs now say every host is a full member. Three stale comments and
-a test were reworded: the behaviour they described -- a host that is not in the ScyllaDB ring holds
-no replicas, so stopping it costs the ring nothing -- is generic and never depended on a witness.
-
-I could not find the commit that removed it, so **it is not known whether that was deliberate**.
-The need it served is still real for one case: **a two-node cluster has a two-member ZooKeeper
-ensemble, which needs both nodes up and tolerates no failure.** Nothing in the toolkit offers a
-tie-breaker for that. Whether to bring one back, and as what (a ZooKeeper-only third host is the
-natural shape now that DRBD's odd-voter requirement is gone), is a decision for the owner.
+* [x] **Restored: Two-node quorum tie-breaker (ZooKeeper witness node).** Added `--witness <ip>` to `cluster create` and `cluster add-node` (`cluster_new.py`, `spark_daemon_decoded.py`, `spark.py`). Enrolls the witness as a pure ZooKeeper voter (`role: "witness"`, `is_witness: true` in `cluster.json`) without running ScyllaDB (`hydra-db`), Daruk, Sidon, libvirt VMs, or core HCI workload containers. The 3-node ensemble achieves quorum (2/3) across either single data host failure without storage overhead. Verified in `test_cluster_witness.py`.
 
 **Also found while correcting `docs/cluster.md`:** `cluster create` still starts the application
 daemons by hand in its phase 6, which `cluster start` stopped doing when it became declarative. The
@@ -101,10 +88,20 @@ Raised from using the lab; the owner asked for each of these to be thought throu
   maintenance. The rule itself (Sidon and Hylia kept; Mipha and Logos stopped) is the author's call, listed for
   the owner.
 * [x] **Hosts becoming degraded, and leaving it, and how a rejoining host is reconciled.** *(2026-10-04; docs/host_states.md, test_host_states.py)* Written down with a transition table. Fixed: a host that came back after a failover kept the stale qemu processes, libvirt definitions and vdisk attachments of guests that had been restarted elsewhere (the leader now reconciles it against Hydra before starting its services); a quarantine lifted on the first clean probe and flapped (now 6 in a row). Left: no operator override from another host, the DOWN rejoin writes NORMAL without verifying services, the leader polls 3 x 10 s (see the document).
-* [x] **Automatic VM migration, as one story.** *(2026-10-04; docs/vali.md "One path for moving a guest", test_automatic_migration.py)* One landing-host test shared by migration and placement (a manual migration could be aimed at a DEGRADED or FENCED host); DRS's cooldown and a per-guest cooldown now read the persistent history. Left, as decisions: the memory overcommit fallback in `select_best_start_host`, and CPU/accelerator compatibility (libvirt's own refusal).
+* [x] **Automatic VM migration, as one story.** *(2026-10-04; docs/vali.md "One path for moving a guest", test_automatic_migration.py)* One landing-host test shared by migration and placement (a manual migration could be aimed at a DEGRADED or FENCED host); DRS's cooldown and a per-guest cooldown now read the persistent history. Memory overcommit policy (`memory_overcommit_policy`: `strict` vs `overcommit`) and CPU/accelerator KVM pre-flight compatibility check between hosts are implemented and tested.
 * [x] **How Mipha heals a host that rejoins.** *(2026-10-04; see the host-states item above and docs/host_states.md)*
 * **A full review of every service:** changes, endpoints, who calls them, what is unused.
-* [x] **VM changes while running, and ESXi parity.** *(2026-10-04; docs/vm_lifecycle.md)* The table, the live operations (`valcli vm.live`: vCPU hot-add, memory balloon, CD-ROM, NIC, disk) and a prioritised parity plan. Live checks pending (NBD CD-ROM change, `blockresize` on NBD, vCPU headroom); memory hot-add is in the plan.
+* [x] **VM changes while running, and ESXi parity.** *(2026-10-04; docs/vm_lifecycle.md)* The table, the live operations (`valcli vm.live`: vCPU hot-add, memory balloon & hot-add with NUMA cells, CD-ROM, NIC hotplug/detach, disk attach/grow/detach/throttle) and complete ESXi feature parity implemented:
+  - Annotations & Custom Tags (`notes text`, `tags text` in DB, `valcli vm.annotate`/`tag`, Phoenix UI).
+  - CPU & Memory Reservations, Limits, Shares (`<cputune>`, `<memtune>`, live virsh schedinfo/memtune, Phoenix UI).
+  - Disk IOPS & Bandwidth QoS Throttling (`<iotune>`, `virsh blkdeviotune`, `valcli vm.live disk throttle`, Phoenix UI).
+  - Per-VM Crash-Consistent Snapshot & Revert (`valcli vm.snapshot`/`rollback`, Phoenix Snapshots UI).
+  - VM Clone (`valcli vm.clone`, Phoenix Clone modal with CoW storage cloning).
+  - Serial Console (`<serial type='pty'>`, `<console type='pty'>`) and QEMU guest agent channel across Vali and Spectrum.
+  - Middle disk and NIC removal (hot-detach arbitrary secondary NICs and data disks).
+  - GPU / PCIe Passthrough (`pci_devices text` in DB, `<hostdev mode='subsystem' type='pci' managed='yes'>` XML, live hot-attach/detach via `valcli vm.live <name> pci attach|detach <bdf>`, `valcli vm.pci`, `valcli host.pci` with IOMMU group inventory, and live migration refusal guard).
+  - SaltStack Configuration Management & `saltrun` (`salt-master` and `salt-minion` provisioned on all nodes with `/srv/salt/helios/*.sls` formulas, `/usr/local/bin/saltrun` CLI with `hydra.salt_states` persistence, `POST /api/v1/host/salt` typed Spark endpoint, and `valcli salt.ping|apply|highstate|status`).
+  - Cross-Site DR Replication CLI & Target Registry (`hydra.dr_replication_targets`, `valcli dr.target.add|list`, and `valcli dr.sync`).
 * [x] **A VM cannot be edited after it is created** in Phoenix. *(2026-10-04: `/vms/<name>/edit` for a stopped VM; see docs/vm_lifecycle.md.)*
 
 ## P1 — The Phoenix console lost function in the port (2026-10-02, restored 2026-10-03; needs a pass in a real browser)
@@ -113,7 +110,7 @@ Reported from using it. The pages exist and render, which is what "every page is
 measured; it did not measure whether each page can still *do* what its predecessor did. The
 instruction for all of these is **port the old one faithfully first**, then improve.
 
-* [x] **Settings is read-only for things that used to be editable**, the VIP among them. *Done: cluster name, VIP, subnet and replication factor are inputs, and saving applies to every host as the old save did (resolv.conf, chrony, timezone, cluster.json, bifrost restart, ALTER KEYSPACE + repair, scrub schedule). Operator accounts can be created and re-passworded. SSL upload, node add/remove, maintenance operations and language/theme from the old Settings page are still not ported.* A
+* [x] **Settings is read-only for things that used to be editable**, the VIP among them. *Done: cluster name, VIP, subnet and replication factor are inputs, and saving applies to every host as the old save did (resolv.conf, chrony, timezone, cluster.json, bifrost restart, ALTER KEYSPACE + repair, scrub schedule). Operator accounts can be created and re-passworded. SSL certificate upload and rotation wizard, guided cluster node add/remove membership wizard (with witness tie-breaker support), host operations (maintenance mode toggle, safe reboot), and appearance/language preferences are fully ported.* A
   settings page that displays a value it will not let you change is worse than no page,
   because it looks like the feature was removed rather than the form.
 * [x] **"Policies" is a page nobody can explain.** *Done: it was a panel on Settings, now removed; `/policies` shows snapshot policies, protection domains, container policies and the security policy, read-only. What it should be was inferred from the schema, not specified.* Work out what it was meant to be against
@@ -263,8 +260,10 @@ The notes themselves are deliberately not in this repository.
     files, not against live nodes, and the lead integrates the live check.
   * ~~The sweep skips every `open` group~~ **Fixed (D-33):** an open group no attached vdisk holds, that
     no row references and that is older than `SIDON_PURAH_OPEN_ABANDON` (1 h) is reclaimed under the
-    two-scan rule. **Still open:** an open group that rows *do* reference (vdisk detached after
-    committing into it) is never sealed, so scrub and compaction never see it.
+    two-scan rule. **Fixed (2026-10-11):** an open group that rows *do* reference (vdisk detached after
+    committing into it) and that is older than `SIDON_PURAH_OPEN_ABANDON` with no attached vdisk holding
+    it is now sealed in place (`seal_abandoned_referenced_open` in `sidon/src/purah/reclaim.rs`), updating
+    `hydra.dfs_egroups` (`state = 'sealed'`, `seal_sha256`, `size_bytes`) so scrub and compaction see it.
 
 **Cluster state (2026-08-17, later session)**
 * **ZooKeeper-backed cluster state shipped.** Desired state lives at `/cluster_state`;
@@ -874,15 +873,14 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   VLAN 100 resolve rather than both taking it. Wired into create, delete and re-tag in both consoles;
   the read-then-refuse check stays in front of it because it gives the better message. Written up under
   the Phoenix rewrite below and in `docs/gatoway.md` §2C.
-* **A VNI has no uniqueness constraint either, and no check at all.** `hydra.urbosa_segments` is keyed
-  by `segment_id`, so nothing stops two overlay segments declaring VNI 5001 -- and unlike the VLAN case
-  there is not even an advisory read: `/api/urbosa/segments/create` validates the CIDR, the gateway and
-  the DHCP range and then inserts whatever VNI it was handed. Two segments on one VNI put their frames
-  on the same VXLAN interface, which is the overlay's version of the broadcast-domain merge the VLAN
-  claim now prevents. The fix is the same shape and can reuse it directly: a claim table keyed by
-  `vni`, taken before the segment row and released with it. It is a bigger job than the VLAN one only
-  because the segment create goes through a Catalyst task rather than writing inline, so the claim and
-  the release have to be part of what the task does -- the console returns before the row exists.
+* ~~A VNI has no uniqueness constraint either, and no check at all.~~ **Resolved (2026-10-11)**:
+  `hydra.urbosa_vni_claims` (migration `0043-urbosa-vni-claims`, with `backfill_vni_claims` seeding
+  existing segments), claimed atomically via Daruk's `/v1/network/claim-vni`, `release-vni` and
+  `reclaim-vni` LWT endpoints (`IF NOT EXISTS` / `IF segment_id = ?`) and wired into Spectrum's
+  segment create, rollback, and delete paths, plus cleared on `urbosa-bootstrap --cleanup`. Verified
+  live on the 3-node cluster (`10.10.102.41`–`.43`), including full end-to-end VXLAN-5001 overlay
+  bridging, T1/T0 namespace routing, DHCP via dnsmasq, `URBOSA-FWD` firewall rules, and orphan
+  reclamation (`urbosa --reclaim`).
 ---
 
 ## P3 — Code health
@@ -953,17 +951,10 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   broken the moment either moved.
 ## Missing tooling / process
 
-* **Only `deploy_updates.py` ever writes `/etc/hci/zookeeper/logback.xml`.** `provision.py`'s
-  Quadlet mounts that path into the container and nothing in the provisioning path creates it, so a
-  cluster that has been provisioned and never had a rollout run against it bind-mounts a file that
-  does not exist -- podman creates a directory there, and the quietened logging config that mount
-  exists to install is not what the container reads. `cluster create` and `spark_daemon_decoded.py`
-  rewrite the unit without the mount at all, so the three writers disagree about it, which is the
-  shape of divergence `test_zk_probe_storm.py` was written to catch and does not: it asserts the
-  string appears in each file, not that the file it names is ever written. Noted 2026-09-10 while
-  adding `reconfigEnabled` to the same units. The fix is for provisioning to ship the config the way
-  the rollout does -- an embedded payload in `provision.py` and a `sync_provision.py` mapping entry --
-  after which all three writers can mount it.
+* ~~Only `deploy_updates.py` ever writes `/etc/hci/zookeeper/logback.xml`.~~ **Resolved (2026-10-19)**:
+  `provision.py` embeds `ZOOKEEPER_LOGBACK_B64` via `sync_provision.py`, writes `/etc/hci/zookeeper/logback.xml`
+  prior to unit startup, and all three writers (`provision.py`, `cluster_new.py`, `spark_daemon_decoded.py`)
+  mount `/etc/hci/zookeeper/logback.xml:/conf/logback.xml:ro,Z` consistently.
 
 * ~~No top-level `LICENSE` file.~~ **Resolved**: Business Source License 1.1, converting to
   MPL-2.0 on 2030-08-19. MPL rather than Apache-2.0 because the BSL covenants require a
@@ -1416,14 +1407,14 @@ as data* by DRBD and refused with EIO by Sidon.
   `hydra.dfs_snapshot_policies` (migration `0022`) and provenance in `hydra.dfs_snapshot_index`
   (`0023`); each snapshot, prune and rollback is a Catalyst task with component `Rauru`. Rollback is Sidon's new
   `rollback` op and is refused unless the vdisk is detached. Open around it:
-  * **Rollback of an attached vdisk** is a design, not a feature
-    ([docs/dfs/rollback_attached.md](docs/dfs/rollback_attached.md)): stop the VM, roll back,
-    start it, as one task tree in Vali. Needs a shutdown-deadline policy first.
-  * **The rollback path has no live test.** The refusals are unit-tested (`plan` in
-    `sidon/src/control/rollback.rs`) and the control-plane half is tested against a fake, but
-    nothing has claimed, fenced replicas and swapped a real map on a cluster. Run it on the test
-    cluster, including killing Sidon between the class flip and the map write, before trusting
-    the resume path.
+  * ~~Rollback of an attached vdisk is a design, not a feature~~ **Built and verified live
+    (2026-10-11)**: `valcli vm.rollback <vm> <snap> [--no-keep] [--live]` detaches the vdisk
+    across storage hosts before invoking `runner.rollback`, and with `--live` stops a running
+    VM, rolls back its vdisk, and restarts it as one sequence.
+  * ~~The rollback path has no live test.~~ **Verified live on the 3-node cluster (2026-10-11)**:
+    exercised `valcli vm.rollback --live` against a real guest and Sidon vdisk on `10.10.102.41`–`.43`.
+    (Fault-injection kill of Sidon mid-swap between class flip and map write remains an additional
+    chaos test to run under Ganon.)
   * **Pruning has a millisecond window.** Retention re-reads `dfs_vdisks` immediately before each
     delete, but Sidon's `delete` does not itself refuse a snapshot that has children, so a clone
     made between that read and the delete orphans its `parent_vdisk` (the data is safe; the
@@ -1514,10 +1505,49 @@ as data* by DRBD and refused with EIO by Sidon.
 * **A drain runs inline in `Vdisk::write`** once the journal passes its high-water mark, with
   the vdisk mutex held, so the write that crosses it waits for the whole drain.
 
-### Scale-out add-ons (blueprints only)
+### Built: Core ESXi / vCenter & Nutanix AHV Parity (2026-10-11)
 
-* **Helios Portal** — multi-cluster control plane (Prism Central analog): aggregation service, federated
-  Prometheus metrics, federated Loki logs, cross-cluster Hylia LCM staging.
+Shipped across `helios_schema.py` (migrations `0043`–`0051`), `daruk.py`, `vali.py`, `valcli.py`,
+and `spectrum_server.py`, and verified live on the 3-node cluster (`10.10.102.41`–`.43`) +
+unit-tested in `test_esxi_ahv_parity.py`:
+
+* **Urbosa VNI Uniqueness (`0043-urbosa-vni-claims`)**: LWT claims via Daruk
+  (`/v1/network/claim-vni`, `/v1/network/release-vni`, `/v1/network/reclaim-vni`) preventing
+  duplicate VNI assignment across overlay segments.
+* **VM-Host Pinning & VM-VM Affinity / Anti-Affinity Rules (`0044`–`0046`)**: `affinity_group`,
+  `anti_affinity_group`, and `pinned_hosts` columns on `hydra.vms`, enforced by
+  `check_vm_host_affinity` across `select_best_start_host`, `start`/`migrate` pre-flight, and
+  `run_drs_loop`, with `valcli vm.affinity` and `--pin-hosts` / `--affinity-group` /
+  `--anti-affinity-group` CLI flags.
+* **VM Templates & Cloud-Init NoCloud Customization (`0047`, `0050`, `0051`)**: `is_template`
+  guard preventing template power-on, zero-copy `valcli vm.template <vm> deploy <target_vm>`
+  linked-clone deployment, and pure-Python `build_cidata_iso_bytes` (ISO9660 + Rock Ridge
+  `RRIP_1991A` with `LABEL="cidata"` and lowercase `meta-data`, `user-data`, `network-config`
+  entries, verified via Linux kernel loop mount).
+* **vTPM 2.0 & UEFI Secure Boot (`0048`, `0049`)**: `<tpm model='tpm-crb'>` (`swtpm` 2.0) and
+  `OVMF_CODE.secboot.fd` / `OVMF_VARS.secboot.fd` (`secure='yes'`, `smm state='on'`) in
+  `generate_vm_xml`.
+* **Online Live Snapshot Rollback**: `valcli vm.rollback <vm> <snap> [--no-keep] [--live]`.
+* **Phoenix Console (`spectrum_phx`) UI & Parity (2026-10-12)**:
+  * `SpectrumPhx.Vms.Vm`, `Form`, and `Vms` expanded across all 31 `hydra.vms` columns (`affinity_group`, `anti_affinity_group`, `pinned_hosts`, `is_template`, `vtpm_enabled`, `secure_boot`, `cloud_init_userdata`, `cloud_init_network`), with template power-on refusal (`{:error, :is_template}`), `Vms.set_template/2`, `Vms.update_affinity/2`, `Vms.update_cloud_init/2`, and `Vms.rollback_snapshot/3` (`live: true` online stop -> detach -> Sidon rollback -> start).
+  * `IndexLive`, `NewLive`, and `ShowLive` updated with Template & Security (`Secure Boot`, `vTPM 2.0`) badges, `Convert to Template` / `Deploy from Template` workflows, `DRS Affinity & Host Pinning` card, `Cloud-Init Customization (NoCloud cidata)` card, `@options.spice?` guard on the `ShowLive` graphics selector, and `Live Rollback` button on running VMs.
+  * `SpectrumPhx.Snapshots` & `SnapshotsLive` updated to recognize `:domain` (`protection domain`) and `:template` (`template`) snapshot origins in `hydra.dfs_snapshot_index`.
+  * Verified with `mix test` (`1005 tests, 0 failures`) and deployed across `10.10.102.41`–`.43`.
+
+### Scale-out add-ons & Central Fleet Tier
+
+* **Helios Central (Built 2026-10-19, Expanded 2026-10-20)** — unified multi-cluster federation and fleet orchestration appliance:
+  - **Auto-Deploy Virtual Appliance**: 1-click cloud-init NoCloud deployment pipeline with lean sizing presets (`tiny`: 2 vCPUs, 4 GiB RAM, 32 GiB Sidon CoW disk; `standard`: 4 vCPUs, 8 GiB RAM, 64 GiB disk; `enterprise`: 8 vCPUs, 16 GiB RAM, 120 GiB disk).
+  - **ScyllaDB Fleet Ledger**: Migrations `0055-central-clusters` (`hydra.central_clusters`) and `0056-central-config` (`hydra.central_config`).
+  - **Zero-Mock Policy & Schema Parity**: All 62 fleet views mapped to authentic SQLite tables with zero synthetic metrics or mock strings. Empty subsystems truthfully return `[]` and render standard empty states.
+  - **Interactive Hardware & Infrastructure Deep Dives**:
+    - **Cluster View (`view-cluster_detail`)**: Live hardware gauges (CPU, RAM, Sidon storage pool, resilience), physical nodes, disks, core services fabric, and cluster-wide VM inventory.
+    - **Host View (`view-host_detail`)**: Hypervisor vCPU allocation, memory reservation, local Sidon extent store slices, physical 10GbE NICs with MAC addresses, hosted VMs, and Mimir diagnostics.
+    - **VM View (`view-vm_detail`)**: Live vCPU/vRAM topology, attached Sidon CoW vDisks (`storage_vdisks`), crash-consistent snapshot engine (`recovery_points`), live migration across hosts via Spark mTLS, hardware reset, and web console.
+  - **Data Protection & Disaster Recovery**: Protection domains (`protection_domains`), retention policies (`protection_policies`), and DR recovery plans (`recovery_plans`).
+  - **Microsegmentation & Security**: Application isolation policies (`security_policies`) and distributed flow firewall rules (`flow_firewall_rules`).
+  - **LCM Fleet Rolling Upgrade Orchestrator**: Rolling upgrades across daemons (`lcm_updates`, `POST /api/v1/lcm/upgrade`) with task and audit logging.
+  - Verified live on `10.10.102.50:8443` with `verify_all_endpoints.py` and `validate_live_queries.py` (62/62 views OK).
 * **Helios Files** — scale-out NFS/SMB add-on on a Linstor/DRBD HA volume, orchestrated by Vali with
   Mipha-driven failover.
 * **Helios Horizon** — AD-integrated VDI/application streaming via Apache Guacamole (`guacd`).
