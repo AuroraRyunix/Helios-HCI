@@ -671,6 +671,7 @@ CREATE TABLE IF NOT EXISTS generated_bundles (
         c.execute("INSERT OR REPLACE INTO lcm_updates (component_name, current_version, available_version, severity, release_notes) VALUES (?, ?, ?, ?, ?)",
                   (cname, ccur, cavail, csev, cnotes))
 
+    c.execute("DELETE FROM vms WHERE vm_id LIKE 'cluster-local_%'")
     conn.commit()
     conn.close()
 
@@ -1013,19 +1014,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet" type="text/css" />
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    html, body {
+      height: 100vh;
+      height: 100dvh;
+      max-height: 100vh;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
     body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     .sidebar-collapsed { width: 4.5rem !important; }
     .sidebar-collapsed .collapse-title span,
     .sidebar-collapsed .collapse-title::after,
     .sidebar-collapsed .collapse-content,
     .sidebar-collapsed .truncate { display: none !important; }
+    #mainViewport {
+      height: 100vh;
+      max-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      min-height: 0;
+    }
+    #mainScrollArea {
+      flex: 1 1 0%;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      scrollbar-gutter: stable;
+      -webkit-overflow-scrolling: touch;
+    }
+    #sidebarTree {
+      flex: 1 1 0%;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
   </style>
 </head>
-<body class="min-h-screen bg-base-100 text-base-content flex overflow-hidden">
+<body class="h-screen max-h-screen w-screen overflow-hidden bg-base-100 text-base-content flex">
 
 
   <!-- SIDEBAR NAVIGATION DRAWER -->
-  <aside id="sidebarNav" class="w-64 bg-base-200 border-r border-base-300 flex flex-col shrink-0 transition-all duration-200 z-30 select-none">
+  <aside id="sidebarNav" class="w-64 h-screen max-h-screen bg-base-200 border-r border-base-300 flex flex-col shrink-0 transition-all duration-200 z-30 select-none overflow-hidden">
     <div class="h-14 border-b border-base-300 px-4 flex items-center justify-between shrink-0">
       <div class="flex items-center gap-2 overflow-hidden">
         <svg class="size-6 text-primary shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
@@ -1038,7 +1069,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <!-- Scrollable Navigation Tree -->
-    <div class="flex-1 overflow-y-auto p-2 space-y-1 text-xs">
+    <div id="sidebarTree" class="flex-1 min-h-0 overflow-y-auto p-2 space-y-1 text-xs">
 
       <!-- Group: Dashboard -->
       <div class="collapse collapse-arrow bg-transparent">
@@ -1605,7 +1636,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 
   <!-- MAIN VIEWPORT -->
-  <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+  <div id="mainViewport" class="flex-1 flex flex-col h-screen max-h-screen min-w-0 min-h-0 overflow-hidden">
     <!-- TOP HEADER NAVBAR -->
     <header class="h-14 bg-base-100 border-b border-base-300 px-4 sm:px-6 flex items-center justify-between gap-4 shrink-0">
       <div class="flex items-center gap-3">
@@ -1643,7 +1674,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </header>
 
     <!-- CONTENT VIEWS CONTAINER (FULL WIDTH DENSITY) -->
-    <main class="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+    <main id="mainScrollArea" class="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-4 pb-24">
 
       <!-- VIEW: fleet (Fleet Overview) -->
       <div id="view-fleet" class="section-view hidden space-y-4">
@@ -4315,6 +4346,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const target = document.getElementById('view-' + viewId);
       if (target) target.classList.remove('hidden');
 
+      const scrollArea = document.getElementById('mainScrollArea');
+      if (scrollArea) scrollArea.scrollTop = 0;
+
       document.getElementById('bcGroup').textContent = groupName || 'Console';
       document.getElementById('bcItem').textContent = itemName || viewId;
 
@@ -4694,7 +4728,7 @@ class CentralServerHandler(http.server.BaseHTTPRequestHandler):
         table_map = {
             "fleet": "SELECT name, status, vip, node_count, vm_count, cpu_cores, memory_total_mb, storage_total_bytes FROM clusters",
             "clusters": "SELECT name, status, vip, node_count, vm_count, memory_total_mb, storage_total_bytes FROM clusters",
-            "vms": "SELECT name, state, cluster_id, vcpus, memory_mb, disk_gb, ip, host FROM vms",
+            "vms": "SELECT name, state, cluster_id, vcpus, memory_mb, disk_gb, ip, host FROM vms GROUP BY cluster_id, name ORDER BY name ASC",
             "templates": "SELECT name, os_type, cluster_id, vcpus, memory_mb, disk_gb, created_at FROM templates",
             "k8s": "SELECT name, version, control_plane_nodes, worker_nodes, status, cluster_id FROM k8s_clusters",
             "ovas": "SELECT name, version, size_bytes, cluster_id, created_at FROM ovas",
