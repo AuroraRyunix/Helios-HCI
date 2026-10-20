@@ -851,59 +851,43 @@ LOGIN_HTML = """<!DOCTYPE html>
   <title>Sign In &mdash; Helios Central</title>
   <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet" type="text/css" />
   <script src="https://cdn.tailwindcss.com"></script>
-  <style>
-    body { background-color: #070d19; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    .glass-box { background: rgba(15, 23, 42, 0.88); backdrop-filter: blur(20px); border: 1px solid rgba(255, 255, 255, 0.08); box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.7); }
-    .glow-bg { position: absolute; width: 500px; height: 500px; border-radius: 50%; filter: blur(140px); opacity: 0.18; pointer-events: none; }
-  </style>
 </head>
-<body class="min-h-screen flex items-center justify-center p-4 relative overflow-hidden text-slate-100">
-  <div class="glow-bg bg-cyan-500 -top-32 -left-32"></div>
-  <div class="glow-bg bg-indigo-600 -bottom-32 -right-32"></div>
-
-  <div class="glass-box rounded-3xl p-8 sm:p-10 w-full max-w-md relative z-10 border border-slate-700/60 shadow-2xl space-y-6">
-    <div class="text-center space-y-2">
-      <div class="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-tr from-cyan-500 to-indigo-600 shadow-lg shadow-cyan-500/30">
-        <svg class="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
-      </div>
-      <h1 class="text-2xl font-black tracking-tight text-white flex items-center justify-center gap-2">
-        <span>Helios</span>
-        <span class="text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-indigo-400">Central</span>
-      </h1>
-      <div class="inline-block px-2.5 py-0.5 rounded-full bg-cyan-500/10 border border-cyan-500/30 text-[10px] uppercase font-mono font-bold tracking-widest text-cyan-400">
-        Multi-Cluster Fleet Orchestration
+<body class="min-h-screen flex items-center justify-center p-4 bg-base-100 text-base-content">
+  <div class="card bg-base-200 border border-base-300 shadow-xl w-full max-w-sm p-6 sm:p-8 space-y-4 rounded-box">
+    <div class="flex items-center gap-3 border-b border-base-300 pb-3">
+      <svg class="size-6 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+      <div>
+        <div class="font-bold text-lg tracking-tight">Helios Central</div>
+        <div class="text-[11px] opacity-60">Fleet Management</div>
       </div>
     </div>
 
-    <div id="alertBox" class="hidden alert alert-error text-xs py-3 rounded-xl border border-red-500/30 shadow-lg">
+    <div id="alertBox" class="hidden alert alert-error text-xs py-2 rounded-lg">
       <span id="alertMsg">Invalid username or password</span>
     </div>
 
-    <form onsubmit="handleLogin(event)" class="space-y-4">
+    <form onsubmit="handleLogin(event)" class="space-y-3">
       <div>
-        <label class="label text-xs font-semibold text-slate-300">Username</label>
-        <input id="username" type="text" value="admin" class="input input-bordered w-full bg-slate-900/90 border-slate-700 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 text-sm font-mono" required />
+        <label class="label text-xs font-semibold">Username</label>
+        <input id="username" type="text" value="admin" class="input input-sm input-bordered w-full font-mono text-xs" required />
       </div>
 
       <div>
-        <div class="flex justify-between items-center">
-          <label class="label text-xs font-semibold text-slate-300">Password</label>
-          <span class="text-[11px] text-slate-500 font-mono">Cluster Password</span>
-        </div>
-        <input id="password" type="password" placeholder="••••••••••••" class="input input-bordered w-full bg-slate-900/90 border-slate-700 focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 text-sm font-mono" required autofocus />
+        <label class="label text-xs font-semibold">Password</label>
+        <input id="password" type="password" placeholder="••••••••••••" class="input input-sm input-bordered w-full font-mono text-xs" required autofocus />
       </div>
 
-      <div class="text-[11px] text-slate-400 font-mono text-center">Credentials: admin / helios (or cluster creds)</div>
-      <div class="pt-2">
-        <button id="loginBtn" type="submit" class="btn btn-primary w-full bg-gradient-to-r from-cyan-500 to-indigo-600 hover:from-cyan-400 hover:to-indigo-500 border-none text-white font-bold tracking-wide shadow-lg shadow-cyan-500/25">
-          Sign In to Central
+      <div class="text-[11px] text-base-content/50 font-mono text-center">Credentials: admin / helios</div>
+
+      <div class="pt-1">
+        <button id="loginBtn" type="submit" class="btn btn-sm btn-primary w-full">
+          Sign In
         </button>
       </div>
     </form>
 
-    <div class="pt-4 border-t border-slate-800/80 text-center space-y-1">
-      <div class="text-xs text-slate-400 font-mono">Static IP: 10.10.102.50:8443</div>
-      <div class="text-[11px] text-slate-500">Autonomous Rocky Linux 10.2 Appliance &bull; Sidon Storage</div>
+    <div class="pt-2 border-t border-base-300 text-center">
+      <div class="text-xs opacity-60 font-mono">10.10.102.50:8443</div>
     </div>
   </div>
 
@@ -914,7 +898,7 @@ LOGIN_HTML = """<!DOCTYPE html>
       const alertBox = document.getElementById('alertBox');
       const alertMsg = document.getElementById('alertMsg');
       btn.disabled = true;
-      btn.innerText = 'Verifying credentials...';
+      btn.innerText = 'Verifying...';
       alertBox.classList.add('hidden');
 
       try {
@@ -933,13 +917,13 @@ LOGIN_HTML = """<!DOCTYPE html>
           alertMsg.innerText = data.error || 'Authentication failed.';
           alertBox.classList.remove('hidden');
           btn.disabled = false;
-          btn.innerText = 'Sign In to Central';
+          btn.innerText = 'Sign In';
         }
       } catch (err) {
         alertMsg.innerText = 'Network error connecting to appliance.';
         alertBox.classList.remove('hidden');
         btn.disabled = false;
-        btn.innerText = 'Sign In to Central';
+        btn.innerText = 'Sign In';
       }
     }
   </script>
@@ -956,88 +940,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet" type="text/css" />
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    body { background-color: #0b1120; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    .glass-nav { background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255, 255, 255, 0.08); }
-    .glass-card { background: rgba(30, 41, 59, 0.5); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.06); }
-    .glass-card:hover { border-color: rgba(6, 182, 212, 0.3); }
-    .tab-active-custom { background: rgba(6, 182, 212, 0.15) !important; color: #38bdf8 !important; border-bottom: 2px solid #38bdf8 !important; }
+    body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   </style>
 </head>
-<body class="min-h-screen text-slate-100 flex flex-col">
-  <!-- TOP NAVBAR -->
-  <header class="glass-nav sticky top-0 z-50 px-6 py-2.5 flex items-center justify-between gap-4">
-    <div class="flex items-center gap-3">
-      <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-cyan-500/25">
-        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
-      </div>
-      <div>
-        <div class="flex items-center gap-2">
-          <span class="font-extrabold text-base tracking-tight text-white">Helios Central</span>
-          <span class="badge badge-xs badge-info font-mono">Fleet Control</span>
+<body class="min-h-screen bg-base-100 text-base-content flex flex-col">
+  <!-- TOP NAVBAR WITH SECTION SWITCHER DROPDOWN (HELIOS STANDARD) -->
+  <header class="navbar border-b border-base-300 gap-2 px-4 sm:px-6 lg:px-8 bg-base-100 sticky top-0 z-50">
+    <div class="flex-none">
+      <a href="/" class="flex items-center gap-2 text-lg font-semibold">
+        <svg class="size-6 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+        <span class="font-bold tracking-tight">Helios</span>
+        <span class="badge badge-sm badge-neutral font-mono">Central</span>
+      </a>
+    </div>
+
+    <!-- Section Switcher: ONE dropdown instead of fifteen links across the bar! -->
+    <nav class="flex-1" aria-label="Console">
+      <div class="dropdown dropdown-bottom">
+        <div tabindex="0" role="button" class="btn btn-ghost btn-sm gap-2 font-semibold text-base">
+          <span id="activeSectionTitle">Fleet Overview</span>
+          <svg class="size-4 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
         </div>
-        <div class="text-[10px] text-slate-400 font-mono">10.10.102.50:8443 &bull; Rocky Linux 10.2 &bull; Sidon CoW</div>
+        <ul tabindex="0" class="dropdown-content menu z-50 mt-2 w-64 rounded-box bg-base-200 border border-base-300 p-1.5 shadow-2xl text-xs font-semibold">
+          <li><a onclick="selectNav('fleet', 'Fleet Overview')">Fleet Overview</a></li>
+          <li><a onclick="selectNav('vms', 'Global VMs')">Global VMs</a></li>
+          <li><a onclick="selectNav('images', 'Content Library')">Content Library</a></li>
+          <li><a onclick="selectNav('lcm', 'Life Cycle Management (LCM)')">Life Cycle Management (LCM)</a></li>
+          <li><a onclick="selectNav('health', 'Cluster Health & Runbooks')">Cluster Health & Runbooks</a></li>
+          <li><a onclick="selectNav('networks', 'Networks & Flow SDN')">Networks & Flow SDN</a></li>
+          <li><a onclick="selectNav('storage', 'Sidon Storage Fabric')">Sidon Storage Fabric</a></li>
+          <li><a onclick="selectNav('dr', 'Disaster Recovery')">Disaster Recovery</a></li>
+          <li><a onclick="selectNav('clusters', 'Member Clusters')">Member Clusters</a></li>
+          <li><a onclick="selectNav('alerts', 'Alerts & Incidents')">Alerts & Incidents</a></li>
+          <li><a onclick="selectNav('tasks', 'Operations & Tasks')">Operations & Tasks</a></li>
+          <li><a onclick="selectNav('iam', 'Access Control (IAM)')">Access Control (IAM)</a></li>
+          <li><a onclick="selectNav('appliance', 'Appliance Diagnostics')">Appliance Diagnostics</a></li>
+        </ul>
       </div>
-    </div>
+    </nav>
 
-    <!-- OMNIBAR GLOBAL SEARCH -->
-    <div class="flex-1 max-w-md hidden md:block relative">
-      <input id="omniSearch" type="text" placeholder="OmniSearch across fleet (VMs, Hosts, Disks, Alerts)..." onkeyup="handleOmniSearch(this.value)" class="input input-xs input-bordered w-full bg-slate-900/90 border-slate-700 text-xs font-mono pl-8 rounded-xl focus:border-cyan-400" />
-      <svg class="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
-      <div id="omniResults" class="hidden absolute left-0 right-0 top-8 bg-slate-900/95 border border-slate-700 rounded-xl shadow-2xl p-2 z-50 max-h-80 overflow-y-auto text-xs space-y-1"></div>
-    </div>
-
-    <!-- USER & ACTIONS -->
-    <div class="flex items-center gap-2">
-      <div class="flex items-center gap-2 bg-slate-900/90 border border-slate-800 px-3 py-1 rounded-xl text-xs">
-        <span class="size-2 rounded-full bg-emerald-400 animate-pulse"></span>
-        <span id="navUser" class="font-mono text-cyan-400 font-bold">admin</span>
-        <span class="badge badge-xs badge-neutral">SuperAdmin</span>
+    <div class="flex-none flex items-center gap-3">
+      <div class="relative w-64 hidden md:block">
+        <input id="omniSearch" type="text" placeholder="Search fleet..." onkeyup="handleOmniSearch(this.value)" class="input input-xs input-bordered w-full font-mono text-xs pl-7" />
+        <svg class="w-3.5 h-3.5 opacity-50 absolute left-2 top-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+        <div id="omniResults" class="hidden absolute left-0 right-0 top-8 bg-base-200 border border-base-300 rounded-box shadow-2xl p-2 z-50 max-h-80 overflow-y-auto text-xs space-y-1"></div>
       </div>
-      <button onclick="handleLogout()" class="btn btn-xs btn-ghost text-slate-400 hover:text-white" title="Sign Out">
-        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
-      </button>
+      <span id="navUser" class="text-sm opacity-70 font-mono">admin</span>
+      <button onclick="handleLogout()" class="btn btn-ghost btn-sm">Sign out</button>
     </div>
   </header>
 
-  <!-- FLEET NAVIGATION TABS -->
-  <div class="bg-slate-900/90 border-b border-slate-800 px-6 py-1.5 flex items-center gap-1 overflow-x-auto text-xs font-semibold">
-    <button onclick="switchTab('fleet')" id="tab-fleet" class="px-3 py-1 rounded-lg tab-active-custom transition-all whitespace-nowrap">Fleet Overview</button>
-    <button onclick="switchTab('vms')" id="tab-vms" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Global VMs</button>
-    <button onclick="switchTab('images')" id="tab-images" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Content Library</button>
-    <button onclick="switchTab('lcm')" id="tab-lcm" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">LCM (Life Cycle)</button>
-    <button onclick="switchTab('health')" id="tab-health" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Health & Runbooks</button>
-    <button onclick="switchTab('networks')" id="tab-networks" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Networks &amp; Flow SDN</button>
-    <button onclick="switchTab('storage')" id="tab-storage" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Sidon Storage Fabric</button>
-    <button onclick="switchTab('dr')" id="tab-dr" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Disaster Recovery</button>
-    <button onclick="switchTab('clusters')" id="tab-clusters" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Member Clusters</button>
-    <button onclick="switchTab('alerts')" id="tab-alerts" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Alerts &amp; Incidents</button>
-    <button onclick="switchTab('tasks')" id="tab-tasks" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Operations &amp; Tasks</button>
-    <button onclick="switchTab('iam')" id="tab-iam" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Access (IAM)</button>
-    <button onclick="switchTab('appliance')" id="tab-appliance" class="px-3 py-1 rounded-lg hover:text-slate-200 text-slate-400 transition-all whitespace-nowrap">Appliance Self-Health</button>
-  </div>
-
-  <!-- MAIN CONTAINER -->
-  <main class="flex-1 p-6 max-w-7xl w-full mx-auto space-y-6">
+  <!-- MAIN CONTAINER (FULL WIDTH DENSITY, HELIOS STANDARD) -->
+  <main class="px-4 py-6 sm:px-6 lg:px-8 w-full space-y-4">
 
     <!-- VIEW 1: FLEET OVERVIEW -->
     <div id="view-fleet" class="space-y-6">
       <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div class="glass-card rounded-2xl p-5 border-l-4 border-l-cyan-500 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-5 border-l-4 border-l-cyan-500 shadow-xl">
           <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Federated Clusters</div>
           <div id="statClusters" class="text-3xl font-extrabold font-mono text-cyan-400 mt-2">--</div>
           <div class="text-xs text-slate-500 mt-1" id="statNodesSub">-- hypervisor nodes</div>
         </div>
-        <div class="glass-card rounded-2xl p-5 border-l-4 border-l-emerald-500 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-5 border-l-4 border-l-emerald-500 shadow-xl">
           <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Global Workloads (VMs)</div>
           <div id="statVms" class="text-3xl font-extrabold font-mono text-emerald-400 mt-2">--</div>
           <div class="text-xs text-slate-500 mt-1" id="statVmsSub">Across all clusters</div>
         </div>
-        <div class="glass-card rounded-2xl p-5 border-l-4 border-l-indigo-500 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-5 border-l-4 border-l-indigo-500 shadow-xl">
           <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Fleet vCPU Capacity</div>
           <div id="statCores" class="text-3xl font-extrabold font-mono text-indigo-400 mt-2">--</div>
           <div class="text-xs text-slate-500 mt-1">Physical hypervisor cores</div>
         </div>
-        <div class="glass-card rounded-2xl p-5 border-l-4 border-l-teal-500 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-5 border-l-4 border-l-teal-500 shadow-xl">
           <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Sidon Storage Fabric</div>
           <div id="statStorage" class="text-3xl font-extrabold font-mono text-teal-400 mt-2">--</div>
           <div id="statStorageSub" class="text-xs text-slate-500 mt-1">Distributed extent storage</div>
@@ -1045,7 +1019,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- CAPACITY RUNWAY & SMART FORECASTING -->
-      <div class="glass-card rounded-3xl p-6 border border-slate-800 shadow-2xl space-y-4">
+      <div class="card bg-base-200 border border-base-300 rounded-box p-6 border border-slate-800 shadow-2xl space-y-4">
         <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
           <div>
             <h3 class="font-bold text-base text-slate-100 flex items-center gap-2">
@@ -1107,7 +1081,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- DYNAMIC RESOURCE SCHEDULING (DRS) -->
-      <div class="glass-card rounded-3xl p-6 border border-slate-800 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-4">
+      <div class="card bg-base-200 border border-base-300 rounded-box p-6 border border-slate-800 shadow-2xl flex flex-col md:flex-row items-center justify-between gap-4">
         <div class="space-y-1">
           <div class="flex items-center gap-2">
             <h4 class="font-bold text-white text-base">Dynamic Resource Scheduling (DRS) &amp; Load Balancing</h4>
@@ -1143,7 +1117,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="overflow-x-auto">
           <table class="table table-sm text-xs font-mono">
             <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1173,7 +1147,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p class="text-xs text-slate-400">Valhalla Distributed Image Service for ISOs and OS cloud templates, replicated with Sidon RF2.</p>
         </div>
       </div>
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
             <tr>
@@ -1206,7 +1180,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- LCM STATUS BANNER -->
-      <div class="glass-card rounded-2xl p-4 border border-slate-800 shadow-xl flex flex-col md:flex-row items-center justify-between gap-4">
+      <div class="card bg-base-200 border border-base-300 rounded-box p-4 border border-slate-800 shadow-xl flex flex-col md:flex-row items-center justify-between gap-4">
         <div class="flex items-center gap-3">
           <div class="p-3 bg-cyan-500/10 border border-cyan-500/30 rounded-xl text-cyan-400">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
@@ -1247,22 +1221,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- HEALTH SUMMARY METRICS -->
       <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
-        <div class="glass-card rounded-2xl p-4 border border-slate-800 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-4 border border-slate-800 shadow-xl">
           <div class="text-[11px] font-semibold text-slate-400 uppercase">Total Checks</div>
           <div id="diagTotal" class="text-2xl font-bold font-mono text-cyan-400 mt-1">--</div>
           <div class="text-[11px] text-slate-500">64 distinct categories</div>
         </div>
-        <div class="glass-card rounded-2xl p-4 border border-slate-800 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-4 border border-slate-800 shadow-xl">
           <div class="text-[11px] font-semibold text-slate-400 uppercase">Passed Checks</div>
           <div id="diagPassed" class="text-2xl font-bold font-mono text-emerald-400 mt-1">--</div>
           <div class="text-[11px] text-slate-500">100% operational</div>
         </div>
-        <div class="glass-card rounded-2xl p-4 border border-slate-800 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-4 border border-slate-800 shadow-xl">
           <div class="text-[11px] font-semibold text-slate-400 uppercase">Warnings</div>
           <div id="diagWarnings" class="text-2xl font-bold font-mono text-amber-400 mt-1">0</div>
           <div class="text-[11px] text-slate-500">No active warnings</div>
         </div>
-        <div class="glass-card rounded-2xl p-4 border border-slate-800 shadow-xl">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-4 border border-slate-800 shadow-xl">
           <div class="text-[11px] font-semibold text-slate-400 uppercase">Failures</div>
           <div id="diagFailures" class="text-2xl font-bold font-mono text-red-400 mt-1">0</div>
           <div class="text-[11px] text-slate-500">Zero quorum violations</div>
@@ -1278,7 +1252,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- CHECKS TABLE -->
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="overflow-x-auto max-h-[500px]">
           <table class="table table-sm text-xs font-mono">
             <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase sticky top-0 z-10">
@@ -1307,7 +1281,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- NETWORKS TABLE -->
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Virtual Networks &amp; Subnets</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1324,7 +1298,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <!-- FLOW FIREWALL RULES TABLE -->
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Flow Microsegmentation Firewall Rules</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1352,7 +1326,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Storage Containers</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1368,7 +1342,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </table>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Extent Stores Across Nodes</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1384,7 +1358,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </table>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Virtual Disks (vDisks)</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1409,7 +1383,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p class="text-xs text-slate-400">Leap Metro Availability and asynchronous replication protection policies.</p>
         </div>
       </div>
-      <div class="glass-card rounded-2xl border border-slate-800 p-6 text-center space-y-3">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 p-6 text-center space-y-3">
         <div class="inline-flex p-3 rounded-full bg-cyan-500/10 text-cyan-400">
           <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>
         </div>
@@ -1427,7 +1401,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
         <button onclick="enrollModal.showModal()" class="btn btn-xs btn-primary">+ Enroll Cluster</button>
       </div>
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
             <tr>
@@ -1456,7 +1430,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p class="text-xs text-slate-400">Centralized alert policies with automatic anomaly detection from Mimir health runs.</p>
         </div>
       </div>
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
             <tr>
@@ -1481,7 +1455,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <p class="text-xs text-slate-400">Unified audit of Catalyst scheduled workflows, Vali migrations, and VM lifecycle tasks.</p>
         </div>
       </div>
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
             <tr>
@@ -1508,7 +1482,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button onclick="userModal.showModal()" class="btn btn-xs btn-primary">+ Add Local User</button>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Authorized Central Users</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1524,7 +1498,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </table>
       </div>
 
-      <div class="glass-card rounded-2xl border border-slate-800 overflow-hidden shadow-xl">
+      <div class="card bg-base-200 border border-base-300 rounded-box border border-slate-800 overflow-hidden shadow-xl">
         <div class="p-3 bg-slate-900/80 font-bold text-xs uppercase text-slate-300 border-b border-slate-800">Central Security Audit Trail</div>
         <table class="table table-sm text-xs font-mono">
           <thead class="bg-slate-900/90 text-slate-400 font-sans uppercase">
@@ -1548,7 +1522,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div class="glass-card rounded-3xl p-6 border border-slate-800 space-y-4">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-6 border border-slate-800 space-y-4">
           <h3 class="font-bold text-sm text-cyan-400 uppercase tracking-wider">Appliance Operating System</h3>
           <div class="space-y-2 text-xs font-mono">
             <div class="flex justify-between border-b border-slate-800 pb-1.5"><span class="text-slate-400">Hostname:</span><span id="appHostname" class="text-white">--</span></div>
@@ -1560,7 +1534,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="glass-card rounded-3xl p-6 border border-slate-800 space-y-4">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-6 border border-slate-800 space-y-4">
           <h3 class="font-bold text-sm text-indigo-400 uppercase tracking-wider">Resource Allocation &amp; Performance</h3>
           <div class="space-y-2 text-xs font-mono">
             <div class="flex justify-between border-b border-slate-800 pb-1.5"><span class="text-slate-400">Assigned vCPUs:</span><span id="appVcpus" class="text-white">--</span></div>
@@ -1676,20 +1650,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     let globalDiagChecks = [];
     let currentDiagFilter = 'ALL';
 
-    function switchTab(tabId) {
+    const sectionLabels = {
+      'fleet': 'Fleet Overview',
+      'vms': 'Global VMs',
+      'images': 'Content Library',
+      'lcm': 'Life Cycle Management (LCM)',
+      'health': 'Cluster Health & Runbooks',
+      'networks': 'Networks & Flow SDN',
+      'storage': 'Sidon Storage Fabric',
+      'dr': 'Disaster Recovery',
+      'clusters': 'Member Clusters',
+      'alerts': 'Alerts & Incidents',
+      'tasks': 'Operations & Tasks',
+      'iam': 'Access Control (IAM)',
+      'appliance': 'Appliance Diagnostics'
+    };
+
+    function selectNav(tabId, label) {
+      document.getElementById('activeSectionTitle').innerText = label || sectionLabels[tabId] || 'Fleet Overview';
       document.querySelectorAll('main > div').forEach(el => el.classList.add('hidden'));
-      document.querySelectorAll('.tab-active-custom').forEach(el => {
-        el.classList.remove('tab-active-custom');
-        el.classList.add('text-slate-400');
-      });
       const targetView = document.getElementById('view-' + tabId);
-      const targetBtn = document.getElementById('tab-' + tabId);
       if (targetView) targetView.classList.remove('hidden');
-      if (targetBtn) {
-        targetBtn.classList.add('tab-active-custom');
-        targetBtn.classList.remove('text-slate-400');
-      }
       currentTab = tabId;
+      if (document.activeElement) document.activeElement.blur();
+    }
+
+    function switchTab(tabId) {
+      selectNav(tabId, sectionLabels[tabId] || 'Fleet Overview');
     }
 
     async function handleLogout() {
@@ -1756,7 +1743,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       const grid = document.getElementById('clusterGrid');
       grid.innerHTML = clusters.map(c => `
-        <div class="card glass-card rounded-3xl p-6 hover:border-cyan-500/50 transition-all shadow-xl">
+        <div class="card card bg-base-200 border border-base-300 rounded-box p-6 hover:border-cyan-500/50 transition-all shadow-xl">
           <div class="flex items-start justify-between">
             <div>
               <div class="flex items-center gap-2">
@@ -1881,7 +1868,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         try { vMap = JSON.parse(n.versions_json); } catch(e){}
         const daemons = ['spark-daemon', 'mipha', 'vali', 'spectrum', 'hylia', 'Dockerfile', 'saltrun'];
         return `
-        <div class="glass-card rounded-2xl p-5 border border-slate-800 space-y-3">
+        <div class="card bg-base-200 border border-base-300 rounded-box p-5 border border-slate-800 space-y-3">
           <div class="flex justify-between items-center border-b border-slate-800 pb-2">
             <div>
               <div class="font-bold text-sm text-cyan-400 font-mono">${n.hostname}</div>
