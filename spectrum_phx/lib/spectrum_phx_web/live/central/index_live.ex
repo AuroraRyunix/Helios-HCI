@@ -215,7 +215,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                   <h1 class="text-2xl font-bold tracking-tight bg-gradient-to-r from-base-content via-primary-content to-accent bg-clip-text text-transparent">
                     Helios Central
                   </h1>
-                  <span class="badge badge-sm badge-primary badge-outline font-mono">vCenter / Prism Central Tier</span>
+                  <span class="badge badge-sm badge-primary badge-outline font-mono">Fleet Federation</span>
                   <span :if={@appliance_status == :ok} class="badge badge-sm badge-success gap-1">
                     <span class="size-1.5 rounded-full bg-success animate-ping"></span>
                     Appliance Online
@@ -646,7 +646,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <span>Helios Central Virtual Appliance Architecture</span>
               </h2>
               <p class="text-xs text-base-content/70 mt-1">
-                The centralized management appliance (vCenter Server Appliance / Nutanix Prism Central analog).
+                The autonomous fleet management virtual appliance for multi-cluster orchestration, DRS, and lifecycle operations.
                 Deploys as a self-contained virtual machine with automated Cloud-Init NoCloud boot.
               </p>
             </div>
