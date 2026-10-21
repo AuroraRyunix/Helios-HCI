@@ -64,7 +64,7 @@ defmodule SpectrumPhx.Snapshots do
       {:ok, %{vdisk_id:, snapshots: [snapshot], policy: policy}}
 
   where a snapshot is `%{id:, origin:, taken_at_ms:, size_bytes:, has_children?:}` with
-  `origin` one of `:policy`, `:manual`, `:pre_rollback`, `:unindexed`, and `policy` is
+  `origin` one of `:policy`, `:domain`, `:template`, `:manual`, `:pre_rollback`, `:unindexed`, and `policy` is
   `{:policy, %{scope:, target:, every_seconds:, keep:}}`, `:exempt` or `:none`.
 
   `{:error, :not_found}` when no such vdisk exists, `{:error, reason}` when Hydra could not
@@ -137,6 +137,8 @@ defmodule SpectrumPhx.Snapshots do
 
   defp origin(nil), do: :unindexed
   defp origin(%{"origin" => "policy"}), do: :policy
+  defp origin(%{"origin" => "domain"}), do: :domain
+  defp origin(%{"origin" => "template"}), do: :template
   defp origin(%{"origin" => "manual"}), do: :manual
   defp origin(%{"origin" => "pre-rollback"}), do: :pre_rollback
   defp origin(_other), do: :unindexed

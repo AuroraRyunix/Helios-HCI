@@ -11,7 +11,9 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
 
   import SpectrumPhxWeb.Cluster.Components
 
+  alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Cluster.Status
+  alias SpectrumPhx.Settings
 
   @refresh_interval_ms 5_000
 
@@ -22,7 +24,11 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
       :timer.send_interval(@refresh_interval_ms, self(), :refresh)
     end
 
-    {:ok, socket |> assign(:selected, nil) |> assign_snapshot(Status.fetch())}
+    {:ok,
+     socket
+     |> assign(:selected, nil)
+     |> assign(:show_add_host, false)
+     |> assign_snapshot(Status.fetch())}
   end
 
   @impl true
@@ -46,12 +52,129 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
     {:noreply, assign_snapshot(socket, Status.fetch())}
   end
 
+  def handle_event("toggle_add_host", _params, socket) do
+    {:noreply, assign(socket, :show_add_host, not socket.assigns.show_add_host)}
+  end
+
+  def handle_event("add_host", params, socket) do
+    hostname = Map.get(params, "hostname", "")
+    ip = Map.get(params, "ip", "")
+    witness? = Map.get(params, "witness") in ["true", "on", "1", true]
+    rf = Map.get(params, "redundancy_factor", "")
+
+    case Settings.add_node(hostname, ip,
+           witness: witness?,
+           redundancy_factor: rf,
+           source: settings_source()
+         ) do
+      {:ok, msg} ->
+        {:noreply,
+         socket
+         |> assign(:show_add_host, false)
+         |> assign_snapshot(Status.fetch())
+         |> put_flash(:info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("toggle_maintenance", %{"ip" => ip, "action" => action}, socket)
+      when action in ["enter", "leave", "service"] do
+    case Settings.node_maintenance(ip, action, source: settings_source()) do
+      {:ok, msg} ->
+        {:noreply,
+         socket
+         |> assign_snapshot(Status.fetch())
+         |> put_flash(:info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("clear_degraded", %{"ip" => ip}, socket) do
+    case Settings.clear_node_degraded(ip, source: settings_source()) do
+      {:ok, msg} ->
+        {:noreply,
+         socket
+         |> assign_snapshot(Status.fetch())
+         |> put_flash(:info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("rescue_host", %{"ip" => ip}, socket) do
+    case Settings.rescue_node(ip, source: settings_source()) do
+      {:ok, msg} ->
+        {:noreply,
+         socket
+         |> assign_snapshot(Status.fetch())
+         |> put_flash(:info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("balance_cluster", _params, socket) do
+    case Settings.balance_cluster(source: settings_source()) do
+      {:ok, msg} ->
+        {:noreply, put_flash(socket, :info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("zk_promote", %{"ip" => ip} = params, socket) do
+    replacing = Map.get(params, "replacing", "")
+
+    case Settings.zk_role_change(ip, "promote",
+           replacing: replacing,
+           source: settings_source()
+         ) do
+      {:ok, msg} ->
+        {:noreply,
+         socket
+         |> assign_snapshot(Status.fetch())
+         |> put_flash(:info, msg)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  defp settings_source do
+    Application.get_env(:spectrum_phx, :settings_source, :live)
+  end
+
   defp assign_snapshot(socket, snapshot) do
     socket
     |> assign(:page_title, "Hosts")
     |> assign(:snapshot, snapshot)
     |> assign(:summary, snapshot.summary)
     |> assign(:updated_at, DateTime.utc_now())
+  end
+
+  defp rack_slot_label(ip, idx) do
+    info = Config.host_info(ip)
+    rack_num = div(idx, 4) + 1
+    slot = Map.get(info, "node_position") || <<?A + rem(idx, 4)>>
+
+    case Map.get(info, "rack") do
+      "rack" <> num -> "Rack #{num} · Slot #{slot}"
+      r when is_binary(r) and r != "" -> "#{r} · Slot #{slot}"
+      _ -> "Rack #{rack_num} · Slot #{slot}"
+    end
+  end
+
+  defp zk_role_label(host, idx) do
+    voter_or_observer = if idx < 3, do: "voter", else: "observer"
+    mode = if host.zk_leader?, do: "leader", else: "follower"
+    "#{mode} (#{voter_or_observer})"
   end
 
   @impl true
@@ -70,15 +193,91 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
           </span>
         </:subtitle>
         <:actions>
+          <button
+            type="button"
+            phx-click="balance_cluster"
+            class="btn btn-sm btn-outline gap-1"
+            id="drs-balance-btn"
+          >
+            <.icon name="hero-scale" class="size-4" /> DRS Balance Cluster
+          </button>
+          <button
+            type="button"
+            phx-click="toggle_add_host"
+            class="btn btn-sm btn-primary gap-1"
+            id="open-add-host-btn"
+          >
+            <.icon name="hero-plus" class="size-4" /> Add Host
+          </button>
+          <.link navigate={~p"/topology"} class="btn btn-sm btn-ghost gap-1" id="topology-link">
+            <.icon name="hero-server-stack" class="size-4" /> Topology
+          </.link>
           <.button navigate={~p"/"} id="overview-link">Overview</.button>
         </:actions>
       </.header>
+
+      <div :if={@show_add_host} class="card card-border bg-base-200/50 mb-6" id="add-host-panel">
+        <div class="card-body p-4 gap-3">
+          <div class="flex items-center justify-between">
+            <div>
+              <h3 class="font-semibold text-sm">Expand Cluster — Add Node</h3>
+              <p class="text-xs opacity-70">
+                Join a provisioned, mTLS-enrolled host (`provision.py --join` + `impa enroll --node &lt;ip&gt;`) into this cluster.
+              </p>
+            </div>
+            <button type="button" phx-click="toggle_add_host" class="btn btn-xs btn-ghost">
+              Close
+            </button>
+          </div>
+          <form phx-submit="add_host" id="add-host-form" class="grid grid-cols-1 sm:grid-cols-5 gap-3 items-end">
+            <div>
+              <label class="label text-xs">Hostname</label>
+              <input
+                type="text"
+                name="hostname"
+                placeholder="helios04"
+                required
+                class="input input-sm input-bordered w-full font-mono"
+              />
+            </div>
+            <div>
+              <label class="label text-xs">Node IPv4</label>
+              <input
+                type="text"
+                name="ip"
+                placeholder="10.10.102.44"
+                required
+                class="input input-sm input-bordered w-full font-mono"
+              />
+            </div>
+            <div>
+              <label class="label text-xs">Redundancy Policy</label>
+              <select name="redundancy_factor" class="select select-sm select-bordered w-full">
+                <option value="">Keep current (RF={Config.redundancy_factor()})</option>
+                <option value="1">RF=1 (2 copies, FTT=1)</option>
+                <option value="2">RF=2 (3 copies, FTT=2)</option>
+              </select>
+            </div>
+            <div>
+              <label class="label cursor-pointer justify-start gap-2">
+                <input type="checkbox" name="witness" value="true" class="checkbox checkbox-sm" />
+                <span class="text-xs">Quorum Witness only</span>
+              </label>
+            </div>
+            <div class="flex justify-end">
+              <button type="submit" class="btn btn-sm btn-primary w-full sm:w-auto">
+                Join Cluster
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
 
       <.no_cluster :if={not @snapshot.configured?} snapshot={@snapshot} />
 
       <div class="grid gap-6">
         <section
-          :for={host <- @snapshot.nodes}
+          :for={{host, idx} <- Enum.with_index(@snapshot.nodes)}
           id={"host-#{dom_slug(host.ip)}"}
           class={[
             "card card-border bg-base-100",
@@ -89,12 +288,57 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
           <div class="card-body gap-4 p-4">
             <div class="flex flex-wrap items-start justify-between gap-2">
               <div class="min-w-0">
-                <h2 class="font-semibold text-base truncate">{host.hostname}</h2>
+                <div class="flex items-center gap-2">
+                  <h2 class="font-semibold text-base truncate">{host.hostname}</h2>
+                  <span class="badge badge-xs badge-neutral font-mono">
+                    {rack_slot_label(host.ip, idx)}
+                  </span>
+                </div>
                 <p class="text-xs font-mono opacity-60">{host.ip}</p>
               </div>
               <div class="flex flex-wrap items-center gap-1.5">
                 <.node_badge node={host} />
                 <.staleness node={host} />
+                <button
+                  type="button"
+                  phx-click="toggle_maintenance"
+                  phx-value-ip={host.ip}
+                  phx-value-action={if host.in_maintenance?, do: "leave", else: "enter"}
+                  id={"maint-btn-#{dom_slug(host.ip)}"}
+                  class="btn btn-xs btn-ghost"
+                >
+                  {if host.in_maintenance?, do: "Exit Maintenance", else: "Maintenance"}
+                </button>
+                <button
+                  :if={not host.in_maintenance?}
+                  type="button"
+                  phx-click="toggle_maintenance"
+                  phx-value-ip={host.ip}
+                  phx-value-action="service"
+                  id={"service-maint-btn-#{dom_slug(host.ip)}"}
+                  class="btn btn-xs btn-ghost"
+                  title="Enter maintenance mode without evacuating VMs (--preserve-vms)"
+                >
+                  Service Maintenance (Keep VMs)
+                </button>
+                <button
+                  type="button"
+                  phx-click="clear_degraded"
+                  phx-value-ip={host.ip}
+                  id={"clear-degraded-btn-#{dom_slug(host.ip)}"}
+                  class="btn btn-xs btn-ghost text-warning"
+                >
+                  Clear Degraded
+                </button>
+                <button
+                  type="button"
+                  phx-click="rescue_host"
+                  phx-value-ip={host.ip}
+                  id={"rescue-host-btn-#{dom_slug(host.ip)}"}
+                  class="btn btn-xs btn-ghost text-error"
+                >
+                  Rescue Host
+                </button>
               </div>
             </div>
 
@@ -102,7 +346,7 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
               <div>
                 <dt class="text-xs uppercase tracking-wide opacity-60">ZK leadership</dt>
                 <dd class={["font-medium", host.zk_leader? && "text-info"]}>
-                  {if host.zk_leader?, do: "leader", else: "follower"}
+                  {zk_role_label(host, idx)}
                 </dd>
               </div>
               <div>
@@ -145,6 +389,25 @@ defmodule SpectrumPhxWeb.Cluster.HostsLive do
                 </dd>
               </div>
             </dl>
+
+            <form
+              :if={length(@snapshot.nodes) > 3 and idx >= 3}
+              phx-submit="zk_promote"
+              id={"zk-promote-form-#{dom_slug(host.ip)}"}
+              class="flex flex-wrap items-center gap-2 text-xs bg-base-200/40 p-2 rounded"
+            >
+              <input type="hidden" name="ip" value={host.ip} />
+              <span class="opacity-75">ZooKeeper observer — hand off vote from:</span>
+              <select name="replacing" class="select select-xs select-bordered font-mono">
+                <option value="">(Add voter without replacement)</option>
+                <option :for={peer <- Enum.reject(@snapshot.nodes, &(&1.ip == host.ip))} value={peer.ip}>
+                  {peer.hostname} ({peer.ip})
+                </option>
+              </select>
+              <button type="submit" class="btn btn-xs btn-outline">
+                Promote to Voter
+              </button>
+            </form>
 
             <div
               :if={host.state == :down}

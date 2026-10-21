@@ -132,6 +132,7 @@ KINDS = {
     "urbosa": DAEMON,
     "hylia": DAEMON,
     "rauru": DAEMON,
+    "kass": frozenset(("quadlet",)),
 }
 
 # The file a script service is embedded from, where it is not simply `<unit>.py`, and the
@@ -438,7 +439,13 @@ REGISTRIES = [
     # MAINTENANCE_STOP_UNITS.
 
     # -- the daemons that start and stop other hosts' services ---------------------------------
-    Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance"),
+    Registry("vali.py", "<module>", "MAINTENANCE_STOP_UNITS", name="vali: enter maintenance",
+             exempt={
+                 "hydra-db": KEPT_UP_IN_MAINTENANCE,
+                 "daruk": KEPT_UP_IN_MAINTENANCE,
+                 "sidon": KEPT_UP_IN_MAINTENANCE,
+                 "hylia": HYLIA_THROUGH_MAINTENANCE,
+             }),
     Registry("mipha.py", "main", "start_units", name="mipha: rejoin a returned host",
              exempt={"urbosa": SETTING_NOT_READ_HERE}),
 
@@ -468,6 +475,12 @@ EXCLUDED = {
          "the units vali stops when a host enters maintenance, so a seventh left running is not "
          "reported. Widening it changes what turns a maintenance check FAIL, and which of the "
          "others may legitimately stay up cannot be judged without a cluster. Recorded in TODO.md"),
+    ("spark.py", "<module>", "CONTAINER_SERVICES", 0):
+        ("only services running inside Podman containers whose PIDs come from podman top rather "
+         "than systemctl show MainPID; not an inventory of all cluster services"),
+    ("spark_daemon_decoded.py", "<module>", "CONTAINER_SERVICES", 0):
+        ("only services running inside Podman containers whose PIDs come from podman top rather "
+         "than systemctl show MainPID; not an inventory of all cluster services"),
 }
 
 
@@ -637,6 +650,7 @@ KNOWN_GAPS = {
 
 HOST_UNITS = frozenset((
     "podman", "firewalld", "systemd-networkd", "systemd-resolved", "sshd",
+    "salt-master", "salt-minion",
 ))
 
 # Units that no longer exist, which a command may still name -- but only to stop, disable or
@@ -959,6 +973,7 @@ class ElectionNames(unittest.TestCase):
         "gatoway": "per-node bridge synchronisation: each node builds its own bridges",
         "urbosa": ("acts for whichever node holds the VIP, which `bifrost-vip` elects; it has no "
                    "election of its own"),
+        "kass": "a per-node Kafka broker: partitions and consumer groups coordinate via ZooKeeper, not a single elected leader",
     }
 
     def _constants(self):

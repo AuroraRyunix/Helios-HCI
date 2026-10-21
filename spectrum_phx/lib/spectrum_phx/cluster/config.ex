@@ -42,6 +42,18 @@ defmodule SpectrumPhx.Cluster.Config do
     end
   end
 
+  @doc "Configured host metadata map (rack, chassis_serial, node_position, node_id, role) for an IP."
+  def host_info(ip) do
+    all()
+    |> Map.get(:hosts, [])
+    |> Enum.with_index(1)
+    |> Enum.find_value(%{}, fn {h, idx} ->
+      if is_map(h) and h["ip"] == ip do
+        Map.put_new(h, "node_id", idx)
+      end
+    end)
+  end
+
   @doc "This node's IP, from spectrum.env, falling back to the first configured host."
   def local_ip, do: all() |> Map.get(:local_ip) || List.first(node_ips()) || "127.0.0.1"
 
@@ -56,6 +68,9 @@ defmodule SpectrumPhx.Cluster.Config do
 
   @doc "Fault-tolerance factor the cluster was created with."
   def redundancy_factor, do: all() |> Map.get(:redundancy_factor, 0)
+
+  @doc "Active cluster fault tolerance domain level (kdisk, khost, kblock, krack)."
+  def fault_domain, do: all() |> Map.get(:fault_domain, "khost")
 
   defp load do
     cluster =
@@ -79,13 +94,40 @@ defmodule SpectrumPhx.Cluster.Config do
           %{}
       end
 
+    raw_hosts = Map.get(cluster, "hosts", [])
+    hosts =
+      raw_hosts
+      |> Enum.with_index()
+      |> Enum.map(fn {host, idx} ->
+        if is_map(host) do
+          rack_num = div(idx, 4) + 1
+          host
+          |> Map.put_new("rack", "rack#{rack_num}")
+          |> Map.put_new("chassis_serial", "chassis-#{String.pad_leading(Integer.to_string(rack_num), 2, "0")}")
+          |> Map.put_new("node_position", <<?A + rem(idx, 4)>>)
+        else
+          host
+        end
+      end)
+
+    fault_domain =
+      Map.get(
+        cluster,
+        "fault_domain",
+        if(length(hosts) <= 1 and Map.get(cluster, "redundancy_factor", 0) > 0,
+          do: "kdisk",
+          else: "khost"
+        )
+      )
+
     %{
-      hosts: Map.get(cluster, "hosts", []),
+      hosts: hosts,
       vip: Map.get(cluster, "vip"),
       cluster_name: Map.get(cluster, "cluster_name"),
       cluster_subnet: Map.get(cluster, "cluster_subnet"),
       cluster_id: Map.get(cluster, "cluster_id"),
       redundancy_factor: Map.get(cluster, "redundancy_factor", 0),
+      fault_domain: fault_domain,
       local_ip: read_local_ip()
     }
   end

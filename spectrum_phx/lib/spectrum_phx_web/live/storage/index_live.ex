@@ -115,6 +115,35 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     end
   end
 
+  def handle_event("update_container", %{"name" => name} = params, socket) do
+    attrs =
+      %{}
+      |> maybe_put_attr("tier", params["tier"])
+      |> maybe_put_attr("ftt", params["ftt"])
+      |> maybe_put_quota_attr(params["quota_gb"], params["quota_bytes"])
+
+    case Containers.update(name, attrs) do
+      {:ok, :updated} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Container #{name} updated.")
+         |> load_containers()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, to_message(message))}
+    end
+  end
+
+  def handle_event("run_maintenance", %{"op" => op}, socket) do
+    case Storage.run_maintenance(op) do
+      {:ok, _task} ->
+        {:noreply, put_flash(socket, :info, "Storage maintenance operation (#{op}) dispatched.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_message(reason))}
+    end
+  end
+
   def handle_event("delete_container", %{"name" => name}, socket) do
     case Containers.delete(name) do
       {:ok, :deleted} ->
@@ -138,6 +167,14 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     end
   end
 
+  defp maybe_put_attr(map, _key, nil), do: map
+  defp maybe_put_attr(map, _key, ""), do: map
+  defp maybe_put_attr(map, key, val), do: Map.put(map, key, val)
+
+  defp maybe_put_quota_attr(map, nil, nil), do: map
+  defp maybe_put_quota_attr(map, nil, bytes), do: Map.put(map, "quota_bytes", bytes)
+  defp maybe_put_quota_attr(map, gb, _bytes), do: Map.put(map, "quota_bytes", gb_to_bytes(gb))
+
   defp load_containers(socket) do
     case Containers.list() do
       {:ok, containers} ->
@@ -153,7 +190,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   end
 
   defp default_container_form do
-    %{"name" => "", "tier" => "SSD", "quota_gb" => "0", "ftt" => "0", "compression" => "none"}
+    %{"name" => "", "tier" => "SSD", "quota_gb" => "0", "ftt" => "1", "compression" => "none"}
   end
 
   # A blank field is zero, which is "unlimited". Anything that is not a number becomes -1
@@ -392,6 +429,8 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         />
       </div>
 
+      <.maintenance_section />
+
       <.vdisks_section vdisks={@snapshot.vdisks} configured?={@snapshot.configured?} />
 
       <.disks_section disks={@snapshot.disks} configured?={@snapshot.configured?} />
@@ -405,6 +444,73 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
   end
 
   # -- sections -------------------------------------------------------------------------
+
+  defp maintenance_section(assigns) do
+    ~H"""
+    <.panel
+      id="storage-maintenance-section"
+      title="Storage Maintenance & Purah Operations"
+      subtitle="Cluster-wide garbage collection, extent integrity verification, compaction, deduplication and replica healing"
+    >
+      <div class="flex flex-wrap gap-2">
+        <button
+          type="button"
+          id="btn-purah-sweep"
+          phx-click="run_maintenance"
+          phx-value-op="sweep"
+          class="btn btn-sm btn-outline"
+        >
+          <.icon name="hero-trash" class="size-4" /> Purah Sweep (GC)
+        </button>
+        <button
+          type="button"
+          id="btn-purah-scrub"
+          phx-click="run_maintenance"
+          phx-value-op="scrub"
+          class="btn btn-sm btn-outline"
+        >
+          <.icon name="hero-shield-check" class="size-4" /> Purah Scrub (Integrity Check)
+        </button>
+        <button
+          type="button"
+          id="btn-purah-compact"
+          phx-click="run_maintenance"
+          phx-value-op="compact"
+          class="btn btn-sm btn-outline"
+        >
+          <.icon name="hero-arrows-pointing-in" class="size-4" /> Compaction Plan
+        </button>
+        <button
+          type="button"
+          id="btn-purah-compact-apply"
+          phx-click="run_maintenance"
+          phx-value-op="compact_apply"
+          class="btn btn-sm btn-outline"
+        >
+          <.icon name="hero-bolt" class="size-4" /> Compaction Run (--apply)
+        </button>
+        <button
+          type="button"
+          id="btn-purah-dedup"
+          phx-click="run_maintenance"
+          phx-value-op="dedup_estimate"
+          class="btn btn-sm btn-outline"
+        >
+          <.icon name="hero-chart-pie" class="size-4" /> Dedup Estimate
+        </button>
+        <button
+          type="button"
+          id="btn-storage-replicate"
+          phx-click="run_maintenance"
+          phx-value-op="replicate_all"
+          class="btn btn-sm btn-primary"
+        >
+          <.icon name="hero-arrow-path-rounded-square" class="size-4" /> Replicate Under-replicated Vdisks
+        </button>
+      </div>
+    </.panel>
+    """
+  end
 
   attr :containers, :list, required: true
   attr :error, :string, default: nil
@@ -441,7 +547,12 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
               <td class="font-medium">{container.name}</td>
               <td>{container.tier}</td>
               <td>{quota_label(container.quota_bytes)}</td>
-              <td>{container.ftt}</td>
+              <td>
+                <span>{container.ftt}</span>
+                <span :if={container.ftt == 0} class="badge badge-xs badge-warning ml-1" title="Single replica: no fault tolerance">
+                  RF=1 (no redundancy)
+                </span>
+              </td>
               <td>
                 <span class={[
                   "badge badge-sm",
@@ -451,22 +562,59 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
                 </span>
               </td>
               <td class="text-right whitespace-nowrap">
-                <button
-                  class="btn btn-xs"
-                  phx-click="set_compression"
-                  phx-value-name={container.name}
-                  phx-value-compression={if container.compression == "none", do: "lz4", else: "none"}
-                >
-                  {if container.compression == "none", do: "Compress", else: "Stop compressing"}
-                </button>
-                <button
-                  class="btn btn-xs btn-error btn-outline"
-                  phx-click="delete_container"
-                  phx-value-name={container.name}
-                  data-confirm={"Delete container " <> container.name <> "?"}
-                >
-                  Delete
-                </button>
+                <div class="inline-flex items-center gap-1 flex-wrap justify-end">
+                  <form
+                    id={"edit-container-" <> container.name}
+                    phx-submit="update_container"
+                    class="inline-flex items-center gap-1"
+                  >
+                    <input type="hidden" name="name" value={container.name} />
+                    <select name="tier" class="select select-xs select-bordered" aria-label="Tier">
+                      <option
+                        :for={tier <- Containers.tiers()}
+                        value={tier}
+                        selected={container.tier == tier}
+                      >
+                        {tier}
+                      </option>
+                    </select>
+                    <input
+                      type="number"
+                      name="quota_gb"
+                      min="0"
+                      value={bytes_to_gb(container.quota_bytes)}
+                      placeholder="GB"
+                      title="Quota in GB (0 = unlimited)"
+                      class="input input-xs input-bordered w-16 font-mono"
+                    />
+                    <input
+                      type="number"
+                      name="ftt"
+                      min="0"
+                      max="2"
+                      value={container.ftt}
+                      title="Failures to tolerate (FTT)"
+                      class="input input-xs input-bordered w-14 font-mono"
+                    />
+                    <button type="submit" class="btn btn-xs btn-ghost">Save</button>
+                  </form>
+                  <button
+                    class="btn btn-xs"
+                    phx-click="set_compression"
+                    phx-value-name={container.name}
+                    phx-value-compression={if container.compression == "none", do: "lz4", else: "none"}
+                  >
+                    {if container.compression == "none", do: "Compress", else: "Stop compressing"}
+                  </button>
+                  <button
+                    class="btn btn-xs btn-error btn-outline"
+                    phx-click="delete_container"
+                    phx-value-name={container.name}
+                    data-confirm={"Delete container " <> container.name <> "?"}
+                  >
+                    Delete
+                  </button>
+                </div>
               </td>
             </tr>
             <tr :if={@containers == [] and is_nil(@error)}>
@@ -536,6 +684,17 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         <button type="submit" class="btn btn-sm btn-primary">Create container</button>
       </form>
 
+      <div
+        :if={to_string(@form["ftt"]) == "0"}
+        id="ftt-zero-warning"
+        class="alert alert-warning alert-soft text-xs mt-2 py-2"
+      >
+        <.icon name="hero-exclamation-triangle" class="size-4 shrink-0" />
+        <span>
+          Warning: FTT 0 stores only a single replica (RF=1) with no fault tolerance. Any node or disk loss will lose data in this container.
+        </span>
+      </div>
+
       <p class="text-xs opacity-50 mt-3">
         Compression applies to extents sealed from then on. Existing data is never
         rewritten, and a change takes effect the next time a vdisk is attached — which is
@@ -544,6 +703,10 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     </.panel>
     """
   end
+
+  defp bytes_to_gb(nil), do: 0
+  defp bytes_to_gb(0), do: 0
+  defp bytes_to_gb(bytes) when is_integer(bytes), do: div(bytes, 1024 * 1024 * 1024)
 
   defp quota_label(0), do: "Unlimited"
   defp quota_label(nil), do: "Unlimited"

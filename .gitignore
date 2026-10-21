@@ -35,3 +35,5 @@ sidon/target/
 # licensed product behaves are useful to us and have no business in a public
 # repository that reimplements the same ideas.
 NUTANIX_FINDINGS.md
+HANDOFF_OVERNIGHT.md
+.gemini/

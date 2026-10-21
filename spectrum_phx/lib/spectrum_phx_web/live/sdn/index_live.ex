@@ -54,16 +54,124 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
 
   def handle_event("clear", _params, socket), do: {:noreply, assign(socket, :selected, nil)}
 
+  def handle_event("create_t0", params, socket) do
+    case Sdn.create_t0_router(params, sdn_opts()) do
+      {:ok, _id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Tier-0 router created.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_t0", %{"id" => id}, socket) do
+    case Sdn.delete_t0_router(id, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Tier-0 router deleted.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("create_t1", params, socket) do
+    case Sdn.create_t1_router(params, sdn_opts()) do
+      {:ok, _id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Tier-1 router created.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_t1", %{"id" => id}, socket) do
+    case Sdn.delete_t1_router(id, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Tier-1 router deleted.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("create_segment", params, socket) do
+    case Sdn.create_segment(params, sdn_opts()) do
+      {:ok, _id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Overlay segment created.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_segment", %{"id" => id}, socket) do
+    case Sdn.delete_segment(id, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Overlay segment deleted.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("create_firewall_rule", params, socket) do
+    case Sdn.create_firewall_rule(params, sdn_opts()) do
+      {:ok, _id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Firewall rule created.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_firewall_rule", %{"id" => id}, socket) do
+    case Sdn.delete_firewall_rule(id, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Firewall rule deleted.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  defp sdn_opts do
+    [source: Application.get_env(:spectrum_phx, :sdn_source, :live)]
+  end
+
   defp load_fabric(socket) do
     socket
-    |> assign(:fabric, Sdn.fabric())
+    |> assign(:fabric, Sdn.fabric(sdn_opts()))
     |> assign(:read_at, DateTime.utc_now())
   end
 
   # Kept on failure rather than blanked: tunnels that cannot be read are not tunnels that
   # are not there.
   defp load_tunnels(socket) do
-    case Sdn.tunnels() do
+    case Sdn.tunnels(sdn_opts()) do
       %{available?: true} = tunnels -> assign(socket, :tunnels, tunnels)
       %{available?: false} = tunnels -> assign(socket, :tunnels, %{tunnels | nodes: socket.assigns.tunnels.nodes})
     end
@@ -160,7 +268,123 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
           </div>
         </.panel>
 
+        <div class="grid gap-4 lg:grid-cols-2" id="sdn-routers">
+          <.panel id="sdn-t0-panel" title="Tier-0 Routers" subtitle="Physical uplink gateways">
+            <form id="t0-form" phx-submit="create_t0" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+              <input type="text" name="name" placeholder="Name (e.g. T0-Edge)" class="input input-xs input-bordered" required />
+              <input type="text" name="uplink_interface" placeholder="Uplink (eth0)" class="input input-xs input-bordered font-mono" />
+              <input type="text" name="uplink_ip" placeholder="Uplink IP/CIDR" class="input input-xs input-bordered font-mono" />
+              <div class="flex gap-1">
+                <input type="text" name="gateway_ip" placeholder="Gateway IP" class="input input-xs input-bordered font-mono flex-1" />
+                <button type="submit" class="btn btn-xs btn-primary">Add T0</button>
+              </div>
+            </form>
+
+            <p :if={@fabric.tier0 == []} class="text-xs opacity-55 italic">No Tier-0 routers defined.</p>
+            <table :if={@fabric.tier0 != []} class="table table-xs">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Uplink</th>
+                  <th>IP / Gateway</th>
+                  <th>T1s</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={t0 <- @fabric.tier0} id={"t0-row-#{dom_slug(t0.id || t0.name)}"}>
+                  <td class="font-medium">{t0.name}</td>
+                  <td class="font-mono">{t0.uplink_interface || "—"}</td>
+                  <td class="font-mono text-xs">{t0.uplink_ip || "—"} → {t0.gateway_ip || "—"}</td>
+                  <td class="tabular-nums">{length(t0.tier1)}</td>
+                  <td class="text-right">
+                    <button
+                      type="button"
+                      phx-click="delete_t0"
+                      phx-value-id={t0.id}
+                      id={"delete-t0-#{dom_slug(t0.id || t0.name)}"}
+                      class="btn btn-ghost btn-xs text-error"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </.panel>
+
+          <.panel id="sdn-t1-panel" title="Tier-1 Routers" subtitle="Tenant logical routers">
+            <form id="t1-form" phx-submit="create_t1" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+              <input type="text" name="name" placeholder="Name (e.g. T1-Prod)" class="input input-xs input-bordered" required />
+              <select name="t0_link_id" class="select select-xs select-bordered">
+                <option value="">No T0 uplink (isolated)</option>
+                <option :for={t0 <- @fabric.tier0} value={t0.id}>{t0.name}</option>
+              </select>
+              <label class="label cursor-pointer justify-start gap-2 text-xs">
+                <input type="checkbox" name="dhcp_enabled" value="true" class="checkbox checkbox-xs" />
+                <span>DHCP Relay</span>
+              </label>
+              <button type="submit" class="btn btn-xs btn-primary">Add T1</button>
+            </form>
+
+            <p :if={all_t1_routers(@fabric) == []} class="text-xs opacity-55 italic">No Tier-1 routers defined.</p>
+            <table :if={all_t1_routers(@fabric) != []} class="table table-xs">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Tier-0 Uplink</th>
+                  <th>DHCP</th>
+                  <th>Segments</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={t1 <- all_t1_routers(@fabric)} id={"t1-row-#{dom_slug(t1.id || t1.name)}"}>
+                  <td class="font-medium">{t1.name}</td>
+                  <td class="font-mono text-xs">{t1.t0_id || "detached"}</td>
+                  <td>
+                    <span :if={t1.dhcp_enabled?} class="badge badge-xs badge-success">on</span>
+                    <span :if={not t1.dhcp_enabled?} class="badge badge-xs badge-ghost">off</span>
+                  </td>
+                  <td class="tabular-nums">{length(t1.segments)}</td>
+                  <td class="text-right">
+                    <button
+                      type="button"
+                      phx-click="delete_t1"
+                      phx-value-id={t1.id}
+                      id={"delete-t1-#{dom_slug(t1.id || t1.name)}"}
+                      class="btn btn-ghost btn-xs text-error"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </.panel>
+        </div>
+
         <.panel id="sdn-segments" title="Segments" subtitle="Every overlay network and what is on it">
+          <form id="segment-form" phx-submit="create_segment" class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 mb-3">
+            <input type="text" name="name" placeholder="Segment name" class="input input-xs input-bordered" required />
+            <input type="number" name="vni" placeholder="VNI (e.g. 5001)" min="1" max="16777215" class="input input-xs input-bordered font-mono" required />
+            <input type="text" name="subnet_cidr" placeholder="CIDR (10.10.1.0/24)" class="input input-xs input-bordered font-mono" required />
+            <input type="text" name="gateway_ip" placeholder="Gateway IP" class="input input-xs input-bordered font-mono" />
+            <select name="t1_link_id" class="select select-xs select-bordered">
+              <option value="">No Tier-1 router</option>
+              <option :for={t1 <- all_t1_routers(@fabric)} value={t1.id}>{t1.name}</option>
+            </select>
+            <input type="text" name="dhcp_start" placeholder="DHCP start" class="input input-xs input-bordered font-mono" />
+            <input type="text" name="dhcp_end" placeholder="DHCP end" class="input input-xs input-bordered font-mono" />
+            <div class="flex items-center gap-2">
+              <label class="label cursor-pointer gap-1 text-xs">
+                <input type="checkbox" name="dhcp_enabled" value="true" class="checkbox checkbox-xs" />
+                <span>DHCP</span>
+              </label>
+              <button type="submit" class="btn btn-xs btn-primary flex-1">Add Segment</button>
+            </div>
+          </form>
+
           <p :if={@fabric.segments == []} class="text-sm opacity-55 italic">No segments defined.</p>
 
           <div :if={@fabric.segments != []} class="overflow-x-auto">
@@ -174,6 +398,7 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
                   <th>DHCP</th>
                   <th>Guests</th>
                   <th>Router</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -204,6 +429,19 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
                       detached
                     </span>
                   </td>
+                  <td class="text-right">
+                    <button
+                      type="button"
+                      phx-click="delete_segment"
+                      phx-value-id={segment.id}
+                      id={"delete-segment-#{dom_slug(segment.id || segment.name)}"}
+                      disabled={segment.guests != []}
+                      title={if segment.guests != [], do: "Detach guests before deleting segment", else: "Delete segment"}
+                      class="btn btn-ghost btn-xs text-error"
+                    >
+                      Delete
+                    </button>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -212,6 +450,27 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
 
         <div class="grid gap-4 lg:grid-cols-2">
           <.panel id="sdn-firewall" title="Distributed firewall" subtitle="In priority order">
+            <form id="firewall-form" phx-submit="create_firewall_rule" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+              <input type="text" name="description" placeholder="Rule description" class="input input-xs input-bordered col-span-2" required />
+              <input type="text" name="source_ip" placeholder="Source (any / CIDR)" class="input input-xs input-bordered font-mono" />
+              <input type="text" name="dest_ip" placeholder="Dest (any / CIDR)" class="input input-xs input-bordered font-mono" />
+              <select name="protocol" class="select select-xs select-bordered font-mono">
+                <option value="any">any</option>
+                <option value="tcp">tcp</option>
+                <option value="udp">udp</option>
+                <option value="icmp">icmp</option>
+              </select>
+              <input type="number" name="port" placeholder="Port (0=any)" class="input input-xs input-bordered font-mono" />
+              <select name="action" class="select select-xs select-bordered">
+                <option value="allow">allow</option>
+                <option value="deny">deny</option>
+              </select>
+              <div class="flex gap-1">
+                <input type="number" name="priority" placeholder="Prio (100)" value="100" class="input input-xs input-bordered font-mono w-20" />
+                <button type="submit" class="btn btn-xs btn-primary flex-1">Add Rule</button>
+              </div>
+            </form>
+
             <p :if={@fabric.firewall == []} class="text-sm opacity-55 italic">No rules defined.</p>
 
             <div :if={@fabric.firewall != []} class="overflow-x-auto">
@@ -224,10 +483,11 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
                     <th>Destination</th>
                     <th>Service</th>
                     <th>Action</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr :for={rule <- @fabric.firewall}>
+                  <tr :for={rule <- @fabric.firewall} id={"fw-rule-#{dom_slug(rule.id || rule.description)}"}>
                     <td class="tabular-nums opacity-55">{rule.priority}</td>
                     <td>{rule.description}</td>
                     <td class="font-mono">{rule.source}</td>
@@ -237,6 +497,17 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
                       <span class={["badge badge-xs", action_class(rule.action)]}>
                         {rule.action}
                       </span>
+                    </td>
+                    <td class="text-right">
+                      <button
+                        type="button"
+                        phx-click="delete_firewall_rule"
+                        phx-value-id={rule.id}
+                        id={"delete-fw-#{dom_slug(rule.id || rule.description)}"}
+                        class="btn btn-ghost btn-xs text-error"
+                      >
+                        Delete
+                      </button>
                     </td>
                   </tr>
                 </tbody>
@@ -281,6 +552,10 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
       </div>
     </Layouts.app>
     """
+  end
+
+  defp all_t1_routers(fabric) do
+    Enum.flat_map(fabric.tier0, & &1.tier1) ++ fabric.orphans.tier1
   end
 
   defp orphan_count(fabric),

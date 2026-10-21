@@ -23,6 +23,7 @@ mcli            text eol=lf
 mcli-runner     text eol=lf
 nodetool        text eol=lf
 allssh          text eol=lf
+saltrun         text eol=lf
 
 # Frontend assets are served to browsers, but keep them consistent anyway.
 *.js            text eol=lf

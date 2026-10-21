@@ -594,7 +594,7 @@ FLAP_RESTART_THRESHOLD = 3       # restarts before "active but no PID" reads as 
 # The only services that run as Podman containers. Everything else is a native systemd
 # unit whose PID comes from `systemctl show -p MainPID`; asking `podman top` about one of
 # those fails and yields no PID at all.
-CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
+CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa", "kass")
 
 # The declared inventory this node manages when converging toward the desired cluster
 # state, in start order. Stop order is the reverse.
@@ -622,9 +622,9 @@ CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
 # started before convergence can begin and stopped after it has finished. `spark-daemon`
 # is absent for a similar reason -- it is the process running this loop.
 MANAGED_SERVICES = (
-    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042},
-    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043},
-    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True},
+    {"unit": "hydra-db", "display": "HydraDB", "requires": (), "ready_port": 9042, "maintenance": "keep"},
+    {"unit": "daruk", "display": "Daruk", "requires": ("hydra-db",), "ready_port": 9043, "maintenance": "keep"},
+    {"unit": "sidon", "display": "Sidon", "requires": ("daruk",), "drain_before_stop": True, "maintenance": "keep"},
     {"unit": "spectrum", "display": "Spectrum", "requires": ("daruk",)},
     # The Phoenix console, on 8444 behind Slate. Slate's console backend points here, and
     # Bifrost's health guard will not bind the VIP while that backend is down, so a cluster
@@ -647,13 +647,28 @@ MANAGED_SERVICES = (
     {"unit": "mipha", "display": "Mipha", "requires": ("daruk",)},
     {"unit": "gatoway", "display": "Gatoway", "requires": ("daruk",)},
     {"unit": "urbosa", "display": "Urbosa", "requires": ("daruk",), "setting": "urbosa_enabled"},
-    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",)},
+    {"unit": "hylia", "display": "Hylia", "requires": ("daruk",), "maintenance": "keep"},
+    {"unit": "kass", "display": "Kass", "requires": ("daruk",), "ready_port": 9092},
 )
 MANAGED_SERVICE_ORDER = [entry["unit"] for entry in MANAGED_SERVICES]
 
-# In full host maintenance, all workloads and managed cluster services on the host are stopped.
-# The host agent (spark-daemon) remains alive to receive commands such as leave maintenance.
-MAINTENANCE_UNMANAGED_KEPT = ("spark-daemon",)
+# What a host in maintenance keeps running, and why (docs/maintenance.md). Maintenance moves the
+# guests off a host and silences everything that places, serves or acts on guests; it does not
+# take the host out of the metadata and storage planes, because the cluster's own margins are
+# built from them:
+#
+#   * ZooKeeper is a voter in the ensemble that holds the desired state and every election;
+#   * HydraDB is a replica of the metadata, and Daruk is the only way anything on the host (the
+#     leave sequence included) reaches it;
+#   * Sidon holds replicas of other hosts' vdisks -- stopping it degrades every vdisk with a copy
+#     here and gains nothing when the point is to empty the host of guests;
+#   * Hylia is the rolling upgrade's orchestrator, and an upgrade is what puts a host in
+#     maintenance in the first place, so stopping it would stop the operation that asked;
+#   * spark-daemon is the agent that is told to leave.
+#
+# The rows above carry `"maintenance": "keep"` for the managed ones; ZooKeeper and spark-daemon are
+# not in the table (they are not converged by the loop) and are named here.
+MAINTENANCE_UNMANAGED_KEPT = ("zookeeper", "spark-daemon")
 
 
 def maintenance_kept_units():
@@ -668,7 +683,7 @@ def maintenance_stopped_units():
 
 def maintenance_watchdog_units():
     """What the maintenance watchdog restarts if it dies, in start order."""
-    return maintenance_kept_units()
+    return ["zookeeper"] + maintenance_kept_units()
 
 
 # Cluster settings that gate a declared service, and how to read them.
@@ -1000,6 +1015,21 @@ def converge_to_desired_state(desired, full=False):
         return _converge_locked(desired, full)
 
 
+def is_witness_node():
+    """Whether this local node is configured as a witness quorum tie-breaker."""
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            hosts = cdata.get("hosts", [])
+            hostname = socket.gethostname()
+            for h in hosts:
+                if h.get("hostname") == hostname:
+                    return bool(h.get("is_witness") or h.get("role") == "witness")
+    except Exception:
+        pass
+    return False
+
+
 def _converge_locked(desired, full=False):
     """The body of `converge_to_desired_state`; see it for why this is behind a lock.
 
@@ -1021,6 +1051,8 @@ def _converge_locked(desired, full=False):
     Restart=always -- and a unit that exhausts its restart limit stays down until someone
     rewrites the desired state.
     """
+    if globals().get("is_witness_node", lambda: False)():
+        return
     running = desired.startswith("start")
     order = MANAGED_SERVICE_ORDER if running else list(reversed(MANAGED_SERVICE_ORDER))
     action = "start" if running else "stop"
@@ -1150,6 +1182,43 @@ def _converge_locked(desired, full=False):
     globals()["CONVERGE_RETRY"] = any(svc not in tainted for svc in targets)
 
 
+def reconcile_running_vm_vdisks():
+    """Ensure all locally running VMs have their required Sidon NBD sockets attached.
+
+    If Sidon was restarted while VMs were running, QEMU will buffer guest I/O
+    temporarily (with reconnect delay). Re-attaching the vdisks recreates the unix sockets
+    so running guests resume normal operation without dying.
+    """
+    try:
+        sidon = load_sidon_module()
+        attached_info = sidon.list_attached(timeout=10)
+        attached_set = {v.get("vdisk_id") for v in attached_info.get("attached", []) if isinstance(v, dict)}
+    except Exception:
+        return
+
+    res = subprocess.run("virsh list --state-running --name", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        return
+    running_vms = [v.strip() for v in res.stdout.decode("utf-8", errors="ignore").splitlines() if v.strip()]
+    if not running_vms:
+        return
+
+    import re
+    for vm in running_vms:
+        res_xml = subprocess.run(f"virsh dumpxml {vm}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res_xml.returncode != 0:
+            continue
+        xml = res_xml.stdout.decode("utf-8", errors="ignore")
+        vdisks = re.findall(r"/var/lib/hci/sidon/nbd/([^/\"']+)\.sock", xml)
+        for vd in set(vdisks):
+            if vd not in attached_set:
+                try:
+                    sidon.attach(vd, timeout=30)
+                    print(f"[Storage Reconnect] Re-attached vdisk {vd} for running guest {vm} after Sidon restart.", flush=True)
+                except Exception as e:
+                    print(f"[Storage Reconnect] Warning: could not re-attach vdisk {vd} for {vm}: {e}", flush=True)
+
+
 def zk_reconcile_loop():
     """Converge local services toward the desired cluster state published in ZooKeeper.
 
@@ -1241,6 +1310,8 @@ def zk_reconcile_loop():
                         last_drift_check = now
                         converge_to_desired_state(desired, full=changed)
                         applied = desired
+                        if desired.startswith("start"):
+                            reconcile_running_vm_vdisks()
                         # A pass that left work behind (a layer waiting on a port, on a
                         # unit still going down) asks to be run again soon.
                         retry_soon = bool(globals().get("CONVERGE_RETRY"))
@@ -1316,6 +1387,8 @@ def build_node_status():
     
     ip_addr = "127.0.0.1"
     hostname = socket.gethostname()
+    is_witness = False
+    role = "hypervisor"
     try:
         with open("/etc/hci/cluster.json", "r") as f:
             cdata = json.load(f)
@@ -1323,6 +1396,8 @@ def build_node_status():
             for h in hosts:
                 if h.get("hostname") == hostname:
                     ip_addr = h.get("ip")
+                    is_witness = bool(h.get("is_witness") or h.get("role") == "witness")
+                    role = h.get("role", "witness" if is_witness else "hypervisor")
                     break
             if ip_addr == "127.0.0.1" and hosts:
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1334,6 +1409,8 @@ def build_node_status():
                         if h.get("ip") == local_ip:
                             ip_addr = local_ip
                             hostname = h.get("hostname")
+                            is_witness = bool(h.get("is_witness") or h.get("role") == "witness")
+                            role = h.get("role", "witness" if is_witness else "hypervisor")
                             break
                 except Exception:
                     pass
@@ -1395,12 +1472,7 @@ def build_node_status():
     if 'LAST_PIDS_CACHE_TIME' not in globals():
         globals()['LAST_PIDS_CACHE_TIME'] = 0
 
-    # `aether` is gone and `sidon` took its place. This list is not cosmetic: vali's
-    # select_best_start_host() requires *every* service here to report UP, so a name that
-    # can never be UP means no VM can ever be placed. Leaving `aether` in after removing
-    # it did exactly that -- creates succeeded, starts refused with "No active hypervisor
-    # host has sufficient memory", and the memory had nothing to do with it.
-    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "agahnim", "slate", "kass"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -1420,15 +1492,26 @@ def build_node_status():
         "logos": "Logos",
         "mipha": "Mipha",
         "agahnim": "Agahnim",
-        "slate": "Slate"
+        "slate": "Slate",
+        "kass": "Kass"
     }
-    if check_urbosa_enabled():
-        services.append("urbosa")
-        svc_map["urbosa"] = "Urbosa"
+
+    if is_witness:
+        services = ["zookeeper", "spark-daemon"]
+        svc_map = {
+            "zookeeper": "ZooKeeper",
+            "spark-daemon": "Spark"
+        }
+    else:
+        if check_urbosa_enabled():
+            services.append("urbosa")
+            svc_map["urbosa"] = "Urbosa"
     
     result = {
         "ip": ip_addr,
         "hostname": hostname,
+        "is_witness": is_witness,
+        "role": role,
         "zk_leader": is_leader,
         "maintenance_status": maint_status,
         "disks": disks_count,
@@ -1643,7 +1726,7 @@ VM_POWER_ACTIONS = ("start", "destroy", "reboot", "shutdown", "reset", "suspend"
 # between a stale call site that is invisible and one that reports itself.
 MANAGED_UNITS = frozenset((
     "agahnim", "bifrost", "catalyst", "chronyd", "dagur", "daruk", "gatoway",
-    "hydra-db", "hylia", "libvirtd", "logos", "mimir", "mipha", "rauru", "sidon", "slate",
+    "hydra-db", "hylia", "kass", "libvirtd", "logos", "mimir", "mipha", "rauru", "sidon", "slate",
     "spark-daemon", "spectrum", "spectrum-phx", "urbosa", "vali", "virtqemud", "zookeeper",
 ))
 
@@ -1985,10 +2068,12 @@ def parse_virsh_domiflist(text):
 # is built here from validated fields (the disks' and CD-ROMs' through helios_sidon, the same
 # builders the domain is created from).
 
-LIVE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk")
+LIVE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk", "resources", "pci", "usb")
 LIVE_NIC_MODELS = ("virtio", "e1000", "e1000e", "rtl8139")
 LIVE_MAC_RE = re.compile(r"\A[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}\Z")
 LIVE_BRIDGE_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,15}\Z")
+LIVE_PCI_BDF_RE = re.compile(r"\A(?:([0-9a-fA-F]{4}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])\Z")
+LIVE_USB_ID_RE = re.compile(r"\A([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\Z")
 # vda is the boot disk and is never hot-removed; sda... are the CD-ROM drives.
 LIVE_DATA_DISK_RE = re.compile(r"\Avd[b-z]\Z")
 LIVE_ANY_DISK_RE = re.compile(r"\Avd[a-z]\Z")
@@ -1996,6 +2081,40 @@ LIVE_CDROM_RE = re.compile(r"\Asd[a-z]\Z")
 LIVE_MIN_MEMORY_MIB = 128
 # The placeholder a step's argv uses for the temporary XML file its `xml` is written to.
 LIVE_XML_PATH = "{xml}"
+
+
+def _pci_hostdev_xml(bdf):
+    """Build a libvirt <hostdev> PCI passthrough element from a validated BDF string."""
+    match = LIVE_PCI_BDF_RE.match(str(bdf or "").strip())
+    if not match:
+        return None, None
+    dom = (match.group(1) or "0000").lower()
+    bus = match.group(2).lower()
+    slot = match.group(3).lower()
+    func = match.group(4).lower()
+    norm = "%s:%s:%s.%s" % (dom, bus, slot, func)
+    xml = (
+        "<hostdev mode='subsystem' type='pci' managed='yes'>"
+        "<source><address domain='0x%s' bus='0x%s' slot='0x%s' function='0x%s'/></source>"
+        "</hostdev>" % (dom, bus, slot, func)
+    )
+    return norm, xml
+
+
+def _usb_hostdev_xml(usb_id):
+    """Build a libvirt <hostdev> USB passthrough element from a validated vendor:product string."""
+    match = LIVE_USB_ID_RE.match(str(usb_id or "").strip())
+    if not match:
+        return None, None
+    vendor = match.group(1).lower()
+    product = match.group(2).lower()
+    norm = "%s:%s" % (vendor, product)
+    xml = (
+        "<hostdev mode='subsystem' type='usb' managed='yes'>"
+        "<source><vendor id='0x%s'/><product id='0x%s'/></source>"
+        "</hostdev>" % (vendor, product)
+    )
+    return norm, xml
 
 
 def _live_int(value):
@@ -2040,7 +2159,7 @@ def plan_live_change(name, payload, info):
                  "xml": None, "what": "set vCPUs to %d" % count}], None
 
     if op == "memory":
-        mib = _live_int(payload.get("mib"))
+        mib = _live_int(payload.get("mib") if payload.get("mib") is not None else payload.get("size_mib"))
         if mib is None or mib < LIVE_MIN_MEMORY_MIB:
             return None, "mib must be a whole number of MiB, at least %d" % LIVE_MIN_MEMORY_MIB
         maximum = info.get("mem_max_kib")
@@ -2050,10 +2169,15 @@ def plan_live_change(name, payload, info):
             return None, ("%d MiB is above this domain's maximum of %d MiB. The maximum is fixed "
                           "when the domain is defined: enable vm_hotplug_headroom and restart the "
                           "VM to raise it" % (mib, maximum // 1024))
-        # --live only: this is the balloon, a runtime target between the domain's floor and its
-        # configured memory. The persistent definition is rebuilt from the VM's record at every
-        # start, so a --config here would claim a persistence it does not have.
-        return [{"argv": VIRSH + ["setmem", name, str(mib * 1024), "--live"],
+        if payload.get("mode") == "dimm":
+            dimm_size = _live_int(payload.get("size_mib")) or mib
+            dimm_xml = ("<memory model='dimm'><target><size unit='MiB'>%d</size><node>0</node></target></memory>" % dimm_size)
+            return [{"argv": VIRSH + ["attach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": dimm_xml, "what": "hotplug a %d MiB DIMM to %s" % (dimm_size, name)}], None
+
+        # --live only by default (balloon); --live --config when persist is requested.
+        flags = ["--live", "--config"] if payload.get("persist") else ["--live"]
+        return [{"argv": VIRSH + ["setmem", name, str(mib * 1024)] + flags,
                  "xml": None, "what": "set the memory balloon to %d MiB" % mib}], None
 
     if op == "cdrom":
@@ -2139,7 +2263,76 @@ def plan_live_change(name, payload, info):
             return None, "size_bytes must be a whole number of KiB, at least 1 MiB"
         return [{"argv": VIRSH + ["blockresize", name, target, str(size // 1024)],
                  "xml": None, "what": "tell the guest's disk %s it is now %d bytes" % (target, size)}], None
-    return None, "action must be attach, detach or resize"
+    if action == "throttle":
+        if not isinstance(target, str) or not LIVE_ANY_DISK_RE.match(target):
+            return None, "target must be a disk such as vda or vdb"
+        iops = _live_int(payload.get("iops"))
+        bps = _live_int(payload.get("bytes_sec"))
+        args = []
+        if iops is not None:
+            args.extend(["--total-iops-sec", str(iops)])
+        if bps is not None:
+            args.extend(["--total-bytes-sec", str(bps)])
+        if not args:
+            return None, "at least one of iops or bytes_sec is required"
+        return [{"argv": VIRSH + ["blkdeviotune", name, target] + args + ["--live", "--config"],
+                 "xml": None, "what": "throttle disk %s on %s" % (target, name)}], None
+    if op == "resources":
+        steps = []
+        sched_args = []
+        cpu_shares = _live_int(payload.get("cpu_shares"))
+        if cpu_shares is not None:
+            if cpu_shares < 2 or cpu_shares > 262144:
+                return None, "cpu_shares must be between 2 and 262144"
+            sched_args.append("cpu_shares=%d" % cpu_shares)
+        cpu_limit = _live_int(payload.get("cpu_limit"))
+        if cpu_limit is not None:
+            sched_args.append("vcpu_quota=%d" % (cpu_limit * 1000 if cpu_limit > 0 else -1))
+        if sched_args:
+            steps.append({
+                "argv": VIRSH + ["schedinfo", name] + sched_args + ["--live", "--config"],
+                "xml": None, "what": "set CPU scheduler limits on %s" % name
+            })
+        mem_args = []
+        mem_limit = _live_int(payload.get("mem_limit"))
+        if mem_limit is not None:
+            mem_args.extend(["--hard-limit", str(mem_limit * 1024)])
+        mem_reservation = _live_int(payload.get("mem_reservation"))
+        if mem_reservation is not None:
+            mem_args.extend(["--min-guarantee", str(mem_reservation * 1024)])
+        if mem_args:
+            steps.append({
+                "argv": VIRSH + ["memtune", name] + mem_args + ["--live", "--config"],
+                "xml": None, "what": "set memory tuning limits on %s" % name
+            })
+        if not steps:
+            return None, "no resource limits specified"
+        return steps, None
+    if op == "pci":
+        action = payload.get("action")
+        norm_bdf, xml = _pci_hostdev_xml(payload.get("bdf"))
+        if not norm_bdf:
+            return None, "bdf must be a PCI address such as 0000:01:00.0"
+        if action == "attach":
+            return [{"argv": VIRSH + ["attach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "attach PCI device %s to %s" % (norm_bdf, name)}], None
+        if action == "detach":
+            return [{"argv": VIRSH + ["detach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "detach PCI device %s from %s" % (norm_bdf, name)}], None
+        return None, "action must be attach or detach"
+    if op == "usb":
+        action = payload.get("action")
+        norm_usb, xml = _usb_hostdev_xml(payload.get("usb_id"))
+        if not norm_usb:
+            return None, "usb_id must be a vendor:product hex pair such as 046d:c52b"
+        if action == "attach":
+            return [{"argv": VIRSH + ["attach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "attach USB device %s to %s" % (norm_usb, name)}], None
+        if action == "detach":
+            return [{"argv": VIRSH + ["detach-device", name, LIVE_XML_PATH, "--live", "--config"],
+                     "xml": xml, "what": "detach USB device %s from %s" % (norm_usb, name)}], None
+        return None, "action must be attach or detach"
+    return None, "action must be attach, detach, resize or throttle"
 
 
 def read_live_domain_info(name):
@@ -3137,6 +3330,9 @@ def schedule_host_reboot(delay=2):
 
 
 class SparkDaemonHandler(BaseHTTPRequestHandler):
+    rbufsize = 1 << 20
+    disable_nagle_algorithm = True
+
     def log_message(self, format, *args):
         pass
 
@@ -3197,8 +3393,8 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(res_bytes)
         except Exception as e:
-            # Fallback for single-node cluster recovery when Vali is down and a leave command is requested
-            if path == "/api/v1/hosts/maintenance" and payload.get("action") == "leave":
+            # Fallback for cluster maintenance when Vali is down
+            if path == "/api/v1/hosts/maintenance":
                 hosts_data = []
                 if os.path.exists("/etc/hci/cluster.json"):
                     try:
@@ -3218,9 +3414,10 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     pass
                 
                 other_ips = [h.get("ip") for h in hosts_data if h.get("ip") and h.get("ip") != local_ip]
+                action_name = payload.get("action", "maintenance")
                 
                 if len(hosts_data) > 1 and other_ips:
-                    print(f"[Spark Daemon] Local Vali is offline. Multi-node cluster detected. Attempting to delegate leave maintenance request to remote spark daemons: {other_ips}")
+                    print(f"[Spark Daemon] Local Vali is offline. Multi-node cluster detected. Attempting to delegate {action_name} maintenance request to remote spark daemons: {other_ips}")
                     context_remote = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt")
                     context_remote.load_cert_chain(certfile="/etc/hci/spark/certs/node.crt", keyfile="/etc/hci/spark/certs/node.key")
                     # Every address here comes from cluster.json, so each one is the IP its
@@ -3241,22 +3438,22 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                                 self.end_headers()
                                 self.wfile.write(res_bytes)
                                 forward_success = True
-                                print(f"[Spark Daemon] Successfully delegated leave maintenance request to remote node {remote_ip}.")
+                                print(f"[Spark Daemon] Successfully delegated {action_name} maintenance request to remote node {remote_ip}.")
                                 break
                         except Exception as rex:
-                            print(f"[Spark Daemon] Failed to delegate leave maintenance request to remote node {remote_ip}: {rex}")
+                            print(f"[Spark Daemon] Failed to delegate {action_name} maintenance request to remote node {remote_ip}: {rex}")
                     
                     if forward_success:
                         return
                     else:
-                        print("[Spark Daemon] All remote delegation attempts failed. Falling back to local bootstrapping...")
+                        print(f"[Spark Daemon] All remote delegation attempts failed for {action_name}.")
                 
                 print("[Spark Daemon] Vali is offline during maintenance leave. Bootstrapping local services directly...")
                 try:
                     if os.path.exists("/etc/hci/maintenance.state"):
                         os.remove("/etc/hci/maintenance.state")
                     
-                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum spectrum-phx bifrost dagur mimir rauru vali catalyst gatoway logos mipha daruk agahnim slate"
+                    start_cmd = "systemctl start zookeeper hydra-db sidon spectrum spectrum-phx bifrost dagur mimir rauru vali catalyst gatoway logos mipha daruk agahnim slate kass"
                     subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
                     self.send_json_response(200, {
@@ -3464,7 +3661,7 @@ class SparkDaemonHandler(BaseHTTPRequestHandler):
                     out_lines.append(f"\n        Host: {BOLD}{ip_addr}{RESET} {GREEN}Up{RESET} {GRAY}({hostname}){leader_str}{RESET}{maint_str}")
                     
                     services = data.get("services", {})
-                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Phoenix", "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate"]
+                    svc_list = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Phoenix", "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia", "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Kass"]
                     if "Urbosa" in services:
                         svc_list.append("Urbosa")
                     for svc_name in svc_list:
@@ -3919,7 +4116,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     raise Exception(f"Daruk proxy failed to listen on port 9043 on {ip}")
             
             # Start spectrum and other services
-            services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia"]
+            services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "logos", "mipha", "agahnim", "slate", "kass", "hylia"]
             for svc in services:
                 run_parallel_checked(servers, f"systemctl start {svc}")
                 for ip in servers:
@@ -4011,7 +4208,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop services on all hosts in parallel
         # 2. Stop services on all hosts in parallel
-        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "kass", "sidon", "daruk", "hydra-db", "zookeeper"]
         svc_list = " ".join(services)
         run_parallel(hosts, f"systemctl stop {svc_list} || true")
         
@@ -4231,8 +4428,8 @@ for dev, mount in claimed:
 # Clean up the extent store
 subprocess.run("systemctl stop sidon || true", shell=True)
 subprocess.run(__SIDON_TEARDOWN__, shell=True)
-subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum spectrum-phx || true", shell=True)
-subprocess.run("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", shell=True)
+subprocess.run("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum spectrum-phx systemd-kass || true", shell=True)
+subprocess.run("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/kafka/data /var/lib/hci/kafka/log /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", shell=True)
 subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", shell=True)
 """
         # One shell command, shared with the unmount above.
@@ -4323,6 +4520,12 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/host/dhcp-leases":
             self.handle_host_dhcp_leases()
             return True
+        if path == "/api/v1/host/pci":
+            self.handle_host_pci()
+            return True
+        if path == "/api/v1/host/usb":
+            self.handle_host_usb()
+            return True
         if path == "/api/v1/db/ring":
             self.handle_db_ring()
             return True
@@ -4330,7 +4533,7 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         segments = [segment for segment in path.split("/") if segment]
         if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"]:
             action = segments[4]
-            if action not in ("interfaces", "console", "info"):
+            if action not in ("interfaces", "console", "info", "guest-agent", "serial"):
                 return False
             name = urllib.parse.unquote(segments[3])
             if not valid_name(name):
@@ -4340,6 +4543,10 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                 self.handle_vm_interfaces(name)
             elif action == "console":
                 self.handle_vm_console(name)
+            elif action == "guest-agent":
+                self.handle_vm_guest_agent_get(name)
+            elif action == "serial":
+                self.handle_vm_serial_get(name)
             else:
                 self.handle_vm_info(name)
             return True
@@ -4394,6 +4601,9 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/host/maintenance-state":
             self.handle_host_maintenance_state()
             return True
+        if path == "/api/v1/host/salt":
+            self.handle_host_salt()
+            return True
 
         segments = [segment for segment in path.split("/") if segment]
         if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "power":
@@ -4424,10 +4634,290 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                 return True
             self.handle_vm_migrate(name)
             return True
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "guest-agent":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_guest_agent_post(name)
+            return True
+        if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"] and segments[4] == "serial":
+            name = urllib.parse.unquote(segments[3])
+            if not valid_name(name):
+                self.reject("Invalid VM name")
+                return True
+            self.handle_vm_serial_post(name)
+            return True
 
         return False
 
     # -- VM ------------------------------------------------------------
+
+    def _qga_cmd(self, name, execute_cmd, arguments=None, timeout=5):
+        payload = {"execute": execute_cmd}
+        if arguments is not None:
+            payload["arguments"] = arguments
+        rc, stdout, stderr = run_argv(
+            VIRSH + ["qemu-agent-command", "--timeout", str(int(timeout)), name, json.dumps(payload)],
+            timeout=max(10, int(timeout) + 5),
+        )
+        if rc != 0:
+            return False, None, (stderr or stdout or "qemu-agent-command failed").strip()
+        try:
+            parsed = json.loads((stdout or "").strip() or "{}")
+            return True, parsed.get("return"), None
+        except Exception as exc:
+            return False, None, str(exc)
+
+    def handle_vm_guest_agent_get(self, name):
+        """Query QEMU Guest Agent for connectivity, hostname, OS info, and live IP addresses."""
+        ok_ping, _, _ = self._qga_cmd(name, "guest-ping", timeout=2)
+        if not ok_ping:
+            self.send_json_response(200, {
+                "connected": False,
+                "hostname": None,
+                "os_info": {},
+                "ips": [],
+                "interfaces": [],
+                "fsfreeze_status": None,
+            })
+            return
+
+        _, host_ret, _ = self._qga_cmd(name, "guest-get-host-name", timeout=3)
+        hostname = host_ret.get("host-name") if isinstance(host_ret, dict) else None
+
+        _, os_ret, _ = self._qga_cmd(name, "guest-get-osinfo", timeout=3)
+        os_info = os_ret if isinstance(os_ret, dict) else {}
+
+        _, freeze_ret, _ = self._qga_cmd(name, "guest-fsfreeze-status", timeout=3)
+        fsfreeze_status = freeze_ret if isinstance(freeze_ret, str) else None
+
+        _, if_ret, _ = self._qga_cmd(name, "guest-network-get-interfaces", timeout=4)
+        interfaces = []
+        flat_ips = []
+        if isinstance(if_ret, list):
+            for iface in if_ret:
+                if not isinstance(iface, dict):
+                    continue
+                ifname = str(iface.get("name") or "")
+                mac = str(iface.get("hardware-address") or "")
+                ip_list = []
+                for addr in (iface.get("ip-addresses") or []):
+                    if not isinstance(addr, dict):
+                        continue
+                    ip_str = str(addr.get("ip-address") or "").strip()
+                    prefix = addr.get("prefix")
+                    if not ip_str:
+                        continue
+                    ip_list.append("%s/%s" % (ip_str, prefix) if prefix is not None else ip_str)
+                    if not ip_str.startswith("127.") and ip_str != "::1" and not ip_str.startswith("fe80:"):
+                        if ip_str not in flat_ips:
+                            flat_ips.append(ip_str)
+                interfaces.append({
+                    "name": ifname,
+                    "mac": mac,
+                    "ips": ip_list,
+                })
+
+        self.send_json_response(200, {
+            "connected": True,
+            "hostname": hostname,
+            "os_info": os_info,
+            "ips": flat_ips,
+            "interfaces": interfaces,
+            "fsfreeze_status": fsfreeze_status,
+        })
+
+    def handle_vm_guest_agent_post(self, name):
+        """Run an action on the QEMU Guest Agent (ping, fsfreeze-freeze, fsfreeze-thaw, set-user-password, exec)."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action = str(payload.get("action") or "").strip()
+        allowed = ("ping", "fsfreeze-freeze", "fsfreeze-thaw", "fsfreeze-status", "set-user-password", "exec")
+        if action not in allowed:
+            self.reject("action must be one of " + ", ".join(allowed))
+            return
+
+        if action == "ping":
+            ok, _, err = self._qga_cmd(name, "guest-ping", timeout=3)
+            self.send_json_response(200 if ok else 409, {"ok": ok, "error": err})
+            return
+
+        if action in ("fsfreeze-freeze", "fsfreeze-thaw", "fsfreeze-status"):
+            cmd = "guest-" + action
+            ok, ret, err = self._qga_cmd(name, cmd, timeout=15)
+            self.send_json_response(200 if ok else 409, {"ok": ok, "result": ret, "error": err})
+            return
+
+        if action == "set-user-password":
+            username = str(payload.get("username") or "").strip()
+            password = str(payload.get("password") or "")
+            if not username or not password:
+                self.reject("username and password are required")
+                return
+            b64_pw = base64.b64encode(password.encode("utf-8")).decode("ascii")
+            ok, ret, err = self._qga_cmd(name, "guest-set-user-password", {
+                "username": username,
+                "password": b64_pw,
+                "crypted": False,
+            }, timeout=10)
+            self.send_json_response(200 if ok else 409, {"ok": ok, "result": ret, "error": err})
+            return
+
+        if action == "exec":
+            path_bin = str(payload.get("path") or "/bin/sh").strip()
+            args = payload.get("args")
+            if args is None:
+                cmd_str = str(payload.get("command") or "").strip()
+                if not cmd_str:
+                    self.reject("command or args is required")
+                    return
+                if path_bin.lower().endswith("cmd.exe"):
+                    args = ["/c", cmd_str]
+                elif path_bin.lower().endswith("powershell.exe"):
+                    args = ["-NoProfile", "-NonInteractive", "-Command", cmd_str]
+                else:
+                    args = ["-c", cmd_str]
+            elif not isinstance(args, list):
+                self.reject("args must be a list of strings")
+                return
+            ok, ret, err = self._qga_cmd(name, "guest-exec", {
+                "path": path_bin,
+                "arg": [str(a) for a in args],
+                "capture-output": True,
+            }, timeout=10)
+            if not ok or not isinstance(ret, dict) or "pid" not in ret:
+                self.send_json_response(409, {"ok": False, "error": err or "guest-exec failed"})
+                return
+            pid = ret["pid"]
+            for _ in range(30):
+                ok_s, s_ret, s_err = self._qga_cmd(name, "guest-exec-status", {"pid": pid}, timeout=3)
+                if not ok_s or not isinstance(s_ret, dict):
+                    self.send_json_response(409, {"ok": False, "error": s_err or "guest-exec-status failed"})
+                    return
+                if s_ret.get("exited"):
+                    out_b64 = s_ret.get("out-data") or ""
+                    err_b64 = s_ret.get("err-data") or ""
+                    stdout_str = base64.b64decode(out_b64).decode("utf-8", errors="replace") if out_b64 else ""
+                    stderr_str = base64.b64decode(err_b64).decode("utf-8", errors="replace") if err_b64 else ""
+                    self.send_json_response(200, {
+                        "ok": True,
+                        "exitcode": s_ret.get("exitcode", 0),
+                        "stdout": stdout_str,
+                        "stderr": stderr_str,
+                    })
+                    return
+                time.sleep(0.25)
+            self.send_json_response(200, {"ok": True, "pid": pid, "running": True})
+            return
+
+    def _read_pty_nonblocking(self, pty_path, wait_seconds=0.35, max_bytes=32768):
+        import select
+        if not pty_path or not os.path.exists(pty_path):
+            return ""
+        chunks = []
+        total = 0
+        fd = None
+        try:
+            fd = os.open(pty_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+            deadline = time.time() + float(wait_seconds)
+            while time.time() < deadline and total < max_bytes:
+                rlist, _, _ = select.select([fd], [], [], max(0.02, deadline - time.time()))
+                if not rlist:
+                    break
+                data = os.read(fd, min(4096, max_bytes - total))
+                if not data:
+                    break
+                chunks.append(data)
+                total += len(data)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return b"".join(chunks).decode("utf-8", errors="replace")
+
+    def handle_vm_serial_get(self, name):
+        """Return the VM's serial PTY device path and any immediately readable output."""
+        rc, stdout, stderr = run_argv(VIRSH + ["ttyconsole", name], timeout=10)
+        if rc != 0:
+            self.send_json_response(200, {
+                "available": False,
+                "pty": None,
+                "output": "",
+                "error": (stderr or stdout or "serial console not active").strip(),
+            })
+            return
+        pty_path = (stdout or "").strip().splitlines()[0].strip() if (stdout or "").strip() else ""
+        output = self._read_pty_nonblocking(pty_path, wait_seconds=0.15) if pty_path else ""
+        self.send_json_response(200, {
+            "available": bool(pty_path),
+            "pty": pty_path or None,
+            "output": output,
+        })
+
+    def handle_vm_serial_post(self, name):
+        """Write input to a running VM's serial PTY and read back the console response."""
+        import select
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        data_str = str(payload.get("input") or "")
+        append_newline = payload.get("newline", True) is not False
+        rc, stdout, stderr = run_argv(VIRSH + ["ttyconsole", name], timeout=10)
+        if rc != 0:
+            self.reject((stderr or stdout or "VM serial console is not active").strip(), 409)
+            return
+        pty_path = (stdout or "").strip().splitlines()[0].strip() if (stdout or "").strip() else ""
+        if not pty_path or not os.path.exists(pty_path):
+            self.reject("Serial PTY device %r is not present on this host" % pty_path, 409)
+            return
+        fd = None
+        chunks = []
+        total = 0
+        try:
+            fd = os.open(pty_path, os.O_RDWR | os.O_NONBLOCK | os.O_NOCTTY)
+            # Drain stale bytes before sending input
+            while True:
+                rlist, _, _ = select.select([fd], [], [], 0.02)
+                if not rlist:
+                    break
+                stale = os.read(fd, 4096)
+                if not stale:
+                    break
+                chunks.append(stale)
+            out_bytes = (data_str + ("\r\n" if append_newline else "")).encode("utf-8")
+            os.write(fd, out_bytes)
+            deadline = time.time() + 0.8
+            while time.time() < deadline and total < 32768:
+                rlist, _, _ = select.select([fd], [], [], max(0.05, deadline - time.time()))
+                if not rlist:
+                    break
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        except OSError as exc:
+            self.reject("Serial PTY I/O error: %s" % exc, 500)
+            return
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.send_json_response(200, {
+            "ok": True,
+            "pty": pty_path,
+            "output": b"".join(chunks).decode("utf-8", errors="replace"),
+        })
 
     def handle_vm_interfaces(self, name):
         rc, stdout, stderr = run_argv(VIRSH + ["domiflist", name], timeout=30)
@@ -5026,6 +5516,12 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             return
 
         try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
+
+        try:
             sidon = load_sidon_module()
         except Exception as exc:
             self.send_json_response(500, {"error": "helios_sidon is unavailable: %s" % exc})
@@ -5329,6 +5825,157 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
     def handle_host_dhcp_leases(self):
         self.send_json_response(200, {"leases": read_dhcp_leases()})
 
+    def handle_host_pci(self):
+        """Enumerate PCI devices and IOMMU groups on this host from sysfs / lspci."""
+        devices = []
+        lspci_map = {}
+        rc_l, out_l, _ = run_argv(["lspci", "-Dnn"], timeout=10)
+        if rc_l == 0 and out_l:
+            for line in out_l.splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    lspci_map[parts[0].strip().lower()] = parts[1].strip()
+        pci_root = "/sys/bus/pci/devices"
+        try:
+            bdfs = sorted(os.listdir(pci_root)) if os.path.isdir(pci_root) else sorted(lspci_map.keys())
+        except OSError:
+            bdfs = sorted(lspci_map.keys())
+        for bdf in bdfs:
+            dev_dir = os.path.join(pci_root, bdf)
+            vendor = read_sysfs_value(os.path.join(dev_dir, "vendor")) or ""
+            device = read_sysfs_value(os.path.join(dev_dir, "device")) or ""
+            iommu_group = None
+            iommu_link = os.path.join(dev_dir, "iommu_group")
+            if os.path.islink(iommu_link):
+                try:
+                    iommu_group = os.path.basename(os.readlink(iommu_link))
+                except OSError:
+                    iommu_group = None
+            driver = None
+            driver_link = os.path.join(dev_dir, "driver")
+            if os.path.islink(driver_link):
+                try:
+                    driver = os.path.basename(os.readlink(driver_link))
+                except OSError:
+                    driver = None
+            devices.append({
+                "bdf": bdf.lower(),
+                "vendor": vendor,
+                "device": device,
+                "iommu_group": iommu_group,
+                "driver": driver,
+                "description": lspci_map.get(bdf.lower(), ""),
+            })
+        self.send_json_response(200, {
+            "iommu_enabled": any(d.get("iommu_group") is not None for d in devices),
+            "devices": devices,
+        })
+
+    def handle_host_usb(self):
+        """Enumerate USB devices on this host from sysfs / lsusb."""
+        devices = []
+        seen = set()
+        rc_u, out_u, _ = run_argv(["lsusb"], timeout=10)
+        if rc_u == 0 and out_u:
+            for line in out_u.splitlines():
+                # Example: Bus 001 Device 002: ID 0627:0001 Adomax Technology Co., Ltd QEMU USB Tablet
+                m = re.match(
+                    r"\ABus\s+(\d+)\s+Device\s+(\d+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*(.*)\Z",
+                    line.strip(),
+                )
+                if not m:
+                    continue
+                bus, dev, vendor, product, desc = m.groups()
+                usb_id = "%s:%s" % (vendor.lower(), product.lower())
+                # Skip Linux Foundation root hubs (1d6b:*) by default unless needed, or mark root_hub
+                is_hub = vendor.lower() == "1d6b"
+                seen.add((bus, dev, usb_id))
+                devices.append({
+                    "usb_id": usb_id,
+                    "bus": bus,
+                    "device": dev,
+                    "vendor": vendor.lower(),
+                    "product": product.lower(),
+                    "description": desc.strip(),
+                    "is_root_hub": is_hub,
+                })
+        usb_root = "/sys/bus/usb/devices"
+        if not devices and os.path.isdir(usb_root):
+            try:
+                entries = sorted(os.listdir(usb_root))
+            except OSError:
+                entries = []
+            for entry in entries:
+                dev_dir = os.path.join(usb_root, entry)
+                vendor = (read_sysfs_value(os.path.join(dev_dir, "idVendor")) or "").strip().lower()
+                product = (read_sysfs_value(os.path.join(dev_dir, "idProduct")) or "").strip().lower()
+                if not (len(vendor) == 4 and len(product) == 4):
+                    continue
+                usb_id = "%s:%s" % (vendor, product)
+                bus = (read_sysfs_value(os.path.join(dev_dir, "busnum")) or "").strip()
+                dev = (read_sysfs_value(os.path.join(dev_dir, "devnum")) or "").strip()
+                mfg = (read_sysfs_value(os.path.join(dev_dir, "manufacturer")) or "").strip()
+                prod_str = (read_sysfs_value(os.path.join(dev_dir, "product")) or "").strip()
+                desc = (" ".join(p for p in (mfg, prod_str) if p)).strip()
+                devices.append({
+                    "usb_id": usb_id,
+                    "bus": bus,
+                    "device": dev,
+                    "vendor": vendor,
+                    "product": product,
+                    "description": desc,
+                    "is_root_hub": vendor == "1d6b",
+                })
+        self.send_json_response(200, {"devices": devices})
+
+    def handle_host_salt(self):
+        """Execute an allowlisted SaltStack operation via /usr/local/bin/saltrun."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action = str(payload.get("action") or "").strip()
+        allowed_actions = ("ping", "state.apply", "highstate", "grains", "pillar", "runner", "status", "list-formulas")
+        if action not in allowed_actions:
+            self.reject("action must be one of " + ", ".join(allowed_actions))
+            return
+        saltrun_bin = "/usr/local/bin/saltrun"
+        argv = ["python3", saltrun_bin, action]
+        if action == "state.apply":
+            state = str(payload.get("state") or "helios.base").strip()
+            if not re.match(r"\A[A-Za-z0-9_.-]{1,64}\Z", state):
+                self.reject("Invalid state name")
+                return
+            argv.append(state)
+            if payload.get("test") is True:
+                argv.append("--test")
+        elif action == "highstate":
+            if payload.get("test") is True:
+                argv.append("--test")
+        elif action == "grains":
+            key = str(payload.get("key") or "").strip()
+            if key:
+                if not re.match(r"\A[A-Za-z0-9_:.-]{1,64}\Z", key):
+                    self.reject("Invalid grain key")
+                    return
+                argv.append(key)
+        elif action == "runner":
+            func = str(payload.get("runner_func") or "manage.status").strip()
+            if not re.match(r"\A[A-Za-z0-9_.-]{1,64}\Z", func):
+                self.reject("Invalid runner function")
+                return
+            argv.append(func)
+        if action in ("ping", "state.apply", "highstate", "grains", "pillar"):
+            argv.append("--local")
+        rc, stdout, stderr = run_argv(argv, timeout=180)
+        self.send_json_response(200 if rc == 0 else 409, {
+            "action": action,
+            "ok": rc == 0,
+            "returncode": rc,
+            "stdout": (stdout or "").strip(),
+            "stderr": (stderr or "").strip(),
+        })
+
     def handle_host_reboot(self):
         payload, error = self.read_json_payload()
         if error:
@@ -5555,15 +6202,28 @@ def check_cluster_and_autostart():
     cluster_state = "unknown"
     if quorum_established:
         try:
-            res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state",
-                                       shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out_state = res_state.stdout.decode("utf-8", errors="ignore")
-            if "started" in out_state:
-                cluster_state = "started"
-            elif "stopped" in out_state:
-                cluster_state = "stopped"
-        except Exception as e:
-            print(f"[AUTOSTART] Error querying cluster state from ZooKeeper: {e}")
+            zkmod = _load_helios_zk()
+            zk_client = zkmod.connect(get_zk_hosts(), timeout=3.0, session_timeout_ms=5000)
+            try:
+                raw_data, _ = zk_client.get(ZK_CLUSTER_STATE)
+                if raw_data:
+                    if b"started" in raw_data:
+                        cluster_state = "started"
+                    elif b"stopped" in raw_data:
+                        cluster_state = "stopped"
+            finally:
+                zk_client.close()
+        except Exception:
+            try:
+                res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state",
+                                           shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out_state = res_state.stdout.decode("utf-8", errors="ignore")
+                if "started" in out_state:
+                    cluster_state = "started"
+                elif "stopped" in out_state:
+                    cluster_state = "stopped"
+            except Exception as e:
+                print(f"[AUTOSTART] Error querying cluster state from ZooKeeper: {e}")
 
     if cluster_state == "unknown":
         print("[AUTOSTART] The desired cluster state could not be read, so nothing is started or "
@@ -5619,22 +6279,36 @@ def check_cluster_and_autostart():
                 
             if not quorum_established:
                 continue
-                
+
+            if globals().get("is_witness_node", lambda: False)():
+                continue
+
             # Query ZooKeeper for cluster state
             cluster_state = "stopped"
             try:
-                res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state", 
-                                           shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out_state = res_state.stdout.decode("utf-8", errors="ignore")
-                if "started" in out_state:
-                    cluster_state = "started"
+                zkmod = _load_helios_zk()
+                zk_client = zkmod.connect(get_zk_hosts(), timeout=3.0, session_timeout_ms=5000)
+                try:
+                    raw_data, _ = zk_client.get(ZK_CLUSTER_STATE)
+                    if raw_data and b"started" in raw_data:
+                        cluster_state = "started"
+                finally:
+                    zk_client.close()
             except Exception:
-                pass
+                try:
+                    res_state = subprocess.run("podman exec systemd-zookeeper zkCli.sh -server 127.0.0.1:2181 get /cluster_state", 
+                                               shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    out_state = res_state.stdout.decode("utf-8", errors="ignore")
+                    if "started" in out_state:
+                        cluster_state = "started"
+                except Exception:
+                    pass
                 
             if cluster_state == "started":
                 # The same pass the ZooKeeper reconcile loop runs: ordered, gated on readiness,
                 # skipping a unit that is mid-transition, and including every declared service.
                 converge_to_desired_state("started")
+                reconcile_running_vm_vdisks()
         except Exception as wex:
             print(f"[WATCHDOG] Error in service watchdog: {wex}")
 

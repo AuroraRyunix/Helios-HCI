@@ -13,7 +13,7 @@ def run_local(cmd):
 # unit, so its PID comes from `systemctl show -p MainPID` and `podman top systemd-<name>`
 # would simply fail. Kept as one list because it was written out three times and the
 # copies had already drifted.
-CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa")
+CONTAINER_SERVICES = ("zookeeper", "hydra-db", "spectrum", "slate", "urbosa", "kass")
 
 SIDON_CONTROL_SOCKET = "/run/sidon/control.sock"
 
@@ -173,7 +173,7 @@ def get_dfs_engine():
     return value if value in ("linstor", "sidon") else "sidon"
 
 def show_status_json():
-    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate", "kass"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -193,12 +193,10 @@ def show_status_json():
         "mipha": "Mipha",
         "daruk": "Daruk",
         "agahnim": "Agahnim",
-        "slate": "Slate"
+        "slate": "Slate",
+        "kass": "Kass"
     }
-    if check_urbosa_enabled():
-        services.append("urbosa")
-        svc_map["urbosa"] = "Urbosa"
-    
+
     _, hostname, _ = run_local("hostname")
     hostname = hostname.strip()
     
@@ -211,11 +209,7 @@ def show_status_json():
         s.close()
     except Exception:
         pass
-        
-    # helios_zk.server_mode reads until the server closes. `Mode:` is the last line of
-    # `stat`, after a line per connected client, so a fixed-size single recv truncates
-    # once a cluster is busy enough -- which is how the leader came to report itself as
-    # a follower while clients came and went.
+
     is_leader = False
     try:
         import helios_zk
@@ -223,11 +217,37 @@ def show_status_json():
             "leader", "standalone")
     except Exception:
         pass
-        
+
+    is_witness = False
+    role = "hypervisor"
+    try:
+        with open("/etc/hci/cluster.json", "r") as f:
+            cdata = json.load(f)
+            hosts = cdata.get("hosts", [])
+            for h in hosts:
+                if h.get("hostname") == hostname or h.get("ip") == ip_addr:
+                    is_witness = bool(h.get("is_witness") or h.get("role") == "witness")
+                    role = h.get("role", "witness" if is_witness else "hypervisor")
+                    break
+    except Exception:
+        pass
+
+    if is_witness:
+        services = ["zookeeper", "spark-daemon"]
+        svc_map = {
+            "zookeeper": "ZooKeeper",
+            "spark-daemon": "Spark"
+        }
+    elif check_urbosa_enabled():
+        services.append("urbosa")
+        svc_map["urbosa"] = "Urbosa"
+    
     maint_status = get_local_maintenance_status(ip_addr)
     result = {
         "ip": ip_addr,
         "hostname": hostname,
+        "is_witness": is_witness,
+        "role": role,
         "zk_leader": is_leader,
         "maintenance_status": maint_status,
         "services": {}
@@ -282,7 +302,7 @@ def show_status_json():
     print(json.dumps(result))
  
 def show_status():
-    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate"]
+    services = ["zookeeper", "hydra-db", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "hylia", "gatoway", "logos", "mipha", "daruk", "agahnim", "slate", "kass"]
     svc_map = {
         "zookeeper": "ZooKeeper",
         "hydra-db": "HydraDB",
@@ -302,7 +322,8 @@ def show_status():
         "mipha": "Mipha",
         "daruk": "Daruk",
         "agahnim": "Agahnim",
-        "slate": "Slate"
+        "slate": "Slate",
+        "kass": "Kass"
     }
     if check_urbosa_enabled():
         services.append("urbosa")
@@ -442,7 +463,7 @@ def main():
             
             if is_all:
                 print("Stopping all cluster services on this node...")
-                services = ["rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper", "spark-daemon"]
+                services = ["rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "hylia", "gatoway", "urbosa", "agahnim", "slate", "kass", "sidon", "daruk", "hydra-db", "zookeeper", "spark-daemon"]
                 for svc in services:
                     rc_act, out_act, _ = run_local(f"systemctl is-active {svc}")
                     if rc_act == 0 and out_act.strip() == "active":

@@ -71,6 +71,17 @@ impl Daruk {
             .unwrap_or_default())
     }
 
+    /// Delete one unmapped extent row from `hydra.dfs_block_map` when a full extent is
+    /// zeroed or trimmed on a vdisk with no parent.
+    pub fn delete_block_map_row(&self, vdisk_id: &str, extent_index: u64) -> Result<()> {
+        self.query(&format!(
+            "DELETE FROM hydra.dfs_block_map WHERE vdisk_id = {} AND extent_index = {}",
+            cql_str(vdisk_id),
+            extent_index
+        ))?;
+        Ok(())
+    }
+
     /// A typed compare-and-swap against one of Daruk's `LWT_OPS` endpoints.
     pub fn cas(&self, path: &str, params: Value) -> Result<Cas> {
         let payload = serde_json::to_vec(&params)
@@ -229,13 +240,73 @@ pub fn block_map_batches(
         for (extent_index, egroup_id, egroup_offset, length, vdisk_hash) in chunk {
             sql.push_str(&format!(
                 "INSERT INTO hydra.dfs_block_map (vdisk_id, extent_index, egroup_id, \
-                 egroup_offset, length, epoch, vdisk_hash) \
-                 VALUES ({}, {}, {}, {}, {}, {}, {}); ",
+                 egroup_offset, length, epoch, vdisk_hash, extent_id) \
+                 VALUES ({}, {}, {}, {}, {}, {}, {}, null); ",
                 cql_str(vdisk_id),
                 extent_index,
                 cql_str(egroup_id),
                 egroup_offset,
                 length,
+                epoch,
+                *vdisk_hash as i64
+            ));
+        }
+        sql.push_str("APPLY BATCH;");
+        out.push(sql);
+    }
+    out
+}
+
+/// Batches for inserting into `hydra.dfs_extent_id_map`.
+///
+/// Rows are `(extent_id, egroup_id, egroup_offset, length, vdisk_hash, created_at_ms)`.
+pub fn extent_map_batches(
+    rows: &[(String, String, u32, u32, u64, i64)],
+    per_batch: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in rows.chunks(per_batch.max(1)) {
+        let mut sql = String::from("BEGIN UNLOGGED BATCH ");
+        for (extent_id, egroup_id, egroup_offset, length, vdisk_hash, created_at_ms) in chunk {
+            sql.push_str(&format!(
+                "INSERT INTO hydra.dfs_extent_id_map (extent_id, egroup_id, \
+                 egroup_offset, length, vdisk_hash, created_at_ms) \
+                 VALUES ({}, {}, {}, {}, {}, {}); ",
+                cql_str(extent_id),
+                cql_str(egroup_id),
+                egroup_offset,
+                length,
+                *vdisk_hash as i64,
+                created_at_ms
+            ));
+        }
+        sql.push_str("APPLY BATCH;");
+        out.push(sql);
+    }
+    out
+}
+
+/// Batches for inserting extent-addressed rows into `hydra.dfs_block_map`.
+///
+/// Rows are `(extent_index, extent_id, vdisk_hash)`.
+/// Nulls `egroup_id`, `egroup_offset`, and `length`.
+pub fn block_map_extent_batches(
+    vdisk_id: &str,
+    epoch: u64,
+    rows: &[(u64, String, u64)],
+    per_batch: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in rows.chunks(per_batch.max(1)) {
+        let mut sql = String::from("BEGIN UNLOGGED BATCH ");
+        for (extent_index, extent_id, vdisk_hash) in chunk {
+            sql.push_str(&format!(
+                "INSERT INTO hydra.dfs_block_map (vdisk_id, extent_index, extent_id, \
+                 epoch, vdisk_hash, egroup_id, egroup_offset, length) \
+                 VALUES ({}, {}, {}, {}, {}, null, null, null); ",
+                cql_str(vdisk_id),
+                extent_index,
+                cql_str(extent_id),
                 epoch,
                 *vdisk_hash as i64
             ));

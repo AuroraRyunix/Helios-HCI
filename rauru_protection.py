@@ -68,6 +68,8 @@ QUIESCES = (QUIESCE_NONE, QUIESCE_VM, QUIESCE_DOMAIN)
 CONSISTENCY_DOMAIN = "crash:domain"   # every member captured inside one barrier
 CONSISTENCY_VM = "crash:vm"           # each VM's disks share a barrier; VMs are skewed
 CONSISTENCY_NONE = "none"             # no barrier; see the recorded skew
+CONSISTENCY_APP = "app_consistent"    # every running VM froze filesystems via guest agent
+CONSISTENCY_CRASH = "crash_consistent"
 
 SET_TAKING = "taking"
 SET_COMPLETE = "complete"
@@ -495,9 +497,10 @@ class Env(snapshots.Env):
     what is trusted: a call that "succeeded" but left the domain running is not a pause.
     """
 
-    def __init__(self, query, dfs, vm_power, **kwargs):
+    def __init__(self, query, dfs, vm_power, guest_agent=None, **kwargs):
         snapshots.Env.__init__(self, query, dfs, **kwargs)
         self.vm_power = vm_power
+        self.guest_agent = guest_agent
 
 
 class Summary(object):
@@ -780,6 +783,8 @@ class Runner(object):
         task = self.tasks.start("protection_set", "protection_set",
                                 {"domain": name, "set_id": set_id})
         taken, error = [], None
+        all_frozen = True
+        had_running_vms = False
         try:
             self._write(set_row_statement(row), "could not record the set")
             cut_start = cut_end = None
@@ -788,10 +793,14 @@ class Runner(object):
                 # Written before each barrier, so a run that dies with a guest suspended leaves
                 # a row that says which guest and where, and when, and `recover` can resume it.
                 # `cut_start_ms` is the heartbeat while the set is `taking`.
+                if group.pause:
+                    had_running_vms = True
                 row["paused_vms"] = list(group.pause)
                 row["cut_start_ms"] = self.env.now_ms()
                 self._write(set_row_statement(row), "could not record the set")
-                start, end, paused = self._take_group(group, budget_ms, taken, row)
+                start, end, paused, group_frozen = self._take_group(group, budget_ms, taken, row)
+                if group.pause and not group_frozen:
+                    all_frozen = False
                 cut_start = start if cut_start is None else min(cut_start, start)
                 cut_end = end if cut_end is None else max(cut_end, end)
                 paused_ms = max(paused_ms, paused)
@@ -804,7 +813,11 @@ class Runner(object):
             self.env.say("FAILED set of %s: %s" % (name, error))
             return False
 
+        achieved_consistency = row["consistency"]
+        if getattr(self.env, "guest_agent", None) is not None and had_running_vms:
+            achieved_consistency = CONSISTENCY_APP if all_frozen else CONSISTENCY_CRASH
         row.update({"state": SET_COMPLETE, "finished_at_ms": self.env.now_ms(),
+                    "consistency": achieved_consistency,
                     "cut_start_ms": cut_start, "cut_end_ms": cut_end, "paused_ms": paused_ms,
                     "paused_vms": []})
         try:
@@ -817,18 +830,25 @@ class Runner(object):
         self.tasks.finish(task)
         summary.taken.append(set_id)
         self.env.say("took %s (%s, %d snapshot(s), cut spread %d ms, paused %d ms)" % (
-            set_id, plan.consistency, len(taken), (cut_end or 0) - (cut_start or 0), paused_ms))
+            set_id, achieved_consistency, len(taken), (cut_end or 0) - (cut_start or 0), paused_ms))
         return True
 
     def _take_group(self, group, budget_ms, taken, row):
-        """Pause, snapshot every target, resume. Returns (cut_start_ms, cut_end_ms, paused_ms).
+        """Freeze, pause, snapshot every target, resume, thaw.
+        Returns (cut_start_ms, cut_end_ms, paused_ms, all_frozen).
 
-        The resume is in a `finally`: a guest left suspended is a worse outcome than any
-        snapshot is worth, so nothing that goes wrong in between may skip it.
+        The resume and thaw are in a `finally`: a guest left suspended or frozen is a worse
+        outcome than any snapshot is worth, so nothing that goes wrong in between may skip them.
         """
         paused = []
+        frozen = []
+        all_frozen = bool(group.pause)
         try:
             for vm in group.pause:
+                if self._fsfreeze(vm, "fsfreeze-freeze"):
+                    frozen.append(vm)
+                else:
+                    all_frozen = False
                 ok, why = self._power(vm, "suspend", "paused")
                 if not ok:
                     raise _GroupFailed("could not pause %s: %s" % (vm["name"], why))
@@ -851,6 +871,8 @@ class Runner(object):
                 ok, why = self._power(vm, "resume", "running", attempts=RESUME_ATTEMPTS)
                 if not ok:
                     stranded.append((vm, why))
+            for vm in reversed(frozen):
+                self._fsfreeze(vm, "fsfreeze-thaw")
             if stranded:
                 # Raised from `finally`, deliberately: this outranks whatever was in flight.
                 raise _GroupFailed("STRANDED: could not resume %s. They are suspended; run "
@@ -859,7 +881,22 @@ class Runner(object):
                                        "; ".join(w for _, w in stranded)))
         if cut_start is None:
             cut_start = cut_end
-        return cut_start, cut_end, (cut_end - began) if paused else 0
+        return cut_start, cut_end, (cut_end - began) if paused else 0, all_frozen
+
+    def _fsfreeze(self, vm, action):
+        """Best-effort QEMU Guest Agent filesystem freeze/thaw (`fsfreeze-freeze` / `fsfreeze-thaw`)."""
+        fn = getattr(self.env, "guest_agent", None)
+        if fn is None:
+            return False
+        try:
+            rc, body, _err = fn(vm["host_ip"], vm["name"], action)
+            if rc != 0:
+                return False
+            if isinstance(body, dict) and body.get("status") == "error":
+                return False
+            return True
+        except Exception:
+            return False
 
     def _snapshot_target(self, target, taken, row):
         ip = self.base._ip_for_owner(target["owner"])

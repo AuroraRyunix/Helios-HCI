@@ -18,21 +18,32 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
     if connected?(socket) do
       Vms.subscribe()
       :timer.send_interval(@poll_interval, :poll)
+      if Application.get_env(:spectrum_phx, :vms_source, :hydra) == :hydra do
+        send(self(), :probe_live_devices)
+      end
     end
 
     case Vms.get_vm(name) do
       {:ok, vm} ->
         options = Options.load(probe_hosts: connected?(socket))
+        snapshots = case Vms.list_snapshots(name) do {:ok, s} -> s; _ -> [] end
 
         {:ok,
          assign(socket,
            vm: vm,
            disks: Vm.disks(vm),
            nics: vm_nics(vm),
+           snapshots: snapshots,
            name: vm.name,
            page_title: vm.name,
            options: options,
-           db_error: nil
+           db_error: nil,
+           show_clone_modal: false,
+           host_pci_devices: [],
+           host_usb_devices: [],
+           guest_agent: nil,
+           guest_exec_output: nil,
+           serial_output: ""
          )}
 
       {:error, reason} ->
@@ -48,6 +59,10 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   def handle_info({:vm_updated, _name}, socket), do: {:noreply, reload(socket)}
   def handle_info({:vm_created, _name}, socket), do: {:noreply, socket}
   def handle_info({:vm_task_submitted, _name, _action}, socket), do: {:noreply, reload(socket)}
+
+  def handle_info(:probe_live_devices, socket) do
+    {:noreply, probe_live_devices(socket)}
+  end
 
   @impl true
   def handle_event("power_on", _params, socket) do
@@ -136,6 +151,18 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
     end)}
   end
 
+  def handle_event("live_detach_disk", %{"index" => idx}, socket) do
+    idx = String.to_integer(idx)
+    {:noreply, act(socket, "Detached and removed data disk vd#{<<?a + idx>>}.", fn ->
+      Vms.live_change(socket.assigns.name, %{
+        "op" => "disk",
+        "action" => "detach",
+        "index" => idx,
+        "confirm_delete" => true
+      })
+    end)}
+  end
+
   def handle_event("live_attach_nic", %{"network_id" => net, "model" => model}, socket) do
     {:noreply, act(socket, "Network interface hot-plugged.", fn ->
       Vms.live_change(socket.assigns.name, %{
@@ -196,7 +223,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
       socket =
         socket
         |> then(&if(vcpu != vm.vcpu, do: act(&1, "", fn -> Vms.live_change(vm.name, %{"op" => "vcpus", "count" => vcpu}) end), else: &1))
-        |> then(&if(mem != vm.memory, do: act(&1, "", fn -> Vms.live_change(vm.name, %{"op" => "memory", "mib" => mem}) end), else: &1))
+        |> then(&if(mem != vm.memory, do: act(&1, "", fn -> Vms.live_change(vm.name, %{"op" => "memory", "mib" => mem, "persist" => true}) end), else: &1))
 
       {:noreply, socket}
     else
@@ -209,6 +236,8 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           "boot_device" => params["boot_device"] || vm.boot_device,
           "graphics" => params["graphics"] || vm.graphics,
           "audio_enabled" => params["audio_enabled"] == "true",
+          "vtpm_enabled" => params["vtpm_enabled"] == "true",
+          "secure_boot" => params["secure_boot"] == "true",
           "disks" => vm.disks_list,
           "iso" => vm.iso,
           "network_id" => vm.network_id
@@ -218,6 +247,321 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
         {:ok, _} -> {:noreply, reload(socket)}
         {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
       end
+    end
+  end
+
+  def handle_event("toggle_template", _params, socket) do
+    vm = socket.assigns.vm
+    target = not Vm.template?(vm)
+    label = if target, do: "converted to golden image template", else: "unmarked as template"
+
+    case Vms.set_template(vm.name, target) do
+      {:ok, _} ->
+        {:noreply, socket |> put_flash(:info, "VM #{vm.name} #{label}.") |> reload()}
+
+      {:error, reason} ->
+        {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+    end
+  end
+
+  def handle_event("save_affinity", params, socket) do
+    vm = socket.assigns.vm
+
+    case Vms.update_affinity(vm.name, params) do
+      {:ok, _} ->
+        {:noreply, socket |> put_flash(:info, "Placement & DRS affinity rules saved.") |> reload()}
+
+      {:error, reason} ->
+        {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+    end
+  end
+
+  def handle_event("save_cloud_init", params, socket) do
+    vm = socket.assigns.vm
+
+    case Vms.update_cloud_init(vm.name, params) do
+      {:ok, _} ->
+        {:noreply, socket |> put_flash(:info, "Cloud-Init customization saved.") |> reload()}
+
+      {:error, reason} ->
+        {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+    end
+  end
+
+  def handle_event("open_clone_modal", _params, socket) do
+    {:noreply, assign(socket, show_clone_modal: true)}
+  end
+
+  def handle_event("close_clone_modal", _params, socket) do
+    {:noreply, assign(socket, show_clone_modal: false)}
+  end
+
+  def handle_event("clone_vm", %{"target_name" => target_name}, socket) do
+    name = socket.assigns.name
+    case Vms.clone_vm(name, target_name) do
+      {:ok, _new_vm} ->
+        {:noreply,
+         socket
+         |> assign(show_clone_modal: false)
+         |> put_flash(:info, "VM #{name} successfully cloned to #{target_name}.")
+         |> push_navigate(to: ~p"/vms/#{target_name}")}
+
+      {:error, reason} ->
+        {:noreply, socket |> put_flash(:error, "Clone failed: #{error_message(reason)}") |> reload()}
+    end
+  end
+
+  def handle_event("save_annotations", %{"notes" => notes, "tags" => tags}, socket) do
+    vm = socket.assigns.vm
+    if Vm.running?(vm) do
+      socket =
+        socket
+        |> then(&act(&1, "Annotations saved.", fn ->
+          Vms.live_change(vm.name, %{"op" => "annotate", "notes" => notes})
+          Vms.live_change(vm.name, %{"op" => "tags", "tags" => tags})
+        end))
+      {:noreply, socket}
+    else
+      edit = %{
+        "vcpu" => vm.vcpu,
+        "memory" => vm.memory,
+        "firmware" => vm.firmware,
+        "cpu_model" => vm.cpu_model,
+        "boot_device" => vm.boot_device,
+        "graphics" => vm.graphics,
+        "audio_enabled" => vm.audio_enabled,
+        "disks" => vm.disks_list,
+        "iso" => vm.iso,
+        "network_id" => vm.network_id,
+        "notes" => notes,
+        "tags" => tags,
+        "cpu_shares" => vm.cpu_shares,
+        "cpu_limit" => vm.cpu_limit,
+        "cpu_reservation" => vm.cpu_reservation,
+        "mem_reservation" => vm.mem_reservation,
+        "mem_limit" => vm.mem_limit
+      }
+      case Vms.update_vm(vm.name, edit) do
+        {:ok, _} -> {:noreply, reload(socket)}
+        {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+      end
+    end
+  end
+
+  def handle_event("save_resources", params, socket) do
+    vm = socket.assigns.vm
+    shares = to_opt_num(params["cpu_shares"])
+    limit = to_opt_num(params["cpu_limit"])
+    cpu_res = to_opt_num(params["cpu_reservation"])
+    mem_res = to_opt_num(params["mem_reservation"])
+    mem_lim = to_opt_num(params["mem_limit"])
+
+    if Vm.running?(vm) do
+      body = %{
+        "op" => "resources",
+        "cpu_shares" => shares,
+        "cpu_limit" => limit,
+        "cpu_reservation" => cpu_res,
+        "mem_reservation" => mem_res,
+        "mem_limit" => mem_lim
+      }
+      {:noreply, act(socket, "Resource QoS applied live.", fn ->
+        Vms.live_change(vm.name, body)
+      end)}
+    else
+      edit = %{
+        "vcpu" => vm.vcpu,
+        "memory" => vm.memory,
+        "firmware" => vm.firmware,
+        "cpu_model" => vm.cpu_model,
+        "boot_device" => vm.boot_device,
+        "graphics" => vm.graphics,
+        "audio_enabled" => vm.audio_enabled,
+        "disks" => vm.disks_list,
+        "iso" => vm.iso,
+        "network_id" => vm.network_id,
+        "notes" => vm.notes,
+        "tags" => vm.tags,
+        "cpu_shares" => shares,
+        "cpu_limit" => limit,
+        "cpu_reservation" => cpu_res,
+        "mem_reservation" => mem_res,
+        "mem_limit" => mem_lim
+      }
+      case Vms.update_vm(vm.name, edit) do
+        {:ok, _} -> {:noreply, reload(socket)}
+        {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+      end
+    end
+  end
+
+  def handle_event("live_throttle_disk", %{"index" => idx, "iops" => iops, "bytes_sec" => bps}, socket) do
+    idx = String.to_integer(idx)
+    iops_val = to_opt_num(iops)
+    bps_val = to_opt_num(bps)
+    body = %{
+      "op" => "disk",
+      "action" => "throttle",
+      "index" => idx,
+      "iops" => iops_val,
+      "bytes_sec" => bps_val
+    }
+    {:noreply, act(socket, "Disk #{idx + 1} throttling updated.", fn ->
+      Vms.live_change(socket.assigns.name, body)
+    end)}
+  end
+
+  def handle_event("take_snapshot", %{"snapshot_name" => snap_name}, socket) do
+    {:noreply, act(socket, "Snapshot #{snap_name} taken.", fn ->
+      Vms.create_snapshot(socket.assigns.name, snap_name)
+    end)}
+  end
+
+  def handle_event("rollback_snapshot", %{"snapshot_name" => snap_name} = params, socket) do
+    live? = params["live"] == "true" or Vm.running?(socket.assigns.vm)
+
+    {:noreply, act(socket, "Rolled back to #{snap_name}.", fn ->
+      Vms.rollback_snapshot(socket.assigns.name, snap_name, live: live?)
+    end)}
+  end
+
+  def handle_event("scan_host_devices", _params, socket) do
+    vm = socket.assigns.vm
+    host_ip = if Vm.placed?(vm), do: vm.host_ip, else: nil
+    pci = Vms.host_pci_devices(host_ip)
+    usb = Vms.host_usb_devices(host_ip)
+    {:noreply, assign(socket, host_pci_devices: pci, host_usb_devices: usb)}
+  end
+
+  def handle_event("attach_pci", %{"bdf" => bdf}, socket) do
+    bdf = String.trim(bdf || "")
+    if bdf == "" do
+      {:noreply, put_flash(socket, :error, "PCI BDF address is required.")}
+    else
+      case Vms.change_pci_device(socket.assigns.name, "attach", bdf) do
+        {:ok, _} -> {:noreply, socket |> put_flash(:info, "Attached PCI device #{bdf}.") |> reload()}
+        {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+      end
+    end
+  end
+
+  def handle_event("detach_pci", %{"bdf" => bdf}, socket) do
+    case Vms.change_pci_device(socket.assigns.name, "detach", bdf) do
+      {:ok, _} -> {:noreply, socket |> put_flash(:info, "Detached PCI device #{bdf}.") |> reload()}
+      {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+    end
+  end
+
+  def handle_event("attach_usb", %{"device" => device}, socket) do
+    device = String.trim(device || "")
+    if device == "" do
+      {:noreply, put_flash(socket, :error, "USB vendor:product ID is required.")}
+    else
+      case Vms.change_usb_device(socket.assigns.name, "attach", device) do
+        {:ok, _} -> {:noreply, socket |> put_flash(:info, "Attached USB device #{device}.") |> reload()}
+        {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+      end
+    end
+  end
+
+  def handle_event("detach_usb", %{"device" => device}, socket) do
+    case Vms.change_usb_device(socket.assigns.name, "detach", device) do
+      {:ok, _} -> {:noreply, socket |> put_flash(:info, "Detached USB device #{device}.") |> reload()}
+      {:error, reason} -> {:noreply, socket |> put_flash(:error, error_message(reason)) |> reload()}
+    end
+  end
+
+  def handle_event("probe_guest_agent", _params, socket) do
+    {:ok, status} = Vms.guest_agent_status(socket.assigns.name)
+    {:noreply, socket |> assign(guest_agent: status) |> reload()}
+  end
+
+  def handle_event("guest_fsfreeze", _params, socket) do
+    case Vms.guest_agent_action(socket.assigns.name, %{"action" => "fsfreeze-freeze"}) do
+      {:ok, res} ->
+        {:noreply, socket |> assign(guest_exec_output: "Frozen filesystems: #{inspect(res["frozen"])}") |> put_flash(:info, "Guest filesystems frozen.")}
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Freeze failed: #{error_message(reason)}")}
+    end
+  end
+
+  def handle_event("guest_fsthaw", _params, socket) do
+    case Vms.guest_agent_action(socket.assigns.name, %{"action" => "fsfreeze-thaw"}) do
+      {:ok, res} ->
+        {:noreply, socket |> assign(guest_exec_output: "Thawed filesystems: #{inspect(res["thawed"])}") |> put_flash(:info, "Guest filesystems thawed.")}
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Thaw failed: #{error_message(reason)}")}
+    end
+  end
+
+  def handle_event("guest_set_password", %{"username" => user, "password" => pass}, socket) do
+    case Vms.guest_agent_action(socket.assigns.name, %{"action" => "set-user-password", "username" => user, "password" => pass}) do
+      {:ok, _} ->
+        {:noreply, put_flash(socket, :info, "Password updated for guest user #{user}.")}
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Password reset failed: #{error_message(reason)}")}
+    end
+  end
+
+  def handle_event("guest_exec", %{"path" => path, "args" => args_str}, socket) do
+    args =
+      (args_str || "")
+      |> String.split(~r/\s+/, trim: true)
+
+    case Vms.guest_agent_action(socket.assigns.name, %{"action" => "exec", "path" => path, "arg" => args, "wait" => true}) do
+      {:ok, res} ->
+        out = "exitcode=#{res["exitcode"]}\n#{res["stdout"] || ""}#{res["stderr"] || ""}"
+        {:noreply, assign(socket, guest_exec_output: String.trim(out))}
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Guest exec failed: #{error_message(reason)}")}
+    end
+  end
+
+  def handle_event("serial_refresh", _params, socket) do
+    {:ok, %{"output" => out}} = Vms.serial_read(socket.assigns.name)
+    {:noreply, assign(socket, serial_output: out || "")}
+  end
+
+  def handle_event("serial_send", %{"input" => input}, socket) do
+    case Vms.serial_send(socket.assigns.name, (input || "") <> "\n") do
+      {:ok, %{"output" => out}} -> {:noreply, assign(socket, serial_output: out || "")}
+      {:error, reason} -> {:noreply, put_flash(socket, :error, "Serial console write failed: #{error_message(reason)}")}
+    end
+  end
+
+  defp probe_live_devices(socket) do
+    vm = socket.assigns.vm
+    host_ip = if Vm.placed?(vm), do: vm.host_ip, else: nil
+    pci = Vms.host_pci_devices(host_ip)
+    usb = Vms.host_usb_devices(host_ip)
+
+    {ga, serial} =
+      if Vm.running?(vm) do
+        {:ok, ga_res} = Vms.guest_agent_status(vm.name)
+
+        ser_res =
+          case Vms.serial_read(vm.name) do
+            {:ok, %{"output" => out}} when is_binary(out) -> out
+            {:ok, _} -> socket.assigns.serial_output
+          end
+
+        {ga_res, ser_res}
+      else
+        {nil, socket.assigns.serial_output}
+      end
+
+    socket
+    |> assign(host_pci_devices: pci, host_usb_devices: usb, guest_agent: ga, serial_output: serial)
+    |> reload()
+  end
+
+  defp to_opt_num(nil), do: nil
+  defp to_opt_num(""), do: nil
+  defp to_opt_num(v) when is_integer(v), do: v
+  defp to_opt_num(v) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, _} -> n
+      :error -> nil
     end
   end
 
@@ -232,7 +576,6 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
 
   defp act(socket, message, fun) do
     case fun.() do
-      # No info toast: the task ring in the header announces the task while it runs.
       {:ok, _result} -> _ = message; reload(socket)
       {:error, reason} -> socket |> put_flash(:error, error_message(reason)) |> reload()
     end
@@ -241,10 +584,12 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   defp reload(socket) do
     case Vms.get_vm(socket.assigns.name) do
       {:ok, vm} ->
+        snapshots = case Vms.list_snapshots(socket.assigns.name) do {:ok, s} -> s; _ -> [] end
         assign(socket,
           vm: vm,
           disks: Vm.disks(vm),
           nics: vm_nics(vm),
+          snapshots: snapshots,
           db_error: nil
         )
 
@@ -263,8 +608,10 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
       <.header>
         <span class="font-mono text-2xl font-bold">{@vm.name}</span>
         <:subtitle>
-          <span class="flex items-center gap-2 mt-1">
+          <span class="flex flex-wrap items-center gap-2 mt-1">
             <.state_badge vm={@vm} />
+            <.template_badge vm={@vm} />
+            <.security_badges vm={@vm} />
             <.lock_badge vm={@vm} />
             <span :if={Vm.placed?(@vm)} class="text-xs text-base-content/60">
               Host: {Config.hostname_for(@vm.host_ip)} (<code>{@vm.host_ip}</code>)
@@ -303,7 +650,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
       <!-- Action Buttons Bar -->
       <div class="mt-6 flex flex-wrap items-center gap-3 p-4 rounded-xl glass-card">
         <.button
-          :if={not Vm.running?(@vm)}
+          :if={not Vm.running?(@vm) and not Vm.template?(@vm)}
           id="start"
           phx-click="power_on"
           phx-disable-with="Starting..."
@@ -365,6 +712,25 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           {console_label(@vm)}
         </a>
 
+        <.button
+          id="clone-vm-btn"
+          phx-click="open_clone_modal"
+          variant={if Vm.template?(@vm), do: "primary", else: "secondary"}
+        >
+          <.icon name="hero-document-duplicate-solid" class="size-4" />
+          {if Vm.template?(@vm), do: "Deploy from Template", else: "Clone VM"}
+        </.button>
+
+        <.button
+          :if={not Vm.running?(@vm)}
+          id="toggle-template-btn"
+          phx-click="toggle_template"
+          variant="secondary"
+        >
+          <.icon name="hero-cube-transparent-solid" class="size-4" />
+          {if Vm.template?(@vm), do: "Unmark Template", else: "Convert to Template"}
+        </.button>
+
         <div class="flex-1"></div>
 
         <.button
@@ -382,6 +748,29 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           <.icon name="hero-trash-solid" class="size-4" />
           {if Vm.running?(@vm), do: "Force Destroy & Delete", else: "Delete VM"}
         </.button>
+      </div>
+
+      <div :if={@show_clone_modal} class="modal modal-open">
+        <div class="modal-box">
+          <h3 class="font-bold text-lg">
+            {if Vm.template?(@vm), do: "Deploy VM from Template #{@vm.name}", else: "Clone VM #{@vm.name}"}
+          </h3>
+          <p class="py-2 text-sm text-base-content/70">
+            Create an independent copy of this virtual machine with its disks cloned copy-on-write on Sidon.
+          </p>
+          <form phx-submit="clone_vm" class="space-y-4 mt-2">
+            <label class="form-control">
+              <span class="label-text text-sm">Target VM Name</span>
+              <input type="text" name="target_name" required pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,62}" placeholder={"#{@vm.name}-clone"} class="input input-bordered w-full font-mono" />
+            </label>
+            <div class="modal-action">
+              <button type="button" phx-click="close_clone_modal" class="btn btn-ghost">Cancel</button>
+              <button type="submit" class="btn btn-primary" phx-disable-with="Cloning...">
+                {if Vm.template?(@vm), do: "Deploy VM", else: "Clone"}
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
 
       <% running = Vm.running?(@vm) %>
@@ -432,13 +821,23 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
             <label class="form-control">
               <span class="label-text text-xs opacity-70">Graphics</span>
               <select name="graphics" class="select select-sm">
-                <option :for={g <- Vm.graphics_types()} value={g} selected={g == @vm.graphics}>{blank(g, "vnc")}</option>
+                <option :for={g <- graphics_types_for(@options, @vm.graphics)} value={g} selected={g == @vm.graphics}>{blank(g, "vnc")}</option>
               </select>
             </label>
-            <label class="label cursor-pointer justify-start gap-2 col-span-2">
+            <label class="label cursor-pointer justify-start gap-2">
               <input type="hidden" name="audio_enabled" value="false" />
               <input type="checkbox" name="audio_enabled" value="true" checked={@vm.audio_enabled} class="toggle toggle-sm" />
               <span class="label-text text-xs">ICH9 audio</span>
+            </label>
+            <label class="label cursor-pointer justify-start gap-2">
+              <input type="hidden" name="secure_boot" value="false" />
+              <input type="checkbox" name="secure_boot" value="true" checked={@vm.secure_boot} class="toggle toggle-sm" />
+              <span class="label-text text-xs">Secure Boot</span>
+            </label>
+            <label class="label cursor-pointer justify-start gap-2 col-span-2">
+              <input type="hidden" name="vtpm_enabled" value="false" />
+              <input type="checkbox" name="vtpm_enabled" value="true" checked={@vm.vtpm_enabled} class="toggle toggle-sm" />
+              <span class="label-text text-xs">Virtual TPM 2.0 (swtpm)</span>
             </label>
           </fieldset>
 
@@ -450,8 +849,126 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           </div>
         </form>
 
+        <!-- Resource Tuning & QoS -->
+        <form id="resources-form" phx-submit="save_resources" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3">
+          <h3 class="panel-title flex items-center justify-between">
+            <span>Resource QoS</span>
+            <span class={["badge badge-sm", if(running, do: "badge-success", else: "badge-ghost")]}>
+              {if running, do: "live", else: "offline edit"}
+            </span>
+          </h3>
+
+          <div class="grid grid-cols-2 gap-3">
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">CPU Shares (e.g. 1024)</span>
+              <input type="number" name="cpu_shares" min="2" max="262144" value={@vm.cpu_shares} placeholder="Normal (1024)" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">CPU Limit (%)</span>
+              <input type="number" name="cpu_limit" min="1" max="10000" value={@vm.cpu_limit} placeholder="Unlimited" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">CPU Reservation (MHz)</span>
+              <input type="number" name="cpu_reservation" min="0" value={@vm.cpu_reservation} placeholder="0" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">Mem Reservation (MiB)</span>
+              <input type="number" name="mem_reservation" min="0" value={@vm.mem_reservation} placeholder="0" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control col-span-2">
+              <span class="label-text text-xs opacity-70">Mem Hard Limit (MiB)</span>
+              <input type="number" name="mem_limit" min="128" value={@vm.mem_limit} placeholder="Unlimited" class="input input-sm font-mono" />
+            </label>
+          </div>
+
+          <div class="flex items-center justify-between pt-1">
+            <span class="text-[11px] opacity-60">
+              {if running, do: "QoS limits apply live to cgroups.", else: "Applies at next power-on."}
+            </span>
+            <button type="submit" class="btn btn-primary btn-sm" phx-disable-with="Applying…">Apply QoS</button>
+          </div>
+        </form>
+
+        <!-- Annotations & Tags -->
+        <form id="annotations-form" phx-submit="save_annotations" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3">
+          <h3 class="panel-title flex items-center justify-between">
+            <span>Notes &amp; Tags</span>
+            <div class="flex flex-wrap gap-1">
+              <span :for={tag <- Vm.tag_list(@vm)} class="badge badge-xs badge-outline badge-primary">{tag}</span>
+            </div>
+          </h3>
+
+          <label class="form-control">
+            <span class="label-text text-xs opacity-70">Tags (comma-separated)</span>
+            <input type="text" name="tags" value={@vm.tags || ""} placeholder="production, web, tier-1" class="input input-sm font-mono" />
+          </label>
+
+          <label class="form-control">
+            <span class="label-text text-xs opacity-70">Operator Notes / Description</span>
+            <textarea name="notes" rows="3" placeholder="Add annotations or operational notes here..." class="textarea textarea-sm font-sans">{@vm.notes || ""}</textarea>
+          </label>
+
+          <div class="flex items-center justify-end pt-1">
+            <button type="submit" class="btn btn-secondary btn-sm" phx-disable-with="Saving…">Save Notes</button>
+          </div>
+        </form>
+
+        <!-- DRS Placement & Host Affinity -->
+        <form id="affinity-form" phx-submit="save_affinity" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3">
+          <h3 class="panel-title flex items-center justify-between">
+            <span>DRS Affinity &amp; Host Pinning</span>
+            <span class="badge badge-sm badge-ghost">scheduler</span>
+          </h3>
+
+          <div class="grid grid-cols-2 gap-3">
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">Affinity Group (keep together)</span>
+              <input type="text" name="affinity_group" value={@vm.affinity_group || ""} placeholder="db-cache-pair" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">Anti-Affinity Group (separate hosts)</span>
+              <input type="text" name="anti_affinity_group" value={@vm.anti_affinity_group || ""} placeholder="ha-web-tier" class="input input-sm font-mono" />
+            </label>
+            <label class="form-control col-span-2">
+              <span class="label-text text-xs opacity-70">Pinned Host IPs (comma-separated allowlist)</span>
+              <input type="text" name="pinned_hosts" value={@vm.pinned_hosts || ""} placeholder="10.10.102.41, 10.10.102.42" class="input input-sm font-mono" />
+            </label>
+          </div>
+
+          <div class="flex items-center justify-between pt-1">
+            <span class="text-[11px] opacity-60">Enforced at placement and DRS rebalancing.</span>
+            <button type="submit" class="btn btn-secondary btn-sm" phx-disable-with="Saving…">Save Affinity</button>
+          </div>
+        </form>
+
+        <!-- Cloud-Init Customization -->
+        <form id="cloud-init-form" phx-submit="save_cloud_init" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3 xl:col-span-2">
+          <h3 class="panel-title flex items-center justify-between">
+            <span>Cloud-Init Customization (NoCloud <code>cidata</code>)</span>
+            <span class={["badge badge-sm", if((@vm.cloud_init_userdata || "") != "", do: "badge-info", else: "badge-ghost")]}>
+              {if (@vm.cloud_init_userdata || "") != "", do: "configured", else: "inactive"}
+            </span>
+          </h3>
+
+          <div class="grid gap-3 sm:grid-cols-2">
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">user-data (#cloud-config YAML or script)</span>
+              <textarea name="cloud_init_userdata" rows="3" placeholder="#cloud-config&#10;ssh_authorized_keys: ..." class="textarea textarea-sm font-mono text-xs">{@vm.cloud_init_userdata || ""}</textarea>
+            </label>
+            <label class="form-control">
+              <span class="label-text text-xs opacity-70">network-config (Netplan v2 YAML)</span>
+              <textarea name="cloud_init_network" rows="3" placeholder="version: 2&#10;ethernets: ..." class="textarea textarea-sm font-mono text-xs">{@vm.cloud_init_network || ""}</textarea>
+            </label>
+          </div>
+
+          <div class="flex items-center justify-between pt-1">
+            <span class="text-[11px] opacity-60">Synthesizes and attaches a NoCloud seed ISO at next boot.</span>
+            <button type="submit" class="btn btn-secondary btn-sm" phx-disable-with="Saving…">Save Cloud-Init</button>
+          </div>
+        </form>
+
         <!-- Placement -->
-        <div class="glass-card p-5 rounded-xl border border-base-content/10 xl:col-span-2">
+        <div class="glass-card p-5 rounded-xl border border-base-content/10 xl:col-span-3">
           <h3 class="panel-title mb-3">Placement &amp; lifecycle</h3>
           <.list>
             <:item title="Host">
@@ -460,6 +977,11 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
             </:item>
             <:item title="Power state">{@vm.state}</:item>
             <:item title="Lifecycle lock">{blank(@vm.status, "none")}</:item>
+            <:item :if={Vm.guest_ip_list(@vm) != []} title="Guest IPs">
+              <span class="flex flex-wrap gap-1">
+                <span :for={ip <- Vm.guest_ip_list(@vm)} class="badge badge-xs badge-info font-mono">{ip}</span>
+              </span>
+            </:item>
           </.list>
         </div>
       </section>
@@ -487,17 +1009,40 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
                   <span class="font-mono text-xs opacity-60 ml-1">{disk.resource}</span>
                 </td>
                 <td class="font-mono text-xs opacity-70">
-                  <span>vd{<<?a + disk.index>>}</span>
+                  <span>{disk.target}</span>
                   <span class="block text-[10px] opacity-60">{disk.path}</span>
                 </td>
                 <td class="text-right">
-                  <form phx-submit="live_grow_disk" class="join justify-end">
-                    <input type="hidden" name="index" value={disk.index} />
-                    <input type="number" name="size_gib" min={(disk.size_gib || 0) + 1} value={(disk.size_gib || 0) + 5}
-                      disabled={not running} class="input input-xs join-item w-20 font-mono" />
-                    <button type="submit" disabled={not running} title={not running && "Grow live while running"}
-                      class="btn btn-xs join-item">Grow GiB</button>
-                  </form>
+                  <div class="flex flex-col items-end gap-1">
+                    <div class="flex items-center justify-end gap-1">
+                      <form phx-submit="live_grow_disk" class="join justify-end">
+                        <input type="hidden" name="index" value={disk.index} />
+                        <input type="number" name="size_gib" min={(disk.size_gib || 0) + 1} value={(disk.size_gib || 0) + 5}
+                          disabled={not running} class="input input-xs join-item w-20 font-mono" />
+                        <button type="submit" disabled={not running} title={not running && "Grow live while running"}
+                          class="btn btn-xs join-item">Grow GiB</button>
+                      </form>
+                      <button :if={disk.index > 0}
+                        type="button"
+                        phx-click="live_detach_disk"
+                        phx-value-index={disk.index}
+                        data-confirm="Detach and permanently delete this data disk? The underlying storage will be destroyed."
+                        disabled={not running}
+                        title={if running, do: "Hot-remove and destroy data disk", else: "VM must be running"}
+                        class="btn btn-xs btn-error btn-outline">
+                        Detach
+                      </button>
+                    </div>
+                    <form phx-submit="live_throttle_disk" class="join justify-end">
+                      <input type="hidden" name="index" value={disk.index} />
+                      <input type="number" name="iops" min="0" placeholder="IOPS"
+                        disabled={not running} class="input input-xs join-item w-16 font-mono" title="Max IOPS (0 for unlimited)" />
+                      <input type="number" name="bytes_sec" min="0" placeholder="B/s"
+                        disabled={not running} class="input input-xs join-item w-20 font-mono" title="Max B/s (0 for unlimited)" />
+                      <button type="submit" disabled={not running} title={if running, do: "Live throttle disk IOPS / Bps", else: "VM must be running"}
+                        class="btn btn-xs join-item">Throttle</button>
+                    </form>
+                  </div>
                 </td>
               </tr>
               <tr :for={{slot, iso} <- cdroms} id={"cdrom-row-#{slot}"}>
@@ -569,7 +1114,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
                   <div class="join">
                     <button phx-click="live_link_nic" phx-value-index={nic.index} phx-value-state="up" disabled={not running} class="btn btn-xs join-item">Up</button>
                     <button phx-click="live_link_nic" phx-value-index={nic.index} phx-value-state="down" disabled={not running} class="btn btn-xs join-item">Down</button>
-                    <button :if={nic.index == length(@nics) - 1} phx-click="live_detach_nic" phx-value-index={nic.index}
+                    <button phx-click="live_detach_nic" phx-value-index={nic.index}
                       data-confirm="Detach this network interface?" disabled={not running} class="btn btn-xs join-item text-error">Remove</button>
                   </div>
                 </td>
@@ -590,9 +1135,183 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           <span class="opacity-60">Direct (macvtap) networks cannot be hot-moved; VLAN/overlay bridges can.</span>
         </form>
       </section>
+
+      <!-- PCI & USB Hardware Passthrough -->
+      <section id="vm-passthrough" class="glass-card p-5 rounded-xl border border-base-content/10 mt-6">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <h3 class="panel-title">PCI &amp; USB Hardware Passthrough</h3>
+          <button type="button" phx-click="scan_host_devices" class="btn btn-xs btn-secondary">
+            <.icon name="hero-magnifying-glass-solid" class="size-3.5" /> Scan Host PCI / USB Inventory
+          </button>
+        </div>
+
+        <div class="grid gap-6 lg:grid-cols-2">
+          <!-- PCI VFIO Passthrough -->
+          <div class="space-y-3">
+            <div class="text-xs font-semibold uppercase tracking-wider opacity-70">PCIe / GPU / NVMe (VFIO)</div>
+            <div class="flex flex-wrap gap-2">
+              <span :if={Vm.pci_device_list(@vm) == []} class="text-xs opacity-60">No PCI devices attached.</span>
+              <span :for={bdf <- Vm.pci_device_list(@vm)} class="badge badge-sm badge-outline gap-1.5 font-mono py-2.5">
+                {bdf}
+                <button type="button" phx-click="detach_pci" phx-value-bdf={bdf} class="text-error hover:underline text-[10px]">✕</button>
+              </span>
+            </div>
+            <form id="attach-pci-form" phx-submit="attach_pci" class="flex flex-wrap items-center gap-2 text-xs">
+              <input type="text" name="bdf" list="host-pci-list" placeholder="0000:01:00.0" class="input input-xs font-mono w-44" />
+              <datalist id="host-pci-list">
+                <option :for={dev <- @host_pci_devices} value={dev["bdf"]}>{dev["description"]} (IOMMU {dev["iommu_group"]})</option>
+              </datalist>
+              <button type="submit" class="btn btn-xs btn-primary">Attach PCI</button>
+            </form>
+          </div>
+
+          <!-- USB Device Passthrough -->
+          <div class="space-y-3">
+            <div class="text-xs font-semibold uppercase tracking-wider opacity-70">USB Host Devices (Live Hotplug)</div>
+            <div class="flex flex-wrap gap-2">
+              <span :if={Vm.usb_device_list(@vm) == []} class="text-xs opacity-60">No USB devices attached.</span>
+              <span :for={usb <- Vm.usb_device_list(@vm)} class="badge badge-sm badge-outline gap-1.5 font-mono py-2.5">
+                {usb}
+                <button type="button" phx-click="detach_usb" phx-value-device={usb} class="text-error hover:underline text-[10px]">✕</button>
+              </span>
+            </div>
+            <form id="attach-usb-form" phx-submit="attach_usb" class="flex flex-wrap items-center gap-2 text-xs">
+              <input type="text" name="device" list="host-usb-list" placeholder="1050:0407 (vendor:product)" class="input input-xs font-mono w-52" />
+              <datalist id="host-usb-list">
+                <option :for={dev <- @host_usb_devices} value={dev["id"]}>{dev["description"]}</option>
+              </datalist>
+              <button type="submit" class="btn btn-xs btn-primary">Attach USB</button>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <!-- QEMU Guest Agent & Serial Console -->
+      <section id="vm-guest-tools" class="mt-6 grid gap-6 lg:grid-cols-2">
+        <!-- QEMU Guest Agent -->
+        <div id="vm-guest-agent" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="panel-title">QEMU Guest Agent (<code>org.qemu.guest_agent.0</code>)</h3>
+            <div class="flex items-center gap-2">
+              <span :if={@guest_agent && @guest_agent["connected"]} class="badge badge-xs badge-success">connected</span>
+              <span :if={@guest_agent && not @guest_agent["connected"]} class="badge badge-xs badge-warning">not responding</span>
+              <button type="button" phx-click="probe_guest_agent" disabled={not running} class="btn btn-xs btn-secondary">
+                Probe Agent
+              </button>
+            </div>
+          </div>
+
+          <div :if={@guest_agent && @guest_agent["connected"]} class="text-xs space-y-1 bg-base-300/40 p-3 rounded-lg font-mono">
+            <div><span class="opacity-60">Hostname:</span> {@guest_agent["hostname"] || "unknown"}</div>
+            <div><span class="opacity-60">OS:</span> {get_in(@guest_agent, ["os", "pretty-name"]) || get_in(@guest_agent, ["os", "name"]) || "unknown"}</div>
+            <div><span class="opacity-60">IPs:</span> {Enum.join(@guest_agent["ips"] || [], ", ")}</div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2 pt-1">
+            <button type="button" phx-click="guest_fsfreeze" disabled={not running} class="btn btn-xs btn-outline">
+              Freeze Filesystems (fsfreeze)
+            </button>
+            <button type="button" phx-click="guest_fsthaw" disabled={not running} class="btn btn-xs btn-outline">
+              Thaw Filesystems (fsthaw)
+            </button>
+          </div>
+
+          <form id="guest-password-form" phx-submit="guest_set_password" class="flex flex-wrap items-center gap-2 text-xs pt-2 border-t border-base-content/10">
+            <span class="opacity-70">Reset Password:</span>
+            <input type="text" name="username" placeholder="root" required disabled={not running} class="input input-xs font-mono w-28" />
+            <input type="password" name="password" placeholder="New password" required disabled={not running} class="input input-xs font-mono w-36" />
+            <button type="submit" disabled={not running} class="btn btn-xs btn-warning">Set Password</button>
+          </form>
+
+          <form id="guest-exec-form" phx-submit="guest_exec" class="flex flex-wrap items-center gap-2 text-xs pt-2 border-t border-base-content/10">
+            <span class="opacity-70">Run Command:</span>
+            <input type="text" name="path" placeholder="/bin/uname" required disabled={not running} class="input input-xs font-mono w-32" />
+            <input type="text" name="args" placeholder="-a" disabled={not running} class="input input-xs font-mono flex-1" />
+            <button type="submit" disabled={not running} class="btn btn-xs btn-primary">Exec</button>
+          </form>
+
+          <pre :if={@guest_exec_output} class="text-xs font-mono bg-black/80 text-emerald-300 p-3 rounded-lg overflow-x-auto max-h-36">{@guest_exec_output}</pre>
+        </div>
+
+        <!-- Serial Console (ttyS0) -->
+        <div id="vm-serial-console" class="glass-card p-5 rounded-xl border border-base-content/10 space-y-3 flex flex-col">
+          <div class="flex items-center justify-between">
+            <h3 class="panel-title">Serial Console (<code>ttyS0</code>)</h3>
+            <button type="button" phx-click="serial_refresh" disabled={not running} class="btn btn-xs btn-secondary">
+              Refresh Output
+            </button>
+          </div>
+
+          <pre class="text-xs font-mono bg-black/85 text-green-400 p-3 rounded-lg overflow-auto h-44 flex-1">{if @serial_output == "", do: "No serial console output captured yet. Click 'Refresh Output' or send a newline below.", else: @serial_output}</pre>
+
+          <form id="serial-send-form" phx-submit="serial_send" class="flex items-center gap-2 text-xs">
+            <input type="text" name="input" placeholder="Send command or press Enter for login prompt..." disabled={not running} class="input input-xs font-mono flex-1" />
+            <button type="submit" disabled={not running} class="btn btn-xs btn-primary">Send to ttyS0</button>
+          </form>
+        </div>
+      </section>
+
+      <!-- Snapshots -->
+      <section id="vm-snapshots" class="glass-card p-5 rounded-xl border border-base-content/10 mt-6">
+        <h3 class="panel-title mb-3 flex items-center justify-between">
+          <span>Snapshots</span>
+          <span class="badge badge-sm badge-ghost font-mono">{length(@snapshots)}</span>
+        </h3>
+
+        <div class="overflow-x-auto">
+          <table class="table table-sm w-full">
+            <thead>
+              <tr><th>Name</th><th>Underlying VDisk</th><th>Size</th><th class="text-right">Actions</th></tr>
+            </thead>
+            <tbody>
+              <tr :if={@snapshots == []}>
+                <td colspan="4" class="text-center text-xs opacity-60 py-4">No snapshots taken yet.</td>
+              </tr>
+              <tr :for={snap <- @snapshots} id={"snap-row-#{snap.name}"}>
+                <td class="font-mono font-semibold">{snap.name}</td>
+                <td class="text-xs opacity-70 font-mono">{snap.vdisk_snapshot}</td>
+                <td class="text-xs opacity-70 font-mono">{round(snap.size_bytes / (1024 * 1024 * 1024))} GiB</td>
+                <td class="text-right">
+                  <button
+                    type="button"
+                    phx-click="rollback_snapshot"
+                    phx-value-snapshot_name={snap.name}
+                    phx-value-live={if running, do: "true", else: "false"}
+                    data-confirm={
+                      if running,
+                        do: "Live-roll back running VM #{@vm.name} to snapshot #{snap.name}? The VM will briefly stop, roll back its vdisks, and restart.",
+                        else: "Roll back VM #{@vm.name} to snapshot #{snap.name}? Any unsaved changes since this snapshot will be lost."
+                    }
+                    class="btn btn-xs btn-warning btn-outline"
+                  >
+                    {if running, do: "Live Rollback", else: "Rollback"}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <form phx-submit="take_snapshot" class="mt-4 flex flex-wrap items-center gap-2 text-xs">
+          <span class="opacity-70">New Snapshot:</span>
+          <input
+            type="text"
+            name="snapshot_name"
+            placeholder="snap-01"
+            required
+            pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,62}"
+            class="input input-xs w-48 font-mono"
+          />
+          <button type="submit" class="btn btn-xs btn-primary">Take Snapshot</button>
+        </form>
+      </section>
     </Layouts.app>
     """
   end
+
+  defp graphics_types_for(%{spice?: true}, _current), do: Vm.graphics_types()
+  defp graphics_types_for(_options, "spice"), do: ["vnc", "spice"]
+  defp graphics_types_for(_options, _current), do: ["vnc"]
 
   # CD-ROM drives from the iso column (comma-separated, "__empty__" for an empty drive).
   defp cdrom_slots(%{iso: iso}) when is_binary(iso) and iso != "" do
@@ -623,6 +1342,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
       {:ok, list} when is_list(list) ->
         Enum.with_index(list, fn entry, idx ->
           case String.split(to_string(entry), ":") do
+            [net, model, _mac | _] -> %{index: idx, network: net, model: model}
             [net, model] -> %{index: idx, network: net, model: model}
             [net] -> %{index: idx, network: net, model: "virtio"}
             _ -> %{index: idx, network: to_string(entry), model: "virtio"}

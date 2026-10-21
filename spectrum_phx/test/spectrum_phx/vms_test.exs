@@ -471,7 +471,7 @@ defmodule SpectrumPhx.VmsTest do
       insert = Vms.insert_cql()
       [_, column_list] = Regex.run(~r/\(([^)]*)\) VALUES/, insert)
       columns = column_list |> String.split(",") |> length()
-      assert columns == 16
+      assert columns == 31
       assert insert |> String.graphemes() |> Enum.count(&(&1 == "?")) == columns
       assert Vms.claim_host_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 4
       assert Vms.set_migration_lock_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 3
@@ -550,7 +550,8 @@ defmodule SpectrumPhx.VmsTest do
       vms = [
         %Vm{name: "running-vm", state: "Running", host_ip: "10.0.0.5"},
         %Vm{name: "stopped-vm", state: "Stopped", host_ip: ""},
-        %Vm{name: "locked-vm", state: "Running", host_ip: "10.0.0.5", status: "migrating"}
+        %Vm{name: "locked-vm", state: "Running", host_ip: "10.0.0.5", status: "migrating"},
+        %Vm{name: "golden-tpl", state: "Stopped", host_ip: "", is_template: true}
       ]
 
       Application.put_env(:spectrum_phx, :vms_source, {:static, vms})
@@ -573,6 +574,11 @@ defmodule SpectrumPhx.VmsTest do
     test "power_on submits a start task for a stopped VM" do
       assert {:ok, %{"task_id" => "test-task"}} = Vms.power_on("stopped-vm")
       assert_received {:task, "vali", "start", %{"vm_name" => "stopped-vm"}}
+    end
+
+    test "power_on refuses a VM marked as a golden image template" do
+      assert {:error, :is_template} = Vms.power_on("golden-tpl")
+      refute_received {:task, _, _, _}
     end
 
     test "power_on refuses a VM that is already running" do
@@ -610,7 +616,7 @@ defmodule SpectrumPhx.VmsTest do
 
     test "list_vms and get_vm read through the configured source" do
       assert {:ok, vms} = Vms.list_vms()
-      assert length(vms) == 3
+      assert length(vms) == 4
       assert {:ok, vm} = Vms.get_vm("locked-vm")
       assert Vm.migrating?(vm)
       assert {:error, :not_found} = Vms.get_vm("no-such-vm")

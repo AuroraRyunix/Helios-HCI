@@ -77,10 +77,17 @@ defmodule SpectrumPhx.Catalyst do
   nothing about whether the work succeeds. That verdict arrives in the row, which is what
   the task ring and `/tasks` read.
   """
-  @spec submit(String.t(), String.t(), map()) :: {:ok, map()} | {:error, term()}
-  def submit(service, action, payload \\ %{})
+  @spec submit(String.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def submit(service, action, payload \\ %{}, opts \\ [])
 
-  def submit(service, action, payload) when service in @services and is_map(payload) do
+  def submit(service, action, payload, opts)
+      when service in @services and is_map(payload) and is_list(opts) do
+    payload =
+      case Keyword.get(opts, :component) do
+        comp when is_binary(comp) and comp != "" -> Map.put_new(payload, "component", comp)
+        _ -> payload
+      end
+
     case submitter() do
       nil -> post(service, action, payload)
       fun when is_function(fun, 3) -> fun.(service, action, payload)
@@ -98,7 +105,7 @@ defmodule SpectrumPhx.Catalyst do
     end
   end
 
-  def submit(service, _action, _payload) when is_binary(service) do
+  def submit(service, _action, _payload, _opts) when is_binary(service) do
     {:error,
      {:unknown_service, "No worker drains the '#{service}' queue, so the task would never run."}}
   end

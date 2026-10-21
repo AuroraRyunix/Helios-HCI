@@ -1083,7 +1083,8 @@ def hylia_rolling_upgrade(job_id):
                     "zookeeper": "zookeeper", "hydra-db": "hydra-db",
                     "spectrum": "spectrum", "bifrost": "bifrost", "dagur": "dagur", "mimir": "mimir", "rauru": "rauru",
                     "vali": "vali", "catalyst": "catalyst", "gatoway": "gatoway", "logos": "logos", 
-                    "mipha": "mipha", "daruk": "daruk", "agahnim": "agahnim", "slate": "slate", "urbosa": "urbosa"
+                    "mipha": "mipha", "daruk": "daruk", "agahnim": "agahnim", "slate": "slate", "urbosa": "urbosa",
+                    "kass": "kass"
                 }
                 for comp in components:
                     if comp in service_components and comp != "hylia":

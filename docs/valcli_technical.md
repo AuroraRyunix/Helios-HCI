@@ -42,7 +42,10 @@ mindmap
 - **`vm.create`**: Prompts/reads VM parameters, submits a POST creation payload to Vali's REST endpoints, and polls progress.
 - **`vm.start` / `vm.stop` / `vm.delete`**: Submits VM task states to the Catalyst scheduler queue.
 - **`host.list`**: Prints cluster nodes, statuses, and hardware information.
-- **`db.query`**: Passes raw CQL arguments directly to the Cassandra database cluster.
+- **`db.query`**: Passes raw CQL arguments directly to the Cassandra/ScyllaDB database cluster.
+- **`db.status`**: Formats `nodetool status` into a human-friendly operator overview displaying resolved hostnames, online/down state, storage load, token ownership, and quorum assessment.
+- **`db.perf`** (or `db.latency`): Formats `nodetool proxyhistograms` into milliseconds (`ms`) across read, write, and range scan percentiles with performance ratings (`[Fast]`, `[Normal]`, `[Warning]`, `[STALL]`) and root cause diagnostics for tail latencies.
+- **`db.info`**: All-in-one ScyllaDB diagnostics summary combining cluster health, node statuses, and latency percentiles.
 - **`backup.*`**: Pass-throughs to `/usr/local/bin/saga` via `run_saga()`, which `exec`s
   the tool with the remaining `sys.argv` and exits with its return code.
 

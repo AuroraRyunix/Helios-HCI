@@ -47,6 +47,7 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
   import SpectrumPhxWeb.Cluster.Components
   import SpectrumPhxWeb.Storage.Components, only: [bytes: 1]
 
+  alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Cluster.Status
   alias SpectrumPhx.Metrics
   alias SpectrumPhx.Storage
@@ -97,6 +98,8 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
     |> assign(:page_title, "Cluster")
     |> assign(:snapshot, snapshot)
     |> assign(:summary, snapshot.summary)
+    |> assign(:fault_domain, Config.fault_domain())
+    |> assign(:ftt, Config.redundancy_factor())
     |> assign(:updated_at, DateTime.utc_now())
   end
 
@@ -172,12 +175,21 @@ defmodule SpectrumPhxWeb.Cluster.OverviewLive do
           <span class="flex flex-wrap items-center gap-2 mt-1">
             <.source_note snapshot={@snapshot} />
             <.desired_badge desired={@summary.desired} />
+            <span class="badge badge-sm badge-info font-mono uppercase">
+              {@fault_domain}
+            </span>
+            <span class={["badge badge-sm", if(@ftt > 0, do: "badge-success", else: "badge-warning")]}>
+              FTT: {@ftt}
+            </span>
             <span class="text-xs opacity-60" id="updated-at">
               updated {Calendar.strftime(@updated_at, "%H:%M:%S")} UTC
             </span>
           </span>
         </:subtitle>
         <:actions>
+          <.link navigate={~p"/topology"} class="btn btn-sm btn-ghost gap-1" id="topology-link">
+            <.icon name="hero-server-stack" class="size-4" /> Topology
+          </.link>
           <.button phx-click="refresh" id="refresh-button">
             <.icon name="hero-arrow-path" class="size-4" /> Refresh
           </.button>

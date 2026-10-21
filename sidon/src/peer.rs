@@ -94,6 +94,10 @@ pub const MAX_DROP_IDS: usize = 256;
 /// toward an older build fails before anything changed rather than half way.
 pub const OP_RELEASE: u16 = 12;
 
+/// Remove replica journal and epoch fence files for a deleted vdisk so a vdisk later created
+/// with the same name can start cleanly at epoch 0.
+pub const OP_VDISK_DROP: u16 = 13;
+
 /// Request flag on OP_APPEND and OP_EGROUP_PUT: this is not the last write of its group, so
 /// the replica need not fsync it -- the group's last write, sent without the flag, is synced
 /// and takes every earlier write to the file with it. For an append the group is one guest
@@ -407,6 +411,28 @@ impl ReplicaStore {
         file.sync_all()?;
         cache.insert(vdisk.to_string(), epoch);
         Ok(epoch)
+    }
+
+    /// Remove this replica's journal and epoch fence files and in-memory state for a deleted
+    /// vdisk so a vdisk recreated with the same name can start at epoch 0.
+    pub fn drop_vdisk(&self, vdisk: &str) -> Result<()> {
+        if !valid_group_id(vdisk) {
+            return Err(Error::refused(format!("{vdisk:?} is not a valid vdisk id")));
+        }
+        self.fenced.lock().expect("fence mutex poisoned").remove(vdisk);
+        self.last_append.lock().expect("append mutex poisoned").remove(vdisk);
+        let jpath = self.journal_path(vdisk);
+        let alt_jpath = self.volume.join("replica").join(format!("{vdisk}.journal"));
+        let tmp_jpath = jpath.with_extension("jrn.tmp");
+        let epath = self.epoch_path(vdisk);
+        for p in [jpath, alt_jpath, tmp_jpath, epath] {
+            match std::fs::remove_file(&p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Error::io(format!("removing replica file {}: {e}", p.display()))),
+            }
+        }
+        Ok(())
     }
 
     /// Append a replicated journal record, refusing anything from a fenced-out epoch.
@@ -779,6 +805,14 @@ pub fn serve_request(store: &ReplicaStore, req: &Request) -> Response {
             Err(Error::Io(_)) => Response::err(ST_NOT_FOUND, 0),
             Err(_) => Response::err(ST_IO, 0),
         },
+        OP_VDISK_DROP => match store.drop_vdisk(&req.vdisk) {
+            Ok(()) => Response::ok(Vec::new()),
+            Err(Error::Refused(_)) => Response::err(ST_REFUSED, 0),
+            Err(e) => {
+                eprintln!("sidon: peer vdisk-drop {}: {e}", req.vdisk);
+                Response::err(ST_IO, 0)
+            }
+        },
         other => {
             eprintln!("sidon: peer sent unknown opcode {other}");
             Response::err(ST_REFUSED, 0)
@@ -1093,6 +1127,28 @@ impl PeerClient {
             Ok(())
         } else {
             Err(Error::io(format!("peer {} answered ping with status {}", self.node, resp.status)))
+        }
+    }
+
+    /// Ask this peer to drop its replica journal and epoch fence files for `vdisk_id`
+    /// when the vdisk is deleted.
+    pub fn drop_vdisk(&self, vdisk_id: &str) -> Result<()> {
+        let resp = self.call(&Request {
+            opcode: OP_VDISK_DROP,
+            vdisk: vdisk_id.to_string(),
+            epoch: 0,
+            seq: 0,
+            offset: 0,
+            flags: 0,
+            data: Vec::new(),
+        })?;
+        if resp.is_ok() {
+            Ok(())
+        } else {
+            Err(Error::io(format!(
+                "peer {} answered vdisk-drop for {vdisk_id} with status {}",
+                self.node, resp.status
+            )))
         }
     }
 }
@@ -1671,6 +1727,32 @@ mod tests {
         store.truncate("vd", 3).unwrap();
         store.append("vd", 3, b"record-0001").unwrap();
         assert_eq!(store.read_tail("vd").unwrap(), b"record-0001");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn op_vdisk_drop_clears_replica_fence_and_journal_allowing_recreate_at_epoch_zero() {
+        let dir = tmpdir("vdisk-drop");
+        let store = Arc::new(ReplicaStore::new(&dir).unwrap());
+        assert_eq!(store.fence("vd-reuse", 7).unwrap(), 7);
+        store.append("vd-reuse", 7, b"old-incarnation-bytes").unwrap();
+        assert!(store.epoch_path("vd-reuse").exists());
+        assert!(store.journal_path("vd-reuse").exists());
+
+        let s2 = Arc::clone(&store);
+        let addr = spawn_test_server(Arc::new(move |req| serve_request(&s2, req)));
+        let client = PeerClient::with_attempts("peer1", &addr, Duration::from_secs(5), 1);
+        client.drop_vdisk("vd-reuse").unwrap();
+
+        assert!(!store.epoch_path("vd-reuse").exists());
+        assert!(!store.journal_path("vd-reuse").exists());
+        assert_eq!(store.fenced_epoch("vd-reuse"), 0);
+        assert!(store.read_tail("vd-reuse").unwrap().is_empty());
+
+        // A recreated vdisk of the same name can now fence at epoch 1 and append at epoch 0/1.
+        store.append("vd-reuse", 0, b"new-incarnation").unwrap();
+        assert_eq!(store.fence("vd-reuse", 1).unwrap(), 1);
+        assert_eq!(store.read_tail("vd-reuse").unwrap(), b"new-incarnation");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

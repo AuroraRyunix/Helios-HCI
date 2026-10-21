@@ -118,12 +118,13 @@ struct World<'a> {
     peers: &'a FakePeers<'a>,
     access: AccessLog,
     ledger: HashMap<String, Instant>,
+    extent_ledger: HashMap<String, Instant>,
     base: Instant,
 }
 
 impl<'a> World<'a> {
     fn new(rig: &'a Rig, peers: &'a FakePeers<'a>) -> World<'a> {
-        World { rig, peers, access: AccessLog::new(1000, 0), ledger: HashMap::new(), base: Instant::now() }
+        World { rig, peers, access: AccessLog::new(1000, 0), ledger: HashMap::new(), extent_ledger: HashMap::new(), base: Instant::now() }
     }
 
     fn sweep_at(&mut self, secs: u64, held: &HashSet<String>) -> SweepReport {
@@ -136,7 +137,7 @@ impl<'a> World<'a> {
             peers: self.peers,
             open_abandon: OPEN_ABANDON,
         };
-        sweep_pass(&pass, &mut self.ledger, held, NOW_MS, later(self.base, secs)).unwrap()
+        sweep_pass(&pass, &mut self.ledger, &mut self.extent_ledger, held, NOW_MS, later(self.base, secs)).unwrap()
     }
 
     /// The two scans that make a group reclaimable: first sight, then past the grace.
@@ -1164,4 +1165,42 @@ fn compaction_at_ftt_one_frees_the_old_group_on_the_replica_after_the_sweep() {
     assert_eq!(moved.egroup.as_deref(), Some(new_group.as_str()));
     let replica_copy = peers.r("n2").store.get_egroup(&new_group, 0, std::fs::metadata(rig.store.path_for(&new_group)).unwrap().len() as usize).unwrap();
     assert_eq!(replica_copy, std::fs::read(rig.store.path_for(&new_group)).unwrap());
+}
+
+#[test]
+fn orphaned_extent_map_rows_are_reclaimed_under_two_scan_grace() {
+    let rig = Rig::new("orphan-ext");
+    let peers = FakePeers::new(&rig, &["n2"]);
+    rig.model.st.borrow_mut().extents.insert(
+        "ext-live".to_string(),
+        crate::purah::testkit::MExt { egroup: "eg-live".to_string(), offset: 0, length: 4096, vhash: 1 },
+    );
+    rig.model.st.borrow_mut().extents.insert(
+        "ext-orphan".to_string(),
+        crate::purah::testkit::MExt { egroup: "eg-orphan".to_string(), offset: 0, length: 4096, vhash: 1 },
+    );
+    rig.model.st.borrow_mut().block.push(MRow {
+        vdisk: "v1".to_string(),
+        idx: 0,
+        egroup: None,
+        offset: 0,
+        length: 4096,
+        vhash: 1,
+        extent: Some("ext-live".to_string()),
+    });
+
+    let mut w = World::new(&rig, &peers);
+    let first = w.sweep_at(0, &HashSet::new());
+    assert!(first.extents_reclaimed.is_empty(), "first scan reclaims nothing: {first:?}");
+    assert!(rig.model.st.borrow().extents.contains_key("ext-orphan"));
+    assert!(rig.model.st.borrow().extents.contains_key("ext-live"));
+
+    let within_grace = w.sweep_at(300, &HashSet::new());
+    assert!(within_grace.extents_reclaimed.is_empty());
+    assert!(rig.model.st.borrow().extents.contains_key("ext-orphan"));
+
+    let second = w.sweep_at(601, &HashSet::new());
+    assert_eq!(second.extents_reclaimed, vec!["ext-orphan".to_string()]);
+    assert!(!rig.model.st.borrow().extents.contains_key("ext-orphan"));
+    assert!(rig.model.st.borrow().extents.contains_key("ext-live"));
 }

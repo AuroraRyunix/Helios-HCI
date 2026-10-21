@@ -123,17 +123,31 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
       <ul id="vms" phx-update="replace" class="mt-6 divide-y divide-zinc-200/70">
         <li :for={vm <- @vms} id={"vm-" <> vm.name} class="flex items-center gap-4 py-4">
           <div class="min-w-0 flex-1">
-            <div class="flex items-center gap-2">
+            <div class="flex flex-wrap items-center gap-2">
               <.link navigate={~p"/vms/#{vm.name}"} class="font-semibold hover:underline">
                 {vm.name}
               </.link>
               <.state_badge vm={vm} />
+              <.template_badge vm={vm} />
               <.lock_badge vm={vm} />
+              <.security_badges vm={vm} />
             </div>
             <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500">
               <span>{vm.vcpu} vCPU</span>
               <span>{vm.memory} MiB</span>
               <span>{vm.firmware}</span>
+              <span :if={vm.affinity_group} class="font-mono text-emerald-600/80">
+                affinity:{vm.affinity_group}
+              </span>
+              <span :if={vm.anti_affinity_group} class="font-mono text-amber-600/80">
+                anti-affinity:{vm.anti_affinity_group}
+              </span>
+              <span :if={vm.pinned_hosts} class="font-mono text-indigo-500/80">
+                pinned:{vm.pinned_hosts}
+              </span>
+              <span :for={ip <- Vm.guest_ip_list(vm)} class="badge badge-xs badge-info font-mono">
+                {ip}
+              </span>
               <span class="flex items-center gap-1">
                 <.icon name="hero-server-micro" class="size-3" /> <.placement vm={vm} />
               </span>
@@ -142,7 +156,7 @@ defmodule SpectrumPhxWeb.Vms.IndexLive do
 
           <div class="flex shrink-0 items-center gap-2">
             <.button
-              :if={not Vm.running?(vm)}
+              :if={not Vm.running?(vm) and not Vm.template?(vm)}
               id={"start-" <> vm.name}
               phx-click="power_on"
               phx-value-name={vm.name}

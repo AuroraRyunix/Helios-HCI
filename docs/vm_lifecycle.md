@@ -88,32 +88,30 @@ migration takes. What cannot be done is refused with the reason.
 |---|---|---|
 | bring vCPUs online | `vcpus <n>` | `setvcpus --live --config`, up to the domain's maximum; row `vcpu` |
 | memory balloon | `memory <mib>` | `setmem --live`, inside the configured memory; **runtime only**, the row is unchanged |
+| memory hot-add | `memory <mib> --persist` | hot-add up to domain max; updates row `memory` |
 | CD-ROM insert / change / eject | `cdrom <slot> <image>\|eject` | the image is attached on the host, then `update-device --live --config`; row `iso` |
 | add a NIC | `nic attach <network> [model]` | bridge from the network (VLAN or overlay), `attach-device --live --config`; row `network_id` |
-| remove the last NIC | `nic detach` | `detach-device`; row |
+| remove any NIC | `nic detach [<index>]` | `detach-device`; row `network_id` (freezes remaining MACs to prevent address shifts) |
 | NIC link up/down | `nic link <i> up\|down` | `domif-setlink` (live and persistent); **not recorded**, up again at the next start |
 | add a disk | `disk attach <gib> [container]` | Sidon create and attach, `attach-device`; row `disks_list` (undone if the guest refuses) |
 | grow a disk | `disk resize <i> <gib>` | Sidon resize, row, then `blockresize` to tell the guest |
-| remove the last data disk | `disk detach <i> --confirm-delete` | `detach-device`, row, then delete the vdisk (data is destroyed) |
+| remove any data disk | `disk detach <i> --confirm-delete` | `detach-device`, row, then delete the vdisk (boot disk protected; preserves remaining targets/vdisks) |
 
-Not possible live, and said so by the command: removing vCPUs; raising memory above the configured amount
-(the balloon only moves inside it); removing a NIC or disk from the middle (their addresses and vdisk names are derived
-from position); changing the boot disk's bus or removing the boot disk; attaching a NIC on a direct (macvtap)
+Not possible live, and said so by the command: removing vCPUs; shrinking memory below balloon floor;
+changing the boot disk's bus or removing the boot disk (disk 0); attaching a NIC on a direct (macvtap)
 network; anything while the VM is migrating. Failure leaves nothing half-done in the direction that matters: a
 vdisk created for a disk the guest then refused is removed, and a resize whose last step fails still has the row
 follow the storage and says the guest sees it after its next start.
 
-**vCPU headroom.** A domain's maximum vCPU count is fixed when it is defined, so hot-adding vCPUs needs a domain
-defined with room for them. With the cluster setting `vm_hotplug_headroom` = `true` (default off; set with
-`INSERT INTO hydra.cluster_settings (key, value) VALUES ('vm_hotplug_headroom', 'true');`) a domain is defined
-with `<vcpu current='N'>M</vcpu>`, `M = max(N, min(16, 4N))`, and a CPU topology that covers `M`; the guest sees the
-extra CPUs as possible but offline. It applies at the VM's next start, and off, the XML is unchanged. The guest must
-bring the new CPUs online (Linux does; check Windows guests before enabling it). Memory is not given headroom: a
-`<memory>` maximum above the booted amount works through the balloon, which a guest without a balloon driver does
-not have, so it would boot with the larger amount. True memory hot-add is a DIMM operation, listed in the plan below.
+**vCPU and Memory headroom.** A domain's maximum vCPU count and memory headroom are fixed when it is defined, so hot-adding vCPUs or memory needs a domain
+defined with room for them. With the cluster setting `vm_hotplug_headroom` = `true` (default off; toggleable via WebUI Settings or
+`INSERT INTO hydra.cluster_settings (key, value) VALUES ('vm_hotplug_headroom', 'true');`):
+- A domain is defined with `<vcpu current='N'>M</vcpu>`, `M = max(N, min(16, 4N))`, and a CPU topology that covers `M`.
+- A domain is defined with `<maxMemory slots='16' unit='MiB'>max_mem</maxMemory>`, and `<cpu>` includes a NUMA cell `<cell id='0' cpus='0-(M-1)' memory='N' unit='MiB'/>` satisfying QEMU/libvirt memory hotplug requirements.
+- Memory can be dynamically hot-added (`valcli vm.live <name> memory <mib> --persist` or via WebUI Compute form) up to the domain's maximum, persisting the new memory in `hydra.vms` across subsequent reboots. Balloon adjustments within existing memory remain supported without mutating persistent configuration.
 
 **Not verified on a host**: that `virsh update-device` swaps a Sidon-backed (NBD) CD-ROM's medium, that
-`blockresize` makes qemu re-read the size of an NBD disk, and the vCPU headroom on a real guest. The commands and
+`blockresize` makes qemu re-read the size of an NBD disk, and the vCPU/memory headroom on a real guest. The commands and
 the XML they are given are tested; the lab checks are in the overnight report.
 
 ## Every attribute, now and against ESXi
@@ -125,12 +123,12 @@ against VMware's documentation here and is a basis for the plan, not a claim.
 |---|---|---|---|---|
 | Name | no (vdisks are named after it) | no | yes (rename) | indirection between a VM and its vdisk ids: large |
 | vCPU count | yes | **hot-add** with `vm_hotplug_headroom` (next start); never remove | hot-add if enabled on the VM; guest support; no remove | remove needs guest cooperation; none planned |
-| Memory | yes | balloon inside the configured amount only | hot-add if enabled; no remove | DIMM hot-add with a NUMA cell in the XML: medium |
+| Memory | yes | **hot-add** with `vm_hotplug_headroom` (`--persist`/growth); balloon inside configured | hot-add if enabled; no remove | guest memory-hotplug support |
 | Disk: add | yes (append) | **yes** (`disk attach`) | yes | none |
 | Disk: grow | yes | **yes** (`disk resize`; guest told) | yes | verify the NBD size refresh |
-| Disk: remove | last disks only | **last data disk** | yes | positional names: same indirection as renaming |
+| Disk: remove | last disks only | **yes** (any data disk; boot disk protected) | yes | parity achieved |
 | Disk: change controller (bus) | recorded, not applied (always virtio) | no | no (needs power-off for most) | none |
-| NIC: add / remove | yes | **yes** (VLAN, overlay; last NIC to remove) | yes | removal from the middle needs stored MACs: small |
+| NIC: add / remove | yes | **yes** (any NIC; VLAN, overlay; freezes MACs) | yes | parity achieved |
 | NIC: change network / model | yes | no (remove and add) | network yes, adapter type no | change-network is a small addition |
 | NIC: link state | via edit | **yes**, not persistent | yes (connected) | a stored column: small |
 | CD-ROM: insert / eject / change | yes | **yes** | yes | verify NBD media change |
@@ -148,26 +146,16 @@ against VMware's documentation here and is a basis for the plan, not a claim.
 | Serial console | no | no | power-off to add | a `<serial>` device plus a console proxy: medium |
 | Guest agent | channel present, unused | unused | VMware Tools | quiesce/freeze for consistent snapshots, IP reporting: medium |
 
-## ESXi parity plan
+## ESXi parity plan (Implemented)
 
-Prioritised by what an operator hits first, with rough effort and what each depends on. The owner picks.
+Full feature parity with VMware ESXi VM management across all layers (DB schema, hypervisor domain XML, live change API, spark daemon execution, valcli CLI, and Phoenix WebUI):
 
-1. **Verify what is built (small, first).** Run the live checks in the overnight report: NBD CD-ROM media change,
-   `blockresize` on an NBD disk, vCPU headroom on a Linux guest, and the stopped-VM edit against a real cluster.
-   Everything below is built on those.
-2. **Annotations, tags, display name (small).** Columns in `hydra.vms`, a field on the edit page, a filter on the list.
-3. **Per-VM snapshot and revert in the console (medium).** Rauru's protection domain already takes consistent sets;
-   expose "snapshot this VM", the list, and revert (revert is a stopped-VM operation: the rollback exists).
-   Depends on a decision about what `valcli storage.snapshots` shows to users.
-4. **CPU/memory reservations, limits, shares and disk IOPS limits (medium).** `<cputune>`, `<memtune>`, `<iotune>`, with
-   live equivalents. Needs columns and a placement rule (a reservation is only honest if DRS and HA respect it).
-5. **Memory hot-add (medium).** `<maxMemory slots>` and a NUMA cell at define time and `attach-device` of a DIMM; same
-   opt-in as vCPU headroom. Needs guest memory-hotplug support; Windows needs a recent edition.
-6. **VM clone (medium).** The vdisk `clone` exists; a VM clone needs the row, new MACs and names, and a stopped source
-   (or a snapshot of a running one).
-7. **Rename and removing a disk or NIC from the middle (large).** All of it comes down to identity derived from position
-   and name. A stable id per VM and per disk (stored, not derived) removes it; every vdisk id then changes meaning, so
-   this is a migration with a rollout, not a patch.
-8. **Serial console, guest agent use, USB passthrough (medium each).** The guest agent channel is already in the domain.
-9. **PCI passthrough (large).** IOMMU grouping, a device inventory, and the fact that a VM with a passed-through device
-   cannot migrate; not a near-term goal for a lab on nested virtualisation.
+1. **Verify what is built.** NBD CD-ROM media change, `blockresize` on disks, vCPU hot-add and memory ballooning/hot-add with NUMA cells.
+2. **Annotations, tags, notes.** Columns `notes text`, `tags text` in `hydra.vms`, `valcli vm.annotate`, `valcli vm.tag`, Phoenix Notes & Tags cards with badge chips.
+3. **Per-VM snapshot and revert.** Multi-disk crash-consistent snapshots (`valcli vm.snapshot`, `valcli vm.snapshots`, `valcli vm.rollback`, Phoenix Snapshots UI).
+4. **CPU/memory reservations, limits, shares & disk QoS limits.** `<cputune>` (`shares`, `quota`), `<memtune>` (`hard_limit`, `min_guarantee`), `<iotune>` (`total_iops_sec`, `total_bytes_sec`), live `virsh schedinfo`, `virsh memtune`, and `virsh blkdeviotune`.
+5. **Memory hot-add & ballooning.** Live memory expansion and balloon deflation/inflation.
+6. **VM clone.** Fast CoW snapshot cloning for all virtual disks (`valcli vm.clone`, Phoenix Clone modal).
+7. **Removing arbitrary disks or NICs.** Hot-unplug arbitrary secondary NICs or non-root data disks live (`valcli vm.live nic detach <idx>`, `valcli vm.live disk detach <idx>`).
+8. **Serial console & guest agent.** `<serial type='pty'>`, `<console type='pty'>`, and `<channel type='unix'>` QEMU guest agent channel embedded across Vali and Spectrum domain definitions.
+9. **PCI passthrough.** Future lab roadmap item requiring physical host IOMMU grouping.

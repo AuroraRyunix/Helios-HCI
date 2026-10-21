@@ -40,6 +40,7 @@ defmodule SpectrumPhx.Settings do
   alias SpectrumPhx.Accounts
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Settings.Apply
+  alias SpectrumPhx.Spark
 
   @settings_cql "SELECT key, value FROM hydra.cluster_settings"
   @users_cql "SELECT username FROM hydra.users"
@@ -56,12 +57,17 @@ defmodule SpectrumPhx.Settings do
     "dns_mtu" => "1500",
     "ntp_servers" => "pool.ntp.org",
     "timezone" => "UTC",
+    "language" => "en-US",
     "cluster_region" => "dc-1",
     "scrub_interval" => "weekly",
     "password_policy" => "disabled",
     "session_timeout" => "30",
     "rate_limit" => "100",
-    "drs_enabled" => "true"
+    "drs_enabled" => "true",
+    "console_protocol_policy" => "both",
+    "default_console_protocol" => "vnc",
+    "fault_domain" => "khost",
+    "vm_hotplug_headroom" => "false"
   }
 
   # Read and shown, never written by `update/2`. The value is what it defaults to when the
@@ -100,6 +106,7 @@ defmodule SpectrumPhx.Settings do
       stored: if(stored == :error, do: @stored, else: stored),
       read_only: read_only_settings(if(stored == :error, do: %{}, else: stored)),
       cluster: cluster,
+      nodes: cluster_nodes(opts),
       users: users(static),
       replication: replication(static, cluster)
     }
@@ -135,9 +142,27 @@ defmodule SpectrumPhx.Settings do
   # `cluster.json` is the authority for these, not a row. A stored row that disagrees is
   # a stale row, and showing it would have an operator reading a name the cluster does
   # not answer to.
-  defp cluster_facts(%{cluster: cluster}) when is_map(cluster), do: cluster
+  defp cluster_facts(%{cluster: cluster} = static) when is_map(cluster) do
+    hosts = Map.get(cluster, :hosts, Map.get(static, :hosts, []))
+    Map.put_new(cluster, :hosts, hosts)
+  end
+
+  defp cluster_facts(%{hosts: hosts} = static) when is_list(hosts) do
+    %{
+      name: Map.get(static, :name, "hci-01"),
+      vip: Map.get(static, :vip, "10.10.102.45"),
+      subnet: Map.get(static, :subnet, "10.10.102.0/24"),
+      id: Map.get(static, :id, "cluster-test"),
+      nodes: length(hosts),
+      redundancy_factor: Map.get(static, :redundancy_factor, 1),
+      fault_domain: Map.get(static, :fault_domain, "khost"),
+      hosts: hosts
+    }
+  end
 
   defp cluster_facts(_static) do
+    hosts = Config.all() |> Map.get(:hosts, [])
+
     %{
       # `Config.all/0` is keyed by atoms. This used to ask for the string "cluster_name",
       # which is never there, so the settings page named no cluster at all.
@@ -146,8 +171,69 @@ defmodule SpectrumPhx.Settings do
       subnet: Config.cluster_subnet(),
       id: Config.cluster_id(),
       nodes: length(Config.node_ips()),
-      redundancy_factor: Config.redundancy_factor()
+      redundancy_factor: Config.redundancy_factor(),
+      fault_domain: Config.fault_domain(),
+      hosts: hosts
     }
+  end
+
+  @doc """
+  List of configured cluster nodes with witness badge and maintenance state.
+  """
+  def cluster_nodes(opts \\ []) do
+    static = static_source(opts)
+    facts = cluster_facts(static)
+    hosts = Map.get(facts, :hosts, [])
+
+    Enum.map(hosts, fn
+      host when is_map(host) ->
+        hostname = host[:hostname] || host["hostname"] || "unknown"
+        ip = host[:ip] || host["ip"] || ""
+        witness? = host[:is_witness] == true or host["is_witness"] == true or host[:role] == "witness" or host["role"] == "witness"
+        role = if witness?, do: "witness", else: (host[:role] || host["role"] || "hypervisor")
+        maintenance = host[:maintenance] || host["maintenance"] || "NORMAL"
+        rack = host[:rack] || host["rack"] || "rack1"
+        chassis_serial = host[:chassis_serial] || host["chassis_serial"] || "chassis-01"
+        node_position = host[:node_position] || host["node_position"] || "A"
+
+        %{
+          hostname: hostname,
+          ip: ip,
+          is_witness?: witness?,
+          role: role,
+          maintenance: maintenance,
+          in_maintenance?: is_binary(maintenance) and maintenance != "NORMAL",
+          rack: rack,
+          chassis_serial: chassis_serial,
+          node_position: node_position
+        }
+
+      ip when is_binary(ip) ->
+        %{
+          hostname: Config.hostname_for(ip),
+          ip: ip,
+          is_witness?: false,
+          role: "hypervisor",
+          maintenance: "NORMAL",
+          in_maintenance?: false,
+          rack: "rack1",
+          chassis_serial: "chassis-01",
+          node_position: "A"
+        }
+
+      _other ->
+        %{
+          hostname: "unknown",
+          ip: "",
+          is_witness?: false,
+          role: "hypervisor",
+          maintenance: "NORMAL",
+          in_maintenance?: false,
+          rack: "rack1",
+          chassis_serial: "chassis-01",
+          node_position: "A"
+        }
+    end)
   end
 
   defp users(static) do
@@ -370,7 +456,8 @@ defmodule SpectrumPhx.Settings do
     current = %{
       "cluster_name" => before.cluster[:name],
       "vip" => before.cluster[:vip],
-      "cluster_subnet" => before.cluster[:subnet]
+      "cluster_subnet" => before.cluster[:subnet],
+      "fault_domain" => before.cluster[:fault_domain] || "khost"
     }
 
     updates =
@@ -672,8 +759,12 @@ defmodule SpectrumPhx.Settings do
 
       true ->
         case query("DELETE FROM hydra.users WHERE username = ?", [username]) do
-          {:ok, _} -> {:ok, username}
-          {:error, reason} -> {:error, "The account could not be removed: #{describe(reason)}"}
+          {:ok, _} ->
+            _ = Accounts.delete_user_sessions(username)
+            {:ok, username}
+
+          {:error, reason} ->
+            {:error, "The account could not be removed: #{describe(reason)}"}
         end
     end
   end
@@ -736,9 +827,15 @@ defmodule SpectrumPhx.Settings do
         statement = "UPDATE hydra.users SET password_hash = ? WHERE username = ? IF EXISTS"
 
         case Hydra.apply_lwt(statement, [Accounts.hash_password(password), username]) do
-          {:ok, true} -> {:ok, username}
-          {:ok, false} -> {:error, "No such user."}
-          {:error, reason} -> {:error, "The password could not be changed: #{describe(reason)}"}
+          {:ok, true} ->
+            _ = Accounts.delete_user_sessions(username)
+            {:ok, username}
+
+          {:ok, false} ->
+            {:error, "No such user."}
+
+          {:error, reason} ->
+            {:error, "The password could not be changed: #{describe(reason)}"}
         end
     end
   end
@@ -758,6 +855,427 @@ defmodule SpectrumPhx.Settings do
   end
 
   def password_problem(_password, _policy), do: "Password must be at least 5 characters long."
+
+  # -- ssl and node management ------------------------------------------------------------
+
+  @doc """
+  Deploy SSL Certificate and Private Key across cluster nodes and restart console services.
+  Validates PEM certificate and key content format before deployment.
+  """
+  def deploy_ssl(cert_pem, key_pem, opts \\ []) do
+    cert_str = if is_binary(cert_pem), do: String.trim(cert_pem), else: ""
+    key_str = if is_binary(key_pem), do: String.trim(key_pem), else: ""
+
+    cond do
+      cert_str == "" or key_str == "" ->
+        {:error, "Certificate and Private Key are required."}
+
+      not (String.contains?(cert_str, "-----BEGIN CERTIFICATE-----") and
+           String.contains?(cert_str, "-----END CERTIFICATE-----")) ->
+        {:error, "Invalid certificate: must be PEM format containing BEGIN CERTIFICATE."}
+
+      not (String.contains?(key_str, "-----BEGIN ") and
+           String.contains?(key_str, "KEY-----")) ->
+        {:error, "Invalid private key: must be PEM format containing private key header."}
+
+      true ->
+        static = static_source(opts)
+        Apply.effect(static, {:ssl, cert_str, key_str}, fn ->
+          cert_dir = Application.get_env(:spectrum_phx, :ssl_cert_dir, "/etc/hci/spectrum/certs")
+          File.mkdir_p!(cert_dir)
+          File.write!(Path.join(cert_dir, "server.crt"), cert_str)
+          File.write!(Path.join(cert_dir, "server.key"), key_str)
+
+          b64_cert = Base.encode64(cert_str)
+          b64_key = Base.encode64(key_str)
+          local_ip = Config.local_ip()
+
+          for host <- Config.all() |> Map.get(:hosts, []) do
+            host_ip = host["ip"]
+            if host_ip && host_ip != local_ip and host_ip != "127.0.0.1" do
+              cmd =
+                "mkdir -p #{cert_dir} && " <>
+                  "echo #{b64_cert} | base64 -d > #{cert_dir}/server.crt && " <>
+                  "echo #{b64_key} | base64 -d > #{cert_dir}/server.key"
+
+              Spark.execute(host_ip, cmd)
+              Spark.host_units(host_ip, "restart", ["slate"])
+            end
+          end
+
+          Task.start(fn ->
+            :timer.sleep(1000)
+            System.cmd("systemctl", ["restart", "slate"])
+            System.cmd("systemctl", ["restart", "spectrum"])
+          end)
+
+          :ok
+        end)
+        |> case do
+          :ok -> {:ok, "SSL Certificate deployed successfully. Web console services restarting..."}
+          {:ok, msg} when is_binary(msg) -> {:ok, msg}
+          {:error, reason} -> {:error, "Failed to deploy SSL certificate: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc """
+  Add a new host node or quorum tie-breaker witness to the cluster.
+  """
+  def add_node(hostname, ip, opts \\ []) do
+    hn = if is_binary(hostname), do: String.trim(hostname), else: ""
+    addr = if is_binary(ip), do: String.trim(ip), else: ""
+    is_witness? = Keyword.get(opts, :witness, false) or Keyword.get(opts, :is_witness, false)
+    rf_opt = parse_rf_opt(Keyword.get(opts, :redundancy_factor))
+
+    cond do
+      hn == "" ->
+        {:error, "Hostname is required."}
+
+      not Regex.match?(~r/\A[A-Za-z0-9][A-Za-z0-9-]{0,62}\z/, hn) ->
+        {:error, "Hostname must be 1-63 alphanumeric characters and hyphens."}
+
+      addr == "" ->
+        {:error, "IP address is required."}
+
+      not match?({:ok, _}, :inet.parse_ipv4strict_address(String.to_charlist(addr))) ->
+        {:error, "Invalid IP address: must be an IPv4 address such as 10.10.102.220."}
+
+      match?({:error, _}, rf_opt) ->
+        rf_opt
+
+      true ->
+        {:ok, rf} = rf_opt
+        static = static_source(opts)
+        existing = cluster_nodes(opts)
+
+        cond do
+          Enum.any?(existing, &(&1.ip == addr)) ->
+            {:error, "Node with IP #{addr} is already configured in the cluster."}
+
+          Enum.any?(existing, &(&1.hostname == hn)) ->
+            {:error, "Node with hostname #{hn} is already configured in the cluster."}
+
+          true ->
+            tag =
+              if is_nil(rf),
+                do: {:add_node, hn, addr, is_witness?},
+                else: {:add_node, hn, addr, is_witness?, rf}
+
+            Apply.effect(static, tag, fn ->
+              args =
+                ["add-node", "--node", addr] ++
+                  if(is_witness?, do: ["--witness"], else: []) ++
+                  if(is_nil(rf), do: [], else: ["-r", Integer.to_string(rf)])
+
+              case System.cmd("/usr/local/bin/cluster", args, stderr_to_stdout: true) do
+                {0, _out} ->
+                  Config.refresh()
+                  :ok
+
+                {_code, out} ->
+                  {:error, String.trim(out)}
+              end
+            end)
+            |> case do
+              :ok ->
+                role_label = if is_witness?, do: "witness node", else: "node"
+                {:ok, "Added #{role_label} #{hn} (#{addr}) to cluster."}
+
+              {:ok, msg} when is_binary(msg) ->
+                {:ok, msg}
+
+              {:error, reason} ->
+                {:error, "Failed to add node: #{describe(reason)}"}
+            end
+        end
+    end
+  end
+
+  defp parse_rf_opt(nil), do: {:ok, nil}
+  defp parse_rf_opt(""), do: {:ok, nil}
+  defp parse_rf_opt(n) when is_integer(n) and n in 0..2, do: {:ok, n}
+
+  defp parse_rf_opt(s) when is_binary(s) do
+    case Integer.parse(String.trim(s)) do
+      {n, ""} when n in 0..2 -> {:ok, n}
+      _ -> {:error, "Redundancy factor must be 0, 1, or 2."}
+    end
+  end
+
+  defp parse_rf_opt(_), do: {:error, "Redundancy factor must be 0, 1, or 2."}
+
+  @doc """
+  Promote or demote a node's ZooKeeper ensemble voting role (`promote` or `demote`).
+  """
+  def zk_role_change(node_or_ip, action, opts \\ []) when action in ~w(promote demote) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+    replacing_raw = Keyword.get(opts, :replacing, "") |> to_string() |> String.trim()
+
+    replacing_node =
+      if replacing_raw == "",
+        do: nil,
+        else: Enum.find(nodes, fn n -> n.hostname == replacing_raw or n.ip == replacing_raw end)
+
+    cond do
+      is_nil(node) ->
+        {:error, "Host #{node_or_ip} not found in cluster configuration."}
+
+      replacing_raw != "" and is_nil(replacing_node) ->
+        {:error, "Replacement host #{replacing_raw} not found in cluster configuration."}
+
+      not is_nil(replacing_node) and replacing_node.ip == node.ip ->
+        {:error, "Target host and replacement host cannot be the same node."}
+
+      true ->
+        replacing_ip = if replacing_node, do: replacing_node.ip, else: nil
+        static = static_source(opts)
+        subcmd = if action == "promote", do: "zk-promote", else: "zk-demote"
+
+        Apply.effect(static, {:zk_role, action, node.ip, replacing_ip}, fn ->
+          args =
+            [subcmd, "--node", node.ip] ++
+              if(replacing_ip, do: ["--replacing", replacing_ip], else: [])
+
+          case System.cmd("/usr/local/bin/cluster", args, stderr_to_stdout: true) do
+            {0, _out} -> :ok
+            {_code, out} -> {:error, String.trim(out)}
+          end
+        end)
+        |> case do
+          :ok ->
+            {:ok, "Updated ZooKeeper role (#{action}) for #{node.hostname} (#{node.ip})."}
+
+          {:ok, msg} when is_binary(msg) ->
+            {:ok, msg}
+
+          {:error, reason} ->
+            {:error, "Failed to change ZooKeeper role: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc """
+  Remove a host node from the cluster.
+  """
+  def remove_node(target, opts \\ []) do
+    target_str = if is_binary(target), do: String.trim(target), else: ""
+    nodes = cluster_nodes(opts)
+
+    node =
+      Enum.find(nodes, fn n ->
+        n.hostname == target_str or n.ip == target_str
+      end)
+
+    cond do
+      target_str == "" ->
+        {:error, "Select a node to remove."}
+
+      is_nil(node) ->
+        {:error, "Node #{target_str} not found in cluster configuration."}
+
+      length(nodes) <= 1 ->
+        {:error, "Cannot remove the only remaining node in the cluster."}
+
+      true ->
+        static = static_source(opts)
+        Apply.effect(static, {:remove_node, node.hostname, node.ip}, fn ->
+          case System.cmd("/usr/local/bin/cluster", ["decommission", "--node", node.ip, "--finalize"], stderr_to_stdout: true) do
+            {0, _out} ->
+              Config.refresh()
+              :ok
+
+            {_code, out} ->
+              {:error, String.trim(out)}
+          end
+        end)
+        |> case do
+          :ok ->
+            {:ok, "Node #{node.hostname} (#{node.ip}) removed from cluster."}
+
+          {:ok, msg} when is_binary(msg) ->
+            {:ok, msg}
+
+          {:error, reason} ->
+            {:error, "Failed to remove node: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc """
+  Set host maintenance mode (`enter`, `leave`, or `service`).
+  """
+  def node_maintenance(node_or_ip, action, opts \\ [])
+
+  def node_maintenance(node_or_ip, "service", opts) do
+    node_service_maintenance(node_or_ip, opts)
+  end
+
+  def node_maintenance(node_or_ip, action, opts) when action in ~w(enter leave) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+
+    if is_nil(node) do
+      {:error, "Host #{node_or_ip} not found."}
+    else
+      static = static_source(opts)
+      Apply.effect(static, {:maintenance, node.ip, action}, fn ->
+        Spark.host_maintenance(node.ip, node.hostname, action)
+      end)
+      |> case do
+        :ok -> {:ok, "Maintenance #{action} initiated for #{node.hostname}."}
+        {:ok, msg} when is_binary(msg) -> {:ok, msg}
+        {:error, reason} -> {:error, "Failed to set maintenance: #{describe(reason)}"}
+      end
+    end
+  end
+
+  @doc """
+  Enter Service Maintenance Mode on a host while keeping VMs running (`--preserve-vms`).
+  """
+  def node_service_maintenance(node_or_ip, opts \\ []) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+
+    if is_nil(node) do
+      {:error, "Host #{node_or_ip} not found."}
+    else
+      static = static_source(opts)
+
+      Apply.effect(static, {:service_maintenance, node.ip}, fn ->
+        case Catalyst.submit(
+               "dagur",
+               "execute",
+               %{
+                 "job_name" => "Service Maintenance (#{node.hostname})",
+                 "command" => "/usr/local/bin/ncli host.maintenance.enter #{node.ip} --preserve-vms"
+               },
+               component: "Cluster"
+             ) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+      end)
+      |> case do
+        :ok -> {:ok, "Service maintenance (preserving VMs) initiated for #{node.hostname}."}
+        {:ok, msg} when is_binary(msg) -> {:ok, msg}
+        {:error, reason} -> {:error, "Failed to enter service maintenance: #{describe(reason)}"}
+      end
+    end
+  end
+
+  @doc """
+  Clear DEGRADED or FENCED status on a host, resetting it to NORMAL in `hydra.nodes`
+  and removing `/run/helios/fenced`.
+  """
+  def clear_node_degraded(node_or_ip, opts \\ []) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+
+    if is_nil(node) do
+      {:error, "Host #{node_or_ip} not found."}
+    else
+      static = static_source(opts)
+
+      Apply.effect(static, {:clear_degraded, node.hostname, node.ip}, fn ->
+        _ = Spark.execute(node.ip, "rm -f /run/helios/fenced")
+
+        case query("UPDATE hydra.nodes SET status = 'NORMAL' WHERE hostname = ?", [node.hostname]) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+      end)
+      |> case do
+        :ok -> {:ok, "Cleared degraded/fenced status for #{node.hostname}."}
+        {:ok, msg} when is_binary(msg) -> {:ok, msg}
+        {:error, reason} -> {:error, "Failed to clear degraded status: #{describe(reason)}"}
+      end
+    end
+  end
+
+  @doc """
+  Trigger host rescue workflow (`ncli host.rescue <ip>`) via Catalyst.
+  """
+  def rescue_node(node_or_ip, opts \\ []) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+
+    if is_nil(node) do
+      {:error, "Host #{node_or_ip} not found."}
+    else
+      static = static_source(opts)
+
+      Apply.effect(static, {:rescue_node, node.ip}, fn ->
+        case Catalyst.submit(
+               "dagur",
+               "execute",
+               %{
+                 "job_name" => "Rescue Host (#{node.hostname})",
+                 "command" => "/usr/local/bin/ncli host.rescue #{node.ip}"
+               },
+               component: "Cluster"
+             ) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+      end)
+      |> case do
+        :ok -> {:ok, "Rescue workflow dispatched for #{node.hostname} (#{node.ip})."}
+        {:ok, msg} when is_binary(msg) -> {:ok, msg}
+        {:error, reason} -> {:error, "Failed to rescue host: #{describe(reason)}"}
+      end
+    end
+  end
+
+  @doc """
+  Trigger DRS cluster workload balancing (`acli vm.balance`) via Catalyst.
+  """
+  def balance_cluster(opts \\ []) do
+    static = static_source(opts)
+
+    Apply.effect(static, :balance_cluster, fn ->
+      case Catalyst.submit(
+             "dagur",
+             "execute",
+             %{
+               "job_name" => "DRS Balance Cluster",
+               "command" => "/usr/local/bin/acli vm.balance"
+             },
+             component: "Cluster"
+           ) do
+        {:ok, _} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end)
+    |> case do
+      :ok -> {:ok, "DRS cluster balance task submitted."}
+      {:ok, msg} when is_binary(msg) -> {:ok, msg}
+      {:error, reason} -> {:error, "Failed to submit DRS balance task: #{describe(reason)}"}
+    end
+  end
+
+  @doc """
+  Trigger safe reboot of a cluster host.
+  """
+  def node_reboot(node_or_ip, opts \\ []) do
+    nodes = cluster_nodes(opts)
+    node = Enum.find(nodes, fn n -> n.hostname == node_or_ip or n.ip == node_or_ip end)
+
+    if is_nil(node) do
+      {:error, "Host #{node_or_ip} not found."}
+    else
+      static = static_source(opts)
+      Apply.effect(static, {:reboot, node.ip}, fn ->
+        Spark.host_reboot(node.ip)
+      end)
+      |> case do
+        :ok -> {:ok, "Reboot command sent to #{node.hostname} (#{node.ip})."}
+        {:ok, msg} when is_binary(msg) -> {:ok, msg}
+        {:error, reason} -> {:error, "Failed to reboot #{node.hostname}: #{describe(reason)}"}
+      end
+    end
+  end
 
   # -- plumbing ---------------------------------------------------------------------------
 

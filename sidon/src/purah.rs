@@ -64,6 +64,9 @@ pub struct Purah {
     /// egroup_id -> when it was first seen unreferenced. Cleared the moment a group is
     /// seen referenced again, so a reused or re-referenced group starts its grace over.
     unreferenced_since: HashMap<String, Instant>,
+    /// extent_id -> when it was first seen unreferenced. Secondary pass reclaiming orphaned
+    /// hydra.dfs_extent_id_map rows under the two-scan grace rule (Stage 3).
+    unreferenced_extents_since: HashMap<String, Instant>,
     /// The node's extent-group access tally, shared with every attached vdisk.
     ///
     /// Purah is both its writer and its reader: it flushes the in-memory counts to Hydra
@@ -110,7 +113,12 @@ pub struct SweepReport {
     pub reclaimed: Vec<String>,
     /// The part of `reclaimed` that was `open`: groups no drain owned. See `reclaim::abandoned`.
     pub reclaimed_abandoned_open: Vec<String>,
+    /// Referenced `open` groups that were older than `open_abandon` and not held, which the
+    /// sweep sealed in place so scrub and compaction can process them (D-33).
+    pub sealed_abandoned_open: Vec<String>,
     pub bytes_reclaimed: u64,
+    /// Orphaned extent rows reclaimed from `hydra.dfs_extent_id_map` under the two-scan grace (Stage 3).
+    pub extents_reclaimed: Vec<String>,
     pub skipped_young: usize,
     pub skipped_open: usize,
     pub skipped_held: usize,
@@ -185,6 +193,7 @@ impl Purah {
             grace,
             open_abandon: default_open_abandon(grace),
             unreferenced_since: HashMap::new(),
+            unreferenced_extents_since: HashMap::new(),
             access,
             strays: tier::StrayLedger::default(),
             last_compaction: None,
@@ -275,7 +284,14 @@ impl Purah {
             peers,
             open_abandon: self.open_abandon,
         };
-        let report = reclaim::sweep_pass(&pass, &mut self.unreferenced_since, held, now_ms, Instant::now())?;
+        let report = reclaim::sweep_pass(
+            &pass,
+            &mut self.unreferenced_since,
+            &mut self.unreferenced_extents_since,
+            held,
+            now_ms,
+            Instant::now(),
+        )?;
         // The copy a move left behind is surplus bytes, not garbage: it is removed by the
         // same two-scan rule, on the same cadence, so there is one answer in this daemon to
         // "when may bytes be deleted".
@@ -498,6 +514,7 @@ impl SweepReport {
             "candidates": self.candidates,
             "reclaimed": self.reclaimed,
             "reclaimed_abandoned_open": self.reclaimed_abandoned_open,
+            "sealed_abandoned_open": self.sealed_abandoned_open,
             "bytes_reclaimed": self.bytes_reclaimed,
             "skipped_open": self.skipped_open,
             "skipped_held": self.skipped_held,

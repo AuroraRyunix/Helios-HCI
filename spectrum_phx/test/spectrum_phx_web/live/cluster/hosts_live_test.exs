@@ -166,4 +166,65 @@ defmodule SpectrumPhxWeb.Cluster.HostsLiveTest do
       refute html =~ "hci-01"
     end
   end
+
+  describe "cluster expansion and 4th-node observer controls" do
+    test "toggles the Add Host drawer and submits add_host", %{conn: conn} do
+      test = self()
+
+      static = %{
+        hosts: [
+          %{"hostname" => "hci-01", "ip" => "10.10.0.11"},
+          %{"hostname" => "hci-02", "ip" => "10.10.0.12"},
+          %{"hostname" => "hci-03", "ip" => "10.10.0.13"}
+        ],
+        effects: fn tag ->
+          send(test, {:effect, tag})
+          :ok
+        end
+      }
+
+      Application.put_env(:spectrum_phx, :settings_source, {:static, static})
+      on_exit(fn -> Application.delete_env(:spectrum_phx, :settings_source) end)
+
+      {:ok, view, _html} = live(conn, ~p"/hosts")
+      refute has_element?(view, "#add-host-form")
+
+      view |> element("#open-add-host-btn") |> render_click()
+      assert has_element?(view, "#add-host-form")
+
+      view
+      |> form("#add-host-form", %{
+        "hostname" => "hci-04",
+        "ip" => "10.10.0.14",
+        "redundancy_factor" => "1"
+      })
+      |> render_submit()
+
+      assert_received {:effect, {:add_node, "hci-04", "10.10.0.14", false, 1}}
+      refute has_element?(view, "#add-host-form")
+    end
+
+    test "renders 4th node as ZooKeeper observer with vote hand-off form", %{conn: conn} do
+      now = System.system_time(:second)
+
+      put_override(
+        nodes: %{
+          "10.10.0.11" => %{"ip" => "10.10.0.11", "hostname" => "hci-01", "zk_leader" => true, "ts" => now, "services" => %{}},
+          "10.10.0.12" => %{"ip" => "10.10.0.12", "hostname" => "hci-02", "zk_leader" => false, "ts" => now, "services" => %{}},
+          "10.10.0.13" => %{"ip" => "10.10.0.13", "hostname" => "hci-03", "zk_leader" => false, "ts" => now, "services" => %{}},
+          "10.10.0.14" => %{"ip" => "10.10.0.14", "hostname" => "hci-04", "zk_leader" => false, "ts" => now, "services" => %{}}
+        },
+        node_ips: ["10.10.0.11", "10.10.0.12", "10.10.0.13", "10.10.0.14"],
+        desired: "started",
+        source: :zookeeper
+      )
+
+      {:ok, view, _html} = live(conn, ~p"/hosts")
+      fourth = view |> element("#host-10-10-0-14") |> render()
+
+      assert fourth =~ "follower (observer)"
+      assert fourth =~ "Slot D"
+      assert has_element?(view, "#zk-promote-form-10-10-0-14")
+    end
+  end
 end

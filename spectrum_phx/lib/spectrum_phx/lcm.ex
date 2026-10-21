@@ -406,6 +406,55 @@ defmodule SpectrumPhx.Lcm do
     |> submitted("The package could not be handed to the cluster")
   end
 
+  @doc "Submit a Catalyst dagur task to check for software updates."
+  @spec check_for_updates() :: {:ok, String.t()} | {:error, String.t()}
+  def check_for_updates do
+    Catalyst.run_on_leader(
+      "lcm_check_updates",
+      "/usr/local/bin/python3 /usr/local/bin/check_updates.py"
+    )
+    |> submitted("Could not check for updates")
+  end
+
+  @doc """
+  Reset/abort a stuck or failed upgrade job (`FAILED`, `RUNNING`, `UPGRADING`, `STARTING`)
+  by setting `hydra.hylia_jobs.state = 'ABORTED'`.
+  """
+  @spec abort_upgrade(keyword()) :: {:ok, String.t()} | {:error, String.t()}
+  def abort_upgrade(opts \\ []) do
+    with {:ok, job} <- loaded_job(opts),
+         :ok <- ensure_abortable(job),
+         {:ok, id} <- upgrade_job_id(job) do
+      case static_source(opts) do
+        %{} = static ->
+          if is_pid(static[:sink]), do: send(static[:sink], {:abort_upgrade, id})
+          {:ok, id}
+
+        nil ->
+          cql = "UPDATE hydra.hylia_jobs SET state = 'ABORTED' WHERE job_id = #{id}"
+
+          case query(cql, []) do
+            {:ok, _} -> {:ok, id}
+            {:error, reason} -> {:error, "Could not abort upgrade job: #{describe(reason)}"}
+          end
+      end
+    end
+  end
+
+  def reset_stuck_upgrade(opts \\ []), do: abort_upgrade(opts)
+
+  @doc "Whether a job can be reset/aborted (`FAILED`, `RUNNING`, `UPGRADING`, `STARTING`)."
+  def abortable?(%{state: state}), do: state in ["FAILED", "RUNNING", "UPGRADING", "STARTING"]
+  def abortable?(_), do: false
+
+  defp ensure_abortable(job) do
+    if abortable?(job) do
+      :ok
+    else
+      {:error, "Job in state #{job.state} cannot be aborted."}
+    end
+  end
+
   @doc """
   Why the package upload is built the way it is.
 

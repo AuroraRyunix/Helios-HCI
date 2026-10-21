@@ -236,6 +236,7 @@ def collect_inventory():
             "check-updates": "/usr/local/bin/check-updates",
             "nodetool": "/usr/local/bin/nodetool",
             "allssh": "/usr/local/bin/allssh",
+            "saltrun": "/usr/local/bin/saltrun",
             "spectrum": "/usr/local/bin/spectrum_server",
             "Dockerfile": "/usr/local/bin/Dockerfile"
         }

@@ -134,11 +134,60 @@ defmodule SpectrumPhxWeb.Policies.IndexLiveTest do
     assert has_element?(view, "#domain-prod")
   end
 
-  test "is read-only: there is nothing here that writes a policy", %{conn: conn} do
+  test "renders interactive forms and actions for snapshot policies, protection domains, and DR targets", %{conn: conn} do
+    test_pid = self()
+
+    Application.put_env(:spectrum_phx, :catalyst_submitter, fn service, action, payload ->
+      send(test_pid, {:catalyst, service, action, payload})
+      {:ok, %{"task_id" => "task-policy-1"}}
+    end)
+
+    on_exit(fn -> Application.delete_env(:spectrum_phx, :catalyst_submitter) end)
+
+    put_policies(%{
+      sink: test_pid,
+      dr_targets: [
+        %{
+          "domain" => "prod",
+          "remote_ip" => "10.20.30.40",
+          "remote_port" => 8443,
+          "status" => "synced",
+          "last_set_id" => "set-01"
+        }
+      ]
+    })
+
     {:ok, view, _html} = live(conn, ~p"/policies")
 
-    refute has_element?(view, "form")
-    refute has_element?(view, "input")
+    assert has_element?(view, "#snapshot-policy-form")
+    assert has_element?(view, "#domain-form")
+    assert has_element?(view, "#dr-target-form")
+    assert has_element?(view, "#dr-target-prod-10-20-30-40")
+
+    view
+    |> form("#snapshot-policy-form", %{
+      "scope" => "container",
+      "target" => "gold",
+      "interval_seconds" => "1800",
+      "keep_last" => "12",
+      "enabled" => "true"
+    })
+    |> render_submit()
+
+    assert_receive {:write, cql, ["container", "gold", true, 1800, 12, _]}
+    assert cql =~ "INSERT INTO hydra.dfs_snapshot_policies"
+
+    view
+    |> element("#run-domain-prod")
+    |> render_click()
+
+    assert_receive {:catalyst, "dagur", "execute", %{"command" => "/usr/local/bin/ncli storage.domain.run prod"}}
+
+    view
+    |> element("#sync-dr-prod")
+    |> render_click()
+
+    assert_receive {:catalyst, "dagur", "execute", %{"command" => "/usr/local/bin/ncli dr.sync prod"}}
   end
 
   test "is not the six-field grab bag the settings panel was", %{conn: conn} do

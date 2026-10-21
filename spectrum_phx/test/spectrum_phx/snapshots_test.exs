@@ -71,18 +71,29 @@ defmodule SpectrumPhx.SnapshotsTest do
           snap("a", "vm-disk0", 100),
           snap("b", "vm-disk0", 200),
           snap("c", "vm-disk0", 300),
-          snap("d", "vm-disk0", 400)
+          snap("d", "vm-disk0", 400),
+          snap("e", "vm-disk0", 500),
+          snap("f", "vm-disk0", 600)
         ],
         index: [
           indexed("a", 100, "policy"),
           indexed("b", 200, "manual"),
-          indexed("c", 300, "pre-rollback")
+          indexed("c", 300, "pre-rollback"),
+          indexed("e", 500, "domain"),
+          indexed("f", 600, "template")
         ]
       })
 
       {:ok, %{snapshots: snaps}} = Snapshots.for_vdisk("vm-disk0")
       origins = Map.new(snaps, &{&1.id, &1.origin})
-      assert origins == %{"a" => :policy, "b" => :manual, "c" => :pre_rollback, "d" => :unindexed}
+      assert origins == %{
+               "a" => :policy,
+               "b" => :manual,
+               "c" => :pre_rollback,
+               "d" => :unindexed,
+               "e" => :domain,
+               "f" => :template
+             }
     end
 
     test "flags a snapshot another vdisk was derived from, because retention will not prune it" do

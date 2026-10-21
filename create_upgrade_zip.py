@@ -136,6 +136,7 @@ components_map = {
     "mcli-runner": {"src": "mcli-runner", "target": "/usr/local/bin/mcli-runner"},
     "nodetool": {"src": "nodetool", "target": "/usr/local/bin/nodetool"},
     "allssh": {"src": "allssh", "target": "/usr/local/bin/allssh"},
+    "saltrun": {"src": "saltrun", "target": "/usr/local/bin/saltrun"},
     "dagur": {"src": "dagur.py", "target": "/usr/local/bin/dagur"},
     "mimir": {"src": "mimir.py", "target": "/usr/local/bin/mimir"},
     "rauru": {"src": "rauru.py", "target": "/usr/local/bin/rauru"},

@@ -29,12 +29,15 @@ use crate::meta::Daruk;
 pub const TABLE_MIGRATION: &str = "0020-dfs-extent-id-map";
 /// The migration that adds `dfs_block_map.extent_id`.
 pub const COLUMN_MIGRATION: &str = "0021-dfs-block-map-extent-id";
+/// The migration that adds `dfs_vdisks.use_extent_id` for per-vdisk writer opt-in (Stage 3).
+pub const VDISK_OPTIN_MIGRATION: &str = "0040-dfs-vdisk-extent-optin";
 
 /// What the mark phase has always read.
 pub const LEGACY_BLOCK_MAP_SCAN: &str = "SELECT egroup_id FROM hydra.dfs_block_map";
 /// What it reads once the column exists.
 pub const BLOCK_MAP_SCAN: &str = "SELECT egroup_id, extent_id FROM hydra.dfs_block_map";
 pub const EXTENT_MAP_SCAN: &str = "SELECT extent_id, egroup_id FROM hydra.dfs_extent_id_map";
+pub const EXTENT_MAP_ORPHAN_SCAN: &str = "SELECT extent_id, created_at_ms FROM hydra.dfs_extent_id_map";
 pub const LEDGER_SCAN: &str = "SELECT id FROM hydra.schema_migrations";
 
 /// A thing that answers CQL with rows. [`Daruk`] is the only production implementation.
@@ -113,7 +116,9 @@ pub fn mark(
     }
 }
 
-/// Every extent group the map points at, across all vdisks, through both levels.
+/// Returns both:
+/// 1. Every extent group the map points at, across all vdisks, through both levels.
+/// 2. Every extent ID referenced by the block map.
 ///
 /// Read *before* the egroup inventory, for the reason Purah documents: a group created
 /// between the two reads then shows as unreferenced-and-young instead of being missed. The
@@ -121,7 +126,7 @@ pub fn mark(
 /// down: an extent a drain adds between the two scans is named by no row this scan saw, so
 /// nothing is lost by its absence, whereas the other order would find a block row naming an
 /// extent the earlier scan never saw and abort a sweep over a race.
-pub fn referenced_egroups<D: Rows>(db: &D) -> Result<HashSet<String>> {
+pub fn referenced_both<D: Rows>(db: &D) -> Result<(HashSet<String>, HashSet<String>)> {
     let (has_column, has_table) = applied_levels(db)?;
     let scan = if has_column { BLOCK_MAP_SCAN } else { LEGACY_BLOCK_MAP_SCAN };
     let block_rows: Vec<(Option<String>, Option<String>)> = db
@@ -130,15 +135,15 @@ pub fn referenced_egroups<D: Rows>(db: &D) -> Result<HashSet<String>> {
         .map(|r| (text(r, "egroup_id"), text(r, "extent_id")))
         .collect();
 
-    let mut wanted: HashSet<&str> = HashSet::new();
+    let mut wanted_extents: HashSet<String> = HashSet::new();
     for (_, extent) in &block_rows {
         if let Some(e) = extent {
-            wanted.insert(e.as_str());
+            wanted_extents.insert(e.clone());
         }
     }
 
     let mut extents: HashMap<String, Option<String>> = HashMap::new();
-    if !wanted.is_empty() {
+    if !wanted_extents.is_empty() {
         if !has_table {
             return Err(Error::meta(format!(
                 "the block map names extents but {TABLE_MIGRATION} is not recorded as applied; \
@@ -152,7 +157,7 @@ pub fn referenced_egroups<D: Rows>(db: &D) -> Result<HashSet<String>> {
         }
     }
 
-    mark(&block_rows, &extents).map_err(|d| {
+    let marked = mark(&block_rows, &extents).map_err(|d| {
         let sample: Vec<&str> = d.iter().take(5).map(String::as_str).collect();
         Error::meta(format!(
             "{} extent id(s) named by the block map have no usable row in the extent id map \
@@ -160,7 +165,30 @@ pub fn referenced_egroups<D: Rows>(db: &D) -> Result<HashSet<String>> {
              look unreferenced",
             d.len()
         ))
-    })
+    })?;
+
+    Ok((marked, wanted_extents))
+}
+
+/// Every extent group the map points at, across all vdisks, through both levels.
+pub fn referenced_egroups<D: Rows>(db: &D) -> Result<HashSet<String>> {
+    referenced_both(db).map(|(egs, _)| egs)
+}
+
+/// Every extent ID referenced by any block map row.
+pub fn referenced_extents<D: Rows>(db: &D) -> Result<HashSet<String>> {
+    let (has_column, _) = applied_levels(db)?;
+    if !has_column {
+        return Ok(HashSet::new());
+    }
+    let rows = db.rows(BLOCK_MAP_SCAN)?;
+    let mut wanted = HashSet::new();
+    for r in rows {
+        if let Some(e) = text(&r, "extent_id") {
+            wanted.insert(e);
+        }
+    }
+    Ok(wanted)
 }
 
 #[cfg(test)]

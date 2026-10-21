@@ -492,6 +492,42 @@ LWT_OPS = {
             "expected_net_id": {"type": "text", "required": True, "nullable": True},
         },
     },
+    # ---- Urbosa VXLAN VNI uniqueness ----------------------------------------------
+    "/v1/network/claim-vni": {
+        "cql": (
+            "INSERT INTO hydra.urbosa_vni_claims (vni, segment_id, name, claimed_at_ms) "
+            "VALUES (?, ?, ?, ?) IF NOT EXISTS"
+        ),
+        "binds": ("vni", "segment_id", "name", "claimed_at_ms"),
+        "params": {
+            "vni": {"type": "int", "required": True},
+            "segment_id": {"type": "text", "required": True},
+            "name": {"type": "text", "default": ""},
+            "claimed_at_ms": {"type": "int", "required": True},
+        },
+    },
+    "/v1/network/release-vni": {
+        "cql": "DELETE FROM hydra.urbosa_vni_claims WHERE vni = ? IF segment_id = ?",
+        "binds": ("vni", "segment_id"),
+        "params": {
+            "vni": {"type": "int", "required": True},
+            "segment_id": {"type": "text", "required": True},
+        },
+    },
+    "/v1/network/reclaim-vni": {
+        "cql": (
+            "UPDATE hydra.urbosa_vni_claims SET segment_id = ?, name = ?, claimed_at_ms = ? "
+            "WHERE vni = ? IF segment_id = ?"
+        ),
+        "binds": ("segment_id", "name", "claimed_at_ms", "vni", "expected_segment_id"),
+        "params": {
+            "vni": {"type": "int", "required": True},
+            "segment_id": {"type": "text", "required": True},
+            "name": {"type": "text", "default": ""},
+            "claimed_at_ms": {"type": "int", "required": True},
+            "expected_segment_id": {"type": "text", "required": True, "nullable": True},
+        },
+    },
 
     # ---- The extent-based DFS (Sidon) --------------------------------------------
     # Explicit columns, never `INSERT ... JSON ? IF NOT EXISTS`: that form silently

@@ -122,6 +122,28 @@ defmodule SpectrumPhx.Spark do
     post_json(ip, "/api/v1/vm/" <> name <> "/power", %{"action" => action})
   end
 
+  @doc "QEMU Guest Agent status, OS info, hostname, and live IP addresses for a VM."
+  def vm_guest_agent(ip, name),
+    do: get_json(ip, "/api/v1/vm/" <> name <> "/guest-agent", retry: false, timeout: 6)
+
+  @doc "Execute a QEMU Guest Agent action (ping, fsfreeze-freeze, fsfreeze-thaw, set-user-password, exec)."
+  def vm_guest_agent_action(ip, name, payload) when is_map(payload),
+    do: post_json(ip, "/api/v1/vm/" <> name <> "/guest-agent", payload, timeout: 20)
+
+  @doc "Read buffered serial console (ttyS0) output for a running VM."
+  def vm_serial_read(ip, name),
+    do: get_json(ip, "/api/v1/vm/" <> name <> "/serial", retry: false, timeout: 6)
+
+  @doc "Send input to a running VM's serial console (ttyS0) and return recent output."
+  def vm_serial_send(ip, name, data) when is_binary(data),
+    do: post_json(ip, "/api/v1/vm/" <> name <> "/serial", %{"data" => data}, timeout: 10)
+
+  @doc "Host PCI / IOMMU passthrough inventory."
+  def host_pci(ip), do: get_json(ip, "/api/v1/host/pci", retry: false, timeout: 6)
+
+  @doc "Host USB device inventory for passthrough."
+  def host_usb(ip), do: get_json(ip, "/api/v1/host/usb", retry: false, timeout: 6)
+
   @doc """
   Call one Sidon operation on a node, through spark-daemon's typed DFS endpoint.
 
@@ -340,6 +362,11 @@ defmodule SpectrumPhx.Spark do
 
   @doc "Reboot a host. Requires explicit confirmation."
   def host_reboot(ip), do: post_json(ip, "/api/v1/host/reboot", %{"confirm" => true})
+
+  @doc "Set or clear maintenance mode on a host (`enter` or `leave`)."
+  def host_maintenance(ip, hostname, action) when action in ~w(enter leave) do
+    post_json(ip, "/api/v1/host/maintenance", %{"hostname" => hostname, "action" => action})
+  end
 
   @doc """
   Act on systemd units on a host: `restart`, `start` or `stop`.

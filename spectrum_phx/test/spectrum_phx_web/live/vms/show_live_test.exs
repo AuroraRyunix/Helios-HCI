@@ -99,12 +99,42 @@ defmodule SpectrumPhxWeb.Vms.ShowLiveTest do
       assert html =~ "web-01-disk1"
       assert html =~ "/var/lib/hci/sidon/nbd/web-01-disk1.sock"
       assert html =~ "fast"
+      assert html =~ "Detach"
     end
 
     test "treats the NONE sentinel as no disks", %{conn: conn} do
       {:ok, _view, html} = live(conn, ~p"/vms/db.prod")
 
       assert html =~ "no disks registered"
+    end
+
+    test "renders DRS affinity, Cloud-Init, Secure Boot, vTPM, and Template controls", %{conn: conn} do
+      tpl = %Vm{
+        @stopped
+        | name: "debian-gold",
+          is_template: true,
+          vtpm_enabled: true,
+          secure_boot: true,
+          affinity_group: "gold-group",
+          anti_affinity_group: "ha-pair",
+          pinned_hosts: "10.10.102.41, 10.10.102.42",
+          cloud_init_userdata: "#cloud-config\npackages: [vim]"
+      }
+
+      Application.put_env(:spectrum_phx, :vms_source, {:static, [tpl]})
+
+      {:ok, view, html} = live(conn, ~p"/vms/debian-gold")
+
+      assert html =~ "Template"
+      assert html =~ "Secure Boot"
+      assert html =~ "vTPM 2.0"
+      assert html =~ "Deploy from Template"
+      assert html =~ "Unmark Template"
+      assert html =~ "gold-group"
+      assert html =~ "ha-pair"
+      assert html =~ "10.10.102.41, 10.10.102.42"
+      assert html =~ "#cloud-config"
+      refute has_element?(view, "#start")
     end
   end
 

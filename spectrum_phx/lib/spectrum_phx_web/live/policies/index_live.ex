@@ -32,6 +32,107 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
   @impl true
   def handle_event("refresh", _params, socket), do: {:noreply, load(socket)}
 
+  def handle_event("save_snapshot_policy", params, socket) do
+    case Policies.save_snapshot_policy(params) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Snapshot policy saved.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_snapshot_policy", %{"scope" => scope, "target" => target}, socket) do
+    case Policies.delete_snapshot_policy(scope, target) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Snapshot policy deleted.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("create_domain", params, socket) do
+    case Policies.create_domain(params) do
+      {:ok, name} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Protection domain #{name} saved.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_domain", %{"name" => name}, socket) do
+    case Policies.delete_domain(name) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Protection domain #{name} deleted.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("run_domain_now", %{"name" => name}, socket) do
+    case Policies.run_domain_now(name) do
+      {:ok, _task} ->
+        {:noreply, put_flash(socket, :info, "Snapshot set triggered for domain #{name}.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_string(reason))}
+    end
+  end
+
+  def handle_event("create_dr_target", params, socket) do
+    case Policies.create_dr_target(params) do
+      {:ok, _} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "DR replication target saved.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_dr_target", params, socket) do
+    domain = params["domain"] || params["target_name"]
+    remote_ip = params["remote_ip"]
+
+    case Policies.delete_dr_target(domain, remote_ip) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "DR replication target deleted.")
+         |> load()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("sync_dr_target", %{"domain" => domain}, socket) do
+    case Policies.sync_dr_target(domain) do
+      {:ok, _task} ->
+        {:noreply, put_flash(socket, :info, "DR sync triggered for #{domain}.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_string(reason))}
+    end
+  end
+
   defp load(socket) do
     socket |> assign(:policies, Policies.overview()) |> assign(:read_at, DateTime.utc_now())
   end
@@ -44,6 +145,7 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
       assign(assigns,
         snapshot_rows: rows_of(assigns.policies.snapshot),
         domain_rows: rows_of(assigns.policies.domains),
+        dr_rows: rows_of(assigns.policies.dr_targets),
         container_rows: rows_of(assigns.policies.containers)
       )
 
@@ -74,6 +176,25 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
           title="Snapshot policies"
           subtitle="Automatic snapshots by scope. Narrowest scope wins; a disabled narrow row is an exemption."
         >
+          <form id="snapshot-policy-form" phx-submit="save_snapshot_policy" class="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-3">
+            <select name="scope" class="select select-xs select-bordered">
+              <option value="cluster">cluster</option>
+              <option value="container">container</option>
+              <option value="vdisk">vdisk</option>
+            </select>
+            <input type="text" name="target" placeholder="Target (* or name)" value="*" class="input input-xs input-bordered font-mono" required />
+            <input type="number" name="interval_seconds" placeholder="Interval (s)" value="3600" min="60" class="input input-xs input-bordered font-mono" required />
+            <input type="number" name="keep_last" placeholder="Keep last" value="24" min="1" class="input input-xs input-bordered font-mono" required />
+            <div class="flex items-center gap-2">
+              <label class="label cursor-pointer gap-1 text-xs">
+                <input type="hidden" name="enabled" value="false" />
+                <input type="checkbox" name="enabled" value="true" checked class="checkbox checkbox-xs" />
+                <span>On</span>
+              </label>
+              <button type="submit" class="btn btn-xs btn-primary flex-1">Save</button>
+            </div>
+          </form>
+
           <.unreadable :if={match?({:error, _}, @policies.snapshot)} section={@policies.snapshot} />
 
           <div :if={@snapshot_rows}>
@@ -86,6 +207,7 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
                     <th>Takes one</th>
                     <th>Keeps</th>
                     <th>State</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -101,6 +223,18 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
                         disabled
                       </span>
                     </td>
+                    <td class="text-right">
+                      <button
+                        type="button"
+                        phx-click="delete_snapshot_policy"
+                        phx-value-scope={row.scope}
+                        phx-value-target={row.target}
+                        id={"delete-snapshot-#{row.scope}-#{slug(row.target)}"}
+                        class="btn btn-ghost btn-xs text-error"
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -111,7 +245,7 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
           </div>
 
           <p class="text-xs opacity-55 mt-3">
-            Set with <code class="font-mono">valcli storage.snapshot-policy.set cluster|container:&lt;name&gt;|vdisk:&lt;id&gt; --every-hours N --keep N</code>.
+            Set above or with <code class="font-mono">valcli storage.snapshot-policy.set cluster|container:&lt;name&gt;|vdisk:&lt;id&gt; --every-hours N --keep N</code>.
             Retention only prunes snapshots a policy took, never ones taken by hand.
           </p>
         </.panel>
@@ -121,6 +255,22 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
           title="Protection domains"
           subtitle="VMs and vdisks snapshotted together, as one crash-consistent set"
         >
+          <form id="domain-form" phx-submit="create_domain" class="grid grid-cols-2 sm:grid-cols-3 gap-2 mb-3">
+            <input type="text" name="name" placeholder="Domain name" class="input input-xs input-bordered font-mono" required />
+            <input type="text" name="vms" placeholder="VMs (comma-separated)" class="input input-xs input-bordered font-mono" />
+            <input type="text" name="vdisks" placeholder="Vdisks (comma-separated)" class="input input-xs input-bordered font-mono" />
+            <input type="number" name="interval_seconds" placeholder="Interval (s)" value="3600" min="60" class="input input-xs input-bordered font-mono" required />
+            <input type="number" name="keep_last" placeholder="Keep sets" value="12" min="1" class="input input-xs input-bordered font-mono" required />
+            <div class="flex gap-1">
+              <select name="quiesce" class="select select-xs select-bordered font-mono flex-1">
+                <option value="none">none</option>
+                <option value="vm">vm</option>
+                <option value="domain">domain</option>
+              </select>
+              <button type="submit" class="btn btn-xs btn-primary">Save Domain</button>
+            </div>
+          </form>
+
           <.unreadable :if={match?({:error, _}, @policies.domains)} section={@policies.domains} />
 
           <div :if={@domain_rows}>
@@ -134,6 +284,7 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
                     <th>Keeps</th>
                     <th>Consistency</th>
                     <th>Latest set</th>
+                    <th></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -152,6 +303,26 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
                       </span>
                     </td>
                     <td class="text-xs">{latest(row.latest)}</td>
+                    <td class="text-right whitespace-nowrap">
+                      <button
+                        type="button"
+                        phx-click="run_domain_now"
+                        phx-value-name={row.name}
+                        id={"run-domain-#{slug(row.name)}"}
+                        class="btn btn-ghost btn-xs text-primary"
+                      >
+                        Snapshot Now
+                      </button>
+                      <button
+                        type="button"
+                        phx-click="delete_domain"
+                        phx-value-name={row.name}
+                        id={"delete-domain-#{slug(row.name)}"}
+                        class="btn btn-ghost btn-xs text-error"
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -164,8 +335,76 @@ defmodule SpectrumPhxWeb.Policies.IndexLive do
 
           <p class="text-xs opacity-55 mt-3">
             Crash-consistent, not application-consistent: nothing quiesces a database inside
-            the guest. Managed with <code class="font-mono">valcli storage.domain*</code>.
+            the guest. Managed above or with <code class="font-mono">valcli storage.domain*</code>.
           </p>
+        </.panel>
+
+        <.panel
+          id="dr-targets"
+          title="DR replication targets"
+          subtitle="Site-to-site asynchronous replication of protection domain snapshot sets"
+        >
+          <form id="dr-target-form" phx-submit="create_dr_target" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+            <input type="text" name="domain" placeholder="Domain name" class="input input-xs input-bordered font-mono" required />
+            <input type="text" name="remote_ip" placeholder="Remote IP / Host" class="input input-xs input-bordered font-mono" required />
+            <input type="number" name="remote_port" placeholder="Port (8443)" value="8443" class="input input-xs input-bordered font-mono" />
+            <div class="flex gap-1">
+              <input type="text" name="pin_sha256" placeholder="TLS SHA256 pin (opt)" class="input input-xs input-bordered font-mono flex-1" />
+              <button type="submit" class="btn btn-xs btn-primary">Add Target</button>
+            </div>
+          </form>
+
+          <.unreadable :if={match?({:error, _}, @policies.dr_targets)} section={@policies.dr_targets} />
+
+          <div :if={@dr_rows}>
+            <div :if={@dr_rows != []} class="overflow-x-auto">
+              <table class="table table-sm" id="dr-targets-table">
+                <thead>
+                  <tr>
+                    <th>Domain</th>
+                    <th>Remote Endpoint</th>
+                    <th>Status</th>
+                    <th>Last Set</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={row <- @dr_rows} id={"dr-target-#{slug(row.domain)}-#{slug(row.remote_ip)}"}>
+                    <td class="font-medium font-mono">{row.domain}</td>
+                    <td class="font-mono text-xs">{row.remote_ip}:{row.remote_port}</td>
+                    <td>
+                      <span class="badge badge-sm badge-ghost">{row.status}</span>
+                    </td>
+                    <td class="font-mono text-xs">{row.last_set_id || "none"}</td>
+                    <td class="text-right whitespace-nowrap">
+                      <button
+                        type="button"
+                        phx-click="sync_dr_target"
+                        phx-value-domain={row.domain}
+                        id={"sync-dr-#{slug(row.domain)}"}
+                        class="btn btn-ghost btn-xs text-primary"
+                      >
+                        Sync Now
+                      </button>
+                      <button
+                        type="button"
+                        phx-click="delete_dr_target"
+                        phx-value-domain={row.domain}
+                        phx-value-remote_ip={row.remote_ip}
+                        id={"delete-dr-#{slug(row.domain)}-#{slug(row.remote_ip)}"}
+                        class="btn btn-ghost btn-xs text-error"
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p :if={@dr_rows == []} class="text-sm opacity-70" id="no-dr-targets">
+              No asynchronous DR replication targets configured.
+            </p>
+          </div>
         </.panel>
 
         <.panel

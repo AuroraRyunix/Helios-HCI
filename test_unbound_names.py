@@ -42,7 +42,7 @@ COMPONENTS = [
     "provision.py", "deploy_updates.py", "check_updates.py", "create_upgrade_zip.py",
     "sync_provision.py", "helios_schema.py", "helios_sidon.py", "helios_sig.py",
     "helios_zk.py", "mimir.py", "mcli", "mcli-runner", "valcli.py", "nodetool",
-    "catcli", "urbosa.py", "urbosa_bootstrap.py",
+    "catcli", "saltrun", "urbosa.py", "urbosa_bootstrap.py",
 ]
 
 BUILTIN_NAMES = frozenset(dir(builtins)) | {

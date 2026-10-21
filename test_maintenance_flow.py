@@ -48,11 +48,11 @@ def read(name):
 
 
 class TheRuleIsOneColumn(unittest.TestCase):
-    KEPT = set()
+    KEPT = {"hydra-db", "daruk", "sidon", "hylia"}
 
     def test_the_declared_table_keeps_exactly_the_documented_units(self):
         self.assertEqual(set(spark.maintenance_kept_units()), self.KEPT)
-        self.assertEqual(set(spark.MAINTENANCE_UNMANAGED_KEPT), {"spark-daemon"})
+        self.assertEqual(set(spark.MAINTENANCE_UNMANAGED_KEPT), {"zookeeper", "spark-daemon"})
 
     def test_every_managed_unit_is_either_kept_or_stopped_never_both_never_neither(self):
         managed = [e["unit"] for e in spark.MANAGED_SERVICES]
@@ -65,12 +65,16 @@ class TheRuleIsOneColumn(unittest.TestCase):
         self.assertEqual(len(vali.MAINTENANCE_STOP_UNITS), len(set(vali.MAINTENANCE_STOP_UNITS)))
 
     def test_nothing_kept_is_stopped_by_maintenance(self):
-        for unit in self.KEPT | {"spark-daemon"}:
+        for unit in self.KEPT | {"zookeeper", "spark-daemon"}:
             self.assertNotIn(unit, vali.MAINTENANCE_STOP_UNITS)
 
     def test_the_watchdog_restarts_what_is_kept_in_start_order(self):
         order = spark.maintenance_watchdog_units()
-        self.assertEqual(order, [])
+        self.assertEqual(order[0], "zookeeper")
+        self.assertEqual(set(order), {"zookeeper"} | self.KEPT)
+        # Daruk after the database it fronts, and Sidon after Daruk.
+        self.assertLess(order.index("hydra-db"), order.index("daruk"))
+        self.assertLess(order.index("daruk"), order.index("sidon"))
 
     def test_the_hardcoded_lists_that_disagreed_are_gone(self):
         src = read("spark_daemon_decoded.py")
@@ -132,7 +136,7 @@ class Cluster:
         if "SELECT JSON hostname, ip, status" in query:
             return 0, json.dumps({"hostname": "n2", "ip": "10.0.0.2", "status": self.status,
                                   "maintenance_mode": self.status == "IN_MAINTENANCE"}), ""
-        if "SELECT JSON name, host_ip, state, memory FROM hydra.vms" in query:
+        if "FROM hydra.vms" in query:
             return 0, "\n".join(json.dumps(v) for v in self.vms), ""
         if "UPDATE hydra.nodes SET status = 'NORMAL'" in query:
             self.status = "NORMAL"
@@ -157,6 +161,8 @@ class Cluster:
         self.events.append(("lock-acquire", hostname))
         if self.lock_taken_elsewhere:
             return True, "", {"holder": self.lock_taken_elsewhere, "reason": "draining"}, ""
+        if self.lock:
+            return True, "", dict(self.lock), ""
         self.lock = {"holder": hostname, "holder_token": "tok"}
         return True, "tok", {}, ""
 
@@ -237,6 +243,8 @@ def patch_vali(c):
         "run_mtls_spark_api": c.node_status, "submit_and_wait_task": c.submit_and_wait,
         "select_best_start_host": c.best_host,
         "check_stop_preserves_quorum": lambda ip: c.quorum,
+        "check_zk_stop_preserves_quorum": lambda ip: getattr(c, "zk_quorum", (True, "ZK quorum ok")),
+        "wait_zookeeper_rejoined": lambda ip, **k: getattr(c, "zk_rejoined", (True, "follower")),
         "read_maintenance_lock": lambda: c.lock,
     }
     started = []
@@ -299,6 +307,13 @@ class TheRequestToEnter(ValiTestCase):
         self.assertEqual(self.c.has("lock-acquire"), [])
         self.assertEqual(self.c.status, "NORMAL")
 
+    def test_the_zk_quorum_gate_refuses_before_anything_is_taken(self):
+        self.c.zk_quorum = (False, "stopping ZooKeeper on n2 leaves 1 of 3 voters")
+        status, body = self.request("enter")
+        self.assertEqual((status, body["reason"]), (409, "quorum"))
+        self.assertEqual(self.c.has("lock-acquire"), [])
+        self.assertEqual(self.c.status, "NORMAL")
+
     def test_another_host_holding_the_lock_refuses_with_its_name(self):
         self.c.lock_taken_elsewhere = "n3"
         status, body = self.request("enter")
@@ -332,6 +347,28 @@ class TheRequestToEnter(ValiTestCase):
         replies = []
         vali.handle_maintenance_request({"hostname": "n2"}, lambda s, b: replies.append(s))
         self.assertEqual(replies, [400])
+
+    def test_transition_from_service_maintenance_to_full_maintenance(self):
+        self.c.status = "SERVICE_MAINTENANCE"
+        self.c.lock = {"holder": "n2", "holder_token": "tok"}
+        status, body = self.request("enter", preserve_vms=False)
+        self.assertEqual((status, body["status"]), (200, "transitioning"))
+        self.assertEqual(self.c.status, "ENTERING_MAINTENANCE")
+        self.assertEqual(self.c.submitted[0]["action"], "host_maintenance_enter")
+        self.assertFalse(self.c.submitted[0]["payload"].get("preserve_vms", False))
+        self.assertEqual(self.c.submitted[0]["payload"]["lock_token"], "tok")
+
+    def test_service_maintenance_request_rejected_if_already_in_service_maintenance(self):
+        self.c.status = "SERVICE_MAINTENANCE"
+        status, body = self.request("enter", preserve_vms=True)
+        self.assertEqual(status, 409)
+        self.assertIn("already in service maintenance", body["error"])
+
+    def test_enter_rejected_if_already_in_full_maintenance(self):
+        self.c.status = "IN_MAINTENANCE"
+        status, body = self.request("enter")
+        self.assertEqual(status, 409)
+        self.assertIn("already in maintenance", body["error"])
 
 
 class TheTaskThatEnters(ValiTestCase):
@@ -470,6 +507,7 @@ class TheTaskThatLeaves(ValiTestCase):
         self.assertEqual(self.c.status, "NORMAL", "nothing used to take the host from RECOVERING")
         self.assertFalse(self.c.marker)
         self.assertEqual(self.c.has("lock-release-host"), [("lock-release-host", "n2")])
+        self.assertEqual(self.c.has("subtask", "vali", "reclaim_storage") and 1, 1)
         self.assertEqual(self.c.has("subtask", "vali", "balance") and 1, 1)
 
     def test_the_marker_goes_first_then_the_units_start_then_recovering_then_normal(self):
@@ -546,6 +584,20 @@ class TheTaskThatLeaves(ValiTestCase):
         self.assertFalse(ok)
         self.assertIn("could not be read", detail)
         self.assertEqual(self.c.status, "RECOVERING")
+
+
+class TheTaskThatReclaimsStorage(ValiTestCase):
+    def test_reclaim_storage_with_no_vms_completes(self):
+        ok, msg = self.task("reclaim_storage")
+        self.assertTrue(ok)
+        self.assertIn("storage redirection not needed", msg)
+
+    def test_reclaim_storage_with_running_vm_attaches_and_hands_over(self):
+        self.c.vms = [{"name": "vm1", "host_ip": "10.0.0.2", "state": "Running", "disks_list": "vd-disk1"}]
+        with mock.patch.object(vali, "hand_over_storage", lambda ip, disks: []):
+            ok, msg = self.task("reclaim_storage")
+        self.assertTrue(ok)
+        self.assertIn("Successfully redirected storage traffic", msg)
 
 
 class AHostThatRebootsInMaintenance(unittest.TestCase):

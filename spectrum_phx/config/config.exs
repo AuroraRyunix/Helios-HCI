@@ -19,7 +19,13 @@ config :spectrum_phx, SpectrumPhxWeb.Endpoint,
     layout: false
   ],
   pubsub_server: SpectrumPhx.PubSub,
-  live_view: [signing_salt: "Z7reP+66"]
+  live_view: [signing_salt: "Z7reP+66"],
+  http: [
+    websocket_options: [
+      max_frame_size: 16_000_000,
+      max_fragmented_message_size: 16_000_000
+    ]
+  ]
 
 # Configure LiveView
 config :phoenix_live_view,
@@ -62,7 +68,9 @@ config :phoenix, :json_library, Jason
 config :mime, :types, %{
   "application/x-iso9660-image" => ["iso"],
   "application/x-qemu-disk" => ["qcow2"],
-  "application/x-raw-disk-image" => ["img"]
+  "application/x-raw-disk-image" => ["img", "raw"],
+  "application/x-vmdk" => ["vmdk"],
+  "application/x-ova" => ["ova"]
 }
 
 # Import environment specific config. This must remain at the bottom

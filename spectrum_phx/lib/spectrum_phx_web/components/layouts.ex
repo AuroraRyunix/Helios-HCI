@@ -30,6 +30,8 @@ defmodule SpectrumPhxWeb.Layouts do
   @nav [
     {:overview, "Overview", "/", :live},
     {:hosts, "Hosts", "/hosts", :live},
+    {:topology, "Topology", "/topology", :live},
+    {:central, "Central", "/central", :live},
     {:vms, "VMs", "/vms", :live},
     {:storage, "Storage", "/storage", :live},
     {:policies, "Policies", "/policies", :live},

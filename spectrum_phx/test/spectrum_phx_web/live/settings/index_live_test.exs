@@ -312,4 +312,125 @@ defmodule SpectrumPhxWeb.Settings.IndexLiveTest do
     end
   end
 
+  describe "appearance and localization" do
+    test "renders language select and theme preference buttons", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      assert has_element?(view, "#appearance-settings")
+      assert has_element?(view, "#setting-language")
+      assert has_element?(view, "#theme-dark-btn")
+      assert has_element?(view, "#theme-light-btn")
+      assert has_element?(view, "#theme-system-btn")
+    end
+  end
+
+  describe "ssl certificate management" do
+    test "renders ssl form and deploys valid certificate", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      assert has_element?(view, "#ssl-settings")
+      assert has_element?(view, "#ssl-cert-input")
+      assert has_element?(view, "#ssl-key-input")
+      assert has_element?(view, "#deploy-ssl-btn")
+
+      cert = "-----BEGIN CERTIFICATE-----\nTEST_CERT\n-----END CERTIFICATE-----"
+      key = "-----BEGIN RSA PRIVATE KEY-----\nTEST_KEY\n-----END RSA PRIVATE KEY-----"
+
+      html =
+        view
+        |> form("#ssl-form", %{"certificate" => cert, "private_key" => key})
+        |> render_submit()
+
+      assert html =~ "SSL Certificate deployed successfully"
+    end
+
+    test "rejects invalid certificate format", %{conn: conn} do
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("#ssl-form", %{"certificate" => "invalid", "private_key" => "invalid"})
+        |> render_submit()
+
+      assert html =~ "Invalid certificate"
+    end
+  end
+
+  describe "cluster node operations and membership" do
+    defp put_cluster_with_witness do
+      nodes = [
+        %{"hostname" => "hci-01", "ip" => "10.10.102.41", "role" => "hypervisor", "is_witness" => false, "maintenance" => "NORMAL"},
+        %{"hostname" => "hci-02", "ip" => "10.10.102.42", "role" => "hypervisor", "is_witness" => false, "maintenance" => "MAINTENANCE"},
+        %{"hostname" => "hci-wit", "ip" => "10.10.102.49", "role" => "witness", "is_witness" => true, "maintenance" => "NORMAL"}
+      ]
+
+      put_settings([], %{
+        hosts: nodes,
+        cluster: %{name: "hci-01", vip: "10.10.102.45", nodes: 3, redundancy_factor: 1, hosts: nodes}
+      })
+    end
+
+    test "renders nodes table with witness badge and maintenance status", %{conn: conn} do
+      put_cluster_with_witness()
+      {:ok, view, _html} = mount_view(conn)
+
+      assert has_element?(view, "#cluster-nodes-panel")
+      assert has_element?(view, "#cluster-nodes-table")
+      assert has_element?(view, "#node-row-hci-01")
+      assert has_element?(view, "#witness-badge-hci-wit")
+      assert has_element?(view, "#maint-badge-hci-02")
+      assert has_element?(view, "#enter-maint-hci-01")
+      assert has_element?(view, "#leave-maint-hci-02")
+      assert has_element?(view, "#reboot-hci-01")
+    end
+
+    test "adds node and witness node to cluster", %{conn: conn} do
+      put_cluster_with_witness()
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("#add-node-form", %{
+          "hostname" => "hci-03",
+          "ip" => "10.10.102.43"
+        })
+        |> render_submit()
+
+      assert html =~ "Added node hci-03"
+
+      html =
+        view
+        |> form("#add-node-form", %{
+          "hostname" => "hci-wit2",
+          "ip" => "10.10.102.50",
+          "witness" => "true"
+        })
+        |> render_submit()
+
+      assert html =~ "Added witness node hci-wit2"
+    end
+
+    test "removes node from cluster", %{conn: conn} do
+      put_cluster_with_witness()
+      {:ok, view, _html} = mount_view(conn)
+
+      html =
+        view
+        |> form("#remove-node-form", %{"target" => "hci-02"})
+        |> render_submit()
+
+      assert html =~ "removed from cluster"
+    end
+
+    test "toggles node maintenance and reboot", %{conn: conn} do
+      put_cluster_with_witness()
+      {:ok, view, _html} = mount_view(conn)
+
+      html = view |> element("#enter-maint-hci-01") |> render_click()
+      assert html =~ "Maintenance enter initiated"
+
+      html = view |> element("#reboot-hci-01") |> render_click()
+      assert html =~ "Reboot command sent"
+    end
+  end
 end

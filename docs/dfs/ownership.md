@@ -146,6 +146,16 @@ the migration commits the placement, retries the takeover, and if it still fails
 step by name together with the command that finishes it (`valcli storage.takeover <vdisk>
 <node>`).
 
+### Storage Autopathing (Service Maintenance)
+
+The handover machinery in §5 is also used for **Storage Autopathing** (1:1 Nutanix Autopathing equivalent) during `SERVICE_MAINTENANCE` (`--preserve-vms`).
+
+When a host undergoes service maintenance (upgrades to Sidon or host software where guest VMs are preserved on the local hypervisor):
+1. **Reconnect Buffer**: Every guest NBD disk connection in libvirt is defined with `<source protocol='nbd' ...><reconnect delay='60'/></source>`. If the local NBD socket temporarily disconnects or restarts, QEMU buffers guest write/read requests in memory for up to 60 seconds rather than dropping the link or raising I/O errors.
+2. **Peer Takeover**: Before the local host stops Sidon, Vali attaches the preserved VM's vdisks to a healthy peer node in the cluster and triggers `takeover` on the peer. The peer acquires primary epoch ownership ($e \to e+1$), fences replicas, and opens the disk backend.
+3. **Remote Forwarding**: During the service window, guest I/O continues seamlessly: either local Sidon forwards traffic to the peer over the cluster network, or guest NBD reconnects to the peer endpoint.
+4. **Locality Reclaim on Leave**: When the serviced host leaves maintenance, Vali completes the reverse handover: it invokes `hand_over_storage` targeting the local host. Local Sidon executes `takeover` ($e+1 \to e+2$), reclaiming primary epoch ownership and returning disk I/O to zero-hop local socket performance without disturbing the running guest.
+
 ## 6. Immutable images
 
 Golden images get a distinct vdisk class: sealed at creation, no journal, no owner, no

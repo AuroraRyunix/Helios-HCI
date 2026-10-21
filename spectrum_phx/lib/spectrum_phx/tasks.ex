@@ -321,6 +321,7 @@ defmodule SpectrumPhx.Tasks do
 
   defp host_label(host, "host_maintenance_enter"), do: "Host '" <> host <> "' - enter maintenance"
   defp host_label(host, "host_maintenance_leave"), do: "Host '" <> host <> "' - leave maintenance"
+  defp host_label(host, "reclaim_storage"), do: "Host '" <> host <> "' - redirect storage traffic"
   defp host_label(host, action), do: "Host '" <> host <> "' - " <> action
 
   # -- parent/child ----------------------------------------------------------

@@ -15,30 +15,49 @@ In hyperconverged infrastructure (such as Nutanix AOS), node maintenance means t
 | `vali`, `catalyst`, `mipha`, `bifrost`, `dagur`, `mimir`, `rauru`, `logos`, `gatoway`, `urbosa`, `hylia` | stopped | All scheduling, HA, VIP, task management, and monitoring roles on this host are silenced. |
 | `spectrum`, `spectrum-phx`, `slate`, `agahnim` | stopped | Console and HTTP reverse proxies are stopped; access is served via healthy peer nodes. |
 
-**The Quorum Gate:**
-Before a host enters maintenance and stops `hydra-db` / `sidon`, Vali checks quorum (`check_stop_preserves_quorum`). The cluster must retain sufficient replicas to survive the loss of the host. If quorum cannot be maintained, maintenance mode entry is refused.
+### Service Maintenance vs Full Maintenance
 
-Upon leaving maintenance (`valcli host.maintenance.leave <host>`), the host agent removes the `/etc/hci/maintenance.state` marker, bootstraps core consensus/storage services (`zookeeper` -> `hydra-db` -> `daruk` -> `sidon`), brings up the remaining cluster services, verifies that every service is `UP` via `services_down_on`, transitions the node status to `NORMAL`, releases the cluster maintenance lock, and triggers background DRS rebalancing and health checks.
+Helios supports two maintenance modes via `ncli host.maintenance.enter`:
+
+1. **Full Maintenance (default)**:
+   - Evacuates all running VMs to healthy peer nodes via live migration prior to stopping host services.
+   - Designed for physical host interventions (hardware replacement, hypervisor kernel updates, host reboot).
+   - Node status transitions through `ENTERING_MAINTENANCE` -> `IN_MAINTENANCE`.
+
+2. **Service Maintenance (`--preserve-vms` or `--storage-only`)**:
+   - Preserves running VMs on the local hypervisor while cluster daemons (`sidon`, `hydra-db`, `daruk`, etc.) are stopped or restarted for service upgrades.
+   - Employs **Storage Autopathing** (1:1 Nutanix Autopathing equivalent):
+     - Guest QEMU NBD connections configured with `<reconnect delay='60'/>` buffer in-flight guest I/O during brief disconnections.
+     - Before local Sidon stops, Vali attaches the preserved VMs' vdisks to a healthy peer node in the cluster and triggers `takeover` (`OP_RELEASE` -> epoch CAS -> fence replicas). The remote peer Sidon assumes primary epoch ownership.
+     - When local Sidon restarts, it forwards guest NBD traffic or handles local requests.
+     - Upon `ncli host.maintenance.leave <host>`, Vali automatically executes `hand_over_storage` back to the local node (`takeover`), re-establishing primary epoch ownership locally and restoring 100% data locality.
+   - Node status transitions to `SERVICE_MAINTENANCE`, recorded in `hydra.nodes` and `/etc/hci/maintenance.state`. Mipha exempts `SERVICE_MAINTENANCE` from health failure fencing and continuously renews the cluster maintenance lock.
+
+**The Quorum Gate (HydraDB & ZooKeeper):**
+Before a host enters maintenance and stops `hydra-db`, `sidon`, and `zookeeper`, Vali checks two quorum gates:
+1. **HydraDB Storage Quorum (`check_stop_preserves_quorum`)**: The cluster must retain sufficient active storage replicas to survive the loss of the host.
+2. **ZooKeeper Ensemble Quorum (`check_zk_stop_preserves_quorum`)**: Because ZooKeeper is also stopped during maintenance (allowing full service updates/patches to ZooKeeper itself across nodes in rolling fashion), Vali queries the ZooKeeper ensemble configuration and active status. It ensures that after stopping this node's ZooKeeper instance, remaining voting peers still satisfy `voters_after >= (total_voters // 2 + 1)`. If stopping the instance would break quorum or if peers are unreachable, maintenance entry is refused (HTTP 409 `reason: "quorum"`).
+
+Upon leaving maintenance (`valcli host.maintenance.leave <host>`), the host agent removes the `/etc/hci/maintenance.state` marker, bootstraps ZooKeeper first, verifies that ZooKeeper successfully rejoins the active ensemble ("the circle") via `wait_zookeeper_rejoined` (verifying mode `follower` or `leader` and state synchronization), and then brings up storage and remaining cluster services (`hydra-db` -> `daruk` -> `sidon` -> `kass` -> ...). It verifies that every service is `UP` via `services_down_on`, transitions the node status to `NORMAL`, releases the cluster maintenance lock, executes the visible `reclaim_storage` task to restore primary storage locality for any preserved VMs, and triggers background DRS rebalancing and health checks.
 
 ## Entering
 
 ```
 POST /api/v1/hosts/maintenance {hostname, action: "enter", force_stop}
+POST /api/v1/hosts/maintenance {hostname, action: "enter", [preserve_vms: bool]}
  1. read hydra.nodes for the host (404 if unknown; 409 if it has no address)
  2. QUORUM GATE   check_stop_preserves_quorum        -> 409 reason "quorum"
- 3. LOCK          hydra.cluster_locks (TTL 5 min)    -> 409 reason "locked", naming the holder
- 4. CLAIM         LWT NORMAL -> ENTERING_MAINTENANCE -> 409 (lock released) if not NORMAL
- 5. submit Catalyst task host_maintenance_enter      -> on failure: back to NORMAL, lock released
+ 3. LOCK          hydra.cluster_locks (TTL 5 min)    -> 409 reason "locked", naming the holder (if transitioning from SERVICE_MAINTENANCE to full maintenance, the host reuses its own held lock)
+ 4. CLAIM         LWT NORMAL|SERVICE_MAINTENANCE -> ENTERING_MAINTENANCE -> 409 (lock released) if not expected status
+ 5. submit Catalyst task host_maintenance_enter      -> on failure: back to expected status, lock released
 
 host_maintenance_enter (Vali's queue worker)
- 6. EVACUATE      every Running VM on the host: select_best_start_host, migrate; the lock is renewed
-                  per VM. No target or a failed migration: force_stop stops the VM, otherwise the
-                  enter FAILS naming the VM and the host goes back to NORMAL, lock released
- 7. QUORUM RE-CHECK the evacuation can take an hour; a replica may have died meanwhile -> NORMAL, lock
-                  released, nothing stopped
- 8. MARK          hydra.nodes IN_MAINTENANCE, lock renewed (Mipha renews it from now on)
- 9. MARKER        /etc/hci/maintenance.state on the host. If it cannot be written -> NORMAL, lock
-                  released, nothing stopped
+ 6. EVACUATE      if `preserve_vms` is false: evacuate every Running VM on the host (even when transitioning from SERVICE_MAINTENANCE):
+                  select_best_start_host, migrate; the lock is renewed per VM.
+                  if `preserve_vms` is true: VMs remain running locally, and disk ownership is handed over to a healthy peer (autopathing).
+ 7. QUORUM RE-CHECK the evacuation can take an hour; a replica may have died meanwhile -> rollback, lock released, nothing stopped
+ 8. MARK          hydra.nodes IN_MAINTENANCE (or SERVICE_MAINTENANCE), lock renewed (Mipha renews it from now on)
+ 9. MARKER        /etc/hci/maintenance.state on the host. If it cannot be written -> rollback, lock released, nothing stopped
 10. STOP          the non-kept units, detached (Vali is one of them and cannot wait for its own
                   stop). If spark refuses, the task FAILS and names `valcli host.maintenance.leave`
 ```
@@ -46,16 +65,16 @@ host_maintenance_enter (Vali's queue worker)
 Guests that migrate use the storage handover described in [vali.md](./vali.md) and
 [dfs/ownership.md](./dfs/ownership.md) §5.
 
-**Failure at each step** (the property to hold: a failed enter leaves the host NORMAL, the lock free
+**Failure at each step** (the property to hold: a failed enter leaves the host in its prior state, the lock free
 and nothing stopped, except the last row):
 
 | Fails at | Host left | Lock | Recovery |
 |---|---|---|---|
 | 1 to 4 | unchanged | free | none needed; the 409 says why |
-| 5 | NORMAL | released | retry |
-| 6 | NORMAL (some VMs may already have moved; DRS rebalances) | released | fix the cause or use `force_stop`, retry |
-| 7 | NORMAL | released | retry when the ring is whole |
-| 9 | NORMAL | released | retry |
+| 5 | NORMAL or SERVICE_MAINTENANCE | released | retry |
+| 6 | NORMAL or SERVICE_MAINTENANCE (some VMs may already have moved; DRS rebalances) | released | fix the cause or use `force_stop`, retry |
+| 7 | prior state | released | retry when the ring is whole |
+| 9 | prior state | released | retry |
 | 10 | IN_MAINTENANCE with some services still up | held | `leave`, or stop the units listed by `cluster status` |
 | the task itself dies (Vali restart, Catalyst loss) | ENTERING_MAINTENANCE | held, renewed by Mipha | `valcli host.maintenance.leave <host>`: ENTERING is a leavable state precisely for this |
 
@@ -63,7 +82,7 @@ and nothing stopped, except the last row):
 
 ```
 POST /api/v1/hosts/maintenance {hostname, action: "leave"}
- 1. the host must be IN_MAINTENANCE, ENTERING_MAINTENANCE or RECOVERING -> otherwise 409 "not_in_maintenance"
+ 1. the host must be IN_MAINTENANCE, SERVICE_MAINTENANCE, ENTERING_MAINTENANCE or RECOVERING -> otherwise 409 "not_in_maintenance"
     (it used to run on a NORMAL host: restart its services and set it RECOVERING)
 
 host_maintenance_leave
@@ -73,7 +92,10 @@ host_maintenance_leave
  5. FINISH        poll the host's status for up to 180 s until every service is UP, then
                   LWT RECOVERING -> NORMAL (a status somebody changed meanwhile, such as FENCED, wins),
                   then release the lock
- 6. a Mimir health check and a DRS rebalance as subtasks
+ 6. RECLAIM       dedicated Catalyst subtask `reclaim_storage` ("Host '<host>' - redirect storage traffic"):
+                  if the host preserved running VMs, attaches disks locally and calls `hand_over_storage(target_ip, ...)`
+                  to restore primary disk locality
+ 7. a Mimir health check and a DRS rebalance as subtasks
 ```
 
 Step 5 did not exist: nothing took the host from RECOVERING to NORMAL (the lock was released and the row
@@ -81,6 +103,25 @@ stayed RECOVERING), so a placed VM never came back to the host and a rolling upg
 timed out. If the services do not all come up the task **fails naming them**, the host stays RECOVERING,
 the lock stays held (Mipha renews it for as long as the row says RECOVERING), and running leave again
 retries from step 2: every step is idempotent. If the host is abandoned the lock's TTL frees it.
+
+In Service Maintenance, Step 6 runs as a visible Catalyst subtask (`reclaim_storage`, visible in Catalyst, Phoenix LiveView, and the CLI),
+scanning all running VMs on the returning host and executing `hand_over_storage(target_ip, ...)`
+reclaiming primary epoch ownership back to the local Sidon daemon. This restores local low-latency read/write I/O
+without pausing or disrupting the running guest.
+
+### Emergency Out-of-Band SSH Rescue
+
+If `spark-daemon` or cluster RPC is wedged, crashed, or unresponsive while a host is in maintenance or attempting to leave, the standard API endpoints cannot reach the node. Helios provides out-of-band SSH fallbacks:
+
+```bash
+# Force leave maintenance via out-of-band SSH execution
+ncli host.maintenance.leave <hostname> --ssh
+
+# Comprehensive out-of-band host rescue
+ncli host.rescue <hostname>
+```
+
+`host.rescue` connects via SSH using cluster keys (`~/.ssh/id_rsa_hci`), forces the removal of `/etc/hci/maintenance.state`, restarts `spark-daemon`, issues systemd unit boots, and re-synchronizes node state directly in ScyllaDB.
 
 ## The lock
 

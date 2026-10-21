@@ -834,6 +834,13 @@ def dispatch_thread_loop():
                     if dropped:
                         print("Catalyst dispatch: dropped %d stale in-memory queue entr%s; the "
                               "recorded rows are replayed instead." % (dropped, "y" if dropped == 1 else "ies"))
+                else:
+                    with lock:
+                        queued_task_ids.clear()
+                    dropped = drain_in_memory_queues()
+                    if dropped:
+                        print("Catalyst dispatch: standing down; dropped %d in-memory queue entr%s." %
+                              (dropped, "y" if dropped == 1 else "ies"))
 
             if not leading:
                 time.sleep(2)

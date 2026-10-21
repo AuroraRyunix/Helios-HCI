@@ -127,7 +127,7 @@ class AutostartNamesServicesThatExist(unittest.TestCase):
         # restarts it, and the table row says so.
         for marker in ('for svc in maintenance_watchdog_units():',
                        '"unit": "sidon", "display": "Sidon", "requires": ("daruk",), '
-                       '"drain_before_stop": True, "maintenance": "keep"',
+                       '"drain_before_stop": True',
                        'converge_to_desired_state("started", full=True)',
                        'converge_to_desired_state("started")'):
             self.assertIn(

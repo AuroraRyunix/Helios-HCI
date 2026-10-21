@@ -43,7 +43,25 @@ defmodule SpectrumPhx.Vms.Vm do
             cpu_model: nil,
             audio_enabled: false,
             graphics: "vnc",
-            status: nil
+            status: nil,
+            notes: nil,
+            tags: nil,
+            cpu_shares: nil,
+            cpu_limit: nil,
+            cpu_reservation: nil,
+            mem_reservation: nil,
+            mem_limit: nil,
+            affinity_group: nil,
+            anti_affinity_group: nil,
+            pinned_hosts: nil,
+            is_template: false,
+            vtpm_enabled: false,
+            secure_boot: false,
+            cloud_init_userdata: nil,
+            cloud_init_network: nil,
+            pci_devices: nil,
+            usb_devices: nil,
+            guest_ips: nil
 
   @type t :: %__MODULE__{
           name: String.t(),
@@ -61,7 +79,25 @@ defmodule SpectrumPhx.Vms.Vm do
           cpu_model: String.t() | nil,
           audio_enabled: boolean(),
           graphics: String.t(),
-          status: String.t() | nil
+          status: String.t() | nil,
+          notes: String.t() | nil,
+          tags: String.t() | nil,
+          cpu_shares: integer() | nil,
+          cpu_limit: integer() | nil,
+          cpu_reservation: integer() | nil,
+          mem_reservation: integer() | nil,
+          mem_limit: integer() | nil,
+          affinity_group: String.t() | nil,
+          anti_affinity_group: String.t() | nil,
+          pinned_hosts: String.t() | nil,
+          is_template: boolean(),
+          vtpm_enabled: boolean(),
+          secure_boot: boolean(),
+          cloud_init_userdata: String.t() | nil,
+          cloud_init_network: String.t() | nil,
+          pci_devices: String.t() | nil,
+          usb_devices: String.t() | nil,
+          guest_ips: String.t() | nil
         }
 
   # `\A` and `\z` rather than `^` and `$`.
@@ -206,7 +242,25 @@ defmodule SpectrumPhx.Vms.Vm do
          cpu_model: values.cpu_model,
          network_id: values.network_id,
          graphics: values.graphics,
-         audio_enabled: truthy?(fetch(params, :audio_enabled))
+         audio_enabled: truthy?(fetch(params, :audio_enabled)),
+         notes: fetch(params, :notes),
+         tags: fetch(params, :tags),
+         cpu_shares: to_opt_int(fetch(params, :cpu_shares)),
+         cpu_limit: to_opt_int(fetch(params, :cpu_limit)),
+         cpu_reservation: to_opt_int(fetch(params, :cpu_reservation)),
+         mem_reservation: to_opt_int(fetch(params, :mem_reservation)),
+         mem_limit: to_opt_int(fetch(params, :mem_limit)),
+         affinity_group: blank_to_nil(fetch(params, :affinity_group)),
+         anti_affinity_group: blank_to_nil(fetch(params, :anti_affinity_group)),
+         pinned_hosts: blank_to_nil(fetch(params, :pinned_hosts)),
+         is_template: truthy?(fetch(params, :is_template)),
+         vtpm_enabled: truthy?(fetch(params, :vtpm_enabled)),
+         secure_boot: truthy?(fetch(params, :secure_boot)),
+         cloud_init_userdata: blank_to_nil(fetch(params, :cloud_init_userdata)),
+         cloud_init_network: blank_to_nil(fetch(params, :cloud_init_network)),
+         pci_devices: blank_to_nil(fetch(params, :pci_devices)),
+         usb_devices: blank_to_nil(fetch(params, :usb_devices)),
+         guest_ips: blank_to_nil(fetch(params, :guest_ips))
        }}
     else
       {:error, errors}
@@ -240,8 +294,75 @@ defmodule SpectrumPhx.Vms.Vm do
       audio_enabled: get(row, "audio_enabled", false),
       # Null means VNC: every row written before the graphics column has one.
       graphics: normalise_graphics(get(row, "graphics", nil)),
-      status: get(row, "status", nil)
+      status: get(row, "status", nil),
+      notes: get(row, "notes", nil),
+      tags: get(row, "tags", nil),
+      cpu_shares: get(row, "cpu_shares", nil),
+      cpu_limit: get(row, "cpu_limit", nil),
+      cpu_reservation: get(row, "cpu_reservation", nil),
+      mem_reservation: get(row, "mem_reservation", nil),
+      mem_limit: get(row, "mem_limit", nil),
+      affinity_group: blank_to_nil(get(row, "affinity_group", nil)),
+      anti_affinity_group: blank_to_nil(get(row, "anti_affinity_group", nil)),
+      pinned_hosts: blank_to_nil(get(row, "pinned_hosts", nil)),
+      is_template: truthy?(get(row, "is_template", false)),
+      vtpm_enabled: truthy?(get(row, "vtpm_enabled", false)),
+      secure_boot: truthy?(get(row, "secure_boot", false)),
+      cloud_init_userdata: blank_to_nil(get(row, "cloud_init_userdata", nil)),
+      cloud_init_network: blank_to_nil(get(row, "cloud_init_network", nil)),
+      pci_devices: blank_to_nil(get(row, "pci_devices", nil)),
+      usb_devices: blank_to_nil(get(row, "usb_devices", nil)),
+      guest_ips: blank_to_nil(get(row, "guest_ips", nil))
     }
+  end
+
+  @doc "The VM's tags as a list of strings."
+  @spec tag_list(t()) :: [String.t()]
+  def tag_list(%__MODULE__{tags: nil}), do: []
+  def tag_list(%__MODULE__{tags: tags}) when is_binary(tags) do
+    tags |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
+  @doc "The VM's attached PCI passthrough BDFs as a list of strings."
+  @spec pci_device_list(t()) :: [String.t()]
+  def pci_device_list(%__MODULE__{pci_devices: nil}), do: []
+  def pci_device_list(%__MODULE__{pci_devices: pci}) when is_binary(pci) do
+    pci |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
+  @doc "The VM's attached USB passthrough vendor:product IDs as a list of strings."
+  @spec usb_device_list(t()) :: [String.t()]
+  def usb_device_list(%__MODULE__{usb_devices: nil}), do: []
+  def usb_device_list(%__MODULE__{usb_devices: usb}) when is_binary(usb) do
+    usb |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
+  @doc "The VM's reported guest IP addresses as a list of strings."
+  @spec guest_ip_list(t()) :: [String.t()]
+  def guest_ip_list(%__MODULE__{guest_ips: nil}), do: []
+  def guest_ip_list(%__MODULE__{guest_ips: ips}) when is_binary(ips) do
+    ips |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
+  @doc "True when the VM is marked as a golden template."
+  @spec template?(t()) :: boolean()
+  def template?(%__MODULE__{is_template: is_template}), do: is_template == true
+
+  @doc "The VM's pinned host IPs as a list of strings."
+  @spec pinned_host_list(t()) :: [String.t()]
+  def pinned_host_list(%__MODULE__{pinned_hosts: nil}), do: []
+  def pinned_host_list(%__MODULE__{pinned_hosts: pinned}) when is_binary(pinned) do
+    pinned |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+  end
+
+  defp to_opt_int(nil), do: nil
+  defp to_opt_int(""), do: nil
+  defp to_opt_int(v) when is_integer(v), do: v
+  defp to_opt_int(v) when is_binary(v) do
+    case Integer.parse(v) do
+      {n, _} -> n
+      :error -> nil
+    end
   end
 
   @doc "True when the VM's power state is Running."
@@ -274,9 +395,7 @@ defmodule SpectrumPhx.Vms.Vm do
     |> split_disks()
     |> Enum.with_index()
     |> Enum.map(fn {entry, index} ->
-      {size, container, bus} = split_entry(entry)
-
-      resource = "#{name}-disk#{index}"
+      {size, container, bus, resource, dev_letter} = split_entry(entry, name, index)
 
       %{
         index: index,
@@ -285,6 +404,8 @@ defmodule SpectrumPhx.Vms.Vm do
         container: container,
         bus: bus || "virtio",
         resource: resource,
+        target: "vd#{dev_letter}",
+        dev_letter: dev_letter,
         path: "/var/lib/hci/sidon/nbd/#{resource}.sock"
       }
     end)
@@ -402,12 +523,34 @@ defmodule SpectrumPhx.Vms.Vm do
     end
   end
 
-  defp blank_to_nil(value) do
+  defp split_entry(entry, name, index) do
+    parts = String.split(entry, ":")
+    size = parts |> Enum.at(0, "") |> String.trim()
+    container = parts |> Enum.at(1) |> blank_to_nil()
+    bus = parts |> Enum.at(2) |> blank_to_nil()
+    resource =
+      case parts |> Enum.at(3) |> blank_to_nil() do
+        nil -> "#{name}-disk#{index}"
+        explicit -> explicit
+      end
+    dev_letter =
+      case parts |> Enum.at(4) |> blank_to_nil() do
+        nil -> <<?a + rem(index, 26)>>
+        explicit -> explicit
+      end
+    {size, container, bus, resource, dev_letter}
+  end
+
+  defp blank_to_nil(nil), do: nil
+
+  defp blank_to_nil(value) when is_binary(value) do
     case String.trim(value) do
       "" -> nil
       trimmed -> trimmed
     end
   end
+
+  defp blank_to_nil(_), do: nil
 
   defp parse_disk_entry(entry) do
     {size, container, bus} = split_entry(entry)
@@ -514,6 +657,7 @@ defmodule SpectrumPhx.Vms.Vm do
     case String.split(entry, ":") do
       [network] when network != "" -> network
       [network, model] when network != "" and model in @nic_models -> network
+      [network, model, _mac | _] when network != "" and model in @nic_models -> network
       _ -> :error
     end
   end

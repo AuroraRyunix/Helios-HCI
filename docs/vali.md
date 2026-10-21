@@ -130,9 +130,13 @@ they share what makes a move safe:
   operator's explicit request and ignores the history.
 * **Visible** — a migration is a Catalyst task; its error names the step that failed (see below).
 
-Not unified: the "fallback to any online host" in `select_best_start_host` returns the first healthy host when
-no host has the memory a guest needs (an overcommit); whether that is wanted is a decision, recorded in
-TODO.md. CPU and accelerator compatibility between hosts is left to libvirt's own refusal at `virsh migrate`.
+* **Configurable overcommit** — `select_best_start_host` honors the cluster setting `memory_overcommit_policy`
+  (`hydra.cluster_settings`). In `strict` mode, placement refuses overcommit and returns `None` if no online
+  host has the required free memory; in `overcommit` mode (the default), it falls back to the first healthy host.
+* **CPU and accelerator compatibility pre-flight** — live migration queries `/api/v1/host/capabilities` on both
+  source and target. If the source VM is running with KVM hardware acceleration enabled and the target host
+  lacks `/dev/kvm` support (e.g. nested TCG fallback), the migration is rejected up front before taking locks
+  or attaching forwarders.
 
 ### What a migration does to the storage
 
@@ -270,11 +274,18 @@ valcli drs.status
 # Place a node into maintenance mode (evacuates all running VMs to other hosts)
 valcli host.maintenance.enter hci-node01
 
+# Place a node into service maintenance (preserves VMs locally, autopaths storage to peer)
+valcli host.maintenance.enter hci-node01 --preserve-vms
+
 # Place a node into maintenance mode and force stop any VMs that cannot migrate
 valcli host.maintenance.enter hci-node01 --force
 
-# Restore a node from maintenance mode, starting services and re-syncing volumes
+# Restore a node from maintenance mode, starting services and re-syncing volumes / reclaiming storage
 valcli host.maintenance.leave hci-node01
+
+# Emergency out-of-band SSH leave or host rescue (bypasses wedged spark/API)
+valcli host.maintenance.leave hci-node01 --ssh
+valcli host.rescue hci-node01
 ```
 
 Entering maintenance is a claim on the host, taken through Daruk's
@@ -283,6 +294,13 @@ is refused with `409` instead of starting a second evacuation of the same VMs. O
 first transition is conditional: the ones that follow are made by the workflow that already
 holds the claim, and `hydra.nodes.status` is also written by Mipha's health loop, so
 conditioning them too would wedge a host the first time the two crossed.
+
+In Service Maintenance (`--preserve-vms` or `--storage-only`), Vali skips VM evacuation.
+Instead, it executes Storage Autopathing: it queries attached vdisks on the target host,
+selects a healthy storage peer, ensures the disks are attached on the peer, and triggers
+`takeover` on that peer before host services stop. When the host leaves maintenance,
+Vali runs the reverse handover (`hand_over_storage`) back to the local host, restoring
+zero-hop local storage performance.
 
 > [!WARNING]
 > The cross-host rule — only one host in maintenance at a time, to preserve quorum — is

@@ -170,6 +170,13 @@ pub struct Vdisk {
     /// until a detach and attach.
     drain_failed_at: Option<Instant>,
     drain_retry_after: Duration,
+    /// Whether writes from this vdisk allocate extent IDs in the three-level map (Stage 3).
+    pub use_extent_id: bool,
+    pub extents_made: u64,
+    /// If this vdisk is a clone or snapshot of another vdisk, the parent's ID.
+    /// Zero extents on a child vdisk must still be written as explicit zero extents rather
+    /// than unmapped, so reads do not fall through to non-zero parent blocks.
+    pub parent_vdisk: Option<String>,
 }
 
 /// How long a failed drain is left alone before one more attempt is allowed. Long enough that a
@@ -203,7 +210,7 @@ impl Vdisk {
     ) -> Result<Vdisk> {
         let rows = daruk.query(&format!(
             "SELECT vdisk_id, size_bytes, class, epoch, drain_seq, extent_bytes, egroup_bytes, \
-             container, rf FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
+             container, rf, use_extent_id, parent_vdisk FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(id)
         ))?;
         let row = rows
@@ -231,6 +238,15 @@ impl Vdisk {
         // unreadable rf opens the vdisk as "one copy asked for", which is what such a row
         // is actually saying.
         let rf = field_u64(row, "rf").unwrap_or(1).max(1);
+        let use_extent_id = row
+            .get("use_extent_id")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let parent_vdisk = row
+            .get("parent_vdisk")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let store = EgroupStore::open(
             crate::extent::discover_disks(&cfg.root), egroup_bytes)?
@@ -272,6 +288,9 @@ impl Vdisk {
             drain_failed_at: None,
             drain_retry_after: DRAIN_RETRY_AFTER,
             journal,
+            use_extent_id,
+            extents_made: 0,
+            parent_vdisk,
         };
 
         v.load_map()?;
@@ -291,6 +310,16 @@ impl Vdisk {
             }
         }
         Ok(v)
+    }
+
+    /// Birth-derived extent ID for writing through the three-level map (Stage 3).
+    pub fn new_extent_id(&mut self, idx: u64) -> String {
+        self.extents_made += 1;
+        format!(
+            "ext-{}-{:x}",
+            &self.id,
+            (now_ms() as u64) ^ self.vh ^ (self.extents_made << 32) ^ idx
+        )
     }
 
     fn load_map(&mut self) -> Result<()> {
@@ -368,12 +397,120 @@ impl Vdisk {
         }
         Ok(discarded)
     }
+}
 
-    /// Read `len` bytes at `offset`. Extent store first, overlay on top: the overlay is
-    /// by construction newer than anything drained.
-    pub fn read(&mut self, offset: u64, len: u32) -> Result<Vec<u8>> {
-        if len == 0 {
+/// What a read needs, extracted under the vdisk lock so that the actual extent read
+/// from disk, journal overlay read, and any replica read-repair can execute outside the lock.
+pub struct ReadPlan {
+    pub id: String,
+    pub epoch: u64,
+    pub extent_bytes: u64,
+    pub store: Arc<EgroupStore>,
+    pub access: Arc<AccessLog>,
+    pub replicas: Vec<Arc<PeerClient>>,
+    pub extents: Vec<(u64, ExtentLoc)>,
+    pub overlay_ranges: Vec<(u64, Arc<File>, u64, usize)>,
+    pub offset: u64,
+    pub len: u32,
+    pub seen_at: i64,
+}
+
+impl ReadPlan {
+    pub fn execute(&self) -> Result<Vec<u8>> {
+        if self.len == 0 {
             return Ok(Vec::new());
+        }
+        let end = self.offset + self.len as u64;
+        let mut buf = vec![0u8; self.len as usize];
+
+        for (idx, loc) in &self.extents {
+            let extent = match self
+                .store
+                .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, *idx)
+            {
+                Ok(bytes) => bytes,
+                Err(local) => match self.read_extent_from_replica(loc, *idx) {
+                    Some(bytes) => {
+                        eprintln!(
+                            "sidon: vdisk {}: extent {idx} unreadable locally ({local}); \
+                             served from a replica",
+                            self.id
+                        );
+                        bytes
+                    }
+                    None => return Err(local),
+                },
+            };
+            self.access.record_read(&loc.egroup_id, extent.len() as u64, self.seen_at);
+            let ext_start = *idx * self.extent_bytes;
+            let copy_start = self.offset.max(ext_start);
+            let copy_end = end.min(ext_start + extent.len() as u64);
+            if copy_end <= copy_start {
+                continue;
+            }
+            let src = (copy_start - ext_start) as usize;
+            let dst = (copy_start - self.offset) as usize;
+            let n = (copy_end - copy_start) as usize;
+            buf[dst..dst + n].copy_from_slice(&extent[src..src + n]);
+        }
+
+        for (copy_start, file, pos, n) in &self.overlay_ranges {
+            let data = journal::read_in(file, *pos, *n)?;
+            let dst = (*copy_start - self.offset) as usize;
+            buf[dst..dst + *n].copy_from_slice(&data);
+        }
+
+        Ok(buf)
+    }
+
+    fn read_extent_from_replica(&self, loc: &ExtentLoc, idx: u64) -> Option<Vec<u8>> {
+        for replica in &self.replicas {
+            let resp = match replica.call(&Request {
+                opcode: peer::OP_EGROUP_GET,
+                vdisk: loc.egroup_id.clone(),
+                epoch: self.epoch,
+                seq: (loc.length as usize + crate::extent::FOOTER_LEN) as u64,
+                offset: loc.offset as u64,
+                flags: 0,
+                data: Vec::new(),
+            }) {
+                Ok(r) if r.is_ok() => r,
+                _ => continue,
+            };
+            if resp.data.len() < loc.length as usize + crate::extent::FOOTER_LEN {
+                continue;
+            }
+            let (data, footer) = resp.data.split_at(loc.length as usize);
+            if crate::extent::verify_footer(data, footer, loc.vdisk_hash, idx).is_ok() {
+                return crate::extent::decode_extent(data, footer).ok();
+            }
+            eprintln!(
+                "sidon: vdisk {}: replica {} also has a damaged copy of extent {idx}",
+                self.id, replica.node
+            );
+        }
+        None
+    }
+}
+
+impl Vdisk {
+    /// Plan a read under the vdisk lock, extracting only mapping metadata and journal
+    /// segment handles so the disk I/O can run unlocked.
+    pub fn plan_read(&self, offset: u64, len: u32) -> Result<ReadPlan> {
+        if len == 0 {
+            return Ok(ReadPlan {
+                id: self.id.clone(),
+                epoch: self.epoch,
+                extent_bytes: self.extent_bytes,
+                store: Arc::clone(&self.store),
+                access: Arc::clone(&self.access),
+                replicas: self.replicas.clone(),
+                extents: Vec::new(),
+                overlay_ranges: Vec::new(),
+                offset,
+                len,
+                seen_at: now_ms(),
+            });
         }
         let end = offset
             .checked_add(len as u64)
@@ -385,66 +522,18 @@ impl Vdisk {
             )));
         }
 
-        // Unwritten ranges read as zeroes, which is what a sparse disk promises.
-        let mut buf = vec![0u8; len as usize];
-
         let first = offset / self.extent_bytes;
         let last = (end - 1) / self.extent_bytes;
-        // One clock read per guest read, not one per extent. The timestamp is what makes a
-        // total readable as a rate and tells a tiering pass how long ago the last access
-        // was; a few hundred microseconds of skew across the extents of one read is far
-        // below the resolution any of that is used at.
         let seen_at = now_ms();
+
+        let mut extents = Vec::new();
         for idx in first..=last {
-            let loc = match self.map.get(&idx) {
-                Some(l) => l.clone(),
-                None => continue,
-            };
-            let extent = match self
-                .store
-                .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, idx)
-            {
-                Ok(bytes) => bytes,
-                Err(local) => {
-                    // The local copy is damaged or missing. Ask a replica before giving up:
-                    // this is the read-repair path, and it is the difference between one
-                    // rotted extent costing a byte range and costing the disk. A replica's
-                    // answer is verified against the same footer, so a second bad copy is
-                    // refused too rather than quietly replacing a first.
-                    match self.read_extent_from_replica(&loc, idx) {
-                        Some(bytes) => {
-                            eprintln!(
-                                "sidon: vdisk {}: extent {idx} unreadable locally ({local}); \
-                                 served from a replica",
-                                self.id
-                            );
-                            bytes
-                        }
-                        None => return Err(local),
-                    }
-                }
-            };
-            // Counted here, after the bytes are in hand and before they are copied out, so
-            // a read that failed on every copy is not recorded as an access to a group
-            // nobody could read. A read served from a replica *is* one: the group was
-            // wanted on this node, which is exactly the fact a placement decision needs.
-            //
-            // Four integer adds under a mutex held across no syscall. That is the entire
-            // cost this adds to the read path, and it is the reason the tally is in memory
-            // rather than in Hydra.
-            self.access.record_read(&loc.egroup_id, extent.len() as u64, seen_at);
-            let ext_start = idx * self.extent_bytes;
-            let copy_start = offset.max(ext_start);
-            let copy_end = end.min(ext_start + extent.len() as u64);
-            if copy_end <= copy_start {
-                continue;
+            if let Some(loc) = self.map.get(&idx) {
+                extents.push((idx, loc.clone()));
             }
-            let src = (copy_start - ext_start) as usize;
-            let dst = (copy_start - offset) as usize;
-            let n = (copy_end - copy_start) as usize;
-            buf[dst..dst + n].copy_from_slice(&extent[src..src + n]);
         }
 
+        let mut overlay_ranges = Vec::new();
         for seg in self.overlay.overlapping(offset, end) {
             let copy_start = offset.max(seg.start);
             let copy_end = end.min(seg.end());
@@ -452,13 +541,31 @@ impl Vdisk {
                 continue;
             }
             let skip = copy_start - seg.start;
+            let pos = seg.data_pos + skip;
             let n = (copy_end - copy_start) as usize;
-            let data = self.journal.read_at(seg.data_pos + skip, n)?;
-            let dst = (copy_start - offset) as usize;
-            buf[dst..dst + n].copy_from_slice(&data);
+            let file = self.journal.segment_for(pos)?;
+            overlay_ranges.push((copy_start, file, pos, n));
         }
 
-        Ok(buf)
+        Ok(ReadPlan {
+            id: self.id.clone(),
+            epoch: self.epoch,
+            extent_bytes: self.extent_bytes,
+            store: Arc::clone(&self.store),
+            access: Arc::clone(&self.access),
+            replicas: self.replicas.clone(),
+            extents,
+            overlay_ranges,
+            offset,
+            len,
+            seen_at,
+        })
+    }
+
+    /// Read `len` bytes at `offset`. Extent store first, overlay on top: the overlay is
+    /// by construction newer than anything drained.
+    pub fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.plan_read(offset, len)?.execute()
     }
 
     /// Record that a drain failed, and stop starting new ones.
@@ -1038,6 +1145,9 @@ impl Vdisk {
             held: Arc::clone(&self.drain_held),
             id_seed: self.journal.next_seq(),
             groups_made: 0,
+            use_extent_id: self.use_extent_id,
+            extents_made: self.extents_made,
+            has_parent: self.parent_vdisk.is_some(),
             t_replicate: Duration::ZERO,
             t_local: Duration::ZERO,
             t_hydra: Duration::ZERO,
@@ -1062,9 +1172,13 @@ impl Vdisk {
         // appended to it by a drain that then failed are unreferenced garbage, and the next
         // drain appends after them.
         self.open_eg = job.open_eg;
+        self.extents_made = job.extents_made;
         let result = match outcome {
             Err(e) => Err(e),
             Ok(done) => {
+                for idx in done.unmapped {
+                    self.map.remove(&idx);
+                }
                 for (idx, loc) in done.locs {
                     self.map.insert(idx, loc);
                 }
@@ -1399,6 +1513,9 @@ struct DrainJob {
     held: Arc<Mutex<HashSet<String>>>,
     id_seed: u64,
     groups_made: u64,
+    use_extent_id: bool,
+    extents_made: u64,
+    has_parent: bool,
     /// Where the time went, for the one log line a drain writes. A drain that is slow is
     /// slow for one of three reasons (the replicas, this disk, or Hydra) and which one is
     /// the whole of the diagnosis.
@@ -1546,6 +1663,7 @@ struct DrainPlan {
 /// A drain that committed: the map entries to apply and the counter it advanced to.
 struct Committed {
     locs: Vec<(u64, ExtentLoc)>,
+    unmapped: Vec<u64>,
     sealed: Vec<String>,
     next_seq: u64,
 }
@@ -1560,6 +1678,15 @@ impl DrainJob {
         }
     }
 
+    fn new_extent_id(&mut self, idx: u64) -> String {
+        self.extents_made += 1;
+        format!(
+            "ext-{}-{:x}",
+            &self.id,
+            (now_ms() as u64) ^ self.vh ^ (self.extents_made << 32) ^ idx
+        )
+    }
+
     /// Phase two: move the frozen ranges into extent groups and commit the map.
     ///
     /// Read-modify-write per extent, then redirect-on-write: the extent's current bytes
@@ -1572,17 +1699,24 @@ impl DrainJob {
         // (a failed write's records, say). There is nothing to repoint, so no Hydra round
         // trip, and the counter does not move.
         if indices.is_empty() {
-            return Ok(Committed { locs: Vec::new(), sealed: Vec::new(), next_seq: self.drain_seq });
+            return Ok(Committed {
+                locs: Vec::new(),
+                unmapped: Vec::new(),
+                sealed: Vec::new(),
+                next_seq: self.drain_seq,
+            });
         }
 
         let started = Instant::now();
-        // The extent whose write ends the drain: its group's last write is synced on the
-        // replicas whether or not the group is full.
-        let last_idx = indices.iter().rev().find(|i| self.extent_len(**i) > 0).copied();
         self.pipe = ExtentPipe::new(&self.replicas, self.epoch);
         let mut new_rows: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(indices.len());
         let mut new_locs: Vec<(u64, ExtentLoc)> = Vec::with_capacity(indices.len());
+        let mut unmapped: Vec<u64> = Vec::new();
         let mut sealed: Vec<String> = Vec::new();
+        // Held until the next non-zero extent or the end of the drain so that the last
+        // non-zero extent of the drain is sent with `defer = false` even if trailing
+        // extents in `indices` turn out to be all zeroes and are unmapped instead.
+        let mut prev_put: Option<(String, u64, Vec<u8>)> = None;
 
         for idx in indices {
             let ext_len = self.extent_len(idx) as usize;
@@ -1623,6 +1757,22 @@ impl DrainJob {
                 buf[dst..dst + n].copy_from_slice(&data);
             }
 
+            // A full extent of zeroes on a vdisk without a parent is unmapped rather than
+            // written to an extent group: unmapped extents already read back as zeroes, and
+            // deleting the block-map row lets Purah reclaim the old extent group. On a clone
+            // or snapshot child (`self.has_parent`), the explicit zero extent is still
+            // written so reads do not fall through to non-zero parent blocks.
+            if !self.has_parent && buf.iter().all(|&b| b == 0) {
+                unmapped.push(idx);
+                continue;
+            }
+
+            if let Some((pg, poff, pframed)) = prev_put.take() {
+                let t = Instant::now();
+                self.pipe.put(&pg, poff, pframed, true)?;
+                self.t_replicate += t.elapsed();
+            }
+
             let eg_id = self.ensure_open_egroup()?;
             let (offset, stored_len, framed) = {
                 let store = &self.store;
@@ -1643,9 +1793,6 @@ impl DrainJob {
                 .as_ref()
                 .map(|eg| self.store.is_full(eg))
                 .unwrap_or(false);
-            let t = Instant::now();
-            self.pipe.put(&eg_id, offset as u64, framed, !(full || Some(idx) == last_idx))?;
-            self.t_replicate += t.elapsed();
             // An append into this extent group, which is the only kind of write an extent
             // group ever takes -- the guest's write reached the journal and was
             // acknowledged there. So a group's write count is a count of drained extents
@@ -1656,7 +1803,7 @@ impl DrainJob {
             // compressed extent is not the size the guest thinks it wrote.
             new_rows.push((idx, eg_id.clone(), offset, stored_len, self.vh));
             new_locs.push((idx, ExtentLoc {
-                egroup_id: eg_id,
+                egroup_id: eg_id.clone(),
                 offset,
                 length: stored_len,
                 // Written here, so stamped with this vdisk's identity. A clone
@@ -1666,6 +1813,9 @@ impl DrainJob {
             }));
 
             if full {
+                let t = Instant::now();
+                self.pipe.put(&eg_id, offset as u64, framed, false)?;
+                self.t_replicate += t.elapsed();
                 // The group is complete here and must be complete on every replica before
                 // Hydra is told it is sealed. Flush this disk's copy first, while the
                 // replicas are still taking theirs, and only then wait for them.
@@ -1676,7 +1826,15 @@ impl DrainJob {
                 self.t_local += t.elapsed();
                 self.replicas_caught_up()?;
                 sealed.push(self.seal_open_egroup()?);
+            } else {
+                prev_put = Some((eg_id, offset as u64, framed));
             }
+        }
+
+        if let Some((pg, poff, pframed)) = prev_put.take() {
+            let t = Instant::now();
+            self.pipe.put(&pg, poff, pframed, false)?;
+            self.t_replicate += t.elapsed();
         }
 
         // Rule 2: bytes durable before any row points at them -- here, with the replicas
@@ -1689,8 +1847,30 @@ impl DrainJob {
         self.replicas_caught_up()?;
 
         let t = Instant::now();
-        for batch in block_map_batches(&self.id, self.epoch, &new_rows, MAP_ROWS_PER_BATCH) {
-            self.daruk.query(&batch)?;
+        for &idx in &unmapped {
+            self.daruk.delete_block_map_row(&self.id, idx)?;
+        }
+        if self.use_extent_id {
+            let now = now_ms();
+            let mut ext_rows = Vec::with_capacity(new_rows.len());
+            let mut blk_rows = Vec::with_capacity(new_rows.len());
+            for (idx, eg_id, offset, stored_len, vh) in &new_rows {
+                let ext_id = self.new_extent_id(*idx);
+                ext_rows.push((ext_id.clone(), eg_id.clone(), *offset, *stored_len, *vh, now));
+                blk_rows.push((*idx, ext_id, *vh));
+            }
+            // Step 1: Write extent rows first (data-before-metadata ordering holds one level up)
+            for batch in crate::meta::extent_map_batches(&ext_rows, MAP_ROWS_PER_BATCH) {
+                self.daruk.query(&batch)?;
+            }
+            // Step 2: Write block map rows pointing at extent_id (and nulling egroup_id)
+            for batch in crate::meta::block_map_extent_batches(&self.id, self.epoch, &blk_rows, MAP_ROWS_PER_BATCH) {
+                self.daruk.query(&batch)?;
+            }
+        } else {
+            for batch in block_map_batches(&self.id, self.epoch, &new_rows, MAP_ROWS_PER_BATCH) {
+                self.daruk.query(&batch)?;
+            }
         }
 
         // The one lightweight transaction per drain. Conditioned on the epoch as well as
@@ -1718,10 +1898,11 @@ impl DrainJob {
         }
         self.t_hydra += t.elapsed();
         eprintln!(
-            "sidon: vdisk {}: drained {} extent(s) in {} ms (replicas {} ms, this disk {} ms, \
-             hydra {} ms)",
+            "sidon: vdisk {}: drained {} extent(s) ({} unmapped) in {} ms (replicas {} ms, \
+             this disk {} ms, hydra {} ms)",
             self.id,
             new_locs.len(),
+            unmapped.len(),
             started.elapsed().as_millis(),
             self.t_replicate.as_millis(),
             self.t_local.as_millis(),
@@ -1729,7 +1910,7 @@ impl DrainJob {
         );
         // Done with the replicas: let their threads end now rather than when the job drops.
         self.pipe = ExtentPipe::none();
-        Ok(Committed { locs: new_locs, sealed, next_seq: next })
+        Ok(Committed { locs: new_locs, unmapped, sealed, next_seq: next })
     }
 
     /// Wait until every replica has taken every extent sent so far, or report the first
@@ -1815,6 +1996,28 @@ impl DrainJob {
     }
 }
 
+fn truncate_one_replica(replica: &PeerClient, vdisk: &str, epoch: u64, keep_seq: u64) {
+    match replica.call(&Request {
+        opcode: peer::OP_TRUNCATE_TO,
+        vdisk: vdisk.to_string(),
+        epoch,
+        seq: keep_seq,
+        offset: 0,
+        flags: 0,
+        data: Vec::new(),
+    }) {
+        Ok(resp) if resp.is_ok() => {}
+        Ok(resp) => eprintln!(
+            "sidon: vdisk {vdisk}: replica {} did not drop its drained journal (status {})",
+            replica.node, resp.status
+        ),
+        Err(e) => eprintln!(
+            "sidon: vdisk {vdisk}: replica {} did not drop its drained journal: {e}",
+            replica.node
+        ),
+    }
+}
+
 /// Tell every replica the drained prefix of its journal may go: records older than
 /// `keep_seq`. Best effort -- a failure wastes disk on a replica and endangers nothing, because
 /// the map already points at the drained extents and replaying a drained record is idempotent.
@@ -1823,26 +2026,18 @@ impl DrainJob {
 /// journal, which is the safe way for it to be wrong: it never empties a journal that holds
 /// writes acknowledged while the drain ran.
 fn truncate_replicas(replicas: &[Arc<PeerClient>], vdisk: &str, epoch: u64, keep_seq: u64) {
-    for replica in replicas {
-        match replica.call(&Request {
-            opcode: peer::OP_TRUNCATE_TO,
-            vdisk: vdisk.to_string(),
-            epoch,
-            seq: keep_seq,
-            offset: 0,
-            flags: 0,
-            data: Vec::new(),
-        }) {
-            Ok(resp) if resp.is_ok() => {}
-            Ok(resp) => eprintln!(
-                "sidon: vdisk {vdisk}: replica {} did not drop its drained journal (status {})",
-                replica.node, resp.status
-            ),
-            Err(e) => eprintln!(
-                "sidon: vdisk {vdisk}: replica {} did not drop its drained journal: {e}",
-                replica.node
-            ),
+    if replicas.len() <= 1 {
+        for replica in replicas {
+            truncate_one_replica(replica, vdisk, epoch, keep_seq);
         }
+    } else {
+        std::thread::scope(|s| {
+            for replica in replicas {
+                s.spawn(move || {
+                    truncate_one_replica(replica, vdisk, epoch, keep_seq);
+                });
+            }
+        });
     }
 }
 
@@ -1984,6 +2179,15 @@ pub fn drain_and_seal(handle: &Arc<Mutex<Vdisk>>) -> Result<Option<String>> {
         }
         _ => Ok(None),
     }
+}
+
+/// Plan a guest read under the vdisk lock and execute the disk and journal I/O outside it.
+pub fn read_through(handle: &Arc<Mutex<Vdisk>>, offset: u64, len: u32) -> Result<Vec<u8>> {
+    let plan = {
+        let v = handle.lock().expect("vdisk mutex poisoned");
+        v.plan_read(offset, len)?
+    };
+    plan.execute()
 }
 
 /// Append a guest write and queue it for the next commit, without waiting for it.
@@ -2289,6 +2493,11 @@ mod tests {
                             return json!({"status": "error", "error": "injected batch failure"});
                         }
                         st.log.lock().unwrap().push("batch".to_string());
+                    } else if q.starts_with("DELETE FROM hydra.dfs_block_map") {
+                        if st.fail_batch.load(Ordering::SeqCst) {
+                            return json!({"status": "error", "error": "injected batch failure"});
+                        }
+                        st.log.lock().unwrap().push("delete".to_string());
                     }
                     json!({"status": "success", "rows": []})
                 }
@@ -2430,6 +2639,9 @@ mod tests {
             degraded: None,
             drain_failed_at: None,
             drain_retry_after: DRAIN_RETRY_AFTER,
+            use_extent_id: false,
+            extents_made: 0,
+            parent_vdisk: None,
         }
     }
 
@@ -2729,7 +2941,7 @@ mod tests {
         // And it can carry on: the next drain takes the sealed segment, then the live one.
         let h2 = Arc::new(Mutex::new(v2));
         drain_all(&h2).unwrap();
-        let mut v2 = h2.lock().unwrap();
+        let v2 = h2.lock().unwrap();
         assert_eq!((v2.journal.len(), v2.needs_drain()), (0, false));
         assert_eq!(v2.read(0, 4 * MIB as u32).unwrap(), model.slice(0, 4 * MIB));
     }
@@ -3040,6 +3252,7 @@ mod tests {
         let grace = Duration::from_secs(600);
         let base = Instant::now();
         let mut ledger = HashMap::new();
+        let mut extent_ledger = HashMap::new();
         let mut sweep = |secs: u64, held: &HashSet<String>| {
             let pass = Pass {
                 db: &model,
@@ -3050,7 +3263,7 @@ mod tests {
                 peers: &Alone,
                 open_abandon: Duration::from_secs(3600),
             };
-            sweep_pass(&pass, &mut ledger, held, now_ms(), base + Duration::from_secs(secs)).unwrap()
+            sweep_pass(&pass, &mut ledger, &mut extent_ledger, held, now_ms(), base + Duration::from_secs(secs)).unwrap()
         };
 
         // While the drain runs, every pass reads the attached set from the live vdisk, as the
@@ -3556,5 +3769,91 @@ mod tests {
         .expect_err("a drain that cannot reach its replica must not commit");
         assert!(err.to_string().contains("unreachable"), "{err}");
         assert!(r.vd.lock().unwrap().journal.has_sealed());
+    }
+
+    #[test]
+    fn draining_a_zero_extent_without_a_parent_unmaps_it_instead_of_writing_zeroes() {
+        let r = rig("zero-unmap", 1, 64 * MIB as u64, 256 * MIB as u64);
+        log_puts(&r.replicas[0], &r.hydra);
+
+        // First write non-zero data to extent 0 and extent 1 and drain so both are in the map.
+        r.write(0, &fill(5, 2 * MIB)).unwrap();
+        drain_all(&r.vd).unwrap();
+        assert_eq!(r.vd.lock().unwrap().map.len(), 2);
+
+        r.hydra.st.log.lock().unwrap().clear();
+
+        // Now zero out extent 0 completely and overwrite extent 1 with new non-zero data.
+        write_zeroes_through(&r.vd, 0, MIB as u64).unwrap();
+        r.write(MIB as u64, &fill(9, MIB)).unwrap();
+        drain_all(&r.vd).unwrap();
+
+        let v = r.vd.lock().unwrap();
+        assert!(!v.map.contains_key(&0), "zeroed extent 0 was unmapped from in-memory map");
+        assert!(v.map.contains_key(&1), "non-zero extent 1 remains mapped");
+        drop(v);
+
+        let log = r.hydra.log();
+        assert!(log.contains(&"delete".to_string()), "Hydra received DELETE FROM hydra.dfs_block_map: {log:?}");
+        let puts: Vec<_> = log.iter().filter(|e| e.starts_with("put:")).collect();
+        assert_eq!(puts, vec![&"put:0".to_string()], "only the one non-zero extent was shipped to the replica, and synced");
+        assert_eq!(r.read(0, MIB as u32), vec![0u8; MIB]);
+        assert_eq!(r.read(MIB as u64, MIB as u32), fill(9, MIB));
+    }
+
+    #[test]
+    fn draining_a_zero_extent_with_a_parent_vdisk_writes_an_explicit_zero_extent() {
+        let r = rig("zero-parent", 1, 64 * MIB as u64, 256 * MIB as u64);
+        r.vd.lock().unwrap().parent_vdisk = Some("golden-image".to_string());
+        log_puts(&r.replicas[0], &r.hydra);
+
+        write_zeroes_through(&r.vd, 0, MIB as u64).unwrap();
+        drain_all(&r.vd).unwrap();
+
+        let v = r.vd.lock().unwrap();
+        assert!(v.map.contains_key(&0), "child vdisk must keep an explicit zero extent mapped");
+        drop(v);
+
+        let log = r.hydra.log();
+        assert!(!log.contains(&"delete".to_string()), "child vdisk must not delete block_map row: {log:?}");
+        assert_eq!(r.read(0, MIB as u32), vec![0u8; MIB]);
+    }
+
+    #[test]
+    fn read_through_executes_journal_and_extent_reads_outside_the_vdisk_lock() {
+        let r = rig("read-through", 0, 64 * MIB as u64, 256 * MIB as u64);
+        r.write(0, &fill(3, MIB)).unwrap();
+        drain_all(&r.vd).unwrap();
+        r.write(4096, &fill(8, 4096)).unwrap();
+
+        // Plan under the lock, then hold the lock on this thread while executing the plan
+        // to prove `ReadPlan::execute` never touches the vdisk mutex for extent or overlay reads.
+        let plan = r.vd.lock().unwrap().plan_read(0, 8192).unwrap();
+        let _guard = r.vd.lock().unwrap();
+        let bytes = plan.execute().unwrap();
+        drop(_guard);
+
+        assert_eq!(&bytes[..4096], &fill(3, 4096)[..]);
+        assert_eq!(&bytes[4096..8192], &fill(8, 4096)[..]);
+        assert_eq!(read_through(&r.vd, 0, 8192).unwrap(), bytes);
+    }
+
+    #[test]
+    fn truncate_replicas_runs_in_parallel_across_multiple_replicas() {
+        let r = rig("parallel-truncate", 2, 64 * MIB as u64, 256 * MIB as u64);
+        for rep in &r.replicas {
+            rep.set_hook(Some(Arc::new(|req| {
+                if req.opcode == peer::OP_TRUNCATE_TO {
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+                None
+            })));
+        }
+        r.write(0, &fill(1, MIB)).unwrap();
+        let t = Instant::now();
+        drain_all(&r.vd).unwrap();
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        assert!(took < Duration::from_millis(750), "serial truncate across 2 replicas would take 800ms+, took {took:?}");
     }
 }

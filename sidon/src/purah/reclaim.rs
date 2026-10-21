@@ -235,6 +235,48 @@ fn forget_group<D: Db>(p: &Pass<D>, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// A referenced `open` group that no attached vdisk holds and that is older than `open_abandon`
+/// had at least one drain batch committed before its writer left, and nothing will ever append to
+/// it again (see [`abandoned`]). Seal it in place with the hash and size of the bytes on disk so
+/// scrub can verify it and compaction can pack it.
+fn seal_abandoned_referenced_open<D: Db>(
+    p: &Pass<D>,
+    id: &str,
+    state: &str,
+    created_at_ms: i64,
+    held_set: &HashSet<String>,
+    now_ms: i64,
+    sealed_out: &mut Vec<String>,
+) {
+    if state != "open" || held_set.contains(id) || !abandoned(created_at_ms, now_ms, p.open_abandon) {
+        return;
+    }
+    let hash = match p.store.seal_hash(id) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("purah: could not hash abandoned referenced open group {id} to seal it: {e}");
+            return;
+        }
+    };
+    let file_size = std::fs::metadata(p.store.path_for(id))
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    match p.db.cas(
+        "/v1/dfs/egroup-state",
+        json_params(vec![
+            ("egroup_id", json!(id)),
+            ("state", json!("sealed")),
+            ("seal_hash", json!(hash)),
+            ("size", json!(file_size)),
+            ("expected_state", json!("open")),
+        ]),
+    ) {
+        Ok(cas) if cas.applied => sealed_out.push(id.to_string()),
+        Ok(_) => {}
+        Err(e) => eprintln!("purah: could not seal abandoned referenced open group {id}: {e}"),
+    }
+}
+
 /// One mark-sweep pass. `held` is the set of extent groups attached vdisks are using right
 /// now, which the caller supplies because only it knows what is attached. `ledger` is the
 /// curator's memory of when each group was first seen unreferenced; `now` is the instant to
@@ -242,6 +284,7 @@ fn forget_group<D: Db>(p: &Pass<D>, id: &str) -> Result<()> {
 pub fn sweep_pass<D: Db>(
     p: &Pass<D>,
     ledger: &mut HashMap<String, Instant>,
+    extent_ledger: &mut HashMap<String, Instant>,
     held: &HashSet<String>,
     now_ms: i64,
     now: Instant,
@@ -250,6 +293,7 @@ pub fn sweep_pass<D: Db>(
 
     // Order matters: references first. See `referenced_egroups`.
     let referenced = crate::extent_id_map::referenced_egroups(p.db)?;
+    let referenced_extents = crate::extent_id_map::referenced_extents(p.db)?;
     let inventory = my_egroups(p.db, p.node)?;
     report.egroups_known = inventory.len();
 
@@ -266,6 +310,16 @@ pub fn sweep_pass<D: Db>(
             // that failed, was unmounted, or never came back after a reboot.
             if !p.store.path_for(&id).exists() {
                 report.missing.push(id.clone());
+            } else {
+                seal_abandoned_referenced_open(
+                    p,
+                    &id,
+                    &state,
+                    created_at_ms,
+                    held,
+                    now_ms,
+                    &mut report.sealed_abandoned_open,
+                );
             }
             // Seen referenced: any grace it had accumulated is void.
             continue;
@@ -355,7 +409,90 @@ pub fn sweep_pass<D: Db>(
     }
 
     *ledger = still_unreferenced;
+
+    report.extents_reclaimed = sweep_orphaned_extents(
+        p.db,
+        extent_ledger,
+        &referenced_extents,
+        p.grace,
+        now_ms,
+        now,
+    )?;
+
     Ok(report)
+}
+
+/// Sweep orphaned rows in `hydra.dfs_extent_id_map` that are no longer referenced by
+/// any block map row.
+///
+/// Follows the two-scan grace rule (and created_at_ms young check):
+/// - 1st scan: record first_seen in ledger.
+/// - 2nd scan: if now - first_seen >= grace, issue DELETE.
+pub fn sweep_orphaned_extents<D: Db>(
+    db: &D,
+    extent_ledger: &mut HashMap<String, Instant>,
+    referenced_extents: &HashSet<String>,
+    grace: Duration,
+    now_ms: i64,
+    now: Instant,
+) -> Result<Vec<String>> {
+    let (_, has_table) = crate::extent_id_map::applied_levels(db)?;
+    if !has_table {
+        return Ok(Vec::new());
+    }
+    let rows = db.rows(crate::extent_id_map::EXTENT_MAP_ORPHAN_SCAN)?;
+    let grace_ms = grace.as_millis() as i64;
+    let mut still_unreferenced: HashMap<String, Instant> = HashMap::new();
+    let mut to_delete: Vec<String> = Vec::new();
+
+    for row in rows {
+        let id = match row.get("extent_id").and_then(Value::as_str) {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        if referenced_extents.contains(&id) {
+            // Live: void any grace.
+            continue;
+        }
+        let created_at_ms = row.get("created_at_ms").and_then(Value::as_i64).unwrap_or(0);
+        if created_at_ms > 0 && now_ms - created_at_ms < grace_ms {
+            let first = extent_ledger.get(&id).copied().unwrap_or(now);
+            still_unreferenced.insert(id, first);
+            continue;
+        }
+
+        let first_seen = match extent_ledger.get(&id) {
+            Some(t) => *t,
+            None => {
+                still_unreferenced.insert(id, now);
+                continue;
+            }
+        };
+        if now.saturating_duration_since(first_seen) < grace {
+            still_unreferenced.insert(id, first_seen);
+            continue;
+        }
+
+        to_delete.push(id);
+    }
+
+    let mut reclaimed = Vec::new();
+    for id in to_delete {
+        if let Err(e) = db.rows(&format!(
+            "DELETE FROM hydra.dfs_extent_id_map WHERE extent_id = {}",
+            cql_str(&id)
+        )) {
+            eprintln!("purah: could not delete orphaned extent row {id}: {e}");
+            if let Some(first_seen) = extent_ledger.get(&id) {
+                still_unreferenced.insert(id, *first_seen);
+            }
+        } else {
+            reclaimed.push(id);
+        }
+    }
+
+    *extent_ledger = still_unreferenced;
+    Ok(reclaimed)
 }
 
 #[cfg(test)]

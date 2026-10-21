@@ -153,7 +153,7 @@ WATCHDOG_PROBE_TIMEOUT = 30
 # libvirtd) must not appear here -- their absence is somebody else's verdict.
 WATCHDOG_SERVICES = ["hydra-db", "daruk", "sidon", "spectrum", "spectrum-phx", "slate", "agahnim",
                      "catalyst", "vali", "bifrost", "dagur", "mimir", "rauru", "logos", "mipha",
-                     "gatoway", "hylia"]
+                     "gatoway", "hylia", "kass"]
 # What a host in maintenance keeps running and the watchdog therefore keeps up: ZooKeeper plus the
 # units marked "keep" in MANAGED_SERVICES (docs/maintenance.md).
 WATCHDOG_MAINTENANCE_SERVICES = ["zookeeper", "hydra-db", "daruk", "sidon", "hylia"]
@@ -1247,7 +1247,7 @@ def check_services(category):
     # 1. Systemd service statuses
     urbosa_active = is_urbosa_enabled()
     in_maint = os.path.exists("/etc/hci/maintenance.state")
-    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "catalyst", "bifrost", "dagur", "mimir", "rauru", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "libvirtd"]
+    svcs = ["zookeeper", "hydra-db", "daruk", "sidon", "spark-daemon", "spectrum", "spectrum-phx", "catalyst", "bifrost", "dagur", "mimir", "rauru", "vali", "gatoway", "logos", "mipha", "agahnim", "slate", "hylia", "kass", "libvirtd"]
     if urbosa_active:
         svcs.append("urbosa")
         
@@ -1326,7 +1326,7 @@ def check_services(category):
         for line in resp.splitlines():
             if "mode:" in line.lower():
                 mode = line.split(":")[-1].strip()
-        if mode in ["leader", "follower"]:
+        if mode in ["leader", "follower", "observer", "standalone"]:
             status = "PASS"
             msg = f"ZooKeeper is online and participating in consensus. Mode: {mode}."
         else:
@@ -2693,7 +2693,7 @@ def check_services(category):
     try:
         managed = ["zookeeper", "hydra-db", "daruk", "sidon",
                    "spark-daemon", "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali",
-                   "bifrost", "dagur", "mimir", "rauru", "logos", "mipha", "gatoway", "hylia",
+                   "bifrost", "dagur", "mimir", "rauru", "logos", "mipha", "gatoway", "hylia", "kass",
                    "libvirtd"]
         if urbosa_active:
             managed.append("urbosa")

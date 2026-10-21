@@ -152,6 +152,58 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
     end
   end
 
+  def handle_event("deploy_ssl", %{"certificate" => cert, "private_key" => key}, socket) do
+    case Settings.deploy_ssl(cert, key) do
+      {:ok, message} ->
+        {:noreply, socket |> put_flash(:info, message) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("add_node", %{"hostname" => hostname, "ip" => ip} = params, socket) do
+    is_witness? = params["witness"] in ["true", true]
+
+    case Settings.add_node(hostname, ip, witness: is_witness?) do
+      {:ok, message} ->
+        {:noreply, socket |> put_flash(:info, message) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("remove_node", %{"target" => target}, socket) do
+    case Settings.remove_node(target) do
+      {:ok, message} ->
+        {:noreply, socket |> put_flash(:info, message) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("node_maintenance", %{"node" => node, "action" => action}, socket) do
+    case Settings.node_maintenance(node, action) do
+      {:ok, message} ->
+        {:noreply, socket |> put_flash(:info, message) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("node_reboot", %{"node" => node}, socket) do
+    case Settings.node_reboot(node) do
+      {:ok, message} ->
+        {:noreply, socket |> put_flash(:info, message) |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
   defp load(socket) do
     socket
     |> assign(:settings, Settings.all())
@@ -245,6 +297,17 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
                     {"disabled", "Disabled"}
                   ]}
                 />
+                <.setting_select
+                  name="fault_domain"
+                  label="Fault tolerance domain"
+                  value={@settings.stored["fault_domain"] || @settings.cluster[:fault_domain] || "khost"}
+                  options={[
+                    {"kdisk", "kDisk (Drive-level mirroring: allows FTT 1 on single node)"},
+                    {"khost", "kHost (Host-level tolerance: requires FTT+1 hosts)"},
+                    {"kblock", "kBlock (Chassis/enclosure tolerance)"},
+                    {"krack", "kRack (Rack-level tolerance)"}
+                  ]}
+                />
               </div>
               <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-4 pt-4 border-t border-base-300">
                 <.figure
@@ -283,6 +346,16 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
                   class="link"
                 >Storage</.link>.
               </p>
+              <div class="alert alert-info alert-soft text-xs mt-3 p-3 flex items-center justify-between" id="fault-domain-note">
+                <div>
+                  <span class="font-semibold uppercase tracking-wider">Fault Domain ({@settings.stored["fault_domain"] || @settings.cluster[:fault_domain] || "khost"}):</span>
+                  Under <span class="font-mono">kDisk</span>, single-node clusters support <span class="font-semibold">FTT 1</span> via local multi-disk mirroring across physical drives (SSDs/NVMe).
+                  Under <span class="font-mono">kHost</span>, surviving failures requires at least FTT+1 physical hosts.
+                </div>
+                <.link navigate={~p"/topology"} class="btn btn-xs btn-primary shrink-0 ml-3">
+                  View Topology <.icon name="hero-arrow-right" class="size-3" />
+                </.link>
+              </div>
               <p
                 :if={mismatched?(@settings.replication)}
                 class="text-sm text-warning mt-2"
@@ -354,6 +427,43 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
                     value={@settings.stored["drs_enabled"]}
                     options={[{"true", "Enabled: rebalance VMs across hosts"}, {"false", "Disabled"}]}
                   />
+                  <.setting_select
+                    name="vm_hotplug_headroom"
+                    label="VM CPU & Memory hot-add headroom"
+                    value={@settings.stored["vm_hotplug_headroom"] || "false"}
+                    options={[
+                      {"true", "Enabled: reserve vCPU and memory headroom at boot for live hot-add"},
+                      {"false", "Disabled: standard fixed allocation"}
+                    ]}
+                  />
+                </div>
+              </.panel>
+
+              <.panel
+                id="console-settings"
+                title="Guest console"
+                subtitle="Remote display protocols and default console for virtual machines"
+              >
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.setting_select
+                    name="console_protocol_policy"
+                    label="Supported console protocols"
+                    value={@settings.stored["console_protocol_policy"] || "both"}
+                    options={[
+                      {"both", "Both VNC & SPICE (per-VM choice)"},
+                      {"vnc", "VNC only (universal compatibility)"},
+                      {"spice", "SPICE only (high-performance desktop)"}
+                    ]}
+                  />
+                  <.setting_select
+                    name="default_console_protocol"
+                    label="Default console protocol"
+                    value={@settings.stored["default_console_protocol"] || "vnc"}
+                    options={[
+                      {"vnc", "VNC"},
+                      {"spice", "SPICE"}
+                    ]}
+                  />
                 </div>
               </.panel>
 
@@ -386,6 +496,62 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
                     type="number"
                     hint="5 to 1000"
                   />
+                </div>
+              </.panel>
+
+              <.panel
+                id="appearance-settings"
+                title="Appearance &amp; region"
+                subtitle="Visual theme and console localization"
+              >
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.setting_select
+                    name="language"
+                    label="Console language"
+                    value={@settings.stored["language"]}
+                    options={[
+                      {"en-US", "English (United States)"},
+                      {"de-DE", "Deutsch (German)"},
+                      {"fr-FR", "Français (French)"},
+                      {"es-ES", "Español (Spanish)"},
+                      {"ja-JP", "日本語 (Japanese)"},
+                      {"nl-NL", "Nederlands (Dutch)"}
+                    ]}
+                  />
+                  <div>
+                    <label class="form-control">
+                      <span class="label-text text-xs opacity-70">Theme preference</span>
+                      <div class="flex items-center gap-2 mt-1">
+                        <button
+                          type="button"
+                          class="btn btn-outline btn-xs"
+                          phx-click={JS.dispatch("phx:set-theme", detail: %{})}
+                          data-phx-theme="dark"
+                          id="theme-dark-btn"
+                        >
+                          <.icon name="hero-moon" class="size-3" /> Dark
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-outline btn-xs"
+                          phx-click={JS.dispatch("phx:set-theme", detail: %{})}
+                          data-phx-theme="light"
+                          id="theme-light-btn"
+                        >
+                          <.icon name="hero-sun" class="size-3" /> Light
+                        </button>
+                        <button
+                          type="button"
+                          class="btn btn-outline btn-xs"
+                          phx-click={JS.dispatch("phx:set-theme", detail: %{})}
+                          data-phx-theme="system"
+                          id="theme-system-btn"
+                        >
+                          <.icon name="hero-computer-desktop" class="size-3" /> System
+                        </button>
+                      </div>
+                    </label>
+                  </div>
                 </div>
               </.panel>
             </div>
@@ -595,6 +761,205 @@ defmodule SpectrumPhxWeb.Settings.IndexLive do
             </form>
           </.panel>
         </div>
+
+        <.panel
+          id="ssl-settings"
+          title="SSL / TLS certificate"
+          subtitle="Deploy public certificate and private key across all cluster nodes"
+        >
+          <p class="text-xs opacity-60 mb-3">
+            Upload or rotate the TLS certificate and unencrypted private key for the web console and proxy.
+            Once saved, the files are securely pushed across all cluster hosts and the slate proxy is reloaded.
+          </p>
+
+          <form id="ssl-form" phx-submit="deploy_ssl" class="flex flex-col gap-3">
+            <div class="grid gap-3 sm:grid-cols-2">
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Certificate (PEM format)</span>
+                <textarea
+                  name="certificate"
+                  id="ssl-cert-input"
+                  class="textarea textarea-bordered font-mono text-xs h-28 w-full"
+                  placeholder={"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"}
+                  required
+                ></textarea>
+                <span class="text-[0.65rem] opacity-45 mt-0.5">X.509 certificate chain in PEM format.</span>
+              </label>
+
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Private key (PEM format)</span>
+                <textarea
+                  name="private_key"
+                  id="ssl-key-input"
+                  class="textarea textarea-bordered font-mono text-xs h-28 w-full"
+                  placeholder={"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"}
+                  required
+                ></textarea>
+                <span class="text-[0.65rem] opacity-45 mt-0.5">Matching RSA or EC private key in PEM format.</span>
+              </label>
+            </div>
+
+            <div class="flex justify-end mt-2">
+              <button type="submit" class="btn btn-primary btn-sm" id="deploy-ssl-btn">
+                <.icon name="hero-shield-check" class="size-4" /> Deploy SSL certificate
+              </button>
+            </div>
+          </form>
+        </.panel>
+
+        <.panel
+          id="cluster-nodes-panel"
+          title="Cluster nodes &amp; membership"
+          subtitle="Manage node membership, quorum tie-breaker witnesses, and safe host operations"
+        >
+          <div class="overflow-x-auto">
+            <table class="table table-zebra table-sm" id="cluster-nodes-table">
+              <thead>
+                <tr>
+                  <th>Hostname</th>
+                  <th>IP address</th>
+                  <th>Role</th>
+                  <th>Maintenance</th>
+                  <th class="text-right">Operations</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={node <- @settings.nodes} id={"node-row-#{node.hostname}"}>
+                  <td class="font-medium font-mono">{node.hostname}</td>
+                  <td class="font-mono text-xs">{node.ip}</td>
+                  <td>
+                    <span :if={node.is_witness?} class="badge badge-sm badge-info gap-1" id={"witness-badge-#{node.hostname}"}>
+                      <.icon name="hero-scale" class="size-3" /> Witness / Quorum Tie-Breaker
+                    </span>
+                    <span :if={not node.is_witness?} class="badge badge-sm badge-ghost gap-1">
+                      <.icon name="hero-server" class="size-3" /> Hypervisor
+                    </span>
+                  </td>
+                  <td>
+                    <span :if={node.in_maintenance?} class="badge badge-sm badge-warning gap-1" id={"maint-badge-#{node.hostname}"}>
+                      <.icon name="hero-wrench-screwdriver" class="size-3" /> Maintenance
+                    </span>
+                    <span :if={not node.in_maintenance?} class="badge badge-sm badge-success gap-1">
+                      <.icon name="hero-check" class="size-3" /> Normal
+                    </span>
+                  </td>
+                  <td class="text-right">
+                    <div class="flex items-center justify-end gap-1.5">
+                      <button
+                        :if={not node.in_maintenance?}
+                        phx-click="node_maintenance"
+                        phx-value-node={node.ip}
+                        phx-value-action="enter"
+                        class="btn btn-ghost btn-xs text-warning"
+                        id={"enter-maint-#{node.hostname}"}
+                      >
+                        Enter maint
+                      </button>
+                      <button
+                        :if={node.in_maintenance?}
+                        phx-click="node_maintenance"
+                        phx-value-node={node.ip}
+                        phx-value-action="leave"
+                        class="btn btn-ghost btn-xs text-success"
+                        id={"leave-maint-#{node.hostname}"}
+                      >
+                        Leave maint
+                      </button>
+                      <button
+                        phx-click="node_reboot"
+                        phx-value-node={node.ip}
+                        data-confirm={"Are you sure you want to reboot #{node.hostname} (#{node.ip})?"}
+                        class="btn btn-ghost btn-xs text-error"
+                        id={"reboot-#{node.hostname}"}
+                      >
+                        Reboot
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2 mt-4 pt-4 border-t border-base-300">
+            <!-- Add Node Form -->
+            <form id="add-node-form" phx-submit="add_node" class="flex flex-col gap-3">
+              <h3 class="text-xs font-semibold uppercase tracking-wider opacity-70">Add node to cluster</h3>
+              <div class="grid gap-2 sm:grid-cols-2">
+                <label class="form-control">
+                  <span class="label-text text-xs opacity-70">Node hostname</span>
+                  <input
+                    type="text"
+                    name="hostname"
+                    id="add-node-hostname"
+                    class="input input-bordered input-sm w-full"
+                    placeholder="e.g. hci-03"
+                    autocomplete="off"
+                    required
+                  />
+                </label>
+                <label class="form-control">
+                  <span class="label-text text-xs opacity-70">Management IP address</span>
+                  <input
+                    type="text"
+                    name="ip"
+                    id="add-node-ip"
+                    class="input input-bordered input-sm w-full"
+                    placeholder="e.g. 10.10.102.43"
+                    autocomplete="off"
+                    required
+                  />
+                </label>
+              </div>
+
+              <div class="flex items-center gap-2 mt-1">
+                <input
+                  type="checkbox"
+                  name="witness"
+                  value="true"
+                  id="add-node-witness"
+                  class="checkbox checkbox-sm checkbox-primary"
+                />
+                <label for="add-node-witness" class="text-xs cursor-pointer">
+                  <span class="font-medium">Quorum tie-breaker (Witness node)</span>
+                  <span class="block text-[0.65rem] opacity-60">Votes in ZooKeeper without storage or VM workloads.</span>
+                </label>
+              </div>
+
+              <div class="flex justify-start mt-1">
+                <button type="submit" class="btn btn-primary btn-sm" id="btn-add-cluster-node">
+                  <.icon name="hero-plus-circle" class="size-4" /> Add node
+                </button>
+              </div>
+            </form>
+
+            <!-- Remove Node Form -->
+            <form id="remove-node-form" phx-submit="remove_node" class="flex flex-col gap-3">
+              <h3 class="text-xs font-semibold uppercase tracking-wider opacity-70">Remove node from cluster</h3>
+              <label class="form-control">
+                <span class="label-text text-xs opacity-70">Select node to remove</span>
+                <select name="target" id="remove-node-select" class="select select-bordered select-sm w-full" required>
+                  <option value="">-- Select node --</option>
+                  <option :for={node <- @settings.nodes} value={node.hostname}>
+                    {node.hostname} ({node.ip}) {if node.is_witness?, do: "[Witness]", else: ""}
+                  </option>
+                </select>
+                <span class="text-[0.65rem] opacity-45 mt-0.5">Updates cluster membership and ZooKeeper ensemble.</span>
+              </label>
+
+              <div class="flex justify-start mt-1">
+                <button
+                  type="submit"
+                  class="btn btn-error btn-outline btn-sm"
+                  id="btn-remove-cluster-node"
+                  data-confirm="Are you sure you want to remove this node from the cluster? This action will update consensus membership."
+                >
+                  <.icon name="hero-trash" class="size-4" /> Remove node
+                </button>
+              </div>
+            </form>
+          </div>
+        </.panel>
       </div>
     </Layouts.app>
     """

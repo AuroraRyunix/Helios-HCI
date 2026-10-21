@@ -17,7 +17,8 @@ Maintenance has its own document: [maintenance.md](./maintenance.md).
 | `FENCED` | the host's own watchdog, after a self-fence that **took** | Its guests were stopped, every vdisk it served was given up, and ZooKeeper leadership released when three or more nodes. The leader restarts its VMs elsewhere. | **an operator**: `mipha --clear-self-fence` on that host (`auto_recover_after_clean_seconds` is 0 by default, on purpose: a host that destroyed its own guests had a real fault) |
 | `DOWN` | the Mipha **leader**, after the host failed 3 consecutive polls (10 s apart) on both ICMP and spark-daemon, and the fencing ladder allowed the failover | Presumed dead. Its VMs were released and restarted elsewhere. | the leader: when spark-daemon answers again it runs the rejoin sequence |
 | `ENTERING_MAINTENANCE` | `POST /hosts/maintenance` (enter) | Being drained. | the enter task (to IN_MAINTENANCE, or back to NORMAL on failure); `leave` if the task died |
-| `IN_MAINTENANCE` | the enter task | Emptied of guests; the metadata and storage planes stay up. | `leave` |
+| `IN_MAINTENANCE` | the enter task | Emptied of guests; host services stopped. | `leave` |
+| `SERVICE_MAINTENANCE` | `POST /hosts/maintenance` (`--preserve-vms`) | Guests preserved on host; cluster services stopped for service maintenance; storage autopathed. | `leave` |
 | `RECOVERING` | the leader's rejoin of a DOWN host; the leave task of a maintenance host | Back, not yet trusted: no placement. | the rejoin (NORMAL after its services start) or the leave task (NORMAL once every service is UP) |
 | *unreachable* | observed | spark-daemon not answering. After three polls the leader marks DOWN (unless the host is FENCED/in maintenance, which it skips). | — |
 
@@ -31,12 +32,13 @@ Maintenance has its own document: [maintenance.md](./maintenance.md).
 | DOWN | no | no | no | no | done at the transition |
 | RECOVERING | no | no | no | no | no |
 | ENTERING/IN_MAINTENANCE | no | no | no | no | not performed: Mipha exempts it |
+| SERVICE_MAINTENANCE | no | no | no | no | not performed: Mipha exempts it (VMs stay running locally) |
 
 Placement, DRS and migration all use the same test (`vali.host_ineligible_reason`): the recorded
-state is NORMAL **and** the host answers with every managed service UP and not in maintenance. A
-database that cannot be read, or a host that does not answer, is a reason to refuse and never a
-pass. Until this was shared, a manual or DRS migration read only the daemon's own maintenance flag
-and could be aimed at a DEGRADED, FENCED or DOWN host.
+state is NORMAL **and** the host answers with every managed service UP (`hydra-db`, `daruk`, `sidon`,
+`catalyst`, `vali`, `kass`, etc.) and not in maintenance. A database that cannot be read, or a host that
+does not answer, is a reason to refuse and never a pass. Until this was shared, a manual or DRS migration
+read only the daemon's own maintenance flag and could be aimed at a DEGRADED, FENCED or DOWN host.
 
 ## Thresholds and timers
 

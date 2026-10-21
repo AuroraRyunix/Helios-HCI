@@ -52,8 +52,8 @@ def production(source):
 def load_valcli(names):
     """Compile only the named top-level functions out of valcli.py, which does real work at import."""
     tree = ast.parse(read("valcli.py"))
-    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-    missing = set(names) - {n.name for n in body}
+    body = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in names) or isinstance(n, (ast.Import, ast.ImportFrom))]
+    missing = set(names) - {n.name for n in body if isinstance(n, ast.FunctionDef)}
     assert not missing, "valcli.py no longer defines %s" % sorted(missing)
     ns = {}
     exec(compile(ast.Module(body=body, type_ignores=[]), "valcli.py", "exec"), ns)
@@ -86,7 +86,8 @@ class TheOperatorCanReachBoth(unittest.TestCase):
         valcli = read("valcli.py")
         for command in ("storage.compact", "storage.dedup.estimate"):
             self.assertIn('cmd == "%s"' % command, valcli)
-            self.assertIn("valcli %s" % command, valcli, "%s is not in the help text" % command)
+            self.assertTrue("valcli %s" % command in valcli or "{p} %s" % command in valcli,
+                            "%s is not in the help text" % command)
         self.assertIn('"op": "purah-compact"', valcli)
         self.assertIn('"op": "purah-dedup"', valcli)
 
@@ -107,7 +108,7 @@ class NothingRunsThemUnattended(unittest.TestCase):
         self.assertIn("apply: false", rust("purah", "compact.rs"))
 
     def test_valcli_plans_unless_given_apply(self):
-        ns = load_valcli(("_compact_request",))
+        ns = load_valcli(("cli_prog_name", "_compact_request"))
         self.assertFalse(ns["_compact_request"]([])["apply"])
         self.assertTrue(ns["_compact_request"](["--apply"])["apply"])
 
@@ -231,7 +232,7 @@ class TheDarukSwapsAreConditional(unittest.TestCase):
 class ValcliParsesStrictlyAndMergesAcrossNodes(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.ns = load_valcli(("_compact_request", "_dedup_request", "_merge_dedup"))
+        cls.ns = load_valcli(("cli_prog_name", "_compact_request", "_dedup_request", "_merge_dedup"))
 
     def test_limits_are_passed_through_as_numbers(self):
         request = self.ns["_compact_request"](["--apply", "--threshold", "0.4", "--max-groups", "3",

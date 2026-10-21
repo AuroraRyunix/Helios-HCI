@@ -102,6 +102,25 @@ class Memory(unittest.TestCase):
     def test_below_the_floor_is_refused(self):
         self.assertIsNone(plan({"op": "memory", "mib": 64})[0])
 
+    def test_persistent_memory_change_includes_config_flag(self):
+        steps, error = plan({"op": "memory", "mib": 4096, "persist": True})
+        self.assertIsNone(error)
+        self.assertEqual(steps[0]["argv"][-5:], ["setmem", "web-01", str(4096 * 1024), "--live", "--config"])
+
+    def test_dimm_hotplug_attaches_memory_device(self):
+        steps, error = plan({"op": "memory", "mode": "dimm", "size_mib": 2048})
+        self.assertIsNone(error)
+        self.assertEqual(len(steps), 1)
+        self.assertIn("attach-device", steps[0]["argv"])
+        self.assertIn("--live", steps[0]["argv"])
+        self.assertIn("--config", steps[0]["argv"])
+        root = ET.fromstring(steps[0]["xml"])
+        self.assertEqual(root.tag, "memory")
+        self.assertEqual(root.get("model"), "dimm")
+        self.assertEqual(root.find("target/size").text, "2048")
+        self.assertEqual(root.find("target/size").get("unit"), "MiB")
+        self.assertEqual(root.find("target/node").text, "0")
+
     def test_garbage(self):
         for mib in ("2048", 2048.0, True, None, -5):
             self.assertIsNone(plan({"op": "memory", "mib": mib})[0], mib)

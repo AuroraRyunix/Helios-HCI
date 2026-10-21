@@ -827,7 +827,8 @@ impl Vdisk {
             )));
         }
         let journal = self.journal.read_all()?;
-        for replica in &self.replicas {
+        let pieces: Vec<&[u8]> = journal.chunks(SEND_MAX).collect();
+        let resync_one = |replica: &PeerClient| -> Result<()> {
             let resp = replica.call(&Request {
                 opcode: peer::OP_TRUNCATE,
                 vdisk: self.id.clone(),
@@ -843,7 +844,6 @@ impl Vdisk {
                     replica.node, self.id, resp.status
                 )));
             }
-            let pieces: Vec<&[u8]> = journal.chunks(SEND_MAX).collect();
             for (i, piece) in pieces.iter().enumerate() {
                 let resp = replica.call(&Request {
                     opcode: peer::OP_APPEND,
@@ -861,6 +861,31 @@ impl Vdisk {
                         replica.node, self.id, resp.status
                     )));
                 }
+            }
+            Ok(())
+        };
+        if self.replicas.len() <= 1 {
+            for replica in &self.replicas {
+                resync_one(replica)?;
+            }
+        } else {
+            let outcomes: Vec<Result<()>> = std::thread::scope(|scope| {
+                let workers: Vec<_> = self
+                    .replicas
+                    .iter()
+                    .map(|replica| scope.spawn(move || resync_one(replica)))
+                    .collect();
+                workers
+                    .into_iter()
+                    .map(|w| {
+                        w.join().unwrap_or_else(|_| {
+                            Err(Error::io("a journal resynchronisation thread panicked".to_string()))
+                        })
+                    })
+                    .collect()
+            });
+            for outcome in outcomes {
+                outcome?;
             }
         }
         self.commit.clear_broken();

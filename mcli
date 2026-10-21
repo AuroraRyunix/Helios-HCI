@@ -88,6 +88,7 @@ CHECK_ID_TO_FUNC = {
     "hylia_status": "service.hylia",
     "agahnim_status": "service.agahnim",
     "slate_status": "service.slate",
+    "kass_status": "service.kass",
     "slate_config_status": "service.slate.config",
     "zookeeper_ring_scale": "database.zookeeper.ring_scale",
     "scylladb_quorum_safety": "database.scylladb.quorum_safety",
@@ -184,7 +185,7 @@ def run_node_checks(node, category, local_ip, results_dict):
             "services": [
                 "zookeeper_status", "hydra-db_status", "daruk_status", "sidon_status", "spectrum_status", "spectrum-phx_status",
                 "spark-daemon_status", "libvirtd_status", "catalyst_status", "bifrost_status", "dagur_status", "mimir_status", "rauru_status", "vali_status",
-                "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "hylia_status", "scylladb_ring_status",
+                "gatoway_status", "urbosa_status", "logos_status", "mipha_status", "agahnim_status", "slate_status", "hylia_status", "kass_status", "scylladb_ring_status",
                 "zookeeper_consensus", "scylladb_replication", "spectrum_api_port",
                 "mtls_cert_expiration", "ingress_cert_expiration", "certs_seeding_check", "slate_config_status", "libvirt_responsiveness", "hostname_resolution",
                 "spectrum_privilege_check", "auth_seeding_check", "vip_binding_status",
@@ -586,6 +587,7 @@ def show_list():
         ("service.hylia", "hylia_status", "Check systemd Hylia upgrade manager state"),
         ("service.agahnim", "agahnim_status", "Check systemd Agahnim console proxy state"),
         ("service.slate", "slate_status", "Check systemd Slate ingress state"),
+        ("service.kass", "kass_status", "Check systemd Kass (Kafka) event streaming service state"),
     ]
     
     for func, check_id, desc in checks:

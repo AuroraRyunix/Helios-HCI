@@ -595,11 +595,12 @@ defmodule SpectrumPhx.ZkTest do
       assert State.stale_after_seconds() == 30
     end
 
-    test "service order starts with ZooKeeper and ends with the gated Urbosa" do
+    test "service order starts with ZooKeeper and ends with Kass" do
       order = State.service_display_order()
 
       assert List.first(order) == "ZooKeeper"
-      assert List.last(order) == "Urbosa"
+      assert List.last(order) == "Kass"
+      assert "Urbosa" in order
       assert "Spark" in order
       assert length(order) == length(Enum.uniq(order))
     end

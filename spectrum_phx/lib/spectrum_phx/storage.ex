@@ -686,12 +686,22 @@ defmodule SpectrumPhx.Storage do
     clamp_replicas(factor, node_count)
   end
 
-  # A single-node cluster keeps one copy however the redundancy factor reads; asking for
-  # two replicas there would flag every vdisk on a deployment that is behaving. This is
-  # ftt=0, a supported topology rather than a broken one.
+  # Under khost, a single-node cluster keeps one copy. Under kdisk, a single-node
+  # cluster can mirror extents across local physical drives, supporting FTT 1 (2 copies).
   defp clamp_replicas(factor, node_count) do
     factor = integer(factor) || 0
-    max(min(factor + 1, max(node_count, 1)), 1)
+    domain =
+      try do
+        Config.fault_domain()
+      catch
+        :exit, _reason -> "khost"
+      end
+
+    if domain == "kdisk" do
+      max(min(factor + 1, 2), 1)
+    else
+      max(min(factor + 1, max(node_count, 1)), 1)
+    end
   end
 
   defp hostname_for(ip) do
@@ -739,4 +749,90 @@ defmodule SpectrumPhx.Storage do
   defp describe(nil), do: nil
   defp describe(reason) when is_binary(reason), do: reason
   defp describe(reason), do: inspect(reason)
+
+  # -- Purah & storage maintenance operations -------------------------------------------
+
+  @doc "Run a Purah or DFS maintenance operation via Catalyst."
+  def run_maintenance("sweep"), do: run_sweep()
+  def run_maintenance("scrub"), do: run_scrub()
+  def run_maintenance("compact"), do: run_compaction(false)
+  def run_maintenance("compact_apply"), do: run_compaction(true)
+  def run_maintenance("dedup_estimate"), do: run_dedup_estimate()
+  def run_maintenance("replicate_all"), do: run_replicate_all()
+  def run_maintenance(other), do: {:error, "Unknown storage maintenance operation: #{inspect(other)}"}
+
+  @doc "Trigger Purah garbage collection sweep."
+  def run_sweep do
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => "Purah Garbage Collection Sweep",
+        "command" => "/usr/local/bin/ncli storage.sweep"
+      },
+      component: "Purah"
+    )
+  end
+
+  @doc "Trigger Purah integrity scrub."
+  def run_scrub do
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => "Purah Integrity Scrub",
+        "command" => "/usr/local/bin/ncli storage.scrub"
+      },
+      component: "Purah"
+    )
+  end
+
+  @doc "Trigger Purah extent group compaction plan or execution."
+  def run_compaction(apply? \\ false) do
+    cmd =
+      if apply? in [true, "true", "1", "apply"],
+        do: "/usr/local/bin/ncli storage.compact --apply",
+        else: "/usr/local/bin/ncli storage.compact"
+
+    label =
+      if apply? in [true, "true", "1", "apply"],
+        do: "Purah Compaction (Apply)",
+        else: "Purah Compaction (Plan)"
+
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => label,
+        "command" => cmd
+      },
+      component: "Purah"
+    )
+  end
+
+  @doc "Trigger DFS deduplication savings estimate."
+  def run_dedup_estimate do
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => "DFS Deduplication Estimate",
+        "command" => "/usr/local/bin/ncli storage.dedup.estimate"
+      },
+      component: "Purah"
+    )
+  end
+
+  @doc "Trigger replication of all under-replicated vdisks."
+  def run_replicate_all do
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => "Replicate Under-replicated Vdisks",
+        "command" => "/usr/local/bin/ncli storage.replicate --all"
+      },
+      component: "Storage"
+    )
+  end
 end

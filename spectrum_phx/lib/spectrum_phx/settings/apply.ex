@@ -37,7 +37,7 @@ defmodule SpectrumPhx.Settings.Apply do
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Spark
 
-  @cluster_fields ~w(cluster_name vip cluster_subnet)
+  @cluster_fields ~w(cluster_name vip cluster_subnet fault_domain)
   @replication_field "replication_factor"
 
   # The cron expression, the interval and whether the job is enabled, per setting.
@@ -136,6 +136,14 @@ defmodule SpectrumPhx.Settings.Apply do
     if value in ~w(true false), do: nil, else: "one of true, false"
   end
 
+  defp check("vm_hotplug_headroom", value) do
+    if value in ~w(true false), do: nil, else: "one of true, false"
+  end
+
+  defp check("language", value) do
+    if value in ~w(en-US de-DE fr-FR es-ES ja-JP nl-NL), do: nil, else: "not a supported language code"
+  end
+
   defp check("dns_servers", value) do
     servers = list(value)
 
@@ -160,6 +168,18 @@ defmodule SpectrumPhx.Settings.Apply do
     if value == "" or Regex.match?(@host_regex, String.trim(value)),
       do: nil,
       else: "must be a domain name"
+  end
+
+  defp check("console_protocol_policy", value) do
+    if value in ~w(both vnc spice), do: nil, else: "one of both, vnc, spice"
+  end
+
+  defp check("default_console_protocol", value) do
+    if value in ~w(vnc spice), do: nil, else: "one of vnc, spice"
+  end
+
+  defp check("fault_domain", value) do
+    if value in ~w(kdisk khost kblock krack), do: nil, else: "one of kdisk, khost, kblock, krack"
   end
 
   defp check(_key, _value), do: nil
@@ -310,9 +330,10 @@ defmodule SpectrumPhx.Settings.Apply do
   defp hosts(%{} = static), do: Map.get(static, :hosts, [])
   defp hosts(nil), do: Config.node_ips()
 
-  defp effect(%{effects: fun}, tag, _live) when is_function(fun, 1), do: fun.(tag)
-  defp effect(%{}, _tag, _live), do: :ok
-  defp effect(nil, _tag, live), do: live.()
+  @doc "Execute an effect or pass to the static mock function."
+  def effect(%{effects: fun}, tag, _live) when is_function(fun, 1), do: fun.(tag)
+  def effect(%{}, _tag, _live), do: :ok
+  def effect(nil, _tag, live), do: live.()
 
   defp host(ip, command) do
     case Spark.execute(ip, command) do

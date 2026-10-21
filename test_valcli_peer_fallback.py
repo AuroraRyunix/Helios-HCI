@@ -160,5 +160,103 @@ class TheCatalystTaskWaiter(unittest.TestCase):
             self.assertTrue(res)
 
 
+class TheDatabaseNodetoolCommands(unittest.TestCase):
+    SAMPLE_STATUS = """Datacenter: datacenter1
+=======================
+Status=Up/Down
+|/ State=Normal/Leaving/Joining/Moving
+--  Address        Load       Tokens  Owns (effective)  Host ID                               Rack
+UN  192.168.1.10   10.7 GiB   256     100.0%            997a4900-1111-2222-3333-444455556666  rack1
+UN  192.168.1.11   10.7 GiB   256     100.0%            3ca91e00-1111-2222-3333-444455556666  rack1
+DN  192.168.1.12   8.7 GiB    256     100.0%            0679d900-1111-2222-3333-444455556666  rack1
+"""
+
+    SAMPLE_HIST = """proxy histograms
+Percentile       Read Latency      Write Latency      Range Latency   CAS Read Latency  CAS Write Latency View Write Latency
+                     (micros)           (micros)           (micros)           (micros)           (micros)           (micros)
+50%                    560.00             486.00            1860.50               0.00               0.00               0.00
+75%                    648.00             711.50            2661.75               0.00               0.00               0.00
+95%                    833.75           14894.25           10000.50               0.00               0.00               0.00
+98%                   1093.00           22227.38           13506.00               0.00               0.00               0.00
+99%                   1260.00          300971.04           16247.50               0.00               0.00               0.00
+Min                     31.00              44.00             116.00               0.00               0.00               0.00
+Max                  28985.00          597005.00           62394.00               0.00               0.00               0.00
+"""
+
+    def test_parse_nodetool_status(self):
+        dc, nodes = valcli.parse_nodetool_status_lines(self.SAMPLE_STATUS)
+        self.assertEqual(dc, "datacenter1")
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(nodes[0]["status"], "Online (Healthy)")
+        self.assertTrue(nodes[0]["is_healthy"])
+        self.assertEqual(nodes[2]["status"], "Offline (DOWN)")
+        self.assertFalse(nodes[2]["is_healthy"])
+
+    def test_parse_proxyhistograms(self):
+        rows = valcli.parse_proxyhistograms(self.SAMPLE_HIST)
+        self.assertEqual(len(rows), 7)
+        p50 = next(r for r in rows if r["percentile"] == "50%")
+        self.assertAlmostEqual(p50["read_us"], 560.0)
+        self.assertAlmostEqual(p50["write_us"], 486.0)
+        p99 = next(r for r in rows if r["percentile"] == "99%")
+        self.assertAlmostEqual(p99["write_us"], 300971.04)
+
+    def test_format_latency_ms(self):
+        self.assertIn("[Fast]", valcli.format_latency_ms(500))
+        self.assertIn("[Normal]", valcli.format_latency_ms(5000))
+        self.assertIn("[Warning]", valcli.format_latency_ms(20000))
+        self.assertIn("[STALL]", valcli.format_latency_ms(300000))
+
+    def test_cmd_db_status_runs_cleanly(self):
+        with mock.patch.object(valcli, "run_nodetool_command", return_value=(0, self.SAMPLE_STATUS, "")), \
+             mock.patch("sys.stdout", io.StringIO()) as out:
+            valcli.cmd_db_status()
+            text = out.getvalue()
+            self.assertIn("ScyllaDB (Hydra) Cluster Status", text)
+            self.assertIn("192.168.1.10", text)
+            self.assertIn("Online (Healthy)", text)
+            self.assertIn("Offline (DOWN)", text)
+
+    def test_cmd_db_perf_runs_cleanly(self):
+        with mock.patch.object(valcli, "run_nodetool_command", return_value=(0, self.SAMPLE_HIST, "")), \
+             mock.patch("sys.stdout", io.StringIO()) as out:
+            valcli.cmd_db_perf()
+            text = out.getvalue()
+            self.assertIn("ScyllaDB (Hydra) Latency & Performance", text)
+            self.assertIn("0.56 ms [Fast]", text)
+            self.assertIn("300.97 ms [STALL]", text)
+            self.assertIn("ELEVATED TAIL STALLS DETECTED", text)
+
+    def test_ncli_execution_routing(self):
+        with mock.patch.object(valcli, "run_nodetool_command", return_value=(0, self.SAMPLE_STATUS, "")), \
+             mock.patch("sys.stdout", io.StringIO()):
+            rc = valcli.execute_command(["db.status"], prog_name="ncli")
+            self.assertEqual(rc, 0)
+
+    def test_host_maintenance_leave_async_by_default(self):
+        mock_wait = mock.MagicMock()
+        mock_api = mock.MagicMock(return_value=(0, {"status": "transitioning", "task_id": "test-task-123"}, ""))
+        with mock.patch.object(valcli, "run_mtls_api", mock_api), \
+             mock.patch.object(valcli, "wait_for_catalyst_task", mock_wait), \
+             mock.patch("sys.stdout", io.StringIO()) as out:
+            rc = valcli.execute_command(["host.maintenance.leave", "Valkyrie-0679D9"], prog_name="ncli")
+            self.assertEqual(rc, 0)
+            text = out.getvalue()
+            self.assertIn("Leaving maintenance mode task submitted (Task ID: test-task-123)", text)
+            mock_wait.assert_not_called()
+
+    def test_host_maintenance_leave_waits_when_wait_flag_passed(self):
+        mock_wait = mock.MagicMock()
+        mock_api = mock.MagicMock(return_value=(0, {"status": "transitioning", "task_id": "test-task-123"}, ""))
+        with mock.patch.object(valcli, "run_mtls_api", mock_api), \
+             mock.patch.object(valcli, "wait_for_catalyst_task", mock_wait), \
+             mock.patch("sys.stdout", io.StringIO()) as out:
+            rc = valcli.execute_command(["host.maintenance.leave", "Valkyrie-0679D9", "--wait"], prog_name="ncli")
+            self.assertEqual(rc, 0)
+            mock_wait.assert_called_once_with("test-task-123")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

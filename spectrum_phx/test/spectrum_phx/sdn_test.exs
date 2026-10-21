@@ -203,4 +203,110 @@ defmodule SpectrumPhx.SdnTest do
       end
     end
   end
+
+  describe "mutations and VNI claims" do
+    test "creates and deletes T0 and T1 routers" do
+      sink = self()
+      opts = [source: {:static, %{sink: sink}}]
+
+      assert {:ok, t0_id} =
+               Sdn.create_t0_router(
+                 %{"name" => "edge-01", "uplink_interface" => "eth1", "uplink_ip" => "192.0.2.2/24"},
+                 opts
+               )
+
+      assert_receive {:write, cql, ["edge-01", "eth1", "192.0.2.2/24", "", "[]"]}
+      assert cql =~ "INSERT INTO hydra.urbosa_t0_routers"
+
+      assert {:ok, t1_id} =
+               Sdn.create_t1_router(
+                 %{"name" => "tenant-01", "t0_link_id" => t0_id, "dhcp_enabled" => "true"},
+                 opts
+               )
+
+      assert_receive {:write, t1_cql, ["tenant-01", true]}
+      assert t1_cql =~ "INSERT INTO hydra.urbosa_t1_routers"
+
+      assert :ok = Sdn.delete_t1_router(t1_id, opts)
+      assert :ok = Sdn.delete_t0_router(t0_id, opts)
+    end
+
+    test "claims VNI before creating segment and refuses duplicate VNI or attached guest deletion" do
+      sink = self()
+      seg_id = Sdn.generate_id()
+
+      opts = [
+        source:
+          {:static,
+           %{
+             sink: sink,
+             vni_claims: [%{"vni" => 5000, "segment_id" => seg_id, "name" => "existing-seg"}],
+             segments: [%{"segment_id" => seg_id, "name" => "existing-seg", "vni" => 5000}],
+             vms: [%{"name" => "app-vm-1", "network_id" => seg_id, "state" => "RUNNING"}]
+           }}
+      ]
+
+      # Duplicate VNI is refused
+      assert {:error, msg} =
+               Sdn.create_segment(
+                 %{"name" => "clash-seg", "vni" => "5000", "subnet_cidr" => "10.50.0.0/24"},
+                 opts
+               )
+
+      assert msg =~ "VNI 5000 is already claimed by existing-seg"
+
+      # Free VNI succeeds and claims VNI first
+      assert {:ok, new_seg_id} =
+               Sdn.create_segment(
+                 %{"name" => "prod-seg", "vni" => "5001", "subnet_cidr" => "10.51.0.0/24"},
+                 opts
+               )
+
+      assert_receive {:vni_claim, 5001, ^new_seg_id}
+      assert_receive {:write, seg_cql, ["prod-seg", 5001, "10.51.0.0/24", "", false, "", ""]}
+      assert seg_cql =~ "INSERT INTO hydra.urbosa_segments"
+
+      # Deleting segment with attached guests is refused
+      assert {:error, del_err} = Sdn.delete_segment(seg_id, opts)
+      assert del_err =~ "app-vm-1"
+
+      # Deleting segment with no attached guests succeeds and releases VNI
+      empty_opts = [
+        source:
+          {:static,
+           %{
+             sink: sink,
+             segments: [%{"segment_id" => seg_id, "name" => "existing-seg", "vni" => 5000}],
+             vms: []
+           }}
+      ]
+
+      assert :ok = Sdn.delete_segment(seg_id, empty_opts)
+      assert_receive {:vni_release, 5000, ^seg_id}
+    end
+
+    test "creates and deletes distributed firewall rules" do
+      sink = self()
+      opts = [source: {:static, %{sink: sink}}]
+
+      assert {:ok, rule_id} =
+               Sdn.create_firewall_rule(
+                 %{
+                   "description" => "Allow HTTPS",
+                   "source_ip" => "any",
+                   "dest_ip" => "10.10.0.0/16",
+                   "protocol" => "tcp",
+                   "port" => "443",
+                   "action" => "allow",
+                   "priority" => "50"
+                 },
+                 opts
+               )
+
+      assert_receive {:write, fw_cql, ["Allow HTTPS", "any", "10.10.0.0/16", "tcp", 443, "allow", 50]}
+      assert fw_cql =~ "INSERT INTO hydra.urbosa_firewall_rules"
+
+      assert :ok = Sdn.delete_firewall_rule(rule_id, opts)
+    end
+  end
 end

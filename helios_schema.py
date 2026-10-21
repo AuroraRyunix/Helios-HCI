@@ -62,6 +62,8 @@ LOCK_TTL_SECONDS = 300
 # so that a VLAN id can be a partition key and therefore the subject of an IF NOT EXISTS.
 VLAN_CLAIMS_TABLE = "hydra.gatoway_vlan_claims"
 NETWORKS_TABLE = "hydra.gatoway_networks"
+VNI_CLAIMS_TABLE = "hydra.urbosa_vni_claims"
+SEGMENTS_TABLE = "hydra.urbosa_segments"
 
 
 def _json_rows(stdout):
@@ -195,6 +197,65 @@ def _claim_holder(execute, vlan_id):
         return None
     rows = _json_rows(stdout)
     return rows[0] if rows else None
+
+
+def claim_vni_statement(vni, segment_id, name, now_ms):
+    """The VNI uniqueness claim, as CQL text."""
+    return (
+        "INSERT INTO %s (vni, segment_id, name, claimed_at_ms) "
+        "VALUES (%d, %s, %s, %d) IF NOT EXISTS;"
+        % (VNI_CLAIMS_TABLE, int(vni), quote(segment_id), quote(name), int(now_ms)))
+
+
+def _vni_claim_holder(execute, vni):
+    try:
+        _rc, stdout, _stderr = _run(
+            execute, "SELECT JSON segment_id, name FROM %s WHERE vni = %d;"
+            % (VNI_CLAIMS_TABLE, int(vni)))
+    except SchemaError:
+        return None
+    rows = _json_rows(stdout)
+    return rows[0] if rows else None
+
+
+def backfill_vni_claims(execute, report, now_ms):
+    """Give every VNI an Urbosa overlay segment already carries a claim, and name any clashes."""
+    rc, stdout, stderr = _run(
+        execute, "SELECT JSON segment_id, name, vni FROM %s;" % SEGMENTS_TABLE)
+    rows = _json_rows(stdout)
+    if rows is None:
+        raise SchemaError(
+            "a row of %s did not parse, so it is not known which VNIs are in use. "
+            "The claim table is created but empty; this migration is not recorded and "
+            "will run again. (%s)" % (SEGMENTS_TABLE, (stderr or "").strip()))
+
+    by_vni = {}
+    for row in rows:
+        vni = row.get("vni")
+        if not isinstance(vni, int) or isinstance(vni, bool):
+            continue
+        by_vni.setdefault(vni, []).append(row)
+
+    for vni in sorted(by_vni):
+        holders = sorted(by_vni[vni], key=lambda row: str(row.get("segment_id") or ""))
+        winner = holders[0]
+        _rc, claim_stdout, _stderr = _run(execute, claim_vni_statement(
+            vni, winner.get("segment_id"), winner.get("name"), now_ms))
+        if not lwt_applied(claim_stdout):
+            winner = _vni_claim_holder(execute, vni) or winner
+
+        losers = [row for row in holders
+                  if str(row.get("segment_id")) != str(winner.get("segment_id"))]
+        if not losers:
+            continue
+        report(
+            "VNI %d is carried by %d overlay segments. The claim is held by %s (%s); %s hold "
+            "no claim and will keep working as they do now, but nothing can be created on "
+            "VNI %d until they are re-numbered or deleted."
+            % (vni, len(holders), winner.get("name"), winner.get("segment_id"),
+               ", ".join("%s (%s)" % (row.get("name"), row.get("segment_id"))
+                         for row in losers),
+               vni))
 
 
 MIGRATIONS = [
@@ -773,6 +834,176 @@ MIGRATIONS = [
             "paused_vms text, error text, "
             "PRIMARY KEY ((domain), taken_at_ms, set_id) ) "
             "WITH CLUSTERING ORDER BY (taken_at_ms DESC, set_id ASC);",
+        ],
+    },
+    {
+        "id": "0040-dfs-vdisk-extent-optin",
+        "description": (
+            "Per-vdisk writer opt-in for the Stage 3 extent ID map (D-23, docs/dfs/extent_id_map.md). "
+            "When true, new extents written by this vdisk are allocated a birth-derived extent_id "
+            "in hydra.dfs_extent_id_map and referenced by hydra.dfs_block_map.extent_id with "
+            "null egroup_id. Default is null / false (the two-level path)."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.dfs_vdisks ADD use_extent_id boolean;",
+        ],
+    },
+    {
+        "id": "0041-vm-esxi-parity",
+        "description": (
+            "ESXi feature parity for hydra.vms: operator notes/annotations, tags, "
+            "CPU shares, CPU limit (quota), CPU reservation, memory reservation, and "
+            "memory limit (hard ceiling)."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.vms ADD notes text;",
+            "ALTER TABLE hydra.vms ADD tags text;",
+            "ALTER TABLE hydra.vms ADD cpu_shares int;",
+            "ALTER TABLE hydra.vms ADD cpu_limit int;",
+            "ALTER TABLE hydra.vms ADD cpu_reservation int;",
+            "ALTER TABLE hydra.vms ADD mem_reservation int;",
+            "ALTER TABLE hydra.vms ADD mem_limit int;",
+        ],
+    },
+    {
+        "id": "0042-pci-salt-dr",
+        "description": (
+            "Physical PCI passthrough device list on hydra.vms, SaltStack state execution "
+            "tracking per node, and site-to-site asynchronous DR replication targets."
+        ),
+        "statements": [
+            "ALTER TABLE hydra.vms ADD pci_devices text;",
+            "CREATE TABLE IF NOT EXISTS hydra.salt_states "
+            "( node text, state_name text, last_run_ms bigint, status text, "
+            "changes_count int, output text, PRIMARY KEY ((node), state_name) );",
+            "CREATE TABLE IF NOT EXISTS hydra.dr_replication_targets "
+            "( domain text, remote_ip text, remote_port int, pin_sha256 text, "
+            "last_set_id text, last_sync_ms bigint, status text, "
+            "PRIMARY KEY ((domain), remote_ip) );",
+        ],
+    },
+    {
+        "id": "0043-urbosa-vni-claims",
+        "description": (
+            "Urbosa VNI uniqueness claims table, claimed and released with compare-and-swap "
+            "via Daruk so two overlay segments can never share a VXLAN VNI."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.urbosa_vni_claims "
+            "( vni int PRIMARY KEY, segment_id text, name text, claimed_at_ms bigint );",
+        ],
+        "backfill": backfill_vni_claims,
+    },
+    {
+        "id": "0044-vm-affinity-group",
+        "description": "VM-VM affinity group name on hydra.vms for DRS and initial placement.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD affinity_group text;",
+        ],
+    },
+    {
+        "id": "0045-vm-anti-affinity-group",
+        "description": "VM-VM anti-affinity group name on hydra.vms so members never share a host.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD anti_affinity_group text;",
+        ],
+    },
+    {
+        "id": "0046-vm-pinned-hosts",
+        "description": "Comma-separated allowed host IPs on hydra.vms for VM-Host pinning.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD pinned_hosts text;",
+        ],
+    },
+    {
+        "id": "0047-vm-is-template",
+        "description": "Boolean template flag on hydra.vms preventing direct power-on of golden images.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD is_template boolean;",
+        ],
+    },
+    {
+        "id": "0048-vm-vtpm",
+        "description": "Virtual TPM 2.0 CRB emulator flag on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD vtpm boolean;",
+        ],
+    },
+    {
+        "id": "0049-vm-secure-boot",
+        "description": "UEFI Secure Boot (OVMF_CODE.secboot.fd + SMM) flag on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD secure_boot boolean;",
+        ],
+    },
+    {
+        "id": "0050-vm-cloud-init-userdata",
+        "description": "Cloud-Init NoCloud user-data payload on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD cloud_init_userdata text;",
+        ],
+    },
+    {
+        "id": "0051-vm-cloud-init-network",
+        "description": "Cloud-Init NoCloud network-config payload on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD cloud_init_network text;",
+        ],
+    },
+    {
+        "id": "0052-vm-vtpm-enabled",
+        "description": "Virtual TPM 2.0 boolean flag column name used by Spectrum Phoenix console on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD vtpm_enabled boolean;",
+        ],
+    },
+    {
+        "id": "0053-vm-usb-devices",
+        "description": "USB hostdev passthrough device identifiers (comma-separated vendor:product) on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD usb_devices text;",
+        ],
+    },
+    {
+        "id": "0054-vm-guest-ips",
+        "description": "Guest IP addresses reported by QEMU Guest Agent or overlay DHCP on hydra.vms.",
+        "statements": [
+            "ALTER TABLE hydra.vms ADD guest_ips text;",
+        ],
+    },
+    {
+        "id": "0055-central-clusters",
+        "description": "Multi-cluster federation and fleet inventory registry for Helios Central (vCenter / Prism Central equivalent).",
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.central_clusters ("
+            "cluster_id text PRIMARY KEY, "
+            "name text, "
+            "vip text, "
+            "port int, "
+            "status text, "
+            "node_count int, "
+            "vm_count int, "
+            "cpu_cores int, "
+            "memory_total_mb bigint, "
+            "memory_used_mb bigint, "
+            "storage_total_bytes bigint, "
+            "storage_used_bytes bigint, "
+            "auth_token text, "
+            "last_seen_ms bigint, "
+            "enrolled_at_ms bigint, "
+            "metadata text"
+            ");",
+        ],
+    },
+    {
+        "id": "0056-central-config",
+        "description": "Helios Central appliance configuration, deployment status, and fleet settings.",
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.central_config ("
+            "key text PRIMARY KEY, "
+            "value text, "
+            "updated_at_ms bigint"
+            ");",
         ],
     },
 ]

@@ -126,6 +126,9 @@ KNOWN_SHELL_COMMANDS = {
     ("urbosa_bootstrap.py", "ip netns del"): "See the entry above.",
     ("urbosa_bootstrap.py", "ip -o link show"): "See the entry above.",
     ("urbosa_bootstrap.py", "ip link del"): "See the entry above.",
+    ("valcli.py", "rm -f /etc/hci/maintenance.state && systemctl restart spark-daemon && systemctl start zookeeper hydra-db daruk sidon && echo RESCUE_SUCCESS"):
+        "Out-of-band emergency host rescue over direct SSH when spark-daemon is wedged, crashed, or "
+        "unreachable via cluster RPC. Executes directly via SSH subprocess rather than spark mTLS.",
 }
 
 

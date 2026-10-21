@@ -26,7 +26,7 @@ def read(*parts):
         return handle.read()
 
 
-FUNCTIONS = ("_sweep_mib", "_grace_phrase", "sweep_lines", "cmd_storage_sweep", "scrub_lines",
+FUNCTIONS = ("cli_prog_name", "_sweep_mib", "_grace_phrase", "sweep_lines", "cmd_storage_sweep", "scrub_lines",
              "cmd_storage_scrub", "cmd_storage_cleanup_orphaned")
 
 
@@ -94,8 +94,10 @@ class TheOperatorCanReachThem(unittest.TestCase):
         valcli = read("valcli.py")
         self.assertIn('elif cmd == "storage.sweep":', valcli)
         self.assertIn('elif cmd == "storage.scrub":', valcli)
-        self.assertIn("valcli storage.sweep ", valcli)
-        self.assertIn("valcli storage.scrub ", valcli)
+        self.assertTrue("valcli storage.sweep " in valcli or "{p} storage.sweep " in valcli,
+                        "storage.sweep is not in help text")
+        self.assertTrue("valcli storage.scrub " in valcli or "{p} storage.scrub " in valcli,
+                        "storage.scrub is not in help text")
 
     def test_the_old_name_is_the_same_command(self):
         """The daily Dagur job runs `storage.cleanup_orphaned`; it must do what `sweep` does."""
@@ -383,9 +385,9 @@ class CompactionAccountsForReplicaReclamation(unittest.TestCase):
 
     def test_the_plan_step_prints_what_replicas_are_given_and_what_they_get_back(self):
         tree = ast.parse(read("valcli.py"))
-        names = ("_compact_request", "cmd_storage_compact")
+        names = ("cli_prog_name", "_compact_request", "cmd_storage_compact")
         fns = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
-        ns = {"sys": sys}
+        ns = {"sys": sys, "os": os}
         ns.update(cluster({"10.0.0.1": self.plan_answer()})[0])
         exec(compile(ast.Module(body=fns, type_ignores=[]), "valcli.py", "exec"), ns)
         out, _ = run(ns, "cmd_storage_compact", [])
@@ -397,8 +399,8 @@ class CompactionAccountsForReplicaReclamation(unittest.TestCase):
                                  net_freed_on_replicas=0)
         tree = ast.parse(read("valcli.py"))
         fns = [n for n in tree.body if isinstance(n, ast.FunctionDef)
-               and n.name in ("_compact_request", "cmd_storage_compact")]
-        ns = {"sys": sys}
+               and n.name in ("cli_prog_name", "_compact_request", "cmd_storage_compact")]
+        ns = {"sys": sys, "os": os}
         ns.update(cluster({"10.0.0.1": answer})[0])
         exec(compile(ast.Module(body=fns, type_ignores=[]), "valcli.py", "exec"), ns)
         out, _ = run(ns, "cmd_storage_compact", [])

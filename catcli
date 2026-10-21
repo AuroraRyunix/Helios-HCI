@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import sys
 import os
+if "/usr/local/bin" not in sys.path:
+    sys.path.insert(0, "/usr/local/bin")
 import json
 import base64
 import subprocess
@@ -19,11 +21,15 @@ try:
 except Exception:
     pass
 
-def run_cql_query(cql_query):
-    b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
-    cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {LOCAL_IP}'
-    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return res.returncode, res.stdout.decode('utf-8', errors='ignore'), res.stderr.decode('utf-8', errors='ignore')
+try:
+    import helios_cql
+    run_cql_query = helios_cql.run_cql_query
+except ImportError:
+    def run_cql_query(cql_query):
+        b64_query = base64.b64encode(cql_query.encode('utf-8')).decode('utf-8')
+        cmd = f'echo {b64_query} | base64 -d | podman exec -i systemd-hydra-db cqlsh {LOCAL_IP}'
+        res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode, res.stdout.decode('utf-8', errors='ignore'), res.stderr.decode('utf-8', errors='ignore')
 
 def get_tasks():
     cql = "SELECT JSON * FROM hydra.catalyst_tasks;"
@@ -125,8 +131,10 @@ def cmd_list(args):
 def cmd_status(args):
     tasks = get_tasks()
     task = None
+    target_id = args.task_id.strip().lower()
     for t in tasks:
-        if t.get("task_id") == args.task_id:
+        tid = str(t.get("task_id", "")).lower()
+        if tid == target_id or tid.startswith(target_id):
             task = t
             break
             

@@ -147,10 +147,10 @@ defmodule SpectrumPhxWeb.Storage.SnapshotsLive do
                   <span :if={snap.has_children?} class="badge badge-sm badge-info gap-1">
                     <.icon name="hero-lock-closed" class="size-3" /> a vdisk was derived from it
                   </span>
-                  <span :if={!snap.has_children? and snap.origin == :policy} class="opacity-70">
+                  <span :if={!snap.has_children? and snap.origin in [:policy, :domain]} class="opacity-70">
                     pruned by retention once past keep
                   </span>
-                  <span :if={!snap.has_children? and snap.origin != :policy} class="opacity-70">
+                  <span :if={!snap.has_children? and snap.origin not in [:policy, :domain]} class="opacity-70">
                     never pruned automatically
                   </span>
                 </td>
@@ -201,11 +201,15 @@ defmodule SpectrumPhxWeb.Storage.SnapshotsLive do
   end
 
   defp origin_class(:policy), do: "badge-success"
+  defp origin_class(:domain), do: "badge-primary"
+  defp origin_class(:template), do: "badge-info"
   defp origin_class(:manual), do: "badge-ghost"
   defp origin_class(:pre_rollback), do: "badge-warning"
   defp origin_class(:unindexed), do: "badge-outline"
 
   defp origin_label(:policy), do: "policy"
+  defp origin_label(:domain), do: "protection domain"
+  defp origin_label(:template), do: "template"
   defp origin_label(:manual), do: "an operator"
   defp origin_label(:pre_rollback), do: "before a rollback"
   defp origin_label(:unindexed), do: "unindexed"

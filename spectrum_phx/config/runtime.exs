@@ -137,7 +137,14 @@ if config_env() == :prod do
 
   config :spectrum_phx, SpectrumPhxWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
-    http: [ip: bind_ip, port: port],
+    http: [
+      ip: bind_ip,
+      port: port,
+      websocket_options: [
+        max_frame_size: 16_000_000,
+        max_fragmented_message_size: 16_000_000
+      ]
+    ],
     check_origin: check_origin,
     secret_key_base: secret_key_base
 

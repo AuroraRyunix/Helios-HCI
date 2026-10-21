@@ -145,7 +145,7 @@ class TheReadPathNeverWaitsOnHydra(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.vdisk = read(VDISK_RS)
-        cls.read_fn = rust_fn(cls.vdisk, "read")
+        cls.read_fn = rust_fn(cls.vdisk, "read") + rust_fn(cls.vdisk, "execute")
 
     def test_a_read_records_the_extent_group_it_served_from(self):
         self.assertIn("record_read", self.read_fn)
@@ -446,20 +446,24 @@ class TheExtentIdMapIsStagedSoTheMarkPhaseComesFirst(unittest.TestCase):
         self.assertIn("an_extent_that_cannot_be_followed_aborts_rather_than_being_skipped", source)
         self.assertIn("a_failed_extent_map_scan_never_yields_a_partial_answer", source)
 
-    def test_nothing_writes_an_extent_id(self):
-        """The writer is what stays off. Every statement that writes the block map, or the
-        extent map, lives in meta.rs/vdisk.rs/control.rs, so none of them may name either."""
-        for path in (META_RS, VDISK_RS, CONTROL_RS, PURAH_RS, self.EXTENT_MAP_RS,
-                     self.RESOLVE_RS):
-            source = read(path)
-            self.assertNotRegex(source, r"INSERT INTO hydra\.dfs_extent_id_map",
-                                "%s writes the extent map" % os.path.basename(path))
-            self.assertNotRegex(source, r"UPDATE hydra\.dfs_extent_id_map",
-                                "%s writes the extent map" % os.path.basename(path))
+    def test_stage_three_writes_extent_id_with_safety_ordering(self):
+        """Stage 3: writing extent IDs with data-before-metadata ordering.
+        Drain commit writes extent rows first, then block-map rows, and nulls
+        extent_id on repoint. derive_child copies extent_id, and Purah reclaims orphans."""
         batches = rust_fn(read(META_RS), "block_map_batches")
-        self.assertNotIn("extent_id", batches,
-                         "the drain's block-map writer names the column; that is stage 3, "
-                         "and it breaks every node that has not applied 0021")
+        self.assertIn("extent_id", batches, "drain repoint must null extent_id on two-level writes")
+        self.assertIn("null", batches)
+        meta = read(META_RS)
+        self.assertIn("INSERT INTO hydra.dfs_extent_id_map", meta)
+        self.assertIn("block_map_extent_batches", meta)
+        vdisk = rust_fn(read(VDISK_RS), "run")
+        self.assertIn("extent_map_batches", vdisk)
+        self.assertIn("block_map_extent_batches", vdisk)
+        control = rust_fn(read(CONTROL_RS), "derive_child")
+        self.assertIn("extent_id", control)
+        self.assertIn("block_map_extent_batches", control)
+        reclaim = rust_fn(read(RECLAIM_RS), "sweep_orphaned_extents")
+        self.assertIn("DELETE FROM hydra.dfs_extent_id_map", reclaim)
 
     def test_a_vdisk_with_no_extent_rows_issues_exactly_the_statement_it_always_did(self):
         load = rust_fn(read(VDISK_RS), "load_map")

@@ -51,6 +51,43 @@ defmodule SpectrumPhxWeb.Vms.Components do
     """
   end
 
+  @doc "Shown when the VM is marked as a golden template."
+  attr :vm, Vm, required: true
+
+  def template_badge(assigns) do
+    ~H"""
+    <span
+      :if={Vm.template?(@vm)}
+      class="inline-flex items-center gap-1 rounded-full bg-indigo-500/10 px-2.5 py-0.5 text-xs font-medium text-indigo-500 ring-1 ring-inset ring-indigo-500/30"
+      title="Golden VM Template: deploy linked clones from it rather than powering it on"
+    >
+      <.icon name="hero-square-2-stack-micro" class="size-3" /> Template
+    </span>
+    """
+  end
+
+  @doc "Badges for UEFI Secure Boot and vTPM 2.0 when enabled."
+  attr :vm, Vm, required: true
+
+  def security_badges(assigns) do
+    ~H"""
+    <span
+      :if={@vm.secure_boot}
+      class="inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-500 ring-1 ring-inset ring-emerald-500/30"
+      title="UEFI Secure Boot (OVMF secboot + SMM)"
+    >
+      <.icon name="hero-shield-check-micro" class="size-3" /> Secure Boot
+    </span>
+    <span
+      :if={@vm.vtpm_enabled}
+      class="inline-flex items-center gap-1 rounded-full bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-500 ring-1 ring-inset ring-cyan-500/30"
+      title="vTPM 2.0 (swtpm CRB)"
+    >
+      <.icon name="hero-key-micro" class="size-3" /> vTPM 2.0
+    </span>
+    """
+  end
+
   @doc "Where the VM is placed, resolved to a hostname when the IP is a known node."
   attr :vm, Vm, required: true
 
@@ -93,6 +130,9 @@ defmodule SpectrumPhxWeb.Vms.Components do
       "Another host already owns this VM. Its placement changed while you were looking at it; " <>
         "starting it here would put two hypervisors on the same disk."
 
+  def error_message(:is_template),
+    do: "That VM is marked as a golden template and cannot be powered on directly. Deploy a VM from it or unmark it as a template first."
+
   def error_message(:already_running), do: "That VM is already running."
 
   def error_message(:not_running), do: "That VM is not running."
@@ -109,6 +149,8 @@ defmodule SpectrumPhxWeb.Vms.Components do
   def error_message(errors) when is_list(errors) do
     Enum.map_join(errors, "; ", fn {field, message} -> "#{field} #{message}" end)
   end
+
+  def error_message(reason) when is_binary(reason), do: reason
 
   def error_message(reason), do: "The cluster database rejected the request: #{inspect(reason)}"
 end

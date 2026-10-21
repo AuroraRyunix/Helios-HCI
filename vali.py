@@ -7,6 +7,7 @@ import time
 import re
 import shlex
 import socket
+import subprocess
 import helios_zk
 import urllib.request
 import ssl
@@ -209,12 +210,11 @@ MIGRATION_COMMAND_TIMEOUT = 3600
 # still up, and the repair for one that died during the window), then everything it stopped.
 # Hylia was missing from the list that used to stand here, which only worked because maintenance
 # never stopped it.
-MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon")
+MAINTENANCE_EXIT_START_UNITS = ("zookeeper", "hydra-db", "daruk", "sidon", "hylia")
 LEAVABLE_HOST_STATES = ("IN_MAINTENANCE", "SERVICE_MAINTENANCE", "ENTERING_MAINTENANCE", "RECOVERING")
 MAINTENANCE_STOP_UNITS = (
     "spectrum", "spectrum-phx", "slate", "agahnim", "catalyst", "vali", "bifrost", "dagur",
-    "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa", "hylia",
-    "sidon", "daruk", "hydra-db",
+    "mimir", "rauru", "logos", "mipha", "gatoway", "urbosa", "kass",
 )
 MAINTENANCE_EXIT_START_UNITS = MAINTENANCE_EXIT_START_UNITS + tuple(
     u for u in MAINTENANCE_STOP_UNITS if u not in MAINTENANCE_EXIT_START_UNITS
@@ -242,7 +242,14 @@ def domain_vdisk_ids(vm_name, disks_list):
     """
     module = sidon_module()
     if disks_list and disks_list != "NONE":
-        return [module.vdisk_id_for(vm_name, i) for i, _ in enumerate(disks_list.split(","))]
+        ids = []
+        for i, entry in enumerate(disks_list.split(",")):
+            parts = entry.split(":")
+            if len(parts) > 3 and parts[3]:
+                ids.append(parts[3])
+            else:
+                ids.append(module.vdisk_id_for(vm_name, i))
+        return ids
     if disks_list == "NONE":
         return []
     return [module.vdisk_id_for(vm_name, 0)]
@@ -975,7 +982,7 @@ def run_drs_loop(aggressive=False):
         underloaded_ip = min(load_metrics, key=load_metrics.get)
         
         # 5. Get running VMs on overloaded host
-        cql_vms = "SELECT JSON name, host_ip, memory, state FROM hydra.vms;"
+        cql_vms = "SELECT JSON name, host_ip, memory, state, affinity_group, anti_affinity_group, pinned_hosts FROM hydra.vms;"
         rc_v, stdout_v, _ = run_cql_query(cql_vms)
         vms = []
         if rc_v == 0:
@@ -1001,6 +1008,16 @@ def run_drs_loop(aggressive=False):
 
             if vm_name in recent and now - recent[vm_name] < DRS_VM_COOLDOWN_SECONDS:
                 continue
+
+            allowed_tgt, _, _ = check_vm_host_affinity(vm, underloaded_ip, all_vms=vms)
+            if not allowed_tgt:
+                continue
+            _, src_bonus, _ = check_vm_host_affinity(vm, overloaded_ip, all_vms=vms)
+            if src_bonus > 0:
+                # Keep co-located affinity-group VMs together unless migrating to a host that also has peers
+                _, tgt_bonus, _ = check_vm_host_affinity(vm, underloaded_ip, all_vms=vms)
+                if tgt_bonus < src_bonus:
+                    continue
 
             # Predict standard deviation post-migration
             # source host loses memory, target host gains memory
@@ -1216,7 +1233,7 @@ def hotplug_headroom_enabled():
     return False
 
 
-def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc", hotplug_max_vcpus=None, hotplug_max_memory=None):
+def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="", host_ip="127.0.0.1", network_id=None, cpu_model=None, audio_enabled=False, graphics="vnc", hotplug_max_vcpus=None, hotplug_max_memory=None, cpu_shares=None, cpu_limit=None, cpu_reservation=None, mem_reservation=None, mem_limit=None, pci_devices=None, usb_devices=None, vtpm=False, secure_boot=False, cloud_init_iso=None):
     primary_container = get_default_container()
     if disks_list and disks_list != "NONE":
         first_entry = disks_list.split(",")[0]
@@ -1244,9 +1261,15 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
 
     if firmware == "uefi":
         nvram_path = f"/var/lib/hci/aether/nvram/{name}_vars.fd"
+        if secure_boot:
+            loader_xml = "<loader readonly='yes' secure='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd</loader>"
+            nvram_tpl = "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd"
+        else:
+            loader_xml = "<loader readonly='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.fd</loader>"
+            nvram_tpl = "/usr/share/edk2/ovmf/OVMF_VARS.fd"
         os_boot_xml = f"""<type arch='x86_64' machine='q35'>hvm</type>
-    <loader readonly='yes' type='pflash'>/usr/share/edk2/ovmf/OVMF_CODE.fd</loader>
-    <nvram template='/usr/share/edk2/ovmf/OVMF_VARS.fd'>{nvram_path}</nvram>
+    {loader_xml}
+    <nvram template='{nvram_tpl}'>{nvram_path}</nvram>
     {boot_devices}
     <bootmenu enable='yes' timeout='3000'/>"""
     else:
@@ -1299,26 +1322,28 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     if disks_list and disks_list != "NONE":
         for idx, entry in enumerate(disks_list.split(",")):
             parts = entry.split(":")
-            bus = parts[2] if len(parts) > 2 else "virtio"
-            d_path = sidon_module().nbd_socket(sidon_module().vdisk_id_for(name, idx))
-            disk_paths_with_bus.append((d_path, bus))
+            bus = parts[2] if len(parts) > 2 and parts[2] else "virtio"
+            vdisk_id = parts[3] if len(parts) > 3 and parts[3] else sidon_module().vdisk_id_for(name, idx)
+            dev_letter = parts[4] if len(parts) > 4 and parts[4] else letters[idx % 26]
+            d_path = sidon_module().nbd_socket(vdisk_id)
+            disk_paths_with_bus.append((d_path, bus, vdisk_id, dev_letter))
     elif disks_list == "NONE":
         disk_paths_with_bus = []
     else:
+        vdisk_id = sidon_module().vdisk_id_for(name, 0)
         disk_paths_with_bus = [
-            (sidon_module().nbd_socket(sidon_module().vdisk_id_for(name, 0)), "virtio")]
+            (sidon_module().nbd_socket(vdisk_id), "virtio", vdisk_id, "a")]
 
     sidon = sidon_module() if using_sidon() else None
 
-    for idx, (d_path, bus) in enumerate(disk_paths_with_bus):
+    for idx, (d_path, bus, vdisk_id, dev_letter) in enumerate(disk_paths_with_bus):
         dev_prefix = "vd" if bus == "virtio" else "sd"
-        dev_letter = letters[idx % 26]
         if sidon is not None:
             # A network disk on a unix socket. qemu talks NBD to the local Sidon and never
             # opens a block device, so there is no /dev node to promote, demote or leak --
             # which is also why the start path attaches instead of running drbdadm.
             disk_devices_xml += sidon.disk_xml(
-                sidon.vdisk_id_for(name, idx), dev_letter, vcpu,
+                vdisk_id, dev_letter, vcpu,
                 boot_order=orders["disk"].get(idx))
             continue
         if bus == "virtio":
@@ -1344,6 +1369,17 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
                     sidon_module().image_vdisk_id(spec.strip()), sata_letter,
                     boot_order=orders["cdrom"].get(cd_index))
                 cd_index += 1
+
+    if cloud_init_iso:
+        ci_idx = len([s for s in (iso or "").split(",") if s.strip()]) if iso else 0
+        ci_letter = letters[ci_idx % 26]
+        disk_devices_xml += f"""
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{cloud_init_iso}'/>
+      <target dev='sd{ci_letter}' bus='sata'/>
+      <readonly/>
+    </disk>"""
 
     global KVM_CACHE, VMWARE_CACHE
     has_kvm = False
@@ -1390,22 +1426,26 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
     vcpu_element = (f"<vcpu placement='static' current='{vcpu}'>{max_vcpus}</vcpu>"
                     if max_vcpus != int(vcpu) else f"<vcpu placement='static'>{vcpu}</vcpu>")
     
+    numa_xml = f"""    <numa>
+      <cell id='0' cpus='0-{max_vcpus - 1}' memory='{memory}' unit='MiB'/>
+    </numa>\n""" if hotplug_max_memory and int(hotplug_max_memory) > int(memory) else ""
+
     actual_cpu = cpu_model if cpu_model else ("host-model" if is_vmware else "host-passthrough")
     
     if actual_cpu == "host-passthrough" and is_vmware:
         cpu_xml = f"""<cpu mode='host-passthrough'>
     <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
     <feature policy='disable' name='vmx'/>
-  </cpu>"""
+{numa_xml}  </cpu>"""
     elif actual_cpu in ["host-model", "host-passthrough"]:
         cpu_xml = f"""<cpu mode='{actual_cpu}'>
     <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
-  </cpu>"""
+{numa_xml}  </cpu>"""
     else:
         cpu_xml = f"""<cpu mode='custom' match='exact'>
     <model>{actual_cpu}</model>
     <topology sockets='1' dies='1' cores='{max_vcpus}' threads='1'/>
-  </cpu>"""
+{numa_xml}  </cpu>"""
 
     if is_vmware:
         features_xml = """<features>
@@ -1470,13 +1510,15 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         network_ids = ["7a68e0d6-11f8-4e89-9430-b3b44b8bc438"]
 
     for idx, net_entry in enumerate(network_ids):
-        import hashlib
-        h = hashlib.md5(f"{name}_nic_{idx}".encode()).hexdigest()
-        mac_addr = f"52:54:00:{h[0:2]}:{h[2:4]}:{h[4:6]}"
-        
         parts = net_entry.split(":")
         net_id = parts[0]
-        nic_model = parts[1] if len(parts) > 1 else "virtio"
+        nic_model = parts[1] if len(parts) > 1 and parts[1] else "virtio"
+        if len(parts) > 2 and parts[2]:
+            mac_addr = parts[2]
+        else:
+            import hashlib
+            h = hashlib.md5(f"{name}_nic_{idx}".encode()).hexdigest()
+            mac_addr = f"52:54:00:{h[0:2]}:{h[2:4]}:{h[4:6]}"
         
         nic_boot = sidon_module().boot_element(orders["nic"].get(idx))
 
@@ -1535,14 +1577,71 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
         )
     else:
         sound_xml = ""
+
+    pci_xml = ""
+    if pci_devices:
+        for bdf in [b.strip() for b in str(pci_devices).split(",") if b.strip()]:
+            m = re.match(r"\A(?:([0-9a-fA-F]{4}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])\Z", bdf)
+            if m:
+                dom = (m.group(1) or "0000").lower()
+                bus = m.group(2).lower()
+                slot = m.group(3).lower()
+                func = m.group(4).lower()
+                pci_xml += (
+                    f"    <hostdev mode='subsystem' type='pci' managed='yes'>\n"
+                    f"      <source>\n"
+                    f"        <address domain='0x{dom}' bus='0x{bus}' slot='0x{slot}' function='0x{func}'/>\n"
+                    f"      </source>\n"
+                    f"    </hostdev>\n"
+                )
+
+    usb_xml = ""
+    if usb_devices:
+        for usb_id in [u.strip() for u in str(usb_devices).split(",") if u.strip()]:
+            m = re.match(r"\A([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\Z", usb_id)
+            if m:
+                vendor = m.group(1).lower()
+                product = m.group(2).lower()
+                usb_xml += (
+                    f"    <hostdev mode='subsystem' type='usb' managed='yes'>\n"
+                    f"      <source>\n"
+                    f"        <vendor id='0x{vendor}'/>\n"
+                    f"        <product id='0x{product}'/>\n"
+                    f"      </source>\n"
+                    f"    </hostdev>\n"
+                )
+
+    if vtpm:
+        tpm_xml = (
+            "    <tpm model='tpm-crb'>\n"
+            "      <backend type='emulator' version='2.0'/>\n"
+            "    </tpm>\n"
+        )
+    else:
+        tpm_xml = ""
+
+    cputune_parts = []
+    if cpu_shares is not None:
+        cputune_parts.append(f"    <shares>{cpu_shares}</shares>")
+    if cpu_limit is not None and int(cpu_limit) > 0:
+        cputune_parts.append(f"    <period>100000</period>\n    <quota>{int(cpu_limit) * 1000}</quota>")
+    cputune_xml = ("  <cputune>\n" + "\n".join(cputune_parts) + "\n  </cputune>\n") if cputune_parts else ""
+
+    memtune_parts = []
+    if mem_limit is not None and int(mem_limit) > 0:
+        memtune_parts.append(f"    <hard_limit unit='MiB'>{mem_limit}</hard_limit>")
+    if mem_reservation is not None and int(mem_reservation) > 0:
+        memtune_parts.append(f"    <min_guarantee unit='MiB'>{mem_reservation}</min_guarantee>")
+    memtune_xml = ("  <memtune>\n" + "\n".join(memtune_parts) + "\n  </memtune>\n") if memtune_parts else ""
+
     max_mem_xml = f"<maxMemory slots='16' unit='MiB'>{hotplug_max_memory}</maxMemory>\n  " if hotplug_max_memory and int(hotplug_max_memory) > int(memory) else ""
     vm_xml = f"""<domain type='{domain_type}'>
   <name>{name}</name>
   {uuid_xml}
   {max_mem_xml}<memory unit='MiB'>{memory}</memory>
   <currentMemory unit='MiB'>{memory}</currentMemory>
-  {vcpu_element}
-  <iothreads>1</iothreads>
+{memtune_xml}  {vcpu_element}
+{cputune_xml}  <iothreads>1</iothreads>
   <os>
     {os_boot_xml}
   </os>
@@ -1552,6 +1651,12 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
   <devices>
     {disk_devices_xml}
     <input type='tablet' bus='usb'/>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
     {interfaces_xml}
     {graphics_xml}
     <controller type='virtio-serial' index='0'/>
@@ -1560,7 +1665,7 @@ def generate_vm_xml(name, memory, vcpu, firmware, disks_list, iso, boot_device="
       <address type='virtio-serial' controller='0' bus='0' port='1'/>
     </channel>
     {video_xml}
-{sound_xml}  </devices>
+{sound_xml}{pci_xml}{usb_xml}{tpm_xml}  </devices>
   <seclabel type='none'/>
 </domain>
 """
@@ -1612,7 +1717,195 @@ def host_ineligible_reason(ip, node_rows=None):
     return None
 
 
-def select_best_start_host(memory_needed):
+def get_memory_overcommit_policy():
+    """Returns 'strict' or 'overcommit' (default) from hydra.cluster_settings."""
+    try:
+        rc, out, _ = run_cql_query("SELECT value FROM hydra.cluster_settings WHERE key = 'memory_overcommit_policy';")
+        if rc == 0 and out:
+            for line in out.splitlines():
+                line = line.strip()
+                if line and not line.startswith("(") and not line.startswith("-") and line != "value":
+                    return line.lower()
+    except Exception:
+        pass
+    return "overcommit"
+
+
+def build_cidata_iso_bytes(vm_name, userdata, network_config=""):
+    """Build a minimal ISO9660 + Rock Ridge ('cidata') seed image in memory for Cloud-Init NoCloud."""
+    import struct
+    SECTOR = 2048
+
+    def both16(v):
+        return struct.pack("<H", v) + struct.pack(">H", v)
+
+    def both32(v):
+        return struct.pack("<I", v) + struct.pack(">I", v)
+
+    raw_ud = (userdata or "").strip()
+    if raw_ud and not raw_ud.startswith("#cloud-config") and not raw_ud.startswith("#!"):
+        raw_ud = "#cloud-config\n" + raw_ud
+    if raw_ud and not raw_ud.endswith("\n"):
+        raw_ud += "\n"
+
+    meta_bytes = f"instance-id: {vm_name}\nlocal-hostname: {vm_name}\n".encode("utf-8")
+    user_bytes = raw_ud.encode("utf-8")
+    files = [
+        ("METADATA.;1", "meta-data", meta_bytes),
+        ("USERDATA.;1", "user-data", user_bytes),
+    ]
+    if network_config and str(network_config).strip():
+        net_str = str(network_config).strip() + "\n"
+        files.append(("NETCFG.;1", "network-config", net_str.encode("utf-8")))
+
+    # Sectors 0..15: system area, 16: PVD, 17: Terminator, 18: L-Path, 19: M-Path, 20: Root Dir
+    next_lba = 21
+    file_entries = []
+    file_sectors = bytearray()
+    for iso_name, posix_name, data in files:
+        lba = next_lba
+        n_sec = max(1, (len(data) + SECTOR - 1) // SECTOR)
+        next_lba += n_sec
+        file_entries.append((iso_name, posix_name, lba, len(data)))
+        padded = data + b"\x00" * (n_sec * SECTOR - len(data))
+        file_sectors.extend(padded)
+
+    total_sectors = next_lba
+    date7 = bytes([126, 1, 1, 0, 0, 0, 0])  # 2026-01-01 00:00:00 UTC
+
+    def make_dir_record(file_id_bytes, lba, length, flags, su_bytes=b""):
+        fid_len = len(file_id_bytes)
+        pad = b"\x00" if (fid_len % 2 == 0) else b""
+        rec_len = 33 + fid_len + len(pad) + len(su_bytes)
+        if rec_len % 2 == 1:
+            su_bytes = su_bytes + b"\x00"
+            rec_len += 1
+        return (
+            bytes([rec_len, 0])
+            + both32(lba)
+            + both32(length)
+            + date7
+            + bytes([flags, 0, 0])
+            + both16(1)
+            + bytes([fid_len])
+            + file_id_bytes
+            + pad
+            + su_bytes
+        )
+
+    # Rock Ridge SP + ER on "." record so Linux isofs enables Rock Ridge lowercase names
+    rr_sp = b"SP\x07\x01\xbe\xef\x00"
+    rr_er = b"ER\x12\x01\x0a\x00\x00\x01RRIP_1991A"
+    dot_rec = make_dir_record(b"\x00", 20, SECTOR, 0x02, rr_sp + rr_er)
+    dotdot_rec = make_dir_record(b"\x01", 20, SECTOR, 0x02)
+
+    root_dir = bytearray(dot_rec + dotdot_rec)
+    for iso_name, posix_name, lba, size in file_entries:
+        p_bytes = posix_name.encode("ascii")
+        rr_nm = b"NM" + bytes([5 + len(p_bytes), 1, 0]) + p_bytes
+        root_dir.extend(make_dir_record(iso_name.encode("ascii"), lba, size, 0x00, rr_nm))
+    root_dir.extend(b"\x00" * (SECTOR - len(root_dir)))
+
+    # Root directory record for PVD (34 bytes, no Rock Ridge SU)
+    pvd_root_rec = make_dir_record(b"\x00", 20, SECTOR, 0x02)
+
+    pvd = bytearray(SECTOR)
+    pvd[0:7] = b"\x01CD001\x01"
+    pvd[8:40] = b"LINUX".ljust(32, b" ")
+    pvd[40:72] = b"cidata".ljust(32, b" ")
+    pvd[80:88] = both32(total_sectors)
+    pvd[120:124] = both16(1)
+    pvd[124:128] = both16(1)
+    pvd[128:132] = both16(SECTOR)
+    pvd[132:140] = both32(10)
+    pvd[140:144] = struct.pack("<I", 18)
+    pvd[148:152] = struct.pack(">I", 19)
+    pvd[156:190] = pvd_root_rec
+    pvd[813:830] = b"2026010100000000\x00"
+    pvd[830:847] = b"2026010100000000\x00"
+    pvd[847:864] = b"0000000000000000\x00"
+    pvd[864:881] = b"2026010100000000\x00"
+    pvd[881] = 1
+
+    term = bytearray(SECTOR)
+    term[0:7] = b"\xffCD001\x01"
+
+    lpath = bytearray(SECTOR)
+    lpath[0:10] = b"\x01\x00" + struct.pack("<I", 20) + struct.pack("<H", 1) + b"\x00\x00"
+    mpath = bytearray(SECTOR)
+    mpath[0:10] = b"\x01\x00" + struct.pack(">I", 20) + struct.pack(">H", 1) + b"\x00\x00"
+
+    iso_image = bytearray(16 * SECTOR)
+    iso_image.extend(pvd)
+    iso_image.extend(term)
+    iso_image.extend(lpath)
+    iso_image.extend(mpath)
+    iso_image.extend(root_dir)
+    iso_image.extend(file_sectors)
+    return bytes(iso_image)
+
+
+def check_vm_host_affinity(vm_data, candidate_ip, all_vms=None):
+    """Evaluate VM-Host pinning, VM-VM anti-affinity, and VM-VM affinity for `candidate_ip`.
+
+    Returns (allowed: bool, bonus_mb: float, reason: str).
+    """
+    if not vm_data or not candidate_ip:
+        return True, 0.0, ""
+    vm_name = vm_data.get("name", "")
+    pinned_raw = str(vm_data.get("pinned_hosts") or "").strip()
+    if pinned_raw:
+        allowed_ips = set()
+        for entry in [x.strip() for x in pinned_raw.split(",") if x.strip()]:
+            resolved = get_node_ip(entry)
+            if resolved:
+                allowed_ips.add(resolved)
+            allowed_ips.add(entry)
+        if candidate_ip not in allowed_ips:
+            return False, 0.0, f"VM '{vm_name}' is pinned to host(s) [{pinned_raw}], which excludes {candidate_ip}"
+
+    aff_group = str(vm_data.get("affinity_group") or "").strip()
+    anti_group = str(vm_data.get("anti_affinity_group") or "").strip()
+    if not aff_group and not anti_group:
+        return True, 0.0, ""
+
+    if all_vms is None:
+        all_vms = []
+        rc_v, stdout_v, _ = run_cql_query(
+            "SELECT JSON name, host_ip, state, affinity_group, anti_affinity_group FROM hydra.vms;")
+        if rc_v == 0 and stdout_v:
+            for line in stdout_v.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        all_vms.append(json.loads(line))
+                    except Exception:
+                        pass
+
+    if anti_group:
+        for other in all_vms:
+            if other.get("name") == vm_name or other.get("state") != "Running":
+                continue
+            if str(other.get("anti_affinity_group") or "").strip() == anti_group and other.get("host_ip") == candidate_ip:
+                return (
+                    False,
+                    0.0,
+                    f"anti-affinity group '{anti_group}' conflict: VM '{other.get('name')}' is already running on {candidate_ip}",
+                )
+
+    bonus = 0.0
+    if aff_group:
+        for other in all_vms:
+            if other.get("name") == vm_name or other.get("state") != "Running":
+                continue
+            if str(other.get("affinity_group") or "").strip() == aff_group and other.get("host_ip") == candidate_ip:
+                bonus = 102400.0
+                break
+
+    return True, bonus, ""
+
+
+def select_best_start_host(memory_needed, vm_data=None):
     # Query nodes in maintenance mode
     maintenance_ips = set()
     try:
@@ -1631,14 +1924,29 @@ def select_best_start_host(memory_needed):
         sys.stderr.write(f"Error querying node maintenance statuses: {e}\n")
 
     hosts = get_cluster_hosts()
-    
+    all_vms = None
+    if vm_data and (vm_data.get("affinity_group") or vm_data.get("anti_affinity_group")):
+        all_vms = []
+        rc_v, stdout_v, _ = run_cql_query(
+            "SELECT JSON name, host_ip, state, affinity_group, anti_affinity_group FROM hydra.vms;")
+        if rc_v == 0 and stdout_v:
+            for line in stdout_v.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        all_vms.append(json.loads(line))
+                    except Exception:
+                        pass
 
     best_host = None
-    min_used_mem = float('inf')
+    min_score = float('inf')
     
     for h in hosts:
         ip = h["ip"]
         if ip in maintenance_ips:
+            continue
+        allowed, bonus, _ = check_vm_host_affinity(vm_data, ip, all_vms=all_vms)
+        if not allowed:
             continue
         # Check status and verify all services are UP
         rc_st, status_data, _ = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
@@ -1660,15 +1968,24 @@ def select_best_start_host(memory_needed):
             _, _, total_mb, used_mb = get_node_utilization(ip, fetch_cpu=False)
             avail_mb = total_mb - used_mb
             if avail_mb >= memory_needed:
-                if used_mb < min_used_mem:
-                    min_used_mem = used_mb
+                score = used_mb - bonus
+                if score < min_score:
+                    min_score = score
                     best_host = ip
                     
     # Fallback to any online host if memory checks are tight
     if not best_host:
+        policy = get_memory_overcommit_policy()
+        if policy == "strict":
+            sys.stderr.write(f"[Placement] Strict memory overcommit policy: no host has {memory_needed} MB available; refusing overcommit placement.\n")
+            return None
+
         for h in hosts:
             ip = h["ip"]
             if ip in maintenance_ips:
+                continue
+            allowed, _, _ = check_vm_host_affinity(vm_data, ip, all_vms=all_vms)
+            if not allowed:
                 continue
             rc_st, status_data, _ = run_mtls_spark_api(ip, "/api/v1/node/status", None, method="GET")
             if rc_st == 0:
@@ -1752,6 +2069,9 @@ def process_queue_task(task):
             
     try:
         if action == "start":
+            if bool(vm_data.get("is_template", False)):
+                return False, f"Refusing to start {vm_name}: it is marked as a VM template. Deploy a clone from it using 'valcli vm.template {vm_name} deploy <new_vm>'."
+
             # 1. Choose host if target not specified
             memory = int(vm_data.get("memory", 1024))
             vcpu = int(vm_data.get("vcpu", 1))
@@ -1760,8 +2080,16 @@ def process_queue_task(task):
             iso = vm_data.get("iso", "")
             boot_device = vm_data.get("boot_device", "")
             
-            selected_host = target_host if target_host else select_best_start_host(memory)
+            if target_host:
+                selected_host = get_node_ip(target_host) or target_host
+                allowed_aff, _, reason_aff = check_vm_host_affinity(vm_data, selected_host)
+                if not allowed_aff:
+                    return False, f"Refusing to start {vm_name} on {selected_host}: {reason_aff}."
+            else:
+                selected_host = select_best_start_host(memory, vm_data=vm_data)
             if not selected_host:
+                if vm_data.get("pinned_hosts") or vm_data.get("anti_affinity_group"):
+                    return False, f"No active hypervisor host satisfies memory and placement/affinity rules for {vm_name} (pinned_hosts={vm_data.get('pinned_hosts')!r}, anti_affinity_group={vm_data.get('anti_affinity_group')!r})."
                 return False, "No active hypervisor host has sufficient memory."
 
             # 2. Claim the VM for that host before anything touches its disks.
@@ -1790,13 +2118,33 @@ def process_queue_task(task):
                     return False, f"Refusing to start {vm_name}: another host already owns it ({owner}). Stop it there first, or start it on {owner}."
                 return False, f"Refusing to start {vm_name}: its placement changed while this start was being prepared (host_ip is now {owner!r}, this start expected {claimed_from!r})."
 
-            # 3. Compile XML
+            # 3. Compile XML (including optional Cloud-Init NoCloud seed ISO, vTPM 2.0, and Secure Boot)
+            import base64
+            cloud_init_iso_path = None
+            ci_userdata = vm_data.get("cloud_init_userdata")
+            ci_network = vm_data.get("cloud_init_network") or ""
+            ci_prep_cmd = ""
+            if ci_userdata and str(ci_userdata).strip():
+                cloud_init_iso_path = f"/var/lib/hci/aether/nvram/{vm_name}_cidata.iso"
+                ci_bytes = build_cidata_iso_bytes(vm_name, str(ci_userdata), str(ci_network))
+                ci_b64 = base64.b64encode(ci_bytes).decode("utf-8")
+                ci_prep_cmd = f"mkdir -p /var/lib/hci/aether/nvram && echo {ci_b64} | base64 -d > {shlex.quote(cloud_init_iso_path)} && "
+
             audio_enabled = bool(vm_data.get("audio_enabled", False))
             vm_xml = generate_vm_xml(vm_name, memory, vcpu, firmware, disks_list, iso, boot_device, host_ip=selected_host, network_id=vm_data.get("network_id"), cpu_model=vm_data.get("cpu_model"), audio_enabled=audio_enabled,
                                      graphics=vm_data.get("graphics"),
                                      hotplug_max_vcpus=hotplug_vcpu_limit(vcpu) if hotplug_headroom_enabled() else None,
-                                     hotplug_max_memory=hotplug_memory_limit(memory) if hotplug_headroom_enabled() else None)
-            import base64
+                                     hotplug_max_memory=hotplug_memory_limit(memory) if hotplug_headroom_enabled() else None,
+                                     cpu_shares=vm_data.get("cpu_shares"),
+                                     cpu_limit=vm_data.get("cpu_limit"),
+                                     cpu_reservation=vm_data.get("cpu_reservation"),
+                                     mem_reservation=vm_data.get("mem_reservation"),
+                                     mem_limit=vm_data.get("mem_limit"),
+                                     pci_devices=vm_data.get("pci_devices"),
+                                     usb_devices=vm_data.get("usb_devices"),
+                                     vtpm=bool(vm_data.get("vtpm", False) or vm_data.get("vtpm_enabled", False)),
+                                     secure_boot=bool(vm_data.get("secure_boot", False)),
+                                     cloud_init_iso=cloud_init_iso_path)
             b64_xml = base64.b64encode(vm_xml.encode("utf-8")).decode("utf-8")
             
             # 4. Define and start VM via host spark-daemon
@@ -1869,6 +2217,7 @@ def process_queue_task(task):
                             f"Refusing to start {vm_name}: its image {spec} could not be "
                             f"attached on {selected_host} ({detail or err_i}). The guest "
                             f"would boot with no install medium.")
+            restore_cmd = f"{ci_prep_cmd}{restore_cmd}"
             cmd = f"{restore_cmd} && virsh -c qemu:///system undefine {q_vm} --keep-nvram || true; echo {b64_xml} | base64 -d > /tmp/{q_vm}.xml && virsh -c qemu:///system define /tmp/{q_vm}.xml && rm /tmp/{q_vm}.xml && virsh -c qemu:///system start {q_vm}"
             rc, stdout, stderr = run_remote_spark(selected_host, cmd)
             if rc != 0:
@@ -1961,6 +2310,15 @@ def process_queue_task(task):
             if not src_host or power_state.lower() != "running":
                 return False, f"VM must be running to migrate (current state: {power_state or 'unknown'}, host: {src_host or 'unplaced'})."
 
+            if vm_data.get("pci_devices") and str(vm_data.get("pci_devices")).strip():
+                return False, f"Refusing to migrate {vm_name}: physical PCI passthrough devices ({vm_data.get('pci_devices')}) are attached. Detach PCI devices before live migration."
+            if vm_data.get("usb_devices") and str(vm_data.get("usb_devices")).strip():
+                return False, f"Refusing to migrate {vm_name}: physical USB passthrough devices ({vm_data.get('usb_devices')}) are attached. Detach USB devices before live migration."
+
+            allowed_aff, _, reason_aff = check_vm_host_affinity(vm_data, target_ip)
+            if not allowed_aff:
+                return False, f"Refusing to migrate {vm_name} to {target_host}: {reason_aff}."
+
             # There is no read of `status` here on purpose: whether the VM is already
             # migrating is decided by the lock below, in the same operation that takes it.
 
@@ -2000,6 +2358,16 @@ def process_queue_task(task):
                                f"cannot be made.")
             if target_free < disk_size:
                 return False, f"Target host {target_host} has insufficient free extent-store space ({target_free} MiB available, needs {disk_size} MiB)."
+
+            # CPU / accelerator compatibility check
+            try:
+                rc_caps, caps_data, _ = run_mtls_spark_api(target_ip, "/api/v1/host/capabilities", None, method="GET")
+                rc_src_caps, src_caps_data, _ = run_mtls_spark_api(src_host, "/api/v1/host/capabilities", None, method="GET")
+                if rc_caps == 0 and isinstance(caps_data, dict) and rc_src_caps == 0 and isinstance(src_caps_data, dict):
+                    if src_caps_data.get("kvm", False) and not caps_data.get("kvm", False):
+                        return False, f"Target host {target_host} lacks KVM hardware acceleration (/dev/kvm), incompatible with source host {src_host}."
+            except Exception as e:
+                sys.stderr.write(f"[Migration] Capability pre-flight check error: {e}\n")
 
             # Take the migration lock. The condition and the write are one Paxos round, so
             # there is no window between them: previously the code read `status`,
@@ -2063,7 +2431,9 @@ def process_queue_task(task):
                         f"and no epoch moved.{note}")
 
                 # 5. Clean up local NVRAM file on source host after successful migration
-                run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{q_vm}_vars.fd")
+                rc_nv, _, _ = run_mtls_spark_api(src_host, f"/api/v1/vm/{urllib.parse.quote(vm_name)}/nvram", {"action": "clean"})
+                if rc_nv != 0:
+                    run_remote_spark(src_host, f"rm -f /var/lib/hci/aether/nvram/{q_vm}_vars.fd")
 
                 # Hand the placement over and drop the lock in one operation, conditional
                 # on both the source host and the lock still being ours. Two statements
@@ -2272,6 +2642,18 @@ def process_queue_task(task):
                         print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL. Its VMs have already been evacuated; DRS will rebalance them.")
                     return False, f"Refused to enter maintenance mode: {quorum_reason}"
 
+                zk_ok, zk_reason = check_zk_stop_preserves_quorum(target_ip)
+                if not zk_ok:
+                    cql = f"UPDATE hydra.nodes SET status = 'NORMAL', maintenance_mode = false WHERE hostname = '{hostname}';"
+                    run_cql_query(cql)
+                    release_maintenance_lock(lock_token)
+                    print(f"[Maintenance Catalyst Task] REFUSED to stop services on {hostname}: {zk_reason}")
+                    if preserve_vms:
+                        print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL.")
+                    else:
+                        print(f"[Maintenance Catalyst Task] Host {hostname} status reverted to NORMAL. Its VMs have already been evacuated; DRS will rebalance them.")
+                    return False, f"Refused to enter maintenance mode: {zk_reason}"
+
                 target_status = 'SERVICE_MAINTENANCE' if preserve_vms else 'IN_MAINTENANCE'
                 cql = f"UPDATE hydra.nodes SET status = '{target_status}', maintenance_mode = true WHERE hostname = '{hostname}';"
                 run_cql_query(cql)
@@ -2360,7 +2742,15 @@ def process_queue_task(task):
             if not ok:
                 print(f"[Maintenance Catalyst Task] Could not start services on "
                       f"{hostname}: {detail}")
-            
+
+            # Verify ZooKeeper has rejoined the ensemble circle
+            print(f"[Maintenance Catalyst Task] Verifying ZooKeeper on {hostname} ({target_ip}) rejoins ensemble...")
+            zk_rejoined, zk_detail = wait_zookeeper_rejoined(target_ip, timeout=30)
+            if zk_rejoined:
+                print(f"[Maintenance Catalyst Task] ZooKeeper on {hostname} successfully rejoined ensemble (mode: {zk_detail}).")
+            else:
+                print(f"[Maintenance Catalyst Task] Warning: {zk_detail}")
+
             # Update task progress
             call_catalyst_api("/api/v1/tasks/update", {
                 "task_id": task_id,
@@ -2388,34 +2778,12 @@ def process_queue_task(task):
             if not back:
                 return False, why
 
-            # Autopathing Reclaim: If any VMs are currently running on target_ip (e.g. from service maintenance),
-            # reclaim primary disk ownership locally now that Sidon is back up, restoring data locality.
-            try:
-                rc_vl, stdout_vl, _ = run_cql_query("SELECT JSON name, host_ip, state, disks_list FROM hydra.vms;")
-                if rc_vl == 0 and stdout_vl:
-                    local_vms = []
-                    for line in stdout_vl.splitlines():
-                        line = line.strip()
-                        if line.startswith("{") and line.endswith("}"):
-                            try:
-                                v_info = json.loads(line)
-                                if v_info.get("state") == "Running" and v_info.get("host_ip") == target_ip:
-                                    local_vms.append(v_info)
-                            except:
-                                pass
-                    if local_vms:
-                        print(f"[Maintenance Catalyst Task] Autopathing: reclaiming local storage ownership for {len(local_vms)} VMs on {hostname}...")
-                        for lv in local_vms:
-                            lv_name = lv.get("name")
-                            lv_disks = domain_vdisk_ids(lv_name, lv.get("disks_list", ""))
-                            # Re-attach locally and takeover ownership
-                            for lvd in lv_disks:
-                                run_mtls_spark_api(target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": lvd})
-                            reclaim_errs = hand_over_storage(target_ip, lv_disks)
-                            if reclaim_errs:
-                                print(f"[Maintenance Catalyst Task] Autopathing warning: could not reclaim storage for {lv_name}: {reclaim_errs}")
-            except Exception as reclaim_ex:
-                print(f"[Maintenance Catalyst Task] Autopathing storage reclaim error on {hostname}: {reclaim_ex}")
+            # Autopathing Reclaim: Spawn subtask to redirect storage traffic / reclaim local storage ownership
+            print(f"[Maintenance Catalyst Task] Spawning storage redirection subtask for host {hostname}...")
+            submit_and_wait_task("vali", "reclaim_storage", {
+                "hostname": hostname,
+                "target_ip": target_ip
+            }, timeout_polls=60, parent_task_id=task_id)
 
             # Spawn subtask to run Mimir Health Check
             print(f"[Maintenance Catalyst Task] Spawning Mimir health checks subtask for host {hostname}...")
@@ -2432,15 +2800,462 @@ def process_queue_task(task):
             
             return True, target_ip
 
+        elif action == "reclaim_storage":
+            hostname = payload.get("hostname")
+            target_ip = payload.get("target_ip")
+            if not target_ip and hostname:
+                target_ip = get_node_ip(hostname)
+
+            if not hostname or not target_ip:
+                return False, "Invalid payload parameters for reclaim_storage."
+
+            call_catalyst_api("/api/v1/tasks/update", {
+                "task_id": task_id,
+                "status": "processing",
+                "progress": 20
+            }, method="POST")
+
+            local_vms = []
+            try:
+                rc_vl, stdout_vl, _ = run_cql_query("SELECT JSON name, host_ip, state, disks_list FROM hydra.vms;")
+                if rc_vl == 0 and stdout_vl:
+                    for line in stdout_vl.splitlines():
+                        line = line.strip()
+                        if line.startswith("{") and line.endswith("}"):
+                            try:
+                                v_info = json.loads(line)
+                                if v_info.get("state") == "Running" and v_info.get("host_ip") == target_ip:
+                                    local_vms.append(v_info)
+                            except:
+                                pass
+            except Exception as ex:
+                print(f"[Reclaim Storage Task] Error querying VMs for {hostname}: {ex}")
+
+            if not local_vms:
+                call_catalyst_api("/api/v1/tasks/update", {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "progress": 100
+                }, method="POST")
+                return True, "No running VMs on host; storage redirection not needed."
+
+            print(f"[Reclaim Storage Task] Redirecting storage traffic locally for {len(local_vms)} VMs running on {hostname} ({target_ip})...")
+            all_reclaimed = True
+            reclaim_errors = []
+            for i, lv in enumerate(local_vms):
+                lv_name = lv.get("name")
+                lv_disks = domain_vdisk_ids(lv_name, lv.get("disks_list", ""))
+                for lvd in lv_disks:
+                    run_mtls_spark_api(target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": lvd})
+                reclaim_errs = hand_over_storage(target_ip, lv_disks)
+                if reclaim_errs:
+                    all_reclaimed = False
+                    reclaim_errors.append(f"{lv_name}: {reclaim_errs}")
+                    print(f"[Reclaim Storage Task] Autopathing warning: could not reclaim storage for {lv_name}: {reclaim_errs}")
+
+                prog = int(20 + ((i + 1) / len(local_vms)) * 75)
+                call_catalyst_api("/api/v1/tasks/update", {
+                    "task_id": task_id,
+                    "status": "processing",
+                    "progress": prog
+                }, method="POST")
+
+            call_catalyst_api("/api/v1/tasks/update", {
+                "task_id": task_id,
+                "status": "completed",
+                "progress": 100
+            }, method="POST")
+
+            if not all_reclaimed:
+                return False, f"Storage redirection partially failed: {'; '.join(reclaim_errors)}"
+            return True, f"Successfully redirected storage traffic for {len(local_vms)} VMs to {hostname}."
+
         elif action == "balance":
             aggressive = payload.get("aggressive", False)
             run_drs_loop(aggressive=aggressive)
             return True, ""
+
+        elif action == "download_image":
+            return download_image_from_url(task_id, payload)
             
     except Exception as e:
         return False, str(e)
         
     return False, "Unsupported action."
+
+
+def _derive_image_name_from_url(url):
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if parsed.query:
+            qs = urllib.parse.parse_qs(parsed.query)
+            for key in ("filename", "response-content-disposition", "content-disposition"):
+                vals = qs.get(key) or []
+                for val in vals:
+                    m = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';]+)["\']?', val, re.I)
+                    if m:
+                        candidate = os.path.basename(urllib.parse.unquote(m.group(1))).strip()
+                        if candidate:
+                            return candidate
+                    elif key == "filename":
+                        candidate = os.path.basename(urllib.parse.unquote(val)).strip()
+                        if candidate:
+                            return candidate
+        base = os.path.basename(urllib.parse.unquote(parsed.path or ""))
+        return base.strip()
+    except Exception:
+        return ""
+
+
+def _probe_url_content_length(url, insecure=False):
+    # First try HEAD (-sIL). Note that S3/R2 presigned GET URLs often return 403 on HEAD
+    # because the signature is bound to GET; if HEAD fails or returns no length, fall back
+    # to a 1-byte ranged GET (-r 0-0 -D - -o /dev/null) and parse Content-Range / Content-Length.
+    for mode in ("head", "range_get"):
+        if mode == "head":
+            cmd = ["curl", "-sIL", "--max-redirs", "10", "--connect-timeout", "15", "-A", "Helios-Valhalla/1.0"]
+        else:
+            cmd = ["curl", "-sL", "-r", "0-0", "-D", "-", "-o", "/dev/null", "--max-redirs", "10", "--connect-timeout", "15", "-A", "Helios-Valhalla/1.0"]
+        if insecure:
+            cmd.append("-k")
+        cmd.extend(["--", url])
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+            if res.returncode != 0:
+                continue
+            length = None
+            status_code = 200
+            for line in res.stdout.decode("utf-8", "replace").splitlines():
+                lower = line.strip().lower()
+                if lower.startswith("http/"):
+                    parts = lower.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        status_code = int(parts[1])
+                elif lower.startswith("content-range:") and "/" in lower:
+                    total_part = lower.rsplit("/", 1)[-1].strip()
+                    if total_part.isdigit() and int(total_part) > 0:
+                        length = int(total_part)
+                elif lower.startswith("content-length:") and mode == "head":
+                    val = lower.split(":", 1)[1].strip()
+                    if val.isdigit() and int(val) > 0:
+                        length = int(val)
+            if status_code in (200, 206) and length and length > 0:
+                return length
+        except Exception:
+            continue
+    return None
+
+
+def download_image_from_url(task_id, payload):
+    """Stream an ISO, qcow2, vmdk, ova, or raw image from an HTTP(S) URL into a sealed Sidon vdisk."""
+    import hashlib
+    url = str(payload.get("url") or "").strip()
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return False, "URL must start with http:// or https://"
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7f for ch in url):
+        return False, "URL must not contain spaces or control characters."
+    parsed = urllib.parse.urlparse(url)
+    if not parsed.netloc:
+        return False, "URL is missing a hostname."
+
+    name = str(payload.get("name") or payload.get("filename") or "").strip()
+    if not name:
+        name = _derive_image_name_from_url(url)
+    allowed_exts = (".iso", ".qcow2", ".vmdk", ".ova", ".raw", ".img")
+    if not name or len(name) > 255 or "/" in name or "\\" in name or any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
+        return False, "Invalid image name; provide an explicit name ending in .iso, .qcow2, .vmdk, .ova, .raw, or .img."
+    lower_name = name.lower()
+    if not lower_name.endswith(allowed_exts):
+        return False, "Image name must end with .iso, .qcow2, .vmdk, .ova, .raw, or .img."
+
+    container = str(payload.get("container") or "").strip() or get_default_container()
+    if not is_valid_object_name(container):
+        return False, f"Invalid container name: {OBJECT_NAME_ERROR}."
+
+    expected_sha256 = str(payload.get("sha256") or "").strip().lower()
+    if expected_sha256 and not re.match(r"^[0-9a-f]{64}$", expected_sha256):
+        return False, "SHA-256 checksum must be a 64-character hexadecimal string."
+
+    insecure = bool(payload.get("insecure", False))
+
+    # Refuse if an image with this name is already catalogued
+    rc_chk, out_chk, _ = run_cql_query(
+        f"SELECT JSON name FROM hydra.valhalla_images WHERE name = '{cql_escape(name)}';"
+    )
+    if rc_chk == 0 and out_chk:
+        for line in out_chk.splitlines():
+            s = line.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    if json.loads(s).get("name") == name:
+                        return False, f"An image named '{name}' is already in the catalogue. Delete it first."
+                except Exception:
+                    pass
+
+    sidon = sidon_module()
+    vdisk_id = sidon.image_vdisk_id(name)
+    socket_path = sidon.nbd_socket(vdisk_id)
+
+    def _report(pct):
+        if task_id:
+            try:
+                call_catalyst_api("/api/v1/tasks/update", {
+                    "task_id": task_id,
+                    "status": "processing",
+                    "progress": max(0, min(99, int(pct)))
+                }, method="POST")
+            except Exception:
+                pass
+
+    def _rollback():
+        try:
+            sidon_op(LOCAL_IP, "detach", vdisk_id)
+        except Exception:
+            pass
+        try:
+            sidon_op(LOCAL_IP, "delete", vdisk_id)
+        except Exception:
+            pass
+
+    _report(2)
+    size_bytes = _probe_url_content_length(url, insecure=insecure)
+    curl_base = ["curl", "-fSL", "--max-redirs", "10", "--retry", "3", "--connect-timeout", "20", "-A", "Helios-Valhalla/1.0"]
+    if insecure:
+        curl_base.append("-k")
+
+    hasher = hashlib.sha256()
+    created_vdisk = False
+    needs_convert = lower_name.endswith((".qcow2", ".vmdk", ".ova"))
+    ts_tag = f"{vdisk_id}-{int(time.time())}"
+    tmp_path = f"/var/lib/hci/aether/images/.download-{ts_tag}.part"
+    extracted_path = f"/var/lib/hci/aether/images/.extract-{ts_tag}.img"
+    raw_path = f"/var/lib/hci/aether/images/.raw-{ts_tag}.raw"
+
+    try:
+        if not needs_convert and size_bytes and size_bytes > 0:
+            # Direct zero-staging stream from curl into Sidon NBD socket for raw/ISO images
+            ok_c, _, detail_c = sidon_op(LOCAL_IP, "create", vdisk_id, size_bytes=size_bytes, container=container)
+            if not ok_c:
+                return False, f"Could not allocate storage for '{name}' ({vdisk_id}): {detail_c}"
+            created_vdisk = True
+
+            ok_a, _, detail_a = sidon_op(LOCAL_IP, "attach", vdisk_id)
+            if not ok_a:
+                _rollback()
+                return False, f"Could not attach '{vdisk_id}' on {LOCAL_IP}: {detail_a}"
+
+            _report(5)
+            proc = subprocess.Popen(
+                curl_base + ["--", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            writer = None
+            written = 0
+            last_pct = 5
+            last_ts = time.time()
+            chunk_size = 8 * sidon.NBD_CHUNK
+            try:
+                writer = sidon.NbdWriter(socket_path, vdisk_id)
+                while written < size_bytes:
+                    want = min(chunk_size, size_bytes - written)
+                    buf = bytearray()
+                    while len(buf) < want:
+                        piece = proc.stdout.read(want - len(buf))
+                        if not piece:
+                            break
+                        buf.extend(piece)
+                    if not buf:
+                        break
+                    data = bytes(buf)
+                    hasher.update(data)
+                    writer.write_pipelined(written, data, max_in_flight=8)
+                    written += len(data)
+                    now = time.time()
+                    pct = 5 + int((written * 88) / size_bytes)
+                    if pct >= last_pct + 2 and (now - last_ts) >= 1.5:
+                        _report(pct)
+                        last_pct = pct
+                        last_ts = now
+                extra = proc.stdout.read(1)
+                if extra:
+                    proc.kill()
+                    raise RuntimeError(f"Remote stream exceeded advertised Content-Length ({size_bytes} bytes)")
+                writer.flush()
+            finally:
+                if writer:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+            _, stderr_bytes = proc.communicate(timeout=30)
+            if proc.returncode != 0:
+                err_txt = (stderr_bytes or b"").decode("utf-8", "replace").strip()
+                raise RuntimeError(f"curl failed (exit {proc.returncode}): {err_txt or 'transfer error'}")
+            if written != size_bytes:
+                raise RuntimeError(f"Download truncated: received {written} of {size_bytes} bytes")
+            actual_sha256 = hasher.hexdigest().lower()
+            if expected_sha256 and actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"SHA-256 checksum mismatch for '{name}': expected {expected_sha256}, got {actual_sha256}"
+                )
+        else:
+            # Stage to local image directory first (needed for qcow2/vmdk/ova conversion or unknown Content-Length)
+            os.makedirs("/var/lib/hci/aether/images", exist_ok=True)
+            _report(5)
+            res = subprocess.run(
+                curl_base + ["-o", tmp_path, "--", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            if res.returncode != 0:
+                err_txt = (res.stderr or b"").decode("utf-8", "replace").strip()
+                raise RuntimeError(f"curl failed (exit {res.returncode}): {err_txt or 'transfer error'}")
+            if not os.path.exists(tmp_path):
+                raise RuntimeError("Downloaded file was not created.")
+            dl_bytes = os.path.getsize(tmp_path)
+            if dl_bytes <= 0:
+                raise RuntimeError("Downloaded image is empty (0 bytes).")
+
+            # Compute SHA-256 on the downloaded artifact before any format conversion
+            with open(tmp_path, "rb") as hf:
+                while True:
+                    hchunk = hf.read(8 * 1024 * 1024)
+                    if not hchunk:
+                        break
+                    hasher.update(hchunk)
+            actual_sha256 = hasher.hexdigest().lower()
+            if expected_sha256 and actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"SHA-256 checksum mismatch for '{name}': expected {expected_sha256}, got {actual_sha256}"
+                )
+
+            _report(40)
+            stream_source_path = tmp_path
+            size_bytes = dl_bytes
+            skip_zeroes = False
+
+            if needs_convert:
+                src_disk_path = tmp_path
+                if lower_name.endswith(".ova"):
+                    import tarfile
+                    if not tarfile.is_tarfile(tmp_path):
+                        raise RuntimeError("OVA file is not a valid tar archive.")
+                    with tarfile.open(tmp_path, "r:*") as tf:
+                        disk_member = None
+                        for member in tf.getmembers():
+                            mname = member.name.lower()
+                            if member.isfile() and mname.endswith((".vmdk", ".qcow2", ".raw", ".img")):
+                                disk_member = member
+                                break
+                        if not disk_member:
+                            raise RuntimeError("OVA archive does not contain a .vmdk, .qcow2, or .raw disk image.")
+                        src_f = tf.extractfile(disk_member)
+                        if not src_f:
+                            raise RuntimeError("Could not extract disk image from OVA archive.")
+                        with open(extracted_path, "wb") as out_f:
+                            while True:
+                                chunk = src_f.read(8 * 1024 * 1024)
+                                if not chunk:
+                                    break
+                                out_f.write(chunk)
+                    src_disk_path = extracted_path
+
+                info_res = subprocess.run(
+                    ["qemu-img", "info", "--output=json", src_disk_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                if info_res.returncode != 0:
+                    err_info = (info_res.stderr or b"").decode("utf-8", "replace").strip()
+                    raise RuntimeError(f"qemu-img info failed: {err_info}")
+                info_json = json.loads(info_res.stdout.decode("utf-8", "replace"))
+                virtual_size = int(info_json.get("virtual-size") or 0)
+                if virtual_size <= 0:
+                    raise RuntimeError("qemu-img reported invalid virtual-size for image.")
+                img_fmt = str(info_json.get("format") or "").lower()
+                _report(50)
+                if img_fmt == "raw":
+                    stream_source_path = src_disk_path
+                    size_bytes = virtual_size
+                    skip_zeroes = True
+                else:
+                    conv_res = subprocess.run(
+                        ["qemu-img", "convert", "-O", "raw", src_disk_path, raw_path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    if conv_res.returncode != 0:
+                        err_conv = (conv_res.stderr or b"").decode("utf-8", "replace").strip()
+                        raise RuntimeError(f"qemu-img convert to raw failed: {err_conv}")
+                    stream_source_path = raw_path
+                    size_bytes = virtual_size
+                    skip_zeroes = True
+
+            _report(65)
+            ok_c, _, detail_c = sidon_op(LOCAL_IP, "create", vdisk_id, size_bytes=size_bytes, container=container)
+            if not ok_c:
+                return False, f"Could not allocate storage for '{name}' ({vdisk_id}): {detail_c}"
+            created_vdisk = True
+
+            ok_a, _, detail_a = sidon_op(LOCAL_IP, "attach", vdisk_id)
+            if not ok_a:
+                _rollback()
+                return False, f"Could not attach '{vdisk_id}' on {LOCAL_IP}: {detail_a}"
+
+            writer = None
+            written = 0
+            chunk_size = 8 * sidon.NBD_CHUNK
+            zero_full = b"\x00" * chunk_size
+            try:
+                writer = sidon.NbdWriter(socket_path, vdisk_id)
+                with open(stream_source_path, "rb") as f:
+                    while written < size_bytes:
+                        data = f.read(min(chunk_size, size_bytes - written))
+                        if not data:
+                            break
+                        if skip_zeroes and (data == zero_full or data == b"\x00" * len(data)):
+                            written += len(data)
+                            continue
+                        writer.write_pipelined(written, data, max_in_flight=8)
+                        written += len(data)
+                writer.flush()
+            finally:
+                if writer:
+                    try:
+                        writer.close()
+                    except Exception:
+                        pass
+
+        _report(95)
+        ok_s, _, detail_s = sidon_op(LOCAL_IP, "seal", vdisk_id)
+        if not ok_s:
+            raise RuntimeError(f"Image '{vdisk_id}' was written but could not be sealed: {detail_s}")
+
+        img_type = "iso" if lower_name.endswith(".iso") else "template"
+        now_ms = int(time.time() * 1000)
+        cql_ins = (
+            f"INSERT INTO hydra.valhalla_images (name, filename, size_bytes, type, path, container, created_at) "
+            f"VALUES ('{cql_escape(name)}', '{cql_escape(name)}', {int(size_bytes)}, '{img_type}', "
+            f"'{cql_escape(socket_path)}', '{cql_escape(container)}', {now_ms});"
+        )
+        rc_ins, _, err_ins = run_cql_query(cql_ins)
+        if rc_ins != 0:
+            raise RuntimeError(f"Image was sealed as {vdisk_id} but could not be registered in Hydra: {err_ins}")
+
+        return True, LOCAL_IP
+    except Exception as exc:
+        if created_vdisk:
+            _rollback()
+        return False, str(exc)
+    finally:
+        for p in (tmp_path, extracted_path, raw_path):
+            try:
+                if os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+
 
 # Queue worker thread
 def queue_thread_loop():
@@ -2744,6 +3559,80 @@ def check_stop_preserves_quorum(address):
     return allowed, reason
 
 
+def check_zk_stop_preserves_quorum(address):
+    """The ZooKeeper quorum gate. Returns (allowed, reason).
+
+    Ensures that stopping ZooKeeper on `address` leaves at least a majority (quorum)
+    of voting participants running in the ensemble.
+    """
+    cluster_hosts = get_cluster_hosts()
+    hosts = [h.get("ip") for h in cluster_hosts if h.get("ip")]
+    if len(hosts) <= 1:
+        return True, "Single-node cluster; ZooKeeper quorum check not applicable."
+
+    # Try to probe /zookeeper/config or probe each host's server_mode
+    zk_config = None
+    try:
+        endpoints = ["127.0.0.1"] + [h for h in hosts if h != "127.0.0.1"]
+        client = helios_zk.connect(endpoints, timeout=2.0)
+        zk_config = helios_zk.read_ensemble_config(client)
+        client.close()
+    except Exception:
+        pass
+
+    modes = {}
+    for h in hosts:
+        try:
+            modes[h] = helios_zk.server_mode(h, timeout=0.5)
+        except Exception:
+            modes[h] = None
+
+    target_mode = modes.get(address)
+    if not target_mode:
+        return True, f"ZooKeeper on {address} is already not answering; stopping it removes nothing currently voting."
+
+    if zk_config and "members" in zk_config:
+        voters = [m["host"] for m in zk_config["members"] if m.get("role") == helios_zk.PARTICIPANT]
+    else:
+        voters = hosts[:min(3, len(hosts))]
+
+    total_voters = len(voters)
+    required = total_voters // 2 + 1
+    live_voters = sum(1 for v in voters if modes.get(v) in ("leader", "follower", "standalone"))
+
+    if address in voters:
+        voters_after = live_voters - 1
+        if voters_after < required:
+            return False, (
+                f"Stopping ZooKeeper on {address} would leave {voters_after} of {total_voters} "
+                f"voters answering, and ZooKeeper quorum requires {required}. "
+                f"Active voters right now: {live_voters} of {total_voters}."
+            )
+        return True, f"ZooKeeper has {total_voters} voters (needs {required} for quorum); stopping {address} leaves {voters_after}."
+    else:
+        return True, f"ZooKeeper on {address} is an observer or non-voter; stopping it does not affect quorum ({live_voters}/{total_voters} voters active)."
+
+
+def wait_zookeeper_rejoined(address, timeout=30, poll_interval=1.0, sleep=None):
+    """Wait for ZooKeeper on `address` to start and successfully rejoin the ensemble.
+
+    Returns (rejoined, mode_or_error).
+    """
+    sleep_fn = sleep or time.sleep
+    deadline = time.time() + timeout
+    last_err = ""
+    while time.time() < deadline:
+        try:
+            mode = helios_zk.server_mode(address, timeout=1.0)
+            if mode in ("leader", "follower", "observer", "standalone"):
+                return True, mode
+            last_err = f"reporting mode '{mode}'" if mode else "not answering stat"
+        except Exception as ex:
+            last_err = str(ex)
+        sleep_fn(poll_interval)
+    return False, f"ZooKeeper did not rejoin the ensemble within {timeout}s ({last_err})"
+
+
 def acquire_maintenance_lock(hostname, reason):
     """Take the cluster-wide maintenance lock. Returns (ok, token, current, error).
 
@@ -2907,7 +3796,7 @@ def finish_maintenance_exit(hostname, target_ip, wait=None, poll=None, sleep=Non
 # VM: it takes the same status lock a migration does. What cannot be done live is refused with the
 # reason. Table: docs/vm_lifecycle.md.
 
-LIVE_CHANGE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk")
+LIVE_CHANGE_OPS = ("vcpus", "memory", "cdrom", "nic", "disk", "resources", "annotate", "tags", "pci", "usb")
 # The sata letters and virtio letters a VM's CD-ROMs and data disks use (`sda...`, `vdb...`).
 _LIVE_LETTERS = "abcdefghijklmnopqrstuvwxyz"
 
@@ -2973,12 +3862,20 @@ def post_live_change(host_ip, vm_name, body):
 def _set_row(vm_name, **columns):
     """Update columns of the VM's row. Values are bound as typed literals here, never interpolated raw."""
     assignments = []
+    allowed = (
+        "vcpu", "memory", "iso", "network_id", "disks_list", "disk_size",
+        "notes", "tags", "cpu_shares", "cpu_limit", "cpu_reservation",
+        "mem_reservation", "mem_limit", "pci_devices", "usb_devices", "guest_ips"
+    )
+    numeric = ("vcpu", "memory", "disk_size", "cpu_shares", "cpu_limit", "cpu_reservation", "mem_reservation", "mem_limit")
     for key, value in columns.items():
-        if key not in ("vcpu", "memory", "iso", "network_id", "disks_list", "disk_size"):
+        if key not in allowed:
             raise ValueError(f"not a column a live change may write: {key}")
         # By column, not by the Python type of the value: a numeric column is always an integer
         # literal (a quoted "4" is a type error in CQL), a text column always a quoted, escaped one.
-        if key in ("vcpu", "memory", "disk_size"):
+        if value is None:
+            assignments.append(f"{key} = null")
+        elif key in numeric:
             assignments.append(f"{key} = {cql_int(value)}")
         else:
             assignments.append(f"{key} = '{cql_escape(value)}'")
@@ -3025,9 +3922,17 @@ def _live_change_locked(vm_name, vm, host, op, payload):
         return True, f"{vm_name} now has {count} vCPUs" + ("" if done else f" (live; its record could not be updated: {err})")
 
     if op == "memory":
-        ok, answer = post_live_change(host, vm_name, {"op": "memory", "mib": payload.get("mib")})
+        mib = payload.get("mib")
+        persist = payload.get("persist", False)
+        current_mem = int(vm.get("memory") or 0)
+        is_growth = mib is not None and mib > current_mem
+        ok, answer = post_live_change(host, vm_name, payload)
         if not ok:
             return False, answer
+        if persist or is_growth:
+            done, err = _set_row(vm_name, memory=mib)
+            return True, (f"{vm_name} now has {mib} MiB memory" +
+                          ("" if done else f" (live; its record could not be updated: {err})"))
         return True, (f"{vm_name}'s memory balloon is {payload.get('mib')} MiB. This is a runtime setting "
                       "inside the configured memory; the VM's recorded memory, and so its next start, is unchanged.")
 
@@ -3058,6 +3963,83 @@ def _live_change_locked(vm_name, vm, host, op, payload):
         return True, (f"drive {slot + 1} of {vm_name} now holds {image}" if image else f"drive {slot + 1} of {vm_name} is ejected") + (
             "" if done else f" (live; its record could not be updated: {err})")
 
+    if op == "annotate":
+        notes = payload.get("notes")
+        done, err = _set_row(vm_name, notes=notes)
+        return True, f"Updated notes for {vm_name}" + ("" if done else f" (live; record error: {err})")
+
+    if op == "tags":
+        tags = payload.get("tags")
+        done, err = _set_row(vm_name, tags=tags)
+        return True, f"Updated tags for {vm_name}" + ("" if done else f" (live; record error: {err})")
+
+    if op == "resources":
+        ok, answer = post_live_change(host, vm_name, payload)
+        if not ok:
+            return False, answer
+        cols = {}
+        for k in ("cpu_shares", "cpu_limit", "cpu_reservation", "mem_reservation", "mem_limit"):
+            if k in payload:
+                cols[k] = payload[k]
+        if cols:
+            done, err = _set_row(vm_name, **cols)
+            return True, f"Resource limits updated for {vm_name}" + ("" if done else f" (live; record error: {err})")
+        return True, f"Resource limits updated for {vm_name}"
+
+    if op == "pci":
+        action = payload.get("action")
+        bdf = str(payload.get("bdf") or "").strip().lower()
+        m = re.match(r"\A(?:([0-9a-fA-F]{4}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])\Z", bdf)
+        if not m:
+            return False, "bdf must be a PCI address such as 0000:01:00.0"
+        norm_bdf = f"{(m.group(1) or '0000').lower()}:{m.group(2).lower()}:{m.group(3).lower()}.{m.group(4).lower()}"
+        current_bdfs = [b.strip().lower() for b in str(vm.get("pci_devices") or "").split(",") if b.strip()]
+        if action == "attach":
+            if norm_bdf in current_bdfs:
+                return True, f"PCI device {norm_bdf} is already attached to {vm_name}"
+            ok, answer = post_live_change(host, vm_name, {"op": "pci", "action": "attach", "bdf": norm_bdf})
+            if not ok:
+                return False, answer
+            current_bdfs.append(norm_bdf)
+            done, err = _set_row(vm_name, pci_devices=",".join(current_bdfs))
+            return True, f"PCI device {norm_bdf} attached to {vm_name}" + ("" if done else f" (live; record error: {err})")
+        if action == "detach":
+            if norm_bdf not in current_bdfs:
+                return False, f"PCI device {norm_bdf} is not attached to {vm_name}"
+            ok, answer = post_live_change(host, vm_name, {"op": "pci", "action": "detach", "bdf": norm_bdf})
+            if not ok:
+                return False, answer
+            current_bdfs = [b for b in current_bdfs if b != norm_bdf]
+            done, err = _set_row(vm_name, pci_devices=",".join(current_bdfs) if current_bdfs else "")
+            return True, f"PCI device {norm_bdf} detached from {vm_name}" + ("" if done else f" (live; record error: {err})")
+        return False, "action must be attach or detach"
+
+    if op == "usb":
+        action = payload.get("action")
+        usb_id = str(payload.get("usb_id") or "").strip().lower()
+        if not re.match(r"\A[0-9a-f]{4}:[0-9a-f]{4}\Z", usb_id):
+            return False, "usb_id must be a vendor:product hex pair such as 046d:c52b"
+        current_usbs = [u.strip().lower() for u in str(vm.get("usb_devices") or "").split(",") if u.strip()]
+        if action == "attach":
+            if usb_id in current_usbs:
+                return True, f"USB device {usb_id} is already attached to {vm_name}"
+            ok, answer = post_live_change(host, vm_name, {"op": "usb", "action": "attach", "usb_id": usb_id})
+            if not ok:
+                return False, answer
+            current_usbs.append(usb_id)
+            done, err = _set_row(vm_name, usb_devices=",".join(current_usbs))
+            return True, f"USB device {usb_id} attached to {vm_name}" + ("" if done else f" (live; record error: {err})")
+        if action == "detach":
+            if usb_id not in current_usbs:
+                return False, f"USB device {usb_id} is not attached to {vm_name}"
+            ok, answer = post_live_change(host, vm_name, {"op": "usb", "action": "detach", "usb_id": usb_id})
+            if not ok:
+                return False, answer
+            current_usbs = [u for u in current_usbs if u != usb_id]
+            done, err = _set_row(vm_name, usb_devices=",".join(current_usbs) if current_usbs else "")
+            return True, f"USB device {usb_id} detached from {vm_name}" + ("" if done else f" (live; record error: {err})")
+        return False, "action must be attach or detach"
+
     if op == "nic":
         return _live_nic(vm_name, vm, host, payload)
 
@@ -3077,33 +4059,59 @@ def _live_nic(vm_name, vm, host, payload):
             return False, why
         if len(entries) >= 8:
             return False, "at most 8 network interfaces are supported"
-        index = len(entries)
+        used_macs = set()
+        for i, e in enumerate(entries):
+            p = e.split(":")
+            used_macs.add(p[2] if len(p) > 2 and p[2] else vm_nic_mac(vm_name, i))
+        idx_cand = 0
+        while vm_nic_mac(vm_name, idx_cand) in used_macs:
+            idx_cand += 1
+        mac = vm_nic_mac(vm_name, idx_cand)
         ok, answer = post_live_change(host, vm_name, {
-            "op": "nic", "action": "attach", "mac": vm_nic_mac(vm_name, index),
+            "op": "nic", "action": "attach", "mac": mac,
             "bridge": bridge, "model": model})
         if not ok:
             return False, answer
-        entries.append(f"{net_id}:{model}")
+        has_explicit = any(len(e.split(":")) > 2 and bool(e.split(":")[2]) for e in entries)
+        if has_explicit or idx_cand != len(entries):
+            entries.append(f"{net_id}:{model}:{mac}")
+        else:
+            entries.append(f"{net_id}:{model}")
         done, err = _set_row(vm_name, network_id=json.dumps(entries))
         return True, f"{vm_name} has a new NIC on {bridge}" + ("" if done else f" (live; its record could not be updated: {err})")
     index = payload.get("index")
-    if action == "detach" and index == -1:
+    if action == "detach" and (index == -1 or index is None):
         index = len(entries) - 1          # the CLI's "the last one"
     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
         return False, "index must be the position of one of the VM's NICs, starting at 0"
+    computed_entries = []
+    for i, e in enumerate(entries):
+        p = e.split(":")
+        net = p[0]
+        mod = p[1] if len(p) > 1 and p[1] else "virtio"
+        mac = p[2] if len(p) > 2 and p[2] else vm_nic_mac(vm_name, i)
+        had_explicit = len(p) > 2 and bool(p[2])
+        computed_entries.append((net, mod, mac, had_explicit))
+    target_mac = computed_entries[index][2]
     if action == "detach":
-        if index != len(entries) - 1:
-            return False, ("only the last NIC can be removed live: the NICs' addresses are derived from their "
-                           "positions, so removing another would change the others' at the next start")
-        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": vm_nic_mac(vm_name, index)})
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": target_mac})
         if not ok:
             return False, answer
-        entries.pop()
-        done, err = _set_row(vm_name, network_id=json.dumps(entries))
-        return True, f"the last NIC of {vm_name} is removed" + ("" if done else f" (live; its record could not be updated: {err})")
+        is_last = (index == len(entries) - 1)
+        computed_entries.pop(index)
+        if is_last:
+            normalized = [
+                f"{net}:{mod}:{mac}" if had_exp else f"{net}:{mod}"
+                for net, mod, mac, had_exp in computed_entries
+            ]
+        else:
+            normalized = [f"{net}:{mod}:{mac}" for net, mod, mac, _ in computed_entries]
+        done, err = _set_row(vm_name, network_id=json.dumps(normalized))
+        nic_desc = "the last NIC" if is_last else f"NIC {index + 1}"
+        return True, f"{nic_desc} of {vm_name} is removed" + ("" if done else f" (live; its record could not be updated: {err})")
     if action == "link":
         ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "link",
-                                                      "mac": vm_nic_mac(vm_name, index),
+                                                      "mac": target_mac,
                                                       "state": payload.get("state")})
         if not ok:
             return False, answer
@@ -3111,21 +4119,19 @@ def _live_nic(vm_name, vm, host, payload):
                       "VM's record, so it is up again after the VM next starts.")
     if action == "change":
         net_id = str(payload.get("network_id") or "").strip()
-        model = payload.get("model") or (entries[index].split(":")[1] if ":" in entries[index] else "virtio")
+        model = payload.get("model") or computed_entries[index][1]
         bridge, why = network_bridge(get_network_by_id(net_id))
         if not bridge:
             return False, why
-        mac = vm_nic_mac(vm_name, index)
-        # libvirt cannot retarget an interface in place (and not at all for macvtap), so the
-        # same MAC is unplugged and plugged back on the new bridge: same adapter to the guest.
-        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": mac})
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "detach", "mac": target_mac})
         if not ok:
             return False, answer
-        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "attach", "mac": mac,
+        ok, answer = post_live_change(host, vm_name, {"op": "nic", "action": "attach", "mac": target_mac,
                                                       "bridge": bridge, "model": model})
         if not ok:
             return False, f"NIC {index + 1} was unplugged but could not be re-plugged on {bridge}: {answer}"
-        entries[index] = f"{net_id}:{model}"
+        had_exp = computed_entries[index][3]
+        entries[index] = f"{net_id}:{model}:{target_mac}" if had_exp else f"{net_id}:{model}"
         done, err = _set_row(vm_name, network_id=json.dumps(entries))
         return True, f"NIC {index + 1} of {vm_name} is now on {bridge}" + ("" if done else f" (live; its record could not be updated: {err})")
     return False, "action must be attach, detach, link or change"
@@ -3141,10 +4147,25 @@ def _live_disk(vm_name, vm, host, payload, module):
             return False, "size_gib must be a whole number of GiB, at least 1"
         if not is_valid_object_name(container):
             return False, f"Invalid container name: {OBJECT_NAME_ERROR}."
-        index = len(disks)
-        if not 1 <= index < 25:
+        if len(disks) >= 26:
             return False, "a running VM can have at most 25 data disks after its boot disk"
-        vdisk_id = module.vdisk_id_for(vm_name, index)
+        used_vdisk_ids = set()
+        used_letters = set()
+        for i, d in enumerate(disks):
+            p = d.split(":")
+            used_vdisk_ids.add(p[3] if len(p) > 3 and p[3] else module.vdisk_id_for(vm_name, i))
+            used_letters.add(p[4] if len(p) > 4 and p[4] else _LIVE_LETTERS[i])
+        idx_cand = 1
+        while module.vdisk_id_for(vm_name, idx_cand) in used_vdisk_ids:
+            idx_cand += 1
+        vdisk_id = module.vdisk_id_for(vm_name, idx_cand)
+        dev_letter = None
+        for ch in _LIVE_LETTERS[1:]:
+            if ch not in used_letters:
+                dev_letter = ch
+                break
+        if not dev_letter:
+            return False, "no disk slot letters available"
         ok_c, _, detail = sidon_op(host, "create", vdisk_id, size_bytes=size * 1024 ** 3, container=container)
         if not ok_c:
             return False, f"step 'create {vdisk_id}' failed: {detail}"
@@ -3153,41 +4174,56 @@ def _live_disk(vm_name, vm, host, payload, module):
             sidon_op(host, "delete", vdisk_id)
             return False, f"step 'attach {vdisk_id} on {host}' failed: {detail}; the new vdisk was removed"
         ok, answer = post_live_change(host, vm_name, {
-            "op": "disk", "action": "attach", "vdisk_id": vdisk_id, "target": "vd" + _LIVE_LETTERS[index]})
+            "op": "disk", "action": "attach", "vdisk_id": vdisk_id, "target": "vd" + dev_letter})
         if not ok:
             sidon_op(host, "detach", vdisk_id)
             sidon_op(host, "delete", vdisk_id)
             return False, f"{answer}; the new vdisk was removed"
-        disks.append(f"{size}GB:{container}:virtio")
+        disks.append(f"{size}GB:{container}:virtio:{vdisk_id}:{dev_letter}")
         done, err = _set_row(vm_name, disks_list=",".join(disks))
-        return True, f"{vdisk_id} ({size} GiB) is attached to {vm_name} as vd{_LIVE_LETTERS[index]}" + (
+        return True, f"{vdisk_id} ({size} GiB) is attached to {vm_name} as vd{dev_letter}" + (
             "" if done else f" (live; its record could not be updated: {err})")
     index = payload.get("index")
     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(disks):
         return False, "index must be the position of one of the VM's disks, starting at 0"
-    vdisk_id = module.vdisk_id_for(vm_name, index)
+    target_entry = disks[index]
+    p = target_entry.split(":")
+    vdisk_id = p[3] if len(p) > 3 and p[3] else module.vdisk_id_for(vm_name, index)
+    dev_letter = p[4] if len(p) > 4 and p[4] else _LIVE_LETTERS[index]
+    target_dev = "vd" + dev_letter
     if action == "detach":
         if index == 0:
             return False, "the boot disk cannot be removed from a running VM"
-        if index != len(disks) - 1:
-            return False, ("only the last disk can be removed: a disk's vdisk is named after its position, so "
-                           "removing another would change the others' names")
         if payload.get("confirm_delete") is not True:
             return False, ("removing a disk deletes its data; pass confirm_delete to do it "
-                           f"({vdisk_id}, {_entry_size_gib(disks[index]) or '?'} GiB)")
-        ok, answer = post_live_change(host, vm_name, {"op": "disk", "action": "detach", "target": "vd" + _LIVE_LETTERS[index]})
+                           f"({vdisk_id}, {_entry_size_gib(target_entry) or '?'} GiB)")
+        ok, answer = post_live_change(host, vm_name, {"op": "disk", "action": "detach", "target": target_dev})
         if not ok:
             return False, answer
-        disks.pop()
-        done, err = _set_row(vm_name, disks_list=",".join(disks) or "NONE")
-        # After the row no longer names it: a failure here leaves an orphan, never a row pointing at nothing.
+        is_last = (index == len(disks) - 1)
+        remaining = []
+        for i, d in enumerate(disks):
+            if i == index:
+                continue
+            parts = d.split(":")
+            size_part = parts[0]
+            cnt_part = parts[1] if len(parts) > 1 and parts[1] else get_default_container()
+            bus_part = parts[2] if len(parts) > 2 and parts[2] else "virtio"
+            vid_part = parts[3] if len(parts) > 3 and parts[3] else module.vdisk_id_for(vm_name, i)
+            let_part = parts[4] if len(parts) > 4 and parts[4] else _LIVE_LETTERS[i]
+            had_explicit = len(parts) > 3 and bool(parts[3])
+            if is_last and not had_explicit:
+                remaining.append(f"{size_part}:{cnt_part}:{bus_part}")
+            else:
+                remaining.append(f"{size_part}:{cnt_part}:{bus_part}:{vid_part}:{let_part}")
+        done, err = _set_row(vm_name, disks_list=",".join(remaining) or "NONE")
         sidon_op(host, "detach", vdisk_id)
         ok_d, _, detail = sidon_op(host, "delete", vdisk_id)
         note = "" if ok_d else f" The vdisk could not be deleted ({detail}) and is now an orphan."
         return True, f"{vdisk_id} is removed from {vm_name}.{note}" + ("" if done else f" Its record could not be updated: {err}")
     if action == "resize":
         size = payload.get("size_gib")
-        old = _entry_size_gib(disks[index])
+        old = _entry_size_gib(target_entry)
         if not isinstance(size, int) or isinstance(size, bool) or size < 1:
             return False, "size_gib must be a whole number of GiB, at least 1"
         if old is None:
@@ -3202,18 +4238,27 @@ def _live_disk(vm_name, vm, host, payload, module):
         parts = disks[index].split(":")
         parts[0] = f"{size}GB"
         disks[index] = ":".join(parts)
-        # The storage has grown, so the record follows it whether or not the guest was told.
         columns = {"disks_list": ",".join(disks)}
         if index == 0:
             columns["disk_size"] = size
         _set_row(vm_name, **columns)
         ok, answer = post_live_change(host, vm_name, {
-            "op": "disk", "action": "resize", "target": "vd" + _LIVE_LETTERS[index], "size_bytes": size * 1024 ** 3})
+            "op": "disk", "action": "resize", "target": target_dev, "size_bytes": size * 1024 ** 3})
         if not ok:
             return False, (f"{vdisk_id} was grown to {size} GiB and the record updated, but the running guest "
                            f"could not be told: {answer}. It sees the new size after its next start.")
         return True, f"{vdisk_id} is {size} GiB and the guest has been told"
-    return False, "action must be attach, detach or resize"
+    if action == "throttle":
+        body = {"op": "disk", "action": "throttle", "target": target_dev}
+        if "iops" in payload and payload["iops"] is not None:
+            body["iops"] = payload["iops"]
+        if "bytes_sec" in payload and payload["bytes_sec"] is not None:
+            body["bytes_sec"] = payload["bytes_sec"]
+        ok, answer = post_live_change(host, vm_name, body)
+        if not ok:
+            return False, answer
+        return True, f"Throttled disk {target_dev} on {vm_name}"
+    return False, "action must be attach, detach, resize or throttle"
 
 
 def handle_maintenance_request(payload, send_json):
@@ -3278,6 +4323,27 @@ def handle_maintenance_request(payload, send_json):
             })
             return
 
+        zk_ok, zk_reason = check_zk_stop_preserves_quorum(target_ip)
+        if not zk_ok:
+            send_json(409, {
+                "error": f"Host '{hostname}' cannot enter maintenance mode: {zk_reason}",
+                "reason": "quorum",
+            })
+            return
+
+        current_status = host_info.get("status")
+        if current_status == "IN_MAINTENANCE":
+            send_json(409, {"error": f"Host '{hostname}' is already in maintenance mode."})
+            return
+        if current_status == "SERVICE_MAINTENANCE" and preserve_vms:
+            send_json(409, {"error": f"Host '{hostname}' is already in service maintenance mode."})
+            return
+        if current_status not in ("NORMAL", "SERVICE_MAINTENANCE"):
+            send_json(409, {"error": f"Host '{hostname}' is in state '{current_status}', so it cannot enter maintenance mode now."})
+            return
+
+        expected_status = current_status  # "NORMAL" or "SERVICE_MAINTENANCE"
+
         # Exclude every other host's transition, cluster-wide, in one Paxos round.
         #
         # What was here before scanned every hydra.nodes row for a host already in
@@ -3291,15 +4357,19 @@ def handle_maintenance_request(payload, send_json):
             send_json(500, {"error": f"Could not take the cluster maintenance lock: {lock_err}"})
             return
         if not lock_token:
-            holder = lock_current.get("holder") or "another host"
-            send_json(409, {
-                "error": f"Host '{holder}' already holds the cluster maintenance lock "
-                         f"({lock_current.get('reason') or 'no reason recorded'}). "
-                         "Only one host may transition at a time, to preserve quorum.",
-                "reason": "locked",
-                "holder": lock_current.get("holder", ""),
-            })
-            return
+            if current_status == "SERVICE_MAINTENANCE" and lock_current.get("holder") == hostname and lock_current.get("holder_token"):
+                lock_token = lock_current.get("holder_token")
+                renew_maintenance_lock(hostname, lock_token, f"transition to full maintenance on {hostname}")
+            else:
+                holder = lock_current.get("holder") or "another host"
+                send_json(409, {
+                    "error": f"Host '{holder}' already holds the cluster maintenance lock "
+                             f"({lock_current.get('reason') or 'no reason recorded'}). "
+                             "Only one host may transition at a time, to preserve quorum.",
+                    "reason": "locked",
+                    "holder": lock_current.get("holder", ""),
+                })
+                return
 
         # Claim the transition rather than announce it. Draining a host is a lock
         # on that host: two requests -- a double click, or a leave racing an enter
@@ -3315,7 +4385,7 @@ def handle_maintenance_request(payload, send_json):
             "hostname": hostname,
             "status": "ENTERING_MAINTENANCE",
             "maintenance_mode": False,
-            "expected_status": "NORMAL",
+            "expected_status": expected_status,
         })
         # Every exit from here on has to give the lock back. Leaving it held on a
         # request that never started a transition blocks maintenance cluster-wide
@@ -3326,7 +4396,7 @@ def handle_maintenance_request(payload, send_json):
             return
         if not applied:
             release_maintenance_lock(lock_token)
-            send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not NORMAL, so it cannot enter maintenance mode now."})
+            send_json(409, {"error": f"Host '{hostname}' is in state '{current.get('status')}', not {expected_status}, so it cannot enter maintenance mode now."})
             return
 
         # Submit Catalyst task. The lock token travels with it: the task renews
@@ -3350,8 +4420,8 @@ def handle_maintenance_request(payload, send_json):
             # Nothing is going to run, so put the host and the lock back.
             run_lwt("/v1/node/maintenance", {
                 "hostname": hostname,
-                "status": "NORMAL",
-                "maintenance_mode": False,
+                "status": expected_status,
+                "maintenance_mode": (expected_status == "SERVICE_MAINTENANCE"),
                 "expected_status": "ENTERING_MAINTENANCE",
             })
             release_maintenance_lock(lock_token)

@@ -137,7 +137,7 @@ impl Backend for LocalVdisk {
         self.0.lock().expect("vdisk mutex poisoned").class == crate::meta::CLASS_IMMUTABLE
     }
     fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>> {
-        self.0.lock().expect("vdisk mutex poisoned").read(offset, len)
+        crate::vdisk::read_through(&self.0, offset, len)
     }
     fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
         // Not `vdisk.write` under the lock: a write that fills the journal must start the

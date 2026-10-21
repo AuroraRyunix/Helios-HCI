@@ -1422,6 +1422,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 taskName = `Host '${payloadObj.hostname}' - Enter Maintenance`;
                             } else if (task.action === 'host_maintenance_leave') {
                                 taskName = `Host '${payloadObj.hostname}' - Leave Maintenance`;
+                            } else if (task.action === 'reclaim_storage') {
+                                taskName = `Host '${payloadObj.hostname}' - Redirect Storage Traffic`;
                             } else {
                                 taskName = `Host '${payloadObj.hostname}' - ${task.action}`;
                             }
@@ -2510,6 +2512,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                         taskName = `Maint Enter: ${payloadObj.hostname}`;
                     } else if (task.action === 'host_maintenance_leave') {
                         taskName = `Maint Leave: ${payloadObj.hostname}`;
+                    } else if (task.action === 'reclaim_storage') {
+                        taskName = `Redirect Storage: ${payloadObj.hostname}`;
                     } else {
                         taskName = `Host '${payloadObj.hostname}' ${task.action}`;
                     }
@@ -2708,6 +2712,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 taskName = `Maint Enter: ${payloadObj.hostname}`;
                             } else if (actTask.action === 'host_maintenance_leave') {
                                 taskName = `Maint Leave: ${payloadObj.hostname}`;
+                            } else if (actTask.action === 'reclaim_storage') {
+                                taskName = `Redirect Storage: ${payloadObj.hostname}`;
                             } else {
                                 taskName = `Host '${payloadObj.hostname}' ${actTask.action}`;
                             }
@@ -2821,6 +2827,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                             taskName = `Host '${payloadObj.hostname}' - Enter Maintenance`;
                         } else if (task.action === 'host_maintenance_leave') {
                             taskName = `Host '${payloadObj.hostname}' - Leave Maintenance`;
+                        } else if (task.action === 'reclaim_storage') {
+                            taskName = `Host '${payloadObj.hostname}' - Redirect Storage Traffic`;
                         } else {
                             taskName = `Host '${payloadObj.hostname}' - ${task.action}`;
                         }
@@ -5931,6 +5939,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'agahnim_status',
             'slate_status',
             'hylia_status',
+            'kass_status',
             'libvirtd_status'
         ];
         
@@ -5955,6 +5964,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             'agahnim_status': 'Agahnim Proxy',
             'slate_status': 'Slate Ingress',
             'hylia_status': 'Hylia Upgrades',
+            'kass_status': 'Kass (Kafka)',
             'libvirtd_status': 'Libvirtd'
         };
         

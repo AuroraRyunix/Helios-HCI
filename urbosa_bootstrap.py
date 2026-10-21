@@ -209,6 +209,7 @@ def main():
         # longer exist. Not fatal - urbosa reclaims orphaned reservations on its
         # own - but a teardown should not need a follow-up.
         run_cql_query("TRUNCATE hydra.urbosa_transit_pool;")
+        run_cql_query("TRUNCATE hydra.urbosa_vni_claims;")
         print("Urbosa cleanup completed successfully.")
         return
 
@@ -234,13 +235,16 @@ def main():
         if not routers:
             print("No Tier-0 routers found. Dynamic topology creation will be prompted upon enabling SDN in Settings.")
             
-            # Default Allow All Firewall Rule
-            fw_id = str(uuid.uuid4())
-            cql_fw = f"""
-            INSERT INTO hydra.urbosa_firewall_rules (rule_id, description, source_ip, dest_ip, protocol, port, action, priority)
-            VALUES ({fw_id}, 'Default Allow All Rule', 'ANY', 'ANY', 'ANY', 0, 'ALLOW', 1000);
-            """
-            run_cql_query(cql_fw)
+            rc_fw_chk, out_fw_chk, _ = run_cql_query("SELECT rule_id FROM hydra.urbosa_firewall_rules;")
+            existing_fw = [l.strip() for l in (out_fw_chk or "").splitlines() if l.strip() and not l.strip().startswith(("(", "-")) and l.strip() != "rule_id"]
+            if not existing_fw:
+                # Default Allow All Firewall Rule
+                fw_id = str(uuid.uuid4())
+                cql_fw = f"""
+                INSERT INTO hydra.urbosa_firewall_rules (rule_id, description, source_ip, dest_ip, protocol, port, action, priority)
+                VALUES ({fw_id}, 'Default Allow All Rule', 'ANY', 'ANY', 'ANY', 0, 'ALLOW', 1000);
+                """
+                run_cql_query(cql_fw)
             
             print("Default Urbosa SDN topology configured successfully!")
         else:

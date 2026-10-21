@@ -72,7 +72,7 @@ defmodule SpectrumPhx.Images do
   # image is named from the slug, so a different slug would delete the wrong vdisk or
   # none at all.
   @slug_max_length 28
-  @image_extensions [".iso", ".qcow2", ".img"]
+  @image_extensions [".iso", ".qcow2", ".img", ".raw", ".vmdk", ".ova"]
 
   @doc "CQL used by `list_images/0`."
   def list_images_cql, do: @list_cql
@@ -595,6 +595,162 @@ defmodule SpectrumPhx.Images do
   def describe_upload_error({:upload, detail}), do: detail
   def describe_upload_error(:invalid_name), do: "That is not a usable image name."
   def describe_upload_error(other), do: "The upload failed: #{describe(other)}"
+
+  @doc """
+  Derive a default image filename from an HTTP(S) URL's query parameters
+  (`response-content-disposition` / `filename`) or path segment.
+  """
+  @spec derive_name_from_url(String.t() | nil) :: String.t()
+  def derive_name_from_url(url) when is_binary(url) do
+    uri = URI.parse(String.trim(url))
+
+    from_query =
+      case uri.query do
+        q when is_binary(q) and q != "" ->
+          params = URI.decode_query(q)
+          disp = params["response-content-disposition"] || params["content-disposition"] || ""
+
+          cond do
+            is_binary(params["filename"]) and String.trim(params["filename"]) != "" ->
+              Path.basename(String.trim(params["filename"]))
+
+            Regex.match?(~r/filename\*?=["']?([^"';]+)["']?/i, disp) ->
+              case Regex.run(~r/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i, disp) do
+                [_, fname] -> fname |> URI.decode() |> Path.basename() |> String.trim()
+                _ -> ""
+              end
+
+            true ->
+              ""
+          end
+
+        _ ->
+          ""
+      end
+
+    if from_query != "" do
+      from_query
+    else
+      case uri.path do
+        path when is_binary(path) and path != "" ->
+          path
+          |> URI.decode()
+          |> Path.basename()
+          |> String.trim()
+
+        _ ->
+          ""
+      end
+    end
+  end
+
+  def derive_name_from_url(_), do: ""
+
+  @doc """
+  Submit a cluster-side URL download task (`vali` / `download_image`) so the hypervisor
+  streams the remote ISO/qcow2/img directly into a sealed Sidon vdisk via curl.
+  """
+  @spec download_from_url(map() | keyword()) :: {:ok, map()} | {:error, String.t()}
+  def download_from_url(params) when is_list(params) do
+    download_from_url(Map.new(params))
+  end
+
+  def download_from_url(params) when is_map(params) do
+    raw_url = Map.get(params, "url") || Map.get(params, :url) || ""
+    url = String.trim(to_string(raw_url))
+
+    raw_name = Map.get(params, "name") || Map.get(params, :name) || ""
+    explicit_name = String.trim(to_string(raw_name))
+    name = if explicit_name == "", do: derive_name_from_url(url), else: explicit_name
+
+    raw_sha = Map.get(params, "sha256") || Map.get(params, :sha256) || ""
+    sha256 = raw_sha |> to_string() |> String.trim() |> String.downcase()
+
+    insecure =
+      case Map.get(params, "insecure") || Map.get(params, :insecure) do
+        true -> true
+        "true" -> true
+        "1" -> true
+        "on" -> true
+        _ -> false
+      end
+
+    with :ok <- validate_download_url(url),
+         :ok <- validate_image_extension(name),
+         :ok <- validate_sha256(sha256),
+         {:ok, valid_name} <- preflight_upload(name) do
+      payload = %{
+        "url" => url,
+        "name" => valid_name,
+        "filename" => valid_name,
+        "sha256" => sha256,
+        "insecure" => insecure
+      }
+
+      case SpectrumPhx.Catalyst.submit("vali", "download_image", payload) do
+        {:ok, %{"task_id" => task_id}} ->
+          {:ok, %{name: valid_name, url: url, task_id: task_id}}
+
+        {:ok, resp} ->
+          {:ok, %{name: valid_name, url: url, task_id: Map.get(resp, "task_id")}}
+
+        {:error, reason} ->
+          {:error, SpectrumPhx.Catalyst.describe(reason)}
+      end
+    else
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      {:error, reason} -> {:error, describe_upload_error(reason)}
+    end
+  end
+
+  defp validate_download_url(url) do
+    uri = URI.parse(url)
+
+    cond do
+      url == "" ->
+        {:error, "Enter an HTTP or HTTPS URL to download."}
+
+      uri.scheme not in ["http", "https"] ->
+        {:error, "URL must start with http:// or https://."}
+
+      is_nil(uri.host) or String.trim(uri.host) == "" ->
+        {:error, "URL is missing a hostname."}
+
+      String.match?(url, ~r/[\s\x00-\x1f\x7f]/) ->
+        {:error, "URL must not contain spaces or control characters."}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_image_extension(name) do
+    lower = String.downcase(name)
+
+    cond do
+      name == "" ->
+        {:error, "Could not infer a filename from the URL; enter an image name ending in .iso, .qcow2, .img, .raw, .vmdk, or .ova."}
+
+      String.contains?(name, ["/", "\\"]) ->
+        {:error, "Image name must not contain path separators."}
+
+      Enum.any?(@image_extensions, &String.ends_with?(lower, &1)) ->
+        :ok
+
+      true ->
+        {:error, "Image name must end with .iso, .qcow2, .img, .raw, .vmdk, or .ova."}
+    end
+  end
+
+  defp validate_sha256(""), do: :ok
+
+  defp validate_sha256(sha) do
+    if String.match?(sha, ~r/\A[0-9a-f]{64}\z/) do
+      :ok
+    else
+      {:error, "SHA-256 checksum must be a 64-character hexadecimal string."}
+    end
+  end
 
   defp describe(reason) when is_binary(reason), do: reason
   defp describe({_status, message}) when is_binary(message), do: message

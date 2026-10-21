@@ -2005,12 +2005,34 @@ def report_ring_detach_candidate(hostname, ip):
 
     This does not detach anything. See the note at the top of this section.
     """
-    rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
-    if rc != 0:
-        sys.stderr.write(f"[Mipha HA] Could not read the ScyllaDB ring: "
-                         f"{(stderr or stdout or '').strip()[:200]}\n")
-        return
-    members = parse_nodetool_status(stdout)
+    rc_ring, res_ring, err_ring = run_mtls_spark_api(LOCAL_IP, "/api/v1/db/ring", None, method="GET")
+    members = []
+    if rc_ring == 0 and isinstance(res_ring, dict) and "nodes" in res_ring:
+        nodes = res_ring.get("nodes") or []
+        if nodes:
+            for n in nodes:
+                addr = n.get("address", "")
+                st = n.get("status", "")
+                st_code = "U" if st.lower().startswith("u") else "D"
+                state = n.get("state", "")
+                state_code = "N" if state.lower().startswith("n") else ("L" if state.lower().startswith("l") else ("J" if state.lower().startswith("j") else "M"))
+                is_available = n.get("available")
+                if is_available is None:
+                    is_available = (st_code == "U" and state_code == "N")
+                members.append({
+                    "address": addr,
+                    "status": st_code,
+                    "state": state_code,
+                    "available": bool(is_available),
+                    "host_id": n.get("host_id", ""),
+                })
+    if not members:
+        rc, stdout, stderr = run_remote_spark(LOCAL_IP, "nodetool status")
+        if rc != 0:
+            sys.stderr.write(f"[Mipha HA] Could not read the ScyllaDB ring: "
+                             f"{(err_ring or stderr or stdout or '').strip()[:200]}\n")
+            return
+        members = parse_nodetool_status(stdout)
     target = next((m for m in members if m["address"] == ip), None)
     if target is None:
         print(f"[Mipha HA] Host {hostname} ({ip}) is not a ScyllaDB ring member; "
@@ -2276,7 +2298,7 @@ def main():
                         start_units = ["zookeeper", "hydra-db", "daruk", "sidon", "spectrum", "spectrum-phx",
                                        "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst",
                                        "gatoway", "logos", "mipha", "agahnim", "slate",
-                                       "hylia"]
+                                       "hylia", "kass"]
                         ok_start, detail_start = spark_unit_action(ip, "start", start_units)
                         if not ok_start:
                             print(f"[Mipha HA] Could not start services on {hostname}: "

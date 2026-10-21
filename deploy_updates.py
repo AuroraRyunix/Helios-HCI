@@ -770,6 +770,7 @@ local_valcli = "valcli.py"
 local_mcli = "mcli"
 local_mcli_runner = "mcli-runner"
 local_allssh = "allssh"
+local_saltrun = "saltrun"
 local_dagur = "dagur.py"
 local_mimir_daemon = "mimir.py"
 local_rauru = "rauru.py"
@@ -830,6 +831,7 @@ local_static_dir = os.path.join(local_dir, "static")
 # different image than provisioning did would silently downgrade a service.
 IMAGES = {
     "slate": "docker.io/library/traefik:v2.10",
+    "kass": "docker.io/apache/kafka:3.8.0",
 }
 
 REGISTRY = (os.environ.get("HELIOS_REGISTRY") or "").strip()
@@ -1370,10 +1372,103 @@ def deploy_to_node(ip):
             print(f"[{ip}] Uploading valcli to /usr/local/bin/valcli...")
             put_text_file(sftp, local_valcli, "/usr/local/bin/valcli")
             
-            # 2ea. Copy allssh CLI
+            # 2ea. Copy allssh and saltrun CLIs
             print(f"[{ip}] Uploading allssh to /usr/local/bin/allssh...")
             put_text_file(sftp, local_allssh, "/usr/local/bin/allssh")
-            
+            print(f"[{ip}] Uploading saltrun to /usr/local/bin/saltrun...")
+            put_text_file(sftp, local_saltrun, "/usr/local/bin/saltrun")
+
+            # Seed SaltStack master/minion configs and state formulas on existing nodes
+            master_ip = nodes[0] if nodes else ip
+            for d in ("/etc/salt", "/etc/salt/master.d", "/etc/salt/minion.d", "/srv/salt", "/srv/salt/helios", "/srv/pillar"):
+                mkdir_p(sftp, d)
+            with sftp.open("/etc/salt/master.d/helios.conf", "w") as f_sm:
+                f_sm.write(
+                    "interface: 0.0.0.0\n"
+                    "auto_accept: True\n"
+                    "worker_threads: 4\n"
+                    "file_roots:\n"
+                    "  base:\n"
+                    "    - /srv/salt\n"
+                    "pillar_roots:\n"
+                    "  base:\n"
+                    "    - /srv/pillar\n"
+                )
+            with sftp.open("/etc/salt/minion.d/helios.conf", "w") as f_smn:
+                f_smn.write(
+                    f"master: {master_ip}\n"
+                    f"id: {ip}\n"
+                    "grains:\n"
+                    "  roles:\n"
+                    "    - helios-hypervisor\n"
+                    "    - sidon-storage\n"
+                )
+            with sftp.open("/srv/salt/top.sls", "w") as f_top:
+                f_top.write(
+                    "base:\n"
+                    "  '*':\n"
+                    "    - helios.base\n"
+                    "    - helios.sysctl\n"
+                    "    - helios.daemons\n"
+                    "    - helios.storage\n"
+                )
+            with sftp.open("/srv/salt/helios/base.sls", "w") as f_sbase:
+                f_sbase.write(
+                    "helios_base_dirs:\n"
+                    "  file.directory:\n"
+                    "    - names:\n"
+                    "      - /etc/hci\n"
+                    "      - /var/lib/hci/images\n"
+                    "      - /var/lib/hci/aether/nvram\n"
+                    "      - /run/hci\n"
+                    "    - mode: '0755'\n"
+                    "    - makedirs: True\n"
+                )
+            with sftp.open("/srv/salt/helios/sysctl.sls", "w") as f_ssys:
+                f_ssys.write(
+                    "net.ipv4.ip_forward:\n"
+                    "  sysctl.present:\n"
+                    "    - value: 1\n"
+                    "vm.swappiness:\n"
+                    "  sysctl.present:\n"
+                    "    - value: 10\n"
+                    "fs.aio-max-nr:\n"
+                    "  sysctl.present:\n"
+                    "    - value: 1048576\n"
+                )
+            with sftp.open("/srv/salt/helios/daemons.sls", "w") as f_ssvc:
+                f_ssvc.write(
+                    "helios_hypervisor_daemons:\n"
+                    "  service.running:\n"
+                    "    - names:\n"
+                    "      - libvirtd\n"
+                    "      - virtqemud\n"
+                    "      - spark-daemon\n"
+                    "    - enable: True\n"
+                )
+            with sftp.open("/srv/salt/helios/storage.sls", "w") as f_ssto:
+                f_ssto.write(
+                    "helios_sidon_dirs:\n"
+                    "  file.directory:\n"
+                    "    - names:\n"
+                    "      - /var/lib/hci/sidon\n"
+                    "      - /run/hci/sidon\n"
+                    "    - mode: '0755'\n"
+                    "    - makedirs: True\n"
+                )
+            with sftp.open("/srv/pillar/top.sls", "w") as f_ptop:
+                f_ptop.write(
+                    "base:\n"
+                    "  '*':\n"
+                    "    - helios\n"
+                )
+            with sftp.open("/srv/pillar/helios.sls", "w") as f_phel:
+                f_phel.write(
+                    "cluster_name: hci-01\n"
+                    "dfs_engine: sidon\n"
+                    "management_port: 9099\n"
+                )
+
             # 2f. Copy Dagur and Mimir daemons
             print(f"[{ip}] Uploading dagur daemon to /usr/local/bin/dagur...")
             put_text_file(sftp, local_dagur, "/usr/local/bin/dagur")
@@ -1670,6 +1765,51 @@ def deploy_to_node(ip):
             f_slate = sftp.open("/etc/containers/systemd/slate.container", "w")
             f_slate.write(slate_container_content)
             f_slate.close()
+
+            # Ensure Kafka directories and permissions exist
+            ssh.exec_command("mkdir -p /var/lib/hci/kafka/data /var/lib/hci/kafka/log && chown -R 1000:1000 /var/lib/hci/kafka || true")
+
+            # Update kass.container Quadlet
+            print(f"[{ip}] Writing kass.container Quadlet...")
+            try:
+                import json as _json
+                _cj_path = "/etc/hci/cluster.json"
+                _cj_raw = ""
+                with sftp.open(_cj_path, "r") as _f_cj:
+                    _cj_raw = _f_cj.read().decode("utf-8")
+                _cj = _json.loads(_cj_raw)
+                _hosts = _cj.get("hosts", [])
+                _node_id = 1
+                for _h in _hosts:
+                    if _h.get("ip") == ip:
+                        _node_id = _h.get("node_id", 1)
+                        break
+                _zoo_servers_str = ",".join(f"{_h.get('ip')}:2181" for _h in _hosts if _h.get("ip"))
+            except Exception:
+                _node_id = 1
+                _zoo_servers_str = ",".join(f"{h}:2181" for h in nodes)
+
+            kass_container_content = (
+                "[Unit]\n"
+                "Description=Kass (Kafka) Cluster Event Streaming Service\n"
+                "After=zookeeper.service\n"
+                "ConditionPathExists=!/etc/hci/maintenance.state\n\n"
+                "[Service]\n"
+                "Restart=always\n"
+                "CPUWeight=100\n"
+                "MemoryMax=1.5G\n"
+                "MemoryHigh=1.2G\n\n"
+                "[Container]\n"
+                f"Image={resolve_image('kass')}\n"
+                "Network=host\n"
+                "Volume=/var/lib/hci/kafka/data:/var/lib/kafka/data:Z\n"
+                "Volume=/var/lib/hci/kafka/log:/var/lib/kafka/logs:Z\n"
+                f"Exec=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties --override zookeeper.connect={_zoo_servers_str} --override broker.id={_node_id} --override listeners=PLAINTEXT://0.0.0.0:9092 --override advertised.listeners=PLAINTEXT://{ip}:9092 --override log.dirs=/var/lib/kafka/data --override offsets.topic.replication.factor=1 --override transaction.state.log.replication.factor=1 --override transaction.state.log.min.isr=1 --override auto.create.topics.enable=true\n"
+                "User=1000:1000\n"
+            )
+            f_kass = sftp.open("/etc/containers/systemd/kass.container", "w")
+            f_kass.write(kass_container_content)
+            f_kass.close()
     
             # Write Slate dynamic and static configuration files
             print(f"[{ip}] Writing Slate configuration files...")
@@ -1797,16 +1937,16 @@ def deploy_to_node(ip):
             
             # 4. Make executables runnable and manage CLI symlinks
             print(f"[{ip}] Setting executable permissions and updating CLI symlinks...")
-            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/rauru /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool && ln -sf /usr/local/bin/valcli /usr/local/bin/ncli && rm -f /usr/local/bin/acli")
+            ssh.exec_command("chmod +x /usr/local/bin/spark /usr/local/bin/cluster /usr/local/bin/spark-daemon /usr/local/bin/bifrost /usr/local/bin/mcli /usr/local/bin/mcli-runner /usr/local/bin/valcli /usr/local/bin/allssh /usr/local/bin/saltrun /usr/local/bin/dagur /usr/local/bin/mimir /usr/local/bin/rauru /usr/local/bin/vali /usr/local/bin/catalyst /usr/local/bin/catcli /usr/local/bin/gatoway /usr/local/bin/urbosa /usr/local/bin/logos /usr/local/bin/mipha /usr/local/bin/hylia /usr/local/bin/urbosa-bootstrap /usr/local/bin/check-updates /usr/local/bin/nodetool && ln -sf /usr/local/bin/valcli /usr/local/bin/ncli && rm -f /usr/local/bin/acli")
             
             # Copy spectrum files to /usr/local/bin/ for future rolling upgrades
             ssh.exec_command("mkdir -p /usr/local/bin/static && cp -rf /tmp/spectrum_build/static/* /usr/local/bin/static/ && cp -f /tmp/spectrum_build/Dockerfile /usr/local/bin/Dockerfile && cp -f /tmp/spectrum_build/spectrum_server.py /usr/local/bin/spectrum_server && chmod +x /usr/local/bin/spectrum_server")
             
-            # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum)
+            # 5. Strip [Install] and WantedBy sections from Quadlets (for zookeeper, hydra-db, spectrum, kass)
             print(f"[{ip}] Removing auto-start dependency from other container Quadlets...")
             cmd_strip = (
-                "sed -i '/\\[Install\\]/d' /etc/containers/systemd/zookeeper.container /etc/containers/systemd/hydra-db.container /etc/containers/systemd/spectrum.container || true && "
-                "sed -i '/WantedBy=multi-user.target/d' /etc/containers/systemd/zookeeper.container /etc/containers/systemd/hydra-db.container /etc/containers/systemd/spectrum.container || true"
+                "sed -i '/\\[Install\\]/d' /etc/containers/systemd/zookeeper.container /etc/containers/systemd/hydra-db.container /etc/containers/systemd/spectrum.container /etc/containers/systemd/kass.container || true && "
+                "sed -i '/WantedBy=multi-user.target/d' /etc/containers/systemd/zookeeper.container /etc/containers/systemd/hydra-db.container /etc/containers/systemd/spectrum.container /etc/containers/systemd/kass.container || true"
             )
             stdin, stdout, stderr = ssh.exec_command(cmd_strip)
             exit_code = stdout.channel.recv_exit_status()
@@ -2096,6 +2236,7 @@ WantedBy=multi-user.target
                 "systemctl enable logos && systemctl restart logos || true",
                 "systemctl enable mipha && systemctl restart mipha || true",
                 "systemctl enable hylia && systemctl restart hylia || true",
+                "(command -v salt-call >/dev/null 2>&1 || dnf install -y --nogpgcheck salt-master salt-minion 2>/dev/null || pip3 install salt 2>/dev/null || true); systemctl enable salt-master salt-minion 2>/dev/null; systemctl restart salt-master salt-minion 2>/dev/null || true",
                 "systemctl stop helios-config-syncer || true",
                 "systemctl disable helios-config-syncer || true",
                 "rm -f /etc/systemd/system/helios-config-syncer.service || true",

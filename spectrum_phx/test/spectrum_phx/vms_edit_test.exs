@@ -405,17 +405,17 @@ defmodule SpectrumPhx.VmsEditTest do
   describe "the write" do
     test "is a compare-and-swap on the VM still being stopped and unplaced" do
       assert Vms.update_cql() =~ "WHERE name = ? IF state = ? AND host_ip = ?"
-      assert Vms.update_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 15
+      assert Vms.update_cql() |> String.graphemes() |> Enum.count(&(&1 == "?")) == 30
     end
 
     test "carries the new definition and the expectation in the order the statement binds them" do
       {:ok, vm} = Vm.new(Map.put(edit_params(), "name", "web-01"))
       params = Vms.update_params(vm, @stopped)
 
-      assert length(params) == 15
-      assert {"text", "web-01"} == Enum.at(params, 12)
-      assert {"text", "Stopped"} == Enum.at(params, 13)
-      assert {"text", ""} == Enum.at(params, 14)
+      assert length(params) == 30
+      assert {"text", "web-01"} == Enum.at(params, 27)
+      assert {"text", "Stopped"} == Enum.at(params, 28)
+      assert {"text", ""} == Enum.at(params, 29)
       assert {"int", 2} == Enum.at(params, 0)
     end
   end

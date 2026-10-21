@@ -79,7 +79,8 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
     params =
       Form.defaults(
         container: List.first(options.containers),
-        network: options.networks |> List.first() |> Map.get(:id)
+        network: options.networks |> List.first() |> Map.get(:id),
+        graphics: options[:default_graphics] || "vnc"
       )
 
     {:ok,
@@ -338,7 +339,63 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
                 SPICE is not offered: it needs every host to report it in its capabilities,
                 and one that does not would refuse to start the VM.
               </p>
-              <.input field={@form[:audio_enabled]} type="checkbox" label="Enable audio device" />
+              <p :if={@options.spice? and @form[:graphics].value == "spice"} class="text-xs opacity-70 text-emerald-400/90" id="spice-active-note">
+                SPICE enables native guest desktop resolution auto-resizing (with spice-vdagent), hardware mouse integration, and high-performance display streaming.
+              </p>
+              <div class="grid grid-cols-1 gap-x-4 sm:grid-cols-2 mt-2">
+                <.input field={@form[:audio_enabled]} type="checkbox" label="Enable audio device" />
+                <.input field={@form[:secure_boot]} type="checkbox" label="UEFI Secure Boot (OVMF)" />
+                <.input field={@form[:vtpm_enabled]} type="checkbox" label="Virtual TPM 2.0 (swtpm)" />
+                <.input field={@form[:is_template]} type="checkbox" label="Mark as Golden Image Template" />
+              </div>
+            </section>
+
+            <section class="glass-card p-4 sm:p-5" id="affinity-section">
+              <h2 class="panel-title mb-1">DRS Placement &amp; Host Affinity</h2>
+              <p class="text-xs opacity-60 mb-3">
+                Optional placement rules evaluated by the cluster scheduler and DRS load balancer.
+              </p>
+              <div class="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+                <.input
+                  field={@form[:affinity_group]}
+                  type="text"
+                  label="Affinity group (keep together)"
+                  placeholder="db-cache-pair"
+                />
+                <.input
+                  field={@form[:anti_affinity_group]}
+                  type="text"
+                  label="Anti-affinity group (separate hosts)"
+                  placeholder="ha-web-tier"
+                />
+              </div>
+              <.input
+                field={@form[:pinned_hosts]}
+                type="text"
+                label="Pinned host IPs (comma-separated allowlist)"
+                placeholder="10.10.102.41, 10.10.102.42"
+              />
+            </section>
+
+            <section class="glass-card p-4 sm:p-5" id="cloud-init-section">
+              <h2 class="panel-title mb-1">Cloud-Init Customization (NoCloud)</h2>
+              <p class="text-xs opacity-60 mb-3">
+                When non-empty, Vali synthesizes a NoCloud <code>cidata</code> ISO and attaches it at boot.
+              </p>
+              <.input
+                field={@form[:cloud_init_userdata]}
+                type="textarea"
+                label="user-data (#cloud-config YAML or script)"
+                placeholder="#cloud-config&#10;ssh_authorized_keys:&#10;  - ssh-ed25519 AAAA..."
+                rows="4"
+              />
+              <.input
+                field={@form[:cloud_init_network]}
+                type="textarea"
+                label="network-config (optional Netplan v2 YAML)"
+                placeholder="version: 2&#10;ethernets: ..."
+                rows="3"
+              />
             </section>
           </div>
 
@@ -589,6 +646,8 @@ defmodule SpectrumPhxWeb.Vms.NewLive do
     }
   end
 
+  defp graphics_options(%{console_policy: "vnc"}), do: [{"VNC", "vnc"}]
+  defp graphics_options(%{console_policy: "spice"}), do: [{"SPICE", "spice"}]
   defp graphics_options(%{spice?: true}), do: [{"VNC", "vnc"}, {"SPICE", "spice"}]
   defp graphics_options(_options), do: [{"VNC", "vnc"}]
 

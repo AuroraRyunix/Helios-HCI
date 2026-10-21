@@ -34,14 +34,46 @@
             padding: 2px 7px; border-radius: 3px;
             background: #0b3d4a; color: #67e8f9; border: 1px solid #155e6b;
         }
+        #toolbar .badge.badge-agent {
+            background: #064e3b; color: #34d399; border-color: #059669;
+        }
         #toolbar .spacer { flex: 1; }
         #toolbar button {
             background: #1f2430; color: #cbd2dc; border: 1px solid #2d3443;
             padding: 5px 11px; border-radius: 4px; cursor: pointer; font-size: 12px;
+            transition: all 0.15s ease;
         }
         #toolbar button:hover { background: #262d3b; color: #fff; }
-        #stage { position: relative; height: calc(100% - 39px); overflow: auto; }
-        #spice-screen { width: 100%; height: 100%; }
+        #toolbar button.active {
+            background: #064e3b; color: #a7f3d0; border-color: #059669;
+        }
+        .hidden { display: none !important; }
+        #stage {
+            position: relative;
+            height: calc(100% - 39px);
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #000;
+        }
+        #spice-screen {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #spice-screen canvas {
+            display: block;
+            margin: auto;
+            border-radius: 4px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+            width: auto !important;
+            height: auto !important;
+            max-width: none !important;
+            max-height: none !important;
+        }
         .overlay {
             position: absolute; inset: 0; display: none;
             flex-direction: column; align-items: center; justify-content: center;
@@ -62,12 +94,15 @@
         #message-div, #debug-div { display: none; }
     </style>
 </head>
-<body>
+<body class="autoscale-enabled">
     <div id="toolbar">
         <span class="name" id="vm-name">&mdash;</span>
         <span class="badge">spice</span>
+        <span class="badge badge-agent hidden" id="badge-agent" title="spice-vdagent is running: native resolution auto-resize enabled">agent active</span>
         <span class="spacer"></span>
+        <button id="btn-autoresize" class="active" title="Toggle Dynamic Guest Resolution Auto-Resize (Native resolution, like VMware ESXi)">Auto-Resize: ON</button>
         <button id="btn-cad" title="Send Ctrl+Alt+Del to the guest">Ctrl+Alt+Del</button>
+        <button id="btn-fullscreen" title="Toggle Fullscreen">Fullscreen</button>
         <button id="btn-reconnect">Reconnect</button>
     </div>
 
@@ -181,9 +216,19 @@
                     onerror: (e) => showError('Disconnected',
                         'The SPICE connection ended: <code>'
                         + String(e && e.message ? e.message : e) + '</code>'),
-                    onsuccess: () => loading.classList.remove('show'),
-                    onagent: (conn) => SpiceHtml5.resize_helper(conn)
+                    onsuccess: () => {
+                        window.spice_connection = sc;
+                        loading.classList.remove('show');
+                    },
+                    onagent: (conn) => {
+                        window.spice_connection = conn;
+                        document.body.classList.add('agent-connected');
+                        const badge = document.getElementById('badge-agent');
+                        if (badge) badge.classList.remove('hidden');
+                        SpiceHtml5.resize_helper(conn);
+                    }
                 });
+                window.spice_connection = sc;
             } catch (e) {
                 showError('The SPICE client would not start', String(e));
                 return;
@@ -192,6 +237,50 @@
             // onsuccess is not fired by every path through the client, so the overlay is
             // also cleared once the display channel has drawn something.
             setTimeout(() => loading.classList.remove('show'), 4000);
+        }
+
+        // ESXi-style dynamic guest resolution auto-resizing
+        let resizeDebounce = null;
+        function triggerAutoResize() {
+            if (!sc) return;
+            if (document.body.classList.contains('autoscale-disabled')) return;
+            clearTimeout(resizeDebounce);
+            resizeDebounce = setTimeout(() => {
+                SpiceHtml5.resize_helper(sc);
+            }, 150);
+        }
+
+        const stageEl = document.getElementById('stage');
+        if (window.ResizeObserver && stageEl) {
+            const observer = new ResizeObserver(() => triggerAutoResize());
+            observer.observe(stageEl);
+        }
+        window.addEventListener('resize', triggerAutoResize);
+
+        const btnAutoresize = document.getElementById('btn-autoresize');
+        if (btnAutoresize) {
+            btnAutoresize.addEventListener('click', () => {
+                const isDisabled = document.body.classList.toggle('autoscale-disabled');
+                if (isDisabled) {
+                    btnAutoresize.textContent = 'Auto-Resize: OFF';
+                    btnAutoresize.classList.remove('active');
+                } else {
+                    btnAutoresize.textContent = 'Auto-Resize: ON';
+                    btnAutoresize.classList.add('active');
+                    if (sc) SpiceHtml5.resize_helper(sc);
+                }
+            });
+        }
+
+        const btnFullscreen = document.getElementById('btn-fullscreen');
+        if (btnFullscreen) {
+            btnFullscreen.addEventListener('click', () => {
+                if (!document.fullscreenElement) {
+                    document.documentElement.requestFullscreen().catch(() => {});
+                } else {
+                    document.exitFullscreen().catch(() => {});
+                }
+            });
         }
 
         document.getElementById('btn-reconnect').addEventListener('click', connect);

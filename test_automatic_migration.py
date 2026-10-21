@@ -132,6 +132,48 @@ class ManualMigrationUsesIt(unittest.TestCase):
         self.assertTrue(ok, detail)
         self.assertIn("/v1/vm/migrate-lock", events)
 
+    def test_target_lacking_kvm_is_refused(self):
+        events = []
+        rows = {"name": "web", "host_ip": A, "state": "Running", "ram": 1024,
+                "disks_list": "a:default:virtio", "iso": ""}
+
+        def cql(query):
+            if "FROM hydra.nodes" in query:
+                return 0, json.dumps({"ip": B, "status": "NORMAL", "maintenance_mode": False}), ""
+            return 0, "", ""
+
+        def spark(ip, path, payload=None, method="POST"):
+            if path == "/api/v1/host/capabilities":
+                if ip == A:
+                    return 0, {"kvm": True}, ""
+                else:
+                    return 0, {"kvm": False}, ""
+            return 0, healthy(), ""
+
+        patches = {
+            "get_node_ip": lambda h: h, "get_vm_xml_specs": lambda n: dict(rows),
+            "run_cql_query": cql,
+            "run_mtls_spark_api": spark,
+            "get_node_utilization": lambda ip, fetch_cpu=False: (0, 0, 16000, 1000),
+            "get_vm_disk_size": lambda n: 100, "get_storage_free_space": lambda ip: 100000,
+            "run_lwt": lambda ep, params, timeout=15: events.append(ep) or (True, True, {}, ""),
+            "run_remote_spark": lambda ip, cmd, timeout=None: events.append("remote") or (0, "", ""),
+            "run_mtls_spark_api_full": lambda *a, **k: events.append("dfs") or (200, {"forwarding_to": "x"}, ""),
+        }
+        started = [mock.patch.object(vali, n, f) for n, f in patches.items()]
+        for p in started:
+            p.start()
+        try:
+            with mock.patch("sys.stdout", io.StringIO()), mock.patch.object(vali.time, "sleep", lambda s: None):
+                (ok, detail) = vali.process_queue_task({"task_id": "t", "vm_name": "web", "action": "migrate",
+                                                        "target_host": B, "payload": {}})
+        finally:
+            for p in started:
+                p.stop()
+        self.assertFalse(ok)
+        self.assertIn("KVM", detail)
+        self.assertEqual(events, [], "no lock taken on capability incompatibility")
+
 
 class DrsDoesNotThrash(unittest.TestCase):
     def setUp(self):
@@ -233,6 +275,34 @@ class StartTimePlacementAlreadyExcludedThem(unittest.TestCase):
                 mock.patch.object(vali, "run_mtls_spark_api", lambda ip, path, payload=None, method="POST": (0, healthy(), "")), \
                 mock.patch.object(vali, "get_node_utilization", lambda ip, fetch_cpu=False: (0, 0, 16000, 1000)):
             self.assertEqual(vali.select_best_start_host(1024), B)
+
+    def test_strict_memory_overcommit_policy_refuses_placement(self):
+        def cql(query):
+            if "cluster_settings" in query:
+                return 0, "strict\n", ""
+            return 0, "\n".join(json.dumps({"ip": ip, "status": "NORMAL", "maintenance_mode": False})
+                                for ip in (A, B)), ""
+
+        with mock.patch.object(vali, "run_cql_query", cql), \
+                mock.patch.object(vali, "get_cluster_hosts", lambda: [{"ip": A}, {"ip": B}]), \
+                mock.patch.object(vali, "run_mtls_spark_api", lambda ip, path, payload=None, method="POST": (0, healthy(), "")), \
+                mock.patch.object(vali, "get_node_utilization", lambda ip, fetch_cpu=False: (0, 0, 16000, 15500)):
+            # Both hosts have only 500 MB free, but 1024 MB is needed.
+            # Strict policy should return None instead of falling back.
+            self.assertIsNone(vali.select_best_start_host(1024))
+
+    def test_overcommit_memory_policy_allows_placement_fallback(self):
+        def cql(query):
+            if "cluster_settings" in query:
+                return 0, "overcommit\n", ""
+            return 0, "\n".join(json.dumps({"ip": ip, "status": "NORMAL", "maintenance_mode": False})
+                                for ip in (A, B)), ""
+
+        with mock.patch.object(vali, "run_cql_query", cql), \
+                mock.patch.object(vali, "get_cluster_hosts", lambda: [{"ip": A}, {"ip": B}]), \
+                mock.patch.object(vali, "run_mtls_spark_api", lambda ip, path, payload=None, method="POST": (0, healthy(), "")), \
+                mock.patch.object(vali, "get_node_utilization", lambda ip, fetch_cpu=False: (0, 0, 16000, 15500)):
+            self.assertIsNotNone(vali.select_best_start_host(1024))
 
 
 if __name__ == "__main__":

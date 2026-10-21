@@ -111,10 +111,9 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       upload = file_input(view, "#upload-form", :image, [entry("rocky.iso", 4096)])
       assert render_upload(upload, "rocky.iso", 0) =~ "rocky.iso"
 
-      # auto_upload is false, so selecting a file must not have allocated anything. If it
-      # had, browsing away from this page would leak a vdisk per file picked.
+      # With auto_upload: true, selecting a file begins uploading and keeps the button disabled until done.
       assert view |> element("#upload-button") |> has_element?()
-      refute view |> element("#upload-button[disabled]") |> has_element?()
+      assert view |> element("#upload-button[disabled]") |> has_element?()
     end
 
     test "a file with the wrong extension is rejected client-side", %{conn: conn} do
@@ -123,7 +122,7 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       upload = file_input(view, "#upload-form", :image, [entry("notes.txt", 10)])
       render_upload(upload, "notes.txt", 0)
 
-      assert render(view) =~ "Only .iso, .qcow2 and .img files can be uploaded."
+      assert render(view) =~ "Only .iso, .qcow2, .img, .raw, .vmdk and .ova files can be uploaded."
     end
 
     test "an entry can be cancelled before it is sent", %{conn: conn} do
@@ -277,6 +276,29 @@ defmodule SpectrumPhxWeb.Images.IndexLiveTest do
       # The note is on the page, not in a comment: an operator needs to know the bytes do
       # not pass through this container's disk.
       assert html =~ "Nothing is staged here"
+    end
+
+    test "failed URL download displays error message and can be dismissed", %{conn: conn} do
+      Application.put_env(:spectrum_phx, :tasks_source, {:static, [
+        %{
+          "task_id" => "dl-fail-1",
+          "action" => "download_image",
+          "status" => "failed",
+          "progress" => 100,
+          "error_msg" => "curl failed: HTTP 404",
+          "payload" => Jason.encode!(%{"name" => "win2022.iso", "url" => "https://example.com/win.iso"})
+        }
+      ]})
+      on_exit(fn -> Application.delete_env(:spectrum_phx, :tasks_source) end)
+
+      {:ok, view, _html} = mount_view(conn)
+      assert has_element?(view, "#active-downloads")
+      assert render(view) =~ "FAILED"
+      assert render(view) =~ "curl failed: HTTP 404"
+      assert render(view) =~ "win2022.iso"
+
+      view |> element("#dismiss-task-dl-fail-1") |> render_click()
+      refute has_element?(view, "#active-downloads")
     end
   end
 

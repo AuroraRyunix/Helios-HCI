@@ -32,38 +32,43 @@
 **--------------------------------------------------------------------------*/
 function resize_helper(sc)
 {
-    if (!document.body.classList.contains('autoscale-enabled'))
+    if (document.body.classList.contains('autoscale-disabled'))
     {
         return;
     }
 
-    var area = document.getElementById("spice-area");
-    var w = area ? area.clientWidth : document.getElementById(sc.screen_id).clientWidth;
-    var h = area ? area.clientHeight : (window.innerHeight - 20);
-
-    var m = document.getElementById(sc.message_id);
-    if (m != null && !area)
+    sc = sc || window.spice_connection;
+    if (!sc || typeof sc.resize_window !== "function")
     {
-        if (window.getComputedStyle(m).getPropertyValue("display") == 'none')
-        {
-            var mh = parseInt(window.getComputedStyle(m).getPropertyValue("height"), 10);
-            h = h - mh;
-        }
-        else
-        {
-            h = h - m.offsetHeight - m.clientHeight;
-        }
+        return;
     }
 
+    var area = document.getElementById("spice-area") ||
+               document.getElementById("stage") ||
+               (sc.screen_id ? document.getElementById(sc.screen_id) : null);
+    if (!area)
+    {
+        return;
+    }
 
-    /* Xorg requires height be a multiple of 8; round down */
+    var w = area.clientWidth;
+    var h = area.clientHeight;
+
+    if (w <= 0 || h <= 0)
+    {
+        return;
+    }
+
+    /* Xorg / video drivers require height & width be a multiple of 8 */
     if (h % 8 > 0)
         h -= (h % 8);
 
-    /* Xorg requires width be a multiple of 8; round down */
     if (w % 8 > 0)
         w -= (w % 8);
 
+    /* Enforce sane bounds (at least 640x480) */
+    w = Math.max(640, w);
+    h = Math.max(480, h);
 
     sc.resize_window(0, w, h, 32, 0, 0);
     sc.spice_resize_timer = undefined;
@@ -71,7 +76,7 @@ function resize_helper(sc)
 
 function handle_resize(e)
 {
-    var sc = window.spice_connection;
+    var sc = (e && typeof e.resize_window === "function" ? e : null) || window.spice_connection;
     if (!sc)
         return;
 
@@ -81,7 +86,7 @@ function handle_resize(e)
         sc.spice_resize_timer = undefined;
     }
 
-    sc.spice_resize_timer = window.setTimeout(resize_helper, 200, sc);
+    sc.spice_resize_timer = window.setTimeout(resize_helper, 150, sc);
 }
 
 export {

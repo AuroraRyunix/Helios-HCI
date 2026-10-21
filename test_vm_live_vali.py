@@ -176,6 +176,17 @@ class Memory(LiveCase):
         self.assertIsNone(self.w.row_update())
         self.assertIn("unchanged", msg)
 
+    def test_memory_growth_persists_to_row(self):
+        ok, msg = self.change(op="memory", mib=4096)
+        self.assertTrue(ok, msg)
+        self.assertIn("memory = 4096", self.w.row_update())
+        self.assertIn("4096 MiB", msg)
+
+    def test_memory_with_persist_flag_updates_row(self):
+        ok, msg = self.change(op="memory", mib=1024, persist=True)
+        self.assertTrue(ok, msg)
+        self.assertIn("memory = 1024", self.w.row_update())
+
 
 class CdRom(LiveCase):
     def test_an_image_is_attached_on_the_host_then_inserted_then_recorded(self):
@@ -231,15 +242,20 @@ class Nics(LiveCase):
         self.assertIn("does not exist", self.change(op="nic", action="attach", network_id="ghost")[1])
         self.assertEqual(self.spark_calls(), [])
 
-    def test_only_the_last_nic_can_be_removed(self):
+    def test_arbitrary_nic_can_be_removed(self):
         self.w.row["network_id"] = '["a:virtio","b:virtio"]'
         ok, msg = self.change(op="nic", action="detach", index=0)
-        self.assertFalse(ok)
-        self.assertIn("only the last NIC", msg)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.spark_calls()[-1][3]["mac"], vali.vm_nic_mac("web", 0))
+        # The remaining NIC explicitly retains its original MAC address
+        self.assertIn(f'b:virtio:{vali.vm_nic_mac("web", 1)}', self.w.updates[-1])
+
+        # Detaching the last NIC also works
+        self.w.row["network_id"] = '["a:virtio","b:virtio"]'
         ok, msg = self.change(op="nic", action="detach", index=-1)
         self.assertTrue(ok, msg)
         self.assertEqual(self.spark_calls()[-1][3]["mac"], vali.vm_nic_mac("web", 1))
-        self.assertIn('["a:virtio"]', self.w.row_update())
+        self.assertIn('["a:virtio"]', self.w.updates[-1])
 
     def test_link_state_is_applied_and_said_not_to_persist(self):
         ok, msg = self.change(op="nic", action="link", index=0, state="down")
@@ -303,12 +319,15 @@ class Disks(LiveCase):
         self.assertIn("record updated", msg)
         self.assertIn("40GB", self.w.row_update())
 
-    def test_removal_needs_confirmation_and_only_takes_the_last_data_disk(self):
+    def test_removal_needs_confirmation_and_protects_boot_disk_while_allowing_middle_disk(self):
         self.assertIn("confirm_delete", self.change(op="disk", action="detach", index=1)[1])
         self.assertIn("boot disk", self.change(op="disk", action="detach", index=0, confirm_delete=True)[1])
         self.w.row["disks_list"] = "10GB:default-pool:virtio,20GB:default-pool:virtio,30GB:default-pool:virtio"
-        self.assertIn("only the last disk", self.change(op="disk", action="detach", index=1, confirm_delete=True)[1])
-        self.assertEqual(self.spark_calls(), [])
+        ok, msg = self.change(op="disk", action="detach", index=1, confirm_delete=True)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.spark_calls()[-1][3]["target"], "vdb")
+        self.assertIn("30GB:default-pool:virtio:web-disk2:c", self.w.row_update())
+        self.assertIn(("delete", "web-disk1"), [(e[1], e[2]) for e in self.w.kinds("sidon")])
 
     def test_removal_detaches_from_the_guest_then_writes_the_row_then_deletes_the_vdisk(self):
         ok, msg = self.change(op="disk", action="detach", index=1, confirm_delete=True)
@@ -364,6 +383,7 @@ class TheCli(unittest.TestCase):
         build = valcli.live_change_from_args
         self.assertEqual(build(["vcpus", "4"]), {"op": "vcpus", "count": 4})
         self.assertEqual(build(["memory", "1024"]), {"op": "memory", "mib": 1024})
+        self.assertEqual(build(["memory", "4096", "--persist"]), {"op": "memory", "mib": 4096, "persist": True})
         self.assertEqual(build(["cdrom", "0", "tools.iso"]), {"op": "cdrom", "slot": 0, "image": "tools.iso"})
         self.assertEqual(build(["cdrom", "1", "eject"]), {"op": "cdrom", "slot": 1, "image": None})
         self.assertEqual(build(["nic", "attach", "net-1"]), {"op": "nic", "action": "attach", "network_id": "net-1"})
@@ -374,6 +394,10 @@ class TheCli(unittest.TestCase):
         self.assertEqual(build(["disk", "resize", "1", "40"]), {"op": "disk", "action": "resize", "index": 1, "size_gib": 40})
         self.assertEqual(build(["disk", "detach", "2", "--confirm-delete"]),
                          {"op": "disk", "action": "detach", "index": 2, "confirm_delete": True})
+        self.assertEqual(build(["disk", "throttle", "1", "--iops", "500", "--bytes-sec", "10485760"]),
+                         {"op": "disk", "action": "throttle", "index": 1, "iops": 500, "bytes_sec": 10485760})
+        self.assertEqual(build(["resources", "--cpu-shares", "1024", "--cpu-limit", "200", "--cpu-reservation", "100", "--mem-reservation", "2048", "--mem-limit", "4096"]),
+                         {"op": "resources", "cpu_shares": 1024, "cpu_limit": 200, "cpu_reservation": 100, "mem_reservation": 2048, "mem_limit": 4096})
 
     def test_a_typo_is_an_error_and_never_a_different_change(self):
         for words in ([], ["vcpu", "4"], ["vcpus"], ["vcpus", "four"], ["disk", "detach", "2"],
@@ -444,6 +468,11 @@ class HeadroomAtDefineTime(unittest.TestCase):
         self.assertEqual(max_mem.get("unit"), "MiB")
         self.assertEqual(root_with.find("memory").text, "2048")
         self.assertEqual(root_with.find("currentMemory").text, "2048")
+        numa_cell = root_with.find("cpu/numa/cell")
+        self.assertIsNotNone(numa_cell, "A NUMA cell must be configured in CPU XML for memory hotplug")
+        self.assertEqual(numa_cell.get("memory"), "2048")
+        self.assertEqual(numa_cell.get("unit"), "MiB")
+        self.assertEqual(numa_cell.get("id"), "0")
 
     def test_the_memory_limit(self):
         limit = vali.hotplug_memory_limit

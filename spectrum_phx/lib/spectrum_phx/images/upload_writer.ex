@@ -259,7 +259,13 @@ defmodule SpectrumPhx.Images.UploadWriter do
       ]
 
       connect_opts = [
-        transport_opts: settings.transport_opts,
+        transport_opts:
+          Keyword.merge(settings.transport_opts,
+            buffer: 4 * 1024 * 1024,
+            recbuf: 4 * 1024 * 1024,
+            sndbuf: 4 * 1024 * 1024,
+            nodelay: true
+          ),
         protocols: [:http1],
         mode: :passive
       ]

@@ -46,6 +46,8 @@ defmodule SpectrumPhxWeb.Router do
       on_mount: [{SpectrumPhxWeb.UserAuth, :ensure_authenticated}] do
       live "/", Cluster.OverviewLive, :overview
       live "/hosts", Cluster.HostsLive, :hosts
+      live "/topology", Cluster.TopologyLive, :index
+      live "/central", Central.IndexLive, :index
 
       live "/vms", Vms.IndexLive, :index
       # Before "/vms/:name", which would otherwise match "new" as a VM name.

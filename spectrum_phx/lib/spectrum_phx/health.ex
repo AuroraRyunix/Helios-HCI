@@ -82,7 +82,7 @@ defmodule SpectrumPhx.Health do
     zookeeper_status hydra-db_status daruk_status sidon_status aether_status spectrum_status spectrum-phx_status
     spark-daemon_status libvirtd_status catalyst_status bifrost_status dagur_status
     mimir_status rauru_status vali_status gatoway_status urbosa_status logos_status mipha_status
-    agahnim_status slate_status hylia_status scylladb_ring_status zookeeper_consensus
+    agahnim_status slate_status hylia_status kass_status scylladb_ring_status zookeeper_consensus
     scylladb_replication spectrum_api_port mtls_cert_expiration ingress_cert_expiration
     certs_seeding_check slate_config_status libvirt_responsiveness hostname_resolution
     spectrum_privilege_check auth_seeding_check vip_binding_status maintenance_mode_check
@@ -570,4 +570,128 @@ defmodule SpectrumPhx.Health do
   defp describe(reason) when is_binary(reason), do: reason
   defp describe(%{__exception__: true} = reason), do: Exception.message(reason)
   defp describe(reason), do: inspect(reason)
+
+  # -- mutations & actions ---------------------------------------------------
+
+  @doc "Submit an immediate Mimir full-cluster diagnostics run via Catalyst."
+  def run_diagnostics_now do
+    SpectrumPhx.Catalyst.submit(
+      "dagur",
+      "execute",
+      %{
+        "job_name" => "Mimir Health Diagnostics",
+        "command" => "/usr/local/bin/mcli health_checks run_all"
+      },
+      component: "Mimir"
+    )
+  end
+
+  @doc "Enable or disable a Dagur scheduled job in `hydra.dagur_schedules`."
+  def toggle_schedule(job_name, enabled?, opts \\ []) do
+    job = string(job_name)
+    enabled = enabled? in [true, "true", "1", 1, "on"]
+
+    if is_nil(job) do
+      {:error, "Job name is required."}
+    else
+      cql = "UPDATE hydra.dagur_schedules SET enabled = ? WHERE job_name = ?"
+
+      case write_schedule(cql, [enabled, job], opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Could not update schedule #{job}: #{describe(reason)}"}
+      end
+    end
+  end
+
+  @doc "Update the cron expression of a Dagur scheduled job in `hydra.dagur_schedules`."
+  def update_schedule_cron(job_name, cron_expression, opts \\ []) do
+    job = string(job_name)
+    cron = string(cron_expression)
+
+    cond do
+      is_nil(job) ->
+        {:error, "Job name is required."}
+
+      is_nil(cron) or length(String.split(cron, ~r/\s+/, trim: true)) != 5 ->
+        {:error, "Cron expression must have 5 space-separated fields (min hour dom mon dow)."}
+
+      true ->
+        cql = "UPDATE hydra.dagur_schedules SET cron_expression = ? WHERE job_name = ?"
+
+        case write_schedule(cql, [cron, job], opts) do
+          :ok -> :ok
+          {:error, reason} -> {:error, "Could not update cron for #{job}: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Read a schedule's command and dispatch an immediate run via Catalyst."
+  def run_schedule_now(job_name, opts \\ []) do
+    job = string(job_name)
+
+    if is_nil(job) do
+      {:error, "Job name is required."}
+    else
+      with {:ok, command} <- lookup_schedule_command(job, opts) do
+        SpectrumPhx.Catalyst.submit(
+          "dagur",
+          "execute",
+          %{
+            "job_name" => job,
+            "command" => command
+          },
+          component: "Dagur"
+        )
+      end
+    end
+  end
+
+  defp lookup_schedule_command(job, opts) do
+    result =
+      cond do
+        Keyword.keyword?(opts) and Keyword.has_key?(opts, :schedules) ->
+          {:ok, Keyword.fetch!(opts, :schedules)}
+
+        true ->
+          case source() do
+            {:static, %{} = data} ->
+              {:ok, Map.get(data, :schedules, [])}
+
+            _ ->
+              safely(fn ->
+                Hydra.query("SELECT job_name, command FROM hydra.dagur_schedules WHERE job_name = ?", [job])
+              end)
+          end
+      end
+
+    case result do
+      {:ok, rows} ->
+        found =
+          rows
+          |> Enum.map(&stringify/1)
+          |> Enum.find(&(string(&1["job_name"]) == job))
+
+        case found && string(found["command"]) do
+          nil -> {:error, "Schedule #{job} was not found or has no command."}
+          cmd -> {:ok, cmd}
+        end
+
+      {:error, reason} ->
+        {:error, "Could not read schedule #{job}: #{describe(reason)}"}
+    end
+  end
+
+  defp write_schedule(cql, params, opts) do
+    case Keyword.get(opts, :source, source()) do
+      {:static, %{} = data} ->
+        if is_pid(data[:sink]), do: send(data[:sink], {:write, cql, params})
+        Map.get(data, :write_result, :ok)
+
+      _ ->
+        case safely(fn -> Hydra.query(cql, params) end) do
+          {:ok, _} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
 end

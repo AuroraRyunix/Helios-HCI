@@ -55,10 +55,11 @@ defmodule SpectrumPhx.Vms do
   alias SpectrumPhx.Storage.Containers
   alias SpectrumPhx.Vms.Vm
 
-  @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status, graphics"
+  @columns "name, vcpu, memory, disk_path, disk_size, state, host_ip, disks_list, firmware, iso, boot_device, network_id, cpu_model, audio_enabled, status, graphics, notes, tags, cpu_shares, cpu_limit, cpu_reservation, mem_reservation, mem_limit, affinity_group, anti_affinity_group, pinned_hosts, is_template, vtpm_enabled, secure_boot, cloud_init_userdata, cloud_init_network"
+  @read_columns "#{@columns}, pci_devices, usb_devices, guest_ips"
 
-  @list_cql "SELECT #{@columns} FROM hydra.vms"
-  @get_cql "SELECT #{@columns} FROM hydra.vms WHERE name = ?"
+  @list_cql "SELECT #{@read_columns} FROM hydra.vms"
+  @get_cql "SELECT #{@read_columns} FROM hydra.vms WHERE name = ?"
 
   # The compare-and-swap that makes a start safe: the update only lands if `host_ip` is
   # still what the caller believed it was when it decided to start the VM.
@@ -97,7 +98,7 @@ defmodule SpectrumPhx.Vms do
   # An edit of a stopped VM. Conditional on the row still being the stopped, unplaced one the edit
   # was planned against: a start that claimed it in the meantime wins, and the edit is refused
   # (and the storage it created is given back) rather than rewriting a running VM's definition.
-  @update_cql "UPDATE hydra.vms SET vcpu = ?, memory = ?, disk_path = ?, disk_size = ?, disks_list = ?, firmware = ?, iso = ?, boot_device = ?, network_id = ?, cpu_model = ?, audio_enabled = ?, graphics = ? WHERE name = ? IF state = ? AND host_ip = ?"
+  @update_cql "UPDATE hydra.vms SET vcpu = ?, memory = ?, disk_path = ?, disk_size = ?, disks_list = ?, firmware = ?, iso = ?, boot_device = ?, network_id = ?, cpu_model = ?, audio_enabled = ?, graphics = ?, notes = ?, tags = ?, cpu_shares = ?, cpu_limit = ?, cpu_reservation = ?, mem_reservation = ?, mem_limit = ?, affinity_group = ?, anti_affinity_group = ?, pinned_hosts = ?, is_template = ?, vtpm_enabled = ?, secure_boot = ?, cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ? IF state = ? AND host_ip = ?"
 
   @migration_lock "migrating"
   @unlocked_status "running"
@@ -383,7 +384,22 @@ defmodule SpectrumPhx.Vms do
         {"text", vm.cpu_model},
         {"boolean", vm.audio_enabled},
         {"text", vm.status},
-        {"text", vm.graphics}
+        {"text", vm.graphics},
+        {"text", vm.notes},
+        {"text", vm.tags},
+        {"int", vm.cpu_shares},
+        {"int", vm.cpu_limit},
+        {"int", vm.cpu_reservation},
+        {"int", vm.mem_reservation},
+        {"int", vm.mem_limit},
+        {"text", vm.affinity_group},
+        {"text", vm.anti_affinity_group},
+        {"text", vm.pinned_hosts},
+        {"boolean", vm.is_template},
+        {"boolean", vm.vtpm_enabled},
+        {"boolean", vm.secure_boot},
+        {"text", vm.cloud_init_userdata},
+        {"text", vm.cloud_init_network}
       ]
 
       case source() do
@@ -654,6 +670,21 @@ defmodule SpectrumPhx.Vms do
       {"text", edited.cpu_model},
       {"boolean", edited.audio_enabled},
       {"text", edited.graphics},
+      {"text", edited.notes},
+      {"text", edited.tags},
+      {"int", edited.cpu_shares},
+      {"int", edited.cpu_limit},
+      {"int", edited.cpu_reservation},
+      {"int", edited.mem_reservation},
+      {"int", edited.mem_limit},
+      {"text", edited.affinity_group},
+      {"text", edited.anti_affinity_group},
+      {"text", edited.pinned_hosts},
+      {"boolean", edited.is_template},
+      {"boolean", edited.vtpm_enabled},
+      {"boolean", edited.secure_boot},
+      {"text", edited.cloud_init_userdata},
+      {"text", edited.cloud_init_network},
       {"text", edited.name},
       {"text", current.state},
       {"text", current.host_ip || ""}
@@ -914,6 +945,7 @@ defmodule SpectrumPhx.Vms do
   def power_on(name, opts \\ []) do
     with {:ok, name} <- validate_name(name),
          {:ok, vm} <- get_vm(name),
+         :ok <- refuse_if_template(vm),
          :ok <- refuse_if_migrating(vm),
          :ok <- refuse_if_running(vm),
          {:ok, target} <- claim_requested_host(vm, Keyword.get(opts, :host_ip)) do
@@ -1058,6 +1090,27 @@ defmodule SpectrumPhx.Vms do
           _ -> false
         end
 
+      vtpm_enabled =
+        case attrs["vtpm_enabled"] do
+          true -> true
+          "true" -> true
+          _ -> false
+        end
+
+      secure_boot =
+        case attrs["secure_boot"] do
+          true -> true
+          "true" -> true
+          _ -> false
+        end
+
+      is_template =
+        case attrs["is_template"] do
+          true -> true
+          "true" -> true
+          _ -> false
+        end
+
       payload = %{
         "name" => name,
         "vcpus" => vcpus,
@@ -1067,6 +1120,14 @@ defmodule SpectrumPhx.Vms do
         "cpu_model" => attrs["cpu_model"] || "",
         "graphics" => attrs["graphics"] || "vnc",
         "audio_enabled" => audio_enabled,
+        "vtpm_enabled" => vtpm_enabled,
+        "secure_boot" => secure_boot,
+        "is_template" => is_template,
+        "affinity_group" => attrs["affinity_group"] || "",
+        "anti_affinity_group" => attrs["anti_affinity_group"] || "",
+        "pinned_hosts" => attrs["pinned_hosts"] || "",
+        "cloud_init_userdata" => attrs["cloud_init_userdata"] || "",
+        "cloud_init_network" => attrs["cloud_init_network"] || "",
         "disks" => disks_val,
         "iso" => iso_val,
         "network_id" => network_id_val
@@ -1088,6 +1149,135 @@ defmodule SpectrumPhx.Vms do
       end
     end
   end
+
+  @doc """
+  Mark or unmark a stopped VM as a golden template.
+  """
+  @spec set_template(String.t(), boolean()) :: {:ok, Vm.t()} | {:error, term()}
+  def set_template(name, enabled?) when is_boolean(enabled?) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name),
+         :ok <- require_stopped(vm) do
+      updated = %Vm{vm | is_template: enabled?}
+
+      case source() do
+        {:static, vms} ->
+          new_list =
+            Enum.map(vms, fn row ->
+              v = Vm.from_row(row)
+              if v.name == name, do: updated, else: v
+            end)
+
+          Application.put_env(:spectrum_phx, :vms_source, {:static, new_list})
+          broadcast({:vm_updated, name})
+          {:ok, updated}
+
+        :hydra ->
+          cql = "UPDATE hydra.vms SET is_template = ? WHERE name = ? IF state = ? AND host_ip = ?"
+          params = [{"boolean", enabled?}, {"text", name}, {"text", vm.state}, {"text", vm.host_ip || ""}]
+
+          case Hydra.apply_lwt(cql, params) do
+            {:ok, true} ->
+              broadcast({:vm_updated, name})
+              {:ok, updated}
+
+            {:ok, false} ->
+              {:error, :changed}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  @doc """
+  Update DRS affinity, anti-affinity, and host pinning rules for a VM (live or stopped).
+  """
+  @spec update_affinity(String.t(), map()) :: {:ok, Vm.t()} | {:error, term()}
+  def update_affinity(name, attrs) when is_map(attrs) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name) do
+      aff = clean_opt_str(attrs["affinity_group"])
+      anti = clean_opt_str(attrs["anti_affinity_group"])
+      pinned = clean_opt_str(attrs["pinned_hosts"])
+      updated = %Vm{vm | affinity_group: aff, anti_affinity_group: anti, pinned_hosts: pinned}
+
+      case source() do
+        {:static, vms} ->
+          new_list =
+            Enum.map(vms, fn row ->
+              v = Vm.from_row(row)
+              if v.name == name, do: updated, else: v
+            end)
+
+          Application.put_env(:spectrum_phx, :vms_source, {:static, new_list})
+          broadcast({:vm_updated, name})
+          {:ok, updated}
+
+        :hydra ->
+          cql = "UPDATE hydra.vms SET affinity_group = ?, anti_affinity_group = ?, pinned_hosts = ? WHERE name = ?"
+          params = [{"text", aff}, {"text", anti}, {"text", pinned}, {"text", name}]
+
+          case Hydra.query(cql, params) do
+            {:ok, _} ->
+              broadcast({:vm_updated, name})
+              {:ok, updated}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  @doc """
+  Update Cloud-Init NoCloud (`cidata`) user-data and network-config for a VM.
+  """
+  @spec update_cloud_init(String.t(), map()) :: {:ok, Vm.t()} | {:error, term()}
+  def update_cloud_init(name, attrs) when is_map(attrs) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name) do
+      ud = clean_opt_str(attrs["cloud_init_userdata"])
+      net = clean_opt_str(attrs["cloud_init_network"])
+      updated = %Vm{vm | cloud_init_userdata: ud, cloud_init_network: net}
+
+      case source() do
+        {:static, vms} ->
+          new_list =
+            Enum.map(vms, fn row ->
+              v = Vm.from_row(row)
+              if v.name == name, do: updated, else: v
+            end)
+
+          Application.put_env(:spectrum_phx, :vms_source, {:static, new_list})
+          broadcast({:vm_updated, name})
+          {:ok, updated}
+
+        :hydra ->
+          cql = "UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?"
+          params = [{"text", ud}, {"text", net}, {"text", name}]
+
+          case Hydra.query(cql, params) do
+            {:ok, _} ->
+              broadcast({:vm_updated, name})
+              {:ok, updated}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  defp clean_opt_str(nil), do: nil
+  defp clean_opt_str(val) when is_binary(val) do
+    case String.trim(val) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+  defp clean_opt_str(other), do: clean_opt_str(to_string(other))
 
   @doc """
   Submit one unit of work to Catalyst's `vali` queue and return without waiting.
@@ -1229,6 +1419,10 @@ defmodule SpectrumPhx.Vms do
     end
   end
 
+  defp refuse_if_template(%Vm{} = vm) do
+    if Vm.template?(vm), do: {:error, :is_template}, else: :ok
+  end
+
   defp refuse_if_migrating(%Vm{} = vm) do
     if Vm.migrating?(vm), do: {:error, :migrating}, else: :ok
   end
@@ -1244,6 +1438,475 @@ defmodule SpectrumPhx.Vms do
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, _key, ""), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  @doc "List snapshots for all virtual disks of a VM."
+  def list_snapshots(vm_name) do
+    case source() do
+      {:static, _} ->
+        {:ok, []}
+
+      _ ->
+        case get_vm(vm_name) do
+          {:ok, vm} ->
+            disk_ids =
+              vm
+              |> Vm.disks()
+              |> Enum.map(& &1.resource)
+              |> MapSet.new()
+
+            cql = "SELECT vdisk_id, parent_vdisk, class, size_bytes FROM hydra.dfs_vdisks"
+
+            case Hydra.query(cql, []) do
+              {:ok, rows} ->
+                snaps =
+                  rows
+                  |> Enum.filter(fn r ->
+                    MapSet.member?(disk_ids, r["parent_vdisk"]) and r["class"] in ["immutable", "ro"]
+                  end)
+                  |> Enum.map(fn r ->
+                    vdisk_snap = r["vdisk_id"]
+                    parent = r["parent_vdisk"]
+                    prefix = parent <> "_"
+
+                    name =
+                      if String.starts_with?(vdisk_snap, prefix),
+                        do: String.replace_prefix(vdisk_snap, prefix, ""),
+                        else: vdisk_snap
+
+                    %{
+                      name: name,
+                      vdisk_snapshot: vdisk_snap,
+                      parent_vdisk: parent,
+                      size_bytes: r["size_bytes"] || 0
+                    }
+                  end)
+                  |> Enum.uniq_by(& &1.name)
+
+                {:ok, snaps}
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
+  end
+
+  @doc "Take a snapshot across all disks of a VM, freezing guest filesystems via QEMU Guest Agent if running."
+  def create_snapshot(vm_name, snapshot_name) do
+    with {:ok, vm} <- get_vm(vm_name) do
+      disks = Vm.disks(vm)
+      now_ms = System.system_time(:millisecond)
+      running? = Vm.running?(vm) and (vm.host_ip || "") != ""
+
+      froze? =
+        if running? do
+          match?(
+            {:ok, %{"ok" => true}},
+            Spark.vm_guest_agent_action(vm.host_ip, vm.name, %{"action" => "fsfreeze-freeze"})
+          )
+        else
+          false
+        end
+
+      try do
+        results =
+          Enum.map(disks, fn d ->
+            child_id = "#{d.resource}_#{snapshot_name}"
+
+            case Spark.dfs(Config.local_ip(), "snapshot", %{
+                   "vdisk_id" => d.resource,
+                   "child_id" => child_id
+                 }) do
+              {:ok, _} ->
+                _ =
+                  Hydra.query(
+                    "INSERT INTO hydra.dfs_snapshot_index (vdisk_id, created_at_ms, snapshot_id, origin) VALUES (?, ?, ?, ?)",
+                    [{"text", d.resource}, {"bigint", now_ms}, {"text", child_id}, {"text", "manual"}]
+                  )
+
+                :ok
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+          end)
+
+        case Enum.find(results, &match?({:error, _}, &1)) do
+          nil ->
+            mode = if froze?, do: "app-consistent", else: "crash-consistent"
+            {:ok, "Snapshot #{snapshot_name} taken (#{mode})."}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+      after
+        if froze? do
+          _ = Spark.vm_guest_agent_action(vm.host_ip, vm.name, %{"action" => "fsfreeze-thaw"})
+        end
+      end
+    end
+  end
+
+  @doc "Roll back a VM to a snapshot. Supports `live: true` to stop, detach, roll back, and restart."
+  def rollback_snapshot(vm_name, snapshot_name, opts \\ []) do
+    live? = Keyword.get(opts, :live, false)
+
+    with {:ok, vm} <- get_vm(vm_name) do
+      cond do
+        Vm.running?(vm) and not live? ->
+          {:error, "VM is running; pass live: true or stop the VM before rolling back."}
+
+        true ->
+          was_running? = Vm.running?(vm)
+
+          if was_running? do
+            _ = power_off(vm_name)
+            wait_until_stopped(vm_name, 15)
+          end
+
+          disks = Vm.disks(vm)
+
+          # Ensure vdisks are detached across storage hosts before invoking Sidon's rollback op
+          Enum.each(disks, fn d ->
+            Enum.each(spark_ips(), fn ip ->
+              _ = Spark.dfs(ip, "detach", %{"vdisk_id" => d.resource})
+            end)
+          end)
+
+          results =
+            Enum.map(disks, fn d ->
+              child_id =
+                if String.starts_with?(snapshot_name, d.resource),
+                  do: snapshot_name,
+                  else: "#{d.resource}_#{snapshot_name}"
+
+              case Spark.dfs(Config.local_ip(), "rollback", %{
+                     "vdisk_id" => d.resource,
+                     "child_id" => child_id
+                   }) do
+                {:ok, _} -> :ok
+                {:error, reason} -> {:error, reason}
+              end
+            end)
+
+          case Enum.find(results, &match?({:error, _}, &1)) do
+            nil ->
+              if was_running?, do: _ = power_on(vm_name)
+              broadcast({:vm_updated, vm_name})
+              {:ok, "VM #{vm_name} rolled back to #{snapshot_name}."}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  defp wait_until_stopped(_vm_name, 0), do: :ok
+
+  defp wait_until_stopped(vm_name, attempts) do
+    case get_vm(vm_name) do
+      {:ok, %Vm{} = vm} ->
+        if not Vm.running?(vm) and (vm.host_ip || "") == "" do
+          :ok
+        else
+          Process.sleep(1_000)
+          wait_until_stopped(vm_name, attempts - 1)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  @doc "Clone a VM (or deploy from a template) and all of its virtual disks."
+  def clone_vm(source_name, target_name) do
+    with {:ok, src_vm} <- get_vm(source_name),
+         {:ok, target_name} <- Vm.validate_name(target_name) do
+      case get_vm(target_name) do
+        {:ok, _existing} ->
+          {:error, "A VM named #{target_name} already exists."}
+
+        {:error, _} ->
+          disks = Vm.disks(src_vm)
+
+          new_disk_specs =
+            disks
+            |> Enum.with_index()
+            |> Enum.map(fn {d, idx} ->
+              target_vid = "#{target_name}-disk#{idx}"
+
+              case Spark.dfs(Config.local_ip(), "clone", %{
+                     "vdisk_id" => d.resource,
+                     "child_id" => target_vid
+                   }) do
+                {:ok, _} -> :ok
+                {:error, _} -> :ok
+              end
+
+              let = <<?a + rem(idx, 26)>>
+              "#{d.size_gib}GB:#{d.container}:#{d.bus}:#{target_vid}:#{let}"
+            end)
+            |> Enum.join(",")
+
+          note_prefix = if Vm.template?(src_vm), do: "Deployed from template", else: "Cloned from"
+
+          new_vm = %Vm{
+            src_vm
+            | name: target_name,
+              state: "Stopped",
+              host_ip: "",
+              status: nil,
+              is_template: false,
+              disks_list: new_disk_specs,
+              notes: "#{note_prefix} #{source_name}"
+          }
+
+          params = [
+            {"text", new_vm.name},
+            {"int", new_vm.vcpu},
+            {"int", new_vm.memory},
+            {"text", new_vm.disk_path},
+            {"int", new_vm.disk_size},
+            {"text", new_vm.state},
+            {"text", new_vm.host_ip},
+            {"text", new_vm.disks_list},
+            {"text", new_vm.firmware},
+            {"text", new_vm.iso},
+            {"text", new_vm.boot_device},
+            {"text", new_vm.network_id},
+            {"text", new_vm.cpu_model},
+            {"boolean", new_vm.audio_enabled},
+            {"text", new_vm.status},
+            {"text", new_vm.graphics},
+            {"text", new_vm.notes},
+            {"text", new_vm.tags},
+            {"int", new_vm.cpu_shares},
+            {"int", new_vm.cpu_limit},
+            {"int", new_vm.cpu_reservation},
+            {"int", new_vm.mem_reservation},
+            {"int", new_vm.mem_limit},
+            {"text", new_vm.affinity_group},
+            {"text", new_vm.anti_affinity_group},
+            {"text", new_vm.pinned_hosts},
+            {"boolean", new_vm.is_template},
+            {"boolean", new_vm.vtpm_enabled},
+            {"boolean", new_vm.secure_boot},
+            {"text", new_vm.cloud_init_userdata},
+            {"text", new_vm.cloud_init_network}
+          ]
+
+          case Hydra.apply_lwt(@insert_cql, params) do
+            {:ok, true} ->
+              broadcast({:vm_created, target_name})
+              {:ok, new_vm}
+
+            {:ok, false} ->
+              {:error, :already_exists}
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+      end
+    end
+  end
+
+  @doc "Attach or detach a PCI passthrough device (live when running, metadata update when stopped)."
+  def change_pci_device(name, action, bdf) when action in ["attach", "detach"] and is_binary(bdf) do
+    norm_bdf = String.downcase(String.trim(bdf))
+
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name) do
+      if Vm.running?(vm) do
+        live_change(name, %{"op" => "pci", "action" => action, "bdf" => norm_bdf})
+      else
+        current = Vm.pci_device_list(vm)
+        next =
+          case action do
+            "attach" -> Enum.uniq(current ++ [norm_bdf])
+            "detach" -> Enum.reject(current, &(&1 == norm_bdf))
+          end
+
+        next_str = Enum.join(next, ",")
+        updated = %Vm{vm | pci_devices: if(next_str == "", do: nil, else: next_str)}
+
+        case source() do
+          {:static, vms} ->
+            new_list = Enum.map(vms, fn r -> v = Vm.from_row(r); if v.name == name, do: updated, else: v end)
+            Application.put_env(:spectrum_phx, :vms_source, {:static, new_list})
+            broadcast({:vm_updated, name})
+            {:ok, updated}
+
+          :hydra ->
+            case Hydra.query("UPDATE hydra.vms SET pci_devices = ? WHERE name = ?", [{"text", next_str}, {"text", name}]) do
+              {:ok, _} ->
+                broadcast({:vm_updated, name})
+                {:ok, updated}
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+        end
+      end
+    end
+  end
+
+  @doc "Attach or detach a USB passthrough device (live when running, metadata update when stopped)."
+  def change_usb_device(name, action, usb_id) when action in ["attach", "detach"] and is_binary(usb_id) do
+    norm_usb = String.downcase(String.trim(usb_id))
+
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name) do
+      if Vm.running?(vm) do
+        live_change(name, %{"op" => "usb", "action" => action, "usb_id" => norm_usb})
+      else
+        current = Vm.usb_device_list(vm)
+        next =
+          case action do
+            "attach" -> Enum.uniq(current ++ [norm_usb])
+            "detach" -> Enum.reject(current, &(&1 == norm_usb))
+          end
+
+        next_str = Enum.join(next, ",")
+        updated = %Vm{vm | usb_devices: if(next_str == "", do: nil, else: next_str)}
+
+        case source() do
+          {:static, vms} ->
+            new_list = Enum.map(vms, fn r -> v = Vm.from_row(r); if v.name == name, do: updated, else: v end)
+            Application.put_env(:spectrum_phx, :vms_source, {:static, new_list})
+            broadcast({:vm_updated, name})
+            {:ok, updated}
+
+          :hydra ->
+            case Hydra.query("UPDATE hydra.vms SET usb_devices = ? WHERE name = ?", [{"text", next_str}, {"text", name}]) do
+              {:ok, _} ->
+                broadcast({:vm_updated, name})
+                {:ok, updated}
+
+              {:error, reason} ->
+                {:error, reason}
+            end
+        end
+      end
+    end
+  end
+
+  @doc "Query host PCI passthrough inventory."
+  def host_pci_devices(host_ip) do
+    ip = if host_ip in [nil, ""], do: Config.local_ip(), else: host_ip
+
+    case source() do
+      {:static, _} ->
+        {:ok, %{"iommu_enabled" => false, "devices" => []}}
+
+      :hydra ->
+        case Spark.host_pci(ip) do
+          {:ok, body} when is_map(body) -> {:ok, body}
+          _ -> {:ok, %{"iommu_enabled" => false, "devices" => []}}
+        end
+    end
+  end
+
+  @doc "Query host USB passthrough inventory."
+  def host_usb_devices(host_ip) do
+    ip = if host_ip in [nil, ""], do: Config.local_ip(), else: host_ip
+
+    case source() do
+      {:static, _} ->
+        {:ok, %{"devices" => []}}
+
+      :hydra ->
+        case Spark.host_usb(ip) do
+          {:ok, body} when is_map(body) -> {:ok, body}
+          _ -> {:ok, %{"devices" => []}}
+        end
+    end
+  end
+
+  @doc "Fetch QEMU Guest Agent status, OS info, and live IP addresses for a running VM."
+  def guest_agent_status(%Vm{} = vm) do
+    cond do
+      elem(source(), 0) == :static ->
+        {:ok, %{"connected" => false}}
+
+      not Vm.running?(vm) or (vm.host_ip || "") == "" ->
+        {:ok, %{"connected" => false}}
+
+      true ->
+        case Spark.vm_guest_agent(vm.host_ip, vm.name) do
+          {:ok, %{"connected" => true, "ip_addresses" => ips} = body} when is_list(ips) ->
+            ip_str = Enum.join(ips, ",")
+
+            if ip_str != "" and ip_str != (vm.guest_ips || "") do
+              _ = Hydra.query("UPDATE hydra.vms SET guest_ips = ? WHERE name = ?", [{"text", ip_str}, {"text", vm.name}])
+            end
+
+            {:ok, body}
+
+          {:ok, body} when is_map(body) ->
+            {:ok, body}
+
+          _ ->
+            {:ok, %{"connected" => false}}
+        end
+    end
+  rescue
+    _ -> {:ok, %{"connected" => false}}
+  end
+
+  @doc "Perform a QEMU Guest Agent action (ping, fsfreeze-freeze, fsfreeze-thaw, set-user-password, exec)."
+  def guest_agent_action(name, payload) when is_map(payload) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name),
+         :ok <- require_running(vm) do
+      ip = if (vm.host_ip || "") == "", do: Config.local_ip(), else: vm.host_ip
+
+      case Spark.vm_guest_agent_action(ip, name, payload) do
+        {:ok, %{"ok" => true} = body} -> {:ok, body}
+        {:ok, %{"error" => err}} -> {:error, err}
+        {:error, {status, msg}} -> {:error, "#{msg} (HTTP #{status})"}
+        {:error, reason} -> {:error, inspect(reason)}
+      end
+    end
+  end
+
+  @doc "Read buffered serial console output for a running VM."
+  def serial_read(%Vm{} = vm) do
+    cond do
+      elem(source(), 0) == :static ->
+        {:ok, %{"output" => "", "pty" => ""}}
+
+      not Vm.running?(vm) or (vm.host_ip || "") == "" ->
+        {:ok, %{"output" => "", "pty" => ""}}
+
+      true ->
+        case Spark.vm_serial_read(vm.host_ip, vm.name) do
+          {:ok, body} when is_map(body) -> {:ok, body}
+          _ -> {:ok, %{"output" => "", "pty" => ""}}
+        end
+    end
+  rescue
+    _ -> {:ok, %{"output" => "", "pty" => ""}}
+  end
+
+  @doc "Send input to a running VM's serial console and return recent output."
+  def serial_send(name, data) when is_binary(data) do
+    with {:ok, name} <- validate_name(name),
+         {:ok, %Vm{} = vm} <- get_vm(name),
+         :ok <- require_running(vm) do
+      ip = if (vm.host_ip || "") == "", do: Config.local_ip(), else: vm.host_ip
+
+      case Spark.vm_serial_send(ip, name, data) do
+        {:ok, %{"ok" => true} = body} -> {:ok, body}
+        {:ok, %{"error" => err}} -> {:error, err}
+        {:error, {status, msg}} -> {:error, "#{msg} (HTTP #{status})"}
+        {:error, reason} -> {:error, inspect(reason)}
+      end
+    end
+  end
 
   # Submission itself lives in `SpectrumPhx.Catalyst`: the mutual-TLS post, the refusal to
   # name a queue nothing drains, and the leader resolution this module used to carry are

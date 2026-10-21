@@ -25,6 +25,7 @@ defmodule SpectrumPhx.Vms.Options do
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Images
   alias SpectrumPhx.Networking
+  alias SpectrumPhx.Settings
   alias SpectrumPhx.Spark
   alias SpectrumPhx.Storage.Containers
   alias SpectrumPhx.Vms
@@ -32,7 +33,7 @@ defmodule SpectrumPhx.Vms.Options do
 
   @doc """
   The choices, as `%{containers: [name], images: [%{name, label}], networks: [%{id, label}],
-  spice?: boolean, notes: [string]}`.
+  spice?: boolean, console_policy: string, default_graphics: string, notes: [string]}`.
 
   `notes` says what could not be read. A catalogue that failed to load is reported, and
   never drawn as an empty one: "no images" and "the image list is unavailable" are
@@ -61,6 +62,8 @@ defmodule SpectrumPhx.Vms.Options do
       images: [],
       networks: [fallback_network()],
       spice?: false,
+      console_policy: "both",
+      default_graphics: "vnc",
       notes: []
     }
 
@@ -72,11 +75,26 @@ defmodule SpectrumPhx.Vms.Options do
     {images, i_notes} = images()
     {networks, n_notes} = networks()
 
+    settings = Settings.all()
+    stored = Map.get(settings, :stored, %{})
+    console_policy = Map.get(stored, "console_protocol_policy", "both")
+    default_graphics = Map.get(stored, "default_console_protocol", "vnc")
+    probed_spice = if(Keyword.get(opts, :probe_hosts, true), do: spice_everywhere?(), else: false)
+
+    spice_available =
+      case console_policy do
+        "vnc" -> false
+        "spice" -> true
+        _ -> probed_spice
+      end
+
     %{
       containers: containers,
       images: images,
       networks: networks,
-      spice?: if(Keyword.get(opts, :probe_hosts, true), do: spice_everywhere?(), else: false),
+      spice?: spice_available,
+      console_policy: console_policy,
+      default_graphics: default_graphics,
       notes: c_notes ++ i_notes ++ n_notes
     }
   end

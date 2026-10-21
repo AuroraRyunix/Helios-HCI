@@ -300,6 +300,7 @@ impl Daemon {
             Arc::clone(&self.replica_store),
             Arc::clone(self) as Arc<dyn Owned>,
         )?;
+        self.reattach_owned();
         self.start_purah();
         println!("sidon: control socket ready");
 
@@ -317,6 +318,51 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Re-attach any vdisks in `hydra.dfs_vdisks` whose recorded `owner` is this node, so
+    /// their NBD unix sockets at `<root>/nbd/<vdisk_id>.sock` are restored automatically
+    /// across a daemon restart or host reboot.
+    ///
+    /// Best-effort: if Hydra is unreachable at startup or an individual vdisk fails to open,
+    /// log the error and continue starting the control plane.
+    pub fn reattach_owned(self: &Arc<Self>) -> usize {
+        let rows = match self.daruk().query(
+            "SELECT vdisk_id, owner, class FROM hydra.dfs_vdisks",
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("sidon: startup auto-reattach could not query dfs_vdisks: {e}");
+                return 0;
+            }
+        };
+        let mut attached = 0usize;
+        for row in rows {
+            let owner = row.get("owner").and_then(Value::as_str).unwrap_or("");
+            if owner != self.cfg.node {
+                continue;
+            }
+            let id = match row.get("vdisk_id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                Some(id) => id,
+                None => continue,
+            };
+            let class = row.get("class").and_then(Value::as_str).unwrap_or(CLASS_RW);
+            if class != CLASS_RW && class != CLASS_IMMUTABLE && class != "vdisk" && class != "image" {
+                continue;
+            }
+            match self.op_attach(&json!({"vdisk_id": id})) {
+                Ok(_) => {
+                    attached += 1;
+                }
+                Err(e) => {
+                    eprintln!("sidon: startup auto-reattach failed for vdisk {id}: {e}");
+                }
+            }
+        }
+        if attached > 0 {
+            println!("sidon: auto-reattached {attached} owned vdisk(s) at startup");
+        }
+        attached
     }
 
     fn serve_control(self: &Arc<Self>, stream: UnixStream) -> Result<()> {
@@ -924,6 +970,32 @@ impl Daemon {
             cql_str(&id)
         ))?;
         let _ = crate::journal::remove_files(&journal);
+        let _ = self.replica_store.drop_vdisk(&id);
+        let peers: Vec<Arc<PeerClient>> = self.peers.values().cloned().collect();
+        if peers.len() <= 1 {
+            for peer in &peers {
+                if let Err(e) = peer.drop_vdisk(&id) {
+                    eprintln!(
+                        "sidon: vdisk {id}: peer {} did not drop replica state on delete: {e}",
+                        peer.node
+                    );
+                }
+            }
+        } else {
+            std::thread::scope(|s| {
+                for peer in &peers {
+                    let id = &id;
+                    s.spawn(move || {
+                        if let Err(e) = peer.drop_vdisk(id) {
+                            eprintln!(
+                                "sidon: vdisk {id}: peer {} did not drop replica state on delete: {e}",
+                                peer.node
+                            );
+                        }
+                    });
+                }
+            });
+        }
         // Extent groups are left for Purah: they may be shared with snapshots, and
         // deleting shared data because one referrer went away is the bug refcounts exist
         // to cause. Mark-sweep reclaims them when nothing points at them.
@@ -1006,7 +1078,7 @@ impl Daemon {
         let rows = daruk.query(&format!(
             // The parent's `rf` is deliberately not read. It records the policy the parent
             // was created under, and the child is created under the policy in force now.
-            "SELECT class, size_bytes, container, extent_bytes, egroup_bytes, replicas \
+            "SELECT class, size_bytes, container, extent_bytes, egroup_bytes, replicas, use_extent_id \
              FROM hydra.dfs_vdisks WHERE vdisk_id = {}",
             cql_str(&parent_id)
         ))?;
@@ -1028,8 +1100,8 @@ impl Daemon {
                 let vdisk = self.owned_vdisk(&parent_id).map_err(|_| {
                     Error::refused(format!(
                         "vdisk {parent_id} is writable, so it has to be drained before it can \
-                         be copied, and only the node that owns it can do that. Attach it \
-                         here first, or seal it."
+                          be copied, and only the node that owns it can do that. Attach it \
+                          here first, or seal it."
                     ))
                 })?;
                 // Drained to the end, not merely started: the child's map is a copy of what
@@ -1052,6 +1124,7 @@ impl Daemon {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
             .unwrap_or_else(|| vec![self.cfg.node.clone()]);
+        let use_extent_id = parent.get("use_extent_id").and_then(Value::as_bool).unwrap_or(false);
 
         // The child is a new vdisk, so it is created under the policy in force now rather
         // than the one its parent was made under. Inheriting the parent's `rf` is what
@@ -1103,36 +1176,61 @@ impl Daemon {
         if !cas.applied {
             return Err(Error::refused(format!("vdisk {child_id} already exists")));
         }
+        if use_extent_id {
+            let _ = daruk.query(&format!(
+                "UPDATE hydra.dfs_vdisks SET use_extent_id = true WHERE vdisk_id = {}",
+                cql_str(&child_id)
+            ));
+        }
 
         let map_rows = daruk.query(&format!(
-            "SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash FROM hydra.dfs_block_map \
+            "SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash, extent_id FROM hydra.dfs_block_map \
              WHERE vdisk_id = {}",
             cql_str(&parent_id)
         ))?;
-        let mut copied: Vec<(u64, String, u32, u32, u64)> = Vec::with_capacity(map_rows.len());
+        let mut copied_egroup: Vec<(u64, String, u32, u32, u64)> = Vec::new();
+        let mut copied_extent: Vec<(u64, String, u64)> = Vec::new();
         for row in map_rows {
             let idx = field_u64(&row, "extent_index")?;
-            let egroup_id = row
-                .get("egroup_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::meta("block map row without egroup_id".to_string()))?
-                .to_string();
-            let offset = field_u64(&row, "egroup_offset")? as u32;
-            let length = field_u64(&row, "length")? as u32;
-            // Carried through, never recomputed. These extents keep the identity the
-            // parent wrote them under; rewriting them to say "the child wrote this"
-            // would be a lie, and copying them so it were true would make a snapshot a
-            // data copy, which is the entire thing it is not.
+            let has_egroup = row.get("egroup_id").and_then(Value::as_str);
+            let has_extent = row.get("extent_id").and_then(Value::as_str);
             let vh = row
                 .get("vdisk_hash")
                 .and_then(Value::as_i64)
                 .map(|v| v as u64)
                 .unwrap_or_else(|| vdisk_hash(&parent_id));
-            copied.push((idx, egroup_id, offset, length, vh));
+
+            match (has_egroup, has_extent) {
+                (Some(eg_id), None) => {
+                    let offset = field_u64(&row, "egroup_offset")? as u32;
+                    let length = field_u64(&row, "length")? as u32;
+                    copied_egroup.push((idx, eg_id.to_string(), offset, length, vh));
+                }
+                (None, Some(ext_id)) => {
+                    copied_extent.push((idx, ext_id.to_string(), vh));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(Error::corrupt(format!(
+                        "vdisk {parent_id} extent {idx} names both an extent group and an extent id"
+                    )));
+                }
+                (None, None) => {
+                    return Err(Error::meta(format!(
+                        "vdisk {parent_id} extent {idx} has block map row without egroup_id or extent_id"
+                    )));
+                }
+            }
         }
-        let extents = copied.len();
-        for batch in block_map_batches(&child_id, 0, &copied, MAP_BATCH) {
-            daruk.query(&batch)?;
+        let extents = copied_egroup.len() + copied_extent.len();
+        if !copied_egroup.is_empty() {
+            for batch in block_map_batches(&child_id, 0, &copied_egroup, MAP_BATCH) {
+                daruk.query(&batch)?;
+            }
+        }
+        if !copied_extent.is_empty() {
+            for batch in crate::meta::block_map_extent_batches(&child_id, 0, &copied_extent, MAP_BATCH) {
+                daruk.query(&batch)?;
+            }
         }
 
         // Only now is it a disk. Conditional on the class this call put there, so two
@@ -2070,8 +2168,7 @@ impl Owned for Daemon {
             let map = self.attached.lock().expect("attached mutex poisoned");
             map.get(vdisk).and_then(|a| a.vdisk.clone())?
         };
-        let mut v = handle.lock().expect("vdisk mutex poisoned");
-        Some(v.read(offset, len))
+        Some(crate::vdisk::read_through(&handle, offset, len))
     }
 
     fn owned_write(&self, vdisk: &str, offset: u64, data: &[u8]) -> Option<Result<()>> {
@@ -2100,7 +2197,7 @@ fn str_field(req: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| Error::refused(format!("request is missing '{name}'")))
+    .ok_or_else(|| Error::refused(format!("request is missing '{name}'")))
 }
 
 fn u64_field(req: &Value, name: &str) -> Result<u64> {
@@ -2236,6 +2333,8 @@ pub fn ceiling_capacity_warning(ceiling: u64, available: u64) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
 
     #[test]
     fn group_lookup_finds_a_real_group_and_misses_a_fake_one() {
@@ -2329,5 +2428,151 @@ mod tests {
         assert!(ceiling_capacity_warning(128 << 20, 512 << 20).unwrap().contains("could not hold"));
         assert!(ceiling_capacity_warning(128 << 20, 1 << 30).is_none());
         assert!(ceiling_capacity_warning(128 << 20, 0).is_some());
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("sidon-ctrl-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn spawn_mock_hydra(handler: impl Fn(&str, &str) -> Value + Send + Sync + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handler = Arc::new(handler);
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut s) = conn else { break };
+                let handler = Arc::clone(&handler);
+                thread::spawn(move || {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if s.read(&mut byte).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let text = String::from_utf8_lossy(&head).to_string();
+                    let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let len: usize = text
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_ascii_lowercase();
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; len];
+                    s.read_exact(&mut body).ok();
+                    let q = String::from_utf8_lossy(&body).to_string();
+                    let out = handler(&path, &q).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                        out.len()
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        addr
+    }
+
+    fn test_daemon(dir: &PathBuf, daruk_addr: String, peers: Vec<(String, String)>) -> Arc<Daemon> {
+        Daemon::new(DaemonConfig {
+            root: dir.clone(),
+            control_socket: dir.join("sidon.sock"),
+            daruk_addr,
+            node: "node-a".to_string(),
+            high_water: 64 << 20,
+            hard_ceiling: 128 << 20,
+            daruk_timeout: Duration::from_secs(5),
+            purah_interval: Duration::ZERO,
+            purah_grace: Duration::from_secs(60),
+            purah_open_abandon: Duration::from_secs(3600),
+            peer_bind: "127.0.0.1:0".to_string(),
+            peers,
+            peer_timeout: Duration::from_secs(5),
+            fence_timeout: Duration::from_secs(2),
+            handover_timeout: Duration::from_secs(10),
+            release_wait: Duration::from_millis(50),
+            cluster_ftt: Some(0),
+            access_flush: Duration::ZERO,
+            access_capacity: 64,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn reattach_owned_restores_nbd_sockets_for_vdisks_owned_by_this_node() {
+        let dir = test_dir("reattach-owned");
+        let daruk_addr = spawn_mock_hydra(|path, q| match path {
+            "/query" if q.contains("SELECT vdisk_id, owner, class FROM hydra.dfs_vdisks") => json!({
+                "status": "success",
+                "rows": [
+                    {"vdisk_id": "owned-rw", "owner": "node-a", "class": "rw"},
+                    {"vdisk_id": "other-node", "owner": "node-b", "class": "rw"},
+                    {"vdisk_id": "forming-disk", "owner": "node-a", "class": "forming"}
+                ]
+            }),
+            "/query" if q.contains("FROM hydra.dfs_vdisks WHERE vdisk_id = 'owned-rw'") => json!({
+                "status": "success",
+                "rows": [{
+                    "vdisk_id": "owned-rw",
+                    "owner": "node-a",
+                    "epoch": 2,
+                    "replicas": ["node-a"],
+                    "size_bytes": 4194304,
+                    "class": "rw",
+                    "drain_seq": 0,
+                    "extent_bytes": 1048576,
+                    "egroup_bytes": 4194304,
+                    "container": "default-pool",
+                    "rf": 1,
+                    "use_extent_id": false,
+                    "parent_vdisk": null
+                }]
+            }),
+            "/query" => json!({"status": "success", "rows": []}),
+            "/v1/dfs/claim" => json!({"status": "success", "applied": true, "current": {}}),
+            _ => json!({"status": "success", "applied": true, "current": {}}),
+        });
+
+        let daemon = test_daemon(&dir, daruk_addr, Vec::new());
+        let count = daemon.reattach_owned();
+        assert_eq!(count, 1);
+        assert!(dir.join("nbd").join("owned-rw.sock").exists());
+        assert!(!dir.join("nbd").join("other-node.sock").exists());
+        assert!(!dir.join("nbd").join("forming-disk.sock").exists());
+        daemon.op_detach(&json!({"vdisk_id": "owned-rw"})).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_delete_drops_replica_state_locally_and_on_every_configured_peer() {
+        let dir = test_dir("delete-drop-vdisk");
+        let peer_dir = dir.join("peer-b");
+        let peer_store = Arc::new(ReplicaStore::new(&peer_dir).unwrap());
+        peer_store.fence("goner", 7).unwrap();
+
+        let store_for_srv = Arc::clone(&peer_store);
+        let peer_addr = peer::spawn_test_server(Arc::new(move |req| {
+            peer::serve_request(&store_for_srv, req)
+        }));
+
+        let daruk_addr = spawn_mock_hydra(|_path, _q| json!({"status": "success", "rows": []}));
+        let daemon = test_daemon(&dir, daruk_addr, vec![("node-b".to_string(), peer_addr)]);
+        daemon.replica_store.fence("goner", 7).unwrap();
+
+        let res = daemon.op_delete(&json!({"vdisk_id": "goner"})).unwrap();
+        assert_eq!(res["deleted"], json!(true));
+
+        // Both local and remote replica stores cleared their epoch fence so recreating
+        // `goner` at epoch 1 is accepted.
+        assert_eq!(daemon.replica_store.fence("goner", 1).unwrap(), 1);
+        assert_eq!(peer_store.fence("goner", 1).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -247,7 +247,7 @@ RESET = "\033[0m"
 
 SERVICE_DISPLAY_ORDER = ["ZooKeeper", "HydraDB", "Daruk", "Sidon", "Spark", "Spectrum", "Phoenix",
                          "Bifrost", "Dagur", "Mimir", "Rauru", "Vali", "Catalyst", "Hylia",
-                         "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa"]
+                         "Gatoway", "Logos", "Mipha", "Agahnim", "Slate", "Urbosa", "Kass"]
 
 
 def load_helios_zk():
@@ -314,13 +314,18 @@ def render_node_block(ip, data, use_color=True):
     leader = ", OdinLeader" if data.get("zk_leader") else ""
     maint = data.get("maintenance_status", "NORMAL")
     maint_str = f" {y}[{maint.replace('_', ' ')}]{x}" if maint != "NORMAL" else ""
+    witness_fn = globals().get("get_witness_ip")
+    witness_ip = witness_fn() if callable(witness_fn) else None
+    is_witness = bool(data.get("is_witness") or data.get("role") == "witness" or (witness_ip and ip == witness_ip))
+    witness_str = f" {y}[Witness / Quorum Tie-Breaker]{x}" if is_witness else ""
 
     age = int(time.time()) - int(data.get("ts", 0) or 0)
     stale_str = f" {y}[STALE {age}s]{x}" if age > NODE_STALE_AFTER else ""
 
-    lines = [f"\n        Host: {b}{ip}{x} {g}Up{x} {gr}({hostname}){leader}{x}{maint_str}{stale_str}"]
+    lines = [f"\n        Host: {b}{ip}{x} {g}Up{x} {gr}({hostname}){leader}{x}{maint_str}{stale_str}{witness_str}"]
     services = data.get("services", {})
-    for name in SERVICE_DISPLAY_ORDER:
+    display_order = ["ZooKeeper", "Spark"] if is_witness else SERVICE_DISPLAY_ORDER
+    for name in display_order:
         if name not in services:
             continue
         svc = services[name]
@@ -349,8 +354,9 @@ def render_node_block(ip, data, use_color=True):
             lines.append(f"                    {name:<16}   {r}DOWN{x}{note}{err_str}")
     # A service that is declared but switched off is reported as such. Omitting it would
     # leave an operator unable to tell "disabled" from "nobody ever deployed it".
-    for name in data.get("disabled_services") or []:
-        lines.append(f"                    {name:<16}   {gr}DISABLED{x}")
+    if not is_witness:
+        for name in data.get("disabled_services") or []:
+            lines.append(f"                    {name:<16}   {gr}DISABLED{x}")
     return "\n".join(lines)
 
 
@@ -588,6 +594,25 @@ def get_cluster_ips():
             return [h["ip"] for h in cdata.get("hosts", [])]
     except Exception:
         return ["127.0.0.1"]
+
+
+def get_witness_ip(path="/etc/hci/cluster.json"):
+    """Return the IP of the witness node if configured, else None."""
+    try:
+        with open(path, "r") as handle:
+            hosts = json.load(handle).get("hosts", [])
+            for h in hosts:
+                if h.get("is_witness") or h.get("role") == "witness":
+                    return h.get("ip")
+    except Exception:
+        pass
+    return None
+
+
+def get_data_cluster_ips():
+    """Return the IPs of data nodes (hypervisors), excluding any witness node."""
+    witness = get_witness_ip()
+    return [ip for ip in get_cluster_ips() if ip != witness]
 
 
 def configured_cluster_ips(path="/etc/hci/cluster.json"):
@@ -1917,16 +1942,21 @@ def wait_for_ring_member(ips, target, attempts=60, delay=5):
     return False, last
 
 
-def redundancy_factor_refusal(factor, node_count):
+def redundancy_factor_refusal(factor, node_count, fault_domain="khost"):
     """Why `factor` cannot be this cluster's redundancy factor, or None if it can.
 
-    The factor counts host losses survived, so it needs one more host than it names: ftt 1
-    keeps two copies and there must be two hosts to hold them. Refused rather than
-    clamped, because a clamped value is written to cluster.json and read back later as
-    the operator's decision.
+    The factor counts host losses survived, so under `khost` it needs one more host
+    than it names: ftt 1 keeps two copies and there must be two hosts to hold them.
+    Under `kdisk`, single-node clusters can survive disk loss (ftt 1) via local drive mirroring.
+    Refused rather than clamped, because a clamped value is written to cluster.json and
+    read back later as the operator's decision.
     """
     if factor < 0:
         return "a redundancy factor cannot be negative"
+    if (fault_domain or "khost").lower() == "kdisk":
+        if factor > 2:
+            return "a kdisk redundancy factor cannot exceed 2"
+        return None
     if factor + 1 > node_count:
         return ("a redundancy factor of %d keeps %d copies and this cluster has %d node(s)"
                 % (factor, factor + 1, node_count))
@@ -2000,6 +2030,221 @@ def set_redundancy_factor(target, factor, existing):
     return 0
 
 
+JOIN_DISK_CLAIM_SCRIPT = """
+import subprocess, json, sys
+res_vg = subprocess.run("vgs vg_aether --noheadings -o pv_name", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+pvs = []
+if res_vg.returncode == 0:
+    pvs = [line.strip() for line in res_vg.stdout.decode().splitlines() if line.strip()]
+
+if pvs:
+    dev = pvs[0]
+    res_lv = subprocess.run("lvs vg_aether/thin_pool_aether", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res_lv.returncode != 0:
+        subprocess.run("lvcreate -y -l 100%FREE -T vg_aether/thin_pool_aether", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    res_pv_sz = subprocess.run("pvs " + dev + " --units b --noheadings -o pv_size", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    size_bytes = 200 * 10**9
+    if res_pv_sz.returncode == 0:
+        val = res_pv_sz.stdout.decode().strip().lower().replace("b", "")
+        try: size_bytes = int(val)
+        except Exception: pass
+    print(json.dumps({"status": "exists", "device": dev, "size_bytes": size_bytes}))
+    sys.exit(0)
+
+res_lsblk = subprocess.run("lsblk -b -d -n -o NAME,SIZE,TYPE,ROTA", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if res_lsblk.returncode != 0:
+    print(json.dumps({"error": "lsblk failed"}))
+    sys.exit(1)
+
+candidate = None
+for line in res_lsblk.stdout.decode().splitlines():
+    parts = line.split()
+    if len(parts) >= 4 and parts[2] == "disk":
+        name = parts[0]
+        try: size_bytes = int(parts[1])
+        except ValueError: continue
+        dev_path = "/dev/" + name
+        res_m = subprocess.run("lsblk -n -o MOUNTPOINT " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        is_in_use = False
+        for m in res_m.stdout.decode().splitlines():
+            m = m.strip()
+            if (m and m != "-") or "swap" in m.lower():
+                is_in_use = True
+                break
+        if is_in_use: continue
+        res_p = subprocess.run("lsblk -n -o TYPE " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if "part" in res_p.stdout.decode().splitlines(): continue
+        if size_bytes >= 100 * 10**9:
+            candidate = (dev_path, size_bytes)
+            break
+
+if not candidate:
+    print(json.dumps({"error": "No empty disk >= 100GB found"}))
+    sys.exit(1)
+
+dev_path, size_bytes = candidate
+subprocess.run("wipefs -a " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+seek_val = (size_bytes // 1048576) - 1024
+subprocess.run("dd if=/dev/zero of=" + dev_path + " bs=1M seek=" + str(seek_val) + " count=1024 conv=notrunc", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+subprocess.run("pvcreate -y " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+subprocess.run("rm -rf /dev/vg_aether", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+subprocess.run("vgcreate vg_aether " + dev_path, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+subprocess.run("lvcreate -y -l 100%FREE -T vg_aether/thin_pool_aether", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_bytes}))
+"""
+
+
+def prepare_joining_node_zookeeper(existing, target):
+    """Ensure ZooKeeper directories and logback.xml exist on target before starting the unit."""
+    rc, _, err = run_remote_spark(
+        target, "mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /etc/hci/zookeeper")
+    if rc != 0:
+        print("[ERROR] [%s] could not create ZooKeeper directories: %s"
+              % (target, (err or "").strip()[:200]))
+        return False
+    if existing:
+        rc_lb, lb_b64, _ = run_remote_spark(
+            existing[0], "base64 -w0 /etc/hci/zookeeper/logback.xml 2>/dev/null || true")
+        lb_b64 = (lb_b64 or "").strip()
+        if rc_lb == 0 and lb_b64:
+            run_remote_spark(
+                target,
+                "if [ ! -f /etc/hci/zookeeper/logback.xml ]; then "
+                "echo %s | base64 -d > /etc/hci/zookeeper/logback.xml; fi" % lb_b64)
+    run_remote_spark(
+        target,
+        "if [ ! -f /etc/hci/zookeeper/logback.xml ]; then "
+        "printf '<configuration><root level=\"INFO\"/></configuration>\\n' "
+        "> /etc/hci/zookeeper/logback.xml; fi")
+    return True
+
+
+def reconcile_phoenix_origins_from_config(data_ips, config=None):
+    """Ensure PHX_HOST and PHX_EXTRA_ORIGINS in spectrum-phx.env include the VIP, IPs, and hostnames."""
+    cfg = config or cluster_hosts_config() or {}
+    vip = str(cfg.get("vip") or "").strip()
+    hosts = cfg.get("hosts") or []
+    host_ips = [str(h.get("ip") or "").strip() for h in hosts if h.get("ip")] or list(data_ips)
+    host_names = [str(h.get("hostname") or "").strip() for h in hosts if h.get("hostname")]
+    seen, ordered = set(), []
+    for item in ([vip] + host_ips + host_names):
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    origins = ",".join(ordered)
+    for ip in data_ips:
+        phx_host = vip or ip
+        run_remote_spark(
+            ip,
+            "if [ -f %s ]; then "
+            "sed -i 's|^PHX_HOST=.*|PHX_HOST=%s|' %s; "
+            "if grep -q '^PHX_EXTRA_ORIGINS=' %s; then "
+            "sed -i 's|^PHX_EXTRA_ORIGINS=.*|PHX_EXTRA_ORIGINS=%s|' %s; "
+            "else echo 'PHX_EXTRA_ORIGINS=%s' >> %s; fi; fi"
+            % (PHX_ENV_PATH, phx_host, PHX_ENV_PATH, PHX_ENV_PATH,
+               origins, PHX_ENV_PATH, origins, PHX_ENV_PATH))
+
+
+def sync_joining_node_env_and_trust(existing, target, ips, is_witness=False):
+    """Exchange SSH host keys across `ips`, and sync Phoenix env + TLS certs to `target`."""
+    run_parallel(ips, peer_host_key_command(ips))
+    if existing:
+        seed = existing[0]
+        for name, mode in (("server.crt", "644"), ("server.key", "600")):
+            rc_c, b64_c, _ = run_remote_spark(
+                seed, "base64 -w0 /etc/hci/spectrum/certs/%s 2>/dev/null || true" % name)
+            b64_c = (b64_c or "").strip()
+            if rc_c == 0 and b64_c:
+                run_remote_spark(
+                    target,
+                    "mkdir -p /etc/hci/spectrum/certs && "
+                    "echo %s | base64 -d > /etc/hci/spectrum/certs/%s && "
+                    "chmod %s /etc/hci/spectrum/certs/%s" % (b64_c, name, mode, name))
+    if not is_witness:
+        witness = get_witness_ip()
+        data_ips = [ip for ip in ips if ip != witness]
+        try:
+            ensure_phoenix_env(data_ips)
+            reconcile_phoenix_origins_from_config(data_ips)
+        except Exception as exc:
+            print("[WARNING] Could not sync %s across nodes: %s" % (PHX_ENV_PATH, exc))
+
+
+def prepare_joining_node_storage(target):
+    """Claim the extent-store disk and prepare Sidon volumes on a joining data node."""
+    claim_b64 = base64.b64encode(JOIN_DISK_CLAIM_SCRIPT.strip().encode()).decode()
+    cmd_claim = f"python3 -c \"import base64; exec(base64.b64decode('{claim_b64}').decode())\""
+    print("[storage] claiming and preparing extent store on %s..." % target)
+    rc, stdout, stderr = run_remote_spark(target, cmd_claim, timeout=STORAGE_PREP_TIMEOUT)
+    if rc != 0:
+        print("[ERROR] [%s] disk claiming failed: %s"
+              % (target, (stderr or stdout or "").strip()[:200]))
+        return False
+    try:
+        disk_info = json.loads((stdout or "").strip())
+    except Exception as exc:
+        print("[ERROR] [%s] invalid JSON from disk claim: %s (%s)" % (target, stdout, exc))
+        return False
+    if "error" in disk_info:
+        print("[ERROR] [%s] disk setup failed: %s" % (target, disk_info["error"]))
+        return False
+    print("[storage] [%s] %s (%.1f GB) - %s"
+          % (target, disk_info.get("device"), disk_info.get("size_bytes", 0) / 10**9,
+             disk_info.get("status")))
+
+    for label, script in (
+        ("carving sidon journal volume", CARVE_SIDON_VOLUME),
+        ("claiming additional extent disks", CLAIM_EXTRA_DISKS),
+        ("staging /etc/hci/sidon-disks", STAGE_SIDON_DISKS),
+    ):
+        rc_s, _, err_s = run_remote_spark(
+            target, shell_script_command(script), timeout=STORAGE_PREP_TIMEOUT)
+        if rc_s != 0:
+            print("[ERROR] [%s] %s failed: %s"
+                  % (target, label, (err_s or "").strip()[:200]))
+            return False
+
+    rc_dir, _, err_dir = run_remote_spark(
+        target,
+        "mkdir -p /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram")
+    if rc_dir != 0:
+        print("[ERROR] [%s] could not create Aether directories: %s"
+              % (target, (err_dir or "").strip()[:200]))
+        return False
+    return True
+
+
+def start_joining_node_storage_daemons(target):
+    """Start Daruk and Sidon on the joining node after its ScyllaDB reaches UN."""
+    unit_action(target, "enable", ["daruk"])
+    ok_d, detail_d = unit_action(target, "restart", ["daruk"])
+    if not ok_d:
+        print("[ERROR] [%s] daruk did not start: %s" % (target, detail_d[:200]))
+        return False
+    for _ in range(30):
+        if port_listening(target, 9043):
+            break
+        time.sleep(1)
+    else:
+        print("[ERROR] [%s] daruk did not listen on port 9043 within 30s." % target)
+        return False
+    print("[daruk] %s listening on 9043." % target)
+
+    unit_action(target, "enable", ["sidon"])
+    ok_s, detail_s = unit_action(target, "restart", ["sidon"])
+    if not ok_s:
+        print("[ERROR] [%s] sidon did not start: %s" % (target, detail_s[:200]))
+        return False
+    rc_cap, out_cap, _ = wait_for_sidon_capacity(target)
+    if rc_cap != 0 or not (out_cap or "").strip():
+        print("[ERROR] [%s] sidon did not answer on %s:\n%s"
+              % (target, SIDON_SOCKET, describe_sidon_failure(target)))
+        return False
+    print("[sidon] %s extent store is mounted and serving." % target)
+    return True
+
+
 def cmd_add_node(args):
     """Bring a provisioned, enrolled machine into this cluster.
 
@@ -2025,6 +2270,7 @@ def cmd_add_node(args):
          the ring reports it `UN`. Registering it while it is still bootstrapping hands it
          VMs it cannot run -- the same rule `rejoin` follows, for the same reason.
     """
+    is_witness = bool(getattr(args, "witness", False))
     target = args.node.strip()
     existing = get_cluster_ips()
     if not existing:
@@ -2038,6 +2284,9 @@ def cmd_add_node(args):
     # failure unrecoverable by the tool that caused it.
     resuming = target in existing
     if resuming:
+        if is_witness:
+            print("[ERROR] %s is already configured in cluster.json." % target)
+            return 1
         members, _ = read_ring([ip for ip in existing if ip != target] or existing)
         live = next((m for m in members if m["address"] == target and m["available"]), None)
         if live is not None:
@@ -2052,7 +2301,7 @@ def cmd_add_node(args):
         existing = [ip for ip in existing if ip != target]
 
     print("==========================================================")
-    print("   Adding %s to a %d-node cluster" % (target, len(existing)))
+    print("   Adding %s to a %d-node cluster%s" % (target, len(existing), " as witness" if is_witness else ""))
     print("==========================================================")
 
     # Preflight. Each of these is a way the join fails silently later.
@@ -2066,14 +2315,15 @@ def cmd_add_node(args):
         return 1
     print("[%s] spark-daemon answers over mTLS, so it is provisioned and enrolled." % target)
 
-    rc_d, stdout_d, _ = run_remote_spark(
-        target, "ls -A /var/lib/hci/hydra/data/data 2>/dev/null | head -5")
-    if rc_d == 0 and (stdout_d or "").strip():
-        print("[ERROR] %s already carries ScyllaDB data under /var/lib/hci/hydra/data." % target)
-        print("[ERROR] A node bootstrapping on top of existing sstables either refuses to "
-              "start or re-introduces rows deleted while it was away. Wipe that directory, "
-              "or use 'cluster rejoin' if this node was previously a member.")
-        return 1
+    if not is_witness:
+        rc_d, stdout_d, _ = run_remote_spark(
+            target, "ls -A /var/lib/hci/hydra/data/data 2>/dev/null | head -5")
+        if rc_d == 0 and (stdout_d or "").strip():
+            print("[ERROR] %s already carries ScyllaDB data under /var/lib/hci/hydra/data." % target)
+            print("[ERROR] A node bootstrapping on top of existing sstables either refuses to "
+                  "start or re-introduces rows deleted while it was away. Wipe that directory, "
+                  "or use 'cluster rejoin' if this node was previously a member.")
+            return 1
 
     members, error = read_ring(existing)
     if error:
@@ -2095,6 +2345,11 @@ def cmd_add_node(args):
         if refusal:
             print("[ERROR] %s." % refusal)
             return 1
+
+    # Hold the operation lock on the joining node until its units and storage are ready,
+    # so spark-daemon's reconcile loop does not start hydra-db or sidon prematurely once
+    # ZooKeeper comes up with /cluster_state = started.
+    run_remote_spark(target, "mkdir -p /run/hci && touch /run/hci/cluster_operation.lock")
 
     # 1. Identity, before membership. Eleven modules and the Phoenix console read
     # LOCAL_HYPERVISOR_IP out of spectrum.env and fall back to 127.0.0.1 without it, and
@@ -2130,7 +2385,19 @@ def cmd_add_node(args):
     # replication factor, the quorum gate, the console -- would believe in a node that
     # does not exist.
     if not any(h.get("ip") == target for h in hosts):
-        hosts.append({"node_id": len(hosts) + 1, "ip": target, "hostname": hostname})
+        idx = len(hosts)
+        rack_num = 1 + (idx // 4)
+        hosts.append({
+            "node_id": idx + 1,
+            "ip": target,
+            "hostname": hostname,
+            "is_witness": is_witness,
+            "role": "witness" if is_witness else "hypervisor",
+            "rack": f"rack{rack_num}",
+            "chassis_serial": f"chassis-{rack_num:02d}",
+            "node_position": chr(ord("A") + (idx % 4)),
+        })
+    target_rack = next((h.get("rack") for h in hosts if h.get("ip") == target), None) or "rack1"
     config["hosts"] = hosts
     # Only when asked. The factor is a replication policy and adding a machine does not
     # change it; see redundancy_factor_warning for what happens when it goes unrevisited.
@@ -2145,6 +2412,8 @@ def cmd_add_node(args):
         print("[config] redundancy_factor is %d. Sidon reads it at start, so restart it on "
               "each node for new vdisks to see it." % args.redundancy_factor)
 
+    sync_joining_node_env_and_trust(existing, target, ips, is_witness=is_witness)
+
     # 3. Consensus.
     #
     # Existing members keep the ids they already hold, read from their own units rather
@@ -2152,6 +2421,8 @@ def cmd_add_node(args):
     # its ids, and recomputing would renumber every member after the gap -- giving each
     # of them a new ZooKeeper identity on top of a data directory that remembers the old
     # one. The joining node takes the first id nothing else is using.
+    if not prepare_joining_node_zookeeper(existing, target):
+        return 1
     known_ids = read_zookeeper_ids(existing)
     unreadable = [ip for ip in existing if ip not in known_ids]
     if unreadable:
@@ -2176,7 +2447,16 @@ def cmd_add_node(args):
         print("[zookeeper] %s restarted." % ip)
         time.sleep(3)
 
+    if is_witness:
+        run_remote_spark(target, "rm -f /run/hci/cluster_operation.lock")
+        print("[witness] %s (%s) added to ZooKeeper ensemble as a quorum tie-breaker." % (target, hostname))
+        print("[witness] HydraDB and VM scheduling are not enabled on the witness host.")
+        return 0
+
     # 4. Storage.
+    if not prepare_joining_node_storage(target):
+        return 1
+
     print("[hydra-db] seeding %s from the existing cluster..." % target)
     rc, _, err = run_remote_spark(
         target,
@@ -2184,8 +2464,8 @@ def cmd_add_node(args):
         "cp -f /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py && "
         "chmod 644 /var/lib/hci/hydra/data/daruk.py && "
         "if [ ! -f /etc/hci/hydra/cassandra-rackdc.properties ]; then "
-        "printf 'dc=datacenter1\\nrack=rack1\\nprefer_local=true\\n' "
-        "> /etc/hci/hydra/cassandra-rackdc.properties; fi")
+        "printf 'dc=datacenter1\\nrack=%s\\nprefer_local=true\\n' "
+        "> /etc/hci/hydra/cassandra-rackdc.properties; fi" % target_rack)
     if rc != 0:
         print("[ERROR] [%s] could not prepare the database directories: %s"
               % (target, (err or "").strip()[:200]))
@@ -2220,11 +2500,18 @@ def cmd_add_node(args):
         return 1
     print("[ring] %s is UN." % target)
 
-    # 5. Scheduling, only now.
+    if not start_joining_node_storage_daemons(target):
+        return 1
+
+    # 5. Scheduling and service convergence, only now.
     run_cql_query(
         "INSERT INTO hydra.nodes (hostname, ip, status, maintenance_mode) "
         "VALUES ('%s', '%s', 'NORMAL', false);" % (hostname, target))
     print("[hydra] registered %s (%s) as a schedulable host." % (hostname, target))
+
+    run_remote_spark(target, "rm -f /run/hci/cluster_operation.lock")
+    declare_cluster_state([target], "started")
+    print("[services] %s is converging toward the cluster's desired state." % target)
 
     stale = redundancy_factor_warning(config, len(ips), target)
     if stale:
@@ -2530,9 +2817,13 @@ def main():
     parser.add_argument("-r", "--redundancy_factor", type=int, default=None, help="Fault Tolerance to Tolerate (FTT) / Redundancy Factor (e.g. 0, 1, or 2). "
                              "With 'add-node' it sets the factor explicitly; on a node that is "
                              "already a member it changes only the factor")
+    parser.add_argument("--fault_domain", "--fault-domain", choices=["kdisk", "khost", "kblock", "krack"], default=None,
+                        help="Fault tolerance domain level (kdisk, khost, kblock, krack). Defaults to khost for multi-node, kdisk for single-node.")
     parser.add_argument("-v", "--vip", required=False, help="Floating Cluster Virtual IP (VIP)")
     parser.add_argument("--verbose", action="store_true", help="Print verbose status information")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable status (ZooKeeper-backed path only)")
+    parser.add_argument("--witness", required=False,
+                        help="IP of the witness node (lightweight quorum tie-breaker for 2-node clusters)")
     parser.add_argument("--node", required=False,
                         help="Single host IP, for 'decommission', 'rejoin', 'add-node', "
                              "'zk-promote' and 'zk-demote'")
@@ -2577,12 +2868,27 @@ def main():
         else:
             parser.error("the following arguments are required: -s/--servers (or a valid /etc/hci/cluster.json config)")
 
+        witness_ip = args.witness.strip() if args.witness else None
+        if witness_ip:
+            if witness_ip not in ips:
+                ips.append(witness_ip)
+            print(f"[Witness] Witness node configured: {witness_ip} (participates in ZooKeeper quorum tie-breaking only).")
+        elif len(ips) == 2:
+            print("[WARNING] 2-node cluster detected without a witness node.")
+            print("[WARNING] A two-node ZooKeeper ensemble requires both nodes up and tolerates zero failures.")
+            print("[WARNING] Use --witness <ip> to provide a lightweight quorum tie-breaker.")
+
+        data_ips = [ip for ip in ips if ip != witness_ip]
+        fault_domain = (args.fault_domain or ("kdisk" if len(data_ips) == 1 else "khost")).lower()
         rf = args.redundancy_factor if args.redundancy_factor is not None else 1
-        if len(ips) == 1:
-            if rf > 0:
-                print(f"[WARNING] Single-node cluster detected. Forcing redundancy factor (FTT) from {rf} to 0 (no replication). Adding nodes later will not raise it: 'cluster add-node --node <ip> -r N' does.")
-            rf = 0
-        for line in two_replica_warning(default_metadata_replication_factor(rf, len(ips))):
+        if len(data_ips) == 1:
+            if fault_domain == "kdisk":
+                print(f"[Fault Domain] kDisk mode enabled: single-node cluster supports redundancy_factor={rf} (FTT={rf}) via local drive mirroring.")
+            else:
+                if rf > 0:
+                    print(f"[WARNING] Single-node cluster detected. Forcing redundancy factor (FTT) from {rf} to 0 (no replication). To enable multi-disk mirroring on a single node, use --fault_domain=kdisk. Adding nodes later will not raise it: 'cluster add-node --node <ip> -r N' does.")
+        # two_replica_warning(default_metadata_replication_factor(rf, len(ips)))
+        for line in two_replica_warning(default_metadata_replication_factor(rf, len(data_ips))):
             print(line)
         vip = args.vip if args.vip else ""
 
@@ -2635,7 +2941,7 @@ def main():
 
         # Ensure any running core services are stopped to prevent them interfering with boot
         print("Ensuring any running cluster services are stopped for a clean bootstrap...")
-        cleanup_services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
+        cleanup_services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "kass", "sidon", "daruk", "hydra-db", "zookeeper"]
         # `ignore_failed` is the `|| true` this used to carry: a service that is not
         # running cannot be stopped, and on a clean host none of them are.
         unit_action_parallel(ips, "stop", cleanup_services, ignore_failed=True)
@@ -2648,15 +2954,23 @@ def main():
             rc, hostname, _ = run_remote_spark(ip, "hostname")
             hostname = hostname.strip() if rc == 0 else f"node-{idx+1}"
             print(f"[{ip}] Resolved hostname: {hostname}")
+            is_wit = (witness_ip is not None and ip == witness_ip)
+            rack_num = 1 + (idx // 4)
             hosts_info.append({
                 "node_id": idx + 1,
                 "ip": ip,
-                "hostname": hostname
+                "hostname": hostname,
+                "is_witness": is_wit,
+                "role": "witness" if is_wit else "hypervisor",
+                "rack": f"rack{rack_num}",
+                "chassis_serial": f"chassis-{rack_num:02d}",
+                "node_position": chr(ord('A') + (idx % 4))
             })
 
         cluster_json_data = {
             "cluster_name": "hci-01",
             "redundancy_factor": rf,
+            "fault_domain": fault_domain,
             "dfs_engine": "sidon",
             "vip": vip,
             "hosts": hosts_info
@@ -2754,7 +3068,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         cmd_claim = f"python3 -c \"import base64; exec(base64.b64decode('{claim_script_b64}').decode())\""
         
         claim_results = run_parallel(
-            ips, cmd_claim, timeout=STORAGE_PREP_TIMEOUT,
+            data_ips, cmd_claim, timeout=STORAGE_PREP_TIMEOUT,
             label="Preparing the extent-store disk (clearing it, then a volume group and thin pool; "
                   "about a minute)")
         
@@ -2782,14 +3096,14 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # further empty disk and record which filesystems are sidon's. Nothing is mounted
         # and /etc/fstab is not touched: sidon mounts what /etc/hci/sidon-disks names, by
         # filesystem UUID, when it starts, and refuses any path whose disk is not there.
-        print("Preparing each node's extent store: volume, further disks, and the disk record...")
-        run_parallel_checked(ips, shell_script_command(CARVE_SIDON_VOLUME),
+        print("Preparing each data node's extent store: volume, further disks, and the disk record...")
+        run_parallel_checked(data_ips, shell_script_command(CARVE_SIDON_VOLUME),
                              timeout=STORAGE_PREP_TIMEOUT,
                              label="Carving sidon's journal volume")
-        run_parallel_checked(ips, shell_script_command(CLAIM_EXTRA_DISKS),
+        run_parallel_checked(data_ips, shell_script_command(CLAIM_EXTRA_DISKS),
                              timeout=STORAGE_PREP_TIMEOUT,
                              label="Registering any further disks for the extent store")
-        run_parallel_checked(ips, shell_script_command(STAGE_SIDON_DISKS),
+        run_parallel_checked(data_ips, shell_script_command(STAGE_SIDON_DISKS),
                              timeout=STORAGE_PREP_TIMEOUT,
                              label="Writing the record of which disks are sidon's")
 
@@ -2830,20 +3144,23 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # The Phoenix console's own environment, which Phase 6 needs before it can start the
         # console. Provisioning wrote it unless a destroy has removed it since.
         try:
-            for ip in ensure_phoenix_env(ips):
+            for ip in ensure_phoenix_env(data_ips):
                 print(f"[{ip}] wrote the Phoenix console environment (it was missing).")
+            reconcile_phoenix_origins_from_config(data_ips, cluster_json_data)
         except RuntimeError as exc:
             print(f"[ERROR] {exc}")
             sys.exit(1)
 
 
         # 5. Database Quorum Setup
-        print("Creating ZooKeeper, ScyllaDB, and Aether volume directories on all nodes...")
-        run_parallel_checked(ips, "mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram")
+        print("Creating ZooKeeper, ScyllaDB, and Aether volume directories on all data nodes...")
+        run_parallel_checked(data_ips, "mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram")
+        if witness_ip:
+            run_parallel_checked([witness_ip], "mkdir -p /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log")
         
         # Copy Daruk proxy script to ScyllaDB volume directory
-        print("Copying Daruk query proxy script to ScyllaDB volume directory on all nodes...")
-        run_parallel_checked(ips, "mkdir -p /var/lib/hci/hydra/data && cp /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py && chmod 644 /var/lib/hci/hydra/data/daruk.py")
+        print("Copying Daruk query proxy script to ScyllaDB volume directory on data nodes...")
+        run_parallel_checked(data_ips, "mkdir -p /var/lib/hci/hydra/data && cp /usr/local/bin/daruk.py /var/lib/hci/hydra/data/daruk.py && chmod 644 /var/lib/hci/hydra/data/daruk.py")
 
         print("Writing dynamic ZooKeeper container configs on all hosts...")
         if len(ips) == 1:
@@ -2892,6 +3209,42 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             # The unit file is written through /execute because writing a file has no
             # typed endpoint; the reload it used to be chained to has one.
             run_remote_spark(ip, f"mkdir -p /etc/containers/systemd && echo {zk_b64} | base64 -d > /etc/containers/systemd/zookeeper.container")
+            if ip in data_ips:
+                zk_conn = ",".join(f"{z_ip}:2181" for z_ip in ips[:3])
+                kass_quad = (
+                    "[Unit]\n"
+                    "Description=Kass (Kafka) Cluster Event Streaming Service\n"
+                    "After=zookeeper.service\n"
+                    "ConditionPathExists=!/etc/hci/maintenance.state\n\n"
+                    "[Service]\n"
+                    "Restart=always\n"
+                    "CPUWeight=100\n"
+                    "MemoryMax=1.5G\n"
+                    "MemoryHigh=1.2G\n\n"
+                    "[Container]\n"
+                    "Image=docker.io/apache/kafka:3.8.0\n"
+                    "Network=host\n"
+                    "Volume=/var/lib/hci/kafka/data:/var/lib/kafka/data:Z\n"
+                    "Volume=/var/lib/hci/kafka/log:/var/lib/kafka/logs:Z\n"
+                    f"Exec=/opt/kafka/bin/kafka-server-start.sh /opt/kafka/config/server.properties "
+                    f"--override zookeeper.connect={zk_conn} --override broker.id={node_id} "
+                    f"--override listeners=PLAINTEXT://0.0.0.0:9092 "
+                    f"--override advertised.listeners=PLAINTEXT://{ip}:9092 "
+                    f"--override log.dirs=/var/lib/kafka/data "
+                    f"--override offsets.topic.replication.factor=1 "
+                    f"--override transaction.state.log.replication.factor=1 "
+                    f"--override transaction.state.log.min.isr=1 "
+                    f"--override auto.create.topics.enable=true\n"
+                    "User=1000:1000\n"
+                )
+                kass_b64 = base64.b64encode(kass_quad.encode()).decode()
+                run_remote_spark(
+                    ip,
+                    f"mkdir -p /etc/containers/systemd && "
+                    f"echo {kass_b64} | base64 -d > /etc/containers/systemd/kass.container && "
+                    f"rm -rf /var/lib/hci/kafka/data/* /var/lib/hci/kafka/log/* && "
+                    f"mkdir -p /var/lib/hci/kafka/data /var/lib/hci/kafka/log && "
+                    f"chown -R 1000:1000 /var/lib/hci/kafka")
             unit_action(ip, "daemon-reload")
 
         print("Starting ZooKeeper service in parallel...")
@@ -2916,15 +3269,16 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             print("[WARNING] Could not write cluster state to ZooKeeper.")
 
         print("Starting ScyllaDB one node at a time, seed first...")
-        scylla_error = start_scylla_in_order(ips)
+        # start_scylla_in_order(ips)
+        scylla_error = start_scylla_in_order(data_ips)
         if scylla_error:
             print(f"[ERROR] {scylla_error}")
             sys.exit(1)
 
-        print("Starting Daruk query proxy service on all hosts...")
-        unit_action_checked(ips, "restart", ["daruk"])
-        print("Waiting for Daruk query proxy to listen on port 9043 on all nodes...")
-        for ip in ips:
+        print("Starting Daruk query proxy service on data hosts...")
+        unit_action_checked(data_ips, "restart", ["daruk"])
+        print("Waiting for Daruk query proxy to listen on port 9043 on data nodes...")
+        for ip in data_ips:
             daruk_ready = False
             for _ in range(30):
                 if port_listening(ip, 9043):
@@ -2934,17 +3288,32 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             if not daruk_ready:
                 print(f"[ERROR] Daruk query proxy failed to listen on port 9043 on {ip}")
                 sys.exit(1)
-        print("Daruk query proxy is ready on all nodes.")
+        print("Daruk query proxy is ready on data nodes.")
+
+        print("Applying Hydra keyspace and schema migrations on the seed node...")
+        rf_meta = default_metadata_replication_factor(rf, len(data_ips))
+        run_cql_query(
+            f"CREATE KEYSPACE IF NOT EXISTS hydra WITH replication = "
+            f"{{'class': 'NetworkTopologyStrategy', 'datacenter1': {rf_meta}}};")
+        try:
+            import helios_schema
+            applied = helios_schema.ensure_schema(
+                run_conditional_cql_query, node_id=data_ips[0])
+            if applied:
+                print(f"Applied {len(applied)} schema migration(s).")
+        except Exception as exc:
+            print(f"[WARNING] Schema initialization on seed reported: {exc}")
 
         # The extent store starts last, after Hydra and Daruk. Sidon keeps vdisk ownership
         # as an (owner, epoch) record in Hydra, and MANAGED_SERVICES declares it behind daruk;
         # create used to start it first, the reverse of the order `cluster start` follows.
-        print("\nStarting the extent store (sidon) on all nodes...")
-        unit_action_checked(ips, "enable", ["sidon"])
-        unit_action_checked(ips, "restart", ["sidon"])
+        print("\nStarting the extent store (sidon) on data nodes...")
+        unit_action_checked(data_ips, "enable", ["sidon"])
+        # unit_action_checked(ips, "restart", ["sidon"])
+        unit_action_checked(data_ips, "restart", ["sidon"])
 
-        print("Verifying each node's extent store is mounted and answering...")
-        for ip in ips:
+        print("Verifying each data node's extent store is mounted and answering...")
+        for ip in data_ips:
             rc_cap, out_cap, err_cap = wait_for_sidon_capacity(ip)
             if rc_cap != 0 or not out_cap.strip():
                 print(f"[ERROR] [{ip}] sidon did not answer on its control socket within 90s: "
@@ -2974,7 +3343,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 6. Start Workload Services
         print("\n--- Phase 6: Starting Core HCI Services ---")
-        services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "hylia"]
+        services = ["spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "rauru", "vali", "catalyst", "gatoway", "urbosa", "logos", "mipha", "agahnim", "slate", "kass", "hylia"]
         
         # Check if urbosa enabled
         urbosa_enabled = False
@@ -2989,9 +3358,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
             services.append("urbosa")
 
         for svc in services:
-            print(f"Starting {svc} service in parallel across all nodes...")
-            unit_action_checked(ips, "restart", [svc])
-            for ip in ips:
+            print(f"Starting {svc} service in parallel across data nodes...")
+            unit_action_checked(data_ips, "restart", [svc])
+            for ip in data_ips:
                 for _ in range(30):
                     if unit_is_active(ip, svc):
                         break
@@ -3002,24 +3371,24 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 7. Verification & Liveness Check Loop
         print("\n--- Phase 7: Verifying Liveness & Cluster Health ---")
-        print("Polling ScyllaDB Gossip Status until all nodes are Up-Normal (UN)...")
+        print("Polling ScyllaDB Gossip Status until all data nodes are Up-Normal (UN)...")
         gossip_healthy = False
         for i in range(30):
-            rc, out, _ = run_remote_spark(ips[0], "podman exec systemd-hydra-db nodetool status")
+            rc, out, _ = run_remote_spark(data_ips[0], "podman exec systemd-hydra-db nodetool status")
             if rc == 0:
                 un_count = 0
                 for line in out.splitlines():
                     if line.strip().startswith("UN"):
                         un_count += 1
-                print(f"Gossip health check {i+1}/30: found {un_count}/{len(ips)} nodes in UN state.")
-                if un_count >= len(ips):
+                print(f"Gossip health check {i+1}/30: found {un_count}/{len(data_ips)} nodes in UN state.")
+                if un_count >= len(data_ips):
                     gossip_healthy = True
                     break
             time.sleep(5)
             
         if not gossip_healthy:
             print("[ERROR] ScyllaDB Gossip ring failed to stabilize. nodetool status output:")
-            rc, out, _ = run_remote_spark(ips[0], "podman exec systemd-hydra-db nodetool status")
+            rc, out, _ = run_remote_spark(data_ips[0], "podman exec systemd-hydra-db nodetool status")
             print(out)
             sys.exit(1)
 
@@ -3027,6 +3396,9 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         zk_healthy = True
         leaders = 0
         followers = 0
+        observers = 0
+        expected_voters = min(len(ips), 3)
+        expected_observers = max(0, len(ips) - expected_voters)
         for ip in ips:
             zk_cmd = "python3 -c \"import sys; sys.path.insert(0, '/usr/local/bin'); import helios_zk; print('Mode: ' + (helios_zk.server_mode('127.0.0.1', timeout=2.0) or 'unknown'))\""
             rc_zk, out_zk, _ = run_remote_spark(ip, zk_cmd)
@@ -3040,15 +3412,20 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
                     leaders += 1
                 elif mode == "follower":
                     followers += 1
+                elif mode == "observer":
+                    observers += 1
             else:
                 print(f"  [{ip}] [ERROR] ZooKeeper consensus check failed: {out_zk}")
                 zk_healthy = False
-        if not zk_healthy or leaders != 1 or followers != len(ips) - 1:
-            print(f"[ERROR] ZooKeeper quorum is not healthy. Leaders: {leaders}, Followers: {followers}")
+        if (not zk_healthy or leaders != 1
+                or followers != expected_voters - 1
+                or observers != expected_observers):
+            print(f"[ERROR] ZooKeeper quorum is not healthy. "
+                  f"Leaders: {leaders}, Followers: {followers}, Observers: {observers}")
             sys.exit(1)
 
-        print("Verifying every node's storage daemon is reachable from its peers...")
-        for ip in ips:
+        print("Verifying every data node's storage daemon is reachable from its peers...")
+        for ip in data_ips:
             rc_p, out_p, _ = run_remote_spark(ip, SIDON_PEERS_CMD)
             if rc_p != 0 or not out_p.strip():
                 print(f"[WARNING] [{ip}] could not read peer reachability.")
@@ -3071,7 +3448,7 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         print("Verifying Spectrum Web UI reachability on port 8443...")
         spectrum_healthy = True
-        for ip in ips:
+        for ip in data_ips:
             reached = False
             for _ in range(20):
                 if port_listening(ip, 8443):
@@ -3454,10 +3831,13 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         atexit.register(release_cluster_lock, ips)
 
 
+        witness_ip = get_witness_ip()
+        data_ips = [ip for ip in ips if ip != witness_ip]
+
         # 1. Stop and undefine all libvirt VMs (with a timeout to prevent hanging)
         print("\n--- Phase 1: Stopping & Undefining libvirt VMs ---")
         vm_cleanup_cmd = "timeout 15 sh -c 'for vm in $(virsh list --all --name); do echo \"Forcing VM destroy: $vm\"; virsh destroy $vm || true; virsh undefine $vm --nvram || true; done' || echo 'VM cleanup timed out'"
-        for ip in ips:
+        for ip in data_ips:
             print(f"[{ip}] Cleaning up virtual machines...")
             rc, out, err = run_remote_spark(ip, vm_cleanup_cmd)
             if out.strip():
@@ -3467,16 +3847,19 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
 
         # 2. Stop all core HCI services in parallel
         print("\n--- Phase 2: Stopping Core HCI Services ---")
-        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "sidon", "daruk", "hydra-db", "zookeeper"]
-        for ip in ips:
+        services = ["hylia", "rauru", "logos", "mipha", "spectrum", "spectrum-phx", "bifrost", "dagur", "mimir", "vali", "catalyst", "gatoway", "urbosa", "agahnim", "slate", "kass", "sidon", "daruk", "hydra-db", "zookeeper"]
+        for ip in data_ips:
             print(f"[{ip}] Stopping services: {', '.join(services)}")
             ok, detail = unit_action(ip, "stop", services, ignore_failed=True)
             if not ok:
                 print(f"[{ip}] [WARNING] Failed to stop services: {detail}")
+        if witness_ip and witness_ip in ips:
+            print(f"[{witness_ip}] Stopping witness services: zookeeper")
+            unit_action(witness_ip, "stop", ["zookeeper"], ignore_failed=True)
 
-        # 3. Unmount the extent store on all hosts
+        # 3. Unmount the extent store on data hosts
         print("\n--- Phase 3: Unmounting Storage Volumes ---")
-        for ip in ips:
+        for ip in data_ips:
             print(f"[{ip}] Unmounting volume paths...")
             rc1, out1, err1 = run_remote_spark(ip, "umount -l /var/lib/hci/aether/volumes/default-vm-container || true")
             if out1.strip() or err1.strip():
@@ -3492,14 +3875,14 @@ print(json.dumps({"status": "created", "device": dev_path, "size_bytes": size_by
         # would fail on it. A vdisk is a file on a filesystem: stopping the daemon and
         # unmounting is the whole teardown.
         print("\n--- Phase 4: Stopping the storage data path ---")
-        for ip in ips:
+        for ip in data_ips:
             unit_action(ip, "stop", ["sidon"], ignore_failed=True)
             run_remote_spark(ip, SIDON_TEARDOWN)
             print(f"[{ip}] storage stopped and unmounted.")
 
         # 5. Wipe LVM vg/thin-pool and disk signatures dynamically
         print("\n--- Phase 5: Wiping LVM Pools & Disk Signatures ---")
-        for ip in ips:
+        for ip in data_ips:
             print(f"[{ip}] Removing LVM thin pool 'thin_pool_aether' and VG 'vg_aether'...")
             rc, out, err = run_remote_spark(ip, "lvchange -an -f /dev/vg_aether/* || true; lvremove -y -f vg_aether || true; vgremove -y -f vg_aether || true; rm -rf /dev/vg_aether || true; dmsetup ls | grep vg_aether | awk '{print $1}' | while read -r dm; do dmsetup remove -f \"$dm\" || true; done")
             if out.strip():
@@ -3728,7 +4111,7 @@ print("Removing system containers...", flush=True)
 run_with_timeout("podman rm -f systemd-hydra-db systemd-zookeeper systemd-spectrum spectrum-phx || true", timeout=15)
 
 print("Removing storage directories...", flush=True)
-run_with_timeout("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", timeout=10)
+run_with_timeout("rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /var/lib/hci/hydra/data /var/lib/hci/kafka/data/* /var/lib/hci/kafka/log/* /var/lib/hci/aether/data /var/lib/hci/aether/volumes /var/lib/hci/aether/images /var/lib/hci/aether/nvram /run/hci/*", timeout=10)
 run_with_timeout("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json /var/lib/hci/sidon", timeout=10)
 print("--- Local wipe completed ---", flush=True)
 """
@@ -3737,13 +4120,19 @@ print("--- Local wipe completed ---", flush=True)
         wipe_script = wipe_script.replace("__SIDON_TEARDOWN__", repr(SIDON_TEARDOWN))
         wipe_b64 = base64.b64encode(wipe_script.encode()).decode()
         cmd_wipe = f"python3 -c \"import base64; exec(base64.b64decode('{wipe_b64}').decode())\""
-        for ip in ips:
+        for ip in data_ips:
             print(f"[{ip}] Wiping local filesystem data and system containers...")
             rc, out, err = run_remote_spark(ip, cmd_wipe)
             if out.strip():
                 print(f"[{ip}] Log:\n{out}")
             if rc != 0:
                 print(f"[{ip}] [WARNING] Cleanup failed: {err}")
+        if witness_ip and witness_ip in ips:
+            print(f"[{witness_ip}] Wiping witness containers and storage configs...")
+            cmd_wit_wipe = "podman rm -f systemd-zookeeper || true; rm -rf /var/lib/hci/zookeeper/data /var/lib/hci/zookeeper/log /run/hci/*; rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hci/cluster.json"
+            rc, out, err = run_remote_spark(witness_ip, cmd_wit_wipe)
+            if rc != 0:
+                print(f"[{witness_ip}] [WARNING] Cleanup failed: {err}")
 
         # 7. Restart spark-daemon asynchronously on all hosts to complete destroy
         print("\n--- Phase 7: Restarting spark-daemon Services ---")

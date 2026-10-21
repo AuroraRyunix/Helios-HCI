@@ -215,19 +215,59 @@ defmodule SpectrumPhx.Lanayru do
     case read(static, :clusters, @clusters_cql) do
       {:ok, [row | _]} ->
         row = stringify(row)
+        name = string(Map.get(row, "name")) || "unnamed"
 
         %{
           id: Map.get(row, "cluster_id"),
-          name: string(Map.get(row, "name")) || "unnamed",
+          name: name,
           control_nodes: integer(Map.get(row, "control_nodes")),
           segment_id: Map.get(row, "overlay_segment_id"),
           status: string(Map.get(row, "status")) || "unknown",
-          created_at: Map.get(row, "created_at")
+          created_at: Map.get(row, "created_at"),
+          kubeconfig: fetch_kubeconfig(name, static)
         }
 
       _ ->
         nil
     end
+  end
+
+  @doc "Read the stored kubeconfig for `cluster_name` from `hydra.cluster_settings`."
+  def kubeconfig(cluster_name, opts \\ []) do
+    fetch_kubeconfig(to_string(cluster_name), static_source(opts))
+  end
+
+  defp fetch_kubeconfig(cluster_name, static) when is_binary(cluster_name) do
+    setting_key = "lanayru_kubeconfig_" <> cluster_name
+
+    case static do
+      %{kubeconfig: kc} when is_binary(kc) ->
+        string(kc)
+
+      %{settings: rows} when is_list(rows) ->
+        rows
+        |> Enum.map(&stringify/1)
+        |> Enum.find_value(fn row ->
+          if string(Map.get(row, "key")) == setting_key, do: string(Map.get(row, "value"))
+        end)
+
+      %{} ->
+        nil
+
+      nil ->
+        case query_cql("SELECT value FROM hydra.cluster_settings WHERE key = ?", [setting_key]) do
+          {:ok, [row | _]} -> string(Map.get(stringify(row), "value"))
+          _ -> nil
+        end
+    end
+  end
+
+  defp query_cql(cql, params) do
+    Hydra.query(cql, params)
+  rescue
+    exception -> {:error, Exception.message(exception)}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   defp segments(static) do

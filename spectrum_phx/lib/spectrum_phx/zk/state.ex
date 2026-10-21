@@ -31,7 +31,7 @@ defmodule SpectrumPhx.Zk.State do
   # rather than with any one renderer, since the keys of `"services"` come from here.
   @service_display_order ~w(ZooKeeper HydraDB Daruk Sidon Spark Spectrum Phoenix Bifrost Dagur
                             Mimir Rauru Vali Catalyst Hylia Gatoway Logos Mipha Agahnim Slate
-                            Urbosa)
+                            Urbosa Kass)
 
   @type node_document :: %{optional(String.t()) => term()}
   @type cluster_state :: %{

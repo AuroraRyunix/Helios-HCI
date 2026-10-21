@@ -44,6 +44,7 @@ mapping = {
     "IMPA_B64": "impa.py",
     "HELIOS_SCHEMA_B64": "helios_schema.py",
     "SAGA_B64": "saga.py",
+    "SALTRUN_B64": "saltrun",
     "ZOOKEEPER_LOGBACK_B64": "zookeeper_config/logback.xml"
 }
 

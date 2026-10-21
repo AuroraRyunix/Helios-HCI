@@ -148,6 +148,33 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
     end
   end
 
+  def handle_event("check_for_updates", _params, socket) do
+    case Lcm.check_for_updates() do
+      {:ok, _task_id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Update check task dispatched.")
+         |> load()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
+  def handle_event("abort_upgrade", _params, socket) do
+    case Lcm.abort_upgrade() do
+      {:ok, _job_id} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Upgrade job reset to ABORTED.")
+         |> load()
+         |> retime()}
+
+      {:error, message} ->
+        {:noreply, put_flash(socket, :error, message)}
+    end
+  end
+
   defp load(socket) do
     socket
     |> assign(:overview, Lcm.overview())
@@ -179,6 +206,9 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
           </span>
         </:subtitle>
         <:actions>
+          <.button phx-click="check_for_updates" id="check-updates-button" class="btn-outline">
+            <.icon name="hero-cloud-arrow-down" class="size-4" /> Check for Updates
+          </.button>
           <.button phx-click="refresh" id="refresh-button">
             <.icon name="hero-arrow-path" class="size-4" /> Refresh
           </.button>
@@ -193,6 +223,17 @@ defmodule SpectrumPhxWeb.Lcm.IndexLive do
           subtitle={"build #{@overview.job.build || "unknown"} · #{@overview.job.state}"}
           class={Lcm.running?(@overview.job) && "glow-primary"}
         >
+          <:actions>
+            <button
+              :if={Lcm.abortable?(@overview.job)}
+              type="button"
+              phx-click="abort_upgrade"
+              id="abort-upgrade-button"
+              class="btn btn-xs btn-error btn-outline"
+            >
+              Reset / Abort Stuck Upgrade
+            </button>
+          </:actions>
           <div class="flex items-baseline justify-between gap-2">
             <span class="text-sm">
               <span :if={@overview.job.current}>

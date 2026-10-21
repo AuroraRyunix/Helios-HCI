@@ -189,6 +189,54 @@ def vm_power_call(host_ip, vm_name, action):
         return -1, {}, str(exc)
 
 
+def vm_guest_agent_call(host_ip, vm_name, action):
+    """Best-effort QEMU Guest Agent call (`fsfreeze-freeze` or `fsfreeze-thaw`) via Spark.
+
+    Tries `POST /api/v1/vm/<vm>/guest-agent` with `{"action": action}` first, and falls back to
+    `virsh qemu-agent-command <vm> '{"execute":"guest-<action>"}'` via `/api/v1/execute`.
+    """
+    if action not in ("fsfreeze-freeze", "fsfreeze-thaw"):
+        return -1, {}, "unsupported guest-agent action %r" % (action,)
+    address, verify_identity = spark_endpoint(host_ip)
+    try:
+        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile="/root/.certs/ca.crt")
+        context.load_cert_chain(certfile="/root/.certs/client.crt", keyfile="/root/.certs/client.key")
+        context.check_hostname = verify_identity
+    except Exception as exc:
+        return -1, {}, str(exc)
+
+    try:
+        request = urllib.request.Request(
+            "https://%s:9099/api/v1/vm/%s/guest-agent" % (address, urllib.parse.quote(vm_name, safe="")),
+            data=json.dumps({"action": action}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, context=context, timeout=15) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            if isinstance(body, dict) and body.get("status") != "error" and not body.get("error"):
+                return 0, body, ""
+    except Exception:
+        pass
+
+    qmp_cmd = json.dumps({"execute": "guest-%s" % action})
+    safe_vm = "'" + str(vm_name).replace("'", "'\"'\"'") + "'"
+    cmd = "virsh -c qemu:///system qemu-agent-command %s '%s'" % (safe_vm, qmp_cmd)
+    try:
+        request = urllib.request.Request(
+            "https://%s:9099/api/v1/execute" % address,
+            data=json.dumps({"command": cmd}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, context=context, timeout=15) as response:
+            body = json.loads(response.read().decode("utf-8"))
+            if isinstance(body, dict) and body.get("status") == "success":
+                return 0, body, ""
+            return -1, body if isinstance(body, dict) else {}, str(body.get("message") or "guest agent command failed")
+    except Exception as exc:
+        return -1, {}, str(exc)
+
+
+DOMAIN_INTERVAL_SECONDS = 60
+
+
 def run_snapshot_policy():
     """One pass of the policy. Returns the Summary; raises RuntimeError if the cluster cannot
     be read, which the loop treats as "not ready yet" and not as a fault."""
@@ -196,10 +244,21 @@ def run_snapshot_policy():
     return helios_snapshots.Runner(env, helios_schema).run()
 
 
+def recover_domain_pass(force=True):
+    """Recover any protection-domain sets left in `taking` by a dead leader: resume paused VMs
+    and abandon incomplete sets."""
+    if rauru_protection is None:
+        return None
+    env = rauru_protection.Env(
+        run_cql_query, dfs_call, vm_power_call, guest_agent=vm_guest_agent_call, say=log)
+    return rauru_protection.Runner(env, helios_schema).recover(force=force)
+
+
 def run_domain_pass():
     """One pass of the protection domains: resume anything a dead run left paused, take the sets
     that are due, prune. A cluster with no enabled domain costs one table read and one line."""
-    env = rauru_protection.Env(run_cql_query, dfs_call, vm_power_call, say=log)
+    env = rauru_protection.Env(
+        run_cql_query, dfs_call, vm_power_call, guest_agent=vm_guest_agent_call, say=log)
     return rauru_protection.Runner(env, helios_schema).run()
 
 
@@ -235,7 +294,8 @@ def run_everything():
 class Daemon(object):
     """The loop, with every effect passed in so it can be driven without a cluster."""
 
-    def __init__(self, election, ready, run, interval, clock=time.time, say=log, backoff=None):
+    def __init__(self, election, ready, run, interval, clock=time.time, say=log, backoff=None,
+                 domain_run=None, domain_recover=None, domain_interval=DOMAIN_INTERVAL_SECONDS):
         self.election = election
         self.ready = ready
         self.run = run
@@ -243,8 +303,15 @@ class Daemon(object):
         self.clock = clock
         self.say = say
         self.backoff = backoff or Backoff()
+        self.domain_run = domain_run if domain_run is not None else (
+            run_domain_pass if run is run_everything else None)
+        self.domain_recover = domain_recover if domain_recover is not None else (
+            recover_domain_pass if run is run_everything else None)
+        self.domain_interval = domain_interval
         self.next_run = 0.0
+        self.next_domain_run = 0.0
         self._leading = None
+        self._recovered_on_lead = False
         self._waiting_on = None
 
     def _announce_waiting(self, why):
@@ -267,6 +334,7 @@ class Daemon(object):
         leads = bool(self.election.leading())
         if leads != self._leading:
             self._leading = leads
+            self._recovered_on_lead = False
             self.say("this node holds the rauru-snapshots election and will run the snapshot "
                      "policy" if leads else
                      "standing by: another node runs the snapshot policy, or the election "
@@ -275,31 +343,67 @@ class Daemon(object):
             return POLL_SECONDS
 
         now = self.clock()
-        if now < self.next_run:
-            return min(POLL_SECONDS, self.next_run - now)
+        policy_due = now >= self.next_run
+        domain_due = self.domain_run is not None and now >= self.next_domain_run
+        need_recover = self.domain_recover is not None and not self._recovered_on_lead
+
+        if not policy_due and not domain_due and not need_recover:
+            next_wake = self.next_run - now
+            if self.domain_run is not None:
+                next_wake = min(next_wake, self.next_domain_run - now)
+            return min(POLL_SECONDS, max(0.0, next_wake))
 
         ok, why = self.ready()
         if not ok:
             self._announce_waiting("Hydra is not answering (%s)" % why)
             return self.backoff.fail()
 
-        try:
-            summary = self.run()
-        except RuntimeError as exc:
-            # The cluster could not be read: the tables are not there yet, or Daruk went away
-            # between the probe and the query. Not a fault in the policy, so not an error.
-            self._announce_waiting(str(exc))
-            return self.backoff.fail()
+        if need_recover:
+            try:
+                self.domain_recover(force=True)
+            except Exception as exc:
+                self.say("startup protection-domain recovery failed (%s)" % exc)
+            self._recovered_on_lead = True
 
-        self._waiting_on = None
-        self.backoff.reset()
-        self.next_run = self.clock() + self.interval
-        if summary is not None and not getattr(summary, "ok", True):
-            self.say("the policy run reported %d failure(s); they are recorded as Rauru tasks"
-                     % len(getattr(summary, "failures", [])))
-        else:
-            self.say("snapshot policy run complete; next in %ds" % self.interval)
-        return min(POLL_SECONDS, self.interval)
+        if policy_due:
+            try:
+                summary = self.run()
+            except RuntimeError as exc:
+                # The cluster could not be read: the tables are not there yet, or Daruk went away
+                # between the probe and the query. Not a fault in the policy, so not an error.
+                self._announce_waiting(str(exc))
+                return self.backoff.fail()
+
+            self._waiting_on = None
+            self.backoff.reset()
+            finished_at = self.clock()
+            self.next_run = finished_at + self.interval
+            self.next_domain_run = finished_at + self.domain_interval
+            if summary is not None and not getattr(summary, "ok", True):
+                self.say("the policy run reported %d failure(s); they are recorded as Rauru tasks"
+                         % len(getattr(summary, "failures", [])))
+            else:
+                self.say("snapshot policy run complete; next in %ds" % self.interval)
+            if self.domain_run is not None:
+                return min(POLL_SECONDS, self.interval, self.domain_interval)
+            return min(POLL_SECONDS, self.interval)
+
+        if domain_due:
+            try:
+                domains = self.domain_run()
+                if domains is not None and not getattr(domains, "ok", True):
+                    self.say("the protection-domain pass reported %d failure(s); they are recorded as Rauru tasks"
+                             % len(getattr(domains, "failures", [])))
+            except Exception as exc:
+                self.say("the protection-domain pass failed (%s)" % exc)
+            self._waiting_on = None
+            self.backoff.reset()
+            self.next_domain_run = self.clock() + self.domain_interval
+
+        next_wake = self.next_run - self.clock()
+        if self.domain_run is not None:
+            next_wake = min(next_wake, self.next_domain_run - self.clock())
+        return min(POLL_SECONDS, max(0.0, next_wake))
 
 
 def check():

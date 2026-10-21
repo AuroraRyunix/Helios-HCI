@@ -336,18 +336,25 @@ impl Journal {
         Ok(rec)
     }
 
-    pub fn read_at(&self, pos: u64, len: usize) -> Result<Vec<u8>> {
+    /// Return a cloned file handle for the segment covering `pos`, allowing positional
+    /// reads (`read_in`) to execute without holding the vdisk mutex.
+    pub fn segment_for(&self, pos: u64) -> Result<Arc<File>> {
         let gen = gen_of(pos);
         if gen == self.gen {
-            return read_in(&self.file, pos, len);
+            return Ok(Arc::clone(&self.file));
         }
         match &self.old {
-            Some(o) if o.gen == gen => read_in(&o.file, pos, len),
+            Some(o) if o.gen == gen => Ok(Arc::clone(&o.file)),
             _ => Err(Error::corrupt(format!(
                 "journal {}: a read at generation {gen} names a segment that is gone",
                 self.path.display()
             ))),
         }
+    }
+
+    pub fn read_at(&self, pos: u64, len: usize) -> Result<Vec<u8>> {
+        let file = self.segment_for(pos)?;
+        read_in(&file, pos, len)
     }
 
     /// Close the live segment to new records and start a fresh one, returning the sequence

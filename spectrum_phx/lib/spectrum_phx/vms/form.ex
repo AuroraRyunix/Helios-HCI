@@ -38,6 +38,7 @@ defmodule SpectrumPhx.Vms.Form do
   def defaults(opts \\ []) do
     container = Keyword.get(opts, :container, "default-pool")
     network = Keyword.get(opts, :network, SpectrumPhx.Vms.Vm.default_network_id())
+    graphics = Keyword.get(opts, :graphics, "vnc")
 
     %{
       "structured" => "true",
@@ -48,8 +49,23 @@ defmodule SpectrumPhx.Vms.Form do
       "firmware" => "uefi",
       "boot_device" => "",
       "cpu_model" => "",
-      "graphics" => "vnc",
+      "graphics" => graphics,
       "audio_enabled" => "false",
+      "notes" => "",
+      "tags" => "",
+      "cpu_shares" => "",
+      "cpu_limit" => "",
+      "cpu_reservation" => "",
+      "mem_reservation" => "",
+      "mem_limit" => "",
+      "affinity_group" => "",
+      "anti_affinity_group" => "",
+      "pinned_hosts" => "",
+      "is_template" => "false",
+      "vtpm_enabled" => "false",
+      "secure_boot" => "false",
+      "cloud_init_userdata" => "",
+      "cloud_init_network" => "",
       "disk_rows" => %{"0" => disk_row(container)},
       "cdrom_rows" => %{},
       "nic_rows" => %{"0" => nic_row(network)}
@@ -115,6 +131,21 @@ defmodule SpectrumPhx.Vms.Form do
     |> Map.put("iso", Enum.map(rows(params, "cdrom_rows"), fn {_i, row} -> row["image"] end))
     |> Map.put("network_id", Enum.map(rows(params, "nic_rows"), &nic_entry/1))
     |> Map.put("memory", memory_mib(params["memory"], params["memory_unit"]))
+    |> Map.put("notes", params["notes"])
+    |> Map.put("tags", params["tags"])
+    |> Map.put("cpu_shares", params["cpu_shares"])
+    |> Map.put("cpu_limit", params["cpu_limit"])
+    |> Map.put("cpu_reservation", params["cpu_reservation"])
+    |> Map.put("mem_reservation", params["mem_reservation"])
+    |> Map.put("mem_limit", params["mem_limit"])
+    |> Map.put("affinity_group", params["affinity_group"])
+    |> Map.put("anti_affinity_group", params["anti_affinity_group"])
+    |> Map.put("pinned_hosts", params["pinned_hosts"])
+    |> Map.put("is_template", params["is_template"])
+    |> Map.put("vtpm_enabled", params["vtpm_enabled"])
+    |> Map.put("secure_boot", params["secure_boot"])
+    |> Map.put("cloud_init_userdata", params["cloud_init_userdata"])
+    |> Map.put("cloud_init_network", params["cloud_init_network"])
   end
 
   def to_attrs(params), do: params
@@ -141,6 +172,21 @@ defmodule SpectrumPhx.Vms.Form do
       "cpu_model" => vm.cpu_model || "",
       "graphics" => vm.graphics || "vnc",
       "audio_enabled" => to_string(vm.audio_enabled == true),
+      "notes" => vm.notes || "",
+      "tags" => vm.tags || "",
+      "cpu_shares" => if(vm.cpu_shares, do: to_string(vm.cpu_shares), else: ""),
+      "cpu_limit" => if(vm.cpu_limit, do: to_string(vm.cpu_limit), else: ""),
+      "cpu_reservation" => if(vm.cpu_reservation, do: to_string(vm.cpu_reservation), else: ""),
+      "mem_reservation" => if(vm.mem_reservation, do: to_string(vm.mem_reservation), else: ""),
+      "mem_limit" => if(vm.mem_limit, do: to_string(vm.mem_limit), else: ""),
+      "affinity_group" => vm.affinity_group || "",
+      "anti_affinity_group" => vm.anti_affinity_group || "",
+      "pinned_hosts" => vm.pinned_hosts || "",
+      "is_template" => to_string(vm.is_template == true),
+      "vtpm_enabled" => to_string(vm.vtpm_enabled == true),
+      "secure_boot" => to_string(vm.secure_boot == true),
+      "cloud_init_userdata" => vm.cloud_init_userdata || "",
+      "cloud_init_network" => vm.cloud_init_network || "",
       "disk_rows" =>
         vm |> SpectrumPhx.Vms.Vm.disks() |> Enum.map(&disk_form_row/1) |> index_rows(),
       "cdrom_rows" =>

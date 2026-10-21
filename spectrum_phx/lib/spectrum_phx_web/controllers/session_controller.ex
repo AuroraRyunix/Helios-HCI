@@ -16,6 +16,11 @@ defmodule SpectrumPhxWeb.SessionController do
       {:ok, authenticated} ->
         UserAuth.log_in_user(conn, authenticated)
 
+      {:error, :rate_limited} ->
+        conn
+        |> put_flash(:error, "Too many login attempts. Please wait a minute and try again.")
+        |> redirect(to: ~p"/login")
+
       {:error, :database_unavailable} ->
         conn
         |> put_flash(:error, "Cannot verify credentials: the database is unreachable.")

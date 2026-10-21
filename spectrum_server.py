@@ -1836,7 +1836,7 @@ def _init_db_once():
     """
     insert_system_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('system_history_cleanup', 'system_cleanup', '0 0 * * *', 86400, true, 0, '/usr/local/bin/valcli system.cleanup') IF NOT EXISTS;
+    VALUES ('system_history_cleanup', 'system_cleanup', '0 0 * * *', 86400, true, 0, '/usr/local/bin/ncli system.cleanup') IF NOT EXISTS;
     """
     # Enabled on a fresh cluster even though no backup target is configured yet, so it
     # fails nightly with a message naming the fix. A cluster with no backups should say so
@@ -1848,7 +1848,7 @@ def _init_db_once():
 
     insert_orphaned_disks_cleanup = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
-    VALUES ('orphaned_disks_cleanup', 'storage_cleanup', '0 2 * * *', 86400, true, 0, '/usr/local/bin/valcli storage.cleanup_orphaned') IF NOT EXISTS;
+    VALUES ('orphaned_disks_cleanup', 'storage_cleanup', '0 2 * * *', 86400, true, 0, '/usr/local/bin/ncli storage.cleanup_orphaned') IF NOT EXISTS;
     """
     insert_helios_update_check = """
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
@@ -2320,6 +2320,12 @@ def generate_vm_xml(name, uuid, memory, vcpu, firmware, disks_list, iso, boot_de
   <devices>
     {disk_devices_xml}
     <input type='tablet' bus='usb'/>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
     <interface type='bridge'>
       <source bridge='virbr0'/>
       <model type='virtio'/>
@@ -2891,6 +2897,88 @@ def release_vlan(vlan_id, net_id):
         return True, ""
     return False, (
         f"the claim on VLAN {int(vlan_id)} now belongs to {holder} and was left alone")
+
+
+def segment_exists(segment_id):
+    """True if segment_id exists in hydra.urbosa_segments, False if absent, None if unreadable."""
+    if not segment_id:
+        return False
+    try:
+        uuid.UUID(str(segment_id))
+    except Exception:
+        return False
+    rc, stdout, _ = run_cql_query(
+        f"SELECT JSON segment_id FROM hydra.urbosa_segments WHERE segment_id = {segment_id};")
+    if rc != 0:
+        return None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            return True
+    return False
+
+
+def claim_vni(vni, segment_id, name):
+    """Take the cluster-wide claim on a VXLAN VNI. Returns `(claimed, message)`."""
+    ok, applied, current, error = run_lwt("/v1/network/claim-vni", {
+        "vni": int(vni),
+        "segment_id": str(segment_id),
+        "name": str(name or ""),
+        "claimed_at_ms": int(time.time() * 1000),
+    })
+    if not ok:
+        return False, f"VNI {int(vni)} could not be claimed: {error}"
+    if applied:
+        return True, ""
+
+    holder_id = str(current.get("segment_id") or "")
+    holder_name = str(current.get("name") or "").strip() or "an unnamed segment"
+    still_there = segment_exists(holder_id)
+    if still_there is None:
+        return False, (
+            f"VNI {int(vni)} is claimed by '{holder_name}' ({holder_id}), and the "
+            f"segment table could not be read to confirm it still exists.")
+    if still_there:
+        return False, (
+            f"VNI {int(vni)} is already assigned to overlay segment '{holder_name}' "
+            f"({holder_id}). Two segments on one VNI merge their VXLAN broadcast domains.")
+
+    try:
+        claimed_at = int(current.get("claimed_at_ms") or 0)
+    except (TypeError, ValueError):
+        claimed_at = 0
+    age_ms = int(time.time() * 1000) - claimed_at
+    if age_ms < VLAN_CLAIM_GRACE_MS:
+        return False, (
+            f"VNI {int(vni)} was just claimed by a segment create that has not "
+            f"finished writing its row.")
+
+    ok, applied, _current, error = run_lwt("/v1/network/reclaim-vni", {
+        "vni": int(vni),
+        "segment_id": str(segment_id),
+        "name": str(name or ""),
+        "claimed_at_ms": int(time.time() * 1000),
+        "expected_segment_id": holder_id,
+    })
+    if ok and applied:
+        return True, ""
+    return False, f"VNI {int(vni)} claim is held by deleted segment {holder_id} and could not be reclaimed."
+
+
+def release_vni(vni, segment_id):
+    """Give a VNI claim back. Returns `(released, message)`."""
+    ok, applied, current, error = run_lwt("/v1/network/release-vni", {
+        "vni": int(vni),
+        "segment_id": str(segment_id),
+    })
+    if not ok:
+        return False, f"the claim on VNI {int(vni)} could not be released: {error}"
+    if applied:
+        return True, ""
+    holder = str(current.get("segment_id") or "")
+    if not holder:
+        return True, ""
+    return False, f"the claim on VNI {int(vni)} now belongs to {holder} and was left alone"
 
 
 def get_network_details(net_id):
@@ -3481,8 +3569,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             virsh_read_ok = False
             try:
                 rc_doms, res_doms, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/domains", None, method="GET")
+                ok = False
                 if rc_doms == 0 and isinstance(res_doms, dict) and "domains" in res_doms:
-                    virsh_read_ok = True
                     for d in res_doms.get("domains") or []:
                         d_name = d.get("name")
                         d_state = d.get("state")
@@ -3492,10 +3580,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             d_state = "Stopped"
                         if d_name:
                             libvirt_vms[d_name] = d_state
+                    ok = True
                 else:
                     rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
                     if rc == 0:
-                        virsh_read_ok = True
                         lines = stdout.splitlines()
                         for line in lines[2:]:
                             parts = line.split()
@@ -3507,6 +3595,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                 elif state_val == "shut off":
                                     state_val = "Stopped"
                                 libvirt_vms[name] = state_val
+                        ok = True
+                if ok:
+                    virsh_read_ok = True
             except Exception:
                 pass
 
@@ -4054,8 +4145,8 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             virsh_read_ok = False
             try:
                 rc_doms, res_doms, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/domains", None, method="GET")
+                ok = False
                 if rc_doms == 0 and isinstance(res_doms, dict) and "domains" in res_doms:
-                    virsh_read_ok = True
                     for d in res_doms.get("domains") or []:
                         d_name = d.get("name")
                         d_state = d.get("state")
@@ -4065,10 +4156,10 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             d_state = "Stopped"
                         if d_name:
                             libvirt_vms[d_name] = d_state
+                    ok = True
                 else:
                     rc, stdout, stderr = run_remote_spark("127.0.0.1", "virsh -c qemu:///system list --all")
                     if rc == 0:
-                        virsh_read_ok = True
                         lines = stdout.splitlines()
                         for line in lines[2:]:
                             parts = line.split()
@@ -4080,6 +4171,9 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                 elif state == "shut off":
                                     state = "Stopped"
                                 libvirt_vms[name] = state
+                        ok = True
+                if ok:
+                    virsh_read_ok = True
             except Exception:
                 pass
 
@@ -4459,22 +4553,26 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 if not node_ip:
                     continue
                 
-                cpu_cmd = 'echo -n "cores:"; nproc; echo -n "model:"; grep -m 1 "model name" /proc/cpuinfo | cut -d: -f2-'
-                rc_cpu, out_cpu, err_cpu = run_remote_spark(node_ip, cpu_cmd)
-                
-                cpu_data = {"cores": 0, "model": "Unknown"}
-                if rc_cpu == 0:
-                    cores = 0
-                    model = "Unknown"
-                    for line in out_cpu.splitlines():
-                        if line.startswith("cores:"):
-                            try:
-                                cores = int(line.split(":", 1)[1].strip())
-                            except:
-                                pass
-                        elif line.startswith("model:"):
-                            model = line.split(":", 1)[1].strip()
-                    cpu_data = {"cores": cores, "model": model}
+                rc_cpu_api, res_cpu_api, _ = run_mtls_spark_api(node_ip, "/api/v1/host/cpu", None, method="GET")
+                if rc_cpu_api == 0 and isinstance(res_cpu_api, dict) and "cores" in res_cpu_api:
+                    cpu_data = {"cores": res_cpu_api.get("cores", 0), "model": res_cpu_api.get("model", "Unknown")}
+                else:
+                    cpu_cmd = 'echo -n "cores:"; nproc; echo -n "model:"; grep -m 1 "model name" /proc/cpuinfo | cut -d: -f2-'
+                    rc_cpu, out_cpu, err_cpu = run_remote_spark(node_ip, cpu_cmd)
+                    
+                    cpu_data = {"cores": 0, "model": "Unknown"}
+                    if rc_cpu == 0:
+                        cores = 0
+                        model = "Unknown"
+                        for line in out_cpu.splitlines():
+                            if line.startswith("cores:"):
+                                try:
+                                    cores = int(line.split(":", 1)[1].strip())
+                                except:
+                                    pass
+                            elif line.startswith("model:"):
+                                model = line.split(":", 1)[1].strip()
+                        cpu_data = {"cores": cores, "model": model}
                 
                 rc_ram, res_ram, err_ram = run_mtls_spark_api(node_ip, "/api/v1/host/memory", None, method="GET")
                 ram_data = {"total": 0, "used": 0, "free": 0}
@@ -6551,6 +6649,17 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(409, {"error": f"A VM named '{name}' already exists (currently placed on {current.get('host_ip') or 'no host'}). Its record was left untouched."})
                 return
 
+            extra_sets = []
+            for bcol in ("vtpm", "secure_boot", "is_template"):
+                if bcol in payload and payload.get(bcol) is not None:
+                    extra_sets.append(f"{bcol} = {'true' if bool(payload.get(bcol)) else 'false'}")
+            for scol in ("affinity_group", "anti_affinity_group", "pinned_hosts", "cloud_init_userdata", "cloud_init_network"):
+                if scol in payload and payload.get(scol) is not None:
+                    val_str = str(payload.get(scol)).replace("'", "''")
+                    extra_sets.append(f"{scol} = '{val_str}'")
+            if extra_sets:
+                run_cql_query(f"UPDATE hydra.vms SET {', '.join(extra_sets)} WHERE name = '{name}';")
+
             # 4. Append event log
             EVENT_LOGS.append({
                 "desc": f"VM '{name}' successfully registered in database.",
@@ -7039,6 +7148,17 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 graphics_changed = graphics != normalise_graphics(vm_data.get("graphics"))
                 cql_upd = f"UPDATE hydra.vms SET vcpu = {vcpu}, memory = {memory}, firmware = '{firmware}', iso = '{iso}', boot_device = '{boot_device}', disks_list = '{disks_list}', disk_path = '{primary_path}', disk_size = {primary_size_gb}, network_id = '{network_id}', cpu_model = '{cpu_model}', audio_enabled = {audio_enabled_str}, graphics = '{graphics}' WHERE name = '{name}';"
                 run_cql_query(cql_upd)
+
+                extra_sets = []
+                for bcol in ("vtpm", "secure_boot", "is_template"):
+                    if bcol in payload and payload.get(bcol) is not None:
+                        extra_sets.append(f"{bcol} = {'true' if bool(payload.get(bcol)) else 'false'}")
+                for scol in ("affinity_group", "anti_affinity_group", "pinned_hosts", "cloud_init_userdata", "cloud_init_network"):
+                    if scol in payload and payload.get(scol) is not None:
+                        val_str = str(payload.get(scol)).replace("'", "''")
+                        extra_sets.append(f"{scol} = '{val_str}'")
+                if extra_sets:
+                    run_cql_query(f"UPDATE hydra.vms SET {', '.join(extra_sets)} WHERE name = '{name}';")
 
                 if bool(payload.get("reset_nvram")) or (firmware != vm_data.get("firmware")):
                     nvram_target = host_ip or LOCAL_IP
@@ -7574,12 +7694,20 @@ class SpectrumHandler(BaseHTTPRequestHandler):
 
             # import uuid
             segment_id = str(uuid.uuid4())
+            if not (1 <= vni <= 16777215):
+                self.send_json(400, {"error": f"VNI {vni} is out of valid VXLAN range (1..16777215)."})
+                return
+            claimed, claim_msg = claim_vni(vni, segment_id, name)
+            if not claimed:
+                self.send_json(409, {"error": claim_msg})
+                return
             cql = f"""
             INSERT INTO hydra.urbosa_segments (segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end)
             VALUES ({segment_id}, '{name}', {vni}, {t1_link_id}, '{subnet_cidr}', '{gateway_ip}', {str(dhcp_enabled).lower()}, '{dhcp_start}', '{dhcp_end}');
             """
             task_id, err = submit_catalyst_cql_task(f"deploy_segment_{name}", cql)
             if err:
+                release_vni(vni, segment_id)
                 self.send_json(500, {"error": f"Failed to submit Segment creation task: {err}"})
                 return
 
@@ -7594,11 +7722,23 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "Invalid payload"})
                 return
 
+            old_vni = None
+            rc_v, out_v, _ = run_cql_query(f"SELECT JSON vni FROM hydra.urbosa_segments WHERE segment_id = {segment_id};")
+            if rc_v == 0 and out_v:
+                for line in out_v.splitlines():
+                    if line.strip().startswith("{"):
+                        try:
+                            old_vni = json.loads(line.strip()).get("vni")
+                        except Exception:
+                            pass
+
             cql = f"DELETE FROM hydra.urbosa_segments WHERE segment_id = {segment_id};"
             task_id, err = submit_catalyst_cql_task(f"delete_segment_{segment_id[:8]}", cql)
             if err:
                 self.send_json(500, {"error": f"Failed to submit Segment deletion task: {err}"})
                 return
+            if old_vni is not None:
+                release_vni(old_vni, segment_id)
 
             self.send_json(200, {"message": "Overlay Segment deletion task triggered.", "task_id": task_id})
             return

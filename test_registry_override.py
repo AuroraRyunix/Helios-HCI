@@ -96,6 +96,7 @@ class QuadletTests(unittest.TestCase):
         "zookeeper": dict(node_id=1, zoo_servers="s", peer_type=""),
         "hydra-db": dict(seeds="10.0.0.1", node_ip="10.0.0.1"),
         "slate": {},
+        "kass": dict(node_id=1, zoo_servers="10.0.0.1:2181", node_ip="10.0.0.1"),
     }
 
     def test_every_overridable_quadlet_formats(self):

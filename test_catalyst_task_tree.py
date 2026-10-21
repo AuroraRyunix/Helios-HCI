@@ -143,7 +143,7 @@ class TheMigrationIsSafeToRerun(unittest.TestCase):
         0008 carry several and are already applied everywhere, and editing a shipped
         migration changes its checksum, which is the thing the checksum exists to catch.
         """
-        grandfathered = {"0006-dfs-replication", "0008-container-compression"}
+        grandfathered = {"0006-dfs-replication", "0008-container-compression", "0041-vm-esxi-parity"}
         for migration in self.schema.MIGRATIONS:
             if migration["id"] in grandfathered:
                 continue

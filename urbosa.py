@@ -737,7 +737,23 @@ VXLAN_RE = re.compile(r"^vxlan-(\d+)$")
 VETH_OV_RE = re.compile(r"^veth-ov-(\d+)$")
 VETH_T1_RE = re.compile(r"^veth-t1-(\d+)$")
 TRANSIT_VETH_RE = re.compile(r"^t[01]-([0-9a-f]{8})$")
+EGRESS_VETH_RE = re.compile(r"^veth-(?:ul|eg)-([0-9a-f]{8})$")
 MACVLAN_T0_RE = re.compile(r"^mv-t0-([0-9a-f]{8})$")
+
+MIN_VNI = 1
+MAX_VNI = 16777215
+VXLAN_MTU = 1450
+URBOSA_STATE_DIR = "/var/lib/hci/urbosa"
+
+
+def validate_vni(vni):
+    """Validate that VNI is an integer in the 24-bit VXLAN range (1 <= int(vni) <= 16777215)."""
+    if isinstance(vni, bool) or vni is None:
+        raise ValueError(f"invalid VNI {vni!r}: must be an integer in 1..16777215")
+    parsed = int(vni)
+    if not (1 <= parsed <= 16777215):
+        raise ValueError(f"VNI {parsed} out of range (1 <= int(vni) <= 16777215)")
+    return parsed
 
 # The all-zero destination MAC is how a static VXLAN mesh floods: one entry per
 # peer, "send broadcast, unknown-unicast and multicast there too". Learned unicast
@@ -1017,8 +1033,8 @@ def namespace_blocker(ns_name, desired, inventory):
             # segment: removing it is the operator's decision, not ours.
             return (f"segment VNI {segment_veth.group(1)} is still configured and this namespace "
                     f"holds its gateway on {device}; delete the segment first")
-        if (TRANSIT_VETH_RE.match(device) or segment_veth
-                or MACVLAN_T0_RE.match(device)):
+        if (TRANSIT_VETH_RE.match(device) or EGRESS_VETH_RE.match(device)
+                or segment_veth or MACVLAN_T0_RE.match(device)):
             continue
         return f"it carries interface {device}, which Urbosa did not create"
 
@@ -1390,7 +1406,7 @@ def build_desired_state(t0_routers, t1_routers, segments, node_ips, leader,
 
     for segment in segments:
         try:
-            vni = int(segment.get("vni"))
+            vni = validate_vni(segment.get("vni"))
         except (TypeError, ValueError):
             continue
         vnis.add(vni)
@@ -1515,6 +1531,61 @@ def plan_t0_routes(t0_routers, t1_routers, segments, pool):
                 wanted[ns_name].add((str(subnet), next_hop))
     return wanted
 
+
+def _deterministic_mac_for_vm(vm_name):
+    digest = hashlib.md5(str(vm_name).encode("utf-8")).hexdigest()
+    return f"52:54:00:{digest[0:2]}:{digest[2:4]}:{digest[4:6]}"
+
+
+def build_segment_dhcp_hosts(segment, vms=None):
+    """Build deterministic `--dhcp-host=<mac>,<ip>,<name>` reservations for VMs on `segment`."""
+    if vms is None:
+        vms = read_json_table(
+            "SELECT JSON name, network_id, guest_ips, cloud_init_network FROM hydra.vms;",
+            "hydra.vms") or []
+    seg_id = str(segment.get("segment_id") or "")
+    vni_str = str(segment.get("vni") or "")
+    subnet_raw = str(segment.get("subnet_cidr") or "")
+    try:
+        subnet_net = ipaddress.ip_network(subnet_raw, strict=False) if subnet_raw else None
+    except ValueError:
+        subnet_net = None
+
+    reservations = []
+    for vm in vms:
+        vm_name = str(vm.get("name") or "").strip()
+        if not vm_name:
+            continue
+        net_raw = str(vm.get("network_id") or "")
+        if seg_id not in net_raw and f"br-ov-{vni_str}" not in net_raw and f"vni-{vni_str}" not in net_raw:
+            continue
+        mac = None
+        mac_match = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", net_raw)
+        if mac_match:
+            mac = mac_match.group(1).lower()
+        else:
+            mac = _deterministic_mac_for_vm(vm_name)
+
+        candidate_ip = None
+        for source in (vm.get("guest_ips"), vm.get("cloud_init_network")):
+            if not source:
+                continue
+            for token in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", str(source)):
+                try:
+                    ip_obj = ipaddress.ip_address(token)
+                except ValueError:
+                    continue
+                if subnet_net is None or ip_obj in subnet_net:
+                    if str(ip_obj) != str(segment.get("gateway_ip") or ""):
+                        candidate_ip = str(ip_obj)
+                        break
+            if candidate_ip:
+                break
+        if mac and candidate_ip:
+            reservations.append(f"{mac},{candidate_ip},{vm_name}")
+    return sorted(set(reservations))
+
+
 def main():
     print("Urbosa SDN logical router and overlay orchestrator started.")
     
@@ -1535,6 +1606,9 @@ def main():
                 time.sleep(LOOP_SECONDS)
                 continue
             firewall_rules = get_db_firewall_rules()
+            vms_rows = read_json_table(
+                "SELECT JSON name, network_id, guest_ips, cloud_init_network FROM hydra.vms;",
+                "hydra.vms")
 
             leader_status = is_leader()
             local_ip = get_local_ip()
@@ -1556,9 +1630,15 @@ def main():
                     if transit_pool is not None:
                         transit_pool[slot] = str(router_id)
 
-            # 1. Reconcile Tier-0 Gateways (Active-Passive Namespace)
+            active_t0_by_id = {
+                str(r.get("router_id")): r
+                for r in t0_routers if r.get("router_id")
+            }
+
+            # 1. Reconcile Tier-0 Gateways (Active-Passive Shared VIP + Local Uplink)
             for r in t0_routers:
-                ns_name = f"ns-t0-{r['router_id'][:8]}"
+                t0_prefix = str(r['router_id'])[:8]
+                ns_name = f"ns-t0-{t0_prefix}"
                 if leader_status:
                     # Ensure namespace exists
                     rc_ns, _, _ = run_cmd(f"ip netns show | grep {ns_name}")
@@ -1567,14 +1647,15 @@ def main():
                         run_cmd(f"ip netns add {ns_name}")
                         run_cmd(f"ip netns exec {ns_name} ip link set lo up")
                     
-                    # Set up external uplink inside the namespace
+                    # Set up external uplink inside the namespace (only the VIP holder
+                    # advertises the shared external gateway IP on mv-t0-* if configured).
                     ext_if = r.get("uplink_interface", "ens192")
                     ext_ip = r.get("uplink_ip")
                     gw_ip = r.get("gateway_ip")
                     
                     # Detect actual uplink interface dynamically
                     ext_if_detected = get_uplink_interface(ext_if)
-                    mv_name = f"mv-t0-{r['router_id'][:8]}"
+                    mv_name = f"mv-t0-{t0_prefix}"
                     
                     # Ensure macvlan interface exists inside Tier-0 namespace
                     rc_mv, _, _ = run_cmd(f"ip netns exec {ns_name} ip link show {mv_name}")
@@ -1584,18 +1665,42 @@ def main():
                         run_cmd(f"ip link set {mv_name} netns {ns_name}")
                         run_cmd(f"ip netns exec {ns_name} ip link set {mv_name} up")
                     
-                    # Assign IP inside netns
+                    # Assign shared external IP inside netns on VIP holder only
                     if ext_ip:
                         ip_clean = ext_ip.split('/')[0]
                         if ip_clean not in get_iface_addresses(mv_name, ns_name):
                             run_cmd(f"ip netns exec {ns_name} ip addr add {ext_ip} dev {mv_name}")
                     
-                    # Set default route inside netns
+                    # Set default route inside netns: via external gateway_ip if configured,
+                    # or via a local veth uplink pair to the host root namespace so north-south
+                    # egress works out the host's external interface via local masquerade.
                     if gw_ip:
                         _, route_out, _ = run_cmd(f"ip netns exec {ns_name} ip route show")
                         if f"default via {gw_ip}" not in route_out:
                             run_cmd(f"ip netns exec {ns_name} ip route del default 2>/dev/null || true")
                             run_cmd(f"ip netns exec {ns_name} ip route add default via {gw_ip} dev {mv_name}")
+                    else:
+                        veth_eg = f"veth-eg-{t0_prefix}"
+                        veth_ul = f"veth-ul-{t0_prefix}"
+                        rc_ul, _, _ = run_cmd(f"ip netns exec {ns_name} ip link show {veth_ul}")
+                        if rc_ul != 0:
+                            run_cmd(f"ip link del {veth_eg} 2>/dev/null || true")
+                            run_cmd(f"ip link add {veth_eg} type veth peer name {veth_ul}")
+                            run_cmd(f"ip link set {veth_ul} netns {ns_name}")
+                            run_cmd(f"ip link set {veth_eg} up")
+                            run_cmd(f"ip netns exec {ns_name} ip link set {veth_ul} up")
+                        if "100.64.254.1" not in get_iface_addresses(veth_eg):
+                            run_cmd(f"ip addr add 100.64.254.1/30 dev {veth_eg} 2>/dev/null || true")
+                        if "100.64.254.2" not in get_iface_addresses(veth_ul, ns_name):
+                            run_cmd(f"ip netns exec {ns_name} ip addr add 100.64.254.2/30 dev {veth_ul} 2>/dev/null || true")
+                        _, route_out, _ = run_cmd(f"ip netns exec {ns_name} ip route show")
+                        if "default via 100.64.254.1" not in route_out:
+                            run_cmd(f"ip netns exec {ns_name} ip route del default 2>/dev/null || true")
+                            run_cmd(f"ip netns exec {ns_name} ip route add default via 100.64.254.1 dev {veth_ul}")
+                        run_cmd("sysctl -w net.ipv4.ip_forward=1")
+                        run_cmd(
+                            f"iptables -t nat -C POSTROUTING -s 100.64.0.0/16 -o {ext_if_detected} -j MASQUERADE 2>/dev/null || "
+                            f"iptables -t nat -A POSTROUTING -s 100.64.0.0/16 -o {ext_if_detected} -j MASQUERADE")
                     
                     # Ensure IP forwarding is enabled inside the namespace
                     run_cmd(f"ip netns exec {ns_name} sysctl -w net.ipv4.ip_forward=1")
@@ -1603,17 +1708,19 @@ def main():
                     # Set up Source NAT (Masquerade)
                     run_cmd(f"ip netns exec {ns_name} iptables -t nat -C POSTROUTING -j MASQUERADE 2>/dev/null || ip netns exec {ns_name} iptables -t nat -A POSTROUTING -j MASQUERADE")
                 else:
-                    # Clean up namespaces on passive nodes
+                    # Clean up Tier-0 namespace and shared VIP macvlan on passive nodes
                     rc_ns, _, _ = run_cmd(f"ip netns show | grep {ns_name}")
                     if rc_ns == 0:
                         print(f"I am not the leader. Removing Tier-0 namespace {ns_name}...")
                         run_cmd(f"ip netns del {ns_name}")
-                        mv_name = f"mv-t0-{r['router_id'][:8]}"
+                        mv_name = f"mv-t0-{t0_prefix}"
                         run_cmd(f"ip link del {mv_name} 2>/dev/null || true")
+                        run_cmd(f"ip link del veth-eg-{t0_prefix} 2>/dev/null || true")
 
-            # 2. Reconcile Tier-1 Routers (Distributed Namespace)
+            # 2. Reconcile Tier-1 Routers (Distributed Namespace + Distributed North-South Egress)
             for r in t1_routers:
-                ns_name = f"ns-t1-{r['router_id'][:8]}"
+                t1_prefix = str(r['router_id'])[:8]
+                ns_name = f"ns-t1-{t1_prefix}"
                 # Ensure T1 namespace exists locally on ALL hosts
                 rc_ns, _, _ = run_cmd(f"ip netns show | grep {ns_name}")
                 if rc_ns != 0:
@@ -1624,32 +1731,34 @@ def main():
                 
                 # Check DHCP status
                 if r.get("dhcp_enabled"):
-                    # Check for a dnsmasq bound to lo INSIDE this namespace.
-                    # A bare 'ip netns exec ... pgrep dnsmasq' saw every other
-                    # namespace's dnsmasq, so this server never started.
                     if not netns_dnsmasq_pids(ns_name, "lo"):
                         print(f"Starting DHCP server (dnsmasq) inside {ns_name}...")
-                        # Run dnsmasq inside namespace (dummy start, catches error if sandbox blocks)
                         run_cmd(f"ip netns exec {ns_name} dnsmasq --bind-interfaces --interface=lo --dhcp-range=100.64.0.2,100.64.0.254,12h")
 
-                # Connect Tier-1 distributed namespace to Tier-0 edge namespace if linked and active on this host
+                # Connect Tier-1 distributed namespace for North-South egress when linked to an active Tier-0 router.
+                # On the VIP holder where ns-t0-* is local, connect ns-t1-* to ns-t0-*.
+                # On every other node (distributed north-south egress), connect ns-t1-* to the host
+                # root namespace via a local veth uplink pair (veth-eg-<prefix> / veth-ul-<prefix>)
+                # and masquerade out the host's external interface so guests on every node have internet routing.
                 t0_id = r.get("t0_link_id")
-                if t0_id:
-                    t0_ns = f"ns-t0-{t0_id[:8]}"
+                if t0_id and str(t0_id) in active_t0_by_id:
+                    linked_t0 = active_t0_by_id[str(t0_id)]
+                    ext_if_detected = get_uplink_interface(linked_t0.get("uplink_interface", "ens192"))
+                    t0_ns = f"ns-t0-{str(t0_id)[:8]}"
                     rc_t0_ns, _, _ = run_cmd(f"ip netns show | grep {t0_ns}")
-                    if rc_t0_ns == 0:
-                        veth_t1 = f"t1-{r['router_id'][:8]}"
-                        veth_t0 = f"t0-{r['router_id'][:8]}"
 
-                        # Transit addressing comes from the recorded pool. No slot
-                        # means the pool could not be read: leave the link exactly
-                        # as it is rather than fall back to the derived index,
-                        # which is what used to hand two routers the same /30.
-                        # Checked before the veth is built, so a pool outage does
-                        # not leave an unaddressed pair behind either.
-                        slot = transit_slots.get(str(r['router_id']))
-                        if slot is None:
-                            continue
+                    slot = transit_slots.get(str(r['router_id']))
+                    if slot is None:
+                        continue
+                    t0_ip, t1_ip, _network = transit_addresses(slot)
+                    t0_addr = t0_ip.split('/')[0]
+                    t1_addr = t1_ip.split('/')[0]
+
+                    if rc_t0_ns == 0:
+                        # Remove any passive-node local egress veth if we transitioned to leader
+                        run_cmd(f"ip link del veth-eg-{t1_prefix} 2>/dev/null || true")
+                        veth_t1 = f"t1-{t1_prefix}"
+                        veth_t0 = f"t0-{t1_prefix}"
 
                         # Ensure veth pair exists inside respective namespaces
                         rc_veth, _, _ = run_cmd(f"ip netns exec {ns_name} ip link show {veth_t1}")
@@ -1662,37 +1771,73 @@ def main():
                             run_cmd(f"ip netns exec {ns_name} ip link set {veth_t1} up")
                             run_cmd(f"ip netns exec {t0_ns} ip link set {veth_t0} up")
 
-                        t0_ip, t1_ip, _network = transit_addresses(slot)
-                        t0_addr = t0_ip.split('/')[0]
-                        t1_addr = t1_ip.split('/')[0]
-
-                        # Assign transit IP to T1 interface
                         if t1_addr not in get_iface_addresses(veth_t1, ns_name):
                             run_cmd(f"ip netns exec {ns_name} ip addr add {t1_ip} dev {veth_t1}")
 
-                        # Assign transit IP to T0 interface
                         if t0_addr not in get_iface_addresses(veth_t0, t0_ns):
                             run_cmd(f"ip netns exec {t0_ns} ip addr add {t0_ip} dev {veth_t0}")
 
-                        # Configure default gateway route in T1 namespace pointing to T0
                         _, t1_routes, _ = run_cmd(f"ip netns exec {ns_name} ip route show")
                         if f"default via {t0_addr} " not in t1_routes + " ":
                             run_cmd(f"ip netns exec {ns_name} ip route del default 2>/dev/null || true")
                             run_cmd(f"ip netns exec {ns_name} ip route add default via {t0_addr} dev {veth_t1}")
 
-                        # Add route back to guest subnets inside T0 namespace.
-                        # Matched exactly rather than by substring: 10.0.1.0/24 is
-                        # a substring of 110.0.1.0/24, and reading a neighbour's
-                        # route as this one's leaves the tenant unreachable.
                         t0_routes_now = list_netns_routes(t0_ns)
                         for s in segments:
                             if s.get("t1_link_id") == r.get("router_id"):
                                 subnet = s.get("subnet_cidr")
                                 if subnet and (t0_routes_now is None or (subnet, t1_addr) not in t0_routes_now):
                                     run_cmd(f"ip netns exec {t0_ns} ip route replace {subnet} via {t1_addr} dev {veth_t0}")
+                                if subnet and not linked_t0.get("gateway_ip"):
+                                    run_cmd(f"ip route replace {subnet} via 100.64.254.2 dev veth-eg-{str(t0_id)[:8]} 2>/dev/null || true")
+                                    run_cmd(
+                                        f"iptables -t nat -C POSTROUTING -s {subnet} -o {ext_if_detected} -j MASQUERADE 2>/dev/null || "
+                                        f"iptables -t nat -A POSTROUTING -s {subnet} -o {ext_if_detected} -j MASQUERADE")
+                    else:
+                        # Distributed North-South Egress on non-VIP nodes: wire ns-t1-<prefix>
+                        # to the host root namespace via a local veth uplink pair and masquerade
+                        # out the host's external interface.
+                        veth_eg = f"veth-eg-{t1_prefix}"
+                        veth_ul = f"veth-ul-{t1_prefix}"
+                        rc_veth, _, _ = run_cmd(f"ip netns exec {ns_name} ip link show {veth_ul}")
+                        if rc_veth != 0:
+                            run_cmd(f"ip link del {veth_eg} 2>/dev/null || true")
+                            run_cmd(f"ip link del {veth_ul} 2>/dev/null || true")
+                            run_cmd(f"ip link add {veth_eg} type veth peer name {veth_ul}")
+                            run_cmd(f"ip link set {veth_ul} netns {ns_name}")
+                            run_cmd(f"ip link set {veth_eg} up")
+                            run_cmd(f"ip netns exec {ns_name} ip link set {veth_ul} up")
 
-            # Fetch MTU from settings, default to 1500
-            mtu_size = 1500
+                        if t0_addr not in get_iface_addresses(veth_eg):
+                            run_cmd(f"ip addr add {t0_ip} dev {veth_eg} 2>/dev/null || true")
+
+                        if t1_addr not in get_iface_addresses(veth_ul, ns_name):
+                            run_cmd(f"ip netns exec {ns_name} ip addr add {t1_ip} dev {veth_ul} 2>/dev/null || true")
+
+                        _, t1_routes, _ = run_cmd(f"ip netns exec {ns_name} ip route show")
+                        if f"default via {t0_addr} " not in t1_routes + " ":
+                            run_cmd(f"ip netns exec {ns_name} ip route del default 2>/dev/null || true")
+                            run_cmd(f"ip netns exec {ns_name} ip route add default via {t0_addr} dev {veth_ul}")
+
+                        run_cmd("sysctl -w net.ipv4.ip_forward=1")
+                        run_cmd(
+                            f"ip netns exec {ns_name} iptables -t nat -C POSTROUTING -o {veth_ul} -j MASQUERADE 2>/dev/null || "
+                            f"ip netns exec {ns_name} iptables -t nat -A POSTROUTING -o {veth_ul} -j MASQUERADE")
+                        run_cmd(
+                            f"iptables -t nat -C POSTROUTING -s 100.64.0.0/16 -o {ext_if_detected} -j MASQUERADE 2>/dev/null || "
+                            f"iptables -t nat -A POSTROUTING -s 100.64.0.0/16 -o {ext_if_detected} -j MASQUERADE")
+                        for s in segments:
+                            if s.get("t1_link_id") == r.get("router_id"):
+                                subnet = s.get("subnet_cidr")
+                                if subnet:
+                                    run_cmd(f"ip route replace {subnet} via {t1_addr} dev {veth_eg} 2>/dev/null || true")
+                                    run_cmd(
+                                        f"iptables -t nat -C POSTROUTING -s {subnet} -o {ext_if_detected} -j MASQUERADE 2>/dev/null || "
+                                        f"iptables -t nat -A POSTROUTING -s {subnet} -o {ext_if_detected} -j MASQUERADE")
+
+            # Fetch underlay MTU from settings (default 1500) and derive VXLAN overlay MTU (1450
+            # on a 1500-byte underlay to account for the 50-byte VXLAN+UDP+IP+Ethernet header).
+            underlay_mtu = 1500
             try:
                 cql_mtu = "SELECT value FROM hydra.cluster_settings WHERE key = 'dns_mtu';"
                 rc_m, out_m, _ = run_cql_query(cql_mtu)
@@ -1703,15 +1848,22 @@ def main():
                             continue
                         val_clean = "".join(c for c in line if c.isdigit())
                         if val_clean:
-                            mtu_size = int(val_clean)
+                            underlay_mtu = int(val_clean)
                             break
             except Exception:
-                mtu_size = 1500
+                underlay_mtu = 1500
+            mtu_size = VXLAN_MTU if underlay_mtu == 1500 else max(1280, underlay_mtu - 50)
 
             # 3. Reconcile Overlay Segments (VXLAN Mesh)
             for s in segments:
-                br_name = f"br-ov-{s['vni']}"
-                vx_name = f"vxlan-{s['vni']}"
+                try:
+                    vni = validate_vni(s.get("vni"))
+                except (TypeError, ValueError) as e:
+                    print(f"Skipping segment with invalid VNI {s.get('vni')!r}: {e}")
+                    continue
+
+                br_name = f"br-ov-{vni}"
+                vx_name = f"vxlan-{vni}"
                 
                 # Ensure overlay bridge exists
                 rc_br, _, _ = run_cmd(f"ip link show {br_name}")
@@ -1723,9 +1875,9 @@ def main():
                 # Ensure VXLAN device exists
                 rc_vx, _, _ = run_cmd(f"ip link show {vx_name}")
                 if rc_vx != 0:
-                    print(f"Creating VXLAN tunnel interface {vx_name} (VNI {s['vni']})...")
+                    print(f"Creating VXLAN tunnel interface {vx_name} (VNI {vni})...")
                     phys_if = get_uplink_interface("eth0")
-                    run_cmd(f"ip link add {vx_name} type vxlan id {s['vni']} dstport 4789 dev {phys_if} 2>/dev/null || ip link add {vx_name} type vxlan id {s['vni']} dstport 4789")
+                    run_cmd(f"ip link add {vx_name} type vxlan id {vni} dstport 4789 dev {phys_if} 2>/dev/null || ip link add {vx_name} type vxlan id {vni} dstport 4789")
                     run_cmd(f"ip link set {vx_name} master {br_name} 2>/dev/null")
                     run_cmd(f"ip link set {vx_name} up")
                 
@@ -1738,7 +1890,7 @@ def main():
                     if ip and ip != local_ip:
                         run_cmd(f"bridge fdb append {FLOOD_MAC} dev {vx_name} dst {ip} 2>/dev/null || true")
 
-                # Enforce dynamic MTU
+                # Enforce VXLAN overlay MTU (1450 on standard 1500-byte underlay)
                 run_cmd(f"ip link set dev {br_name} mtu {mtu_size} 2>/dev/null || true")
                 run_cmd(f"ip link set dev {vx_name} mtu {mtu_size} 2>/dev/null || true")
 
@@ -1749,8 +1901,8 @@ def main():
                     # Ensure T1 namespace exists
                     rc_ns, _, _ = run_cmd(f"ip netns show | grep {ns_name}")
                     if rc_ns == 0:
-                        veth_host = f"veth-ov-{s['vni']}"
-                        veth_ns = f"veth-t1-{s['vni']}"
+                        veth_host = f"veth-ov-{vni}"
+                        veth_ns = f"veth-t1-{vni}"
                         
                         # Create veth pair if it doesn't exist
                         rc_veth, _, _ = run_cmd(f"ip link show {veth_host}")
@@ -1776,16 +1928,36 @@ def main():
                                 print(f"Assigning gateway IP {gw_ip}/{mask} to interface {veth_ns} inside {ns_name}...")
                                 run_cmd(f"ip netns exec {ns_name} ip addr add {gw_ip}/{mask} dev {veth_ns} 2>/dev/null || true")
 
-                        # DHCP Server Configuration for the segment
+                        # DHCP Server Configuration for the segment with persistent leasefile
+                        # and deterministic host reservations across nodes.
                         dhcp_enabled = s.get("dhcp_enabled")
                         dhcp_start = s.get("dhcp_start")
                         dhcp_end = s.get("dhcp_end")
                         
                         if dhcp_enabled and dhcp_start and dhcp_end:
+                            seg_id = str(s.get("segment_id") or vni)
+                            try:
+                                os.makedirs(URBOSA_STATE_DIR, exist_ok=True)
+                            except Exception:
+                                pass
+                            leasefile = f"{URBOSA_STATE_DIR}/dhcp-{seg_id}.leases"
+                            hostsfile = f"{URBOSA_STATE_DIR}/dhcp-{seg_id}.hosts"
+                            hosts_entries = build_segment_dhcp_hosts(s, vms=vms_rows)
+                            hosts_arg = ""
+                            if hosts_entries:
+                                try:
+                                    with open(hostsfile, "w") as hf:
+                                        hf.write("\n".join(hosts_entries) + "\n")
+                                    hosts_arg = f" --dhcp-hostsfile={hostsfile}"
+                                except Exception:
+                                    hosts_arg = " " + " ".join(f"--dhcp-host={entry}" for entry in hosts_entries)
                             # Namespace-scoped, exact-interface match.
                             if not netns_dnsmasq_pids(ns_name, veth_ns):
                                 print(f"Starting DHCP server (dnsmasq) inside {ns_name} for segment interface {veth_ns}...")
-                                run_cmd(f"ip netns exec {ns_name} dnsmasq --bind-interfaces --except-interface=lo --interface={veth_ns} --dhcp-range={dhcp_start},{dhcp_end},12h --dhcp-option=option:router,{gw_ip}")
+                                run_cmd(
+                                    f"ip netns exec {ns_name} dnsmasq --bind-interfaces --except-interface=lo "
+                                    f"--interface={veth_ns} --dhcp-authoritative --dhcp-leasefile={leasefile} "
+                                    f"--dhcp-range={dhcp_start},{dhcp_end},12h --dhcp-option=option:router,{gw_ip}{hosts_arg}")
                         else:
                             # Only kill PIDs proven to live in THIS namespace and
                             # to be bound to THIS interface. PIDs are host-global

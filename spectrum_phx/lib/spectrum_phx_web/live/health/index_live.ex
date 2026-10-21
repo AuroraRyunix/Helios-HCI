@@ -75,6 +75,52 @@ defmodule SpectrumPhxWeb.Health.IndexLive do
     {:noreply, assign_snapshot(socket, Health.fetch())}
   end
 
+  def handle_event("run_diagnostics_now", _params, socket) do
+    case Health.run_diagnostics_now() do
+      {:ok, _task} ->
+        {:noreply, put_flash(socket, :info, "Mimir diagnostics run submitted.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, "Could not start diagnostics: #{inspect(reason)}")}
+    end
+  end
+
+  def handle_event("toggle_schedule", %{"job" => job, "enabled" => enabled}, socket) do
+    case Health.toggle_schedule(job, enabled) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Schedule #{job} updated.")
+         |> assign_snapshot(Health.fetch())}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("run_schedule_now", %{"job" => job}, socket) do
+    case Health.run_schedule_now(job) do
+      {:ok, _task} ->
+        {:noreply, put_flash(socket, :info, "Job #{job} dispatched.")}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_string(reason))}
+    end
+  end
+
+  def handle_event("update_schedule_cron", %{"job" => job, "cron" => cron}, socket) do
+    case Health.update_schedule_cron(job, cron) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Cron updated for #{job}.")
+         |> assign_snapshot(Health.fetch())}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
   defp schedule_refresh do
     Process.send_after(self(), :refresh, @refresh_interval_ms)
   end
@@ -125,6 +171,9 @@ defmodule SpectrumPhxWeb.Health.IndexLive do
           </span>
         </:subtitle>
         <:actions>
+          <.button phx-click="run_diagnostics_now" id="run-diagnostics-button" class="btn-primary">
+            <.icon name="hero-play" class="size-4" /> Run Diagnostics Now
+          </.button>
           <.button phx-click="refresh" id="refresh-button">
             <.icon name="hero-arrow-path" class="size-4" /> Refresh
           </.button>
@@ -342,6 +391,7 @@ defmodule SpectrumPhxWeb.Health.IndexLive do
                   <th>Cron</th>
                   <th>Enabled</th>
                   <th>Last dispatched</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -350,7 +400,24 @@ defmodule SpectrumPhxWeb.Health.IndexLive do
                     <p class="font-medium">{schedule.job}</p>
                     <p class="text-xs opacity-50 font-mono break-all">{schedule.command}</p>
                   </td>
-                  <td class="align-top font-mono text-xs">{schedule.cron || "-"}</td>
+                  <td class="align-top font-mono text-xs">
+                    <span class="block mb-1">{schedule.cron || "-"}</span>
+                    <form
+                      id={"cron-form-#{dom_slug(schedule.job)}"}
+                      phx-submit="update_schedule_cron"
+                      class="flex items-center gap-1"
+                    >
+                      <input type="hidden" name="job" value={schedule.job} />
+                      <input
+                        type="text"
+                        name="cron"
+                        value={schedule.cron || ""}
+                        placeholder="*/5 * * * *"
+                        class="input input-xs input-bordered font-mono w-28"
+                      />
+                      <button type="submit" class="btn btn-ghost btn-xs">Save</button>
+                    </form>
+                  </td>
                   <td class="align-top">
                     <span class={[
                       "badge badge-sm",
@@ -364,6 +431,27 @@ defmodule SpectrumPhxWeb.Health.IndexLive do
                       {stamp(schedule.last_run)}
                     </span>
                     <span :if={schedule.overdue?} class="block opacity-70">overdue</span>
+                  </td>
+                  <td class="align-top text-right whitespace-nowrap">
+                    <button
+                      type="button"
+                      phx-click="toggle_schedule"
+                      phx-value-job={schedule.job}
+                      phx-value-enabled={to_string(not schedule.enabled?)}
+                      id={"toggle-schedule-#{dom_slug(schedule.job)}"}
+                      class="btn btn-ghost btn-xs"
+                    >
+                      {if schedule.enabled?, do: "Disable", else: "Enable"}
+                    </button>
+                    <button
+                      type="button"
+                      phx-click="run_schedule_now"
+                      phx-value-job={schedule.job}
+                      id={"run-schedule-#{dom_slug(schedule.job)}"}
+                      class="btn btn-ghost btn-xs text-primary"
+                    >
+                      Run Now
+                    </button>
                   </td>
                 </tr>
               </tbody>

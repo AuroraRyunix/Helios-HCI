@@ -108,6 +108,11 @@ impl Rows for Model {
                 st.egroups.remove(&id);
                 return Ok(Vec::new());
             }
+            if let Some(rest) = cql.strip_prefix("DELETE FROM hydra.dfs_extent_id_map WHERE extent_id = ") {
+                let id = rest.trim().trim_matches('\'').to_string();
+                st.extents.remove(&id);
+                return Ok(Vec::new());
+            }
             if cql.starts_with("DELETE FROM hydra.dfs_egroup_access WHERE egroup_id = ") {
                 return Ok(Vec::new());
             }
@@ -131,6 +136,13 @@ impl Rows for Model {
                 .extents
                 .iter()
                 .map(|(id, e)| json!({"extent_id": id, "egroup_id": e.egroup}))
+                .collect());
+        }
+        if cql == crate::extent_id_map::EXTENT_MAP_ORPHAN_SCAN {
+            return Ok(st
+                .extents
+                .iter()
+                .map(|(id, _)| json!({"extent_id": id, "created_at_ms": 0}))
                 .collect());
         }
         if cql == BLOCK_ROWS {

@@ -357,6 +357,11 @@ class NbdWriter(object):
     def __init__(self, socket_path, export, timeout=3600):
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.settimeout(timeout)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        except Exception:
+            pass
         self.sock.connect(socket_path)
         self.handle = 0
         self.size = self._handshake(export)
@@ -404,6 +409,7 @@ class NbdWriter(object):
 
     def _request(self, cmd, offset, length, data=None, want_data=False):
         import struct
+        self._drain_in_flight()
         self.handle += 1
         self.sock.sendall(struct.pack(">IHHQQI", NBD_REQUEST_MAGIC, 0, cmd,
                                       self.handle, offset, length))
@@ -423,23 +429,72 @@ class NbdWriter(object):
             return self._recv(length)
         return None
 
+    def _recv_one_in_flight(self):
+        import struct
+        in_flight = getattr(self, "_in_flight", None)
+        if not in_flight:
+            return
+        reply = self._recv(16)
+        magic, errno, handle = struct.unpack(">IIQ", reply)
+        if magic != NBD_SIMPLE_REPLY_MAGIC:
+            raise SidonError("nbd reply magic 0x%x; the stream is desynchronised" % magic, "io")
+        offset = in_flight.pop(handle, None)
+        if offset is None:
+            raise SidonError("nbd reply handle %d was not in flight" % handle, "io")
+        if errno:
+            raise SidonError("nbd server returned errno %d at offset %d" % (errno, offset), "io")
+
+    def _drain_in_flight(self):
+        in_flight = getattr(self, "_in_flight", None)
+        while in_flight:
+            self._recv_one_in_flight()
+
+    def write_pipelined(self, offset, data, max_in_flight=8):
+        """Send a write without blocking unless `max_in_flight` writes are already pending."""
+        import struct
+        if not hasattr(self, "_in_flight"):
+            self._in_flight = {}
+        while len(self._in_flight) >= max_in_flight:
+            self._recv_one_in_flight()
+        self.handle += 1
+        req_handle = self.handle
+        self._in_flight[req_handle] = offset
+        self.sock.sendall(struct.pack(">IHHQQI", NBD_REQUEST_MAGIC, 0, NBD_CMD_WRITE,
+                                      req_handle, offset, len(data)))
+        self.sock.sendall(data)
+
     def write_stream(self, stream, total, progress=None):
-        """Copy `total` bytes from `stream` into the vdisk. Returns bytes written."""
+        """Copy `total` bytes from `stream` into the vdisk. Returns bytes written.
+
+        Batches up to 8 MiB per NBD_CMD_WRITE and keeps up to 8 writes in flight at once:
+        Sidon splits a multi-MiB write into 1 MiB journal records with APPEND_DEFER_SYNC on
+        all but the last record, so one 8 MiB write costs one fsync instead of eight, and
+        pipelining overlaps reading the next batch from the client with replicating the
+        previous batch across the cluster.
+        """
         if total > self.size:
             raise SidonError(
                 "image is %d bytes but the vdisk holds %d" % (total, self.size), "refused")
+        batch_bytes = 8 * NBD_CHUNK
         written = 0
-        while written < total:
-            want = min(NBD_CHUNK, total - written)
-            chunk = stream.read(want)
-            if not chunk:
-                break
-            # A short read is not an error here; it is a slow client. Write what arrived
-            # and keep the offset honest rather than padding to the requested length.
-            self._request(NBD_CMD_WRITE, written, len(chunk), chunk)
-            written += len(chunk)
-            if progress:
-                progress(written)
+        try:
+            while written < total:
+                want = min(batch_bytes, total - written)
+                buf = bytearray()
+                while len(buf) < want:
+                    piece = stream.read(want - len(buf))
+                    if not piece:
+                        break
+                    buf.extend(piece)
+                if not buf:
+                    break
+                chunk = bytes(buf)
+                self.write_pipelined(written, chunk, max_in_flight=8)
+                written += len(chunk)
+                if progress:
+                    progress(written)
+        finally:
+            self._drain_in_flight()
         return written
 
     def read(self, offset, length):

@@ -60,6 +60,10 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
   @impl true
   def handle_event("refresh", _params, socket), do: {:noreply, load(socket)}
 
+  def handle_event("toggle_kubeconfig", _params, socket) do
+    {:noreply, assign(socket, :show_kubeconfig?, not socket.assigns.show_kubeconfig?)}
+  end
+
   # Keeps what was typed across a re-render. Without it the periodic refresh empties a
   # half-filled form under the operator's hands.
   def handle_event("validate_deploy", params, socket) do
@@ -120,6 +124,7 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
     blocking = Enum.filter(overview.checks, &(&1.status == :error))
 
     socket
+    |> assign_new(:show_kubeconfig?, fn -> false end)
     |> assign(:overview, overview)
     |> assign(:ready?, Lanayru.ready?(overview.checks))
     |> assign(:blocking, blocking)
@@ -168,6 +173,18 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
           title="Kubernetes cluster"
           subtitle="On record in hydra.lanayru_clusters"
         >
+          <:actions>
+            <button
+              type="button"
+              phx-click="toggle_kubeconfig"
+              id="toggle-kubeconfig-btn"
+              class="btn btn-xs btn-outline gap-1"
+            >
+              <.icon name="hero-document-text" class="size-3.5" />
+              {if @show_kubeconfig?, do: "Hide Kubeconfig", else: "View / Download Kubeconfig"}
+            </button>
+          </:actions>
+
           <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
             <.figure
               id="k8s-name"
@@ -195,6 +212,35 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
               value={segment_name(@overview)}
               caption="overlay network"
             />
+          </div>
+
+          <div
+            :if={@show_kubeconfig? or not is_nil(@overview.cluster.kubeconfig)}
+            id="lanayru-kubeconfig"
+            class="mt-4 pt-3 border-t border-base-300"
+          >
+            <div class="flex items-center justify-between gap-2 mb-2">
+              <span class="text-xs font-semibold uppercase tracking-wide opacity-70">
+                Kubeconfig (lanayru_kubeconfig_{@overview.cluster.name})
+              </span>
+              <a
+                :if={@overview.cluster.kubeconfig}
+                id="download-kubeconfig-link"
+                href={"data:text/yaml;charset=utf-8," <> URI.encode(@overview.cluster.kubeconfig)}
+                download={"#{@overview.cluster.name}-kubeconfig.yaml"}
+                class="btn btn-xs btn-primary"
+              >
+                Download Kubeconfig
+              </a>
+            </div>
+            <pre
+              :if={@overview.cluster.kubeconfig}
+              id="kubeconfig-content"
+              class="max-h-64 overflow-y-auto bg-base-300/50 rounded p-3 font-mono text-xs whitespace-pre-wrap break-all"
+            >{@overview.cluster.kubeconfig}</pre>
+            <p :if={is_nil(@overview.cluster.kubeconfig)} id="kubeconfig-empty" class="text-xs opacity-60 italic">
+              Kubeconfig has not been published to hydra.cluster_settings yet (key lanayru_kubeconfig_{@overview.cluster.name}).
+            </p>
           </div>
         </.panel>
 

@@ -105,12 +105,63 @@ defmodule SpectrumPhx.AccountsTest do
       assert {:error, :malformed_token} = Accounts.user_from_token("' OR 1=1--")
       assert {:error, :malformed_token} = Accounts.user_from_token(nil)
     end
+
+    test "enforces session_timeout and rejects expired sessions" do
+      valid_token = String.duplicate("a", 64)
+      now_ms = 1_700_000_000_000
+      fresh_created_ms = now_ms - 15 * 60_000
+      expired_created_ms = now_ms - 65 * 60_000
+
+      assert {:ok, "helios"} =
+               Accounts.user_from_token(valid_token,
+                 timeout_minutes: 60,
+                 now_ms: now_ms,
+                 session_row: %{"username" => "helios", "created_at" => fresh_created_ms}
+               )
+
+      assert {:error, :session_expired} =
+               Accounts.user_from_token(valid_token,
+                 timeout_minutes: 60,
+                 now_ms: now_ms,
+                 session_row: %{"username" => "helios", "created_at" => expired_created_ms}
+               )
+    end
   end
 
-  describe "authenticate/2" do
+  describe "authenticate/2 and rate limiting" do
     test "rejects non-binary credentials" do
       assert {:error, :invalid_credentials} = Accounts.authenticate(nil, "x")
       assert {:error, :invalid_credentials} = Accounts.authenticate("x", nil)
+    end
+
+    test "enforces per-minute login rate limit in ETS" do
+      Accounts.reset_rate_limit()
+      key = "brute_user_#{System.unique_integer([:positive])}"
+
+      assert :ok = Accounts.check_rate_limit(key, 3)
+      assert :ok = Accounts.check_rate_limit(key, 3)
+      assert :ok = Accounts.check_rate_limit(key, 3)
+      assert {:error, :rate_limited} = Accounts.check_rate_limit(key, 3)
+      assert {:error, :rate_limited} = Accounts.authenticate(key, "secret", rate_limit: 3)
+    end
+  end
+
+  describe "delete_user_sessions/2" do
+    test "evicts all sessions belonging to the target user" do
+      t1 = String.duplicate("a", 64)
+      t2 = String.duplicate("b", 64)
+      t3 = String.duplicate("c", 64)
+
+      sessions = [
+        %{"session_token" => t1, "username" => "alice"},
+        %{"session_token" => t2, "username" => "bob"},
+        %{"session_token" => t3, "username" => "alice"}
+      ]
+
+      assert :ok = Accounts.delete_user_sessions("alice", sessions: sessions, sink: self())
+      assert_receive {:evicted_session, "alice", ^t1}
+      assert_receive {:evicted_session, "alice", ^t3}
+      refute_receive {:evicted_session, "bob", _}
     end
   end
 end

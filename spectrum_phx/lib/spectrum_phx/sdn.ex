@@ -397,4 +397,361 @@ defmodule SpectrumPhx.Sdn do
   defp describe(reason) when is_binary(reason), do: reason
   defp describe(%{message: message}) when is_binary(message), do: message
   defp describe(reason), do: inspect(reason)
+
+  # -- mutations -----------------------------------------------------------------------
+
+  @vni_claim_cql "INSERT INTO hydra.urbosa_vni_claims (vni, segment_id, name, claimed_at_ms) VALUES (?, ?, ?, ?) IF NOT EXISTS"
+  @vni_release_cql "DELETE FROM hydra.urbosa_vni_claims WHERE vni = ? IF segment_id = ?"
+  @vni_range 1..16_777_215
+
+  @doc "Generate a v4 UUID for SDN resources."
+  def generate_id do
+    SpectrumPhx.Networking.generate_net_id()
+  end
+
+  @doc "Whether `value` is a canonical UUID string."
+  def uuid?(value), do: SpectrumPhx.Networking.uuid?(value)
+
+  @doc "Create a Tier-0 gateway router in `hydra.urbosa_t0_routers`."
+  def create_t0_router(attrs, opts \\ []) when is_map(attrs) do
+    attrs = stringify(attrs)
+    id = string(get(attrs, "router_id")) || generate_id()
+    name = string(get(attrs, "name"))
+    uplink_iface = string(get(attrs, "uplink_interface")) || string(get(attrs, "uplink_iface")) || "eth0"
+    uplink_ip = string(get(attrs, "uplink_ip")) || ""
+    gateway_ip = string(get(attrs, "gateway_ip")) || ""
+    nat_rules = string(get(attrs, "nat_rules")) || "[]"
+
+    cond do
+      is_nil(name) ->
+        {:error, "Tier-0 router name is required."}
+
+      not uuid?(id) ->
+        {:error, "Invalid router_id UUID."}
+
+      true ->
+        cql =
+          "INSERT INTO hydra.urbosa_t0_routers (router_id, name, uplink_interface, uplink_ip, gateway_ip, nat_rules) " <>
+            "VALUES (#{id}, ?, ?, ?, ?, ?)"
+
+        case write(cql, [name, uplink_iface, uplink_ip, gateway_ip, nat_rules], opts) do
+          :ok -> {:ok, id}
+          {:error, reason} -> {:error, "Could not create Tier-0 router: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Delete a Tier-0 gateway router from `hydra.urbosa_t0_routers`."
+  def delete_t0_router(router_id, opts \\ []) do
+    id = string(router_id)
+
+    if uuid?(id) do
+      case write("DELETE FROM hydra.urbosa_t0_routers WHERE router_id = #{id}", [], opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Could not delete Tier-0 router: #{describe(reason)}"}
+      end
+    else
+      {:error, "Invalid Tier-0 router ID."}
+    end
+  end
+
+  @doc "Create a Tier-1 logical router in `hydra.urbosa_t1_routers`."
+  def create_t1_router(attrs, opts \\ []) when is_map(attrs) do
+    attrs = stringify(attrs)
+    id = string(get(attrs, "router_id")) || generate_id()
+    name = string(get(attrs, "name"))
+    t0_id = string(get(attrs, "t0_link_id")) || string(get(attrs, "t0_id"))
+    dhcp_enabled = truthy?(get(attrs, "dhcp_enabled"))
+
+    cond do
+      is_nil(name) ->
+        {:error, "Tier-1 router name is required."}
+
+      not uuid?(id) ->
+        {:error, "Invalid router_id UUID."}
+
+      not is_nil(t0_id) and not uuid?(t0_id) ->
+        {:error, "Invalid Tier-0 link UUID."}
+
+      true ->
+        t0_literal = if t0_id, do: t0_id, else: "NULL"
+
+        cql =
+          "INSERT INTO hydra.urbosa_t1_routers (router_id, name, t0_link_id, dhcp_enabled) " <>
+            "VALUES (#{id}, ?, #{t0_literal}, ?)"
+
+        case write(cql, [name, dhcp_enabled], opts) do
+          :ok -> {:ok, id}
+          {:error, reason} -> {:error, "Could not create Tier-1 router: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Delete a Tier-1 logical router from `hydra.urbosa_t1_routers`."
+  def delete_t1_router(router_id, opts \\ []) do
+    id = string(router_id)
+
+    if uuid?(id) do
+      case write("DELETE FROM hydra.urbosa_t1_routers WHERE router_id = #{id}", [], opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Could not delete Tier-1 router: #{describe(reason)}"}
+      end
+    else
+      {:error, "Invalid Tier-1 router ID."}
+    end
+  end
+
+  @doc """
+  Create an overlay segment in `hydra.urbosa_segments` after atomically claiming its VNI
+  in `hydra.urbosa_vni_claims`.
+  """
+  def create_segment(attrs, opts \\ []) when is_map(attrs) do
+    attrs = stringify(attrs)
+    id = string(get(attrs, "segment_id")) || generate_id()
+    name = string(get(attrs, "name"))
+    vni = integer(get(attrs, "vni"))
+    t1_id = string(get(attrs, "t1_link_id")) || string(get(attrs, "t1_id"))
+    subnet_cidr = string(get(attrs, "subnet_cidr"))
+    gateway_ip = string(get(attrs, "gateway_ip")) || ""
+    dhcp_enabled = truthy?(get(attrs, "dhcp_enabled"))
+    dhcp_start = string(get(attrs, "dhcp_start")) || ""
+    dhcp_end = string(get(attrs, "dhcp_end")) || ""
+
+    cond do
+      is_nil(name) ->
+        {:error, "Segment name is required."}
+
+      not uuid?(id) ->
+        {:error, "Invalid segment_id UUID."}
+
+      is_nil(vni) or vni not in @vni_range ->
+        {:error, "VNI must be an integer between 1 and 16777215."}
+
+      is_nil(subnet_cidr) or not String.contains?(subnet_cidr, "/") ->
+        {:error, "A valid subnet CIDR (e.g. 10.20.1.0/24) is required."}
+
+      not is_nil(t1_id) and not uuid?(t1_id) ->
+        {:error, "Invalid Tier-1 router UUID."}
+
+      true ->
+        with :ok <- claim_vni(vni, id, name, opts) do
+          t1_literal = if t1_id, do: t1_id, else: "NULL"
+
+          cql =
+            "INSERT INTO hydra.urbosa_segments " <>
+              "(segment_id, name, vni, t1_link_id, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end) " <>
+              "VALUES (#{id}, ?, ?, #{t1_literal}, ?, ?, ?, ?, ?)"
+
+          params = [name, vni, subnet_cidr, gateway_ip, dhcp_enabled, dhcp_start, dhcp_end]
+
+          case write(cql, params, opts) do
+            :ok ->
+              {:ok, id}
+
+            {:error, reason} ->
+              _ = release_vni(vni, id, opts)
+              {:error, "Could not create segment: #{describe(reason)}"}
+          end
+        end
+    end
+  end
+
+  @doc """
+  Delete an overlay segment from `hydra.urbosa_segments` and release its VNI claim.
+  Refuses if any VMs are still attached to the segment.
+  """
+  def delete_segment(segment_id, opts \\ []) do
+    id = string(segment_id)
+
+    if not uuid?(id) do
+      {:error, "Invalid segment ID."}
+    else
+      with :ok <- ensure_no_attached_guests(id, opts),
+           {:ok, vni} <- segment_vni(id, opts),
+           :ok <- write("DELETE FROM hydra.urbosa_segments WHERE segment_id = #{id}", [], opts) do
+        _ = if vni, do: release_vni(vni, id, opts), else: :ok
+        :ok
+      end
+    end
+  end
+
+  @doc "Create a distributed firewall rule in `hydra.urbosa_firewall_rules`."
+  def create_firewall_rule(attrs, opts \\ []) when is_map(attrs) do
+    attrs = stringify(attrs)
+    id = string(get(attrs, "rule_id")) || generate_id()
+    description = string(get(attrs, "description"))
+    source_ip = string(get(attrs, "source_ip")) || "any"
+    dest_ip = string(get(attrs, "dest_ip")) || "any"
+    protocol = (string(get(attrs, "protocol")) || "any") |> String.downcase()
+    port = integer(get(attrs, "port")) || 0
+    action_raw = (string(get(attrs, "action")) || "") |> String.downcase()
+    priority = integer(get(attrs, "priority")) || 100
+
+    cond do
+      is_nil(description) ->
+        {:error, "Firewall rule description is required."}
+
+      not uuid?(id) ->
+        {:error, "Invalid rule_id UUID."}
+
+      action_raw not in ~w(allow deny accept drop reject) ->
+        {:error, "Firewall action must be allow or deny."}
+
+      protocol not in ~w(any tcp udp icmp) ->
+        {:error, "Protocol must be any, tcp, udp, or icmp."}
+
+      true ->
+        normalized_action = if action_raw in ~w(allow accept), do: "allow", else: "deny"
+
+        cql =
+          "INSERT INTO hydra.urbosa_firewall_rules " <>
+            "(rule_id, description, source_ip, dest_ip, protocol, port, action, priority) " <>
+            "VALUES (#{id}, ?, ?, ?, ?, ?, ?, ?)"
+
+        params = [description, source_ip, dest_ip, protocol, port, normalized_action, priority]
+
+        case write(cql, params, opts) do
+          :ok -> {:ok, id}
+          {:error, reason} -> {:error, "Could not create firewall rule: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Delete a distributed firewall rule from `hydra.urbosa_firewall_rules`."
+  def delete_firewall_rule(rule_id, opts \\ []) do
+    id = string(rule_id)
+
+    if uuid?(id) do
+      case write("DELETE FROM hydra.urbosa_firewall_rules WHERE rule_id = #{id}", [], opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Could not delete firewall rule: #{describe(reason)}"}
+      end
+    else
+      {:error, "Invalid firewall rule ID."}
+    end
+  end
+
+  defp claim_vni(vni, segment_id, name, opts) do
+    case static_source(opts) do
+      %{} = static ->
+        report(static, {:vni_claim, vni, segment_id})
+
+        case static
+             |> Map.get(:vni_claims, [])
+             |> Enum.map(&stringify/1)
+             |> Enum.find(&(integer(get(&1, "vni")) == vni)) do
+          nil ->
+            :ok
+
+          holder ->
+            holder_name = string(get(holder, "name")) || "another segment"
+            {:error, "VNI #{vni} is already claimed by #{holder_name}."}
+        end
+
+      nil ->
+        now_ms = System.system_time(:millisecond)
+
+        case lwt(@vni_claim_cql, [vni, segment_id, name, now_ms]) do
+          {:ok, true, _row} ->
+            :ok
+
+          {:ok, false, holder} ->
+            holder = stringify(holder || %{})
+            holder_name = string(get(holder, "name")) || string(get(holder, "segment_id")) || "another segment"
+            {:error, "VNI #{vni} is already claimed by #{holder_name}."}
+
+          {:error, reason} ->
+            {:error, "Could not claim VNI #{vni}: #{describe(reason)}"}
+        end
+    end
+  end
+
+  defp release_vni(vni, segment_id, opts) do
+    case static_source(opts) do
+      %{} = static ->
+        report(static, {:vni_release, vni, segment_id})
+        :ok
+
+      nil ->
+        case lwt(@vni_release_cql, [vni, segment_id]) do
+          {:ok, _, _} -> :ok
+          {:error, reason} -> {:error, describe(reason)}
+        end
+    end
+  end
+
+  defp ensure_no_attached_guests(segment_id, opts) do
+    case read(static_source(opts), :vms, @vm_cql) do
+      {:ok, vm_rows} ->
+        attached =
+          vm_rows
+          |> Enum.map(&stringify/1)
+          |> Enum.filter(&(string(get(&1, "network_id")) == segment_id))
+
+        if attached == [] do
+          :ok
+        else
+          names = Enum.map_join(attached, ", ", &(string(get(&1, "name")) || "unnamed"))
+          {:error, "Segment still has attached guests (#{names}) and cannot be deleted."}
+        end
+
+      {:error, reason} ->
+        {:error, "Could not verify attached guests before deleting segment: #{describe(reason)}"}
+    end
+  end
+
+  defp segment_vni(segment_id, opts) do
+    case read(static_source(opts), :segments, @segment_cql) do
+      {:ok, rows} ->
+        vni =
+          rows
+          |> Enum.map(&stringify/1)
+          |> Enum.find_value(fn row ->
+            if uuid(get(row, "segment_id")) == segment_id, do: integer(get(row, "vni"))
+          end)
+
+        {:ok, vni}
+
+      {:error, reason} ->
+        {:error, "Could not read segment before delete: #{describe(reason)}"}
+    end
+  end
+
+  defp write(cql, params, opts) do
+    case static_source(opts) do
+      %{} = static ->
+        report(static, {:write, cql, params})
+        Map.get(static, :write_result, :ok)
+
+      nil ->
+        try do
+          case Hydra.query(cql, params) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        rescue
+          exception -> {:error, Exception.message(exception)}
+        catch
+          :exit, reason -> {:error, {:exit, reason}}
+        end
+    end
+  end
+
+  defp lwt(cql, params) do
+    Hydra.apply_lwt_row(cql, params)
+  rescue
+    exception -> {:error, Exception.message(exception)}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
+  end
+
+  defp report(%{sink: pid}, message) when is_pid(pid), do: send(pid, message)
+  defp report(_static, _message), do: :ok
+
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?("1"), do: true
+  defp truthy?("on"), do: true
+  defp truthy?(1), do: true
+  defp truthy?(_), do: false
 end

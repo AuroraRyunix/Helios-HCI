@@ -173,9 +173,187 @@ defmodule SpectrumPhx.SettingsTest do
     end
   end
 
+  describe "ssl deployment" do
+    test "rejects missing or empty cert and key" do
+      assert {:error, msg} = Settings.deploy_ssl("", "", source: {:static, %{}})
+      assert msg =~ "Certificate and Private Key are required"
+    end
+
+    test "rejects invalid PEM certificate" do
+      assert {:error, msg} = Settings.deploy_ssl("not-a-cert", "-----BEGIN RSA PRIVATE KEY-----\nKEY\n-----END RSA PRIVATE KEY-----", source: {:static, %{}})
+      assert msg =~ "BEGIN CERTIFICATE"
+    end
+
+    test "rejects invalid PEM private key" do
+      valid_cert = "-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"
+      assert {:error, msg} = Settings.deploy_ssl(valid_cert, "plain-text-key", source: {:static, %{}})
+      assert msg =~ "private key"
+    end
+
+    test "deploys valid cert and key through effects" do
+      test = self()
+      valid_cert = "-----BEGIN CERTIFICATE-----\nMIIC...\n-----END CERTIFICATE-----"
+      valid_key = "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----"
+
+      static = %{
+        effects: fn {:ssl, c, k} ->
+          send(test, {:ssl_deployed, c, k})
+          :ok
+        end
+      }
+
+      assert {:ok, msg} = Settings.deploy_ssl(valid_cert, valid_key, source: {:static, static})
+      assert msg =~ "SSL Certificate deployed"
+      assert_received {:ssl_deployed, ^valid_cert, ^valid_key}
+    end
+  end
+
+  describe "node operations" do
+    defp sample_nodes do
+      [
+        %{"hostname" => "hci-01", "ip" => "10.10.102.41", "role" => "hypervisor", "is_witness" => false},
+        %{"hostname" => "hci-02", "ip" => "10.10.102.42", "role" => "hypervisor", "is_witness" => false},
+        %{"hostname" => "hci-wit", "ip" => "10.10.102.49", "role" => "witness", "is_witness" => true}
+      ]
+    end
+
+    test "cluster_nodes lists nodes and identifies witnesses" do
+      nodes = Settings.cluster_nodes(source: {:static, %{hosts: sample_nodes()}})
+      assert length(nodes) == 3
+      assert Enum.find(nodes, &(&1.hostname == "hci-wit")).is_witness?
+      refute Enum.find(nodes, &(&1.hostname == "hci-01")).is_witness?
+    end
+
+    test "add_node validates hostname and IP" do
+      static = %{hosts: sample_nodes()}
+      assert {:error, msg} = Settings.add_node("", "10.10.102.43", source: {:static, static})
+      assert msg =~ "Hostname is required"
+
+      assert {:error, msg} = Settings.add_node("invalid host", "10.10.102.43", source: {:static, static})
+      assert msg =~ "alphanumeric"
+
+      assert {:error, msg} = Settings.add_node("hci-03", "banana", source: {:static, static})
+      assert msg =~ "IPv4 address"
+    end
+
+    test "add_node refuses duplicates" do
+      static = %{hosts: sample_nodes()}
+      assert {:error, msg} = Settings.add_node("hci-01", "10.10.102.99", source: {:static, static})
+      assert msg =~ "already configured"
+
+      assert {:error, msg} = Settings.add_node("hci-99", "10.10.102.41", source: {:static, static})
+      assert msg =~ "already configured"
+    end
+
+    test "add_node dispatches addition with witness flag" do
+      test = self()
+      static = %{
+        hosts: sample_nodes(),
+        effects: fn tag ->
+          send(test, {:effect, tag})
+          :ok
+        end
+      }
+
+      assert {:ok, _} = Settings.add_node("hci-wit2", "10.10.102.50", source: {:static, static}, witness: true)
+      assert_received {:effect, {:add_node, "hci-wit2", "10.10.102.50", true}}
+    end
+
+    test "remove_node refuses removing the only node or non-existent node" do
+      assert {:error, msg} = Settings.remove_node("ghost", source: {:static, %{hosts: sample_nodes()}})
+      assert msg =~ "not found"
+
+      single = %{hosts: [%{"hostname" => "sole-node", "ip" => "10.0.0.1"}]}
+      assert {:error, msg} = Settings.remove_node("sole-node", source: {:static, single})
+      assert msg =~ "only remaining node"
+    end
+
+    test "remove_node dispatches removal through effects" do
+      test = self()
+      static = %{
+        hosts: sample_nodes(),
+        effects: fn tag ->
+          send(test, {:effect, tag})
+          :ok
+        end
+      }
+
+      assert {:ok, _} = Settings.remove_node("hci-02", source: {:static, static})
+      assert_received {:effect, {:remove_node, "hci-02", "10.10.102.42"}}
+    end
+
+    test "node_maintenance and reboot dispatch through effects" do
+      test = self()
+      static = %{
+        hosts: sample_nodes(),
+        effects: fn tag ->
+          send(test, {:effect, tag})
+          :ok
+        end
+      }
+
+      assert {:ok, _} = Settings.node_maintenance("10.10.102.41", "enter", source: {:static, static})
+      assert_received {:effect, {:maintenance, "10.10.102.41", "enter"}}
+
+      assert {:ok, _} = Settings.node_reboot("10.10.102.41", source: {:static, static})
+      assert_received {:effect, {:reboot, "10.10.102.41"}}
+    end
+
+    test "add_node supports optional redundancy_factor and zk_role_change dispatches promotion" do
+      test = self()
+      static = %{
+        hosts: sample_nodes(),
+        effects: fn tag ->
+          send(test, {:effect, tag})
+          :ok
+        end
+      }
+
+      assert {:ok, _} =
+               Settings.add_node("hci-04", "10.10.102.44",
+                 source: {:static, static},
+                 redundancy_factor: "2"
+               )
+
+      assert_received {:effect, {:add_node, "hci-04", "10.10.102.44", false, 2}}
+
+      assert {:error, msg} =
+               Settings.add_node("hci-05", "10.10.102.45",
+                 source: {:static, static},
+                 redundancy_factor: "9"
+               )
+
+      assert msg =~ "Redundancy factor"
+
+      assert {:ok, _} =
+               Settings.zk_role_change("10.10.102.42", "promote",
+                 replacing: "10.10.102.41",
+                 source: {:static, static}
+               )
+
+      assert_received {:effect, {:zk_role, "promote", "10.10.102.42", "10.10.102.41"}}
+    end
+  end
+
   describe "statements" do
     test "every read names its columns" do
       for {_name, cql} <- Settings.statements(), do: refute(cql =~ "SELECT *")
+    end
+
+    test "console protocol policy and default protocol are stored settings" do
+      defaults = Settings.defaults()
+      assert defaults["console_protocol_policy"] == "both"
+      assert defaults["default_console_protocol"] == "vnc"
+
+      params = %{
+        "console_protocol_policy" => "spice",
+        "default_console_protocol" => "spice"
+      }
+      assert {:ok, %{saved: 2}} = Settings.save(params, source: {:static, %{}})
+
+      invalid = %{"console_protocol_policy" => "rdp"}
+      assert {:error, msg} = Settings.save(invalid, source: {:static, %{}})
+      assert msg =~ "one of both, vnc, spice"
     end
   end
 end
