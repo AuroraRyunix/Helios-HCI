@@ -12,6 +12,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   alias SpectrumPhx.Cluster.Config
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Images
+  alias SpectrumPhx.Storage.Containers
 
   @refresh_interval_ms 15_000
 
@@ -166,6 +167,26 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         _ -> []
       end
 
+    containers =
+      case Containers.list() do
+        {:ok, list} -> list
+        _ -> []
+      end
+
+    container_names = Enum.map(containers, & &1.name)
+    current_container = socket.assigns.deploy_form["container"]
+    selected_container =
+      cond do
+        current_container in container_names ->
+          current_container
+        containers != [] ->
+          hd(containers).name
+        true ->
+          Containers.default_name()
+      end
+
+    deploy_form = Map.put(socket.assigns.deploy_form, "container", selected_container)
+
     # Load local VMs for cross-cluster inventory view
     local_vms =
       case Hydra.query("SELECT name, state, vcpu, memory, host_ip, affinity_group FROM hydra.vms;") do
@@ -216,6 +237,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     |> assign(:allocated_vcpus, allocated_vcpus)
     |> assign(:vcpu_percent, vcpu_percent)
     |> assign(:images, images)
+    |> assign(:containers, containers)
+    |> assign(:deploy_form, deploy_form)
     |> assign(:read_at, DateTime.utc_now())
   end
 
@@ -366,7 +389,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               </div>
 
               <button phx-click="open_deploy_modal" class="btn btn-sm btn-primary gap-1.5 w-full shadow-sm" id="deploy-appliance-btn">
-                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Central Appliance
+                <.icon name="hero-server-stack" class="size-4" /> Deploy Central Appliance
               </button>
             </div>
 
@@ -677,7 +700,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 phx-click="open_deploy_modal"
                 class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
               >
-                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
+                <.icon name="hero-server-stack" class="size-4" /> Deploy Appliance
               </button>
             </div>
 
@@ -761,14 +784,17 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               </div>
               <div>
                 <label class="label text-xs font-semibold">Storage Container</label>
-                <input
-                  type="text"
-                  placeholder="default-pool"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["container"]}
+                <select
+                  class="select select-sm select-bordered w-full font-mono"
                   phx-change="update_deploy_field"
                   phx-value-field="container"
-                />
+                  name="container"
+                >
+                  <option :if={@containers == []} value="" disabled selected>No storage containers found</option>
+                  <option :for={c <- @containers} value={c.name} selected={@deploy_form["container"] == c.name}>
+                    {c.name} ({c.tier}, FTT={c.ftt})
+                  </option>
+                </select>
               </div>
             </div>
 
@@ -826,7 +852,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           <div class="modal-action border-t border-base-content/10 pt-4">
             <button phx-click="close_deploy_modal" class="btn btn-sm btn-ghost">Cancel</button>
             <button phx-click="trigger_deploy" class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/20" id="confirm-deploy-btn">
-              <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance Now
+              <.icon name="hero-check" class="size-4" /> Deploy Appliance Now
             </button>
           </div>
         </div>

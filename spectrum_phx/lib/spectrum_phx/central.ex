@@ -253,10 +253,10 @@ defmodule SpectrumPhx.Central do
     gateway = Map.get(params, "gateway", "")
     dns = Map.get(params, "dns", "")
     admin_password = Map.get(params, "admin_password", "")
+    container = Map.get(params, "container", "default-pool")
 
-    if ip == "" or gateway == "" or admin_password == "" do
-      {:error, "Appliance IP, gateway, and admin password are required."}
-    else
+    with :ok <- SpectrumPhx.Storage.Containers.ensure_exists(container),
+         true <- (ip != "" and gateway != "" and admin_password != "") || {:error, "Appliance IP, gateway, and admin password are required."} do
       userdata_yaml = """
       #cloud-config
       system_info:
@@ -296,7 +296,7 @@ defmodule SpectrumPhx.Central do
               "vcpu" => preset.vcpus,
               "memory" => preset.memory_mb,
               "firmware" => "uefi",
-              "disks_list" => "#{preset.disk_gb}G:default-pool",
+              "disks_list" => "#{preset.disk_gb}G:#{container}",
               "cpu_model" => "host-passthrough",
               "cloud_init_userdata" => userdata_yaml,
               "cloud_init_network" => network_yaml
@@ -353,6 +353,8 @@ defmodule SpectrumPhx.Central do
         {:error, reason} ->
           {:error, reason}
       end
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
 end

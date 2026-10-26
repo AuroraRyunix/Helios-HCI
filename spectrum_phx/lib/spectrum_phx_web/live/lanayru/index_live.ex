@@ -340,7 +340,7 @@ defmodule SpectrumPhxWeb.Lanayru.IndexLive do
                 disabled={@blocking != []}
                 id="deploy-submit"
               >
-                <.icon name="hero-rocket-launch" class="size-4" /> Deploy
+                <.icon name="hero-server-stack" class="size-4" /> Deploy
               </button>
               <span :if={@blocking == [] and not @ready?} class="text-xs text-warning">
                 The pre-flight has warnings. Read them before you press this.
