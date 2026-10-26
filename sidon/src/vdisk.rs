@@ -2159,6 +2159,14 @@ pub fn drain_all(handle: &Arc<Mutex<Vdisk>>) -> Result<()> {
     lock_idle(handle).close()
 }
 
+/// Drain a vdisk completely and return the held vdisk guard so the caller can read a
+/// consistent block map from Hydra before any subsequent write or background drain can start.
+pub fn drain_and_hold(handle: &Arc<Mutex<Vdisk>>) -> Result<MutexGuard<'_, Vdisk>> {
+    let mut v = lock_idle(handle);
+    v.close()?;
+    Ok(v)
+}
+
 /// Drain a vdisk completely and seal the extent group it was appending to, for a vdisk that is
 /// being detached or handed over.
 ///

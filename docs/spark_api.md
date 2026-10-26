@@ -66,11 +66,13 @@ All are mTLS on `:9099`, JSON in and out. Errors return
 | GET | `/api/v1/vm/{name}/interfaces` | -- | `{"interfaces":[{"mac","type","source","model"}]}` |
 | GET | `/api/v1/vm/{name}/console` | -- | `{"graphics":"vnc"\|"spice","port":int,"listen":str}` |
 | GET | `/api/v1/vm/{name}/info` | -- | `{"state","vcpus","memory_kib","autostart"}` |
+| GET | `/api/v1/vm/{name}/domstats` | -- | `{"name":str,"stats":{...},"raw":str}` |
 | POST | `/api/v1/vm/define` | `{"name","xml_b64"}` | `{"defined":true}` |
 | POST | `/api/v1/vm/undefine` | `{"name","keep_nvram":bool}` | `{"undefined":true}` |
 | POST | `/api/v1/vm/{name}/live` | `{"op":"vcpus"\|"memory"\|"cdrom"\|"nic"\|"disk", ...}` (fields per op in [vm_lifecycle.md](./vm_lifecycle.md)) | `{"applied":[...],"state"}`, or 409 `{"error","applied"}` naming the step that failed |
 | POST | `/api/v1/vm/live` | `{"name","change":{...}}` | forwarded to Vali: apply the change on the host the VM runs on and update its record |
 | GET | `/api/v1/host/domains` | -- | `{"domains":[{"name","state"}]}` (every libvirt domain on the host; what a rejoining host is reconciled against) |
+| POST | `/api/v1/host/virsh` | `{"action":"list"\|"dominfo"\|"domstate"\|"domstats"\|"dumpxml"\|"start"\|"shutdown"\|"destroy"\|"reboot"\|"reset"\|"suspend"\|"resume"\|"undefine", "name"?:str}` | `{"action","ok","stdout","info"?,"stats"?,"lines"?}` |
 | POST | `/api/v1/vm/{name}/power` | `{"action":"start"\|"destroy"\|"reboot"\|"shutdown"\|"reset"}` | `{"state":str}` |
 
 `xml_b64` is base64 so domain XML never passes through a shell. The daemon decodes it to a
@@ -197,6 +199,8 @@ could never finish draining it.
 | GET | `/api/v1/host/listeners` | `?port=` (optional) | `{"listeners":[...]}`, or `{"port","listening","listeners"}` |
 | GET | `/api/v1/host/units` | `?units=a,b` (optional) | `{"units":[{"unit","load_state","active_state","sub_state","unit_file_state","active"}]}` |
 | POST | `/api/v1/host/units` | `{"action","units","detach"?,"ignore_failed"?}` | `{"action","units","ok"}` |
+| POST | `/api/v1/host/containers` | `{"action":"rm"\|"restart"\|"stop"\|"start"\|"inspect"\|"system-prune"\|"nodetool-cleanup"\|"nodetool-status","containers"?,"force"?,"ignore_failed"?}` | `{"action","containers"?,"ok","stdout","stderr"}` |
+| POST | `/api/v1/host/fs` | `{"action":"stat"\|"mkdir"\|"rm"\|"read"\|"write"\|"chmod","path":str,"mode"?,"content"?,"content_b64"?}` | `{"action","path","ok"}` |
 | GET | `/api/v1/host/capabilities` | -- | `{"kvm":bool,"secure_boot":bool}` |
 | GET | `/api/v1/host/dhcp-leases` | -- | `{"leases":[{"mac","ip","hostname","expires"}]}` |
 | POST | `/api/v1/host/reboot` | `{"confirm":true}` | `{"rebooting":true}` |

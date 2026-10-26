@@ -526,11 +526,83 @@ class RouteTests(unittest.TestCase):
                 ("/api/v1/host/units", "handle_host_units"),
                 ("/api/v1/host/units", "handle_host_units_action"),
                 ("/api/v1/host/listeners", "handle_host_listeners"),
-                ("/api/v1/host/interfaces", "handle_host_interfaces")):
+                ("/api/v1/host/interfaces", "handle_host_interfaces"),
+                ("/api/v1/host/containers", "handle_host_containers"),
+                ("/api/v1/host/virsh", "handle_host_virsh"),
+                ("/api/v1/host/fs", "handle_host_fs"),
+                ("/api/v1/host/bgp", "handle_host_bgp_get"),
+                ("/api/v1/host/bgp", "handle_host_bgp_post"),
+                ("/api/v1/host/files", "handle_host_files_get"),
+                ("/api/v1/host/files", "handle_host_files_post")):
             with self.subTest(path=path, handler=handler):
                 self.assertIn('"%s"' % path, source)
                 self.assertIn("def %s(" % handler, source)
                 self.assertIn("self.%s(" % handler, source)
+        self.assertIn("def handle_vm_domstats(", source)
+        self.assertIn("self.handle_vm_domstats(", source)
+
+
+class SandboxedEndpointValidationTests(unittest.TestCase):
+    """Tests for container, virsh, domstats, and fs typed validation boundaries."""
+
+    def test_managed_containers_allow_known_names_and_reject_unknown_or_shell_input(self):
+        for name in ("systemd-hydra-db", "systemd-zookeeper", "systemd-spectrum", "spectrum-phx"):
+            container, err = daemon.validate_container(name)
+            self.assertEqual(container, name)
+            self.assertIsNone(err)
+        for bad in ("redis", "systemd-spectrum; id", "", None, 42):
+            container, err = daemon.validate_container(bad)
+            self.assertIsNone(container)
+            self.assertIsNotNone(err)
+
+    def test_validate_containers_rejects_whole_list_when_one_entry_is_invalid(self):
+        containers, err = daemon.validate_containers(["systemd-spectrum", "unmanaged-box"])
+        self.assertIsNone(containers)
+        self.assertIn("unmanaged-box", err)
+
+    def test_container_and_virsh_actions_are_strictly_allowlisted(self):
+        for act in ("rm", "restart", "stop", "start", "system-prune", "nodetool-cleanup"):
+            res, err = daemon.validate_container_action(act)
+            self.assertEqual(res, act)
+            self.assertIsNone(err)
+        res, err = daemon.validate_container_action("exec -it /bin/sh")
+        self.assertIsNone(res)
+        self.assertIsNotNone(err)
+
+        for v_act in ("list", "dominfo", "domstate", "domstats", "start", "shutdown", "destroy"):
+            res, err = daemon.validate_virsh_action(v_act)
+            self.assertEqual(res, v_act)
+            self.assertIsNone(err)
+        res, err = daemon.validate_virsh_action("qemu-monitor-command")
+        self.assertIsNone(res)
+        self.assertIsNotNone(err)
+
+    def test_validate_fs_path_accepts_allowed_roots_and_rejects_traversal(self):
+        for good in ("/var/lib/hci/sidon/state.json", "/etc/hci/cluster.json", "/tmp/helios_update.zip"):
+            path, err = daemon.validate_fs_path(good)
+            self.assertIsNotNone(path, good)
+            self.assertIsNone(err, good)
+        for bad in ("/etc/shadow", "/var/lib/hci/../../etc/passwd", "relative/path", "/root/.ssh/authorized_keys"):
+            path, err = daemon.validate_fs_path(bad)
+            self.assertIsNone(path, bad)
+            self.assertIsNotNone(err, bad)
+
+    def test_parse_virsh_domstats_extracts_typed_numbers(self):
+        sample = (
+            "Domain: 'vm-alpha'\n"
+            "  state.state=1\n"
+            "  cpu.time=9876543210\n"
+            "  balloon.current=4194304\n"
+            "  balloon.rss=2097152\n"
+            "  block.0.name=vda\n"
+            "  block.0.rd.reqs=120\n"
+            "  block.0.wr.reqs=45\n"
+        )
+        parsed = daemon.parse_virsh_domstats(sample)
+        self.assertEqual(parsed["cpu.time"], 9876543210)
+        self.assertEqual(parsed["balloon.rss"], 2097152)
+        self.assertEqual(parsed["block.0.name"], "vda")
+        self.assertEqual(parsed["block.0.rd.reqs"], 120)
 
     def test_every_path_branch_says_it_handled_the_request(self):
         """`/api/v1/host/cpu` was written as the `if` half of an if/elif pair and so

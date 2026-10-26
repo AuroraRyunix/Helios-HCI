@@ -299,6 +299,401 @@ def get_db_firewall_rules():
         "hydra.urbosa_firewall_rules",
         consequence=f"Skipping firewall rebuild; leaving {FW_CHAIN} as-is.")
 
+
+DEFAULT_BGP_CONFIG = {
+    "config_id": "cluster",
+    "asn": 65000,
+    "router_id": "",
+    "evpn_enabled": False,
+    "arp_suppression": False,
+    "disable_headend_flood": False,
+    "route_reflectors": "",
+    "bfd_enabled": True,
+}
+
+
+def get_db_bgp_config():
+    """Read cluster-wide BGP EVPN configuration from hydra.urbosa_bgp_config."""
+    rows = read_json_table(
+        "hydra.urbosa_bgp_config",
+        consequence="Keeping previous BGP EVPN state for this pass.")
+    if rows is None:
+        return None
+    cfg = dict(DEFAULT_BGP_CONFIG)
+    for row in rows:
+        if row.get("config_id") in ("cluster", None, ""):
+            for k in DEFAULT_BGP_CONFIG:
+                if row.get(k) is not None:
+                    cfg[k] = row[k]
+            break
+    try:
+        cfg["asn"] = int(cfg.get("asn") or 65000)
+    except (TypeError, ValueError):
+        cfg["asn"] = 65000
+    cfg["evpn_enabled"] = bool(cfg.get("evpn_enabled"))
+    cfg["arp_suppression"] = bool(cfg.get("arp_suppression"))
+    cfg["disable_headend_flood"] = bool(cfg.get("disable_headend_flood"))
+    cfg["bfd_enabled"] = bool(cfg.get("bfd_enabled", True))
+    cfg["route_reflectors"] = str(cfg.get("route_reflectors") or "").strip()
+    cfg["router_id"] = str(cfg.get("router_id") or "").strip()
+    return cfg
+
+
+def get_db_bgp_peers():
+    """Read explicit BGP EVPN neighbors from hydra.urbosa_bgp_peers."""
+    rows = read_json_table(
+        "hydra.urbosa_bgp_peers",
+        consequence="Keeping previous BGP neighbor list for this pass.")
+    if rows is None:
+        return None
+    peers = []
+    for r in rows:
+        peer_ip = str(r.get("peer_ip") or "").strip()
+        if not peer_ip:
+            continue
+        try:
+            ipaddress.ip_address(peer_ip)
+        except ValueError:
+            continue
+        try:
+            remote_asn = int(r.get("remote_asn") or 65000)
+        except (TypeError, ValueError):
+            remote_asn = 65000
+        peers.append({
+            "peer_ip": peer_ip,
+            "remote_asn": remote_asn,
+            "description": str(r.get("description") or "").strip(),
+            "bfd_enabled": bool(r.get("bfd_enabled", True)),
+            "route_reflector_client": bool(r.get("route_reflector_client", False)),
+        })
+    return sorted(peers, key=lambda x: x["peer_ip"])
+
+
+def render_frr_config(bgp_cfg, bgp_peers, node_ips, local_ip, segments, hostname=None):
+    """Render deterministic FRRouting configuration for BGP L2VPN EVPN control plane."""
+    cfg = dict(DEFAULT_BGP_CONFIG)
+    if bgp_cfg:
+        cfg.update(bgp_cfg)
+    asn = int(cfg.get("asn") or 65000)
+    if not (1 <= asn <= 4294967294):
+        raise ValueError(f"Invalid BGP ASN {asn}: must be in 1..4294967294")
+
+    router_id = str(cfg.get("router_id") or "").strip() or local_ip or "127.0.0.1"
+    host_label = hostname or socket.gethostname() or "helios-node"
+    bfd_global = bool(cfg.get("bfd_enabled", True))
+
+    rr_ips = []
+    for token in str(cfg.get("route_reflectors") or "").replace(";", ",").split(","):
+        tok = token.strip()
+        if tok:
+            try:
+                ipaddress.ip_address(tok)
+                rr_ips.append(tok)
+            except ValueError:
+                pass
+    is_rr = local_ip in rr_ips
+
+    # Combine internal cluster nodes (iBGP) + explicit spine/external BGP peers
+    neighbor_map = {}
+    for nip in sorted(set(node_ips or [])):
+        if not nip or nip == local_ip or nip == "127.0.0.1":
+            continue
+        try:
+            ipaddress.ip_address(nip)
+        except ValueError:
+            continue
+        # If route reflectors are configured and this node is NOT a route reflector,
+        # peer only with the route reflectors instead of full mesh.
+        if rr_ips and not is_rr and nip not in rr_ips:
+            continue
+        neighbor_map[nip] = {
+            "peer_ip": nip,
+            "remote_asn": asn,
+            "description": "helios-ibgp-evpn-peer",
+            "bfd_enabled": bfd_global,
+            "route_reflector_client": is_rr and (nip not in rr_ips),
+        }
+
+    for p in bgp_peers or []:
+        pip = str(p.get("peer_ip") or "").strip()
+        if not pip or pip == local_ip:
+            continue
+        neighbor_map[pip] = {
+            "peer_ip": pip,
+            "remote_asn": int(p.get("remote_asn") or asn),
+            "description": str(p.get("description") or "external-evpn-peer"),
+            "bfd_enabled": bool(p.get("bfd_enabled", bfd_global)),
+            "route_reflector_client": bool(p.get("route_reflector_client", False)),
+        }
+
+    neighbors = [neighbor_map[k] for k in sorted(neighbor_map.keys())]
+
+    lines = [
+        "! Managed by Urbosa SDN Scale-Out BGP EVPN Reconciler",
+        "frr defaults datacenter",
+        f"hostname {host_label}",
+        "service integrated-vtysh-config",
+        "log syslog informational",
+        "!",
+    ]
+
+    if bfd_global and neighbors:
+        lines.append("bfd")
+        for nb in neighbors:
+            if nb.get("bfd_enabled"):
+                lines.append(f" peer {nb['peer_ip']}")
+                lines.append("  no shutdown")
+                lines.append(" exit")
+        lines.append("exit")
+        lines.append("!")
+
+    lines.append(f"router bgp {asn}")
+    lines.append(f" bgp router-id {router_id}")
+    lines.append(" no bgp default ipv4-unicast")
+    lines.append(" no bgp ebgp-requires-policy")
+    lines.append(" coalesce-time 1000")
+    if is_rr:
+        lines.append(f" bgp cluster-id {router_id}")
+
+    for nb in neighbors:
+        pip = nb["peer_ip"]
+        rasn = nb["remote_asn"]
+        desc = re.sub(r"[^A-Za-z0-9_.: -]", "", nb.get("description") or "")
+        lines.append(f" neighbor {pip} remote-as {rasn}")
+        if local_ip and local_ip != "127.0.0.1":
+            lines.append(f" neighbor {pip} update-source {local_ip}")
+        lines.append(f" neighbor {pip} capability extended-nexthop")
+        if desc:
+            lines.append(f" neighbor {pip} description {desc}")
+        if nb.get("bfd_enabled"):
+            lines.append(f" neighbor {pip} bfd")
+
+    lines.append(" !")
+    lines.append(" address-family l2vpn evpn")
+    for nb in neighbors:
+        pip = nb["peer_ip"]
+        lines.append(f"  neighbor {pip} activate")
+        if nb.get("route_reflector_client"):
+            lines.append(f"  neighbor {pip} route-reflector-client")
+    lines.append("  advertise-all-vni")
+    lines.append("  advertise-svi-ip")
+
+    vnis = []
+    for seg in segments or []:
+        try:
+            v = validate_vni(seg.get("vni"))
+            vnis.append(v)
+        except Exception:
+            continue
+    for vni in sorted(set(vnis)):
+        lines.append(f"  vni {vni}")
+        lines.append(f"   rd {router_id}:{vni}")
+        lines.append(f"   route-target import {asn}:{vni}")
+        lines.append(f"   route-target export {asn}:{vni}")
+        lines.append("  exit-vni")
+
+    lines.append(" exit-address-family")
+    lines.append("exit")
+    lines.append("!")
+    return "\n".join(lines) + "\n"
+
+
+def build_vxlan_segment_commands(vni, phys_if, mtu_size, node_ips, local_ip,
+                                 bgp_cfg=None, br_exists=False, vx_exists=False):
+    """Build deterministic kernel iproute2/bridge commands for one overlay segment VNI.
+
+    When `evpn_enabled` is True in `bgp_cfg`:
+      - Creates/configures `vxlan-<vni>` with `nolearning` and bridge port `learning off`
+        so MAC learning is driven by FRR BGP EVPN Type-2 routes instead of data-plane flooding.
+      - When `arp_suppression` is True, enables `neigh_suppress on` on the VXLAN bridge port
+        so local hypervisors respond to ARP/ND queries from EVPN Type-2 MAC/IP tables.
+      - When `disable_headend_flood` is True, omits static `00:00:00:00:00:00` flood entries
+        (allowing FRR EVPN Type-3 IMET ingress replication to manage BUM).
+    """
+    vni = validate_vni(vni)
+    br_name = f"br-ov-{vni}"
+    vx_name = f"vxlan-{vni}"
+    evpn_on = bool((bgp_cfg or {}).get("evpn_enabled"))
+    arp_supp = bool((bgp_cfg or {}).get("arp_suppression")) and evpn_on
+    no_static_flood = bool((bgp_cfg or {}).get("disable_headend_flood")) and evpn_on
+
+    cmds = []
+    if not br_exists:
+        cmds.append(f"ip link add {br_name} type bridge")
+        cmds.append(f"ip link set {br_name} up")
+
+    learning_flag = "nolearning" if evpn_on else "learning"
+    local_clause = f"local {local_ip} " if (local_ip and local_ip != "127.0.0.1") else ""
+    if not vx_exists:
+        cmds.append(
+            f"ip link add {vx_name} type vxlan id {vni} dstport 4789 {local_clause}dev {phys_if} {learning_flag} 2>/dev/null || "
+            f"ip link add {vx_name} type vxlan id {vni} dstport 4789 {learning_flag}"
+        )
+        cmds.append(f"ip link set {vx_name} master {br_name} 2>/dev/null")
+        cmds.append(f"ip link set {vx_name} up")
+    else:
+        cmds.append(f"ip link set dev {vx_name} type vxlan {learning_flag} 2>/dev/null || true")
+
+    if evpn_on:
+        cmds.append(f"bridge link set dev {vx_name} learning off 2>/dev/null || true")
+    else:
+        cmds.append(f"bridge link set dev {vx_name} learning on 2>/dev/null || true")
+
+    if arp_supp:
+        cmds.append(f"bridge link set dev {vx_name} neigh_suppress on 2>/dev/null || true")
+        cmds.append(f"ip link set dev {br_name} type bridge neigh_suppress on 2>/dev/null || true")
+    else:
+        cmds.append(f"bridge link set dev {vx_name} neigh_suppress off 2>/dev/null || true")
+
+    if not no_static_flood:
+        for ip in node_ips or []:
+            if ip and ip != local_ip:
+                cmds.append(f"bridge fdb append {FLOOD_MAC} dev {vx_name} dst {ip} 2>/dev/null || true")
+
+    cmds.append(f"ip link set dev {br_name} mtu {mtu_size} 2>/dev/null || true")
+    cmds.append(f"ip link set dev {vx_name} mtu {mtu_size} 2>/dev/null || true")
+    return cmds
+
+
+_LAST_FRR_HASH = None
+
+
+def reconcile_frr_evpn(bgp_cfg, bgp_peers, node_ips, local_ip, segments,
+                       frr_conf_path="/etc/frr/frr.conf",
+                       daemons_path="/etc/frr/daemons",
+                       run=None):
+    """Ensure FRRouting bgpd/zebra configuration matches desired BGP EVPN state."""
+    global _LAST_FRR_HASH
+    runner = run or run_cmd
+    if not bgp_cfg or not bgp_cfg.get("evpn_enabled"):
+        return {"applied": False, "evpn_enabled": False}
+
+    rendered = render_frr_config(bgp_cfg, bgp_peers, node_ips, local_ip, segments)
+    digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    existing = ""
+    try:
+        if os.path.exists(frr_conf_path):
+            with open(frr_conf_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+    except OSError:
+        existing = ""
+
+    if existing == rendered and _LAST_FRR_HASH == digest:
+        return {"applied": False, "evpn_enabled": True, "hash": digest}
+
+    try:
+        parent = os.path.dirname(frr_conf_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.path.exists(daemons_path):
+            with open(daemons_path, "r", encoding="utf-8") as df:
+                d_text = df.read()
+            updated_d = d_text.replace("bgpd=no", "bgpd=yes").replace("bfdd=no", "bfdd=yes")
+            if updated_d != d_text:
+                with open(daemons_path, "w", encoding="utf-8") as df:
+                    df.write(updated_d)
+        tmp_path = frr_conf_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(rendered)
+        os.replace(tmp_path, frr_conf_path)
+    except OSError as exc:
+        return {"applied": False, "evpn_enabled": True, "error": str(exc)}
+
+    rc_reload, out_reload, err_reload = runner(
+        "/usr/lib/frr/frrinit.sh reload 2>/dev/null || systemctl reload-or-restart frr 2>/dev/null || true"
+    )
+    _LAST_FRR_HASH = digest
+    return {
+        "applied": True,
+        "evpn_enabled": True,
+        "hash": digest,
+        "returncode": rc_reload,
+    }
+
+
+def collect_evpn_status(run=None):
+    """Query live FRRouting BGP L2VPN EVPN state and kernel FDB/neigh tables on this host.
+
+    Never fabricates or mocks peer counts or routes: if FRR/vtysh is not installed or
+    inactive, returns authentic empty lists and `bgpd_running: False`.
+    """
+    runner = run or run_cmd
+    rc_ver, out_ver, _ = runner("vtysh -c 'show version' 2>/dev/null")
+    frr_installed = (rc_ver == 0 and bool(out_ver))
+
+    rc_sum, out_sum, err_sum = runner("vtysh -c 'show bgp l2vpn evpn summary json' 2>/dev/null")
+    bgpd_running = False
+    router_id = None
+    local_as = None
+    peers = []
+    if rc_sum == 0 and out_sum:
+        try:
+            parsed_sum = json.loads(out_sum)
+            evpn_block = parsed_sum.get("l2vpnEvpn") or parsed_sum
+            if isinstance(evpn_block, dict):
+                bgpd_running = True
+                router_id = evpn_block.get("routerId")
+                local_as = evpn_block.get("as")
+                raw_peers = evpn_block.get("peers") or {}
+                for peer_ip, pinfo in sorted(raw_peers.items()):
+                    if not isinstance(pinfo, dict):
+                        continue
+                    peers.append({
+                        "peer_ip": peer_ip,
+                        "remote_as": pinfo.get("remoteAs"),
+                        "state": pinfo.get("state") or "Unknown",
+                        "uptime": pinfo.get("peerUptime") or "00:00:00",
+                        "pfx_rcvd": int(pinfo.get("pfxRcd") or 0),
+                        "pfx_sent": int(pinfo.get("pfxSnt") or 0),
+                        "msg_rcvd": int(pinfo.get("msgRcvd") or 0),
+                        "msg_sent": int(pinfo.get("msgSent") or 0),
+                    })
+        except Exception:
+            pass
+
+    rc_vni, out_vni, _ = runner("vtysh -c 'show evpn vni json' 2>/dev/null")
+    vnis = []
+    if rc_vni == 0 and out_vni:
+        try:
+            parsed_vni = json.loads(out_vni)
+            if isinstance(parsed_vni, dict):
+                for vni_key, vinfo in sorted(parsed_vni.items()):
+                    if not isinstance(vinfo, dict):
+                        continue
+                    vnis.append({
+                        "vni": vinfo.get("vni") or vni_key,
+                        "type": vinfo.get("type") or "L2",
+                        "vxlan_if": vinfo.get("vxlanIf") or f"vxlan-{vni_key}",
+                        "num_macs": int(vinfo.get("numMacs") or 0),
+                        "num_arps": int(vinfo.get("numArpNd") or 0),
+                        "num_remote_vteps": int(vinfo.get("numRemoteVteps") or 0),
+                    })
+        except Exception:
+            pass
+
+    # Inspect kernel bridge ports for active ARP suppression (`neigh_suppress`)
+    rc_br, out_br, _ = runner("bridge -d -json link show 2>/dev/null")
+    arp_suppression_interfaces = []
+    if rc_br == 0 and out_br:
+        try:
+            for entry in json.loads(out_br):
+                ifname = entry.get("ifname")
+                if ifname and entry.get("neigh_suppress") is True:
+                    arp_suppression_interfaces.append(ifname)
+        except Exception:
+            pass
+
+    return {
+        "frr_installed": frr_installed,
+        "bgpd_running": bgpd_running,
+        "router_id": router_id,
+        "local_as": local_as,
+        "peers": peers,
+        "vnis": vnis,
+        "arp_suppression_interfaces": sorted(set(arp_suppression_interfaces)),
+    }
+
 # --------------------------------------------------------------------------------
 # Transit /30 allocation
 # --------------------------------------------------------------------------------
@@ -1853,8 +2248,10 @@ def main():
             except Exception:
                 underlay_mtu = 1500
             mtu_size = VXLAN_MTU if underlay_mtu == 1500 else max(1280, underlay_mtu - 50)
+            bgp_cfg = get_db_bgp_config()
+            bgp_peers = get_db_bgp_peers()
 
-            # 3. Reconcile Overlay Segments (VXLAN Mesh)
+            # 3. Reconcile Overlay Segments (VXLAN Mesh + BGP EVPN / ARP Suppression)
             for s in segments:
                 try:
                     vni = validate_vni(s.get("vni"))
@@ -1864,35 +2261,22 @@ def main():
 
                 br_name = f"br-ov-{vni}"
                 vx_name = f"vxlan-{vni}"
-                
-                # Ensure overlay bridge exists
-                rc_br, _, _ = run_cmd(f"ip link show {br_name}")
-                if rc_br != 0:
-                    print(f"Creating Overlay segment bridge {br_name}...")
-                    run_cmd(f"ip link add {br_name} type bridge")
-                    run_cmd(f"ip link set {br_name} up")
-                
-                # Ensure VXLAN device exists
-                rc_vx, _, _ = run_cmd(f"ip link show {vx_name}")
-                if rc_vx != 0:
-                    print(f"Creating VXLAN tunnel interface {vx_name} (VNI {vni})...")
-                    phys_if = get_uplink_interface("eth0")
-                    run_cmd(f"ip link add {vx_name} type vxlan id {vni} dstport 4789 dev {phys_if} 2>/dev/null || ip link add {vx_name} type vxlan id {vni} dstport 4789")
-                    run_cmd(f"ip link set {vx_name} master {br_name} 2>/dev/null")
-                    run_cmd(f"ip link set {vx_name} up")
-                
-                # Reconcile FDB flooding entries for VXLAN mesh. `bridge fdb
-                # append` is idempotent for a given (mac, dst) pair - verified on
-                # the live cluster - so repeating this every pass adds nothing.
-                # Entries for peers that have LEFT hydra.nodes are removed by the
-                # reclaimer, not here.
-                for ip in node_ips or []:
-                    if ip and ip != local_ip:
-                        run_cmd(f"bridge fdb append {FLOOD_MAC} dev {vx_name} dst {ip} 2>/dev/null || true")
 
-                # Enforce VXLAN overlay MTU (1450 on standard 1500-byte underlay)
-                run_cmd(f"ip link set dev {br_name} mtu {mtu_size} 2>/dev/null || true")
-                run_cmd(f"ip link set dev {vx_name} mtu {mtu_size} 2>/dev/null || true")
+                rc_br, _, _ = run_cmd(f"ip link show {br_name}")
+                rc_vx, _, _ = run_cmd(f"ip link show {vx_name}")
+                phys_if = get_uplink_interface("eth0")
+                seg_cmds = build_vxlan_segment_commands(
+                    vni=vni,
+                    phys_if=phys_if,
+                    mtu_size=mtu_size,
+                    node_ips=node_ips,
+                    local_ip=local_ip,
+                    bgp_cfg=bgp_cfg,
+                    br_exists=(rc_br == 0),
+                    vx_exists=(rc_vx == 0),
+                )
+                for seg_cmd in seg_cmds:
+                    run_cmd(seg_cmd)
 
                 # Connect Segment Bridge to Tier-1 Namespace via VETH Pair
                 t1_id = s.get("t1_link_id")
@@ -1976,6 +2360,16 @@ def main():
             if firewall_rules is not None:
                 apply_firewall_rules(firewall_rules)
 
+            # 4b. Reconcile FRRouting BGP L2VPN EVPN control plane when configured
+            if bgp_cfg is not None:
+                reconcile_frr_evpn(
+                    bgp_cfg=bgp_cfg,
+                    bgp_peers=bgp_peers or [],
+                    node_ips=node_ips or [],
+                    local_ip=local_ip,
+                    segments=segments,
+                )
+
             # 5. Reclaim resources whose database rows are gone. Runs last, on a
             # desired state that has already been proven readable, and after
             # reconciliation has had its chance to recreate anything it wants.
@@ -1999,6 +2393,8 @@ USAGE = """Urbosa - SDN logical router and overlay orchestrator.
   urbosa                   run the reconciliation daemon (this is what urbosa.service does)
   urbosa --reclaim         report what the reclaimer would remove on this host, and remove nothing
   urbosa --reclaim --apply remove it
+  urbosa --evpn-status     output live FRRouting BGP L2VPN EVPN and ARP suppression status as JSON
+  urbosa --render-frr      render the desired /etc/frr/frr.conf from ScyllaDB state to stdout
 
 --reclaim reads the same desired state the daemon does and refuses to remove
 anything it cannot prove is idle; the refusals it prints are as much the point as
@@ -2010,6 +2406,16 @@ def main_cli(argv):
     args = list(argv)
     if "--help" in args or "-h" in args:
         print(USAGE)
+        return 0
+    if "--evpn-status" in args:
+        print(json.dumps(collect_evpn_status(), indent=2))
+        return 0
+    if "--render-frr" in args:
+        bgp_cfg = get_db_bgp_config() or dict(DEFAULT_BGP_CONFIG)
+        bgp_peers = get_db_bgp_peers() or []
+        node_ips = get_db_node_ips() or []
+        segments = get_db_segments() or []
+        print(render_frr_config(bgp_cfg, bgp_peers, node_ips, get_local_ip(), segments), end="")
         return 0
     if "--reclaim" not in args:
         main()

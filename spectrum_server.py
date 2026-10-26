@@ -15,7 +15,6 @@ import urllib.parse
 import urllib.error
 import time
 import traceback
-import random
 import threading
 import hashlib
 import secrets
@@ -1515,19 +1514,22 @@ VM_IO_CACHE = {}
 
 def get_vm_stats(host_ip, vm_name, vcpus, allocated_mem_mb):
     global VM_CPU_CACHE, VM_IO_CACHE
-    cmd = f"virsh -c qemu:///system domstats {vm_name}"
-    
-    if host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "":
-        rc, stdout, stderr = run_remote_spark("127.0.0.1", cmd)
-    else:
-        rc, stdout, stderr = run_remote_spark(host_ip, cmd)
-        
+    target_ip = "127.0.0.1" if (host_ip == LOCAL_IP or host_ip == "127.0.0.1" or host_ip == "") else host_ip
+    encoded_name = urllib.parse.quote(vm_name, safe="")
+    rc_api, res_api, _ = run_mtls_spark_api(
+        target_ip, f"/api/v1/vm/{encoded_name}/domstats", None, method="GET"
+    )
     stats = {}
-    if rc == 0:
-        for line in stdout.splitlines():
-            if "=" in line:
-                k, v = line.strip().split("=", 1)
-                stats[k.strip()] = v.strip()
+    if rc_api == 0 and isinstance(res_api, dict) and isinstance(res_api.get("stats"), dict):
+        stats = {str(k): str(v) for k, v in res_api["stats"].items()}
+    else:
+        cmd = f"virsh -c qemu:///system domstats {vm_name}"
+        rc, stdout, stderr = run_remote_spark(target_ip, cmd)
+        if rc == 0:
+            for line in stdout.splitlines():
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    stats[k.strip()] = v.strip()
                 
     # Parse CPU time
     cpu_time = int(stats.get("cpu.time", 0))
@@ -1569,21 +1571,18 @@ def get_vm_stats(host_ip, vm_name, vcpus, allocated_mem_mb):
                     cpu_pct = 0.0
         VM_CPU_CACHE[vm_name] = (cpu_time, now)
         
-    # Calculate Mem stats
+    # Calculate Mem stats from authentic libvirt domstats only
     mem_usage_mb = 0.0
     mem_usage_pct = 0.0
-    if rss_kib > 0:
+    if rss_kib > 0 and allocated_mem_mb > 0:
         mem_usage_mb = rss_kib / 1024.0
         mem_usage_pct = (mem_usage_mb / allocated_mem_mb) * 100
         mem_usage_pct = min(100.0, max(0.0, mem_usage_pct))
     else:
         balloon_curr = int(stats.get("balloon.current", 0))
-        if balloon_curr > 0:
-            mem_usage_mb = (balloon_curr / 1024.0) * 0.45
-            mem_usage_pct = 45.0
-        else:
-            mem_usage_mb = allocated_mem_mb * 0.35
-            mem_usage_pct = 35.0
+        if balloon_curr > 0 and allocated_mem_mb > 0:
+            mem_usage_mb = balloon_curr / 1024.0
+            mem_usage_pct = min(100.0, max(0.0, (mem_usage_mb / allocated_mem_mb) * 100))
             
     # Calculate IOPS and Latency
     iops = 0.0
@@ -1697,8 +1696,8 @@ def get_cluster_metrics(nodes_info):
         
         cpu_pct = 0.0
         mem_pct = 0.0
-        cores = 2
-        t_mem = 8589934592  # 8 GB default fallback
+        cores = 0
+        t_mem = 0
         
         if rc_l == 0 and stdout_l:
             for line in stdout_l.splitlines():
@@ -1717,7 +1716,7 @@ def get_cluster_metrics(nodes_info):
                     except:
                         pass
         
-        u_mem = int(t_mem * (mem_pct / 100.0))
+        u_mem = int(t_mem * (mem_pct / 100.0)) if t_mem > 0 else 0
         
         total_cores += cores
         total_mem_bytes += t_mem
@@ -1732,20 +1731,20 @@ def get_cluster_metrics(nodes_info):
                     
     if online_count > 0:
         avg_cpu_pct = round(cpu_pct_sum / online_count, 2)
-        avg_mem_pct = round((used_mem_bytes / total_mem_bytes) * 100, 2)
+        avg_mem_pct = round((used_mem_bytes / total_mem_bytes) * 100, 2) if total_mem_bytes > 0 else 0.0
         total_mem_gb = round(total_mem_bytes / (1024**3), 2)
         used_mem_gb = round(used_mem_bytes / (1024**3), 2)
     else:
         avg_cpu_pct = 0.0
         avg_mem_pct = 0.0
-        total_mem_gb = 18.0
-        used_mem_gb = 2.0
-        total_cores = 6
+        total_mem_gb = 0.0
+        used_mem_gb = 0.0
+        total_cores = 0
         
     return {
         "cpu_pct": avg_cpu_pct,
         "cpu_cores": total_cores,
-        "total_cpu_ghz": round(2.4 * total_cores, 1),
+        "total_cpu_ghz": 0.0,
         "mem_pct": avg_mem_pct,
         "total_mem_gb": total_mem_gb,
         "used_mem_gb": used_mem_gb
@@ -2053,74 +2052,6 @@ def init_ssl():
         cmd = f'openssl req -x509 -nodes -newkey rsa:2048 -keyout {key_file} -out {cert_file} -days 365 -subj "/CN=Spectrum"'
         subprocess.run(cmd, shell=True, check=True)
     return cert_file, key_file
-
-# Metric helpers
-def get_cpu_pct():
-    try:
-        with open('/proc/stat', 'r') as f:
-            line = f.readline()
-        parts = line.split()
-        if len(parts) >= 5:
-            idle = int(parts[4])
-            total = sum(int(x) for x in parts[1:8])
-            # Sleep briefly to sample delta
-            time.sleep(0.1)
-            with open('/proc/stat', 'r') as f:
-                line2 = f.readline()
-            parts2 = line2.split()
-            idle2 = int(parts2[4])
-            total2 = sum(int(x) for x in parts2[1:8])
-            
-            idle_delta = idle2 - idle
-            total_delta = total2 - total
-            if total_delta > 0:
-                return round((1.0 - (idle_delta / total_delta)) * 100, 2)
-    except Exception:
-        pass
-    return round(random.uniform(3.5, 7.8), 2)
-
-def get_cpu_info():
-    try:
-        cores = os.cpu_count() or 4
-        return cores, 2.4
-    except Exception:
-        return 4, 2.4
-
-def get_mem_stats():
-    try:
-        with open('/proc/meminfo', 'r') as f:
-            lines = f.readlines()
-        mem_total = 0
-        mem_free = 0
-        mem_avail = 0
-        for line in lines:
-            if line.startswith('MemTotal:'):
-                mem_total = int(line.split()[1]) * 1024
-            elif line.startswith('MemFree:'):
-                mem_free = int(line.split()[1]) * 1024
-            elif line.startswith('MemAvailable:'):
-                mem_avail = int(line.split()[1]) * 1024
-        if mem_avail == 0:
-            mem_avail = mem_free
-        used = mem_total - mem_avail
-        mem_pct = (used / mem_total) * 100 if mem_total > 0 else 0
-        return round(mem_pct, 2), round(mem_total / (1024*1024*1024), 2), round(used / (1024*1024*1024), 2)
-    except Exception:
-        return 12.5, 16.0, 2.0
-
-
-def parse_free_m_all(stdout):
-    for line in stdout.splitlines():
-        if line.strip().startswith("Mem:"):
-            parts = line.split()
-            if len(parts) >= 7:
-                try:
-                    used = int(parts[2])
-                    available = int(parts[6])
-                    return used, available
-                except ValueError:
-                    pass
-    return None, None
 
 
 def get_default_container():
@@ -4716,6 +4647,66 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
             self.send_json(200, {"containers": db_containers})
+            return
+
+        elif path == "/api/urbosa/bgp":
+            cfg = {
+                "config_id": "cluster",
+                "asn": 65000,
+                "router_id": "",
+                "evpn_enabled": False,
+                "arp_suppression": False,
+                "disable_headend_flood": False,
+                "route_reflectors": "",
+                "bfd_enabled": True,
+            }
+            rc_c, out_c, _ = run_cql_query("SELECT JSON * FROM hydra.urbosa_bgp_config;")
+            if rc_c == 0 and out_c:
+                for row in parse_json_rows(out_c):
+                    if row.get("config_id") in ("cluster", None, ""):
+                        for k in cfg:
+                            if row.get(k) is not None:
+                                cfg[k] = row[k]
+                        break
+            rc_p, out_p, _ = run_cql_query("SELECT JSON * FROM hydra.urbosa_bgp_peers;")
+            peers = parse_json_rows(out_p) if rc_p == 0 else []
+            live_status = {}
+            rc_live, res_live, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/bgp", None, method="GET")
+            if rc_live == 0 and isinstance(res_live, dict):
+                live_status = res_live
+            self.send_json(200, {
+                "config": cfg,
+                "configured_peers": peers,
+                "live": live_status,
+            })
+            return
+
+        elif path == "/api/files/shares":
+            rc_f, out_f, err_f = run_cql_query("SELECT JSON * FROM hydra.files_shares;")
+            if rc_f != 0:
+                self.send_json(503, {"error": f"Could not read hydra.files_shares: {err_f or out_f}"})
+                return
+            shares = parse_json_rows(out_f)
+            shares.sort(key=lambda s: str(s.get("share_name") or ""))
+            for share in shares:
+                host_ip = str(share.get("host_ip") or "").strip() or LOCAL_IP
+                rc_m, res_m, _ = run_mtls_spark_api(
+                    host_ip,
+                    "/api/v1/host/files",
+                    {"action": "inspect", "share_name": share.get("share_name"), "export_path": share.get("export_path")},
+                    method="POST",
+                )
+                if rc_m == 0 and isinstance(res_m, dict) and "mounted" in res_m:
+                    share["mounted"] = bool(res_m.get("mounted"))
+                    share["total_bytes"] = res_m.get("total_bytes")
+                    share["used_bytes"] = res_m.get("used_bytes")
+                    share["avail_bytes"] = res_m.get("avail_bytes")
+                else:
+                    share["mounted"] = False
+                    share["total_bytes"] = None
+                    share["used_bytes"] = None
+                    share["avail_bytes"] = None
+            self.send_json(200, {"shares": shares})
             return
 
         elif path == "/api/images":
@@ -7877,6 +7868,303 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 return
 
             self.send_json(200, {"message": "Firewall rule deleted successfully."})
+            return
+
+        elif self.path == "/api/urbosa/bgp/configure":
+            try:
+                payload = json.loads(post_data.decode("utf-8"))
+                asn = int(payload.get("asn", 65000))
+                if not (1 <= asn <= 4294967294):
+                    raise ValueError("ASN must be in 1..4294967294")
+                router_id = str(payload.get("router_id") or "").strip()
+                if router_id:
+                    import ipaddress
+                    ipaddress.ip_address(router_id)
+                evpn_enabled = bool(payload.get("evpn_enabled", False))
+                arp_suppression = bool(payload.get("arp_suppression", False))
+                disable_headend_flood = bool(payload.get("disable_headend_flood", False))
+                bfd_enabled = bool(payload.get("bfd_enabled", True))
+                route_reflectors = str(payload.get("route_reflectors") or "").strip().replace("'", "''")
+            except Exception as exc:
+                self.send_json(400, {"error": f"Invalid BGP configuration payload: {exc}"})
+                return
+
+            now_ms = int(time.time() * 1000)
+            cql = (
+                "INSERT INTO hydra.urbosa_bgp_config "
+                "(config_id, asn, router_id, evpn_enabled, arp_suppression, disable_headend_flood, route_reflectors, bfd_enabled, updated_at_ms) "
+                f"VALUES ('cluster', {asn}, '{router_id}', {str(evpn_enabled).lower()}, {str(arp_suppression).lower()}, "
+                f"{str(disable_headend_flood).lower()}, '{route_reflectors}', {str(bfd_enabled).lower()}, {now_ms});"
+            )
+            rc, out, err = run_cql_query(cql)
+            if rc != 0:
+                self.send_json(500, {"error": f"Failed to save BGP configuration: {err or out}"})
+                return
+            for node in get_cluster_nodes():
+                nip = node.get("ip")
+                if nip:
+                    run_mtls_spark_api(nip, "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+            self.send_json(200, {
+                "message": "BGP EVPN configuration updated.",
+                "config": {
+                    "asn": asn,
+                    "router_id": router_id,
+                    "evpn_enabled": evpn_enabled,
+                    "arp_suppression": arp_suppression,
+                    "disable_headend_flood": disable_headend_flood,
+                    "route_reflectors": route_reflectors,
+                    "bfd_enabled": bfd_enabled,
+                },
+            })
+            return
+
+        elif self.path == "/api/urbosa/bgp/peers/add":
+            try:
+                import ipaddress
+                payload = json.loads(post_data.decode("utf-8"))
+                peer_ip = str(ipaddress.ip_address(str(payload["peer_ip"]).strip()))
+                remote_asn = int(payload.get("remote_asn", 65000))
+                if not (1 <= remote_asn <= 4294967294):
+                    raise ValueError("remote_asn must be in 1..4294967294")
+                description = str(payload.get("description") or "").strip().replace("'", "''")
+                bfd_enabled = bool(payload.get("bfd_enabled", True))
+                rr_client = bool(payload.get("route_reflector_client", False))
+            except Exception as exc:
+                self.send_json(400, {"error": f"Invalid BGP peer payload: {exc}"})
+                return
+
+            now_ms = int(time.time() * 1000)
+            cql = (
+                "INSERT INTO hydra.urbosa_bgp_peers (peer_ip, remote_asn, description, bfd_enabled, route_reflector_client, created_at_ms) "
+                f"VALUES ('{peer_ip}', {remote_asn}, '{description}', {str(bfd_enabled).lower()}, {str(rr_client).lower()}, {now_ms});"
+            )
+            rc, out, err = run_cql_query(cql)
+            if rc != 0:
+                self.send_json(500, {"error": f"Failed to add BGP peer: {err or out}"})
+                return
+            for node in get_cluster_nodes():
+                nip = node.get("ip")
+                if nip:
+                    run_mtls_spark_api(nip, "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+            self.send_json(201, {"message": f"BGP EVPN peer {peer_ip} (AS{remote_asn}) added.", "peer_ip": peer_ip})
+            return
+
+        elif self.path == "/api/urbosa/bgp/peers/delete":
+            try:
+                import ipaddress
+                payload = json.loads(post_data.decode("utf-8"))
+                peer_ip = str(ipaddress.ip_address(str(payload["peer_ip"]).strip()))
+            except Exception:
+                self.send_json(400, {"error": "Invalid peer_ip"})
+                return
+            rc, out, err = run_cql_query(f"DELETE FROM hydra.urbosa_bgp_peers WHERE peer_ip = '{peer_ip}';")
+            if rc != 0:
+                self.send_json(500, {"error": f"Failed to remove BGP peer: {err or out}"})
+                return
+            for node in get_cluster_nodes():
+                nip = node.get("ip")
+                if nip:
+                    run_mtls_spark_api(nip, "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+            self.send_json(200, {"message": f"BGP EVPN peer {peer_ip} removed."})
+            return
+
+        elif self.path == "/api/files/create":
+            try:
+                import helios_files
+                payload = json.loads(post_data.decode("utf-8"))
+                share_name, err_n = helios_files.validate_share_name(payload.get("share_name"))
+                if err_n:
+                    self.send_json(400, {"error": err_n})
+                    return
+                protocol, err_p = helios_files.validate_protocol(payload.get("protocol", "nfs"))
+                if err_p:
+                    self.send_json(400, {"error": err_p})
+                    return
+                squash_mode, err_s = helios_files.validate_squash(payload.get("squash_mode", "root_squash"))
+                if err_s:
+                    self.send_json(400, {"error": err_s})
+                    return
+                allowed_clients, err_c = helios_files.validate_allowed_clients(payload.get("allowed_clients", "*"))
+                if err_c:
+                    self.send_json(400, {"error": err_c})
+                    return
+                size_gb = int(payload.get("size_gb", 50))
+                if size_gb < 1 or size_gb > 65536:
+                    self.send_json(400, {"error": "size_gb must be between 1 and 65536"})
+                    return
+                container = str(payload.get("container") or get_default_container()).strip()
+                require_container(container)
+                host_ip = str(payload.get("host_ip") or "").strip() or LOCAL_IP
+                smb_guest_ok = bool(payload.get("smb_guest_ok", False))
+            except Exception as exc:
+                self.send_json(400, {"error": f"Invalid share payload: {exc}"})
+                return
+
+            existing, err_ex = helios_files.get_db_share(share_name, run_cql_query)
+            if err_ex:
+                self.send_json(503, {"error": err_ex})
+                return
+            if existing is not None:
+                self.send_json(409, {"error": f"A file share named '{share_name}' already exists."})
+                return
+
+            vdisk_id = helios_files.vdisk_id_for_share(share_name)
+            export_path = helios_files.export_path_for_share(share_name)
+            size_bytes = size_gb * 1024 * 1024 * 1024
+
+            rc_vd, res_vd, err_vd = run_mtls_spark_api(
+                host_ip,
+                "/api/v1/dfs/vdisk",
+                {"op": "create", "vdisk_id": vdisk_id, "size_bytes": size_bytes, "container": container},
+                method="POST",
+            )
+            if rc_vd != 0 or (isinstance(res_vd, dict) and res_vd.get("error")):
+                self.send_json(500, {"error": f"Failed to allocate Sidon vdisk '{vdisk_id}': {(res_vd or {}).get('error') or err_vd}"})
+                return
+
+            run_mtls_spark_api(
+                host_ip,
+                "/api/v1/dfs/vdisk",
+                {"op": "attach", "vdisk_id": vdisk_id},
+                method="POST",
+            )
+            rc_act, res_act, err_act = run_mtls_spark_api(
+                host_ip,
+                "/api/v1/host/files",
+                {
+                    "action": "activate",
+                    "share_name": share_name,
+                    "vdisk_id": vdisk_id,
+                    "export_path": export_path,
+                    "protocol": protocol,
+                    "allowed_clients": allowed_clients,
+                    "squash_mode": squash_mode,
+                    "smb_guest_ok": smb_guest_ok,
+                },
+                method="POST",
+            )
+            state_val = "ONLINE" if (rc_act == 0 and isinstance(res_act, dict) and res_act.get("ok")) else "PROVISIONED"
+            now_ms = int(time.time() * 1000)
+            cql = (
+                "INSERT INTO hydra.files_shares "
+                "(share_name, vdisk_id, container, size_gb, protocol, export_path, allowed_clients, host_ip, vip, state, squash_mode, smb_guest_ok, created_at_ms, updated_at_ms) "
+                f"VALUES ('{share_name}', '{vdisk_id}', '{container}', {size_gb}, '{protocol}', '{export_path}', '{allowed_clients}', "
+                f"'{host_ip}', '', '{state_val}', '{squash_mode}', {str(smb_guest_ok).lower()}, {now_ms}, {now_ms});"
+            )
+            rc_ins, out_ins, err_ins = run_cql_query(cql)
+            if rc_ins != 0:
+                self.send_json(500, {"error": f"Failed recording share in database: {err_ins or out_ins}"})
+                return
+            self.send_json(201, {
+                "message": f"Helios Files share '{share_name}' created on {host_ip}.",
+                "share_name": share_name,
+                "vdisk_id": vdisk_id,
+                "export_path": export_path,
+                "host_ip": host_ip,
+                "state": state_val,
+            })
+            return
+
+        elif self.path == "/api/files/delete":
+            try:
+                import helios_files
+                payload = json.loads(post_data.decode("utf-8"))
+                share_name, err_n = helios_files.validate_share_name(payload.get("share_name"))
+                if err_n:
+                    self.send_json(400, {"error": err_n})
+                    return
+            except Exception:
+                self.send_json(400, {"error": "Invalid payload"})
+                return
+
+            existing, err_ex = helios_files.get_db_share(share_name, run_cql_query)
+            if err_ex:
+                self.send_json(503, {"error": err_ex})
+                return
+            if existing is None:
+                self.send_json(404, {"error": f"Share '{share_name}' not found."})
+                return
+
+            host_ip = str(existing.get("host_ip") or "").strip() or LOCAL_IP
+            vdisk_id = str(existing.get("vdisk_id") or helios_files.vdisk_id_for_share(share_name))
+            export_path = str(existing.get("export_path") or helios_files.export_path_for_share(share_name))
+
+            run_mtls_spark_api(
+                host_ip,
+                "/api/v1/host/files",
+                {"action": "deactivate", "share_name": share_name, "export_path": export_path},
+                method="POST",
+            )
+            run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id}, method="POST")
+            run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", {"op": "delete", "vdisk_id": vdisk_id}, method="POST")
+
+            rc_del, out_del, err_del = run_cql_query(f"DELETE FROM hydra.files_shares WHERE share_name = '{share_name}';")
+            if rc_del != 0:
+                self.send_json(500, {"error": f"Failed deleting share row: {err_del or out_del}"})
+                return
+            self.send_json(200, {"message": f"Helios Files share '{share_name}' deleted."})
+            return
+
+        elif self.path == "/api/files/failover":
+            try:
+                import helios_files
+                payload = json.loads(post_data.decode("utf-8"))
+                share_name, err_n = helios_files.validate_share_name(payload.get("share_name"))
+                if err_n:
+                    self.send_json(400, {"error": err_n})
+                    return
+                target_ip = str(payload.get("target_ip") or "").strip()
+                if not target_ip:
+                    self.send_json(400, {"error": "target_ip is required"})
+                    return
+            except Exception:
+                self.send_json(400, {"error": "Invalid payload"})
+                return
+
+            existing, err_ex = helios_files.get_db_share(share_name, run_cql_query)
+            if err_ex:
+                self.send_json(503, {"error": err_ex})
+                return
+            if existing is None:
+                self.send_json(404, {"error": f"Share '{share_name}' not found."})
+                return
+
+            old_ip = str(existing.get("host_ip") or "").strip()
+            vdisk_id = str(existing.get("vdisk_id") or helios_files.vdisk_id_for_share(share_name))
+            export_path = str(existing.get("export_path") or helios_files.export_path_for_share(share_name))
+
+            if old_ip and old_ip != target_ip:
+                run_mtls_spark_api(
+                    old_ip,
+                    "/api/v1/host/files",
+                    {"action": "deactivate", "share_name": share_name, "export_path": export_path},
+                    method="POST",
+                )
+                run_mtls_spark_api(old_ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id}, method="POST")
+
+            rc_att, res_att, err_att = run_mtls_spark_api(
+                target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vdisk_id}, method="POST"
+            )
+            if rc_att != 0 or (isinstance(res_att, dict) and res_att.get("error")):
+                self.send_json(409, {"error": f"Could not claim Sidon vdisk '{vdisk_id}' on {target_ip}: {(res_att or {}).get('error') or err_att}"})
+                return
+
+            existing["host_ip"] = target_ip
+            existing_payload = dict(existing)
+            existing_payload["action"] = "activate"
+            run_mtls_spark_api(target_ip, "/api/v1/host/files", existing_payload, method="POST")
+
+            now_ms = int(time.time() * 1000)
+            run_cql_query(
+                f"UPDATE hydra.files_shares SET host_ip = '{target_ip}', state = 'ONLINE', updated_at_ms = {now_ms} "
+                f"WHERE share_name = '{share_name}';"
+            )
+            self.send_json(200, {
+                "message": f"Share '{share_name}' failed over to {target_ip}.",
+                "share_name": share_name,
+                "previous_host_ip": old_ip,
+                "host_ip": target_ip,
+            })
             return
 
         elif self.path == "/api/urbosa/t0/update":

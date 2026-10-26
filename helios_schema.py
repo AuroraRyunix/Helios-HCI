@@ -1006,6 +1006,53 @@ MIGRATIONS = [
             ");",
         ],
     },
+    {
+        "id": "0057-urbosa-bgp-evpn",
+        "description": "Scale-Out Urbosa FRRouting BGP EVPN control plane configuration and BGP neighbor registry.",
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.urbosa_bgp_config ("
+            "config_id text PRIMARY KEY, "
+            "asn int, "
+            "router_id text, "
+            "evpn_enabled boolean, "
+            "arp_suppression boolean, "
+            "disable_headend_flood boolean, "
+            "route_reflectors text, "
+            "bfd_enabled boolean, "
+            "updated_at_ms bigint"
+            ");",
+            "CREATE TABLE IF NOT EXISTS hydra.urbosa_bgp_peers ("
+            "peer_ip text PRIMARY KEY, "
+            "remote_asn int, "
+            "description text, "
+            "bfd_enabled boolean, "
+            "route_reflector_client boolean, "
+            "created_at_ms bigint"
+            ");",
+        ],
+    },
+    {
+        "id": "0058-helios-files-shares",
+        "description": "Helios Files scale-out HA NFSv4/SMB3 file shares backed by replicated Sidon vdisks.",
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.files_shares ("
+            "share_name text PRIMARY KEY, "
+            "vdisk_id text, "
+            "container text, "
+            "size_gb int, "
+            "protocol text, "
+            "export_path text, "
+            "allowed_clients text, "
+            "host_ip text, "
+            "vip text, "
+            "state text, "
+            "squash_mode text, "
+            "smb_guest_ok boolean, "
+            "created_at_ms bigint, "
+            "updated_at_ms bigint"
+            ");",
+        ],
+    },
 ]
 
 

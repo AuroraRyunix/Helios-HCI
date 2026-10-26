@@ -754,4 +754,93 @@ defmodule SpectrumPhx.Sdn do
   defp truthy?("on"), do: true
   defp truthy?(1), do: true
   defp truthy?(_), do: false
+
+  @bgp_config_cql "SELECT config_id, asn, router_id, evpn_enabled, arp_suppression, disable_headend_flood, route_reflectors, bfd_enabled, updated_at_ms FROM hydra.urbosa_bgp_config"
+  @bgp_peers_cql "SELECT peer_ip, remote_asn, description, bfd_enabled, route_reflector_client, created_at_ms FROM hydra.urbosa_bgp_peers"
+
+  @doc "Read Scale-Out Urbosa BGP EVPN configuration and configured peers."
+  def bgp_state(opts \\ []) do
+    static = static_source(opts)
+
+    with {:ok, cfg_rows} <- read(static, :bgp_config, @bgp_config_cql),
+         {:ok, peer_rows} <- read(static, :bgp_peers, @bgp_peers_cql) do
+      cfg =
+        cfg_rows
+        |> Enum.map(&stringify/1)
+        |> List.first()
+        |> case do
+          nil ->
+            %{
+              asn: 65000,
+              router_id: "",
+              evpn_enabled?: false,
+              arp_suppression?: false,
+              disable_headend_flood?: false,
+              route_reflectors: "",
+              bfd_enabled?: true
+            }
+
+          row ->
+            %{
+              asn: integer(get(row, "asn")) || 65000,
+              router_id: get(row, "router_id") || "",
+              evpn_enabled?: truthy?(get(row, "evpn_enabled")),
+              arp_suppression?: truthy?(get(row, "arp_suppression")),
+              disable_headend_flood?: truthy?(get(row, "disable_headend_flood")),
+              route_reflectors: get(row, "route_reflectors") || "",
+              bfd_enabled?: truthy?(Map.get(row, "bfd_enabled", true))
+            }
+        end
+
+      peers =
+        peer_rows
+        |> Enum.map(&stringify/1)
+        |> Enum.map(fn r ->
+          %{
+            peer_ip: get(r, "peer_ip") || "",
+            remote_asn: integer(get(r, "remote_asn")) || 65000,
+            description: get(r, "description") || "",
+            bfd_enabled?: truthy?(Map.get(r, "bfd_enabled", true)),
+            route_reflector_client?: truthy?(get(r, "route_reflector_client"))
+          }
+        end)
+        |> Enum.sort_by(& &1.peer_ip)
+
+      {:ok, %{config: cfg, peers: peers}}
+    end
+  end
+
+  @doc "Update cluster-wide FRRouting BGP EVPN and ARP suppression configuration."
+  def configure_bgp(params, opts \\ []) when is_map(params) do
+    p = stringify(params)
+    asn = integer(get(p, "asn")) || 65000
+
+    if asn < 1 or asn > 4_294_967_294 do
+      {:error, "BGP ASN must be between 1 and 4294967294."}
+    else
+      router_id = get(p, "router_id") || ""
+      evpn? = truthy?(get(p, "evpn_enabled"))
+      arp_supp? = truthy?(get(p, "arp_suppression"))
+      no_flood? = truthy?(get(p, "disable_headend_flood"))
+      bfd? = truthy?(Map.get(p, "bfd_enabled", true))
+      rr = get(p, "route_reflectors") || ""
+      now_ms = System.system_time(:millisecond)
+
+      cql =
+        "INSERT INTO hydra.urbosa_bgp_config (config_id, asn, router_id, evpn_enabled, arp_suppression, disable_headend_flood, route_reflectors, bfd_enabled, updated_at_ms) " <>
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+      case write(cql, ["cluster", asn, router_id, evpn?, arp_supp?, no_flood?, rr, bfd?, now_ms], opts) do
+        :ok ->
+          Enum.each(nodes(static_source(opts)), fn nip ->
+            SpectrumPhx.SparkClient.request(nip, :post, "/api/v1/host/bgp", %{"action" => "reload"})
+          end)
+
+          :ok
+
+        {:error, reason} ->
+          {:error, "Could not save BGP EVPN configuration: #{describe(reason)}"}
+      end
+    end
+  end
 end

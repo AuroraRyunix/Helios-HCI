@@ -2151,6 +2151,54 @@ def run_auto_heal():
     return 0
 
 
+def failover_orphaned_file_shares(dead_ip, hosts):
+    """Fail over any Helios Files shares owned by `dead_ip` to a surviving online host.
+
+    Uses Sidon's `(owner, epoch)` compare-and-swap via `/api/v1/dfs/vdisk` `attach` on the
+    surviving host before mounting XFS and re-exporting NFS/SMB via `/api/v1/host/files`.
+    """
+    rc, stdout, _ = run_cql_query("SELECT JSON * FROM hydra.files_shares;")
+    if rc != 0 or not stdout:
+        return []
+    orphaned_shares = [
+        row for row in parse_json_rows(stdout)
+        if str(row.get("host_ip") or "").strip() == dead_ip
+    ]
+    if not orphaned_shares:
+        return []
+
+    candidates = [
+        h.get("ip") for h in (hosts or [])
+        if h.get("ip") and h.get("ip") != dead_ip
+    ]
+    if not candidates:
+        return []
+
+    recovered = []
+    for idx, share in enumerate(orphaned_shares):
+        share_name = share.get("share_name")
+        vdisk_id = share.get("vdisk_id") or f"files-{share_name}"
+        if not share_name:
+            continue
+        target_ip = candidates[idx % len(candidates)]
+        status_att, body_att, _ = run_mtls_spark_api_full(
+            target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vdisk_id}
+        )
+        if status_att != 200 or (isinstance(body_att, dict) and body_att.get("error")):
+            continue
+        act_payload = dict(share)
+        act_payload["action"] = "activate"
+        act_payload["host_ip"] = target_ip
+        run_mtls_spark_api_full(target_ip, "/api/v1/host/files", act_payload)
+        now_ms = int(time.time() * 1000)
+        run_cql_query(
+            f"UPDATE hydra.files_shares SET host_ip = '{target_ip}', state = 'ONLINE', "
+            f"updated_at_ms = {now_ms} WHERE share_name = '{share_name}';"
+        )
+        recovered.append((share_name, target_ip))
+    return recovered
+
+
 def main():
     print("Mipha High-Availability Host Monitor and VM Failover Coordinator started.")
     
@@ -2519,7 +2567,10 @@ def main():
                     if not vali_ok:
                         print("[Mipha HA] WARNING: Vali remains unresponsive. Proceeding with database orchestration.")
                         
-                    # D. Query dead host's VMs in ScyllaDB
+                    # D. Query dead host's VMs and Helios Files shares in ScyllaDB
+                    recovered_shares = failover_orphaned_file_shares(ip, hosts)
+                    if recovered_shares:
+                        print(f"[Mipha HA] Failed over {len(recovered_shares)} Helios Files share(s): {recovered_shares}")
                     print(f"[Mipha HA] Scanning ScyllaDB for active VMs hosted on dead node {ip}...")
                     cql_up = f"UPDATE hydra.catalyst_tasks SET progress = 70, updated_at = {int(time.time()*1000)} WHERE task_id = {parent_task_id};"
                     run_cql_query(cql_up)

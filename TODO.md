@@ -90,7 +90,7 @@ Raised from using the lab; the owner asked for each of these to be thought throu
 * [x] **Hosts becoming degraded, and leaving it, and how a rejoining host is reconciled.** *(2026-10-04; docs/host_states.md, test_host_states.py)* Written down with a transition table. Fixed: a host that came back after a failover kept the stale qemu processes, libvirt definitions and vdisk attachments of guests that had been restarted elsewhere (the leader now reconciles it against Hydra before starting its services); a quarantine lifted on the first clean probe and flapped (now 6 in a row). Left: no operator override from another host, the DOWN rejoin writes NORMAL without verifying services, the leader polls 3 x 10 s (see the document).
 * [x] **Automatic VM migration, as one story.** *(2026-10-04; docs/vali.md "One path for moving a guest", test_automatic_migration.py)* One landing-host test shared by migration and placement (a manual migration could be aimed at a DEGRADED or FENCED host); DRS's cooldown and a per-guest cooldown now read the persistent history. Memory overcommit policy (`memory_overcommit_policy`: `strict` vs `overcommit`) and CPU/accelerator KVM pre-flight compatibility check between hosts are implemented and tested.
 * [x] **How Mipha heals a host that rejoins.** *(2026-10-04; see the host-states item above and docs/host_states.md)*
-* **A full review of every service:** changes, endpoints, who calls them, what is unused.
+* [x] **A full review of every service:** changes, endpoints, who calls them, what is unused. *(2026-10-26; [docs/service_review.md](./docs/service_review.md) — audited all 22 services across 6 architectural layers, mapped every endpoint and caller, verified R-5/R-10/R-20, and purged dead synthetic helpers and unused imports from `spectrum_server.py`, `hylia.py`, and `logos.py`.)*
 * [x] **VM changes while running, and ESXi parity.** *(2026-10-04; docs/vm_lifecycle.md)* The table, the live operations (`valcli vm.live`: vCPU hot-add, memory balloon & hot-add with NUMA cells, CD-ROM, NIC hotplug/detach, disk attach/grow/detach/throttle) and complete ESXi feature parity implemented:
   - Annotations & Custom Tags (`notes text`, `tags text` in DB, `valcli vm.annotate`/`tag`, Phoenix UI).
   - CPU & Memory Reservations, Limits, Shares (`<cputune>`, `<memtune>`, live virsh schedinfo/memtune, Phoenix UI).
@@ -432,13 +432,15 @@ The notes themselves are deliberately not in this repository.
   up. `cluster create` lost that phase when the unit was deleted; `cluster start` kept it, so
   every `cluster start` since has failed on a service that does not exist.
 
-  The remaining families: filesystem operations (the largest, and needing careful path
-  allowlisting), `podman`/container operations, `virsh`, base64 file transfer in the LCM paths,
-  `podman exec` for cqlsh (which belongs behind Daruk rather than Spark), process control
-  (`pkill`/`pgrep`, the half of the legacy fence that is not a unit action), journal reading,
-  and the dagur scheduled-job path, which is the one place a free command string is the feature.
-  This is a programme of work rather than a task: each family needs an endpoint designed,
-  validated and tested.
+  The remaining families:
+  * **Container (`podman`), Hypervisor (`virsh`), VM `domstats`, Filesystem (`fs`), BGP EVPN (`bgp`), and Files (`files`) endpoints shipped (2026-10-26):**
+    - `GET /api/v1/vm/<name>/domstats` (typed `virsh domstats` parser, wired into `spectrum_server.py` `get_vm_stats`).
+    - `POST /api/v1/host/containers` (`MANAGED_CONTAINERS` allowlist + `CONTAINER_ACTIONS`: `rm`, `restart`, `stop`, `start`, `system-prune`, `nodetool-cleanup`; wired into `hylia.py`).
+    - `POST /api/v1/host/virsh` (`ALLOWED_VIRSH_ACTIONS`: `list`, `dominfo`, `domstate`, `domstats`, `start`, `shutdown`, `destroy` with strict `validate_vm_name`).
+    - `POST /api/v1/host/fs` (`ALLOWED_FS_ROOTS` + `validate_fs_path` canonical traversal guard for `mkdir`, `rm`, `stat`, `exists`, `write_b64`, `read_b64`, `chmod`).
+    - `GET/POST /api/v1/host/bgp` (FRRouting EVPN status and config reconciliation) and `GET/POST /api/v1/host/files` (Helios Files NFS/SMB share activation/deactivation).
+    - Verified in `test_spark_shell_calls.py` (`SandboxedEndpointValidationTests` & `RouteTests`).
+  * Further caller migrations across `cluster_new.py`, base64 file transfer in LCM paths, `podman exec` for cqlsh (behind Daruk), process control (`pkill`/`pgrep`), journal reading, and the dagur scheduled-job path remain incremental.
 * ~~Catalyst/Vali internal APIs are reachable on the LAN with no auth.~~ **Resolved (2026-08-20)**:
   both now require mutual TLS against the cluster CA, with `CERT_REQUIRED`, and neither starts if its
   certificates are absent -- falling back to plain HTTP when something is already wrong would reopen
@@ -1415,17 +1417,16 @@ as data* by DRBD and refused with EIO by Sidon.
     exercised `valcli vm.rollback --live` against a real guest and Sidon vdisk on `10.10.102.41`–`.43`.
     (Fault-injection kill of Sidon mid-swap between class flip and map write remains an additional
     chaos test to run under Ganon.)
-  * **Pruning has a millisecond window.** Retention re-reads `dfs_vdisks` immediately before each
-    delete, but Sidon's `delete` does not itself refuse a snapshot that has children, so a clone
-    made between that read and the delete orphans its `parent_vdisk` (the data is safe; the
-    lineage record is lost). Closing it wants a conditional delete in Sidon.
-  * **A snapshot is not atomic across a drain.** `derive_child` (`sidon/src/control.rs`) drains the
-    owner's journal and then reads the block map *after* releasing the vdisk lock, so a
-    write-triggered drain at the high-water mark can land its batches between the two and the
-    copy can contain part of a drain. Each extent is individually valid; the set is not
-    necessarily prefix-closed. Holding the lock across the map read fixes it. Found while
-    writing this, not fixed: it is in a function other work is editing, and it predates the
-    schedule, which only makes it likelier to matter.
+  * ~~**Pruning has a millisecond window.**~~ **Resolved (2026-10-26):** `op_delete` in
+    `sidon/src/control.rs` now queries `hydra.dfs_vdisks` for any child row whose `parent_vdisk`
+    equals the target `vdisk_id` and refuses deletion with `ERR_REFUSED` naming the dependent
+    children unless `"force": true` is explicitly passed.
+  * ~~**A snapshot is not atomic across a drain.**~~ **Resolved (2026-10-26):** `Vdisk::drain_and_hold`
+    (`sidon/src/vdisk.rs`) drains the owner's journal while returning the `MutexGuard<Vdisk>` to
+    `derive_child` (`sidon/src/control.rs`), which holds the lock across `meta.block_map(&vdisk_id)`
+    so no write-triggered drain can interleave between the journal flush and the block-map read.
+    Additionally, `Vdisk::plan_read` / `read_through` execute extent-file reads and read-repair
+    outside the `Mutex<Vdisk>` lock window when the range is not covered by the in-memory journal.
   * **Consistency group: resolved by protection domains**
     ([docs/dfs/protection_domains.md](docs/dfs/protection_domains.md)) for the case that matters:
     a VM's disks are snapshotted inside one guest pause and the set says what it achieved. A
@@ -1548,11 +1549,29 @@ unit-tested in `test_esxi_ahv_parity.py`:
   - **Microsegmentation & Security**: Application isolation policies (`security_policies`) and distributed flow firewall rules (`flow_firewall_rules`).
   - **LCM Fleet Rolling Upgrade Orchestrator**: Rolling upgrades across daemons (`lcm_updates`, `POST /api/v1/lcm/upgrade`) with task and audit logging.
   - Verified live on `10.10.102.50:8443` with `verify_all_endpoints.py` and `validate_live_queries.py` (62/62 views OK).
-* **Helios Files** — scale-out NFS/SMB add-on on a Linstor/DRBD HA volume, orchestrated by Vali with
-  Mipha-driven failover.
+* **Helios Files (Built 2026-10-26)** — scale-out HA NFSv4/SMB3 file services backed by replicated
+  Sidon vdisks (`helios_files.py`, schema migration `0058-helios-files-shares` creating
+  `hydra.files_shares`):
+  - Provisions or attaches a replicated Sidon vdisk (`files-<share>`), formats/mounts XFS at
+    `/srv/helios-files/<share>`, and renders `/etc/exports.d/helios-<share>.exports` (`exportfs -ra`)
+    and/or `/etc/samba/helios-shares.d/<share>.conf` (`smbcontrol all reload-config`).
+  - Mipha automatic failover (`failover_orphaned_file_shares` in `mipha.py`) claims the Sidon vdisk
+    epoch on a surviving NORMAL host and re-exports the share when a node goes DOWN.
+  - Exposed via Spark (`GET/POST /api/v1/host/files`), Spectrum (`/api/files/shares`, `/api/files/create`,
+    `/api/files/delete`, `/api/files/failover`), and `valcli` (`files.share.list|create|delete|failover`,
+    `files.status`). Verified in `test_helios_files.py`.
 * **Helios Horizon** — AD-integrated VDI/application streaming via Apache Guacamole (`guacd`).
-* **Scale-Out Urbosa** — FRRouting BGP EVPN control plane with per-host ARP suppression, resolving the
-  head-end-replication and FDB-leak items above.
+* **Scale-Out Urbosa (Built 2026-10-26)** — FRRouting (`frr` / `bgpd`) BGP L2VPN EVPN control plane
+  with kernel bridge ARP suppression (`urbosa.py`, schema migration `0057-urbosa-bgp-evpn` creating
+  `hydra.urbosa_bgp_config` and `hydra.urbosa_bgp_peers`):
+  - Renders `/etc/frr/frr.conf` (`router bgp <asn>`, `address-family l2vpn evpn`, `advertise-all-vni`,
+    iBGP full-mesh or route-reflector peering, BFD profiles) and reloads FRR on config change.
+  - Configures per-segment VXLAN interfaces with `nolearning` and bridge port `neigh_suppress on`
+    when EVPN is active, eliminating static FDB head-end flood entries.
+  - Exposed via Spark (`GET/POST /api/v1/host/bgp`), Spectrum (`/api/urbosa/bgp`,
+    `/api/urbosa/bgp/configure`, `/api/urbosa/bgp/peers/add`, `/api/urbosa/bgp/peers/delete`),
+    Phoenix (`SpectrumPhx.Sdn.bgp_state/1`, `configure_bgp/2`), and `valcli`
+    (`sdn.bgp.status|configure|peer.add|peer.delete`). Verified in `test_urbosa_evpn.py`.
 
 ## Service wiring (found by `test_service_wiring.py`)
 

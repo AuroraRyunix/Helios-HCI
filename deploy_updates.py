@@ -759,6 +759,7 @@ SPECTRUM_BUILD_FILES = (
     ("helios_sidon.py", "helios_sidon.py"),
     ("helios_cql.py", "helios_cql.py"),
     ("helios_zk.py", "helios_zk.py"),
+    ("helios_files.py", "helios_files.py"),
 )
 
 local_helios_sig = "helios_sig.py"
@@ -1337,6 +1338,8 @@ def deploy_to_node(ip):
             # it imports and which in turn looks for it.
             print(f"[{ip}] Uploading rauru_protection to /usr/local/bin/rauru_protection.py...")
             put_text_file(sftp, "rauru_protection.py", "/usr/local/bin/rauru_protection.py")
+            print(f"[{ip}] Uploading helios_files to /usr/local/bin/helios_files.py...")
+            put_text_file(sftp, "helios_files.py", "/usr/local/bin/helios_files.py")
 
             # Imported by spectrum_server at runtime, so it needs to be on the host as
             # well as inside the console image.

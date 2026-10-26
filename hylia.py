@@ -140,6 +140,22 @@ def spark_unit_action(ip, action, units, detach=False, ignore_failed=False):
     return False, str((body or {}).get("error") or "spark-daemon answered %s" % status)
 
 
+def spark_container_action(ip, action, containers, force=True, ignore_failed=False):
+    """Act on managed Podman containers on a host via /api/v1/host/containers."""
+    payload = {
+        "action": action,
+        "containers": list(containers),
+        "force": bool(force),
+        "ignore_failed": bool(ignore_failed),
+    }
+    status, body, error = run_mtls_spark_api_full(ip, "/api/v1/host/containers", payload)
+    if status == 200:
+        return True, ""
+    if error:
+        return False, error
+    return False, str((body or {}).get("error") or "spark-daemon answered %s" % status)
+
+
 def get_cluster_hosts():
     try:
         with open("/etc/hci/cluster.json", "r") as f:
@@ -164,7 +180,6 @@ def get_zookeeper_leader_ip():
     ips = [h.get("ip") for h in hosts if h.get("ip")] if hosts else []
     # One cached probe, shared by every daemon -- see helios_zk.leader_ip.
     return helios_zk.leader_ip(ips)
-    return None
 
 _CANDIDACIES = {}
 _CANDIDACY_LOCK = threading.Lock()
@@ -908,7 +923,7 @@ def hylia_rolling_upgrade(job_id):
                         "cp /usr/local/bin/hylia /tmp/spectrum_build/hylia.py && "
                         # The Dockerfile COPYs these too; a build without them failed on every
                         # upgrade, and the failure was only logged as a warning.
-                        "for m in helios_sig helios_schema helios_sidon helios_cql helios_zk; do "
+                        "for m in helios_sig helios_schema helios_sidon helios_cql helios_zk helios_files; do "
                         "cp /usr/local/bin/$m.py /tmp/spectrum_build/$m.py || exit 1; done && "
                         "cp /usr/local/bin/Dockerfile /tmp/spectrum_build/Dockerfile && "
                         # lanayru is imported by spectrum_server at runtime; tolerate its
@@ -924,12 +939,13 @@ def hylia_rolling_upgrade(job_id):
                     else:
                         ok_s, detail_s = spark_unit_action(node_ip, "stop", ["spectrum"])
                         if ok_s:
-                            rc_rm, out_rm, err_rm = run_remote_spark(
-                                node_ip, "podman rm -f systemd-spectrum")
-                            if rc_rm == 0:
+                            ok_rm, detail_rm = spark_container_action(
+                                node_ip, "rm", ["systemd-spectrum"], force=True, ignore_failed=True
+                            )
+                            if ok_rm:
                                 ok_s, detail_s = spark_unit_action(node_ip, "start", ["spectrum"])
                             else:
-                                ok_s, detail_s = False, (err_rm or out_rm)
+                                ok_s, detail_s = False, detail_rm
                         if not ok_s:
                             log_upgrade(job_id, f"[{hostname}] Warning restarting Spectrum: {detail_s}")
                         

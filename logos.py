@@ -2,10 +2,7 @@
 import time
 import os
 import sys
-import socket
 import re
-import base64
-import subprocess
 
 # The cluster's one CQL query layer. Fifteen files carried their own copy of this, most
 # of them identical, and the guard against conditional statements had reached only three

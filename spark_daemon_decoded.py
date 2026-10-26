@@ -1916,6 +1916,144 @@ def validate_unit_action(value):
     return None, "action must be one of " + ", ".join(UNIT_ACTIONS)
 
 
+MANAGED_CONTAINERS = frozenset((
+    "systemd-hydra-db",
+    "systemd-zookeeper",
+    "systemd-spectrum",
+    "spectrum-phx",
+    "systemd-slate",
+    "systemd-kass",
+))
+
+CONTAINER_ACTIONS = (
+    "rm",
+    "restart",
+    "stop",
+    "start",
+    "inspect",
+    "system-prune",
+    "nodetool-cleanup",
+    "nodetool-status",
+)
+
+ALLOWED_VIRSH_ACTIONS = (
+    "list",
+    "dominfo",
+    "domstate",
+    "domstats",
+    "dumpxml",
+    "start",
+    "shutdown",
+    "destroy",
+    "reboot",
+    "reset",
+    "suspend",
+    "resume",
+    "undefine",
+)
+
+ALLOWED_FS_ROOTS = (
+    "/var/lib/hci/",
+    "/etc/hci/",
+    "/srv/salt/",
+    "/run/hci/",
+    "/tmp/",
+)
+
+FS_ACTIONS = ("stat", "mkdir", "rm", "read", "write", "chmod")
+
+
+def validate_container(value):
+    """A managed Podman container name from MANAGED_CONTAINERS."""
+    if not isinstance(value, str) or not value:
+        return None, "container must be a non-empty string"
+    if value not in MANAGED_CONTAINERS:
+        return None, "%s is not a container this cluster manages" % value
+    return value, None
+
+
+def validate_containers(value):
+    """A non-empty list of managed container names."""
+    if isinstance(value, str):
+        return None, "containers must be an array of container names, not a string"
+    if not isinstance(value, list) or not value:
+        return None, "containers must be a non-empty array of container names"
+    if len(value) > MAX_UNITS_PER_REQUEST:
+        return None, "containers must name at most %d containers" % MAX_UNITS_PER_REQUEST
+    containers = []
+    for entry in value:
+        container, error = validate_container(entry)
+        if error:
+            return None, error
+        containers.append(container)
+    return containers, None
+
+
+def validate_container_action(value):
+    """A Podman lifecycle or ScyllaDB maintenance verb from CONTAINER_ACTIONS."""
+    if value in CONTAINER_ACTIONS:
+        return value, None
+    return None, "action must be one of " + ", ".join(CONTAINER_ACTIONS)
+
+
+def validate_virsh_action(value):
+    """A libvirt hypervisor verb from ALLOWED_VIRSH_ACTIONS."""
+    if value in ALLOWED_VIRSH_ACTIONS:
+        return value, None
+    return None, "action must be one of " + ", ".join(ALLOWED_VIRSH_ACTIONS)
+
+
+def validate_fs_path(value):
+    """Resolve and allowlist a caller-supplied filesystem path under ALLOWED_FS_ROOTS."""
+    if not isinstance(value, str) or not value:
+        return None, "path must be a non-empty string"
+    if "\x00" in value:
+        return None, "path must not contain a null byte"
+    if not value.startswith("/"):
+        return None, "path must be absolute"
+    parts = [p for p in value.split("/") if p]
+    if ".." in parts:
+        return None, "path must not contain '..' traversal segments"
+
+    literal = os.path.normpath(value).replace("\\", "/")
+    real = os.path.realpath(value).replace("\\", "/")
+    # On Windows unit test hosts realpath adds a drive letter prefix; normalize for root check
+    if os.name == "nt" and len(real) >= 3 and real[1] == ":" and real[2] == "/":
+        real = real[2:]
+
+    def under_fs_root(candidate):
+        for root in ALLOWED_FS_ROOTS:
+            if candidate.startswith(root) and len(candidate) > len(root):
+                return True
+        return False
+
+    if not under_fs_root(literal):
+        return None, "path must be under " + " or ".join(ALLOWED_FS_ROOTS)
+    if not under_fs_root(real):
+        return None, "path resolves outside " + " or ".join(ALLOWED_FS_ROOTS)
+    return literal, None
+
+
+def parse_virsh_domstats(stdout):
+    """Parse `virsh domstats <name>` output into a typed dictionary of metrics."""
+    metrics = {}
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line or line.startswith("Domain:"):
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if val.isdigit():
+            metrics[key] = int(val)
+        else:
+            try:
+                metrics[key] = float(val)
+            except ValueError:
+                metrics[key] = val
+    return metrics
+
+
 def validate_port(value):
     """A TCP port number, as an integer or as its decimal spelling.
 
@@ -4526,6 +4664,12 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/host/usb":
             self.handle_host_usb()
             return True
+        if path == "/api/v1/host/bgp":
+            self.handle_host_bgp_get()
+            return True
+        if path == "/api/v1/host/files":
+            self.handle_host_files_get()
+            return True
         if path == "/api/v1/db/ring":
             self.handle_db_ring()
             return True
@@ -4533,7 +4677,7 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         segments = [segment for segment in path.split("/") if segment]
         if len(segments) == 5 and segments[0:3] == ["api", "v1", "vm"]:
             action = segments[4]
-            if action not in ("interfaces", "console", "info", "guest-agent", "serial"):
+            if action not in ("interfaces", "console", "info", "domstats", "guest-agent", "serial"):
                 return False
             name = urllib.parse.unquote(segments[3])
             if not valid_name(name):
@@ -4543,6 +4687,8 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                 self.handle_vm_interfaces(name)
             elif action == "console":
                 self.handle_vm_console(name)
+            elif action == "domstats":
+                self.handle_vm_domstats(name)
             elif action == "guest-agent":
                 self.handle_vm_guest_agent_get(name)
             elif action == "serial":
@@ -4603,6 +4749,21 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             return True
         if path == "/api/v1/host/salt":
             self.handle_host_salt()
+            return True
+        if path == "/api/v1/host/containers":
+            self.handle_host_containers()
+            return True
+        if path == "/api/v1/host/virsh":
+            self.handle_host_virsh()
+            return True
+        if path == "/api/v1/host/fs":
+            self.handle_host_fs()
+            return True
+        if path == "/api/v1/host/bgp":
+            self.handle_host_bgp_post()
+            return True
+        if path == "/api/v1/host/files":
+            self.handle_host_files_post()
             return True
 
         segments = [segment for segment in path.split("/") if segment]
@@ -4950,6 +5111,19 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                         virsh_status_for(stderr))
             return
         self.send_json_response(200, parse_virsh_dominfo(stdout))
+
+    def handle_vm_domstats(self, name):
+        """Return live libvirt domstats for a guest domain."""
+        rc, stdout, stderr = run_argv(VIRSH + ["domstats", name], timeout=30)
+        if rc != 0:
+            self.reject((stderr or stdout).strip() or "virsh domstats failed",
+                        virsh_status_for(stderr))
+            return
+        self.send_json_response(200, {
+            "name": name,
+            "stats": parse_virsh_domstats(stdout),
+            "raw": (stdout or "").strip(),
+        })
 
     def handle_vm_define(self):
         payload, error = self.read_json_payload()
@@ -5974,6 +6148,514 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             "returncode": rc,
             "stdout": (stdout or "").strip(),
             "stderr": (stderr or "").strip(),
+        })
+
+    def handle_host_containers(self):
+        """Execute an allowlisted Podman container lifecycle or maintenance action via run_argv."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action, error = validate_container_action(payload.get("action"))
+        if error:
+            self.reject(error)
+            return
+        ignore_failed, error = validate_flag(payload.get("ignore_failed"), "ignore_failed")
+        if error:
+            self.reject(error)
+            return
+
+        if action == "system-prune":
+            rc, stdout, stderr = run_argv(["podman", "system", "prune", "-af"], timeout=120)
+            ok = (rc == 0) or ignore_failed
+            self.send_json_response(200 if ok else 409, {
+                "action": action,
+                "ok": rc == 0,
+                "returncode": rc,
+                "stdout": (stdout or "").strip(),
+                "stderr": (stderr or "").strip(),
+            })
+            return
+
+        if action == "nodetool-cleanup":
+            keyspace = payload.get("keyspace", "hydra")
+            if not valid_name(keyspace):
+                self.reject("Invalid keyspace name")
+                return
+            rc, stdout, stderr = run_argv(
+                ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "cleanup", keyspace],
+                timeout=300,
+            )
+            ok = (rc == 0) or ignore_failed
+            self.send_json_response(200 if ok else 409, {
+                "action": action,
+                "keyspace": keyspace,
+                "ok": rc == 0,
+                "returncode": rc,
+                "stdout": (stdout or "").strip(),
+                "stderr": (stderr or "").strip(),
+            })
+            return
+
+        if action == "nodetool-status":
+            rc, stdout, stderr = run_argv(
+                ["podman", "exec", HYDRA_DB_CONTAINER, "nodetool", "status"],
+                timeout=60,
+            )
+            if rc != 0 and not ignore_failed:
+                self.reject((stderr or stdout).strip() or "nodetool status failed", 409)
+                return
+            self.send_json_response(200, {
+                "action": action,
+                "ok": rc == 0,
+                "nodes": parse_nodetool_status(stdout) if rc == 0 else [],
+                "stdout": (stdout or "").strip(),
+            })
+            return
+
+        raw_containers = payload.get("containers")
+        if raw_containers is None and payload.get("container") is not None:
+            raw_containers = [payload.get("container")]
+        containers, error = validate_containers(raw_containers)
+        if error:
+            self.reject(error)
+            return
+
+        force, error = validate_flag(payload.get("force"), "force")
+        if error:
+            self.reject(error)
+            return
+
+        argv = ["podman", action]
+        if action == "rm" and (force or payload.get("force") is None):
+            argv.append("-f")
+        argv.extend(containers)
+        rc, stdout, stderr = run_argv(argv, timeout=90)
+        ok = (rc == 0) or ignore_failed
+        self.send_json_response(200 if ok else 409, {
+            "action": action,
+            "containers": containers,
+            "ok": rc == 0,
+            "returncode": rc,
+            "stdout": (stdout or "").strip(),
+            "stderr": (stderr or "").strip(),
+        })
+
+    def handle_host_virsh(self):
+        """Execute an allowlisted libvirt domain operation via run_argv."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action, error = validate_virsh_action(payload.get("action"))
+        if error:
+            self.reject(error)
+            return
+
+        if action == "list":
+            flag_map = {
+                "all": "--all",
+                "name": "--name",
+                "state_running": "--state-running",
+                "autostart": "--autostart",
+            }
+            argv = list(VIRSH) + ["list"]
+            for key, flag in flag_map.items():
+                val = payload.get(key)
+                if val is True:
+                    argv.append(flag)
+                elif val not in (None, False):
+                    self.reject("%s must be a boolean" % key)
+                    return
+            rc, stdout, stderr = run_argv(argv, timeout=30)
+            if rc != 0:
+                self.reject((stderr or stdout).strip() or "virsh list failed", 500)
+                return
+            lines = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip()]
+            self.send_json_response(200, {
+                "action": action,
+                "ok": True,
+                "lines": lines,
+                "stdout": (stdout or "").strip(),
+            })
+            return
+
+        name = payload.get("name")
+        if not valid_name(name):
+            self.reject("Invalid VM name")
+            return
+
+        argv = list(VIRSH) + [action, name]
+        if action == "undefine":
+            if payload.get("keep_nvram") is True:
+                argv.append("--keep-nvram")
+            elif payload.get("nvram") is True:
+                argv.append("--nvram")
+        rc, stdout, stderr = run_argv(argv, timeout=60)
+        if rc != 0:
+            self.send_json_response(virsh_status_for(stderr), {
+                "action": action,
+                "name": name,
+                "ok": False,
+                "returncode": rc,
+                "error": (stderr or stdout).strip() or ("virsh %s failed" % action),
+            })
+            return
+        result = {
+            "action": action,
+            "name": name,
+            "ok": True,
+            "stdout": (stdout or "").strip(),
+        }
+        if action == "dominfo":
+            result["info"] = parse_virsh_dominfo(stdout)
+        elif action == "domstats":
+            result["stats"] = parse_virsh_domstats(stdout)
+        self.send_json_response(200, result)
+
+    def handle_host_fs(self):
+        """Perform an allowlisted filesystem operation under ALLOWED_FS_ROOTS."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action = payload.get("action")
+        if action not in FS_ACTIONS:
+            self.reject("action must be one of " + ", ".join(FS_ACTIONS))
+            return
+        path, error = validate_fs_path(payload.get("path"))
+        if error:
+            self.reject(error)
+            return
+
+        if action == "stat":
+            exists = os.path.exists(path)
+            is_dir = os.path.isdir(path) if exists else False
+            is_file = os.path.isfile(path) if exists else False
+            size_bytes = os.path.getsize(path) if is_file else 0
+            self.send_json_response(200, {
+                "action": action,
+                "path": path,
+                "exists": exists,
+                "is_dir": is_dir,
+                "is_file": is_file,
+                "size_bytes": size_bytes,
+            })
+            return
+
+        if action == "mkdir":
+            mode_str = payload.get("mode", "0755")
+            if mode_str not in ("0700", "0750", "0755", "0775"):
+                self.reject("mode must be one of 0700, 0750, 0755, 0775")
+                return
+            try:
+                os.makedirs(path, mode=int(mode_str, 8), exist_ok=True)
+                os.chmod(path, int(mode_str, 8))
+            except OSError as exc:
+                self.reject(str(exc), 500)
+                return
+            self.send_json_response(200, {"action": action, "path": path, "ok": True})
+            return
+
+        if action == "rm":
+            recursive = payload.get("recursive") is True
+            try:
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.remove(path)
+                elif os.path.isdir(path):
+                    if recursive:
+                        shutil.rmtree(path)
+                    else:
+                        os.rmdir(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self.reject(str(exc), 500)
+                return
+            self.send_json_response(200, {"action": action, "path": path, "ok": True})
+            return
+
+        if action == "chmod":
+            mode_str, error = validate_mode(payload.get("mode"))
+            if error:
+                self.reject(error)
+                return
+            try:
+                os.chmod(path, int(mode_str, 8))
+            except OSError as exc:
+                self.reject(str(exc), 500)
+                return
+            self.send_json_response(200, {"action": action, "path": path, "mode": mode_str, "ok": True})
+            return
+
+        if action == "read":
+            if not os.path.isfile(path):
+                self.reject("File not found: %s" % path, 404)
+                return
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read(4 * 1024 * 1024)
+            except OSError as exc:
+                self.reject(str(exc), 500)
+                return
+            self.send_json_response(200, {
+                "action": action,
+                "path": path,
+                "content_b64": base64.b64encode(data).decode("ascii"),
+                "size_bytes": len(data),
+            })
+            return
+
+        # action == "write"
+        content_b64 = payload.get("content_b64")
+        content_text = payload.get("content")
+        if content_b64 is not None:
+            try:
+                raw_bytes = base64.b64decode(str(content_b64), validate=True)
+            except Exception:
+                self.reject("content_b64 is not valid base64")
+                return
+        elif isinstance(content_text, str):
+            raw_bytes = content_text.encode("utf-8")
+        else:
+            self.reject("Either content or content_b64 is required")
+            return
+
+        try:
+            parent_dir = os.path.dirname(path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            temp_path = path + ".tmp"
+            with open(temp_path, "wb") as handle:
+                handle.write(raw_bytes)
+            if payload.get("mode") is not None:
+                mode_str, err = validate_mode(payload.get("mode"))
+                if err:
+                    os.remove(temp_path)
+                    self.reject(err)
+                    return
+                os.chmod(temp_path, int(mode_str, 8))
+            os.replace(temp_path, path)
+        except OSError as exc:
+            self.reject(str(exc), 500)
+            return
+        self.send_json_response(200, {
+            "action": action,
+            "path": path,
+            "written": len(raw_bytes),
+            "ok": True,
+        })
+
+    def handle_host_bgp_get(self):
+        """Return live FRRouting BGP L2VPN EVPN state and bridge ARP suppression status on this host."""
+        rc_ver, out_ver, _ = run_argv(["vtysh", "-c", "show version"], timeout=10)
+        frr_installed = (rc_ver == 0 and bool((out_ver or "").strip()))
+
+        rc_sum, out_sum, _ = run_argv(["vtysh", "-c", "show bgp l2vpn evpn summary json"], timeout=15)
+        bgpd_running = False
+        router_id = None
+        local_as = None
+        peers = []
+        if rc_sum == 0 and (out_sum or "").strip():
+            try:
+                parsed_sum = json.loads(out_sum)
+                evpn_block = parsed_sum.get("l2vpnEvpn") or parsed_sum
+                if isinstance(evpn_block, dict):
+                    bgpd_running = True
+                    router_id = evpn_block.get("routerId")
+                    local_as = evpn_block.get("as")
+                    raw_peers = evpn_block.get("peers") or {}
+                    for peer_ip, pinfo in sorted(raw_peers.items()):
+                        if not isinstance(pinfo, dict):
+                            continue
+                        peers.append({
+                            "peer_ip": peer_ip,
+                            "remote_as": pinfo.get("remoteAs"),
+                            "state": pinfo.get("state") or "Unknown",
+                            "uptime": pinfo.get("peerUptime") or "00:00:00",
+                            "pfx_rcvd": int(pinfo.get("pfxRcd") or 0),
+                            "pfx_sent": int(pinfo.get("pfxSnt") or 0),
+                        })
+            except Exception:
+                pass
+
+        rc_vni, out_vni, _ = run_argv(["vtysh", "-c", "show evpn vni json"], timeout=15)
+        vnis = []
+        if rc_vni == 0 and (out_vni or "").strip():
+            try:
+                parsed_vni = json.loads(out_vni)
+                if isinstance(parsed_vni, dict):
+                    for vni_key, vinfo in sorted(parsed_vni.items()):
+                        if not isinstance(vinfo, dict):
+                            continue
+                        vnis.append({
+                            "vni": vinfo.get("vni") or vni_key,
+                            "type": vinfo.get("type") or "L2",
+                            "vxlan_if": vinfo.get("vxlanIf") or ("vxlan-%s" % vni_key),
+                            "num_macs": int(vinfo.get("numMacs") or 0),
+                            "num_arps": int(vinfo.get("numArpNd") or 0),
+                            "num_remote_vteps": int(vinfo.get("numRemoteVteps") or 0),
+                        })
+            except Exception:
+                pass
+
+        rc_br, out_br, _ = run_argv(["bridge", "-d", "-json", "link", "show"], timeout=10)
+        arp_suppression_interfaces = []
+        if rc_br == 0 and (out_br or "").strip():
+            try:
+                for entry in json.loads(out_br):
+                    ifname = entry.get("ifname")
+                    if ifname and entry.get("neigh_suppress") is True:
+                        arp_suppression_interfaces.append(ifname)
+            except Exception:
+                pass
+
+        self.send_json_response(200, {
+            "frr_installed": frr_installed,
+            "bgpd_running": bgpd_running,
+            "router_id": router_id,
+            "local_as": local_as,
+            "peers": peers,
+            "vnis": vnis,
+            "arp_suppression_interfaces": sorted(set(arp_suppression_interfaces)),
+        })
+
+    def handle_host_bgp_post(self):
+        """Apply or reload FRRouting BGP EVPN configuration on this host."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        action = str(payload.get("action") or "reload").strip()
+        if action not in ("reload", "clear-bgp"):
+            self.reject("action must be reload or clear-bgp")
+            return
+        if action == "clear-bgp":
+            neighbor = str(payload.get("neighbor") or "*").strip()
+            if neighbor != "*" and not IPV4_RE.match(neighbor):
+                self.reject("neighbor must be '*' or an IPv4 address")
+                return
+            rc, stdout, stderr = run_argv(
+                ["vtysh", "-c", "clear bgp l2vpn evpn %s" % neighbor], timeout=30
+            )
+            self.send_json_response(200 if rc == 0 else 409, {
+                "action": action,
+                "neighbor": neighbor,
+                "ok": rc == 0,
+                "stdout": (stdout or "").strip(),
+                "stderr": (stderr or "").strip(),
+            })
+            return
+
+        # action == "reload"
+        rc, stdout, stderr = run_argv(["python3", "/usr/local/bin/urbosa", "--render-frr"], timeout=30)
+        if rc == 0 and (stdout or "").strip():
+            try:
+                os.makedirs("/etc/frr", exist_ok=True)
+                with open("/etc/frr/frr.conf", "w", encoding="utf-8") as fh:
+                    fh.write(stdout)
+            except OSError as exc:
+                self.reject("Failed writing /etc/frr/frr.conf: %s" % exc, 500)
+                return
+        rc_svc, out_svc, err_svc = run_argv(["systemctl", "reload-or-restart", "frr"], timeout=45)
+        self.send_json_response(200, {
+            "action": action,
+            "ok": rc_svc == 0,
+            "returncode": rc_svc,
+            "stdout": (out_svc or "").strip(),
+            "stderr": (err_svc or "").strip(),
+        })
+
+    def handle_host_files_get(self):
+        """Inspect live mounted Helios Files shares and NFS/SMB daemon status on this host."""
+        try:
+            import helios_files
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "helios_files",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_files.py"),
+            )
+            helios_files = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helios_files)
+
+        mounts = []
+        root_dir = helios_files.FILES_MOUNT_ROOT
+        if os.path.isdir(root_dir):
+            try:
+                for entry in sorted(os.listdir(root_dir)):
+                    ok_name, _ = helios_files.validate_share_name(entry)
+                    if ok_name:
+                        mounts.append(helios_files.inspect_local_share_mount(entry))
+            except OSError:
+                pass
+
+        rc_nfs, out_nfs, _ = run_argv(["systemctl", "is-active", "nfs-server"], timeout=10)
+        rc_smb, out_smb, _ = run_argv(["systemctl", "is-active", "smb"], timeout=10)
+        self.send_json_response(200, {
+            "nfs_active": (rc_nfs == 0 and (out_nfs or "").strip() == "active"),
+            "smb_active": (rc_smb == 0 and (out_smb or "").strip() == "active"),
+            "shares": mounts,
+        })
+
+    def handle_host_files_post(self):
+        """Activate, deactivate, or inspect a Helios Files share on this host."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        try:
+            import helios_files
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "helios_files",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_files.py"),
+            )
+            helios_files = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helios_files)
+
+        action = str(payload.get("action") or "").strip()
+        if action not in ("activate", "deactivate", "inspect"):
+            self.reject("action must be activate, deactivate, or inspect")
+            return
+        share_name, err = helios_files.validate_share_name(payload.get("share_name"))
+        if err:
+            self.reject(err)
+            return
+
+        if action == "inspect":
+            info = helios_files.inspect_local_share_mount(
+                share_name, payload.get("export_path")
+            )
+            self.send_json_response(200, info)
+            return
+
+        if action == "deactivate":
+            ok, detail = helios_files.deactivate_share_on_host(
+                share_name, payload.get("export_path"), run_argv_fn=run_argv
+            )
+            if not ok:
+                self.reject(detail or "Failed to deactivate share", 409)
+                return
+            self.send_json_response(200, {
+                "action": action,
+                "share_name": share_name,
+                "ok": True,
+            })
+            return
+
+        # action == "activate"
+        ok, detail = helios_files.activate_share_on_host(payload, run_argv_fn=run_argv)
+        if not ok:
+            self.reject(detail or "Failed to activate share", 409)
+            return
+        info = helios_files.inspect_local_share_mount(share_name, payload.get("export_path"))
+        self.send_json_response(200, {
+            "action": action,
+            "share_name": share_name,
+            "ok": True,
+            "mount": info,
         })
 
     def handle_host_reboot(self):

@@ -5704,6 +5704,411 @@ def cmd_central_deploy(argv):
     print(f"Success: Helios Central Virtual Appliance '{name}' is ready at https://{ip.split('/')[0]}:8443")
 
 
+def cmd_sdn_bgp_status():
+    """Display Scale-Out Urbosa BGP EVPN configuration, neighbors, and live FRR/ARP suppression state."""
+    rc_c, out_c, _ = run_cql_query("SELECT JSON * FROM hydra.urbosa_bgp_config;")
+    cfg = {
+        "asn": 65000,
+        "router_id": "",
+        "evpn_enabled": False,
+        "arp_suppression": False,
+        "disable_headend_flood": False,
+        "route_reflectors": "",
+        "bfd_enabled": True,
+    }
+    if rc_c == 0 and out_c:
+        for line in out_c.splitlines():
+            s = line.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    row = json.loads(s)
+                    for k in cfg:
+                        if row.get(k) is not None:
+                            cfg[k] = row[k]
+                except Exception:
+                    pass
+    print("=== Urbosa BGP L2VPN EVPN Control Plane ===")
+    print(f"  EVPN Control Plane : {'ENABLED' if cfg['evpn_enabled'] else 'DISABLED (Static Flood)'}")
+    print(f"  Local BGP ASN      : {cfg['asn']}")
+    print(f"  Router ID          : {cfg['router_id'] or '(auto per-host)'}")
+    print(f"  ARP Suppression    : {'ON (neigh_suppress)' if cfg['arp_suppression'] else 'OFF'}")
+    print(f"  Head-End Flooding  : {'DISABLED (EVPN IMET)' if cfg['disable_headend_flood'] else 'ENABLED'}")
+    print(f"  BFD Fast Failover  : {'ENABLED' if cfg['bfd_enabled'] else 'DISABLED'}")
+    print(f"  Route Reflectors   : {cfg['route_reflectors'] or '(iBGP Full Mesh)'}")
+    print("")
+
+    rc_p, out_p, _ = run_cql_query("SELECT JSON * FROM hydra.urbosa_bgp_peers;")
+    peer_rows = []
+    if rc_p == 0 and out_p:
+        for line in out_p.splitlines():
+            s = line.strip()
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    p = json.loads(s)
+                    peer_rows.append([
+                        p.get("peer_ip", ""),
+                        p.get("remote_asn", ""),
+                        "yes" if p.get("bfd_enabled", True) else "no",
+                        "yes" if p.get("route_reflector_client") else "no",
+                        p.get("description", ""),
+                    ])
+                except Exception:
+                    pass
+    if peer_rows:
+        print_table(["Peer IP", "Remote ASN", "BFD", "RR Client", "Description"], peer_rows)
+    else:
+        print("No external/spine BGP peers configured (using automatic cluster node iBGP mesh).")
+
+    rc_l, res_l, _ = run_mtls_spark_api("127.0.0.1", "/api/v1/host/bgp", None, method="GET")
+    if rc_l == 0 and isinstance(res_l, dict):
+        print("")
+        print(f"Live Host FRR State: bgpd_running={res_l.get('bgpd_running', False)} | "
+              f"ARP-suppressed ports={', '.join(res_l.get('arp_suppression_interfaces') or []) or 'none'}")
+
+
+def cmd_sdn_bgp_configure(sub_args):
+    """Configure Scale-Out Urbosa BGP EVPN and ARP suppression settings."""
+    asn = 65000
+    router_id = ""
+    evpn_enabled = True
+    arp_suppression = True
+    disable_headend_flood = False
+    bfd_enabled = True
+    route_reflectors = ""
+
+    i = 0
+    while i < len(sub_args):
+        arg = sub_args[i]
+        if arg == "--asn" and i + 1 < len(sub_args):
+            asn = int(sub_args[i + 1])
+            i += 2
+        elif arg == "--router-id" and i + 1 < len(sub_args):
+            router_id = sub_args[i + 1].strip()
+            i += 2
+        elif arg == "--route-reflectors" and i + 1 < len(sub_args):
+            route_reflectors = sub_args[i + 1].strip()
+            i += 2
+        elif arg == "--enable-evpn":
+            evpn_enabled = True
+            i += 1
+        elif arg == "--disable-evpn":
+            evpn_enabled = False
+            i += 1
+        elif arg == "--arp-suppression":
+            arp_suppression = True
+            i += 1
+        elif arg == "--no-arp-suppression":
+            arp_suppression = False
+            i += 1
+        elif arg == "--disable-headend-flood":
+            disable_headend_flood = True
+            i += 1
+        elif arg == "--no-bfd":
+            bfd_enabled = False
+            i += 1
+        else:
+            print("Usage: valcli sdn.bgp.configure [--asn N] [--enable-evpn|--disable-evpn] "
+                  "[--arp-suppression|--no-arp-suppression] [--route-reflectors ip1,ip2] [--router-id IP]")
+            sys.exit(1)
+
+    if not (1 <= asn <= 4294967294):
+        print("Error: ASN must be between 1 and 4294967294.")
+        sys.exit(1)
+
+    now_ms = int(time.time() * 1000)
+    cql = (
+        "INSERT INTO hydra.urbosa_bgp_config "
+        "(config_id, asn, router_id, evpn_enabled, arp_suppression, disable_headend_flood, route_reflectors, bfd_enabled, updated_at_ms) "
+        f"VALUES ('cluster', {asn}, '{cql_escape(router_id)}', {str(evpn_enabled).lower()}, {str(arp_suppression).lower()}, "
+        f"{str(disable_headend_flood).lower()}, '{cql_escape(route_reflectors)}', {str(bfd_enabled).lower()}, {now_ms});"
+    )
+    rc, _out, err = run_cql_query(cql)
+    if rc != 0:
+        print(f"Error saving BGP EVPN configuration: {err}")
+        sys.exit(1)
+    run_mtls_spark_api("127.0.0.1", "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+    print(f"Configured Urbosa BGP EVPN: ASN={asn}, evpn_enabled={evpn_enabled}, arp_suppression={arp_suppression}.")
+
+
+def cmd_sdn_bgp_peer_add(sub_args):
+    """Add an external or spine BGP EVPN neighbor."""
+    if len(sub_args) < 2:
+        print("Usage: valcli sdn.bgp.peer.add <peer_ip> <remote_asn> [--description TEXT] [--rr-client] [--no-bfd]")
+        sys.exit(1)
+    peer_ip = sub_args[0].strip()
+    try:
+        remote_asn = int(sub_args[1])
+    except ValueError:
+        print("Error: remote_asn must be an integer.")
+        sys.exit(1)
+    description = ""
+    rr_client = False
+    bfd_enabled = True
+    i = 2
+    while i < len(sub_args):
+        if sub_args[i] == "--description" and i + 1 < len(sub_args):
+            description = sub_args[i + 1].strip()
+            i += 2
+        elif sub_args[i] == "--rr-client":
+            rr_client = True
+            i += 1
+        elif sub_args[i] == "--no-bfd":
+            bfd_enabled = False
+            i += 1
+        else:
+            i += 1
+    now_ms = int(time.time() * 1000)
+    cql = (
+        "INSERT INTO hydra.urbosa_bgp_peers (peer_ip, remote_asn, description, bfd_enabled, route_reflector_client, created_at_ms) "
+        f"VALUES ('{cql_escape(peer_ip)}', {remote_asn}, '{cql_escape(description)}', {str(bfd_enabled).lower()}, {str(rr_client).lower()}, {now_ms});"
+    )
+    rc, _out, err = run_cql_query(cql)
+    if rc != 0:
+        print(f"Error adding BGP peer: {err}")
+        sys.exit(1)
+    run_mtls_spark_api("127.0.0.1", "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+    print(f"Added BGP EVPN neighbor {peer_ip} (AS{remote_asn}).")
+
+
+def cmd_sdn_bgp_peer_delete(sub_args):
+    """Remove a BGP EVPN neighbor."""
+    if not sub_args:
+        print("Usage: valcli sdn.bgp.peer.delete <peer_ip>")
+        sys.exit(1)
+    peer_ip = sub_args[0].strip()
+    rc, _out, err = run_cql_query(f"DELETE FROM hydra.urbosa_bgp_peers WHERE peer_ip = '{cql_escape(peer_ip)}';")
+    if rc != 0:
+        print(f"Error deleting BGP peer: {err}")
+        sys.exit(1)
+    run_mtls_spark_api("127.0.0.1", "/api/v1/host/bgp", {"action": "reload"}, method="POST")
+    print(f"Removed BGP EVPN neighbor {peer_ip}.")
+
+
+def cmd_files_share_list():
+    """List Helios Files shares backed by Sidon vdisks."""
+    import helios_files
+    shares, err = helios_files.list_db_shares(run_cql_query)
+    if err:
+        print(f"Error reading shares: {err}")
+        sys.exit(1)
+    if not shares:
+        print("No Helios Files shares configured.")
+        return
+    rows = []
+    for s in shares:
+        rows.append([
+            s.get("share_name", ""),
+            s.get("protocol", "nfs").upper(),
+            f"{s.get('size_gb', 0)} GiB",
+            s.get("vdisk_id", ""),
+            s.get("export_path", ""),
+            s.get("host_ip", ""),
+            s.get("allowed_clients", "*"),
+            s.get("state", "UNKNOWN"),
+        ])
+    print_table(["Share", "Protocol", "Size", "Sidon Vdisk", "Export Path", "Active Host", "Clients", "State"], rows)
+
+
+def cmd_files_share_create(sub_args):
+    """Create a scale-out HA NFS/SMB share backed by a Sidon vdisk."""
+    import helios_files
+    if len(sub_args) < 2:
+        print("Usage: valcli files.share.create <share_name> <size_gb> [--protocol nfs|smb|dual] "
+              "[--container NAME] [--clients CIDR] [--squash root_squash|no_root_squash|all_squash] [--host IP]")
+        sys.exit(1)
+    share_name, err_n = helios_files.validate_share_name(sub_args[0])
+    if err_n:
+        print(f"Error: {err_n}")
+        sys.exit(1)
+    try:
+        size_gb = int(sub_args[1])
+    except ValueError:
+        print("Error: size_gb must be an integer.")
+        sys.exit(1)
+    protocol = "nfs"
+    container = "default-pool"
+    clients = "*"
+    squash = "root_squash"
+    host_ip = LOCAL_IP
+    guest_ok = False
+    i = 2
+    while i < len(sub_args):
+        if sub_args[i] == "--protocol" and i + 1 < len(sub_args):
+            protocol = sub_args[i + 1]
+            i += 2
+        elif sub_args[i] == "--container" and i + 1 < len(sub_args):
+            container = sub_args[i + 1]
+            i += 2
+        elif sub_args[i] == "--clients" and i + 1 < len(sub_args):
+            clients = sub_args[i + 1]
+            i += 2
+        elif sub_args[i] == "--squash" and i + 1 < len(sub_args):
+            squash = sub_args[i + 1]
+            i += 2
+        elif sub_args[i] == "--host" and i + 1 < len(sub_args):
+            host_ip = sub_args[i + 1]
+            i += 2
+        elif sub_args[i] == "--guest-ok":
+            guest_ok = True
+            i += 1
+        else:
+            print(f"Unknown option: {sub_args[i]}")
+            sys.exit(1)
+
+    protocol, err_p = helios_files.validate_protocol(protocol)
+    if err_p:
+        print(f"Error: {err_p}")
+        sys.exit(1)
+    squash, err_s = helios_files.validate_squash(squash)
+    if err_s:
+        print(f"Error: {err_s}")
+        sys.exit(1)
+    clients, err_c = helios_files.validate_allowed_clients(clients)
+    if err_c:
+        print(f"Error: {err_c}")
+        sys.exit(1)
+
+    vdisk_id = helios_files.vdisk_id_for_share(share_name)
+    export_path = helios_files.export_path_for_share(share_name)
+    size_bytes = size_gb * 1024 * 1024 * 1024
+
+    rc_v, res_v, err_v = run_mtls_spark_api(
+        host_ip, "/api/v1/dfs/vdisk",
+        {"op": "create", "vdisk_id": vdisk_id, "size_bytes": size_bytes, "container": container},
+        method="POST",
+    )
+    if rc_v != 0 or (isinstance(res_v, dict) and res_v.get("error")):
+        print(f"Error creating Sidon vdisk '{vdisk_id}': {(res_v or {}).get('error') or err_v}")
+        sys.exit(1)
+
+    run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vdisk_id}, method="POST")
+    rc_a, res_a, _ = run_mtls_spark_api(
+        host_ip, "/api/v1/host/files",
+        {
+            "action": "activate",
+            "share_name": share_name,
+            "vdisk_id": vdisk_id,
+            "export_path": export_path,
+            "protocol": protocol,
+            "allowed_clients": clients,
+            "squash_mode": squash,
+            "smb_guest_ok": guest_ok,
+        },
+        method="POST",
+    )
+    state_val = "ONLINE" if (rc_a == 0 and isinstance(res_a, dict) and res_a.get("ok")) else "PROVISIONED"
+    now_ms = int(time.time() * 1000)
+    cql = (
+        "INSERT INTO hydra.files_shares "
+        "(share_name, vdisk_id, container, size_gb, protocol, export_path, allowed_clients, host_ip, vip, state, squash_mode, smb_guest_ok, created_at_ms, updated_at_ms) "
+        f"VALUES ('{cql_escape(share_name)}', '{cql_escape(vdisk_id)}', '{cql_escape(container)}', {size_gb}, '{protocol}', '{cql_escape(export_path)}', "
+        f"'{cql_escape(clients)}', '{cql_escape(host_ip)}', '', '{state_val}', '{squash}', {str(guest_ok).lower()}, {now_ms}, {now_ms});"
+    )
+    rc_i, _, err_i = run_cql_query(cql)
+    if rc_i != 0:
+        print(f"Error recording share in database: {err_i}")
+        sys.exit(1)
+    print(f"Created Helios Files share '{share_name}' ({protocol.upper()}, {size_gb} GiB) at {host_ip}:{export_path} (vdisk: {vdisk_id}).")
+
+
+def cmd_files_share_delete(sub_args):
+    """Delete a Helios Files share and its backing Sidon vdisk."""
+    import helios_files
+    if not sub_args:
+        print("Usage: valcli files.share.delete <share_name>")
+        sys.exit(1)
+    share_name, err_n = helios_files.validate_share_name(sub_args[0])
+    if err_n:
+        print(f"Error: {err_n}")
+        sys.exit(1)
+    existing, err_ex = helios_files.get_db_share(share_name, run_cql_query)
+    if err_ex:
+        print(f"Error: {err_ex}")
+        sys.exit(1)
+    if existing is None:
+        print(f"Error: Share '{share_name}' not found.")
+        sys.exit(1)
+    host_ip = str(existing.get("host_ip") or "").strip() or LOCAL_IP
+    vdisk_id = str(existing.get("vdisk_id") or helios_files.vdisk_id_for_share(share_name))
+    export_path = str(existing.get("export_path") or helios_files.export_path_for_share(share_name))
+    run_mtls_spark_api(
+        host_ip, "/api/v1/host/files",
+        {"action": "deactivate", "share_name": share_name, "export_path": export_path},
+        method="POST",
+    )
+    run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id}, method="POST")
+    run_mtls_spark_api(host_ip, "/api/v1/dfs/vdisk", {"op": "delete", "vdisk_id": vdisk_id}, method="POST")
+    run_cql_query(f"DELETE FROM hydra.files_shares WHERE share_name = '{cql_escape(share_name)}';")
+    print(f"Deleted Helios Files share '{share_name}' and Sidon vdisk '{vdisk_id}'.")
+
+
+def cmd_files_share_failover(sub_args):
+    """Hand over a Helios Files share to another cluster node using Sidon epoch CAS."""
+    import helios_files
+    if len(sub_args) < 2:
+        print("Usage: valcli files.share.failover <share_name> <target_host_ip>")
+        sys.exit(1)
+    share_name, err_n = helios_files.validate_share_name(sub_args[0])
+    if err_n:
+        print(f"Error: {err_n}")
+        sys.exit(1)
+    target_ip = sub_args[1].strip()
+    existing, err_ex = helios_files.get_db_share(share_name, run_cql_query)
+    if err_ex or existing is None:
+        print(f"Error: {err_ex or ('Share not found: ' + share_name)}")
+        sys.exit(1)
+    old_ip = str(existing.get("host_ip") or "").strip()
+    vdisk_id = str(existing.get("vdisk_id") or helios_files.vdisk_id_for_share(share_name))
+    export_path = str(existing.get("export_path") or helios_files.export_path_for_share(share_name))
+    if old_ip and old_ip != target_ip:
+        run_mtls_spark_api(
+            old_ip, "/api/v1/host/files",
+            {"action": "deactivate", "share_name": share_name, "export_path": export_path},
+            method="POST",
+        )
+        run_mtls_spark_api(old_ip, "/api/v1/dfs/vdisk", {"op": "detach", "vdisk_id": vdisk_id}, method="POST")
+    rc_att, res_att, err_att = run_mtls_spark_api(
+        target_ip, "/api/v1/dfs/vdisk", {"op": "attach", "vdisk_id": vdisk_id}, method="POST"
+    )
+    if rc_att != 0 or (isinstance(res_att, dict) and res_att.get("error")):
+        print(f"Error claiming Sidon vdisk '{vdisk_id}' on {target_ip}: {(res_att or {}).get('error') or err_att}")
+        sys.exit(1)
+    act_payload = dict(existing)
+    act_payload["action"] = "activate"
+    run_mtls_spark_api(target_ip, "/api/v1/host/files", act_payload, method="POST")
+    now_ms = int(time.time() * 1000)
+    run_cql_query(
+        f"UPDATE hydra.files_shares SET host_ip = '{cql_escape(target_ip)}', state = 'ONLINE', updated_at_ms = {now_ms} "
+        f"WHERE share_name = '{cql_escape(share_name)}';"
+    )
+    print(f"Failed over share '{share_name}' ({vdisk_id}) from {old_ip or 'none'} to {target_ip}.")
+
+
+def cmd_files_status():
+    """Show local NFS/SMB file server status and mounted shares."""
+    rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/host/files", None, method="GET")
+    if rc != 0 or not isinstance(res, dict):
+        print(f"Error querying host file services: {err}")
+        sys.exit(1)
+    print(f"NFSv4 Server : {'ACTIVE' if res.get('nfs_active') else 'INACTIVE'}")
+    print(f"SMB3 Server  : {'ACTIVE' if res.get('smb_active') else 'INACTIVE'}")
+    mounts = res.get("shares") or []
+    if mounts:
+        rows = [
+            [
+                m.get("share_name", ""),
+                m.get("export_path", ""),
+                "yes" if m.get("mounted") else "no",
+                m.get("device") or "-",
+                m.get("fstype") or "-",
+            ]
+            for m in mounts
+        ]
+        print_table(["Share", "Mount Path", "Mounted", "Device", "FS"], rows)
+    else:
+        print("No local share directories mounted on this node.")
+
+
 VALCLI_COMMANDS = {
     "vm.list", "vm.create", "vm.delete", "vm.edit", "vm.live", "vm.on", "vm.off",
     "vm.migrate", "vm.balance", "vm.annotate", "vm.tag", "vm.clone",
@@ -5712,6 +6117,8 @@ VALCLI_COMMANDS = {
     "vm.affinity", "vm.template",
     "image.list", "image.download", "image.delete",
     "disk.list", "disk.delete",
+    "sdn.bgp.status", "sdn.bgp.configure", "sdn.bgp.peer.add", "sdn.bgp.peer.delete",
+    "files.share.list", "files.share.create", "files.share.delete", "files.share.failover", "files.status",
 }
 
 NCLI_COMMANDS = {
@@ -5721,6 +6128,8 @@ NCLI_COMMANDS = {
     "salt.ping", "salt.apply", "salt.highstate", "salt.status",
     "dr.target.add", "dr.target.list", "dr.sync",
     "central.status", "central.deploy", "central.cluster.list", "central.cluster.add", "central.cluster.remove",
+    "sdn.bgp.status", "sdn.bgp.configure", "sdn.bgp.peer.add", "sdn.bgp.peer.delete",
+    "files.share.list", "files.share.create", "files.share.delete", "files.share.failover", "files.status",
     "storage.list", "storage.container.create", "storage.container.update", "storage.container.delete",
     "storage.benchmark", "storage.cleanup_orphaned", "storage.snapshot", "storage.clone",
     "storage.children", "storage.snapshots", "storage.snapshot-policy", "storage.snapshot-policy.set",
@@ -5996,6 +6405,24 @@ def execute_command(args, prog_name="valcli"):
             cmd_central_cluster_add(args[1:])
         elif cmd == "central.cluster.remove":
             cmd_central_cluster_remove(args[1:])
+        elif cmd == "sdn.bgp.status":
+            cmd_sdn_bgp_status()
+        elif cmd == "sdn.bgp.configure":
+            cmd_sdn_bgp_configure(args[1:])
+        elif cmd == "sdn.bgp.peer.add":
+            cmd_sdn_bgp_peer_add(args[1:])
+        elif cmd == "sdn.bgp.peer.delete":
+            cmd_sdn_bgp_peer_delete(args[1:])
+        elif cmd == "files.share.list":
+            cmd_files_share_list()
+        elif cmd == "files.share.create":
+            cmd_files_share_create(args[1:])
+        elif cmd == "files.share.delete":
+            cmd_files_share_delete(args[1:])
+        elif cmd == "files.share.failover":
+            cmd_files_share_failover(args[1:])
+        elif cmd == "files.status":
+            cmd_files_status()
         elif cmd == "host.maintenance.enter":
             sub_args = args[1:]
             flags = {"--force-stop", "--preserve-vms", "--storage-only"}

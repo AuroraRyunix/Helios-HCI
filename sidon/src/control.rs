@@ -958,6 +958,24 @@ impl Daemon {
         // must not have half happened.
         let journal = crate::mounts::journal_dir(&self.cfg.root)?.join(format!("{id}.jrn"));
         let daruk = self.daruk();
+        let force = req.get("force").and_then(Value::as_bool).unwrap_or(false);
+        if !force {
+            let all_vdisks = daruk.query(
+                "SELECT vdisk_id, parent_vdisk FROM hydra.dfs_vdisks",
+            )?;
+            let mut children: Vec<String> = all_vdisks
+                .into_iter()
+                .filter(|row| row.get("parent_vdisk").and_then(Value::as_str) == Some(id.as_str()))
+                .filter_map(|row| row.get("vdisk_id").and_then(Value::as_str).map(str::to_string))
+                .collect();
+            children.sort();
+            if !children.is_empty() {
+                return Err(Error::refused(format!(
+                    "vdisk {id} has child vdisk(s) ({}) and cannot be deleted while children reference its lineage",
+                    children.join(", ")
+                )));
+            }
+        }
         // Map rows first, then the vdisk row. The reverse order would leave orphaned map
         // rows pointing into egroups with no vdisk to explain them, which is exactly the
         // state Purah cannot distinguish from a bug.
@@ -1091,11 +1109,14 @@ impl Daemon {
         // about yet. Draining it is what makes the copied map a complete answer -- and
         // only the owner can drain, so a writable parent has to be attached here.
         //
+        // The vdisk lock stays held from the drain across the `dfs_block_map` read so no
+        // write-triggered drain at the high-water mark can land batches between the two.
+        //
         // An immutable parent needs none of this: it has no journal, its map is final,
         // and any node may copy it. That is the clone-from-image case, and it is the
         // common one.
-        match parent_class {
-            CLASS_IMMUTABLE => {}
+        let parent_handle = match parent_class {
+            CLASS_IMMUTABLE => None,
             CLASS_RW => {
                 let vdisk = self.owned_vdisk(&parent_id).map_err(|_| {
                     Error::refused(format!(
@@ -1104,16 +1125,18 @@ impl Daemon {
                           here first, or seal it."
                     ))
                 })?;
-                // Drained to the end, not merely started: the child's map is a copy of what
-                // Hydra holds, so a drain still running here would be left out of it.
-                crate::vdisk::drain_all(&vdisk)?;
+                Some(vdisk)
             }
             other => {
                 return Err(Error::refused(format!(
                     "vdisk {parent_id} has class '{other}' and cannot be copied"
                 )))
             }
-        }
+        };
+        let parent_guard = match &parent_handle {
+            Some(vdisk) => Some(crate::vdisk::drain_and_hold(vdisk)?),
+            None => None,
+        };
 
         let size = parent.get("size_bytes").and_then(Value::as_i64).unwrap_or(0).max(0);
         let container = parent.get("container").and_then(Value::as_str).unwrap_or("default");
@@ -1188,6 +1211,7 @@ impl Daemon {
              WHERE vdisk_id = {}",
             cql_str(&parent_id)
         ))?;
+        drop(parent_guard);
         let mut copied_egroup: Vec<(u64, String, u32, u32, u64)> = Vec::new();
         let mut copied_extent: Vec<(u64, String, u64)> = Vec::new();
         for row in map_rows {
@@ -2573,6 +2597,29 @@ mod tests {
         // `goner` at epoch 1 is accepted.
         assert_eq!(daemon.replica_store.fence("goner", 1).unwrap(), 1);
         assert_eq!(peer_store.fence("goner", 1).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_delete_refuses_when_child_vdisk_references_parent() {
+        let dir = test_dir("delete-child-lineage");
+        let daruk_addr = spawn_mock_hydra(|path, q| match path {
+            "/query" if q.contains("SELECT vdisk_id, parent_vdisk FROM hydra.dfs_vdisks") => json!({
+                "status": "success",
+                "rows": [
+                    {"vdisk_id": "snap-1", "parent_vdisk": "root-disk"},
+                    {"vdisk_id": "clone-1", "parent_vdisk": "snap-1"}
+                ]
+            }),
+            _ => json!({"status": "success", "rows": []}),
+        });
+        let daemon = test_daemon(&dir, daruk_addr, Vec::new());
+
+        let err = daemon.op_delete(&json!({"vdisk_id": "snap-1"})).unwrap_err();
+        assert!(err.to_string().contains("clone-1"), "unexpected error: {err}");
+
+        let forced = daemon.op_delete(&json!({"vdisk_id": "snap-1", "force": true})).unwrap();
+        assert_eq!(forced["deleted"], json!(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
