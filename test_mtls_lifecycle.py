@@ -22,7 +22,9 @@ Python's hostname verification actually accepts; it skips if openssl is absent.
 Run with:  python -m unittest test_mtls_lifecycle
 """
 
+import base64
 import calendar
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -485,6 +487,62 @@ class MimirSurveyTests(unittest.TestCase):
         # the console shows two checks disagreeing about the same certificates.
         self.assertEqual((mimir.CERT_WARN_DAYS, mimir.CERT_FAIL_DAYS),
                          (impa.CERT_WARN_DAYS, impa.CERT_FAIL_DAYS))
+
+
+class SitePairingTests(unittest.TestCase):
+    def test_pairing_bundle_creation_and_verification(self):
+        # Build synthetic cert DER with SubjectPublicKeyInfo
+        # outer 0x30, tbs 0x30, version 0xA0, serial 0x02, sig 0x30, iss 0x30, val 0x30, sub 0x30, spki 0x30
+        spki_content = b"\x30\x0c\x06\x03\x55\x04\x03\x04\x05hello"
+        tbs_parts = [
+            b"\xa0\x03\x02\x01\x02",       # version v3
+            b"\x02\x01\x01",               # serial 1
+            b"\x30\x02\x05\x00",           # sig alg
+            b"\x30\x02\x05\x00",           # issuer
+            b"\x30\x02\x05\x00",           # validity
+            b"\x30\x02\x05\x00",           # subject
+            spki_content,                  # SPKI
+        ]
+        tbs_body = b"".join(tbs_parts)
+        tbs = b"\x30" + bytes([len(tbs_body)]) + tbs_body
+        cert_body = tbs + b"\x30\x02\x05\x00\x03\x02\x00\x00"
+        cert_der = b"\x30" + bytes([len(cert_body)]) + cert_body
+        cert_pem = "-----BEGIN CERTIFICATE-----\n" + base64.b64encode(cert_der).decode() + "\n-----END CERTIFICATE-----\n"
+
+        expected_spki = hashlib.sha256(spki_content).hexdigest()
+        calc_spki = impa.spki_sha256_of_pem(cert_pem)
+        self.assertEqual(calc_spki, expected_spki)
+
+        bundle = impa.build_site_pairing_bundle(
+            site_id="site-remote",
+            name="Remote DR Site",
+            endpoints=["10.10.103.1:9099"],
+            cert_pem=cert_pem,
+            may_push=True,
+            quota_bytes=1000000,
+        )
+        self.assertEqual(bundle["pinned_spki"], expected_spki)
+        self.assertEqual(bundle["site_id"], "site-remote")
+
+        ok, parsed, err = impa.verify_site_pairing_bundle(bundle, expected_spki=expected_spki)
+        self.assertTrue(ok, err)
+        self.assertEqual(parsed["site_id"], "site-remote")
+
+        ok_bad, _, err_bad = impa.verify_site_pairing_bundle(bundle, expected_spki="deadbeef")
+        self.assertFalse(ok_bad)
+        self.assertIn("does not match expected_spki", err_bad)
+
+    @unittest.skipUnless(HAVE_OPENSSL, "openssl is not on PATH")
+    def test_mint_site_cert(self):
+        directory = tempfile.mkdtemp(prefix="helios-site-mint-")
+        try:
+            key, crt, fp = impa.mint_site_cert(directory, "site-test", days=30)
+            self.assertTrue(os.path.exists(key))
+            self.assertTrue(os.path.exists(crt))
+            self.assertEqual(len(fp), 64)
+            self.assertEqual(fp, impa.spki_sha256_of_pem(crt))
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 if __name__ == "__main__":

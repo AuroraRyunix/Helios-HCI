@@ -932,7 +932,7 @@ defmodule SpectrumPhx.Storage do
           :ok ->
             if host_ip != "" and Keyword.get(opts, :source, files_source()) == :hydra do
               try do
-                SpectrumPhx.SparkClient.request(host_ip, :post, "/api/v1/host/files", %{
+                SpectrumPhx.Spark.post_json(host_ip, "/api/v1/host/files", %{
                   "action" => "activate",
                   "share" => %{
                     "share_name" => share_name,

@@ -9,7 +9,7 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     {:ok, view, html} = live(conn, ~p"/central")
 
     assert html =~ "Helios Central"
-    assert html =~ "vCenter / Prism Central Tier"
+    assert html =~ "Fleet Federation"
     assert html =~ "Managed Clusters"
     assert html =~ "Fleet vCPU Allocation"
     assert html =~ "Fleet Memory Distribution"

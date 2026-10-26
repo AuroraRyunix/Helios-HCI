@@ -265,6 +265,100 @@ class MemoryStateStore(StateStore):
         return [dict(v, set_id=k[1], snapshot=k[2]) for k, v in self.data.items() if k[0] == site]
 
 
+class HydraStateStore(StateStore):
+    """Hydra-backed state store persisted in `hydra.dfs_replication_sets`."""
+
+    def __init__(self, query_fn=None):
+        if query_fn is not None:
+            self.query_fn = query_fn
+        else:
+            from helios_cql import run_cql_query
+            self.query_fn = run_cql_query
+
+    def get(self, site, set_id, snapshot):
+        from helios_cql import cql_escape
+        cql = (
+            "SELECT JSON site_id, set_id, domain, state, map_digests, bytes_sent, attempts, last_error, updated_at_ms "
+            "FROM hydra.dfs_replication_sets "
+            f"WHERE site_id = '{cql_escape(site)}' AND set_id = '{cql_escape(set_id)}';"
+        )
+        rc, stdout, _ = self.query_fn(cql)
+        if rc != 0 or not stdout:
+            return None
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    data = json.loads(line)
+                    digests_raw = data.get("map_digests") or "{}"
+                    digests = json.loads(digests_raw) if isinstance(digests_raw, str) else digests_raw
+                    if snapshot in digests:
+                        return digests[snapshot]
+                except Exception:
+                    pass
+        return None
+
+    def put(self, site, set_id, snapshot, record):
+        from helios_cql import cql_escape
+        existing_digests = {}
+        cql_get = (
+            "SELECT JSON map_digests FROM hydra.dfs_replication_sets "
+            f"WHERE site_id = '{cql_escape(site)}' AND set_id = '{cql_escape(set_id)}';"
+        )
+        rc, stdout, _ = self.query_fn(cql_get)
+        if rc == 0 and stdout:
+            for line in stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        raw = json.loads(line).get("map_digests") or "{}"
+                        existing_digests = json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        pass
+        existing_digests[snapshot] = dict(record)
+        state = record.get("state") or "offered"
+        bytes_sent = int(record.get("bytes_sent") or 0)
+        attempts = int(record.get("attempts") or 0)
+        last_error = record.get("error") or ""
+        updated_at_ms = int(record.get("updated_at_ms") or 0)
+        map_json = json.dumps(existing_digests, sort_keys=True)
+        cql_put = (
+            "INSERT INTO hydra.dfs_replication_sets "
+            "(site_id, set_id, domain, state, map_digests, bytes_sent, attempts, last_error, updated_at_ms) "
+            f"VALUES ('{cql_escape(site)}', '{cql_escape(set_id)}', '', '{cql_escape(state)}', "
+            f"'{cql_escape(map_json)}', {bytes_sent}, {attempts}, '{cql_escape(last_error)}', {updated_at_ms});"
+        )
+        self.query_fn(cql_put)
+
+    def records(self, site):
+        from helios_cql import cql_escape
+        cql = (
+            "SELECT JSON site_id, set_id, domain, state, map_digests, bytes_sent, attempts, last_error, updated_at_ms "
+            "FROM hydra.dfs_replication_sets "
+            f"WHERE site_id = '{cql_escape(site)}';"
+        )
+        rc, stdout, _ = self.query_fn(cql)
+        if rc != 0 or not stdout:
+            return []
+        all_records = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    data = json.loads(line)
+                    s_id = data.get("set_id")
+                    digests_raw = data.get("map_digests") or "{}"
+                    digests = json.loads(digests_raw) if isinstance(digests_raw, str) else digests_raw
+                    for snap, rec in digests.items():
+                        entry = dict(rec)
+                        entry["set_id"] = s_id
+                        entry["snapshot"] = snap
+                        all_records.append(entry)
+                except Exception:
+                    pass
+        return all_records
+
+
 def advance(record, state, **fields):
     """Move a transfer record to `state`, refusing a transition that is not on the map: a
     visible snapshot does not become anything else, and a failed one is retried by an operator

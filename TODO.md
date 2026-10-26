@@ -568,10 +568,12 @@ The notes themselves are deliberately not in this repository.
   Verified against live Scylla, which settled three things that were not assumable: the driver renames
   `[applied]` to `applied` inside rows, `was_applied` is single-use, and **`INSERT ... JSON ? IF NOT
   EXISTS` silently ignores the condition and overwrites the row**.
-  **Outstanding**: the migration lock has no holder identity or expiry, so a late cleanup from a failed
-  attempt can release a *later* migration's lock. Cross-host maintenance exclusion is still
-  read-then-write and an LWT cannot fix it (it spans partitions); it needs a single-row cluster lock,
-  which belongs with the schema-ownership item.
+  **Resolved (2026-10-26)**: Migration lock holder identity and TTL expiry implemented via
+  `hydra.cluster_locks` (`acquire_migration_holder_lock` / `release_migration_holder_lock` with
+  900s TTL) in `vali.py`. Process queue acquires a holder token before `/v1/vm/migrate-lock`,
+  releases on commit, and on error only releases `/v1/vm/migrate-unlock` if its holder token was
+  successfully released, preventing late cleanups from stale attempts unlocking newer migrations.
+  Cross-host maintenance exclusion is handled via `hydra.cluster_locks`.
 * ~~Scheduled major compaction is an anti-pattern.~~ **Resolved (2026-08-19)**: the 12-hourly
   `nodetool compact` job is disabled, with a migration for existing clusters. Disabled rather than
   deleted so an operator can see it and re-enable deliberately.
@@ -1377,11 +1379,11 @@ as data* by DRBD and refused with EIO by Sidon.
   from one machine: the instances share a clock and a page cache. Real hosts are what
   settle clock skew, genuine partitions, and the kernel-death injector — which needs
   `kernel.sysrq` widened on a node somebody is willing to lose.
-* **A cluster-wide replica check before a rolling reboot.** `hylia` verifies the node it
-  is about to take down — daemon answering, store mounted with room, no degraded vdisk —
-  and nothing verifies the *cluster*. Rebooting the node holding the last reachable
-  replica of a vdisk still makes it unavailable. It needs more than one node to write or
-  to test.
+* ~~A cluster-wide replica check before a rolling reboot.~~ **Resolved (2026-10-26):**
+  `verify_cluster_vdisk_replicas_before_reboot` in `hylia.py` inspects `hydra.dfs_vdisks`,
+  verifies surviving replica counts across surviving cluster nodes, verifies active ownership,
+  and refuses reboots that would cause quorum storage loss. Also updated Hylia reboot markers
+  to use typed `/api/v1/host/fs` and `/api/v1/host/reboot` with fallback to `run_remote_spark`.
 * ~~Leftover LINSTOR logical volumes on upgraded nodes.~~ **Reported, not removed
   (2026-08-22).** The DRBD teardown unmounts, downs the resources, unloads the module and
   removes the packages, and deliberately does not touch the backing volumes: one may be a
@@ -1571,9 +1573,10 @@ unit-tested in `test_esxi_ahv_parity.py`:
     `verify_horizon_token`), and authentic local `guacd` daemon inspection/control (`inspect_local_guacd`).
   - Exposed via Spark (`GET/POST /api/v1/host/horizon`), Spectrum (`/api/horizon/pools`,
     `/api/horizon/pools/create`, `/api/horizon/pools/delete`, `/api/horizon/pools/provision`,
-    `/api/horizon/sessions`, `/api/horizon/connect`, `/api/horizon/disconnect`), and `valcli`
-    (`vdi.pool.list|create|delete|provision`, `vdi.session.list|connect|disconnect`, `vdi.status`).
-    Verified in `test_helios_horizon.py`.
+    `/api/horizon/sessions`, `/api/horizon/connect`, `/api/horizon/disconnect`), Phoenix console
+    (`SpectrumPhx.Horizon`, `SpectrumPhxWeb.Central.IndexLive` VDI tab, and `test/spectrum_phx/horizon_test.exs`),
+    and `valcli` (`vdi.pool.list|create|delete|provision`, `vdi.session.list|connect|disconnect`, `vdi.status`).
+    Verified in `test_helios_horizon.py` and `mix test`.
 * **Scale-Out Urbosa (Built 2026-10-26)** — FRRouting (`frr` / `bgpd`) BGP L2VPN EVPN control plane
   with kernel bridge ARP suppression (`urbosa.py`, schema migration `0057-urbosa-bgp-evpn` creating
   `hydra.urbosa_bgp_config` and `hydra.urbosa_bgp_peers`):
@@ -1586,6 +1589,13 @@ unit-tested in `test_esxi_ahv_parity.py`:
     Phoenix (`SpectrumPhx.Sdn.bgp_state/1`, `configure_bgp/2`, `add_bgp_peer/2`, `delete_bgp_peer/2`,
     `Sdn.IndexLive`), and `valcli` (`sdn.bgp.status|configure|peer.add|peer.delete`). Verified in
     `test_urbosa_evpn.py`.
+* **Cross-Site DFS Replication & Pairing (Built 2026-10-26)** — schema migration `0060-dfs-cross-site-replication`
+  creating `hydra.dfs_remote_sites` and `hydra.dfs_replication_sets`:
+  - `HydraStateStore` implemented in `rauru_replication.py` for persistent replication set tracking.
+  - Pure-Python SPKI SHA-256 fingerprinting and site pairing bundle generation (`impa site-init`,
+    `impa site-pair`, `mint_site_cert`, `build_site_pairing_bundle`, `verify_site_pairing_bundle`) in `impa.py`
+    matching `sidon/src/replicate/site_tls.rs`.
+  - Verified in `test_rauru_replication.py` and `test_mtls_lifecycle.py`.
 
 ## Service wiring (found by `test_service_wiring.py`)
 

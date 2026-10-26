@@ -30,6 +30,7 @@ live migration; this reuses that channel.
 
 import argparse
 import base64
+import hashlib
 import json
 import ipaddress
 import os
@@ -628,6 +629,215 @@ def mint_leaf(directory, cn, days, ca_key, ca_crt, eku, san=None, stem=None):
     return key, crt
 
 
+def _der_tlv(b):
+    if len(b) < 2:
+        return None
+    tag = b[0]
+    first = b[1]
+    if first < 0x80:
+        length = first
+        header = 2
+    else:
+        n = first & 0x7f
+        if n == 0 or n > 4 or len(b) < 2 + n:
+            return None
+        length = int.from_bytes(b[2:2 + n], "big")
+        header = 2 + n
+    end = header + length
+    if len(b) < end:
+        return None
+    return tag, b[:end], b[header:end], b[end:]
+
+
+def spki_sha256_of_der(cert_der):
+    """Calculate the SPKI SHA-256 fingerprint matching Sidon's site_tls.rs."""
+    bad = ValueError("The peer certificate is not valid DER")
+    res = _der_tlv(cert_der)
+    if not res or res[0] != 0x30:
+        raise bad
+    res = _der_tlv(res[2])
+    if not res or res[0] != 0x30:
+        raise bad
+    cur = res[2]
+    fields = []
+    while cur:
+        part = _der_tlv(cur)
+        if not part:
+            break
+        t, w, _c, cur = part
+        fields.append((t, w))
+    if not fields:
+        raise bad
+    # If version is present (context-specific tag 0xA0), SPKI is field 6; else field 5.
+    spki_idx = 6 if fields[0][0] == 0xA0 else 5
+    if len(fields) <= spki_idx:
+        raise bad
+    spki_bytes = fields[spki_idx][1]
+    return hashlib.sha256(spki_bytes).hexdigest()
+
+
+def spki_sha256_of_pem(pem_or_path):
+    """Return the SPKI SHA-256 hex string from a PEM certificate string or file path."""
+    if isinstance(pem_or_path, str) and os.path.exists(pem_or_path):
+        with open(pem_or_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    else:
+        text = str(pem_or_path)
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("-----")]
+    der = base64.b64decode("".join(lines))
+    return spki_sha256_of_der(der)
+
+
+def mint_site_cert(directory, site_id, days=DEFAULT_LEAF_DAYS, ca_key=None, ca_crt=None):
+    """Mint a site certificate and private key for cross-site replication pairing.
+
+    Returns `(key_path, crt_path, spki_fingerprint)`.
+    """
+    ca_key = ca_key or os.path.join(NODE_CERT_DIR, "ca.key")
+    ca_crt = ca_crt or os.path.join(NODE_CERT_DIR, "ca.crt")
+    if not (os.path.exists(ca_key) and os.path.exists(ca_crt)):
+        ca_key, ca_crt = mint_ca(directory, cn=f"HCI-Site-CA-{site_id}", days=DEFAULT_CA_DAYS)
+    stem = f"site_{site_id}"
+    key, crt = mint_leaf(
+        directory,
+        cn=f"HCI-Site-{site_id}",
+        days=days,
+        ca_key=ca_key,
+        ca_crt=ca_crt,
+        eku="serverAuth,clientAuth",
+        stem=stem,
+    )
+    fp = spki_sha256_of_pem(crt)
+    return key, crt, fp
+
+
+def build_site_pairing_bundle(site_id, name, endpoints, cert_pem, may_push=True, quota_bytes=0, bandwidth_bps=0):
+    """Create a standardized pairing bundle for cross-site replication."""
+    if isinstance(endpoints, str):
+        eps = [e.strip() for e in endpoints.split(",") if e.strip()]
+    else:
+        eps = list(endpoints or [])
+    pinned_spki = spki_sha256_of_pem(cert_pem)
+    bundle = {
+        "format": "helios-site-pairing-v1",
+        "site_id": str(site_id).strip(),
+        "name": str(name or site_id).strip(),
+        "endpoints": eps,
+        "cert_pem": cert_pem.strip(),
+        "pinned_spki": pinned_spki,
+        "may_push": bool(may_push),
+        "quota_bytes": int(quota_bytes),
+        "bandwidth_bps": int(bandwidth_bps),
+    }
+    return bundle
+
+
+def verify_site_pairing_bundle(bundle_str_or_dict, expected_spki=None):
+    """Validate a site pairing bundle structure and verify its SPKI fingerprint."""
+    if isinstance(bundle_str_or_dict, str):
+        try:
+            bundle = json.loads(bundle_str_or_dict)
+        except Exception as e:
+            return False, None, f"invalid JSON: {e}"
+    elif isinstance(bundle_str_or_dict, dict):
+        bundle = dict(bundle_str_or_dict)
+    else:
+        return False, None, "bundle must be a JSON string or dict"
+
+    if bundle.get("format") != "helios-site-pairing-v1":
+        return False, None, f"unsupported bundle format: {bundle.get('format')}"
+    if not bundle.get("site_id"):
+        return False, None, "bundle missing site_id"
+    if not bundle.get("cert_pem"):
+        return False, None, "bundle missing cert_pem"
+
+    try:
+        calculated_spki = spki_sha256_of_pem(bundle["cert_pem"])
+    except Exception as e:
+        return False, None, f"failed to calculate SPKI from cert_pem: {e}"
+
+    pinned = (bundle.get("pinned_spki") or "").strip().lower()
+    if pinned and pinned != calculated_spki.lower():
+        return False, None, f"pinned_spki mismatch: {pinned} != {calculated_spki}"
+
+    if expected_spki and calculated_spki.lower() != expected_spki.strip().lower():
+        return False, None, f"SPKI does not match expected_spki: {calculated_spki} != {expected_spki}"
+
+    bundle["pinned_spki"] = calculated_spki
+    return True, bundle, ""
+
+
+def cmd_site_init(args):
+    """Initialize a site certificate and generate its pairing bundle."""
+    site_id = args.site_id
+    out_dir = args.dir or tempfile.mkdtemp(prefix="site-init-")
+    key, crt, fp = mint_site_cert(out_dir, site_id, days=args.days)
+    with open(crt, "r", encoding="utf-8") as f:
+        cert_pem = f.read()
+    endpoints = args.endpoints or local_ip()
+    bundle = build_site_pairing_bundle(
+        site_id=site_id,
+        name=args.name or site_id,
+        endpoints=endpoints,
+        cert_pem=cert_pem,
+        may_push=not args.no_push,
+    )
+    bundle_json = json.dumps(bundle, indent=2)
+    bundle_path = os.path.join(out_dir, f"site_{site_id}_bundle.json")
+    with open(bundle_path, "w", encoding="utf-8") as f:
+        f.write(bundle_json + "\n")
+    print(f"Site certificate and pairing bundle generated:")
+    print(f"  Site ID:    {site_id}")
+    print(f"  SPKI Pin:   {fp}")
+    print(f"  Cert Path:  {crt}")
+    print(f"  Key Path:   {key}")
+    print(f"  Bundle:     {bundle_path}")
+    if args.json:
+        print(bundle_json)
+    return 0
+
+
+def cmd_site_pair(args):
+    """Verify and import a remote site pairing bundle."""
+    bundle_input = args.bundle
+    if os.path.exists(bundle_input):
+        with open(bundle_input, "r", encoding="utf-8") as f:
+            raw = f.read()
+    else:
+        raw = bundle_input
+    ok, bundle, err = verify_site_pairing_bundle(raw, expected_spki=args.expected_spki)
+    if not ok:
+        print(f"ERROR: Invalid site pairing bundle: {err}", file=sys.stderr)
+        return 1
+    print(f"Valid site pairing bundle:")
+    print(f"  Site ID:     {bundle['site_id']}")
+    print(f"  Name:        {bundle['name']}")
+    print(f"  Endpoints:   {', '.join(bundle['endpoints'])}")
+    print(f"  SPKI Pin:    {bundle['pinned_spki']}")
+    print(f"  May Push:    {bundle['may_push']}")
+
+    if args.apply:
+        from helios_cql import run_cql_query, cql_escape
+        site_id = cql_escape(bundle['site_id'])
+        name = cql_escape(bundle['name'])
+        eps = cql_escape(",".join(bundle['endpoints']))
+        spki = cql_escape(bundle['pinned_spki'])
+        may_push = "true" if bundle['may_push'] else "false"
+        now_ms = int(time.time() * 1000)
+        cql = (
+            "INSERT INTO hydra.dfs_remote_sites "
+            "(site_id, name, endpoints, pinned_spki, may_push, quota_bytes, bandwidth_bps, enabled, updated_at_ms) "
+            f"VALUES ('{site_id}', '{name}', '{eps}', '{spki}', {may_push}, "
+            f"{bundle.get('quota_bytes', 0)}, {bundle.get('bandwidth_bps', 0)}, true, {now_ms});"
+        )
+        rc, _, err_c = run_cql_query(cql)
+        if rc != 0:
+            print(f"ERROR: Failed to save remote site to hydra.dfs_remote_sites: {err_c}", file=sys.stderr)
+            return 1
+        print("Successfully registered remote site in hydra.dfs_remote_sites.")
+    return 0
+
+
 def ca_expiry_epoch(ca_crt):
     rc, out, _ = run("openssl x509 -noout -enddate -in %s" % ca_crt)
     if rc != 0:
@@ -1182,6 +1392,24 @@ def build_parser():
         "selftest", help="mint a throwaway chain and handshake against it")
     selftest.add_argument("--dir", help="keep the generated material in this directory")
     selftest.set_defaults(func=cmd_selftest)
+
+    site_init = sub.add_parser(
+        "site-init", help="mint site certificate and generate replication pairing bundle")
+    site_init.add_argument("--site-id", required=True, help="unique ID of this site/cluster")
+    site_init.add_argument("--name", help="display name of the site")
+    site_init.add_argument("--endpoints", help="comma-separated endpoints (IP:port)")
+    site_init.add_argument("--days", type=int, default=DEFAULT_LEAF_DAYS)
+    site_init.add_argument("--dir", help="output directory for certificate and bundle")
+    site_init.add_argument("--no-push", action="store_true", help="disallow remote site pushes")
+    site_init.add_argument("--json", action="store_true", help="output JSON bundle to stdout")
+    site_init.set_defaults(func=cmd_site_init)
+
+    site_pair = sub.add_parser(
+        "site-pair", help="verify and optionally register a remote site pairing bundle")
+    site_pair.add_argument("--bundle", required=True, help="path to pairing bundle JSON file or JSON string")
+    site_pair.add_argument("--expected-spki", help="expected SPKI SHA-256 fingerprint for verification")
+    site_pair.add_argument("--apply", action="store_true", help="insert remote site into hydra.dfs_remote_sites")
+    site_pair.set_defaults(func=cmd_site_pair)
 
     return parser
 

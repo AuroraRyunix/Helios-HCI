@@ -2377,10 +2377,22 @@ def process_queue_task(task):
             # risks now is two migrations racing each other's ownership CAS and leaving
             # the VM defined on a host that does not own its disk.
             print(f"Taking the migration lock for VM '{vm_name}'...")
+            ok_h, mig_token, cur_h, err_h = acquire_migration_holder_lock(
+                vm_name,
+                holder=f"{src_host}->{target_ip}",
+                reason=f"task {task_id or 'migrate'}",
+            )
+            if not ok_h:
+                return False, f"Refusing to migrate {vm_name}: the migration holder lease could not be taken ({err_h})."
+            if not mig_token:
+                return False, f"Refusing to migrate {vm_name}: another migration lease is active (holder = {cur_h.get('holder')!r})."
+
             ok, applied, current, err = run_lwt("/v1/vm/migrate-lock", {"name": vm_name})
             if not ok:
+                release_migration_holder_lock(vm_name, mig_token)
                 return False, f"Refusing to migrate {vm_name}: the migration lock could not be taken ({err}). Without it a concurrent migration of the same VM would not be detected."
             if not applied:
+                release_migration_holder_lock(vm_name, mig_token)
                 return False, f"Refusing to migrate {vm_name}: it is already migrating (status = {current.get('status')!r})."
 
             try:
@@ -2457,6 +2469,7 @@ def process_queue_task(task):
                     "host_ip": target_ip,
                     "expected_host_ip": src_host,
                 })
+                release_migration_holder_lock(vm_name, mig_token)
                 if not ok or not applied:
                     detail = err if not ok else (
                         f"the row moved underneath the migration (host_ip = "
@@ -2495,10 +2508,16 @@ def process_queue_task(task):
                 return True, target_ip
             except Exception as migrate_err:
                 print(f"Migration error caught: {migrate_err}. Releasing the migration lock...")
-                # Conditional on the lock still being held by this migration. An
-                # unconditional reset here would clear the lock of whichever migration is
-                # running now, which is how a late cleanup from a failed attempt lets a
-                # second live migration of the same VM start.
+                # Verify that this attempt still holds the migration holder token before
+                # unlocking `hydra.vms.status`, so a stale cleanup cannot drop a newer
+                # migration's lock after the first lease expired.
+                ok_tok, applied_tok, _cur_tok, _err_tok = release_migration_holder_lock(vm_name, mig_token)
+                if ok_tok and not applied_tok:
+                    sys.stderr.write(
+                        f"VM {vm_name}: migration failed, but its holder token was no longer active; "
+                        f"leaving the VM migration status lock untouched.\n"
+                    )
+                    return False, f"Migration failed: {str(migrate_err)}"
                 ok_u, applied_u, current_u, err_u = run_lwt("/v1/vm/migrate-unlock", {"name": vm_name})
                 if not ok_u:
                     sys.stderr.write(f"VM {vm_name}: migration failed and the lock could not be released ({err_u}). Further migrations will be refused until it is cleared.\n")
@@ -3742,6 +3761,50 @@ def release_maintenance_lock_for_host(hostname):
               f"not by '{hostname}'; leaving it alone.")
         return False
     return release_maintenance_lock(lock.get("holder_token") or "")
+
+
+MIGRATION_LOCK_TTL_SECONDS = 900
+
+
+def migration_lock_name(vm_name):
+    """Cluster lock name for a VM's active migration lease."""
+    return f"vm_migration:{vm_name}"
+
+
+def acquire_migration_holder_lock(vm_name, holder, reason="", ttl_seconds=MIGRATION_LOCK_TTL_SECONDS):
+    """Acquire a per-VM migration lease with a unique holder token and TTL in `hydra.cluster_locks`.
+
+    Returns `(ok, token, current, error)`.
+    """
+    ensure_cluster_locks_table()
+    token = str(uuid.uuid4())
+    ok, applied, current, error = run_lwt("/v1/lock/acquire", {
+        "name": migration_lock_name(vm_name),
+        "holder": str(holder or vm_name),
+        "holder_token": token,
+        "reason": str(reason or ""),
+        "acquired_at_ms": int(time.time() * 1000),
+        "ttl_seconds": int(ttl_seconds),
+    })
+    if not ok:
+        return False, "", {}, error
+    if not applied:
+        return True, "", current, ""
+    return True, token, {}, ""
+
+
+def release_migration_holder_lock(vm_name, token):
+    """Release a per-VM migration lease conditional on `holder_token`.
+
+    Returns `(ok, applied, current, error)`. When `applied` is False, the lease expired
+    or was superseded by a newer migration and the caller must NOT drop `/v1/vm/migrate-unlock`.
+    """
+    if not token:
+        return True, False, {}, ""
+    return run_lwt("/v1/lock/release", {
+        "name": migration_lock_name(vm_name),
+        "holder_token": token,
+    })
 
 
 # REST HTTP Handlers

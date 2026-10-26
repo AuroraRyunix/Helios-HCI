@@ -1954,6 +1954,7 @@ ALLOWED_VIRSH_ACTIONS = (
 
 ALLOWED_FS_ROOTS = (
     "/var/lib/hci/",
+    "/var/lib/hylia/",
     "/etc/hci/",
     "/srv/salt/",
     "/run/hci/",

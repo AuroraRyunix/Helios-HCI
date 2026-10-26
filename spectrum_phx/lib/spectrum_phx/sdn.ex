@@ -656,7 +656,7 @@ defmodule SpectrumPhx.Sdn do
             :ok
 
           {:ok, false, holder} ->
-            holder = stringify(holder || %{})
+            holder = stringify(holder)
             holder_name = string(get(holder, "name")) || string(get(holder, "segment_id")) || "another segment"
             {:error, "VNI #{vni} is already claimed by #{holder_name}."}
 
@@ -927,7 +927,7 @@ defmodule SpectrumPhx.Sdn do
       nil ->
         Enum.each(nodes(nil), fn nip ->
           try do
-            SpectrumPhx.SparkClient.request(nip, :post, "/api/v1/host/bgp", %{"action" => "reload"})
+            SpectrumPhx.Spark.post_json(nip, "/api/v1/host/bgp", %{"action" => "reload"})
           rescue
             _ -> :ok
           catch

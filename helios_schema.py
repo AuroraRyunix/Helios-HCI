@@ -1091,6 +1091,38 @@ MIGRATIONS = [
             ");",
         ],
     },
+    {
+        "id": "0060-dfs-cross-site-replication",
+        "description": (
+            "Tables tracking remote sites and disaster-recovery replication set transfers "
+            "(docs/dfs/replication.md section 7)."
+        ),
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_remote_sites ("
+            "site_id text PRIMARY KEY, "
+            "name text, "
+            "endpoints text, "
+            "pinned_spki text, "
+            "may_push boolean, "
+            "quota_bytes bigint, "
+            "bandwidth_bps bigint, "
+            "enabled boolean, "
+            "updated_at_ms bigint"
+            ");",
+            "CREATE TABLE IF NOT EXISTS hydra.dfs_replication_sets ("
+            "site_id text, "
+            "set_id text, "
+            "domain text, "
+            "state text, "
+            "map_digests text, "
+            "bytes_sent bigint, "
+            "attempts int, "
+            "last_error text, "
+            "updated_at_ms bigint, "
+            "PRIMARY KEY ((site_id), set_id)"
+            ");",
+        ],
+    },
 ]
 
 

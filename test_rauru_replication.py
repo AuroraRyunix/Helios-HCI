@@ -18,6 +18,7 @@ Run with:  python -m unittest test_rauru_replication
 """
 
 import io
+import json
 import os
 import re
 import sys
@@ -409,6 +410,53 @@ class WhatRetentionIsToldNotToDelete(unittest.TestCase):
         pinned = RR.pinned_sets(store, "site-b", {"s2": ["a-2"]})
         plan = RP.plan_set_retention(sets, 1, set(), {}, pinned)
         self.assertEqual(plan.prune, [])
+
+
+class HydraStateStoreTests(unittest.TestCase):
+    def test_hydra_state_store_put_get_records(self):
+        store_map = {}
+
+        def fake_cql(query):
+            query = query.strip()
+            if query.startswith("SELECT JSON"):
+                if "WHERE site_id = 'site-a' AND set_id = 'set-1'" in query:
+                    if ("site-a", "set-1") in store_map:
+                        rec = store_map[("site-a", "set-1")]
+                        line = json.dumps({"site_id": "site-a", "set_id": "set-1", "map_digests": json.dumps(rec)})
+                        return 0, line, ""
+                    return 0, "", ""
+                if "WHERE site_id = 'site-a'" in query:
+                    lines = []
+                    for (s, st), rec in store_map.items():
+                        if s == "site-a":
+                            lines.append(json.dumps({"site_id": s, "set_id": st, "map_digests": json.dumps(rec)}))
+                    return 0, "\n".join(lines), ""
+                return 0, "", ""
+            if query.startswith("INSERT INTO hydra.dfs_replication_sets"):
+                m = re.search(r"VALUES \('([^']+)', '([^']+)', '', '([^']+)', '([^']+)', (\d+), (\d+), '([^']*)', (\d+)\)", query)
+                if m:
+                    site, set_id, state, map_json = m.group(1), m.group(2), m.group(3), m.group(4)
+                    store_map[(site, set_id)] = json.loads(map_json)
+                return 0, "", ""
+            return 0, "", ""
+
+        store = RR.HydraStateStore(query_fn=fake_cql)
+        self.assertIsNone(store.get("site-a", "set-1", "snap-1"))
+
+        store.put("site-a", "set-1", "snap-1", {"state": RR.VISIBLE, "bytes_sent": 100})
+        got = store.get("site-a", "set-1", "snap-1")
+        self.assertIsNotNone(got)
+        self.assertEqual(got["state"], RR.VISIBLE)
+        self.assertEqual(got["bytes_sent"], 100)
+
+        store.put("site-a", "set-1", "snap-2", {"state": RR.PAUSED, "bytes_sent": 50})
+        got2 = store.get("site-a", "set-1", "snap-2")
+        self.assertEqual(got2["state"], RR.PAUSED)
+
+        recs = store.records("site-a")
+        self.assertEqual(len(recs), 2)
+        snapshots = {r["snapshot"] for r in recs}
+        self.assertEqual(snapshots, {"snap-1", "snap-2"})
 
 
 class TheWiring(unittest.TestCase):

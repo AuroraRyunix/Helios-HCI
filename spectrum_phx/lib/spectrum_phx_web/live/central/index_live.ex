@@ -8,6 +8,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
   alias SpectrumPhx.Central
   alias SpectrumPhx.Cluster.Config
+  alias SpectrumPhx.Horizon
   alias SpectrumPhx.Hydra
 
   @refresh_interval_ms 15_000
@@ -156,11 +157,39 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     {:noreply, assign(socket, :search_query, String.trim(query))}
   end
 
+  def handle_event("delete_horizon_pool", %{"pool" => pool_name}, socket) do
+    Horizon.delete_pool(pool_name)
+    {:noreply,
+     socket
+     |> put_flash(:info, "Horizon desktop pool '#{pool_name}' deleted.")
+     |> load_central_state()}
+  end
+
+  def handle_event("disconnect_horizon_session", %{"session" => session_id}, socket) do
+    Horizon.disconnect_session(session_id)
+    {:noreply,
+     socket
+     |> put_flash(:info, "Horizon session '#{session_id}' disconnected.")
+     |> load_central_state()}
+  end
+
   defp load_central_state(socket) do
     clusters = Central.list_clusters()
     summary = Central.fleet_summary(clusters)
     presets = Central.sizing_presets()
     {status_type, appliance} = Central.deployment_status()
+
+    horizon_pools =
+      case Horizon.list_pools() do
+        {:ok, list} -> list
+        _ -> []
+      end
+
+    horizon_sessions =
+      case Horizon.list_sessions() do
+        {:ok, list} -> list
+        _ -> []
+      end
 
     # Load local VMs for cross-cluster inventory view
     local_vms =
@@ -192,6 +221,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     |> assign(:appliance_status, status_type)
     |> assign(:appliance, appliance)
     |> assign(:vms, all_vms)
+    |> assign(:horizon_pools, horizon_pools)
+    |> assign(:horizon_sessions, horizon_sessions)
     |> assign(:read_at, DateTime.utc_now())
   end
 
@@ -380,6 +411,14 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           id="tab-setup"
         >
           <.icon name="hero-cpu-chip" class="size-4" /> Central Appliance Setup
+        </button>
+        <button
+          phx-click="switch_tab"
+          phx-value-tab="horizon"
+          class={["btn btn-sm gap-2", if(@active_tab == :horizon, do: "btn-primary", else: "btn-ghost")]}
+          id="tab-horizon"
+        >
+          <.icon name="hero-tv" class="size-4" /> Horizon VDI ({length(@horizon_pools)})
         </button>
       </div>
 
@@ -718,6 +757,153 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <div class="font-bold text-sm">Cluster Auto-Pairing</div>
                 <p class="text-xs text-base-content/60 mt-1">Mutual TLS cluster trust exchange registering the deploying cluster as Member 01.</p>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <%!-- TAB 5: HELIOS HORIZON VDI (DESKTOP POOLS & SESSIONS) --%>
+      <div :if={@active_tab == :horizon} class="space-y-6" id="horizon-tab-content">
+        <%!-- Desktop Pools Deck --%>
+        <div class="card bg-base-200 border border-base-content/10 shadow-lg rounded-2xl overflow-hidden">
+          <div class="card-body p-6">
+            <div class="flex items-center justify-between pb-4 border-b border-base-content/10">
+              <div class="flex items-center gap-3">
+                <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+                  <.icon name="hero-tv" class="size-6" />
+                </div>
+                <div>
+                  <h2 class="text-lg font-bold">Horizon Virtual Desktop Pools</h2>
+                  <p class="text-xs text-base-content/70">
+                    Automated VDI desktop pool orchestration, linked clone CoW provisioning, and session broker.
+                  </p>
+                </div>
+              </div>
+              <span class="badge badge-primary font-mono">{length(@horizon_pools)} configured</span>
+            </div>
+
+            <div :if={@horizon_pools == []} class="py-12 text-center text-base-content/50 text-sm">
+              <.icon name="hero-computer-desktop" class="size-8 mx-auto mb-2 opacity-40" />
+              No Horizon desktop pools found in hydra.horizon_pools.
+            </div>
+
+            <div :if={@horizon_pools != []} class="overflow-x-auto mt-4">
+              <table class="table table-sm">
+                <thead>
+                  <tr class="text-xs text-base-content/60 border-b border-base-content/10">
+                    <th>Pool Name</th>
+                    <th>Type</th>
+                    <th>Protocol / Port</th>
+                    <th>Template VM</th>
+                    <th>Desktops (Min/Max)</th>
+                    <th>Sizing (vCPU/RAM)</th>
+                    <th>Entitled Groups</th>
+                    <th>Status</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={p <- @horizon_pools} class="hover:bg-base-300/40 border-b border-base-content/5">
+                    <td class="font-bold font-mono text-sm">{p.pool_name}</td>
+                    <td>
+                      <span class="badge badge-xs badge-outline font-mono">{p.pool_type}</span>
+                    </td>
+                    <td>
+                      <span class="font-mono text-xs">{p.protocol}:{p.desktop_port}</span>
+                    </td>
+                    <td class="font-mono text-xs">{p.template_vm}</td>
+                    <td class="font-mono text-xs">{p.min_desktops} / {p.max_desktops}</td>
+                    <td class="font-mono text-xs">{p.vcpu} vCPU · {round(p.memory_mb / 1024)}G</td>
+                    <td class="text-xs">{p.entitled_groups}</td>
+                    <td>
+                      <span class={["badge badge-xs gap-1 font-mono", if(p.state == "active", do: "badge-success", else: "badge-warning")]}>
+                        {p.state}
+                      </span>
+                    </td>
+                    <td class="text-right">
+                      <button
+                        phx-click="delete_horizon_pool"
+                        phx-value-pool={p.pool_name}
+                        data-confirm={"Are you sure you want to delete pool #{p.pool_name}?"}
+                        class="btn btn-ghost btn-xs text-error gap-1"
+                      >
+                        <.icon name="hero-trash" class="size-3.5" /> Delete
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <%!-- Active VDI Sessions Deck --%>
+        <div class="card bg-base-200 border border-base-content/10 shadow-lg rounded-2xl overflow-hidden">
+          <div class="card-body p-6">
+            <div class="flex items-center justify-between pb-4 border-b border-base-content/10">
+              <div class="flex items-center gap-3">
+                <div class="size-10 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent">
+                  <.icon name="hero-user-group" class="size-6" />
+                </div>
+                <div>
+                  <h2 class="text-lg font-bold">Active User VDI Sessions</h2>
+                  <p class="text-xs text-base-content/70">
+                    Live client connections authenticated through Guacamole proxy and guest Horizon agent.
+                  </p>
+                </div>
+              </div>
+              <span class="badge badge-accent font-mono">{length(@horizon_sessions)} active</span>
+            </div>
+
+            <div :if={@horizon_sessions == []} class="py-12 text-center text-base-content/50 text-sm">
+              <.icon name="hero-users" class="size-8 mx-auto mb-2 opacity-40" />
+              No active user VDI sessions connected.
+            </div>
+
+            <div :if={@horizon_sessions != []} class="overflow-x-auto mt-4">
+              <table class="table table-sm">
+                <thead>
+                  <tr class="text-xs text-base-content/60 border-b border-base-content/10">
+                    <th>Session ID</th>
+                    <th>User</th>
+                    <th>Desktop Pool</th>
+                    <th>Assigned VM</th>
+                    <th>Protocol</th>
+                    <th>Host IP</th>
+                    <th>Client IP</th>
+                    <th>Status</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={s <- @horizon_sessions} class="hover:bg-base-300/40 border-b border-base-content/5">
+                    <td class="font-mono text-xs">{s.session_id}</td>
+                    <td class="font-bold text-xs">{s.username}</td>
+                    <td class="font-mono text-xs">{s.pool_name}</td>
+                    <td class="font-mono text-xs">{s.vm_name}</td>
+                    <td>
+                      <span class="badge badge-xs badge-outline font-mono">{s.protocol}</span>
+                    </td>
+                    <td class="font-mono text-xs">{s.host_ip}</td>
+                    <td class="font-mono text-xs">{s.client_ip}</td>
+                    <td>
+                      <span class="badge badge-xs badge-success gap-1 font-mono">
+                        <span class="size-1.5 rounded-full bg-success animate-ping"></span>
+                        {s.state}
+                      </span>
+                    </td>
+                    <td class="text-right">
+                      <button
+                        phx-click="disconnect_horizon_session"
+                        phx-value-session={s.session_id}
+                        class="btn btn-ghost btn-xs text-warning gap-1"
+                      >
+                        <.icon name="hero-arrow-right-on-rectangle" class="size-3.5" /> Disconnect
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </div>
         </div>

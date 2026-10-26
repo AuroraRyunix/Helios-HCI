@@ -718,6 +718,109 @@ def verify_node_storage_health(job_id, node_ip, hostname):
     return True
 
 
+def verify_cluster_vdisk_replicas_before_reboot(job_id, rebooting_ip, rebooting_hostname, target_nodes):
+    """Verify across the cluster that rebooting `rebooting_ip` will not take down the last
+    reachable replica of any vdisk or strand an actively owned vdisk on the rebooting host.
+    """
+    rebooting_ids = {str(rebooting_ip or "").strip(), str(rebooting_hostname or "").strip()} - {"", "Unknown"}
+    surviving_ids = set()
+    for node_entry in (target_nodes or []):
+        if isinstance(node_entry, dict):
+            n_ip = str(node_entry.get("ip") or "").strip()
+            n_host = str(node_entry.get("hostname") or "").strip()
+        else:
+            n_ip = str(node_entry or "").strip()
+            n_host = str(get_hostname_by_ip(n_ip) if n_ip and n_ip != rebooting_ip else "").strip()
+        if n_ip and n_ip not in rebooting_ids:
+            surviving_ids.add(n_ip)
+        if n_host and n_host not in ("", "Unknown") and n_host not in rebooting_ids:
+            surviving_ids.add(n_host)
+
+    rc, stdout, _ = run_cql_query("SELECT JSON vdisk_id, owner, rf, replicas FROM hydra.dfs_vdisks;")
+    if rc != 0:
+        log_upgrade(
+            job_id,
+            f"[{rebooting_hostname}] Cluster vdisk pre-flight failed: could not query hydra.dfs_vdisks.",
+        )
+        return False
+
+    at_risk = []
+    for raw_line in (stdout or "").splitlines():
+        line = raw_line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        vdisk_id = str(row.get("vdisk_id") or "").strip()
+        if not vdisk_id:
+            continue
+        owner = str(row.get("owner") or "").strip()
+        replicas = [str(r).strip() for r in (row.get("replicas") or []) if str(r).strip()]
+        rf = int(row.get("rf") or len(replicas) or 1)
+
+        if owner and owner in rebooting_ids:
+            at_risk.append(f"{vdisk_id} (still owned by {owner})")
+            continue
+
+        if replicas:
+            surviving_replicas = [
+                r for r in replicas
+                if r not in rebooting_ids and (not surviving_ids or r in surviving_ids)
+            ]
+            if not surviving_replicas and (rf > 1 or len(target_nodes or []) > 1):
+                at_risk.append(f"{vdisk_id} (no surviving replica outside {rebooting_ip})")
+
+    if at_risk:
+        log_upgrade(
+            job_id,
+            f"[{rebooting_hostname}] ERROR: Rebooting {rebooting_ip} would take offline the last "
+            f"reachable replica or active owner for: {', '.join(at_risk)}.",
+        )
+        return False
+
+    return True
+
+
+def check_reboot_marker(node_ip, job_id):
+    """Check whether `/var/lib/hylia/upgrade_rebooted_<job_id>` exists via `/api/v1/host/fs`."""
+    marker_path = f"/var/lib/hylia/upgrade_rebooted_{job_id}"
+    rc, res, _ = run_mtls_spark_api(
+        node_ip, "/api/v1/host/fs", {"action": "stat", "path": marker_path}
+    )
+    if rc == 0 and isinstance(res, dict) and "exists" in res:
+        return bool(res.get("exists"))
+    rc_r, _, _ = run_remote_spark(node_ip, f"test -f {marker_path}")
+    return rc_r == 0
+
+
+def write_reboot_marker(node_ip, job_id):
+    """Create `/var/lib/hylia/upgrade_rebooted_<job_id>` via `/api/v1/host/fs`."""
+    marker_path = f"/var/lib/hylia/upgrade_rebooted_{job_id}"
+    rc, res, _ = run_mtls_spark_api(
+        node_ip,
+        "/api/v1/host/fs",
+        {"action": "write", "path": marker_path, "content": f"{job_id}\n"},
+    )
+    if rc == 0 and isinstance(res, dict) and res.get("ok"):
+        return True
+    rc_r, _, _ = run_remote_spark(node_ip, f"mkdir -p /var/lib/hylia && touch {marker_path}")
+    return rc_r == 0
+
+
+def clear_reboot_marker(node_ip, job_id):
+    """Remove `/var/lib/hylia/upgrade_rebooted_<job_id>` via `/api/v1/host/fs`."""
+    marker_path = f"/var/lib/hylia/upgrade_rebooted_{job_id}"
+    rc, res, _ = run_mtls_spark_api(
+        node_ip, "/api/v1/host/fs", {"action": "rm", "path": marker_path}
+    )
+    if rc == 0 and isinstance(res, dict) and res.get("ok"):
+        return True
+    rc_r, _, _ = run_remote_spark(node_ip, f"rm -f {marker_path}")
+    return rc_r == 0
+
+
 # Active set of jobs running on this host thread
 running_jobs = set()
 
@@ -828,8 +931,7 @@ def hylia_rolling_upgrade(job_id):
             
             # Check if we already rebooted this node for this job
             already_rebooted = False
-            rc_r, _, _ = run_remote_spark(node_ip, f"test -f /var/lib/hylia/upgrade_rebooted_{job_id}")
-            if rc_r == 0:
+            if check_reboot_marker(node_ip, job_id):
                 already_rebooted = True
                 log_upgrade(job_id, f"[{hostname}] Detected post-reboot resume. Skipping reboot step.")
 
@@ -970,20 +1072,27 @@ def hylia_rolling_upgrade(job_id):
                                 log_upgrade(job_id, f"[{hostname}] ERROR: Storage replica on node {o_host} is degraded or unsynchronized. Cannot reboot safely.")
                                 preflight_ok = False
                                 break
+                    if preflight_ok and len(target_nodes) > 1:
+                        if not verify_cluster_vdisk_replicas_before_reboot(job_id, node_ip, hostname, target_nodes):
+                            preflight_ok = False
                     if not preflight_ok:
                         raise Exception("Pre-flight storage health check failed. Aborting rolling upgrade reboot to prevent quorum storage loss.")
 
                     # Write marker file before rebooting
-                    run_remote_spark(node_ip, f"mkdir -p /var/lib/hylia && touch /var/lib/hylia/upgrade_rebooted_{job_id}")
+                    write_reboot_marker(node_ip, job_id)
                     
                     # Step 3: Reboot Host
                     log_upgrade(job_id, f"[{hostname}] Initiating host reboot sequence...")
-                    run_remote_spark(node_ip, "reboot || true")
+                    rc_reb, _, _ = run_mtls_spark_api(node_ip, "/api/v1/host/reboot", {}, method="POST")
+                    if rc_reb != 0:
+                        run_remote_spark(node_ip, "reboot || true")
                     time.sleep(10)
                     
                     log_upgrade(job_id, f"[{hostname}] Waiting for node to go offline...")
                     for _ in range(60):
-                        rc_p, _, _ = run_remote_spark(node_ip, "echo 1")
+                        rc_p, _, _ = run_mtls_spark_api(node_ip, "/api/v1/node/status", None, method="GET")
+                        if rc_p != 0:
+                            rc_p, _, _ = run_remote_spark(node_ip, "echo 1")
                         if rc_p != 0:
                             log_upgrade(job_id, f"[{hostname}] Node went offline.")
                             break
@@ -992,7 +1101,9 @@ def hylia_rolling_upgrade(job_id):
                     log_upgrade(job_id, f"[{hostname}] Waiting for node to come back online...")
                     online = False
                     for _ in range(120):
-                        rc_p, _, _ = run_remote_spark(node_ip, "echo 1")
+                        rc_p, _, _ = run_mtls_spark_api(node_ip, "/api/v1/node/status", None, method="GET")
+                        if rc_p != 0:
+                            rc_p, _, _ = run_remote_spark(node_ip, "echo 1")
                         if rc_p == 0:
                             online = True
                             log_upgrade(job_id, f"[{hostname}] Node is back online.")
@@ -1079,7 +1190,7 @@ def hylia_rolling_upgrade(job_id):
                     log_upgrade(job_id, f"[{hostname}] Single-node cluster: skipping maintenance leave.")
 
                 # Cleanup the reboot marker file
-                run_remote_spark(node_ip, f"rm -f /var/lib/hylia/upgrade_rebooted_{job_id}")
+                clear_reboot_marker(node_ip, job_id)
                 
                 log_upgrade(job_id, f"[{hostname}] Starting Hylia daemon service on upgraded host...")
                 ok_st, detail_st = spark_unit_action(node_ip, "start", ["hylia"])
