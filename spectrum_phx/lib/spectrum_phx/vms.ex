@@ -1827,6 +1827,13 @@ defmodule SpectrumPhx.Vms do
   end
 
   @doc "Fetch QEMU Guest Agent status, OS info, and live IP addresses for a running VM."
+  def guest_agent_status(name) when is_binary(name) do
+    case get_vm(name) do
+      {:ok, vm} -> guest_agent_status(vm)
+      _ -> {:ok, %{"connected" => false}}
+    end
+  end
+
   def guest_agent_status(%Vm{} = vm) do
     cond do
       elem(source(), 0) == :static ->
@@ -1844,7 +1851,7 @@ defmodule SpectrumPhx.Vms do
               _ = Hydra.query("UPDATE hydra.vms SET guest_ips = ? WHERE name = ?", [{"text", ip_str}, {"text", vm.name}])
             end
 
-            {:ok, body}
+            {:ok, Map.put_new(body, "ips", ips)}
 
           {:ok, body} when is_map(body) ->
             {:ok, body}
@@ -1874,6 +1881,13 @@ defmodule SpectrumPhx.Vms do
   end
 
   @doc "Read buffered serial console output for a running VM."
+  def serial_read(name) when is_binary(name) do
+    case get_vm(name) do
+      {:ok, vm} -> serial_read(vm)
+      _ -> {:ok, %{"output" => "", "pty" => ""}}
+    end
+  end
+
   def serial_read(%Vm{} = vm) do
     cond do
       elem(source(), 0) == :static ->

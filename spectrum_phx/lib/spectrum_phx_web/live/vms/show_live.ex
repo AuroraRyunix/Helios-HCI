@@ -428,8 +428,19 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   def handle_event("scan_host_devices", _params, socket) do
     vm = socket.assigns.vm
     host_ip = if Vm.placed?(vm), do: vm.host_ip, else: nil
-    pci = Vms.host_pci_devices(host_ip)
-    usb = Vms.host_usb_devices(host_ip)
+
+    pci =
+      case Vms.host_pci_devices(host_ip) do
+        {:ok, %{"devices" => list}} when is_list(list) -> list
+        _ -> []
+      end
+
+    usb =
+      case Vms.host_usb_devices(host_ip) do
+        {:ok, %{"devices" => list}} when is_list(list) -> list
+        _ -> []
+      end
+
     {:noreply, assign(socket, host_pci_devices: pci, host_usb_devices: usb)}
   end
 
@@ -472,7 +483,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   end
 
   def handle_event("probe_guest_agent", _params, socket) do
-    {:ok, status} = Vms.guest_agent_status(socket.assigns.name)
+    {:ok, status} = Vms.guest_agent_status(socket.assigns.vm)
     {:noreply, socket |> assign(guest_agent: status) |> reload()}
   end
 
@@ -518,7 +529,12 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   end
 
   def handle_event("serial_refresh", _params, socket) do
-    {:ok, %{"output" => out}} = Vms.serial_read(socket.assigns.name)
+    out =
+      case Vms.serial_read(socket.assigns.name) do
+        {:ok, %{"output" => o}} when is_binary(o) -> o
+        _ -> socket.assigns.serial_output
+      end
+
     {:noreply, assign(socket, serial_output: out || "")}
   end
 
@@ -532,17 +548,30 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
   defp probe_live_devices(socket) do
     vm = socket.assigns.vm
     host_ip = if Vm.placed?(vm), do: vm.host_ip, else: nil
-    pci = Vms.host_pci_devices(host_ip)
-    usb = Vms.host_usb_devices(host_ip)
+
+    pci =
+      case Vms.host_pci_devices(host_ip) do
+        {:ok, %{"devices" => list}} when is_list(list) -> list
+        _ -> []
+      end
+
+    usb =
+      case Vms.host_usb_devices(host_ip) do
+        {:ok, %{"devices" => list}} when is_list(list) -> list
+        _ -> []
+      end
 
     {ga, serial} =
       if Vm.running?(vm) do
-        {:ok, ga_res} = Vms.guest_agent_status(vm.name)
+        ga_res =
+          case Vms.guest_agent_status(vm) do
+            {:ok, res} -> res
+          end
 
         ser_res =
-          case Vms.serial_read(vm.name) do
+          case Vms.serial_read(vm) do
             {:ok, %{"output" => out}} when is_binary(out) -> out
-            {:ok, _} -> socket.assigns.serial_output
+            _ -> socket.assigns.serial_output
           end
 
         {ga_res, ser_res}
@@ -1204,7 +1233,7 @@ defmodule SpectrumPhxWeb.Vms.ShowLive do
           <div :if={@guest_agent && @guest_agent["connected"]} class="text-xs space-y-1 bg-base-300/40 p-3 rounded-lg font-mono">
             <div><span class="opacity-60">Hostname:</span> {@guest_agent["hostname"] || "unknown"}</div>
             <div><span class="opacity-60">OS:</span> {get_in(@guest_agent, ["os", "pretty-name"]) || get_in(@guest_agent, ["os", "name"]) || "unknown"}</div>
-            <div><span class="opacity-60">IPs:</span> {Enum.join(@guest_agent["ips"] || [], ", ")}</div>
+            <div><span class="opacity-60">IPs:</span> {Enum.join(@guest_agent["ips"] || @guest_agent["ip_addresses"] || [], ", ")}</div>
           </div>
 
           <div class="flex flex-wrap items-center gap-2 pt-1">
