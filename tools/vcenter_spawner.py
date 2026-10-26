@@ -344,13 +344,15 @@ def cmd_create(args, client):
     root_hash = "$y$j9T$3uOZwrcN4XuEhGphjaXQf15m$QMQMrrJsqbfoC5VK5wxRV8ql9Mz0YAvysuhtbKasLv0"
 
     deployed_nodes = []
+    start_idx = getattr(args, 'start_index', 1)
 
-    for i in range(1, count + 1):
+    for i in range(start_idx, start_idx + count):
         node_name = f"helios-node-{i:02d}"
-        ip = f"10.10.102.{args.start_ip + i - 1}"
+        offset = i - start_idx
+        ip = f"10.10.102.{args.start_ip + offset}"
         hostname = f"{node_name}.{DEFAULT_DOMAIN}"
 
-        print(f"\n--- Node {i}/{count}: {node_name} ({ip}) ---")
+        print(f"\n--- Node {i}/{start_idx + count - 1}: {node_name} ({ip}) ---")
 
         # 1. Generate Kickstart and OEMDRV ISO
         print(f"[{node_name}] Generating unattended kickstart ISO...")
@@ -542,6 +544,7 @@ def main():
     # create
     p_create = subparsers.add_parser("create", help="Spawn 1, 2, or 3 hypervisor test VMs")
     p_create.add_argument("--count", type=int, default=1, choices=[1, 2, 3], help="Number of nodes to spawn")
+    p_create.add_argument("--start-index", type=int, default=1, help="Starting node index (default: 1)")
     p_create.add_argument("--start-ip", type=int, default=DEFAULT_IP_BASE, help="Starting last-octet IP (default: 71)")
     p_create.add_argument("--ram-mb", type=int, default=8192, help="Memory size in MiB (default: 8192)")
     p_create.add_argument("--cpus", type=int, default=4, help="vCPU count (default: 4)")

@@ -1684,6 +1684,7 @@ WantedBy=multi-user.target
                 else:
                     zoo_servers_parts.append(f"server.{i}={ip}:2888:3888;2181")
             zoo_servers_str = " ".join(zoo_servers_parts)
+            zoo_client_str = ",".join(f"{ip}:2181" for ip in HOSTS[:3])
             seed_ips = HOSTS[0]
 
             # Generate cluster.json
@@ -1955,7 +1956,7 @@ WantedBy=multi-user.target
             node.write_file("/etc/containers/systemd/slate.container", slate_quad)
 
             kass_quad = QUADLETS["kass"].format(
-                node_id=idx, zoo_servers=zoo_servers_str, node_ip=node.ip,
+                node_id=idx, zoo_servers=zoo_client_str, node_ip=node.ip,
                 image=resolve_image("kass"))
             node.write_file("/etc/containers/systemd/kass.container", kass_quad)
 
@@ -2092,7 +2093,7 @@ openssl genrsa -out ca.key 2048
 # The CA outlives the leaves it signs, deliberately. At 3650 days for both, the CA and
 # every node certificate expired on the same day -- and a leaf renewed near that date
 # gets a notAfter past its issuer's, verifies fine on the day it is issued, and takes the
-# whole cluster down when the CA lapses under it. `impa` refuses to sign such a leaf.
+# whole cluster down when the CA lapses under it. impa refuses to sign such a leaf.
 openssl req -new -x509 -days 7300 -key ca.key -out ca.crt -subj "/CN=HCI-Root-CA"
 
 # 2. Client
@@ -2134,7 +2135,7 @@ keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth,clientAuth
 # Every address a caller can legitimately reach this node by. Without these, hostname
 # verification cannot be enabled at all and any cluster-signed cert impersonates any
-# node. The VIP term is conditional -- an empty SAN component makes `openssl req` fail.
+# node. The VIP term is conditional -- an empty SAN component makes openssl req fail.
 subjectAltName = IP:$ip,IP:127.0.0.1,DNS:localhost,DNS:Valkyrie-$h{f",IP:{VIP}" if VIP else ""}
 EOF
   openssl genrsa -out "node-$ip.key" 2048

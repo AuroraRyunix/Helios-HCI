@@ -2480,6 +2480,9 @@ def cmd_add_node(args):
 
     run_remote_spark(target, "rm -f /run/hci/cluster_operation.lock")
     declare_cluster_state([target], "started")
+    if not is_witness:
+        for ip in existing:
+            unit_action(ip, "restart", ["sidon"])
     print("[services] %s is converging toward the cluster's desired state." % target)
 
     stale = redundancy_factor_warning(config, len(ips), target)
@@ -2557,6 +2560,15 @@ def write_cluster_config(ips, config):
     """Push a cluster.json to every listed node. Returns the list of nodes that failed."""
     payload = base64.b64encode(json.dumps(config, indent=4).encode("utf-8")).decode("utf-8")
     command = f"mkdir -p /etc/hci && echo {payload} | base64 -d > /etc/hci/cluster.json"
+    hosts = config.get("hosts", [])
+    hosts_cmds = []
+    for h in hosts:
+        hip = h.get("ip")
+        hname = h.get("hostname")
+        if hip and hname:
+            hosts_cmds.append(f"grep -q '{hname}' /etc/hosts || echo '{hip} {hname}' >> /etc/hosts")
+    if hosts_cmds:
+        command += " && " + " && ".join(hosts_cmds)
     failed = []
     for ip, (rc, _out, _err) in run_parallel(ips, command).items():
         if rc != 0:
