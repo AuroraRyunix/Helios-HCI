@@ -202,6 +202,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         nil
       end
 
+    central_deployed? = status_type == :ok or length(clusters) > 0
+
     socket
     |> assign(:clusters, clusters)
     |> assign(:summary, summary)
@@ -209,6 +211,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     |> assign(:appliance_status, status_type)
     |> assign(:appliance, appliance)
     |> assign(:appliance_ip, appliance_ip)
+    |> assign(:central_deployed?, central_deployed?)
     |> assign(:vms, local_vms)
     |> assign(:allocated_vcpus, allocated_vcpus)
     |> assign(:vcpu_percent, vcpu_percent)
@@ -220,7 +223,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   def render(assigns) do
     ~H"""
     <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:central}>
-      <%!-- Hero Header with Status Indicators --%>
+      <%!-- Top Hero Header --%>
       <div class="relative overflow-hidden rounded-2xl bg-gradient-to-r from-base-200/90 via-base-200/50 to-base-300/80 p-6 border border-primary/20 shadow-2xl backdrop-blur-md mb-6">
         <div class="absolute -top-24 -right-24 size-72 rounded-full bg-primary/10 blur-3xl pointer-events-none"></div>
         <div class="absolute -bottom-24 -left-24 size-72 rounded-full bg-accent/10 blur-3xl pointer-events-none"></div>
@@ -237,9 +240,13 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                     Helios Central
                   </h1>
                   <span class="badge badge-sm badge-primary badge-outline font-mono">Fleet Federation</span>
-                  <span :if={@appliance_status == :ok and @appliance_ip} class="badge badge-sm badge-success gap-1">
+                  <span :if={@central_deployed? and @appliance_ip} class="badge badge-sm badge-success gap-1">
                     <span class="size-1.5 rounded-full bg-success animate-ping"></span>
                     Appliance Online
+                  </span>
+                  <span :if={!@central_deployed?} class="badge badge-sm badge-ghost border border-base-content/20 gap-1 text-base-content/70">
+                    <span class="size-1.5 rounded-full bg-base-content/40"></span>
+                    Not Deployed
                   </span>
                 </div>
                 <p class="text-xs text-base-content/70 mt-0.5">
@@ -251,7 +258,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
           <div class="flex flex-wrap items-center gap-2.5">
             <a
-              :if={@appliance_status == :ok and @appliance_ip}
+              :if={@central_deployed? and @appliance_ip}
               href={"https://#{@appliance_ip}:8443/"}
               target="_blank"
               class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/25"
@@ -260,7 +267,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               <.icon name="hero-arrow-top-right-on-square" class="size-4" /> Launch Helios Central
             </a>
             <button
-              :if={@appliance_status != :ok}
+              :if={!@central_deployed?}
               phx-click="open_deploy_modal"
               class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/25"
               id="deploy-appliance-btn"
@@ -284,8 +291,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           </div>
         </div>
 
-        <%!-- Fleet Metrics Deck --%>
-        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-6 pt-6 border-t border-base-content/10">
+        <%!-- Fleet Metrics Deck (Shown only when Central is active and managing clusters) --%>
+        <div :if={@central_deployed?} class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-6 pt-6 border-t border-base-content/10">
           <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5 relative overflow-hidden group hover:border-primary/30 transition-all">
             <div class="flex items-center justify-between text-xs text-base-content/70 mb-1">
               <span>Managed Clusters</span>
@@ -341,8 +348,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         </div>
       </div>
 
-      <%!-- Central Appliance Connected Banner --%>
-      <div :if={@appliance_status == :ok and @appliance_ip} class="alert bg-base-200 border border-primary/30 shadow-lg rounded-2xl mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+      <%!-- Central Appliance Connected Banner (if deployed) --%>
+      <div :if={@central_deployed? and @appliance_ip} class="alert bg-base-200 border border-primary/30 shadow-lg rounded-2xl mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div class="flex items-center gap-3">
           <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
             <.icon name="hero-shield-check" class="size-6" />
@@ -368,311 +375,103 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         </div>
       </div>
 
-      <%!-- View Switcher Tabs --%>
-      <div class="flex items-center gap-2 border-b border-base-content/10 pb-3 mb-6">
-        <button
-          phx-click="switch_tab"
-          phx-value-tab="fleet"
-          class={["btn btn-sm gap-2", if(@active_tab == :fleet, do: "btn-primary", else: "btn-ghost")]}
-          id="tab-fleet"
-        >
-          <.icon name="hero-squares-2x2" class="size-4" /> Member Clusters ({@summary.total_clusters})
-        </button>
-        <button
-          phx-click="switch_tab"
-          phx-value-tab="vms"
-          class={["btn btn-sm gap-2", if(@active_tab == :vms, do: "btn-primary", else: "btn-ghost")]}
-          id="tab-vms"
-        >
-          <.icon name="hero-computer-desktop" class="size-4" /> Global VM Explorer ({length(@vms)})
-        </button>
-        <button
-          phx-click="switch_tab"
-          phx-value-tab="library"
-          class={["btn btn-sm gap-2", if(@active_tab == :library, do: "btn-primary", else: "btn-ghost")]}
-          id="tab-library"
-        >
-          <.icon name="hero-rectangle-stack" class="size-4" /> Central Content Library ({length(@images)})
-        </button>
-        <button
-          phx-click="switch_tab"
-          phx-value-tab="setup"
-          class={["btn btn-sm gap-2", if(@active_tab == :setup, do: "btn-primary", else: "btn-ghost")]}
-          id="tab-setup"
-        >
-          <.icon name="hero-cpu-chip" class="size-4" /> Central Appliance Setup
-        </button>
-      </div>
-
-      <%!-- TAB 1: FLEET CLUSTERS MATRIX --%>
-      <div :if={@active_tab == :fleet} class="space-y-4" id="fleet-tab-content">
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          <div :for={c <- @clusters} class="card bg-base-200 border border-base-content/10 shadow-lg hover:border-primary/40 transition-all rounded-2xl overflow-hidden group">
-            <div class="card-body p-5">
-              <div class="flex items-start justify-between gap-3">
-                <div class="flex items-center gap-2.5">
-                  <div class="size-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary group-hover:scale-105 transition-transform">
-                    <.icon name="hero-circle-stack" class="size-5" />
-                  </div>
-                  <div>
-                    <h3 class="font-bold text-base tracking-tight flex items-center gap-1.5">
-                      <span>{c.name}</span>
-                      <span :if={c.is_local?} class="badge badge-xs badge-primary font-mono">LOCAL</span>
-                    </h3>
-                    <div class="font-mono text-xs text-base-content/60 flex items-center gap-1.5 mt-0.5">
-                      <.icon name="hero-signal" class="size-3 text-success" />
-                      <span>{c.vip}:{c.port}</span>
-                    </div>
-                  </div>
-                </div>
-                <span class={["badge badge-sm font-mono uppercase gap-1", if(c.status == "CONNECTED", do: "badge-success", else: "badge-error")]}>
-                  <span class="size-1 rounded-full bg-current"></span>
-                  {c.status}
-                </span>
+      <%!-- STATE A: HELIOS CENTRAL NOT DEPLOYED (Authentic Onboarding View) --%>
+      <div :if={!@central_deployed?} class="space-y-6" id="central-not-deployed-view">
+        <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-xl">
+          <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pb-6 border-b border-base-content/10">
+            <div class="flex items-center gap-4">
+              <div class="size-12 rounded-2xl bg-base-300 border border-base-content/10 flex items-center justify-center text-primary shrink-0">
+                <.icon name="hero-server-stack" class="size-7" />
               </div>
-
-              <div class="grid grid-cols-3 gap-2 my-4 pt-3 border-t border-base-content/5 text-center">
-                <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
-                  <div class="text-[11px] text-base-content/60">Nodes</div>
-                  <div class="text-base font-bold font-mono">{c.node_count}</div>
-                </div>
-                <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
-                  <div class="text-[11px] text-base-content/60">Guests</div>
-                  <div class="text-base font-bold font-mono">{c.vm_count}</div>
-                </div>
-                <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
-                  <div class="text-[11px] text-base-content/60">vCPUs</div>
-                  <div class="text-base font-bold font-mono">{c.cpu_cores}</div>
-                </div>
-              </div>
-
-              <div class="space-y-2 text-xs">
-                <div>
-                  <div class="flex justify-between text-[11px] text-base-content/70 mb-0.5">
-                    <span>Memory Allocation</span>
-                    <span class="font-mono">{round(c.memory_used_mb / 1024)} / {round(c.memory_total_mb / 1024)} GiB</span>
-                  </div>
-                  <div class="w-full bg-base-100 rounded-full h-1.5 overflow-hidden">
-                    <div class="bg-primary h-1.5 rounded-full" style={"width: #{if c.memory_total_mb > 0, do: min(100, round(c.memory_used_mb * 100 / c.memory_total_mb)), else: 0}%"}></div>
-                  </div>
-                </div>
-                <div>
-                  <div class="flex justify-between text-[11px] text-base-content/70 mb-0.5">
-                    <span>Sidon Storage</span>
-                    <span class="font-mono">{round(c.storage_used_bytes / 1_073_741_824)} / {round(c.storage_total_bytes / 1_073_741_824)} GiB</span>
-                  </div>
-                  <div class="w-full bg-base-100 rounded-full h-1.5 overflow-hidden">
-                    <div class="bg-accent h-1.5 rounded-full" style={"width: #{if c.storage_total_bytes > 0, do: min(100, round(c.storage_used_bytes * 100 / c.storage_total_bytes)), else: 0}%"}></div>
-                  </div>
-                </div>
-              </div>
-
-              <div class="card-actions justify-between items-center mt-4 pt-3 border-t border-base-content/5">
-                <a
-                  href={"https://#{c.vip}:#{if c.is_local?, do: 8444, else: c.port}/"}
-                  target="_blank"
-                  class="btn btn-xs btn-ghost gap-1 text-primary hover:bg-primary/10"
-                >
-                  <.icon name="hero-arrow-top-right-on-square" class="size-3.5" /> Open WebUI
-                </a>
-                <div class="flex items-center gap-1">
-                  <button
-                    :if={!c.is_local?}
-                    phx-click="remove_cluster"
-                    phx-value-id={c.cluster_id}
-                    class="btn btn-xs btn-ghost btn-circle text-error hover:bg-error/10"
-                    title="Disconnect Cluster"
-                  >
-                    <.icon name="hero-trash" class="size-3.5" />
-                  </button>
-                </div>
+              <div>
+                <h2 class="text-xl font-bold tracking-tight">Helios Central is Not Deployed</h2>
+                <p class="text-xs text-base-content/70 mt-1">
+                  This cluster is operating in standalone cluster mode (Element tier). Deploy the Helios Central virtual appliance
+                  to enable multi-cluster federation, cross-cluster DRS, and fleet-wide governance, or connect to an existing Central instance.
+                </p>
               </div>
             </div>
-          </div>
-        </div>
-      </div>
-
-      <%!-- TAB 2: GLOBAL VM EXPLORER --%>
-      <div :if={@active_tab == :vms} class="space-y-4" id="vms-tab-content">
-        <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
-          <div class="relative w-full sm:w-96">
-            <.icon name="hero-magnifying-glass" class="size-4 text-base-content/50 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              placeholder="Search cross-cluster VMs by name, state, or host..."
-              class="input input-sm input-bordered w-full pl-9"
-              phx-keyup="search_vms"
-              phx-debounce="200"
-              value={@search_query}
-            />
-          </div>
-          <div class="text-xs text-base-content/60 font-mono">
-            Showing {length(filtered_vms(@vms, @search_query))} of {length(@vms)} virtual guests
-          </div>
-        </div>
-
-        <div :if={@vms == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
-          <.icon name="hero-computer-desktop" class="size-8 mx-auto mb-2 opacity-40" />
-          No virtual machines provisioned on this cluster yet.
-        </div>
-
-        <div :if={@vms != []} class="overflow-x-auto rounded-xl border border-base-content/10 bg-base-200">
-          <table class="table table-sm">
-            <thead>
-              <tr class="border-b border-base-content/10 bg-base-300/50">
-                <th>Virtual Machine</th>
-                <th>Cluster Origin</th>
-                <th>Status</th>
-                <th>vCPUs</th>
-                <th>Memory</th>
-                <th>Assigned Hypervisor</th>
-                <th>Affinity Policy</th>
-                <th class="text-right">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr :for={vm <- filtered_vms(@vms, @search_query)} class="hover:bg-base-100/50 border-b border-base-content/5">
-                <td class="font-bold flex items-center gap-2">
-                  <.icon name="hero-computer-desktop" class="size-4 text-primary" />
-                  <span>{vm.name}</span>
-                </td>
-                <td>
-                  <span class="badge badge-sm badge-outline gap-1 font-mono">
-                    <.icon name="hero-circle-stack" class="size-3" />
-                    {vm.cluster_name}
-                  </span>
-                </td>
-                <td>
-                  <span class={["badge badge-xs uppercase font-mono", if(vm.state == "running", do: "badge-success", else: "badge-ghost")]}>
-                    {vm.state}
-                  </span>
-                </td>
-                <td class="font-mono">{vm.vcpu} vCPU</td>
-                <td class="font-mono">{vm.memory} MiB</td>
-                <td class="font-mono text-xs">{if vm.host_ip != "", do: vm.host_ip, else: "—"}</td>
-                <td>
-                  <span :if={vm.affinity} class="badge badge-xs badge-info font-mono">{vm.affinity}</span>
-                  <span :if={!vm.affinity} class="text-xs text-base-content/40">—</span>
-                </td>
-                <td class="text-right">
-                  <a
-                    href={~p"/vms/#{vm.name}"}
-                    class="btn btn-xs btn-ghost gap-1"
-                  >
-                    <.icon name="hero-adjustments-horizontal" class="size-3" /> Manage
-                  </a>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      <%!-- TAB 3: CENTRAL CONTENT LIBRARY --%>
-      <div :if={@active_tab == :library} class="space-y-4" id="library-tab-content">
-        <div class="flex items-center justify-between">
-          <div>
-            <h2 class="text-lg font-bold">Central Golden Images &amp; Templates</h2>
-            <p class="text-xs text-base-content/70">Replicated storage catalog registered in Sidon DFS and hydra.valhalla_images.</p>
-          </div>
-          <a href={~p"/images"} class="btn btn-sm btn-outline btn-primary gap-1">
-            <.icon name="hero-arrow-up-tray" class="size-4" /> Manage Images Catalogue
-          </a>
-        </div>
-
-        <div :if={@images == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
-          <.icon name="hero-rectangle-stack" class="size-8 mx-auto mb-2 opacity-40" />
-          No golden images or ISO templates registered in the Content Library.
-          <div class="mt-2">
-            <a href={~p"/images"} class="btn btn-xs btn-primary gap-1">
-              <.icon name="hero-plus" class="size-3" /> Upload an Image
-            </a>
-          </div>
-        </div>
-
-        <div :if={@images != []} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          <div :for={img <- @images} class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
-            <div class="flex items-center justify-between mb-2">
-              <span class="badge badge-sm badge-info font-mono uppercase">{img.type}</span>
-              <span :if={img.on_vdisk?} class="badge badge-xs badge-success font-mono">vDisk</span>
-              <span :if={!img.on_vdisk?} class="badge badge-xs badge-ghost font-mono">File</span>
-            </div>
-            <h4 class="font-bold text-sm truncate" title={img.name}>{img.name}</h4>
-            <div class="text-xs text-base-content/60 font-mono mt-1 truncate" title={img.filename}>
-              {img.filename} ({bytes(img.size_bytes)})
-            </div>
-            <div class="text-[11px] text-base-content/50 mt-2 font-mono truncate" title={img.path}>
-              {img.path}
-            </div>
-            <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
-              <span class="text-xs font-mono text-base-content/60">
-                {if img.created_at, do: Calendar.strftime(img.created_at, "%Y-%m-%d %H:%M"), else: "—"}
-              </span>
-              <a href={~p"/images"} class="btn btn-xs btn-ghost text-primary">View in Catalogue</a>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <%!-- TAB 4: CENTRAL APPLIANCE SETUP & SIZING --%>
-      <div :if={@active_tab == :setup} class="space-y-6" id="setup-tab-content">
-        <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-lg">
-          <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-base-content/10">
-            <div>
-              <h2 class="text-xl font-bold flex items-center gap-2">
-                <.icon name="hero-server-stack" class="size-6 text-primary" />
-                <span>Helios Central Virtual Appliance Architecture</span>
-              </h2>
-              <p class="text-xs text-base-content/70 mt-1">
-                The autonomous fleet management virtual appliance for multi-cluster orchestration, DRS, and lifecycle operations.
-                Deploys as a self-contained virtual machine with automated Cloud-Init NoCloud boot.
-              </p>
-            </div>
-            <button
-              phx-click="open_deploy_modal"
-              class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
-            >
-              <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
-            </button>
-          </div>
-
-          <div class="mt-6">
-            <h3 class="text-sm font-semibold uppercase tracking-wider text-base-content/60 mb-3">
-              Appliance Hardware Sizing Presets
-            </h3>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div
-                :for={p <- @presets}
-                phx-click="select_preset"
-                phx-value-preset={p.id}
-                class={["card p-5 rounded-xl border cursor-pointer transition-all hover:scale-[1.01]",
-                  if(@selected_preset == p.id, do: "border-primary bg-primary/5 shadow-md shadow-primary/10", else: "border-base-content/10 bg-base-100/50 hover:border-base-content/30")]}
+            <div class="flex items-center gap-2 shrink-0">
+              <button
+                phx-click="open_deploy_modal"
+                class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
               >
-                <div class="flex items-center justify-between mb-2">
-                  <span class="font-bold text-base">{p.name}</span>
-                  <span class={["badge badge-sm font-mono", "badge-#{p.color}"]}>{p.badge}</span>
+                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
+              </button>
+              <button
+                phx-click="open_enroll_modal"
+                class="btn btn-outline btn-accent gap-1.5"
+              >
+                <.icon name="hero-plus-circle" class="size-4" /> Connect to Central
+              </button>
+            </div>
+          </div>
+
+          <%!-- Deployment Options Breakdown --%>
+          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+            <div class="rounded-xl bg-base-100/60 p-5 border border-base-content/5 space-y-3">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-sm flex items-center gap-2">
+                  <.icon name="hero-cpu-chip" class="size-4 text-primary" />
+                  Option 1: Deploy New Central Virtual Appliance
+                </h3>
+                <span class="badge badge-xs badge-primary font-mono">1-Click Provision</span>
+              </div>
+              <p class="text-xs text-base-content/70">
+                Spawns a dedicated, self-contained Rocky Linux 10 virtual appliance on this cluster.
+                Automates Sidon CoW rootfs cloning, pure Cloud-Init NoCloud configuration, vTPM 2.0 emulator, and auto-pairing as Member 01.
+              </p>
+              <div class="grid grid-cols-3 gap-2 pt-2">
+                <div :for={p <- @presets} class="bg-base-200/60 p-2.5 rounded-lg border border-base-content/5 text-center">
+                  <div class="font-bold text-xs">{p.name |> String.split(" ") |> hd()}</div>
+                  <div class="text-[11px] font-mono text-base-content/60 mt-0.5">{p.vcpus}C / {round(p.memory_mb / 1024)}G</div>
+                  <div class="text-[10px] text-base-content/40 font-mono">{p.disk_gb}G CoW</div>
                 </div>
-                <p class="text-xs text-base-content/70 mb-4">{p.desc}</p>
-                <div class="space-y-1.5 font-mono text-xs border-t border-base-content/5 pt-3">
-                  <div class="flex justify-between">
-                    <span class="text-base-content/60">vCPUs:</span>
-                    <span class="font-bold">{p.vcpus} vCPU</span>
-                  </div>
-                  <div class="flex justify-between">
-                    <span class="text-base-content/60">Memory:</span>
-                    <span class="font-bold">{p.memory_mb} MiB ({round(p.memory_mb / 1024)} GiB)</span>
-                  </div>
-                  <div class="flex justify-between">
-                    <span class="text-base-content/60">Storage vDisk:</span>
-                    <span class="font-bold">{p.disk_gb} GiB Sidon CoW</span>
-                  </div>
+              </div>
+              <div class="pt-2">
+                <button phx-click="open_deploy_modal" class="btn btn-xs btn-primary gap-1 w-full">
+                  Configure &amp; Deploy Appliance Now
+                </button>
+              </div>
+            </div>
+
+            <div class="rounded-xl bg-base-100/60 p-5 border border-base-content/5 space-y-3">
+              <div class="flex items-center justify-between">
+                <h3 class="font-bold text-sm flex items-center gap-2">
+                  <.icon name="hero-link" class="size-4 text-accent" />
+                  Option 2: Connect to Existing Helios Central
+                </h3>
+                <span class="badge badge-xs badge-accent font-mono">Fleet Registration</span>
+              </div>
+              <p class="text-xs text-base-content/70">
+                If your datacenter environment already has an active Helios Central instance running, register this cluster
+                using its target Virtual IP (VIP), API port, and mutual TLS federation token.
+              </p>
+              <div class="bg-base-200/60 p-3 rounded-lg border border-base-content/5 space-y-1.5 text-xs font-mono">
+                <div class="flex justify-between">
+                  <span class="text-base-content/60">Local Cluster VIP:</span>
+                  <span class="font-bold">{Config.vip() || "Configured via keepalived"}</span>
                 </div>
+                <div class="flex justify-between">
+                  <span class="text-base-content/60">Local Hypervisor Nodes:</span>
+                  <span class="font-bold">{length(SpectrumPhx.Settings.cluster_nodes())} nodes</span>
+                </div>
+                <div class="flex justify-between">
+                  <span class="text-base-content/60">Federation Protocol:</span>
+                  <span class="font-bold">mTLS TLSv1.3 on :8443</span>
+                </div>
+              </div>
+              <div class="pt-2">
+                <button phx-click="open_enroll_modal" class="btn btn-xs btn-outline btn-accent gap-1 w-full">
+                  Connect This Cluster to Central
+                </button>
               </div>
             </div>
           </div>
 
+          <%!-- Architecture & Boot Flow Steps --%>
           <div class="mt-8 pt-6 border-t border-base-content/10">
-            <h3 class="text-sm font-semibold uppercase tracking-wider text-base-content/60 mb-3">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-base-content/60 mb-3">
               Automated First-Boot Provisioning Sequence
             </h3>
             <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -695,6 +494,347 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <div class="text-success font-mono text-xs mb-1">04 / ENROLLMENT</div>
                 <div class="font-bold text-sm">Cluster Auto-Pairing</div>
                 <p class="text-xs text-base-content/60 mt-1">Mutual TLS cluster trust exchange registering the deploying cluster as Member 01.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <%!-- STATE B: HELIOS CENTRAL DEPLOYED (Active Fleet Management Dashboard) --%>
+      <div :if={@central_deployed?} class="space-y-6" id="central-deployed-view">
+        <%!-- View Switcher Tabs --%>
+        <div class="flex items-center gap-2 border-b border-base-content/10 pb-3 mb-6">
+          <button
+            phx-click="switch_tab"
+            phx-value-tab="fleet"
+            class={["btn btn-sm gap-2", if(@active_tab == :fleet, do: "btn-primary", else: "btn-ghost")]}
+            id="tab-fleet"
+          >
+            <.icon name="hero-squares-2x2" class="size-4" /> Member Clusters ({@summary.total_clusters})
+          </button>
+          <button
+            phx-click="switch_tab"
+            phx-value-tab="vms"
+            class={["btn btn-sm gap-2", if(@active_tab == :vms, do: "btn-primary", else: "btn-ghost")]}
+            id="tab-vms"
+          >
+            <.icon name="hero-computer-desktop" class="size-4" /> Global VM Explorer ({length(@vms)})
+          </button>
+          <button
+            phx-click="switch_tab"
+            phx-value-tab="library"
+            class={["btn btn-sm gap-2", if(@active_tab == :library, do: "btn-primary", else: "btn-ghost")]}
+            id="tab-library"
+          >
+            <.icon name="hero-rectangle-stack" class="size-4" /> Central Content Library ({length(@images)})
+          </button>
+          <button
+            phx-click="switch_tab"
+            phx-value-tab="setup"
+            class={["btn btn-sm gap-2", if(@active_tab == :setup, do: "btn-primary", else: "btn-ghost")]}
+            id="tab-setup"
+          >
+            <.icon name="hero-cpu-chip" class="size-4" /> Central Appliance Setup
+          </button>
+        </div>
+
+        <%!-- TAB 1: FLEET CLUSTERS MATRIX --%>
+        <div :if={@active_tab == :fleet} class="space-y-4" id="fleet-tab-content">
+          <div :if={@clusters == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
+            <.icon name="hero-circle-stack" class="size-8 mx-auto mb-2 opacity-40" />
+            No member clusters currently enrolled in this Central fleet.
+          </div>
+
+          <div :if={@clusters != []} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <div :for={c <- @clusters} class="card bg-base-200 border border-base-content/10 shadow-lg hover:border-primary/40 transition-all rounded-2xl overflow-hidden group">
+              <div class="card-body p-5">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="flex items-center gap-2.5">
+                    <div class="size-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary group-hover:scale-105 transition-transform">
+                      <.icon name="hero-circle-stack" class="size-5" />
+                    </div>
+                    <div>
+                      <h3 class="font-bold text-base tracking-tight flex items-center gap-1.5">
+                        <span>{c.name}</span>
+                        <span :if={c.is_local?} class="badge badge-xs badge-primary font-mono">LOCAL</span>
+                      </h3>
+                      <div class="font-mono text-xs text-base-content/60 flex items-center gap-1.5 mt-0.5">
+                        <.icon name="hero-signal" class="size-3 text-success" />
+                        <span>{c.vip}:{c.port}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <span class={["badge badge-sm font-mono uppercase gap-1", if(c.status == "CONNECTED", do: "badge-success", else: "badge-error")]}>
+                    <span class="size-1 rounded-full bg-current"></span>
+                    {c.status}
+                  </span>
+                </div>
+
+                <div class="grid grid-cols-3 gap-2 my-4 pt-3 border-t border-base-content/5 text-center">
+                  <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
+                    <div class="text-[11px] text-base-content/60">Nodes</div>
+                    <div class="text-base font-bold font-mono">{c.node_count}</div>
+                  </div>
+                  <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
+                    <div class="text-[11px] text-base-content/60">Guests</div>
+                    <div class="text-base font-bold font-mono">{c.vm_count}</div>
+                  </div>
+                  <div class="bg-base-100/50 rounded-lg p-2 border border-base-content/5">
+                    <div class="text-[11px] text-base-content/60">vCPUs</div>
+                    <div class="text-base font-bold font-mono">{c.cpu_cores}</div>
+                  </div>
+                </div>
+
+                <div class="space-y-2 text-xs">
+                  <div>
+                    <div class="flex justify-between text-[11px] text-base-content/70 mb-0.5">
+                      <span>Memory Allocation</span>
+                      <span class="font-mono">{round(c.memory_used_mb / 1024)} / {round(c.memory_total_mb / 1024)} GiB</span>
+                    </div>
+                    <div class="w-full bg-base-100 rounded-full h-1.5 overflow-hidden">
+                      <div class="bg-primary h-1.5 rounded-full" style={"width: #{if c.memory_total_mb > 0, do: min(100, round(c.memory_used_mb * 100 / c.memory_total_mb)), else: 0}%"}></div>
+                    </div>
+                  </div>
+                  <div>
+                    <div class="flex justify-between text-[11px] text-base-content/70 mb-0.5">
+                      <span>Sidon Storage</span>
+                      <span class="font-mono">{round(c.storage_used_bytes / 1_073_741_824)} / {round(c.storage_total_bytes / 1_073_741_824)} GiB</span>
+                    </div>
+                    <div class="w-full bg-base-100 rounded-full h-1.5 overflow-hidden">
+                      <div class="bg-accent h-1.5 rounded-full" style={"width: #{if c.storage_total_bytes > 0, do: min(100, round(c.storage_used_bytes * 100 / c.storage_total_bytes)), else: 0}%"}></div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="card-actions justify-between items-center mt-4 pt-3 border-t border-base-content/5">
+                  <a
+                    href={"https://#{c.vip}:#{if c.is_local?, do: 8444, else: c.port}/"}
+                    target="_blank"
+                    class="btn btn-xs btn-ghost gap-1 text-primary hover:bg-primary/10"
+                  >
+                    <.icon name="hero-arrow-top-right-on-square" class="size-3.5" /> Open WebUI
+                  </a>
+                  <div class="flex items-center gap-1">
+                    <button
+                      :if={!c.is_local?}
+                      phx-click="remove_cluster"
+                      phx-value-id={c.cluster_id}
+                      class="btn btn-xs btn-ghost btn-circle text-error hover:bg-error/10"
+                      title="Disconnect Cluster"
+                    >
+                      <.icon name="hero-trash" class="size-3.5" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <%!-- TAB 2: GLOBAL VM EXPLORER --%>
+        <div :if={@active_tab == :vms} class="space-y-4" id="vms-tab-content">
+          <div class="flex flex-col sm:flex-row items-center justify-between gap-4">
+            <div class="relative w-full sm:w-96">
+              <.icon name="hero-magnifying-glass" class="size-4 text-base-content/50 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search cross-cluster VMs by name, state, or host..."
+                class="input input-sm input-bordered w-full pl-9"
+                phx-keyup="search_vms"
+                phx-debounce="200"
+                value={@search_query}
+              />
+            </div>
+            <div class="text-xs text-base-content/60 font-mono">
+              Showing {length(filtered_vms(@vms, @search_query))} of {length(@vms)} virtual guests
+            </div>
+          </div>
+
+          <div :if={@vms == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
+            <.icon name="hero-computer-desktop" class="size-8 mx-auto mb-2 opacity-40" />
+            No virtual machines provisioned across the fleet.
+          </div>
+
+          <div :if={@vms != []} class="overflow-x-auto rounded-xl border border-base-content/10 bg-base-200">
+            <table class="table table-sm">
+              <thead>
+                <tr class="border-b border-base-content/10 bg-base-300/50">
+                  <th>Virtual Machine</th>
+                  <th>Cluster Origin</th>
+                  <th>Status</th>
+                  <th>vCPUs</th>
+                  <th>Memory</th>
+                  <th>Assigned Hypervisor</th>
+                  <th>Affinity Policy</th>
+                  <th class="text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr :for={vm <- filtered_vms(@vms, @search_query)} class="hover:bg-base-100/50 border-b border-base-content/5">
+                  <td class="font-bold flex items-center gap-2">
+                    <.icon name="hero-computer-desktop" class="size-4 text-primary" />
+                    <span>{vm.name}</span>
+                  </td>
+                  <td>
+                    <span class="badge badge-sm badge-outline gap-1 font-mono">
+                      <.icon name="hero-circle-stack" class="size-3" />
+                      {vm.cluster_name}
+                    </span>
+                  </td>
+                  <td>
+                    <span class={["badge badge-xs uppercase font-mono", if(vm.state == "running", do: "badge-success", else: "badge-ghost")]}>
+                      {vm.state}
+                    </span>
+                  </td>
+                  <td class="font-mono">{vm.vcpu} vCPU</td>
+                  <td class="font-mono">{vm.memory} MiB</td>
+                  <td class="font-mono text-xs">{if vm.host_ip != "", do: vm.host_ip, else: "—"}</td>
+                  <td>
+                    <span :if={vm.affinity} class="badge badge-xs badge-info font-mono">{vm.affinity}</span>
+                    <span :if={!vm.affinity} class="text-xs text-base-content/40">—</span>
+                  </td>
+                  <td class="text-right">
+                    <a
+                      href={~p"/vms/#{vm.name}"}
+                      class="btn btn-xs btn-ghost gap-1"
+                    >
+                      <.icon name="hero-adjustments-horizontal" class="size-3" /> Manage
+                    </a>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <%!-- TAB 3: CENTRAL CONTENT LIBRARY --%>
+        <div :if={@active_tab == :library} class="space-y-4" id="library-tab-content">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-lg font-bold">Central Golden Images &amp; Templates</h2>
+              <p class="text-xs text-base-content/70">Replicated storage catalog registered in Sidon DFS and hydra.valhalla_images.</p>
+            </div>
+            <a href={~p"/images"} class="btn btn-sm btn-outline btn-primary gap-1">
+              <.icon name="hero-arrow-up-tray" class="size-4" /> Manage Images Catalogue
+            </a>
+          </div>
+
+          <div :if={@images == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
+            <.icon name="hero-rectangle-stack" class="size-8 mx-auto mb-2 opacity-40" />
+            No golden images or ISO templates registered in the Content Library.
+            <div class="mt-2">
+              <a href={~p"/images"} class="btn btn-xs btn-primary gap-1">
+                <.icon name="hero-plus" class="size-3" /> Upload an Image
+              </a>
+            </div>
+          </div>
+
+          <div :if={@images != []} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div :for={img <- @images} class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
+              <div class="flex items-center justify-between mb-2">
+                <span class="badge badge-sm badge-info font-mono uppercase">{img.type}</span>
+                <span :if={img.on_vdisk?} class="badge badge-xs badge-success font-mono">vDisk</span>
+                <span :if={!img.on_vdisk?} class="badge badge-xs badge-ghost font-mono">File</span>
+              </div>
+              <h4 class="font-bold text-sm truncate" title={img.name}>{img.name}</h4>
+              <div class="text-xs text-base-content/60 font-mono mt-1 truncate" title={img.filename}>
+                {img.filename} ({bytes(img.size_bytes)})
+              </div>
+              <div class="text-[11px] text-base-content/50 mt-2 font-mono truncate" title={img.path}>
+                {img.path}
+              </div>
+              <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
+                <span class="text-xs font-mono text-base-content/60">
+                  {if img.created_at, do: Calendar.strftime(img.created_at, "%Y-%m-%d %H:%M"), else: "—"}
+                </span>
+                <a href={~p"/images"} class="btn btn-xs btn-ghost text-primary">View in Catalogue</a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <%!-- TAB 4: CENTRAL APPLIANCE SETUP & SIZING --%>
+        <div :if={@active_tab == :setup} class="space-y-6" id="setup-tab-content">
+          <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-lg">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 pb-6 border-b border-base-content/10">
+              <div>
+                <h2 class="text-xl font-bold flex items-center gap-2">
+                  <.icon name="hero-server-stack" class="size-6 text-primary" />
+                  <span>Helios Central Virtual Appliance Architecture</span>
+                </h2>
+                <p class="text-xs text-base-content/70 mt-1">
+                  The autonomous fleet management virtual appliance for multi-cluster orchestration, DRS, and lifecycle operations.
+                  Deploys as a self-contained virtual machine with automated Cloud-Init NoCloud boot.
+                </p>
+              </div>
+              <button
+                phx-click="open_deploy_modal"
+                class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
+              >
+                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
+              </button>
+            </div>
+
+            <div class="mt-6">
+              <h3 class="text-sm font-semibold uppercase tracking-wider text-base-content/60 mb-3">
+                Appliance Hardware Sizing Presets
+              </h3>
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div
+                  :for={p <- @presets}
+                  phx-click="select_preset"
+                  phx-value-preset={p.id}
+                  class={["card p-5 rounded-xl border cursor-pointer transition-all hover:scale-[1.01]",
+                    if(@selected_preset == p.id, do: "border-primary bg-primary/5 shadow-md shadow-primary/10", else: "border-base-content/10 bg-base-100/50 hover:border-base-content/30")]}
+                >
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="font-bold text-base">{p.name}</span>
+                    <span class={["badge badge-sm font-mono", "badge-#{p.color}"]}>{p.badge}</span>
+                  </div>
+                  <p class="text-xs text-base-content/70 mb-4">{p.desc}</p>
+                  <div class="space-y-1.5 font-mono text-xs border-t border-base-content/5 pt-3">
+                    <div class="flex justify-between">
+                      <span class="text-base-content/60">vCPUs:</span>
+                      <span class="font-bold">{p.vcpus} vCPU</span>
+                    </div>
+                    <div class="flex justify-between">
+                      <span class="text-base-content/60">Memory:</span>
+                      <span class="font-bold">{p.memory_mb} MiB ({round(p.memory_mb / 1024)} GiB)</span>
+                    </div>
+                    <div class="flex justify-between">
+                      <span class="text-base-content/60">Storage vDisk:</span>
+                      <span class="font-bold">{p.disk_gb} GiB Sidon CoW</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-8 pt-6 border-t border-base-content/10">
+              <h3 class="text-sm font-semibold uppercase tracking-wider text-base-content/60 mb-3">
+                Automated First-Boot Provisioning Sequence
+              </h3>
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
+                  <div class="text-primary font-mono text-xs mb-1">01 / STORAGE</div>
+                  <div class="font-bold text-sm">Sidon CoW Clone</div>
+                  <p class="text-xs text-base-content/60 mt-1">Zero-copy map clone from golden appliance base image onto local extent store.</p>
+                </div>
+                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
+                  <div class="text-accent font-mono text-xs mb-1">02 / CLOUD-INIT</div>
+                  <div class="font-bold text-sm">NoCloud Injection</div>
+                  <p class="text-xs text-base-content/60 mt-1">ISO9660 generation injecting static IP, gateway, DNS &amp; initial credentials.</p>
+                </div>
+                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
+                  <div class="text-secondary font-mono text-xs mb-1">03 / SECURITY</div>
+                  <div class="font-bold text-sm">vTPM 2.0 &amp; Secure Boot</div>
+                  <p class="text-xs text-base-content/60 mt-1">Cryptographic hardware emulator and UEFI OVMF Secure Boot signature verification.</p>
+                </div>
+                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
+                  <div class="text-success font-mono text-xs mb-1">04 / ENROLLMENT</div>
+                  <div class="font-bold text-sm">Cluster Auto-Pairing</div>
+                  <p class="text-xs text-base-content/60 mt-1">Mutual TLS cluster trust exchange registering the deploying cluster as Member 01.</p>
+                </div>
               </div>
             </div>
           </div>

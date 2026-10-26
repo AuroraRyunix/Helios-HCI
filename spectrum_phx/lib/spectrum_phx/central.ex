@@ -64,12 +64,11 @@ defmodule SpectrumPhx.Central do
   @doc "Fetch all registered member clusters from hydra.central_clusters"
   def list_clusters do
     case Hydra.query("SELECT cluster_id, name, vip, port, status, node_count, vm_count, cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes, auth_token, last_seen_ms, enrolled_at_ms, metadata FROM hydra.central_clusters;") do
-      {:ok, rows} when is_list(rows) and length(rows) > 0 ->
+      {:ok, rows} when is_list(rows) ->
         Enum.map(rows, &normalize_cluster/1)
 
       _ ->
-        # Auto-discover and populate the local cluster as Member 01
-        [local_cluster_record()]
+        []
     end
   end
 
@@ -330,6 +329,25 @@ defmodule SpectrumPhx.Central do
 
           json_val = Jason.encode!(deployment_data)
           Hydra.query("INSERT INTO hydra.central_config (key, value, updated_at_ms) VALUES ('deployment', ?, ?);", [json_val, now])
+
+          local = local_cluster_record()
+          Hydra.query("""
+          INSERT INTO hydra.central_clusters (
+            cluster_id, name, vip, port, status, node_count, vm_count,
+            cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes,
+            auth_token, last_seen_ms, enrolled_at_ms, metadata
+          ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?
+          );
+          """, [
+            local.cluster_id, local.name, local.vip, local.port, local.status,
+            local.node_count, local.vm_count, local.cpu_cores, local.memory_total_mb,
+            local.memory_used_mb, local.storage_total_bytes, local.storage_used_bytes,
+            local.auth_token, local.last_seen_ms, local.enrolled_at_ms, local.metadata
+          ])
+
           {:ok, deployment_data}
 
         {:error, reason} ->

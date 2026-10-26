@@ -5,44 +5,23 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
 
   setup %{conn: conn}, do: %{conn: log_in(conn)}
 
-  test "mounts and displays Helios Central fleet dashboard", %{conn: conn} do
+  test "mounts and displays Helios Central when not deployed", %{conn: conn} do
     {:ok, view, html} = live(conn, ~p"/central")
 
     assert html =~ "Helios Central"
     assert html =~ "Fleet Federation"
-    assert html =~ "Managed Clusters"
-    assert html =~ "Fleet vCPU Allocation"
-    assert html =~ "Fleet Memory Distribution"
-    assert html =~ "Sidon Storage Fabric"
+    assert html =~ "Not Deployed"
+    assert html =~ "Helios Central is Not Deployed"
+    assert html =~ "Option 1: Deploy New Central Virtual Appliance"
+    assert html =~ "Option 2: Connect to Existing Helios Central"
 
-    # Tab navigation buttons exist
-    assert has_element?(view, "#tab-fleet")
-    assert has_element?(view, "#tab-vms")
-    assert has_element?(view, "#tab-library")
-    assert has_element?(view, "#tab-setup")
-
-    # Action buttons
-    assert has_element?(view, "#enroll-cluster-btn")
+    # Action buttons exist
     assert has_element?(view, "#deploy-appliance-btn")
-  end
+    assert has_element?(view, "#enroll-cluster-btn")
+    assert has_element?(view, "#central-refresh-btn")
 
-  test "can switch tabs to global VM explorer and library", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/central")
-
-    # Switch to global VMs
-    html = render_click(view, "switch_tab", %{"tab" => "vms"})
-    assert html =~ "Global VM Explorer"
-    assert has_element?(view, "#vms-tab-content")
-
-    # Switch to content library
-    html = render_click(view, "switch_tab", %{"tab" => "library"})
-    assert html =~ "Central Golden Images &amp; Templates"
-    assert has_element?(view, "#library-tab-content")
-
-    # Switch to setup
-    html = render_click(view, "switch_tab", %{"tab" => "setup"})
-    assert html =~ "Helios Central Virtual Appliance Architecture"
-    assert has_element?(view, "#setup-tab-content")
+    # Fleet metrics deck should NOT be displayed when not deployed
+    refute html =~ "Managed Clusters"
   end
 
   test "opens and closes deployment modal and sizing presets", %{conn: conn} do
@@ -64,6 +43,19 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     # Close modal
     _html = render_click(view, "close_deploy_modal")
     refute has_element?(view, "#deploy-modal")
+  end
+
+  test "opens and closes connect cluster enrollment modal", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/central")
+
+    # Open enroll modal
+    html = render_click(view, "open_enroll_modal")
+    assert html =~ "Connect External Helios Cluster"
+    assert has_element?(view, "#enroll-modal")
+
+    # Close modal
+    _html = render_click(view, "close_enroll_modal")
+    refute has_element?(view, "#enroll-modal")
   end
 
   test "handles appliance deployment trigger and validation", %{conn: conn} do
