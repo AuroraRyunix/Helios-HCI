@@ -112,15 +112,20 @@ defmodule SpectrumPhxWeb.Storage.IndexLiveTest do
   defp put_container_vdisks(rows),
     do: Application.put_env(:spectrum_phx, :containers_vdisk_source, {:static, rows})
 
+  defp put_file_shares(rows),
+    do: Application.put_env(:spectrum_phx, :files_source, {:static, rows})
+
   setup do
     put_source(healthy())
     put_containers([container("default-pool"), container("packed", compression: "lz4")])
     put_container_vdisks([])
+    put_file_shares([])
 
     on_exit(fn ->
       Application.delete_env(:spectrum_phx, :storage_source)
       Application.delete_env(:spectrum_phx, :containers_source)
       Application.delete_env(:spectrum_phx, :containers_vdisk_source)
+      Application.delete_env(:spectrum_phx, :files_source)
     end)
 
     :ok

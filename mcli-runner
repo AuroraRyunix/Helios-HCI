@@ -1866,7 +1866,11 @@ def check_services(category):
                 running_vms = [v.strip() for v in out_v.strip().splitlines() if v.strip()]
             
             active_services = []
-            services_to_check = ["gatoway", "urbosa", "logos", "mipha", "agahnim", "slate"]
+            services_to_check = [
+                "spectrum", "slate", "spectrum-phx", "agahnim",
+                "catalyst", "vali", "bifrost", "dagur", "mimir",
+                "logos", "mipha", "gatoway", "urbosa", "rauru", "kass",
+            ]
             for svc in services_to_check:
                 rc_svc, out_svc, _ = run_cmd(f"systemctl is-active {svc}")
                 if rc_svc == 0 and out_svc.strip() == "active":

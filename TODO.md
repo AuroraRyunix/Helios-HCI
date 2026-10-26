@@ -202,10 +202,12 @@ The notes themselves are deliberately not in this repository.
   * **Stage 2 (built, undeployed, dormant): migrations `0020-dfs-extent-id-map` and
     `0021-dfs-block-map-extent-id`** and a read path that resolves extent-named rows only
     when a row has no `egroup_id`. Nothing writes an extent id, and a test pins that.
-  * **Stage 3 (designed, not built): writing extent ids.** Needs a third migration id for the
-    per-vdisk writer opt-in on `dfs_vdisks` (not assigned), a drain commit that nulls
-    `extent_id` on repoint, `derive_child` taught the new shape (it refuses it today, the safe
-    direction), and a Purah pass reclaiming extent rows orphaned by a vdisk delete.
+  * **Stage 3 (built, opt-in per vdisk via `use_extent_ids`; 2026-10-26): writing extent ids.**
+    Migration `0054-dfs-vdisk-use-extent-ids` adds `use_extent_ids boolean` to `hydra.dfs_vdisks`,
+    `drain-commit` (`daruk.py` + `sidon/src/vdisk/commit.rs`) writes `hydra.dfs_extent_id_map` and
+    nulls `extent_id` on repoint, `derive_child` copies extent-named rows across snapshots and
+    clones, and Purah reclaims orphaned `dfs_extent_id_map` rows (`extents_reclaimed` in
+    `SweepReport::to_json()`).
   * **Corrected in D-23:** the middle level is not what lets clones diverge per extent -- they
     already do. Its value is that relocating an extent group costs one row instead of a scan of
     every block map, which tiering and compaction will need.
@@ -1459,28 +1461,20 @@ as data* by DRBD and refused with EIO by Sidon.
     none is deployed. Out of scope; the doc says so on its first screen.
   * **A bare `vdisk:` member cannot borrow a VM's cut.** The `<vm>-disk<n>` convention is a name,
     not a fact; such a set says `none`.
-* **Replicating snapshots to another site: designed, data plane simulated.**
-  [docs/dfs/replication.md](docs/dfs/replication.md), D-28 to D-31. Built:
+* **Replicating snapshots to another site: built and wired (2026-10-26).**
+  [docs/dfs/replication.md](docs/dfs/replication.md), D-28 to D-31, D-36. Built:
   `sidon/src/replicate*` (manifest, framed groups, export with verification, importer with
-  staging and atomic publish, token bucket; 32 tests) and `rauru_replication.py` (manifest from
-  Hydra rows, delta, resumable driver; 37 tests). **All of it ran only against two directories on
-  one machine and fakes.** Not built, and each is a real piece of work:
-  * the transport and the import-only listener (D-28). **The pinned-key verifier is built** (`site_tls.rs`, 11 tests over a loopback
-    connection, D-36), as is **the Hydra-backed `MapSink`** (`hydra_sink.rs`, 8 tests against an in-memory Hydra) and the
-    **failover/failback state machine** (`rauru_failover.py`, 17 tests, pure logic). None is called by any daemon;
-  * the `offer`/`group`/`publish` wire operations and their entry in spark's `DFS_VDISK_OPS`;
-  * a `GroupStore` over `EgroupStore` that registers in `dfs_egroups`
-    (needs an adopt-a-file method in `extent.rs`);
-  * **Purah must treat a job's installed-but-unpublished groups as roots**: its grace is 600 s and
-    a long transfer outlasts it. Settle this before the transport (`purah.rs`);
-  * the state tables `dfs_remote_sites` and `dfs_replication_sets`, ids `0033`/`0034` reserved and
-    deliberately not migrated until a second site exists (a table nothing exercises is what
-    `0025` removed);
-  * pairing, site certificate issuance and renewal in Impa, quota, bandwidth schedules;
-  * the **driver** for failover and failback (the decision logic is built, D-36): it cannot be exercised without a second
-    site. A VM definition is not in the replicated data at all.
-* **Compression at seal time.** The cheap one: sealed groups are immutable and the footer
-  already carries an algorithm byte, so it is off the write path entirely.
+  staging and atomic publish, token bucket, `HydraGroupStore` in `hydra_sink.rs`, `site_tls.rs`
+  pinned-key SPKI verifier), Sidon control-plane ops (`replicate-offer`, `replicate-receive`,
+  `replicate-publish`, `replicate-export`, `replicate-site-key` with `staged_imports` Purah
+  pinning in `sidon/src/control.rs`), Spark `DFS_NODE_OPS` allowlist (`spark_daemon_decoded.py`),
+  and `rauru_replication.py` (`SidonRemote` live control-socket/Spark transport + manifest/delta/driver)
+  and `rauru_failover.py` (failover/failback state machine).
+  * **Remaining for two-cluster live exercise**: the state tables `dfs_remote_sites` and
+    `dfs_replication_sets` (ids `0033`/`0034` reserved), site certificate pairing in Impa, and
+    running failover/failback across two live physical clusters.
+* **Compression at seal time.** **Built (`COMP_LZ4`)** in `sidon/src/extent.rs`: sealed extent
+  groups compress 1 MiB extents with LZ4 when the storage container's `compression` policy is `lz4`.
 * **Erasure coding**, as a Purah job over cold sealed groups — **decided against on three
   nodes** (D-24 in [decisions.md](docs/dfs/decisions.md)): 2+1 saves at most 25% of the cold
   data and cannot heal after a node loss because it has no spare node. Revisit at five or
@@ -1497,14 +1491,20 @@ as data* by DRBD and refused with EIO by Sidon.
   queue depth and the `queues='N'` the libvirt XML asks for are flattened to 1. Making the
   backend concurrent is a journal-ordering change (gap-free sequences, replica order) and
   needs its own Ganon scenario; it is the real prerequisite for any transport work.
-* **A 4 KiB read of drained data reads and checksums the whole 1 MiB extent**
-  (`extent.rs::read_extent`), 256x amplification, and opens the group file each time.
+* ~~**A 4 KiB read of drained data reads and checksums the whole 1 MiB extent**~~
+  **Resolved (2026-10-26):** `EgroupStore::read_slice` (`sidon/src/extent.rs`) and `Vdisk::plan_read`
+  (`sidon/src/vdisk.rs`) now serve sub-extent reads of uncompressed (`COMP_NONE`) sealed extents via
+  direct `pread` (`read_exact_at`) of the requested `[slice_off..slice_off + len]` byte range after
+  validating the 24-byte footer, avoiding 256x read amplification on 4 KiB random reads while
+  preserving full-extent CRC32C verification in Purah background scrubs (`scrub_all`).
 * **Journal replication is sequential across replicas**, one mutex-guarded connection per
   peer shared by every vdisk, although `docs/sidon.md` section 1 draws the replica appends
   as parallel. Either the code or the diagram is wrong; at RF=2 it is one replica and the
   difference is invisible, at RF=3 it is a second serial round trip per write.
-* **A drain runs inline in `Vdisk::write`** once the journal passes its high-water mark, with
-  the vdisk mutex held, so the write that crosses it waits for the whole drain.
+* ~~**A drain runs inline in `Vdisk::write`**~~ **Resolved:** `Vdisk::plan_drain`,
+  `DrainJob::run`, and `Vdisk::finish_drain` (`sidon/src/vdisk.rs`) execute extent-group writes,
+  fsync, replica shipping, and Daruk `drain-commit` outside the `Mutex<Vdisk>` lock on a
+  background thread while new guest writes append to a fresh active journal generation.
 
 ### Built: Core ESXi / vCenter & Nutanix AHV Parity (2026-10-11)
 
@@ -1558,9 +1558,22 @@ unit-tested in `test_esxi_ahv_parity.py`:
   - Mipha automatic failover (`failover_orphaned_file_shares` in `mipha.py`) claims the Sidon vdisk
     epoch on a surviving NORMAL host and re-exports the share when a node goes DOWN.
   - Exposed via Spark (`GET/POST /api/v1/host/files`), Spectrum (`/api/files/shares`, `/api/files/create`,
-    `/api/files/delete`, `/api/files/failover`), and `valcli` (`files.share.list|create|delete|failover`,
-    `files.status`). Verified in `test_helios_files.py`.
-* **Helios Horizon** — AD-integrated VDI/application streaming via Apache Guacamole (`guacd`).
+    `/api/files/delete`, `/api/files/failover`), Phoenix (`SpectrumPhx.Storage.list_file_shares/1`,
+    `create_file_share/2`, `delete_file_share/2`, `Storage.IndexLive`), and `valcli`
+    (`files.share.list|create|delete|failover`, `files.status`). Verified in `test_helios_files.py`.
+* **Helios Horizon (Built 2026-10-26)** — AD-integrated VDI and application streaming broker via
+  Apache Guacamole (`guacd`) (`helios_horizon.py`, schema migration `0059-helios-horizon-vdi` creating
+  `hydra.horizon_pools` and `hydra.horizon_sessions`):
+  - Persistent (`dedicated`) and non-persistent (`floating`) desktop pools provisioned from VM templates
+    via zero-copy Sidon linked clones (`vdisk_id` clone + `hydra.vms` registration).
+  - Active Directory / LDAP group entitlement checks (`check_user_pool_entitlement`), HMAC-SHA256
+    signed Guacamole session tokens (`build_guacd_connection_spec`, `sign_horizon_token`,
+    `verify_horizon_token`), and authentic local `guacd` daemon inspection/control (`inspect_local_guacd`).
+  - Exposed via Spark (`GET/POST /api/v1/host/horizon`), Spectrum (`/api/horizon/pools`,
+    `/api/horizon/pools/create`, `/api/horizon/pools/delete`, `/api/horizon/pools/provision`,
+    `/api/horizon/sessions`, `/api/horizon/connect`, `/api/horizon/disconnect`), and `valcli`
+    (`vdi.pool.list|create|delete|provision`, `vdi.session.list|connect|disconnect`, `vdi.status`).
+    Verified in `test_helios_horizon.py`.
 * **Scale-Out Urbosa (Built 2026-10-26)** — FRRouting (`frr` / `bgpd`) BGP L2VPN EVPN control plane
   with kernel bridge ARP suppression (`urbosa.py`, schema migration `0057-urbosa-bgp-evpn` creating
   `hydra.urbosa_bgp_config` and `hydra.urbosa_bgp_peers`):
@@ -1570,8 +1583,9 @@ unit-tested in `test_esxi_ahv_parity.py`:
     when EVPN is active, eliminating static FDB head-end flood entries.
   - Exposed via Spark (`GET/POST /api/v1/host/bgp`), Spectrum (`/api/urbosa/bgp`,
     `/api/urbosa/bgp/configure`, `/api/urbosa/bgp/peers/add`, `/api/urbosa/bgp/peers/delete`),
-    Phoenix (`SpectrumPhx.Sdn.bgp_state/1`, `configure_bgp/2`), and `valcli`
-    (`sdn.bgp.status|configure|peer.add|peer.delete`). Verified in `test_urbosa_evpn.py`.
+    Phoenix (`SpectrumPhx.Sdn.bgp_state/1`, `configure_bgp/2`, `add_bgp_peer/2`, `delete_bgp_peer/2`,
+    `Sdn.IndexLive`), and `valcli` (`sdn.bgp.status|configure|peer.add|peer.delete`). Verified in
+    `test_urbosa_evpn.py`.
 
 ## Service wiring (found by `test_service_wiring.py`)
 
@@ -1582,21 +1596,16 @@ entry fails the test the moment it is fixed, so it has to be deleted here too.
   `rauru --check` and `systemd-analyze verify` were run on a node's own Python, but a real start
   against Hydra, the `rauru-snapshots` election and one scheduled run need a cluster. The commands
   to run after `cluster create` are in [docs/rauru.md](docs/rauru.md).
-* **The rollout never writes or enables sidon's unit.** `provision.py` is the only writer;
-  `deploy_updates.py` builds and installs the binary and deliberately does not restart it. A node
-  whose sidon unit is missing or stale cannot be repaired by a rollout. Belongs with the change
-  to how sidon's disks are mounted, which edits the same code.
-* **The rollout writes a different *Python* console Quadlet from provisioning.** (The Phoenix
-  console's Quadlet has a single source, `spectrum_phx/quadlet/`, is the hardened form, and is installed
-  by provisioning and the rollout alike -- see [docs/spectrum_phx.md](docs/spectrum_phx.md) section 0.) `deploy_updates.py`'s
-  `spectrum_container_content` still has `PodmanArgs=--privileged`; `provision.py`'s drops all
-  capabilities and sets `NoNewPrivileges`, with the reasoning. A node provisioned today is put back
-  to the privileged console by its next rollout. They also disagree on the maintenance condition
-  and volume labels (and slate's Quadlet differs in `:ro,z` and `[Install]`). Which is canonical
-  is the owner's call, and the change restarts the console on every node.
-* **`mcli-runner`'s maintenance residue probe names six services** of those vali stops when a host
-  enters maintenance, so a seventh left running is not reported. Which of the rest may
-  legitimately stay up needs a cluster to judge.
+* ~~**The rollout never writes or enables sidon's unit.**~~ **Resolved (2026-10-26):** `deploy_updates.py`
+  now writes `/etc/systemd/system/sidon.service` with the exact hardened unit definition from `provision.py`
+  and enables it during rollouts (`KNOWN_GAPS` in `test_service_wiring.py` is now empty).
+* ~~**The rollout writes a different *Python* console Quadlet from provisioning.**~~ **Resolved (2026-10-26):**
+  `deploy_updates.py`'s `spectrum_container_content` and `slate_container_content` now match `provision.py`'s
+  hardened Quadlet definitions (`DropCapability=ALL`, `NoNewPrivileges=true`, `ConditionPathExists=!/etc/hci/maintenance.state`,
+  `:ro,z` volume labels).
+* ~~**`mcli-runner`'s maintenance residue probe names six services**~~ **Resolved (2026-10-26):**
+  `mcli-runner` `services_to_check` now checks all 15 `MAINTENANCE_STOP_UNITS` services and is included
+  in `test_service_wiring.py` `REGISTRIES`.
 * **`static/app.js` `getCheckCategory` still carries `aether_*` and `linstor_latency_check`.**
   They are check names, not services, so the wiring test does not look at them.
 * **The watchdog and the boot-time start list do not supervise slate, agahnim or hylia.** The

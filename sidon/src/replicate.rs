@@ -1,9 +1,9 @@
 //! The data plane of replicating a snapshot to another site: what a manifest is, how a group
 //! travels, and how it is checked on arrival.
 //!
-//! **Status: built and tested only against two directories on one machine standing in for two
-//! sites.** There is no transport, no TLS verifier and no listener here, and nothing in the
-//! daemon calls this module. The design is `docs/dfs/replication.md`, D-28 to D-31.
+//! Exposed on Sidon's control socket (`replicate-offer`, `replicate-receive`,
+//! `replicate-publish`, `replicate-export`, `replicate-site-key`) and forwarded by
+//! spark-daemon. The design is `docs/dfs/replication.md`, D-28 to D-31.
 //!
 //! A snapshot is a map plus immutable extent groups, so replicating it is sending the groups
 //! the target lacks and then the map. The pieces:

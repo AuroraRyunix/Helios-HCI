@@ -1,8 +1,8 @@
 //! How two sites authenticate each other: a pinned certificate key, not a chain
 //! (`docs/dfs/replication.md` section 2, D-28).
 //!
-//! **Status: exercised only over a loopback socket between two throwaway certificates.** Nothing
-//! in the daemon constructs these configs and no listener exists.
+//! Exposed via `replicate-site-key` on Sidon's control socket so operators and Rauru can
+//! compute SPKI fingerprints and validate site certificate/key pairs against a pin set.
 //!
 //! A site is identified by the SHA-256 of its leaf certificate's SubjectPublicKeyInfo. The
 //! verifier ignores the chain and the name and accepts a peer if and only if that hash is in the

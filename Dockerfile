@@ -26,6 +26,8 @@ COPY helios_sidon.py .
 COPY helios_cql.py .
 COPY helios_zk.py .
 COPY helios_files.py .
+COPY helios_horizon.py .
+COPY rauru_replication.py .
 COPY static/ ./static/
 EXPOSE 8443
 CMD ["python", "-u", "server.py"]

@@ -158,13 +158,55 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
     end
   end
 
+  def handle_event("configure_bgp", params, socket) do
+    case Sdn.configure_bgp(params, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "BGP EVPN configuration saved and FRR reload triggered.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("add_bgp_peer", params, socket) do
+    case Sdn.add_bgp_peer(params, sdn_opts()) do
+      {:ok, peer_ip} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "BGP neighbor #{peer_ip} added.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
+  def handle_event("delete_bgp_peer", %{"ip" => peer_ip}, socket) do
+    case Sdn.delete_bgp_peer(peer_ip, sdn_opts()) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "BGP neighbor #{peer_ip} removed.")
+         |> load_fabric()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, reason)}
+    end
+  end
+
   defp sdn_opts do
     [source: Application.get_env(:spectrum_phx, :sdn_source, :live)]
   end
 
   defp load_fabric(socket) do
+    {:ok, bgp} = Sdn.bgp_state(sdn_opts())
+
     socket
     |> assign(:fabric, Sdn.fabric(sdn_opts()))
+    |> assign(:bgp, bgp)
     |> assign(:read_at, DateTime.utc_now())
   end
 
@@ -549,6 +591,179 @@ defmodule SpectrumPhxWeb.Sdn.IndexLive do
             </div>
           </.panel>
         </div>
+
+        <.panel
+          id="sdn-bgp-evpn"
+          title="Scale-Out BGP EVPN Control Plane"
+          subtitle="FRRouting EVPN Type-2/Type-3 route distribution, ARP suppression, and BGP neighbors"
+        >
+          <p :if={not @bgp.available?} class="text-sm text-warning mb-3" id="bgp-error">
+            BGP EVPN configuration could not be read from ScyllaDB: <span class="font-mono">{@bgp.error}</span>
+          </p>
+
+          <div class="grid gap-4 lg:grid-cols-2">
+            <div>
+              <h4 class="text-xs font-semibold uppercase tracking-wide opacity-60 mb-2">
+                Cluster BGP / EVPN Settings
+              </h4>
+              <form id="bgp-config-form" phx-submit="configure_bgp" class="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                <label class="form-control">
+                  <span class="label-text text-xs">Local ASN</span>
+                  <input
+                    type="number"
+                    name="asn"
+                    value={@bgp.config.asn}
+                    min="1"
+                    max="4294967294"
+                    class="input input-xs input-bordered font-mono"
+                    required
+                  />
+                </label>
+                <label class="form-control">
+                  <span class="label-text text-xs">Router ID (optional)</span>
+                  <input
+                    type="text"
+                    name="router_id"
+                    value={@bgp.config.router_id}
+                    placeholder="Auto (host IP)"
+                    class="input input-xs input-bordered font-mono"
+                  />
+                </label>
+                <label class="form-control">
+                  <span class="label-text text-xs">Route Reflectors</span>
+                  <input
+                    type="text"
+                    name="route_reflectors"
+                    value={@bgp.config.route_reflectors}
+                    placeholder="10.10.0.11,10.10.0.12"
+                    class="input input-xs input-bordered font-mono"
+                  />
+                </label>
+                <label class="label cursor-pointer justify-start gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    name="evpn_enabled"
+                    value="true"
+                    checked={@bgp.config.evpn_enabled?}
+                    class="checkbox checkbox-xs"
+                  />
+                  <span>Advertise all VNI (EVPN)</span>
+                </label>
+                <label class="label cursor-pointer justify-start gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    name="arp_suppression"
+                    value="true"
+                    checked={@bgp.config.arp_suppression?}
+                    class="checkbox checkbox-xs"
+                  />
+                  <span>Bridge ARP Suppression</span>
+                </label>
+                <label class="label cursor-pointer justify-start gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    name="disable_headend_flood"
+                    value="true"
+                    checked={@bgp.config.disable_headend_flood?}
+                    class="checkbox checkbox-xs"
+                  />
+                  <span>Disable Head-End Flood</span>
+                </label>
+                <label class="label cursor-pointer justify-start gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    name="bfd_enabled"
+                    value="true"
+                    checked={@bgp.config.bfd_enabled?}
+                    class="checkbox checkbox-xs"
+                  />
+                  <span>BFD Fast Failover</span>
+                </label>
+                <div class="col-span-2 flex items-center justify-end">
+                  <button type="submit" class="btn btn-xs btn-primary">Save & Reload FRR</button>
+                </div>
+              </form>
+            </div>
+
+            <div>
+              <h4 class="text-xs font-semibold uppercase tracking-wide opacity-60 mb-2">
+                BGP EVPN Neighbors ({length(@bgp.peers)})
+              </h4>
+              <form id="bgp-peer-form" phx-submit="add_bgp_peer" class="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3">
+                <input
+                  type="text"
+                  name="peer_ip"
+                  placeholder="Neighbor IPv4"
+                  class="input input-xs input-bordered font-mono"
+                  required
+                />
+                <input
+                  type="number"
+                  name="remote_asn"
+                  placeholder="Remote ASN"
+                  value={@bgp.config.asn}
+                  min="1"
+                  max="4294967294"
+                  class="input input-xs input-bordered font-mono"
+                  required
+                />
+                <input
+                  type="text"
+                  name="description"
+                  placeholder="Description (e.g. ToR-1)"
+                  class="input input-xs input-bordered"
+                />
+                <div class="flex items-center gap-2">
+                  <label class="label cursor-pointer gap-1 text-xs" title="Route Reflector Client">
+                    <input type="checkbox" name="route_reflector_client" value="true" class="checkbox checkbox-xs" />
+                    <span>RR</span>
+                  </label>
+                  <button type="submit" class="btn btn-xs btn-primary flex-1">Add Peer</button>
+                </div>
+              </form>
+
+              <p :if={@bgp.peers == []} class="text-xs opacity-55 italic">
+                No explicit BGP neighbors configured.
+              </p>
+
+              <div :if={@bgp.peers != []} class="overflow-x-auto">
+                <table class="table table-xs" id="bgp-peers-table">
+                  <thead>
+                    <tr>
+                      <th>Neighbor IP</th>
+                      <th>Remote ASN</th>
+                      <th>Description</th>
+                      <th>Flags</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr :for={peer <- @bgp.peers} id={"bgp-peer-#{dom_slug(peer.peer_ip)}"}>
+                      <td class="font-mono font-medium">{peer.peer_ip}</td>
+                      <td class="font-mono tabular-nums">{peer.remote_asn}</td>
+                      <td>{if peer.description != "", do: peer.description, else: "—"}</td>
+                      <td>
+                        <span :if={peer.bfd_enabled?} class="badge badge-xs badge-info mr-1">BFD</span>
+                        <span :if={peer.route_reflector_client?} class="badge badge-xs badge-secondary">RR-Client</span>
+                      </td>
+                      <td class="text-right">
+                        <button
+                          type="button"
+                          phx-click="delete_bgp_peer"
+                          phx-value-ip={peer.peer_ip}
+                          id={"delete-bgp-peer-#{dom_slug(peer.peer_ip)}"}
+                          class="btn btn-ghost btn-xs text-error"
+                        >
+                          Remove
+                        </button>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </.panel>
       </div>
     </Layouts.app>
     """

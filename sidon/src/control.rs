@@ -118,6 +118,10 @@ pub struct Daemon {
     /// between a parent and every snapshot of it, so its temperature is the sum of what
     /// every vdisk on the node does to it.
     access: Arc<AccessLog>,
+    /// Extent groups installed by an in-progress cross-site snapshot import that has not yet
+    /// published its snapshot map. Included in `held_egroups` so Purah's sweep does not
+    /// reclaim them before `replicate-publish`.
+    staged_imports: Mutex<HashSet<String>>,
 }
 
 /// The container a create lands in when its request names none. It is the container the
@@ -228,6 +232,7 @@ impl Daemon {
             replica_store,
             reaper: ReplicaReaper::new(cfg_grace),
             access,
+            staged_imports: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -437,6 +442,11 @@ impl Daemon {
             "purah-placement" => self.op_purah_placement(req),
             "purah-compact" => self.op_purah_compact(req),
             "purah-dedup" => self.op_purah_dedup(req),
+            "replicate-offer" => self.op_replicate_offer(req),
+            "replicate-receive" => self.op_replicate_receive(req),
+            "replicate-publish" => self.op_replicate_publish(req),
+            "replicate-export" => self.op_replicate_export(req),
+            "replicate-site-key" => self.op_replicate_site_key(req),
             other => Err(Error::refused(format!("unknown op '{other}'"))),
         }
     }
@@ -1551,6 +1561,9 @@ impl Daemon {
                 held.extend(v.held_egroups());
             }
         }
+        if let Ok(staged) = self.staged_imports.lock() {
+            held.extend(staged.iter().cloned());
+        }
         held
     }
 
@@ -1906,6 +1919,277 @@ impl Daemon {
         let store = crate::extent::EgroupStore::open(crate::extent::discover_disks(&self.cfg.root), 0)?;
         let clock = crate::replicate::throttle::SystemClock::new();
         dedup::run(&self.daruk(), &store, &self.cfg.node, &clock, &opts)
+    }
+
+    fn parse_replicate_manifest(req: &Value) -> Result<crate::replicate::Manifest> {
+        let m_val = match req.get("manifest") {
+            Some(Value::String(s)) => serde_json::from_str::<Value>(s)
+                .map_err(|e| Error::refused(format!("manifest is not valid JSON: {e}")))?,
+            Some(v @ Value::Object(_)) => v.clone(),
+            _ => return Err(Error::refused("request is missing 'manifest'".to_string())),
+        };
+        crate::replicate::Manifest::from_json(&m_val)
+    }
+
+    fn decode_hex_bytes(hex_str: &str) -> Result<Vec<u8>> {
+        let clean = hex_str.trim();
+        if clean.len() % 2 != 0 {
+            return Err(Error::refused("hex payload has an odd number of digits".to_string()));
+        }
+        let mut out = Vec::with_capacity(clean.len() / 2);
+        let bytes = clean.as_bytes();
+        for chunk in bytes.chunks(2) {
+            let pair = std::str::from_utf8(chunk)
+                .map_err(|_| Error::refused("hex payload is not ASCII".to_string()))?;
+            let b = u8::from_str_radix(pair, 16)
+                .map_err(|_| Error::refused(format!("invalid hex byte '{pair}'")))?;
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    /// Preflight an offered cross-site snapshot manifest (`replicate-offer`).
+    fn op_replicate_offer(&self, req: &Value) -> Result<Value> {
+        use crate::replicate::hydra_sink::{HydraGroupStore, HydraMapSink};
+        use crate::replicate::import::{Have, Importer, Offer};
+
+        let job = str_field(req, "job")?;
+        let manifest = Self::parse_replicate_manifest(req)?;
+        let container = req
+            .get("container")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_CONTAINER);
+        let staging = self.cfg.root.join("replicate-staging");
+        let eg_store = crate::extent::EgroupStore::open(
+            crate::extent::discover_disks(&self.cfg.root),
+            0,
+        )?;
+        let group_store = HydraGroupStore::new(eg_store, self.daruk(), &self.cfg.node, &manifest.snapshot);
+        let importer = Importer::new(group_store, &staging)?;
+        let sink = HydraMapSink::new(self.daruk(), container);
+        match importer.offer(&job, &manifest, &sink)? {
+            Offer::AlreadyPresent => Ok(json!({
+                "status": "already_present",
+                "snapshot": manifest.snapshot,
+                "map_sha256": manifest.map_digest(),
+            })),
+            Offer::Proceed { have, need_bytes } => {
+                let mut have_map = serde_json::Map::new();
+                for (gid, h) in have {
+                    let v = match h {
+                        Have::Complete => json!(["complete"]),
+                        Have::Absent => json!(["absent"]),
+                        Have::Partial(staged) => json!(["partial", staged]),
+                    };
+                    have_map.insert(gid, v);
+                }
+                Ok(json!({
+                    "status": "proceed",
+                    "snapshot": manifest.snapshot,
+                    "need_bytes": need_bytes,
+                    "have": Value::Object(have_map),
+                }))
+            }
+        }
+    }
+
+    /// Receive, verify, and install framed extent groups for a cross-site snapshot (`replicate-receive`).
+    fn op_replicate_receive(&self, req: &Value) -> Result<Value> {
+        use crate::replicate::hydra_sink::HydraGroupStore;
+        use crate::replicate::import::{DirStore, Importer};
+
+        let job = str_field(req, "job")?;
+        let manifest = Self::parse_replicate_manifest(req)?;
+        let frames_hex = str_field(req, "frames_hex")?;
+        let frame_bytes = Self::decode_hex_bytes(&frames_hex)?;
+        let staging = self.cfg.root.join("replicate-staging");
+
+        if let Some(dir_str) = req.get("local_dir").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            let cap = req.get("capacity_bytes").and_then(Value::as_u64);
+            let dir_store = DirStore::new(std::path::Path::new(dir_str), cap)?;
+            let mut importer = Importer::new(dir_store, &staging)?;
+            if let Some(limit) = req.get("max_bytes").and_then(Value::as_u64) {
+                let mut seen = 0u64;
+                importer = importer.with_space_guard(Box::new(move |n| {
+                    seen = seen.saturating_add(n);
+                    if seen > limit {
+                        Err(Error::refused("transfer exceeded max_bytes guard".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }));
+            }
+            let mut cursor = std::io::Cursor::new(frame_bytes);
+            let report = importer.receive(&job, &manifest, &mut cursor)?;
+            let paths: Vec<String> = report
+                .installed
+                .iter()
+                .map(|id| importer.store.path_of(id).to_string_lossy().to_string())
+                .collect();
+            return Ok(json!({
+                "installed": report.installed,
+                "installed_paths": paths,
+                "failed": report.failed,
+                "bytes": report.bytes,
+            }));
+        }
+
+        let eg_store = crate::extent::EgroupStore::open(
+            crate::extent::discover_disks(&self.cfg.root),
+            0,
+        )?;
+        let group_store = HydraGroupStore::new(eg_store, self.daruk(), &self.cfg.node, &manifest.snapshot);
+        let mut importer = Importer::new(group_store, &staging)?;
+        if let Some(reap_secs) = req.get("reap_older_than_secs").and_then(Value::as_u64) {
+            let _ = importer.reap_staging(Duration::from_secs(reap_secs));
+        }
+        let mut cursor = std::io::Cursor::new(frame_bytes);
+        let report = importer.receive(&job, &manifest, &mut cursor)?;
+        if let Ok(mut staged) = self.staged_imports.lock() {
+            for id in &report.installed {
+                staged.insert(id.clone());
+            }
+        }
+        Ok(json!({
+            "installed": report.installed,
+            "failed": report.failed,
+            "bytes": report.bytes,
+        }))
+    }
+
+    /// Atomically publish a replicated snapshot map once all its extent groups are installed (`replicate-publish`).
+    fn op_replicate_publish(&self, req: &Value) -> Result<Value> {
+        use crate::replicate::hydra_sink::{HydraGroupStore, HydraMapSink};
+        use crate::replicate::import::{Importer, Published};
+
+        let manifest = Self::parse_replicate_manifest(req)?;
+        let container = req
+            .get("container")
+            .and_then(Value::as_str)
+            .unwrap_or(DEFAULT_CONTAINER);
+        let staging = self.cfg.root.join("replicate-staging");
+        let eg_store = crate::extent::EgroupStore::open(
+            crate::extent::discover_disks(&self.cfg.root),
+            0,
+        )?;
+        let group_store = HydraGroupStore::new(eg_store, self.daruk(), &self.cfg.node, &manifest.snapshot);
+        let mut importer = Importer::new(group_store, &staging)?;
+        let mut sink = HydraMapSink::new(self.daruk(), container);
+        let outcome = importer.publish(&manifest, &mut sink)?;
+        if let Ok(mut staged) = self.staged_imports.lock() {
+            for g in &manifest.groups {
+                staged.remove(&g.id);
+            }
+        }
+        let status = match outcome {
+            Published::Published => "published",
+            Published::AlreadyVisible => "already_visible",
+        };
+        Ok(json!({
+            "status": status,
+            "snapshot": manifest.snapshot,
+            "map_sha256": manifest.map_digest(),
+        }))
+    }
+
+    /// Export requested extent groups for a snapshot manifest as a verified frame stream (`replicate-export`).
+    fn op_replicate_export(&self, req: &Value) -> Result<Value> {
+        use crate::replicate::export::{export_groups, Want};
+        use crate::replicate::throttle::{SystemClock, TokenBucket};
+        use crate::replicate::{hex, GroupRef, CHUNK};
+
+        let manifest = Self::parse_replicate_manifest(req)?;
+        let wants_arr = req
+            .get("wants")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::refused("request is missing 'wants' array".to_string()))?;
+        let mut wants = Vec::with_capacity(wants_arr.len());
+        for w in wants_arr {
+            let gid = str_field(w, "id")?;
+            let group = manifest
+                .groups
+                .iter()
+                .find(|g| g.id == gid)
+                .cloned()
+                .unwrap_or_else(|| GroupRef {
+                    id: gid.clone(),
+                    length: w.get("length").and_then(Value::as_u64).unwrap_or(0),
+                    seal: w.get("seal").and_then(Value::as_str).unwrap_or("").to_string(),
+                });
+            let source_id = w
+                .get("source_id")
+                .and_then(Value::as_str)
+                .unwrap_or(&gid)
+                .to_string();
+            let start = w.get("start").and_then(Value::as_u64).unwrap_or(0);
+            wants.push(Want {
+                group,
+                source_id,
+                start,
+            });
+        }
+        let rate = req.get("rate_bytes_per_sec").and_then(Value::as_u64).unwrap_or(0);
+        let mut bucket = if rate == 0 {
+            TokenBucket::unlimited()
+        } else {
+            TokenBucket::new(rate, (CHUNK as u64).saturating_mul(2))
+        };
+        let clock = SystemClock::new();
+        let store = crate::extent::EgroupStore::open(
+            crate::extent::discover_disks(&self.cfg.root),
+            0,
+        )?;
+        let mut out = Vec::new();
+        let report = export_groups(&manifest, &store, &wants, &mut out, &mut bucket, &clock)?;
+        Ok(json!({
+            "groups": report.groups,
+            "bytes_sent": report.bytes_sent,
+            "frames_hex": hex(&out),
+            "manifest": manifest.to_json(),
+        }))
+    }
+
+    /// Inspect or verify a site certificate and optional key/pin set (`replicate-site-key`).
+    fn op_replicate_site_key(&self, req: &Value) -> Result<Value> {
+        use crate::replicate::site_tls::{
+            client_config, server_config, spki_fingerprint, PinSet, LEEWAY_SECONDS,
+        };
+        let cert_pem = str_field(req, "cert_pem")?;
+        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+        let certs = rustls_pemfile::certs(&mut reader)
+            .map_err(|e| Error::refused(format!("invalid certificate PEM: {e}")))?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| Error::refused("no certificate found in cert_pem".to_string()))?;
+        let fp = spki_fingerprint(leaf)?;
+
+        let mut verified_pins = false;
+        if let Some(pins_arr) = req.get("pins").and_then(Value::as_array) {
+            let pins = PinSet::new(pins_arr.iter().filter_map(Value::as_str));
+            let now_secs = req
+                .get("now_secs")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| now_ms() / 1000);
+            pins.check(leaf, now_secs)?;
+            verified_pins = true;
+            if let Some(key_pem) = req.get("key_pem").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                let mut kreader = std::io::BufReader::new(key_pem.as_bytes());
+                let mut keys = rustls_pemfile::pkcs8_private_keys(&mut kreader)
+                    .map_err(|e| Error::refused(format!("invalid private key PEM: {e}")))?;
+                let key = keys
+                    .pop()
+                    .ok_or_else(|| Error::refused("no PKCS#8 key found in key_pem".to_string()))?;
+                let chain: Vec<rustls::Certificate> =
+                    certs.iter().cloned().map(rustls::Certificate).collect();
+                let _ = client_config(pins.clone(), chain.clone(), rustls::PrivateKey(key.clone()))?;
+                let _ = server_config(pins, chain, rustls::PrivateKey(key))?;
+            }
+        }
+        Ok(json!({
+            "spki_sha256": fp,
+            "verified_pins": verified_pins,
+            "leeway_seconds": LEEWAY_SECONDS,
+        }))
     }
 
     /// The background loop. Sweeps, then scrubs, forever, logging anything it finds.
@@ -2621,5 +2905,132 @@ mod tests {
         let forced = daemon.op_delete(&json!({"vdisk_id": "snap-1", "force": true})).unwrap();
         assert_eq!(forced["deleted"], json!(true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replicate_control_ops_export_offer_receive_and_publish_end_to_end() {
+        let src_dir = test_dir("replicate-src");
+        let dst_dir = test_dir("replicate-dst");
+        let src_hydra = spawn_mock_hydra(|_path, _q| json!({"status": "success", "rows": []}));
+        let src_daemon = test_daemon(&src_dir, src_hydra, Vec::new());
+
+        let vh = crate::extent::vdisk_hash("snap-rep");
+        let payload = vec![0x5Au8; 256];
+        let footer = crate::extent::footer_with(&payload, vh, 0, crate::extent::COMP_NONE, 256);
+        let mut group_bytes = payload.clone();
+        group_bytes.extend_from_slice(&footer);
+        let seal = crate::replicate::seal_of(&group_bytes);
+        std::fs::write(src_dir.join("egroups").join("eg-rep-1.eg"), &group_bytes).unwrap();
+
+        let manifest = crate::replicate::Manifest {
+            snapshot: "snap-rep".to_string(),
+            size_bytes: 1 << 20,
+            extent_bytes: 1 << 20,
+            rows: vec![crate::replicate::MapRow {
+                extent_index: 0,
+                group: "eg-rep-1".to_string(),
+                offset: 0,
+                length: 256,
+                vdisk_hash: vh,
+            }],
+            groups: vec![crate::replicate::GroupRef {
+                id: "eg-rep-1".to_string(),
+                length: group_bytes.len() as u64,
+                seal: seal.clone(),
+            }],
+        };
+
+        let exported = src_daemon
+            .dispatch(&json!({
+                "op": "replicate-export",
+                "manifest": manifest.to_json(),
+                "wants": [{"id": "eg-rep-1", "source_id": "eg-rep-1", "start": 0}],
+            }))
+            .unwrap();
+        assert_eq!(exported["groups"], json!(1));
+        assert_eq!(exported["bytes_sent"], json!(group_bytes.len()));
+        let frames_hex = exported["frames_hex"].as_str().unwrap().to_string();
+
+        let installed_state = Arc::new(Mutex::new(false));
+        let visible_state = Arc::new(Mutex::new(false));
+        let inst_ref = Arc::clone(&installed_state);
+        let vis_ref = Arc::clone(&visible_state);
+        let seal_clone = seal.clone();
+        let glen = group_bytes.len() as i64;
+        let dst_hydra = spawn_mock_hydra(move |path, q| match path {
+            "/query" if q.contains("FROM hydra.dfs_egroups WHERE egroup_id = 'eg-rep-1'") => {
+                if *inst_ref.lock().unwrap() {
+                    json!({
+                        "status": "success",
+                        "rows": [{"state": "sealed", "size": glen, "seal_hash": seal_clone}]
+                    })
+                } else {
+                    json!({"status": "success", "rows": []})
+                }
+            }
+            "/query" if q.contains("SELECT vdisk_id, class, size_bytes, extent_bytes FROM hydra.dfs_vdisks") => {
+                if *vis_ref.lock().unwrap() {
+                    json!({
+                        "status": "success",
+                        "rows": [{"vdisk_id": "snap-rep", "class": "immutable", "size_bytes": 1048576, "extent_bytes": 1048576}]
+                    })
+                } else {
+                    json!({"status": "success", "rows": []})
+                }
+            }
+            "/query" if q.contains("SELECT extent_index, egroup_id, egroup_offset, length, vdisk_hash") => json!({
+                "status": "success",
+                "rows": [{
+                    "extent_index": 0,
+                    "egroup_id": "eg-rep-1",
+                    "egroup_offset": 0,
+                    "length": 256,
+                    "vdisk_hash": vh as i64
+                }]
+            }),
+            "/v1/dfs/egroup-create" => {
+                *inst_ref.lock().unwrap() = true;
+                json!({"status": "success", "applied": true, "current": {}})
+            }
+            "/v1/dfs/vdisk-create" => json!({"status": "success", "applied": true, "current": {}}),
+            "/v1/dfs/vdisk-class" => {
+                *vis_ref.lock().unwrap() = true;
+                json!({"status": "success", "applied": true, "current": {}})
+            }
+            _ => json!({"status": "success", "rows": []}),
+        });
+
+        let dst_daemon = test_daemon(&dst_dir, dst_hydra, Vec::new());
+        let offer = dst_daemon
+            .dispatch(&json!({
+                "op": "replicate-offer",
+                "job": "j-test-1",
+                "manifest": manifest.to_json(),
+            }))
+            .unwrap();
+        assert_eq!(offer["status"], json!("proceed"));
+
+        let recv = dst_daemon
+            .dispatch(&json!({
+                "op": "replicate-receive",
+                "job": "j-test-1",
+                "manifest": manifest.to_json(),
+                "frames_hex": frames_hex,
+            }))
+            .unwrap();
+        assert_eq!(recv["installed"], json!(["eg-rep-1"]));
+        assert!(dst_daemon.held_egroups().contains("eg-rep-1"));
+
+        let pub_res = dst_daemon
+            .dispatch(&json!({
+                "op": "replicate-publish",
+                "manifest": manifest.to_json(),
+            }))
+            .unwrap();
+        assert_eq!(pub_res["status"], json!("published"));
+        assert!(!dst_daemon.held_egroups().contains("eg-rep-1"));
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 }

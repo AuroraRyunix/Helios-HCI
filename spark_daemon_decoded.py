@@ -4670,6 +4670,9 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
         if path == "/api/v1/host/files":
             self.handle_host_files_get()
             return True
+        if path == "/api/v1/host/horizon":
+            self.handle_host_horizon_get()
+            return True
         if path == "/api/v1/db/ring":
             self.handle_db_ring()
             return True
@@ -4764,6 +4767,9 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             return True
         if path == "/api/v1/host/files":
             self.handle_host_files_post()
+            return True
+        if path == "/api/v1/host/horizon":
+            self.handle_host_horizon_post()
             return True
 
         segments = [segment for segment in path.split("/") if segment]
@@ -5593,7 +5599,7 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
     # How long each operation may take before the control socket is given up on. A takeover
     # waits for the previous owner to drain its journal (SIDON_HANDOVER_TIMEOUT, 120 s) and
     # then claims and fences, so the 60 s default would abandon one that is working.
-    DFS_OP_TIMEOUTS = {"takeover": 300}
+    DFS_OP_TIMEOUTS = {"takeover": 300, "replicate-receive": 300, "replicate-export": 300}
     DFS_NODE_OPS = ("list", "ping", "capacity", "peers",
                     "purah-sweep", "purah-scrub", "purah-heal",
                     # Ranks this node's extent groups by how hot they are. A node
@@ -5611,7 +5617,10 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
                     # Compaction of this node's sparse sealed groups, and the read-only dedup
                     # estimate. Node operations: which groups a node created is a fact about
                     # the node. `purah-compact` plans unless told to apply.
-                    "purah-compact", "purah-dedup")
+                    "purah-compact", "purah-dedup",
+                    # Cross-site snapshot replication control operations (D-28 to D-31).
+                    "replicate-offer", "replicate-receive", "replicate-publish",
+                    "replicate-export", "replicate-site-key")
     DFS_OPS = DFS_VDISK_OPS + DFS_NODE_OPS
 
     def handle_dfs_vdisk(self):
@@ -6656,6 +6665,54 @@ subprocess.run("rm -rf --one-file-system /etc/hci/odin /etc/hci/spectrum /etc/hc
             "share_name": share_name,
             "ok": True,
             "mount": info,
+        })
+
+    def _load_horizon_module(self):
+        try:
+            import helios_horizon
+            return helios_horizon
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "helios_horizon",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "helios_horizon.py"),
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+    def handle_host_horizon_get(self):
+        """Inspect live local Apache Guacamole (`guacd`) and Horizon VDI host state."""
+        horizon = self._load_horizon_module()
+        info = horizon.inspect_local_horizon_host(run_argv_fn=run_argv)
+        self.send_json_response(200, info)
+
+    def handle_host_horizon_post(self):
+        """Manage local Horizon VDI host services (`ensure_guacd` or `status`)."""
+        payload, error = self.read_json_payload()
+        if error:
+            self.reject(error)
+            return
+        horizon = self._load_horizon_module()
+        action = str(payload.get("action") or "status").strip()
+        if action not in ("ensure_guacd", "status"):
+            self.reject("action must be ensure_guacd or status")
+            return
+        if action == "status":
+            self.send_json_response(200, horizon.inspect_local_horizon_host(run_argv_fn=run_argv))
+            return
+        ok, detail = horizon.ensure_guacd_on_host(
+            bind_host=str(payload.get("bind_host") or horizon.GUACD_DEFAULT_HOST),
+            bind_port=int(payload.get("bind_port") or horizon.GUACD_DEFAULT_PORT),
+            run_argv_fn=run_argv,
+        )
+        if not ok:
+            self.reject(detail or "Failed to configure guacd", 409)
+            return
+        self.send_json_response(200, {
+            "action": action,
+            "ok": True,
+            "status": horizon.inspect_local_horizon_host(run_argv_fn=run_argv),
         })
 
     def handle_host_reboot(self):

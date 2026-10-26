@@ -1817,10 +1817,9 @@ def _init_db_once():
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('mimir_diagnostics', 'mimir_health', '0 * * * *', 3600, true, 0, '/usr/local/bin/mcli health_checks run_all') IF NOT EXISTS;
     """
-    # Purah's scrub, not drbdadm's status. `drbdadm status` reported connection state
-    # and called it a scrub; this recomputes every sealed extent group's checksum against
-    # the hash taken when it was known good, which is what the job was always named for.
-    scrub_cmd = "printf '{\"op\":\"purah-scrub\"}\n' | nc -U /run/sidon/control.sock || true"
+    # Purah's scrub, routed through the typed `/api/v1/dfs/vdisk` (`purah-scrub`) endpoint via
+    # `valcli storage.scrub` rather than writing raw JSON to `/run/sidon/control.sock` (R-8).
+    scrub_cmd = "/usr/local/bin/valcli storage.scrub"
     insert_storage_scrub = f"""
     INSERT INTO hydra.dagur_schedules (job_name, task_type, cron_expression, interval_seconds, enabled, last_run_epoch, command)
     VALUES ('storage_scrub', 'storage_scrub', '0 */6 * * *', 21600, true, 0, '{scrub_cmd}') IF NOT EXISTS;
@@ -4709,6 +4708,33 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"shares": shares})
             return
 
+        elif path == "/api/horizon/pools":
+            import helios_horizon
+            pools, err_p = helios_horizon.list_db_pools(run_cql_query)
+            if err_p:
+                self.send_json(503, {"error": err_p})
+                return
+            sessions, _ = helios_horizon.list_db_sessions(run_query=run_cql_query)
+            for p in pools:
+                pname = p.get("pool_name")
+                vms, _ = helios_horizon.list_pool_desktop_vms(pname, run_query=run_cql_query)
+                p["provisioned_desktops"] = len(vms or [])
+                p["active_sessions"] = sum(
+                    1 for s in (sessions or [])
+                    if s.get("pool_name") == pname and s.get("state") == "CONNECTED"
+                )
+            self.send_json(200, {"pools": pools})
+            return
+
+        elif path == "/api/horizon/sessions":
+            import helios_horizon
+            sessions, err_s = helios_horizon.list_db_sessions(run_query=run_cql_query)
+            if err_s:
+                self.send_json(503, {"error": err_s})
+                return
+            self.send_json(200, {"sessions": sessions})
+            return
+
         elif path == "/api/images":
             # A pure read. This endpoint used to scan
             # /var/lib/hci/aether/volumes/default-image-container and INSERT a catalogue
@@ -5788,8 +5814,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             for h in hosts:
                 other_ip = h.get("ip")
                 if other_ip and other_ip != local_ip and other_ip != "127.0.0.1":
-                    sync_cmd = f"mkdir -p /etc/hci && echo {b64_data} | base64 -d > /etc/hci/cluster.json"
-                    run_remote_spark(other_ip, sync_cmd)
+                    rc_fs, res_fs, _ = run_mtls_spark_api(
+                        other_ip,
+                        "/api/v1/host/fs",
+                        {"op": "write_b64", "path": "/etc/hci/cluster.json", "content_b64": b64_data, "mode": "0644"},
+                    )
+                    if rc_fs != 0 or (isinstance(res_fs, dict) and res_fs.get("error")):
+                        sync_cmd = f"mkdir -p /etc/hci && echo {b64_data} | base64 -d > /etc/hci/cluster.json"
+                        run_remote_spark(other_ip, sync_cmd)
 
             self.send_json(200, {"status": "success", "message": f"Node {hostname} added successfully"})
             return
@@ -5877,8 +5909,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             for h in new_hosts:
                 other_ip = h.get("ip")
                 if other_ip and other_ip != local_ip and other_ip != "127.0.0.1":
-                    sync_cmd = f"mkdir -p /etc/hci && echo {b64_data} | base64 -d > /etc/hci/cluster.json"
-                    run_remote_spark(other_ip, sync_cmd)
+                    rc_fs, res_fs, _ = run_mtls_spark_api(
+                        other_ip,
+                        "/api/v1/host/fs",
+                        {"op": "write_b64", "path": "/etc/hci/cluster.json", "content_b64": b64_data, "mode": "0644"},
+                    )
+                    if rc_fs != 0 or (isinstance(res_fs, dict) and res_fs.get("error")):
+                        sync_cmd = f"mkdir -p /etc/hci && echo {b64_data} | base64 -d > /etc/hci/cluster.json"
+                        run_remote_spark(other_ip, sync_cmd)
 
             self.send_json(200, {"status": "success", "message": f"Node {removed_hostname or removed_ip} removed successfully"})
             return
@@ -7045,9 +7083,20 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                                     # the map is keyed by extent index, so the new range simply
                                     # has no entries and reads as zeroes. Only qemu needs telling.
                                     
-                                    # 2. Tell QEMU block layer to resize
-                                    blockresize_cmd = f"virsh -c qemu:///system blockresize {name} {dev_prefix}{dev_letter} {clean_new_size}"
-                                    run_remote_spark(host_ip, blockresize_cmd)
+                                    # 2. Tell QEMU block layer to resize via typed endpoint first
+                                    rc_lv, res_lv, _ = run_mtls_spark_api(
+                                        host_ip,
+                                        f"/api/v1/vm/{urllib.parse.quote(name)}/live",
+                                        {
+                                            "op": "disk",
+                                            "action": "resize",
+                                            "target": f"{dev_prefix}{dev_letter}",
+                                            "size_bytes": int(size_val) * 1024 * 1024 * 1024,
+                                        },
+                                    )
+                                    if rc_lv != 0 or (isinstance(res_lv, dict) and res_lv.get("error")):
+                                        blockresize_cmd = f"virsh -c qemu:///system blockresize {name} {dev_prefix}{dev_letter} {clean_new_size}"
+                                        run_remote_spark(host_ip, blockresize_cmd)
                         else:
                             # A new disk gets the same treatment as one made by
                             # /api/vms/create: a vdisk, then a claim. There is no
@@ -7073,14 +7122,25 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                             # Attach disk live to the running VM
                             if is_running and host_ip:
                                 dev_letter = letters[idx % 26]
-                                # --source-protocol nbd: the disk is a socket, not a
-                                # device node, so attach-disk has to be told the protocol
-                                # rather than being handed a path it would open directly.
-                                attach_cmd = (
-                                    f"virsh -c qemu:///system attach-disk {name} "
-                                    f"--source {new_path} --source-protocol nbd "
-                                    f"--target vd{dev_letter} --persistent --live")
-                                run_remote_spark(host_ip, attach_cmd)
+                                rc_lv, res_lv, _ = run_mtls_spark_api(
+                                    host_ip,
+                                    f"/api/v1/vm/{urllib.parse.quote(name)}/live",
+                                    {
+                                        "op": "disk",
+                                        "action": "attach",
+                                        "vdisk_id": res_name,
+                                        "target": f"vd{dev_letter}",
+                                    },
+                                )
+                                if rc_lv != 0 or (isinstance(res_lv, dict) and res_lv.get("error")):
+                                    # --source-protocol nbd: the disk is a socket, not a
+                                    # device node, so attach-disk has to be told the protocol
+                                    # rather than being handed a path it would open directly.
+                                    attach_cmd = (
+                                        f"virsh -c qemu:///system attach-disk {name} "
+                                        f"--source {new_path} --source-protocol nbd "
+                                        f"--target vd{dev_letter} --persistent --live")
+                                    run_remote_spark(host_ip, attach_cmd)
 
                     # Step B: Remove deleted disks
                     for idx in range(len(new_parsed), len(old_parsed)):
@@ -7089,8 +7149,14 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                         # Detach disk live from the running VM first
                         if is_running and host_ip:
                             dev_letter = letters[idx % 26]
-                            detach_cmd = f"virsh -c qemu:///system detach-disk {name} vd{dev_letter} --persistent --live"
-                            run_remote_spark(host_ip, detach_cmd)
+                            rc_lv, res_lv, _ = run_mtls_spark_api(
+                                host_ip,
+                                f"/api/v1/vm/{urllib.parse.quote(name)}/live",
+                                {"op": "disk", "action": "detach", "target": f"vd{dev_letter}"},
+                            )
+                            if rc_lv != 0 or (isinstance(res_lv, dict) and res_lv.get("error")):
+                                detach_cmd = f"virsh -c qemu:///system detach-disk {name} vd{dev_letter} --persistent --live"
+                                run_remote_spark(host_ip, detach_cmd)
                             
                         # Detach then delete: Sidon refuses to delete a vdisk it is still
                         # serving, which is the guard against removing storage from under
@@ -8167,6 +8233,111 @@ class SpectrumHandler(BaseHTTPRequestHandler):
             })
             return
 
+        elif self.path == "/api/horizon/pools/create":
+            try:
+                import helios_horizon
+                payload = json.loads(post_data.decode("utf-8"))
+            except Exception as exc:
+                self.send_json(400, {"error": f"Invalid payload: {exc}"})
+                return
+            pool, err_p = helios_horizon.create_pool_record(payload, run_query=run_cql_query)
+            if err_p:
+                self.send_json(400, {"error": err_p})
+                return
+            host_ip = str(payload.get("host_ip") or "").strip() or LOCAL_IP
+            def _spark_sidon_clone(parent_vdisk, child_vdisk):
+                rc_c, res_c, err_c = run_mtls_spark_api(
+                    host_ip,
+                    "/api/v1/dfs/vdisk",
+                    {"op": "clone", "vdisk_id": parent_vdisk, "child_id": child_vdisk},
+                    method="POST",
+                )
+                if rc_c != 0 or (isinstance(res_c, dict) and res_c.get("error")):
+                    raise RuntimeError((res_c or {}).get("error") or err_c or "clone failed")
+            provisioned = []
+            for idx in range(1, int(pool.get("min_desktops") or 0) + 1):
+                vm_rec, _ = helios_horizon.provision_desktop_clone(
+                    pool, idx, host_ip=host_ip, sidon_clone_fn=_spark_sidon_clone, run_query=run_cql_query
+                )
+                if vm_rec:
+                    provisioned.append(vm_rec["name"])
+            self.send_json(201, {
+                "message": f"Helios Horizon VDI pool '{pool['pool_name']}' created.",
+                "pool": pool,
+                "provisioned_desktops": provisioned,
+            })
+            return
+
+        elif self.path == "/api/horizon/pools/delete":
+            try:
+                import helios_horizon
+                payload = json.loads(post_data.decode("utf-8"))
+                pool_name = payload.get("pool_name")
+                force = bool(payload.get("force", False))
+            except Exception:
+                self.send_json(400, {"error": "Invalid payload"})
+                return
+            ok, err_d = helios_horizon.delete_pool_record(pool_name, force=force, run_query=run_cql_query)
+            if not ok:
+                self.send_json(409, {"error": err_d})
+                return
+            self.send_json(200, {"message": f"Helios Horizon VDI pool '{pool_name}' deleted."})
+            return
+
+        elif self.path == "/api/horizon/sessions/launch":
+            try:
+                import helios_horizon
+                payload = json.loads(post_data.decode("utf-8"))
+                pool_name = payload.get("pool_name")
+                username = str(payload.get("username") or "admin").strip()
+                user_groups = payload.get("groups") or []
+            except Exception as exc:
+                self.send_json(400, {"error": f"Invalid payload: {exc}"})
+                return
+            host_ip = str(payload.get("host_ip") or "").strip() or LOCAL_IP
+            def _spark_sidon_clone(parent_vdisk, child_vdisk):
+                rc_c, res_c, err_c = run_mtls_spark_api(
+                    host_ip,
+                    "/api/v1/dfs/vdisk",
+                    {"op": "clone", "vdisk_id": parent_vdisk, "child_id": child_vdisk},
+                    method="POST",
+                )
+                if rc_c != 0 or (isinstance(res_c, dict) and res_c.get("error")):
+                    raise RuntimeError((res_c or {}).get("error") or err_c or "clone failed")
+            res, err_b = helios_horizon.broker_desktop_session(
+                pool_name=pool_name,
+                username=username,
+                user_groups=user_groups,
+                client_ip=self.client_address[0] if self.client_address else "",
+                default_host_ip=host_ip,
+                sidon_clone_fn=_spark_sidon_clone,
+                run_query=run_cql_query,
+                secret=ensure_verifier_secret() or helios_horizon.get_horizon_signing_secret(),
+            )
+            if err_b:
+                self.send_json(409, {"error": err_b})
+                return
+            self.send_json(200, res)
+            return
+
+        elif self.path == "/api/horizon/sessions/disconnect":
+            try:
+                import helios_horizon
+                payload = json.loads(post_data.decode("utf-8"))
+                session_id = payload.get("session_id")
+                reclaim = bool(payload.get("delete_instant_clone", False))
+            except Exception:
+                self.send_json(400, {"error": "Invalid payload"})
+                return
+            ok, err_dc = helios_horizon.disconnect_session(
+                session_id, delete_instant_clone=reclaim, run_query=run_cql_query
+            )
+            if not ok:
+                self.send_json(404, {"error": err_dc})
+                return
+            self.send_json(200, {"message": f"Session '{session_id}' disconnected."})
+            return
+
         elif self.path == "/api/urbosa/t0/update":
             try:
                 payload = json.loads(post_data.decode("utf-8"))
@@ -8627,12 +8798,25 @@ class SpectrumHandler(BaseHTTPRequestHandler):
                 for host in hosts:
                     host_ip = host.get("ip", "")
                     if host_ip and host_ip != LOCAL_IP:
-                        cmd = (
-                            f"mkdir -p /etc/hci/spectrum/certs && "
-                            f"echo {b64_cert} | base64 -d > /etc/hci/spectrum/certs/server.crt && "
-                            f"echo {b64_key} | base64 -d > /etc/hci/spectrum/certs/server.key"
+                        rc_c1, res_c1, _ = run_mtls_spark_api(
+                            host_ip,
+                            "/api/v1/host/fs",
+                            {"op": "write_b64", "path": "/etc/hci/spectrum/certs/server.crt", "content_b64": b64_cert, "mode": "0644"},
                         )
-                        rc_cert, _, _ = run_remote_spark(host_ip, cmd)
+                        rc_c2, res_c2, _ = run_mtls_spark_api(
+                            host_ip,
+                            "/api/v1/host/fs",
+                            {"op": "write_b64", "path": "/etc/hci/spectrum/certs/server.key", "content_b64": b64_key, "mode": "0600"},
+                        )
+                        if rc_c1 == 0 and rc_c2 == 0 and not (isinstance(res_c1, dict) and res_c1.get("error")) and not (isinstance(res_c2, dict) and res_c2.get("error")):
+                            rc_cert = 0
+                        else:
+                            cmd = (
+                                f"mkdir -p /etc/hci/spectrum/certs && "
+                                f"echo {b64_cert} | base64 -d > /etc/hci/spectrum/certs/server.crt && "
+                                f"echo {b64_key} | base64 -d > /etc/hci/spectrum/certs/server.key"
+                            )
+                            rc_cert, _, _ = run_remote_spark(host_ip, cmd)
                         if rc_cert == 0:
                             spark_unit_action(host_ip, "restart", ["slate"])
 
@@ -9171,8 +9355,104 @@ def execute_dagur_job_thread(job_name, command):
     })
 
 
+VERIFIER_SECRET_PATH = "/etc/hci/spectrum/verifier.secret"
+_CONSOLE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
+
+
+def ensure_verifier_secret(path=VERIFIER_SECRET_PATH):
+    """Read or create the shared loopback secret for the port-8089 console token verifier (R-19)."""
+    env_sec = os.environ.get("AGAHNIM_VERIFIER_SECRET", "").strip()
+    if env_sec:
+        return env_sec
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                sec = f.read().strip()
+            if sec:
+                return sec
+        parent = os.path.dirname(path)
+        if parent and os.path.isdir(parent):
+            import secrets
+            sec = secrets.token_hex(32)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(sec + "\n")
+            try:
+                os.chmod(path, 0o600)
+            except Exception:
+                pass
+            return sec
+    except Exception:
+        pass
+    return ""
+
+
+def verify_console_token_request(raw_msg, expected_secret=None, now=None):
+    """Authenticate and verify a console token request from Agahnim (R-19).
+
+    When `expected_secret` is non-empty, the caller must present `AUTH|<secret>|<token>`;
+    unauthenticated or mismatched requests are rejected with `ERROR`.
+    """
+    import hmac
+    msg = (raw_msg or "").strip()
+    if not msg:
+        return "ERROR"
+
+    expected = (
+        ensure_verifier_secret() if expected_secret is None else str(expected_secret or "").strip()
+    )
+    if expected:
+        if not msg.startswith("AUTH|"):
+            return "ERROR"
+        parts = msg.split("|", 2)
+        if len(parts) != 3:
+            return "ERROR"
+        _, supplied_secret, token = parts
+        if not hmac.compare_digest(supplied_secret.encode("utf-8"), expected.encode("utf-8")):
+            return "ERROR"
+    else:
+        if msg.startswith("AUTH|"):
+            parts = msg.split("|", 2)
+            if len(parts) != 3:
+                return "ERROR"
+            token = parts[2]
+        else:
+            token = msg
+
+    token = token.strip()
+    if not token or not _CONSOLE_TOKEN_RE.match(token):
+        return "ERROR"
+
+    cql = (
+        f"SELECT JSON host_ip, port, expires_at FROM hydra.console_sessions "
+        f"WHERE console_token = '{cql_escape(token)}';"
+    )
+    rc, out, _ = run_cql_query(cql)
+
+    host_ip = None
+    port = None
+    expires_at = 0
+
+    if rc == 0 and out:
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    data = json.loads(line)
+                    host_ip = data.get("host_ip")
+                    port = data.get("port")
+                    expires_at = int(data.get("expires_at") or 0)
+                except Exception:
+                    pass
+
+    now_sec = int(time.time()) if now is None else int(now)
+    if host_ip and port and expires_at > now_sec:
+        return f"OK|{host_ip}|{port}"
+    return "ERROR"
+
+
 def internal_token_verifier_loop():
     import socket
+    ensure_verifier_secret()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -9186,36 +9466,12 @@ def internal_token_verifier_loop():
     while True:
         try:
             conn, addr = s.accept()
-            token = conn.recv(1024).decode('utf-8').strip()
-            if not token:
+            raw_msg = conn.recv(1024).decode('utf-8', errors='replace').strip()
+            if not raw_msg:
                 conn.close()
                 continue
-            
-            cql = f"SELECT JSON host_ip, port, expires_at FROM hydra.console_sessions WHERE console_token = '{token}';"
-            rc, out, err = run_cql_query(cql)
-            
-            host_ip = None
-            port = None
-            expires_at = 0
-            
-            if rc == 0:
-                for line in out.splitlines():
-                    line = line.strip()
-                    if line.startswith("{") and line.endswith("}"):
-                        try:
-                            data = json.loads(line)
-                            host_ip = data.get("host_ip")
-                            port = data.get("port")
-                            expires_at = data.get("expires_at", 0)
-                        except Exception:
-                            pass
-            
-            now = int(time.time())
-            if host_ip and port and expires_at > now:
-                response = f"OK|{host_ip}|{port}"
-            else:
-                response = "ERROR"
-                
+
+            response = verify_console_token_request(raw_msg)
             conn.sendall(response.encode('utf-8'))
             conn.close()
         except Exception as e:

@@ -923,7 +923,7 @@ def hylia_rolling_upgrade(job_id):
                         "cp /usr/local/bin/hylia /tmp/spectrum_build/hylia.py && "
                         # The Dockerfile COPYs these too; a build without them failed on every
                         # upgrade, and the failure was only logged as a warning.
-                        "for m in helios_sig helios_schema helios_sidon helios_cql helios_zk helios_files; do "
+                        "for m in helios_sig helios_schema helios_sidon helios_cql helios_zk helios_files helios_horizon rauru_replication; do "
                         "cp /usr/local/bin/$m.py /tmp/spectrum_build/$m.py || exit 1; done && "
                         "cp /usr/local/bin/Dockerfile /tmp/spectrum_build/Dockerfile && "
                         # lanayru is imported by spectrum_server at runtime; tolerate its

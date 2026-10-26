@@ -516,6 +516,7 @@ impl SweepReport {
             "reclaimed_abandoned_open": self.reclaimed_abandoned_open,
             "sealed_abandoned_open": self.sealed_abandoned_open,
             "bytes_reclaimed": self.bytes_reclaimed,
+            "extents_reclaimed": self.extents_reclaimed,
             "skipped_open": self.skipped_open,
             "skipped_held": self.skipped_held,
             "skipped_young": self.skipped_young,

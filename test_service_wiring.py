@@ -456,6 +456,14 @@ REGISTRIES = [
              name="mcli-runner: the units spark-daemon's watchdog restarts",
              exempt={"urbosa": SETTING_NOT_READ_HERE}),
     Registry("mcli-runner", "check_services", "svcs", name="mcli-runner: per-service status checks"),
+    Registry("mcli-runner", "check_services", "services_to_check",
+             name="mcli-runner: maintenance mode stopped services check",
+             exempt={
+                 "hydra-db": KEPT_UP_IN_MAINTENANCE,
+                 "daruk": KEPT_UP_IN_MAINTENANCE,
+                 "sidon": KEPT_UP_IN_MAINTENANCE,
+                 "hylia": HYLIA_THROUGH_MAINTENANCE,
+             }),
     Registry("mcli-runner", "check_services", "managed", name="mcli-runner: flapping check"),
 ]
 
@@ -470,11 +478,6 @@ EXCLUDED = {
     ("provision.py", "provision_single_node", "stale_quadlets", 0):
         ("units that USED to be Quadlets and whose leftover .container files are deleted. A "
          "native-unit service must not be added to it; it is a list of the past, not of services"),
-    ("mcli-runner", "check_services", "services_to_check", 0):
-        ("NOT widened, and that is a gap rather than a decision: this residue probe names six of "
-         "the units vali stops when a host enters maintenance, so a seventh left running is not "
-         "reported. Widening it changes what turns a maintenance check FAIL, and which of the "
-         "others may legitimately stay up cannot be judged without a cluster. Recorded in TODO.md"),
     ("spark.py", "<module>", "CONTAINER_SERVICES", 0):
         ("only services running inside Podman containers whose PIDs come from podman top rather "
          "than systemctl show MainPID; not an inventory of all cluster services"),
@@ -544,13 +547,10 @@ TEXT_REGISTRIES = [
     TextRegistry("deploy_updates.py writes the systemd unit", "deploy_updates.py",
                  r'sftp\.open\("/etc/systemd/system/{unit}\.service", "w"\)',
                  applies=has("native-unit"),
-                 exempt={"sidon": ("KNOWN GAP, see KNOWN_GAPS: the rollout never writes sidon's "
-                                   "unit; provision.py is the only writer")}),
+                 exempt={}),
     TextRegistry("deploy_updates.py enables the unit, so a node without one gains it",
                  "deploy_updates.py", enable_pattern(), applies=has("native-unit"),
-                 exempt={"sidon": ("KNOWN GAP, see KNOWN_GAPS: installed but neither enabled nor "
-                                   "restarted by the rollout, which is deliberate for the restart "
-                                   "and unexamined for the enable")}),
+                 exempt={}),
     TextRegistry("deploy_updates.py makes the script executable", "deploy_updates.py",
                  r'chmod \+x[^"\n]*/usr/local/bin/{name}(?![A-Za-z0-9_.-])',
                  applies=lambda u: has("script")(u) and has("native-unit")(u) and u != "daruk",
@@ -624,27 +624,7 @@ def _spectrum_quadlet_pair():
     return provision, deploy
 
 
-KNOWN_GAPS = {
-    "sidon is not installed by the rollout's unit writers": (
-        "provision.py is the only place sidon's unit is written, and deploy_updates.py neither "
-        "writes nor enables it (it only builds and installs the binary, and deliberately does not "
-        "restart it). A node whose sidon unit is missing or stale cannot be repaired by a rollout. "
-        "Left alone because the rollout's sidon handling and the unit's mount handling are being "
-        "changed together in provision.py and deploy_updates.py by someone else; it belongs in "
-        "that change. Recorded in TODO.md.",
-        lambda: "sidon" not in _unit_texts("deploy_updates.py"),
-    ),
-    "the rollout writes a different console Quadlet from the one provisioning writes": (
-        "deploy_updates.py's spectrum_container_content still carries `PodmanArgs=--privileged`, "
-        "while provision.py's has `DropCapability=ALL` and `NoNewPrivileges=true` and explains why "
-        "the privileged form was removed. A node provisioned today runs the hardened console and "
-        "is put back to the privileged one by the next rollout. The two also disagree about the "
-        "maintenance condition and the volume labels. Which is canonical is the owner's decision, "
-        "and the change restarts the console on every node, so it is recorded rather than made. "
-        "Recorded in TODO.md.",
-        lambda: (lambda pair: pair[0] is not None and pair[0] != pair[1])(_spectrum_quadlet_pair()),
-    ),
-}
+KNOWN_GAPS = {}
 
 # -- hosts' own units that a command string may name ---------------------------------------------
 
@@ -1025,8 +1005,6 @@ class TheTwoCopiesOfAUnitAreOneUnit(unittest.TestCase):
         for unit in UNITS:
             if not has("native-unit")(unit):
                 continue
-            if unit == "sidon":
-                continue    # in KNOWN_GAPS: the rollout has no copy to compare
             self.assertIn(unit, provision, "provision.py writes no unit for %s" % unit)
             self.assertIn(unit, deploy, "deploy_updates.py writes no unit for %s" % unit)
             for copy in provision[unit] + deploy[unit]:

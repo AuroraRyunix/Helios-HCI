@@ -308,5 +308,50 @@ defmodule SpectrumPhx.SdnTest do
 
       assert :ok = Sdn.delete_firewall_rule(rule_id, opts)
     end
+
+    test "configures BGP EVPN and manages BGP neighbors" do
+      sink = self()
+      opts = [source: {:static, %{sink: sink, bgp_config: [], bgp_peers: []}}]
+
+      assert {:ok, %{available?: true, config: cfg, peers: []}} = Sdn.bgp_state(opts)
+      assert cfg.asn == 65000
+      assert cfg.bfd_enabled? == true
+
+      assert :ok =
+               Sdn.configure_bgp(
+                 %{
+                   "asn" => "65100",
+                   "router_id" => "10.10.0.11",
+                   "evpn_enabled" => "true",
+                   "arp_suppression" => "true",
+                   "disable_headend_flood" => "false",
+                   "route_reflectors" => "10.10.0.11",
+                   "bfd_enabled" => "true"
+                 },
+                 opts
+               )
+
+      assert_receive {:write, bgp_cql, ["cluster", 65100, "10.10.0.11", true, true, false, "10.10.0.11", true, _now]}
+      assert bgp_cql =~ "INSERT INTO hydra.urbosa_bgp_config"
+
+      assert {:ok, "10.10.0.12"} =
+               Sdn.add_bgp_peer(
+                 %{
+                   "peer_ip" => "10.10.0.12",
+                   "remote_asn" => "65100",
+                   "description" => "ToR-Leaf-1",
+                   "bfd_enabled" => "true",
+                   "route_reflector_client" => "true"
+                 },
+                 opts
+               )
+
+      assert_receive {:write, peer_cql, ["10.10.0.12", 65100, "ToR-Leaf-1", true, true, _peer_now]}
+      assert peer_cql =~ "INSERT INTO hydra.urbosa_bgp_peers"
+
+      assert :ok = Sdn.delete_bgp_peer("10.10.0.12", opts)
+      assert_receive {:write, del_cql, ["10.10.0.12"]}
+      assert del_cql =~ "DELETE FROM hydra.urbosa_bgp_peers"
+    end
   end
 end

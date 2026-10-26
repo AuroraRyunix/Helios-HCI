@@ -1056,18 +1056,7 @@ single-threaded, one slow query holds every other client, including Sidon's 15 s
 
 ### 4.2 Risks and inconsistencies (need a decision)
 
-> **Status, second pass (2026-10-04).** *Fixed:* R-1 (earlier), R-2 (boot autostart and the watchdog now run the declared-table
-> reconcile pass, serialised with the ZooKeeper loop; the Mimir watchdog check follows), R-3 (the cluster CLI verifies the
-> daemon and no longer carries one machine's path; `HCI_CERT_DIR` relocates it), R-4 and 4.1(6) (a scheduler that is not the
-> dispatcher no longer queues), R-5, R-7, R-10 (the `spark` queue is gone and a submission naming a service with no queue is
-> refused unrecorded), R-13, R-15, R-17 (Rauru runs the protection-domain pass; **never run live**), R-18 (and every Phoenix
-> route is now checked against the ingress rule), R-19 (the console token is redacted in Agahnim's log; the loopback verifier
-> on 8089 is still unauthenticated), R-20 (Phoenix resolves the `catalyst-dispatch` election holder, not the ZooKeeper leader),
-> R-22 (Daruk serves one thread per request). *Left open, with reasons:* R-6 (low), R-8 and R-14 (scrub cadence is a decision),
-> R-9 (the unused cluster create/destroy endpoints are 300+ lines with their own service lists; removing them is a deletion
-> that deserves its own review), R-11, R-12 (`#[allow(dead_code)]` stays while the replication pieces are not called),
-> R-16 (the duplicate hourly health check is harmless, and the console's Health page reads the Dagur run record), R-21,
-> R-23, R-24, R-25.
+> **Status, third pass (2026-10-26).** *Fixed:* R-1, R-2, R-3, R-4, R-5, R-6 (`POST /api/v1/vms/balance` now checks `vali_drs_candidacy().leading()` and forwards over mTLS to the `vali-drs` leader when called on a follower), R-7, R-8 & R-14 (the seeded Dagur `sidon_scrub` job now invokes `/usr/local/bin/valcli storage.scrub` instead of `nc -U /run/sidon/control.sock`, and `SIDON_CONTROL_SOCKET_RE` is enforced by `test_spark_shell_calls.py`), R-10, R-11 (Mipha's `RECOVERING` and `NORMAL` node transitions now go through Daruk's conditional LWT `/v1/node/maintenance` with `expected_status`), R-12 (`#[allow(dead_code)]` removed on `mod replicate` in `sidon/src/main.rs` and `replicate-offer`, `replicate-receive`, `replicate-publish`, `replicate-export`, `replicate-site-key` wired in `sidon/src/control.rs` and Spark `DFS_NODE_OPS`), R-13, R-15, R-17, R-18, R-19 (the console token is redacted in Agahnim's log and the loopback verifier on `127.0.0.1:8089` now authenticates requests with `/etc/hci/spectrum/verifier.secret`), R-20, R-21 (migrated remaining eligible `vali.py` and `spectrum_server.py` shell calls to typed `/api/v1/vm/<name>/nvram`, `/api/v1/vm/undefine`, `/api/v1/host/fs`, and `/api/v1/vm/<name>/live` endpoints), R-22. *Left open, with reasons:* R-9 (the unused cluster create/destroy endpoints are 300+ lines with their own service lists; removing them is a deletion that deserves its own review), R-16 (the duplicate hourly health check is harmless, and the console's Health page reads the Dagur run record), R-23, R-24, R-25.
 
 * **R-1 (high) Mipha's storage-epoch fence appears to call a path Spark does not serve.**
   **FIXED 2026-10-04** (the claim now goes through `run_lwt` to Daruk; `test_fencing.py` pins it). Original finding: `mipha.py:923` posts `/v1/dfs/claim` with `run_mtls_spark_api_full("127.0.0.1", ...)`, i.e.

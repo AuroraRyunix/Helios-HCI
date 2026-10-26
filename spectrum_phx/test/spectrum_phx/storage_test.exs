@@ -560,4 +560,51 @@ defmodule SpectrumPhx.StorageTest do
       assert length(snapshot.vdisks.entries) == 1
     end
   end
+
+  describe "Helios Files shares" do
+    test "lists, creates, and deletes file shares under static source" do
+      opts = [
+        source:
+          {:static,
+           [
+             %{
+               "share_name" => "shared-iso",
+               "vdisk_id" => "files-shared-iso",
+               "container" => "default-pool",
+               "size_gb" => 100,
+               "protocol" => "nfs",
+               "export_path" => "/srv/helios-files/shared-iso",
+               "allowed_clients" => "10.10.0.0/24",
+               "host_ip" => @a,
+               "state" => "EXPORTED",
+               "squash_mode" => "root_squash",
+               "smb_guest_ok" => false
+             }
+           ]},
+        static: healthy()
+      ]
+
+      assert {:ok, [share]} = Storage.list_file_shares(opts)
+      assert share.share_name == "shared-iso"
+      assert share.protocol == "nfs"
+      assert share.size_gb == 100
+      assert share.state == "EXPORTED"
+
+      assert {:ok, "corp-smb"} =
+               Storage.create_file_share(
+                 %{
+                   "share_name" => "corp-smb",
+                   "protocol" => "dual",
+                   "size_gb" => "200",
+                   "container" => "default-pool",
+                   "allowed_clients" => "*",
+                   "squash_mode" => "root_squash"
+                 },
+                 opts
+               )
+
+      assert {:error, _} = Storage.create_file_share(%{"share_name" => "INVALID NAME"}, opts)
+      assert :ok = Storage.delete_file_share("corp-smb", opts)
+    end
+  end
 end

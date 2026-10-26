@@ -2387,15 +2387,27 @@ def process_queue_task(task):
                 q_vm = shlex.quote(vm_name)
 
                 # 1. Force-backup NVRAM on source host to ScyllaDB
-                backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=False)
-                run_remote_spark(src_host, backup_cmd)
+                rc_nb, _, _ = run_mtls_spark_api(
+                    src_host, f"/api/v1/vm/{urllib.parse.quote(vm_name)}/nvram", {"action": "backup"}
+                )
+                if rc_nb != 0:
+                    backup_cmd = get_nvram_backup_cmd(vm_name, delete_local=False)
+                    run_remote_spark(src_host, backup_cmd)
 
                 # 2. Restore NVRAM on target host (ensuring directories exist and files are written)
-                restore_cmd = get_nvram_restore_cmd(vm_name)
-                run_remote_spark(target_ip, restore_cmd)
+                rc_nr, _, _ = run_mtls_spark_api(
+                    target_ip, f"/api/v1/vm/{urllib.parse.quote(vm_name)}/nvram", {"action": "restore"}
+                )
+                if rc_nr != 0:
+                    restore_cmd = get_nvram_restore_cmd(vm_name)
+                    run_remote_spark(target_ip, restore_cmd)
 
                 # 3. Pre-clean stale definition on target host
-                run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {q_vm} --keep-nvram || true")
+                rc_un, _, _ = run_mtls_spark_api(
+                    target_ip, "/api/v1/vm/undefine", {"name": vm_name, "keep_nvram": True}
+                )
+                if rc_un != 0:
+                    run_remote_spark(target_ip, f"virsh -c qemu:///system undefine {q_vm} --keep-nvram || true")
 
                 # 3b. Attach the guest's disks on the target. The domain XML names an NBD
                 # socket per disk and the destination qemu opens it as the migration starts;
@@ -4261,6 +4273,67 @@ def _live_disk(vm_name, vm, host, payload, module):
     return False, "action must be attach, detach, resize or throttle"
 
 
+def forward_drs_balance_to_leader(leader_ip, aggressive=False):
+    """Forward a DRS balance request over mTLS to the Vali node holding `vali-drs`."""
+    ctx = ssl.create_default_context(
+        ssl.Purpose.SERVER_AUTH, cafile="/etc/hci/spark/certs/ca.crt"
+    )
+    ctx.load_cert_chain(
+        certfile="/etc/hci/spark/certs/node.crt",
+        keyfile="/etc/hci/spark/certs/node.key",
+    )
+    ctx.check_hostname = True
+    url = f"https://{leader_ip}:9095/api/v1/vms/balance"
+    data = json.dumps({"aggressive": bool(aggressive), "forwarded": True}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST", headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=15) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            return response.status == 200, res, ""
+    except Exception as exc:
+        return False, {}, str(exc)
+
+
+def trigger_drs_balance(payload, send_json):
+    """`POST /api/v1/vms/balance`: run DRS on the `vali-drs` leader (R-6).
+
+    If this node holds `vali-drs` (or no remote leader is published), run the pass locally.
+    Otherwise forward the request to the node holding `vali-drs` so only one node runs
+    `run_drs_loop` at a time.
+    """
+    payload = payload or {}
+    aggressive = bool(payload.get("aggressive", False))
+    if not payload.get("forwarded"):
+        drs = candidacy(helios_zk.SERVICE_VALI_DRS)
+        if not drs.leading():
+            published = drs.leader_identity()
+            leader_ip = (
+                published.decode("utf-8", "replace").strip()
+                if isinstance(published, (bytes, bytearray))
+                else str(published or "").strip()
+            )
+            if leader_ip and leader_ip not in (LOCAL_IP, "127.0.0.1", "::1", "localhost"):
+                ok, res, err = forward_drs_balance_to_leader(leader_ip, aggressive=aggressive)
+                if ok:
+                    send_json(200, {"status": "triggered", "forwarded_to": leader_ip})
+                else:
+                    send_json(
+                        503,
+                        {
+                            "error": (
+                                f"This node does not hold the vali-drs election and forwarding "
+                                f"to leader {leader_ip} failed: {err}"
+                            )
+                        },
+                    )
+                return
+
+    threading.Thread(target=run_drs_loop, args=(aggressive,), daemon=True).start()
+    send_json(200, {"status": "triggered", "leader": LOCAL_IP})
+
+
 def handle_maintenance_request(payload, send_json):
     """`POST /api/v1/hosts/maintenance`: enter or leave maintenance for a host.
 
@@ -4610,10 +4683,7 @@ class ValiAPIHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(409, {"error": err_msg})
         elif self.path == "/api/v1/vms/balance":
-            aggressive = payload.get("aggressive", False)
-            # Trigger DRS check in a background thread immediately
-            threading.Thread(target=run_drs_loop, args=(aggressive,), daemon=True).start()
-            self.send_json(200, {"status": "triggered"})
+            trigger_drs_balance(payload, self.send_json)
         elif self.path == "/api/v1/hosts/maintenance":
             handle_maintenance_request(payload, self.send_json)
         else:

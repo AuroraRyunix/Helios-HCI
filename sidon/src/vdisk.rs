@@ -424,11 +424,24 @@ impl ReadPlan {
         let mut buf = vec![0u8; self.len as usize];
 
         for (idx, loc) in &self.extents {
-            let extent = match self
-                .store
-                .read_extent(&loc.egroup_id, loc.offset, loc.length, loc.vdisk_hash, *idx)
-            {
-                Ok(bytes) => bytes,
+            let ext_start = *idx * self.extent_bytes;
+            let copy_start = self.offset.max(ext_start);
+            let max_end = end.min(ext_start + self.extent_bytes);
+            if max_end <= copy_start {
+                continue;
+            }
+            let src = (copy_start - ext_start) as usize;
+            let want_len = (max_end - copy_start) as usize;
+            let (slice_bytes, plain_len) = match self.store.read_slice(
+                &loc.egroup_id,
+                loc.offset,
+                loc.length,
+                loc.vdisk_hash,
+                *idx,
+                src,
+                want_len,
+            ) {
+                Ok(res) => res,
                 Err(local) => match self.read_extent_from_replica(loc, *idx) {
                     Some(bytes) => {
                         eprintln!(
@@ -436,22 +449,22 @@ impl ReadPlan {
                              served from a replica",
                             self.id
                         );
-                        bytes
+                        let plen = bytes.len();
+                        let s = src.min(plen);
+                        let e = src.saturating_add(want_len).min(plen);
+                        (bytes[s..e].to_vec(), plen)
                     }
                     None => return Err(local),
                 },
             };
-            self.access.record_read(&loc.egroup_id, extent.len() as u64, self.seen_at);
-            let ext_start = *idx * self.extent_bytes;
-            let copy_start = self.offset.max(ext_start);
-            let copy_end = end.min(ext_start + extent.len() as u64);
+            self.access.record_read(&loc.egroup_id, plain_len as u64, self.seen_at);
+            let copy_end = end.min(ext_start + plain_len as u64);
             if copy_end <= copy_start {
                 continue;
             }
-            let src = (copy_start - ext_start) as usize;
             let dst = (copy_start - self.offset) as usize;
-            let n = (copy_end - copy_start) as usize;
-            buf[dst..dst + n].copy_from_slice(&extent[src..src + n]);
+            let n = ((copy_end - copy_start) as usize).min(slice_bytes.len());
+            buf[dst..dst + n].copy_from_slice(&slice_bytes[..n]);
         }
 
         for (copy_start, file, pos, n) in &self.overlay_ranges {

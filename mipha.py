@@ -2318,9 +2318,26 @@ def main():
                     if db_status == "DOWN":
                         print(f"[Mipha HA] Host {hostname} ({ip}) is back online! Starting rejoin sequence...")
                         
-                        # A1. Set host status to RECOVERING
-                        cql_recovering = f"UPDATE hydra.nodes SET status = 'RECOVERING' WHERE hostname = '{hostname}';"
-                        run_cql_query(cql_recovering)
+                        # A1. Set host status to RECOVERING (conditional on DOWN so a concurrent
+                        # maintenance transition is not clobbered, R-11)
+                        ok_rec, applied_rec, current_rec, _ = run_lwt(
+                            "/v1/node/maintenance",
+                            {
+                                "hostname": hostname,
+                                "status": "RECOVERING",
+                                "maintenance_mode": False,
+                                "expected_status": "DOWN",
+                            },
+                        )
+                        if not ok_rec:
+                            cql_recovering = f"UPDATE hydra.nodes SET status = 'RECOVERING' WHERE hostname = '{hostname}';"
+                            run_cql_query(cql_recovering)
+                        elif not applied_rec:
+                            print(
+                                f"[Mipha HA] {hostname} was no longer DOWN "
+                                f"(it is '{current_rec.get('status')}'); skipping rejoin."
+                            )
+                            continue
                         
                         # A1b. Drop what the host still holds of guests that live elsewhere
                         # now. It was away long enough to be failed over, so its VMs were
@@ -2378,9 +2395,24 @@ def main():
                         if all_services_up:
                             run_cql_query(schema_module().task_update_statement(
                                 parent_task_id, "completed", 100, now_ms_end))
-                            run_cql_query(
-                                f"UPDATE hydra.nodes SET status = 'NORMAL' "
-                                f"WHERE hostname = '{hostname}';")
+                            ok_norm, applied_norm, current_norm, _ = run_lwt(
+                                "/v1/node/maintenance",
+                                {
+                                    "hostname": hostname,
+                                    "status": "NORMAL",
+                                    "maintenance_mode": False,
+                                    "expected_status": "RECOVERING",
+                                },
+                            )
+                            if not ok_norm:
+                                run_cql_query(
+                                    f"UPDATE hydra.nodes SET status = 'NORMAL' "
+                                    f"WHERE hostname = '{hostname}';")
+                            elif not applied_norm:
+                                print(
+                                    f"[Mipha HA] {hostname} was moved from RECOVERING to "
+                                    f"'{current_norm.get('status')}' during rejoin; leaving status alone."
+                                )
                             print(f"[Mipha HA] Host {hostname} rejoined with all services UP; Purah will restore "
                                   f"replica counts in the background.")
                         else:

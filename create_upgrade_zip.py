@@ -170,7 +170,9 @@ components_map = {
     "helios-snapshots": {"src": "helios_snapshots.py", "target": "/usr/local/bin/helios_snapshots.py"},
     # Imported by valcli for protection domains, and by the Rauru daemon.
     "rauru-protection": {"src": "rauru_protection.py", "target": "/usr/local/bin/rauru_protection.py"},
+    "rauru-replication": {"src": "rauru_replication.py", "target": "/usr/local/bin/rauru_replication.py"},
     "helios-files": {"src": "helios_files.py", "target": "/usr/local/bin/helios_files.py"},
+    "helios-horizon": {"src": "helios_horizon.py", "target": "/usr/local/bin/helios_horizon.py"},
     "Dockerfile": {"src": "Dockerfile", "target": "/usr/local/bin/Dockerfile"}
 }
 

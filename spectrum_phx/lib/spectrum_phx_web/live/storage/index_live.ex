@@ -56,6 +56,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
       |> assign_snapshot(Storage.snapshot())
       |> assign(:container_form, default_container_form())
       |> load_containers()
+      |> load_file_shares()
 
     {:ok, socket}
   end
@@ -74,7 +75,7 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
   @impl true
   def handle_event("refresh", _params, socket) do
-    {:noreply, socket |> assign_snapshot(Storage.snapshot()) |> load_containers()}
+    {:noreply, socket |> assign_snapshot(Storage.snapshot()) |> load_containers() |> load_file_shares()}
   end
 
   def handle_event("container_form", params, socket) do
@@ -167,6 +168,32 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
     end
   end
 
+  def handle_event("create_file_share", params, socket) do
+    case Storage.create_file_share(params) do
+      {:ok, share_name} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Helios Files share #{share_name} created.")
+         |> load_file_shares()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_message(reason))}
+    end
+  end
+
+  def handle_event("delete_file_share", %{"name" => name}, socket) do
+    case Storage.delete_file_share(name) do
+      :ok ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Helios Files share #{name} deleted.")
+         |> load_file_shares()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, to_message(reason))}
+    end
+  end
+
   defp maybe_put_attr(map, _key, nil), do: map
   defp maybe_put_attr(map, _key, ""), do: map
   defp maybe_put_attr(map, key, val), do: Map.put(map, key, val)
@@ -186,6 +213,16 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
         socket
         |> assign(:containers, [])
         |> assign(:containers_error, inspect(reason))
+    end
+  end
+
+  defp load_file_shares(socket) do
+    case Storage.list_file_shares() do
+      {:ok, shares} ->
+        socket |> assign(:file_shares, shares) |> assign(:file_shares_error, nil)
+
+      {:error, reason} ->
+        socket |> assign(:file_shares, []) |> assign(:file_shares_error, to_string(reason))
     end
   end
 
@@ -431,6 +468,12 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
 
       <.maintenance_section />
 
+      <.file_shares_section
+        shares={@file_shares}
+        error={@file_shares_error}
+        containers={@containers}
+      />
+
       <.vdisks_section vdisks={@snapshot.vdisks} configured?={@snapshot.configured?} />
 
       <.disks_section disks={@snapshot.disks} configured?={@snapshot.configured?} />
@@ -508,6 +551,144 @@ defmodule SpectrumPhxWeb.Storage.IndexLive do
           <.icon name="hero-arrow-path-rounded-square" class="size-4" /> Replicate Under-replicated Vdisks
         </button>
       </div>
+    </.panel>
+    """
+  end
+
+  attr :shares, :list, required: true
+  attr :error, :string, default: nil
+  attr :containers, :list, required: true
+
+  defp file_shares_section(assigns) do
+    ~H"""
+    <.panel
+      id="file-shares-section"
+      title="Helios Files (HA NFSv4 & SMB3 Shares)"
+      subtitle="Scale-out file shares backed by replicated Sidon vdisks and epoch-fenced HA failover"
+    >
+      <div :if={@error} class="alert alert-warning text-sm mb-3" id="file-shares-error">
+        <.icon name="hero-exclamation-triangle" class="size-4" />
+        <span>File shares catalogue could not be read: {@error}</span>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="table table-sm" id="file-shares-table">
+          <thead>
+            <tr>
+              <th>Share Name</th>
+              <th>Protocol</th>
+              <th>Size</th>
+              <th>Vdisk / Container</th>
+              <th>Export Path</th>
+              <th>Allowed Clients</th>
+              <th>Active Host</th>
+              <th>State</th>
+              <th class="text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr :for={share <- @shares} id={"file-share-" <> share.share_name}>
+              <td class="font-mono font-semibold">{share.share_name}</td>
+              <td>
+                <span class="badge badge-xs badge-info uppercase">{share.protocol}</span>
+                <span :if={share.protocol in ["nfs", "dual"]} class="text-xs opacity-60 ml-1 font-mono">
+                  {share.squash_mode}
+                </span>
+              </td>
+              <td class="tabular-nums">{share.size_gb} GB</td>
+              <td class="font-mono text-xs">
+                {share.vdisk_id} <span class="opacity-60">({share.container})</span>
+              </td>
+              <td class="font-mono text-xs">{share.export_path}</td>
+              <td class="font-mono text-xs">{share.allowed_clients}</td>
+              <td class="font-mono text-xs">{share.host_ip || "—"}</td>
+              <td>
+                <span class={[
+                  "badge badge-xs",
+                  if(share.state == "EXPORTED", do: "badge-success", else: "badge-warning")
+                ]}>
+                  {share.state}
+                </span>
+              </td>
+              <td class="text-right">
+                <button
+                  type="button"
+                  phx-click="delete_file_share"
+                  phx-value-name={share.share_name}
+                  id={"delete-file-share-" <> share.share_name}
+                  class="btn btn-xs btn-error btn-outline"
+                >
+                  Delete
+                </button>
+              </td>
+            </tr>
+            <tr :if={@shares == [] and is_nil(@error)}>
+              <td colspan="9" class="text-sm opacity-60">No Helios Files shares defined.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <form
+        id="create-file-share-form"
+        phx-submit="create_file_share"
+        class="flex flex-wrap gap-2 items-end mt-4 pt-4 border-t border-base-300"
+      >
+        <label class="form-control">
+          <span class="label-text text-xs">Share Name</span>
+          <input
+            type="text"
+            name="share_name"
+            placeholder="shared-iso"
+            class="input input-sm input-bordered font-mono"
+            required
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Protocol</span>
+          <select name="protocol" class="select select-sm select-bordered">
+            <option :for={proto <- Storage.share_protocols()} value={proto}>{String.upcase(proto)}</option>
+          </select>
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Size (GB)</span>
+          <input
+            type="number"
+            name="size_gb"
+            min="1"
+            max="65536"
+            value="100"
+            class="input input-sm input-bordered w-24 font-mono"
+            required
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Container</span>
+          <select name="container" class="select select-sm select-bordered">
+            <option value="default-pool">default-pool</option>
+            <option :for={c <- @containers} :if={c.name != "default-pool"} value={c.name}>
+              {c.name}
+            </option>
+          </select>
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">Allowed Clients</span>
+          <input
+            type="text"
+            name="allowed_clients"
+            value="*"
+            placeholder="* or 10.10.0.0/24"
+            class="input input-sm input-bordered font-mono w-40"
+          />
+        </label>
+        <label class="form-control">
+          <span class="label-text text-xs">NFS Squash</span>
+          <select name="squash_mode" class="select select-sm select-bordered font-mono">
+            <option :for={sq <- Storage.share_squash_modes()} value={sq}>{sq}</option>
+          </select>
+        </label>
+        <button type="submit" class="btn btn-sm btn-primary">Create Share</button>
+      </form>
     </.panel>
     """
   end

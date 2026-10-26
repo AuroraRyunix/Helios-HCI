@@ -27,7 +27,6 @@ mod nbd;
 mod overlay;
 mod peer;
 mod purah;
-#[allow(dead_code)]
 mod replicate;
 mod tls;
 mod vdisk;

@@ -649,6 +649,51 @@ impl EgroupStore {
         decode_extent(stored, footer)
     }
 
+    /// Read a sub-range `[slice_offset..slice_offset + slice_len]` of one extent after
+    /// verifying its footer (`crc32c`, `vdisk_hash`, `extent_index`).
+    ///
+    /// For uncompressed extents (`COMP_NONE`), this avoids allocating a second full-extent
+    /// buffer in `decode_extent`, copying only the requested slice after the footer check.
+    pub fn read_slice(
+        &self,
+        egroup_id: &str,
+        offset: u32,
+        length: u32,
+        vdisk_hash: u64,
+        extent_index: u64,
+        slice_offset: usize,
+        slice_len: usize,
+    ) -> Result<(Vec<u8>, usize)> {
+        let (mut file, _) = self.open_group(egroup_id).map_err(|e| {
+            Error::io(format!(
+                "extent group {} unreadable: {e}",
+                self.path_for(egroup_id).display()
+            ))
+        })?;
+        let mut buf = vec![0u8; length as usize + FOOTER_LEN];
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read_exact(&mut buf).map_err(|e| {
+            Error::corrupt(format!(
+                "extent group {egroup_id} is shorter than the map claims \
+                 (wanted {} bytes at {offset}): {e}",
+                length as usize + FOOTER_LEN
+            ))
+        })?;
+        let (stored, footer) = buf.split_at(length as usize);
+        verify_footer(stored, footer, vdisk_hash, extent_index)?;
+        if footer[5] == COMP_NONE {
+            let plain_len = stored.len();
+            let start = slice_offset.min(plain_len);
+            let end = slice_offset.saturating_add(slice_len).min(plain_len);
+            return Ok((stored[start..end].to_vec(), plain_len));
+        }
+        let plain = decode_extent(stored, footer)?;
+        let plain_len = plain.len();
+        let start = slice_offset.min(plain_len);
+        let end = slice_offset.saturating_add(slice_len).min(plain_len);
+        Ok((plain[start..end].to_vec(), plain_len))
+    }
+
     /// One extent plus its footer, exactly as stored.
     ///
     /// Deliberately unverified: this is for copying bytes to a new replica, and verifying
@@ -1139,6 +1184,29 @@ mod tests {
         assert_eq!(store.path_for("eg-rep"), eg_path);
         let read = store.read_extent("eg-rep", 0, stored.len() as u32, vh, 0).unwrap();
         assert_eq!(read, data);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_slice_verifies_footer_and_returns_exact_subrange() {
+        let dir = tmpdir("read-slice");
+        let store = EgroupStore::new(&dir, 1 << 20).unwrap();
+        let mut eg = store.create("eg-s").unwrap();
+        let vh = vdisk_hash("vd-slice");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let (off0, len0, _) = store.append_framed(&mut eg, &data, vh, 0, false).unwrap();
+        let (off1, len1, _) = store.append_framed(&mut eg, &data, vh, 1, true).unwrap();
+        store.sync(&mut eg).unwrap();
+
+        let (sub0, plain0) = store.read_slice("eg-s", off0, len0, vh, 0, 128, 256).unwrap();
+        assert_eq!(plain0, 4096);
+        assert_eq!(sub0, &data[128..384]);
+
+        let (sub1, plain1) = store.read_slice("eg-s", off1, len1, vh, 1, 512, 1024).unwrap();
+        assert_eq!(plain1, 4096);
+        assert_eq!(sub1, &data[512..1536]);
+
+        assert!(store.read_slice("eg-s", off0, len0, vh, 99, 0, 64).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

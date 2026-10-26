@@ -760,6 +760,8 @@ SPECTRUM_BUILD_FILES = (
     ("helios_cql.py", "helios_cql.py"),
     ("helios_zk.py", "helios_zk.py"),
     ("helios_files.py", "helios_files.py"),
+    ("helios_horizon.py", "helios_horizon.py"),
+    ("rauru_replication.py", "rauru_replication.py"),
 )
 
 local_helios_sig = "helios_sig.py"
@@ -1127,24 +1129,84 @@ WantedBy=multi-user.target
 spectrum_container_content = """[Unit]
 Description=Spectrum (Prism) Web Console & Management UI
 After=hydra-db.service
-ConditionPathExists=!/etc/hci/maintenance.state
 
 [Service]
 Restart=always
 CPUWeight=500
 MemoryMax=1.0G
 MemoryHigh=800M
-SuccessExitStatus=137 143
 
 [Container]
 Image=localhost/spectrum:latest
 Pull=never
 Network=host
-Volume=/etc/hci/spectrum:/etc/hci/spectrum:Z
-Volume=/etc/hci:/etc/hci:ro,z
-Volume=/root/.certs:/root/.certs:ro,z
+Volume=/etc/hci/spectrum:/etc/hci/spectrum:z
+Volume=/etc/hci:/etc/hci:ro
+Volume=/root/.certs:/root/.certs:ro
 Volume=/var/lib/hci/aether/volumes:/var/lib/hci/aether/volumes:rslave
-PodmanArgs=--privileged
+
+## No --privileged. It granted this container nothing it could use, and everything
+## an attacker would want.
+##
+## What it granted: the full capability set, SELinux confinement off, and podman's
+## whole /dev -- every block device on the host. A process in this container could
+## open /dev/sda read-write. The web console is the most exposed surface in the
+## cluster, and a compromise of it was a compromise of the boot disk.
+##
+## What it did not grant: any working path to storage. Podman's /dev carries device
+## nodes but not udev's subdirectories, so the /dev/drbd/by-res/<resource>/0 path every
+## code path then used did not exist in the container at all. That is why image upload
+## failed with ENOENT for as long as it existed: not a missing permission, a missing
+## path. Adding privilege could never have fixed it. Storage now reaches the container
+## not at all -- it relays uploads to spark, which owns the data path.
+##
+## Storage operations belong to spark-daemon, which runs on the host and owns the
+## data path the way Stargate rather than Prism does on Nutanix. See docs/spark_api.md.
+##
+## Note this container still shells out to `podman exec` and `systemctl` in a few
+## places (run_cql_query's cqlsh fallback, the certificate-apply restart). Those
+## already fail today -- there is no podman socket and no systemd socket here, and
+## --privileged never changed that. They are tracked as part of the /api/v1/execute
+## migration; dropping privilege does not make them any more broken than they are.
+##
+## Spectrum binds 8443, reads config and certificates, and makes outbound TLS calls.
+## None of that needs a capability: the port is above 1024, and the process is uid 0
+## so it matches the owner of root's 0600 key without DAC_OVERRIDE.
+DropCapability=ALL
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+sidon_service_content = """[Unit]
+Description=Sidon DFS Data Path Daemon
+After=network.target daruk.service
+Wants=daruk.service
+ConditionPathExists=/etc/hci/cluster.json
+# No maintenance condition: sidon is kept up in maintenance (docs/maintenance.md), and a condition
+# would make systemd skip it on a host rebooted in maintenance while the watchdog kept re-issuing
+# a start that does nothing.
+
+[Service]
+Type=simple
+# No port is opened. Control arrives on a unix socket from spark-daemon, which has
+# already authenticated the caller over mutual TLS on 9099, and guests attach over a
+# per-vdisk unix socket. Adding a storage tier adds no new authenticated surface.
+RuntimeDirectory=sidon
+RuntimeDirectoryMode=0755
+Environment=SIDON_ROOT=/var/lib/hci/sidon
+Environment=SIDON_CONTROL=/run/sidon/control.sock
+Environment=SIDON_DARUK=127.0.0.1:9043
+ExecStart=/usr/local/bin/sidon
+Restart=always
+RestartSec=3
+User=root
+CPUWeight=200
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
 """
 
 slate_container_content = """[Unit]
@@ -1338,8 +1400,12 @@ def deploy_to_node(ip):
             # it imports and which in turn looks for it.
             print(f"[{ip}] Uploading rauru_protection to /usr/local/bin/rauru_protection.py...")
             put_text_file(sftp, "rauru_protection.py", "/usr/local/bin/rauru_protection.py")
+            print(f"[{ip}] Uploading rauru_replication to /usr/local/bin/rauru_replication.py...")
+            put_text_file(sftp, "rauru_replication.py", "/usr/local/bin/rauru_replication.py")
             print(f"[{ip}] Uploading helios_files to /usr/local/bin/helios_files.py...")
             put_text_file(sftp, "helios_files.py", "/usr/local/bin/helios_files.py")
+            print(f"[{ip}] Uploading helios_horizon to /usr/local/bin/helios_horizon.py...")
+            put_text_file(sftp, "helios_horizon.py", "/usr/local/bin/helios_horizon.py")
 
             # Imported by spectrum_server at runtime, so it needs to be on the host as
             # well as inside the console image.
@@ -2065,6 +2131,10 @@ MemoryMax=256M
 WantedBy=multi-user.target
 """)
             f_agah.close()
+
+            f_sidon = sftp.open("/etc/systemd/system/sidon.service", "w")
+            f_sidon.write(sidon_service_content)
+            f_sidon.close()
                 
             if not fast_mode:
                 # 10. Rebuild the spectrum container image locally
@@ -2225,6 +2295,10 @@ WantedBy=multi-user.target
                 "podman exec systemd-hydra-db rm -f /var/lib/scylla/cql_proxy.py || true",
                 "systemctl daemon-reload",
                 "systemctl enable daruk; systemctl is-active hydra-db && systemctl restart daruk || true",
+                # sidon is enabled here so a node whose unit was rewritten or newly installed has
+                # its boot symlink, and deliberately NOT restarted: restarting the storage daemon
+                # detaches every vdisk on the node.
+                "systemctl enable sidon || true",
                 "systemctl enable catalyst && systemctl restart catalyst || true",
                 "systemctl enable dagur; systemctl is-active dagur && systemctl restart dagur || true",
                 "systemctl enable mimir; systemctl is-active mimir && systemctl restart mimir || true",

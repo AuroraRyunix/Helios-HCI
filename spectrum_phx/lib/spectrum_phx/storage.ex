@@ -835,4 +835,178 @@ defmodule SpectrumPhx.Storage do
       component: "Storage"
     )
   end
+
+  # -- Helios Files (HA NFSv4 / SMB3 file shares) ---------------------------------------
+
+  @files_shares_cql "SELECT share_name, vdisk_id, container, size_gb, protocol, export_path, allowed_clients, host_ip, vip, state, squash_mode, smb_guest_ok, created_at_ms, updated_at_ms FROM hydra.files_shares"
+  @share_name_re ~r/^[a-z0-9][a-z0-9_-]{0,46}$/
+  @share_protocols ~w(nfs smb dual)
+  @share_squash_modes ~w(root_squash no_root_squash all_squash)
+
+  @doc "Where Helios Files share reads come from: `:hydra` (default) or `{:static, rows}`."
+  def files_source, do: Application.get_env(:spectrum_phx, :files_source, :hydra)
+
+  @doc "Valid Helios Files protocols (`nfs`, `smb`, `dual`)."
+  def share_protocols, do: @share_protocols
+
+  @doc "Valid NFS squash modes."
+  def share_squash_modes, do: @share_squash_modes
+
+  @doc "List all Helios Files NFSv4/SMB3 shares from `hydra.files_shares`."
+  def list_file_shares(opts \\ []) do
+    src = Keyword.get(opts, :source, files_source())
+
+    case src do
+      {:static, rows} when is_list(rows) ->
+        {:ok, rows |> Enum.map(&normalise_share_row/1) |> Enum.sort_by(& &1.share_name)}
+
+      :hydra ->
+        try do
+          case SpectrumPhx.Hydra.query(@files_shares_cql, []) do
+            {:ok, rows} ->
+              {:ok, rows |> Enum.map(&normalise_share_row/1) |> Enum.sort_by(& &1.share_name)}
+
+            {:error, reason} ->
+              {:error, describe(reason)}
+          end
+        rescue
+          exception -> {:error, Exception.message(exception)}
+        catch
+          :exit, reason -> {:error, describe(reason)}
+        end
+    end
+  end
+
+  @doc "Create a scale-out HA NFSv4/SMB3 file share in `hydra.files_shares`."
+  def create_file_share(attrs, opts \\ []) when is_map(attrs) do
+    share_name = string(attrs["share_name"] || attrs[:share_name])
+    protocol = (string(attrs["protocol"] || attrs[:protocol]) || "nfs") |> String.downcase()
+    size_gb = integer(attrs["size_gb"] || attrs[:size_gb]) || 50
+    container = string(attrs["container"] || attrs[:container]) || "default-pool"
+    allowed_clients = string(attrs["allowed_clients"] || attrs[:allowed_clients]) || "*"
+    squash_mode = (string(attrs["squash_mode"] || attrs[:squash_mode]) || "root_squash") |> String.downcase()
+    smb_guest_ok = (attrs["smb_guest_ok"] || attrs[:smb_guest_ok]) in [true, "true", "1", "on", 1]
+
+    cond do
+      is_nil(share_name) or not Regex.match?(@share_name_re, share_name) ->
+        {:error, "Share name must be 1..47 lowercase alphanumeric characters, '-' or '_'."}
+
+      protocol not in @share_protocols ->
+        {:error, "Protocol must be nfs, smb, or dual."}
+
+      size_gb < 1 or size_gb > 65536 ->
+        {:error, "Share size must be between 1 GB and 65536 GB."}
+
+      squash_mode not in @share_squash_modes ->
+        {:error, "Squash mode must be root_squash, no_root_squash, or all_squash."}
+
+      true ->
+        vdisk_id = "files-#{share_name}"
+        export_path = "/srv/helios-files/#{share_name}"
+        now_ms = System.system_time(:millisecond)
+        host_ip = List.first(node_ips(static_payload(opts))) || ""
+
+        cql =
+          "INSERT INTO hydra.files_shares " <>
+            "(share_name, vdisk_id, container, size_gb, protocol, export_path, allowed_clients, host_ip, vip, state, squash_mode, smb_guest_ok, created_at_ms, updated_at_ms) " <>
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+        params = [
+          share_name,
+          vdisk_id,
+          container,
+          size_gb,
+          protocol,
+          export_path,
+          allowed_clients,
+          host_ip,
+          "",
+          "EXPORTED",
+          squash_mode,
+          smb_guest_ok,
+          now_ms,
+          now_ms
+        ]
+
+        case write_files(cql, params, opts) do
+          :ok ->
+            if host_ip != "" and Keyword.get(opts, :source, files_source()) == :hydra do
+              try do
+                SpectrumPhx.SparkClient.request(host_ip, :post, "/api/v1/host/files", %{
+                  "action" => "activate",
+                  "share" => %{
+                    "share_name" => share_name,
+                    "vdisk_id" => vdisk_id,
+                    "protocol" => protocol,
+                    "export_path" => export_path,
+                    "allowed_clients" => allowed_clients,
+                    "squash_mode" => squash_mode,
+                    "smb_guest_ok" => smb_guest_ok
+                  }
+                })
+              rescue
+                _ -> :ok
+              catch
+                :exit, _ -> :ok
+              end
+            end
+
+            {:ok, share_name}
+
+          {:error, reason} ->
+            {:error, "Could not create file share: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Delete a Helios Files share from `hydra.files_shares`."
+  def delete_file_share(share_name, opts \\ []) do
+    name = string(share_name)
+
+    if is_nil(name) or not Regex.match?(@share_name_re, name) do
+      {:error, "Invalid file share name."}
+    else
+      case write_files("DELETE FROM hydra.files_shares WHERE share_name = ?", [name], opts) do
+        :ok -> :ok
+        {:error, reason} -> {:error, "Could not delete file share: #{describe(reason)}"}
+      end
+    end
+  end
+
+  defp normalise_share_row(row) when is_map(row) do
+    name = string(row["share_name"] || row[:share_name]) || "unknown"
+
+    %{
+      share_name: name,
+      vdisk_id: string(row["vdisk_id"] || row[:vdisk_id]) || "files-#{name}",
+      container: string(row["container"] || row[:container]) || "default-pool",
+      size_gb: integer(row["size_gb"] || row[:size_gb]) || 0,
+      protocol: string(row["protocol"] || row[:protocol]) || "nfs",
+      export_path: string(row["export_path"] || row[:export_path]) || "/srv/helios-files/#{name}",
+      allowed_clients: string(row["allowed_clients"] || row[:allowed_clients]) || "*",
+      host_ip: string(row["host_ip"] || row[:host_ip]),
+      state: string(row["state"] || row[:state]) || "UNKNOWN",
+      squash_mode: string(row["squash_mode"] || row[:squash_mode]) || "root_squash",
+      smb_guest_ok?: (row["smb_guest_ok"] || row[:smb_guest_ok]) == true
+    }
+  end
+
+  defp write_files(cql, params, opts) do
+    case Keyword.get(opts, :source, files_source()) do
+      {:static, _} ->
+        :ok
+
+      :hydra ->
+        try do
+          case SpectrumPhx.Hydra.query(cql, params) do
+            {:ok, _} -> :ok
+            {:error, reason} -> {:error, reason}
+          end
+        rescue
+          exception -> {:error, Exception.message(exception)}
+        catch
+          :exit, reason -> {:error, reason}
+        end
+    end
+  end
 end

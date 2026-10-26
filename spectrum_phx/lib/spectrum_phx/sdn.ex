@@ -806,7 +806,24 @@ defmodule SpectrumPhx.Sdn do
         end)
         |> Enum.sort_by(& &1.peer_ip)
 
-      {:ok, %{config: cfg, peers: peers}}
+      {:ok, %{available?: true, error: nil, config: cfg, peers: peers}}
+    else
+      {:error, reason} ->
+        {:ok,
+         %{
+           available?: false,
+           error: describe(reason),
+           config: %{
+             asn: 65000,
+             router_id: "",
+             evpn_enabled?: false,
+             arp_suppression?: false,
+             disable_headend_flood?: false,
+             route_reflectors: "",
+             bfd_enabled?: true
+           },
+           peers: []
+         }}
     end
   end
 
@@ -832,15 +849,91 @@ defmodule SpectrumPhx.Sdn do
 
       case write(cql, ["cluster", asn, router_id, evpn?, arp_supp?, no_flood?, rr, bfd?, now_ms], opts) do
         :ok ->
-          Enum.each(nodes(static_source(opts)), fn nip ->
-            SpectrumPhx.SparkClient.request(nip, :post, "/api/v1/host/bgp", %{"action" => "reload"})
-          end)
-
+          reload_host_bgp(opts)
           :ok
 
         {:error, reason} ->
           {:error, "Could not save BGP EVPN configuration: #{describe(reason)}"}
       end
+    end
+  end
+
+  @doc "Register a BGP EVPN neighbor in `hydra.urbosa_bgp_peers` and trigger FRR reload."
+  def add_bgp_peer(params, opts \\ []) when is_map(params) do
+    p = stringify(params)
+    peer_ip = string(get(p, "peer_ip"))
+    remote_asn = integer(get(p, "remote_asn")) || 65000
+    description = string(get(p, "description")) || ""
+    bfd? = truthy?(Map.get(p, "bfd_enabled", true))
+    rr_client? = truthy?(get(p, "route_reflector_client"))
+
+    cond do
+      is_nil(peer_ip) or not valid_ipv4?(peer_ip) ->
+        {:error, "A valid IPv4 peer address is required."}
+
+      remote_asn < 1 or remote_asn > 4_294_967_294 ->
+        {:error, "Remote ASN must be between 1 and 4294967294."}
+
+      true ->
+        now_ms = System.system_time(:millisecond)
+
+        cql =
+          "INSERT INTO hydra.urbosa_bgp_peers (peer_ip, remote_asn, description, bfd_enabled, route_reflector_client, created_at_ms) " <>
+            "VALUES (?, ?, ?, ?, ?, ?)"
+
+        case write(cql, [peer_ip, remote_asn, description, bfd?, rr_client?, now_ms], opts) do
+          :ok ->
+            reload_host_bgp(opts)
+            {:ok, peer_ip}
+
+          {:error, reason} ->
+            {:error, "Could not add BGP peer: #{describe(reason)}"}
+        end
+    end
+  end
+
+  @doc "Remove a BGP EVPN neighbor from `hydra.urbosa_bgp_peers` and trigger FRR reload."
+  def delete_bgp_peer(peer_ip, opts \\ []) do
+    ip = string(peer_ip)
+
+    if is_nil(ip) or not valid_ipv4?(ip) do
+      {:error, "Invalid BGP peer IPv4 address."}
+    else
+      case write("DELETE FROM hydra.urbosa_bgp_peers WHERE peer_ip = ?", [ip], opts) do
+        :ok ->
+          reload_host_bgp(opts)
+          :ok
+
+        {:error, reason} ->
+          {:error, "Could not delete BGP peer: #{describe(reason)}"}
+      end
+    end
+  end
+
+  defp valid_ipv4?(ip) when is_binary(ip) do
+    case :inet.parse_ipv4strict_address(String.to_charlist(ip)) do
+      {:ok, _} -> true
+      _ -> false
+    end
+  end
+
+  defp valid_ipv4?(_), do: false
+
+  defp reload_host_bgp(opts) do
+    case static_source(opts) do
+      %{} ->
+        :ok
+
+      nil ->
+        Enum.each(nodes(nil), fn nip ->
+          try do
+            SpectrumPhx.SparkClient.request(nip, :post, "/api/v1/host/bgp", %{"action" => "reload"})
+          rescue
+            _ -> :ok
+          catch
+            :exit, _ -> :ok
+          end
+        end)
     end
   end
 end

@@ -2,11 +2,12 @@
 """The control-plane half of replicating a snapshot to another site: what to send, and how a
 transfer is driven to completion.
 
-**Status: exercised only against fakes.** There is no transport here, no listener and no second
-site; `Remote` is an interface and the tests implement it with an object that can drop the
-link, run out of space and be offered the same snapshot twice. The design is
-`docs/dfs/replication.md` (D-28 to D-31). The bytes are moved by Sidon
-(`sidon/src/replicate*`), never by Python; this module decides *what* and drives the retries.
+`Remote` is the transport interface and `SidonRemote` connects it to Sidon's `replicate-offer`,
+`replicate-export`, `replicate-receive`, and `replicate-publish` control operations; unit tests
+also exercise `Replicator` against a fake `Remote` that can drop the link, run out of space and
+be offered the same snapshot twice. The design is `docs/dfs/replication.md` (D-28 to D-31). The
+bytes are verified and staged by Sidon (`sidon/src/replicate*`); this module decides *what* and
+drives the retries.
 
 Pure functions build the manifest from `dfs_block_map` and `dfs_egroups` rows and decide the
 delta against what the remote reports holding. `Replicator` is the thin loop that offers,
@@ -402,3 +403,105 @@ class Replicator(object):
         state = VISIBLE if all(r.state == VISIBLE for r in results.values()) else (
             FAILED if any(r.state == FAILED for r in results.values()) else PAUSED)
         return state, results
+
+
+class SidonRemote(Remote):
+    """Drives `Remote` over Sidon's `replicate-*` control operations (`replicate-offer`,
+    `replicate-export`, `replicate-receive`, `replicate-publish`).
+
+    `source_call` and `target_call` are injected callables `(op, **params) -> dict` (for
+    example `helios_sidon.call` locally or a Spark `/api/v1/dfs/vdisk` caller across sites).
+    `source_ids` maps target group ids (`gid` or `gid~length`) back to the source egroup id.
+    """
+
+    def __init__(self, site_id, source_call, target_call, source_ids=None, container=None):
+        self.site_id = site_id
+        self.source_call = source_call
+        self.target_call = target_call
+        self.source_ids = dict(source_ids or {})
+        self.container = container
+
+    def _classify_error(self, exc):
+        msg = str(exc)
+        low = msg.lower()
+        if "conflict" in low or "different content" in low:
+            raise Conflict(msg)
+        if "no space" in low or "free" in low and "need" in low:
+            raise NoSpace(msg)
+        if "damaged" in low or "digest" in low or "seal" in low or "corrupt" in low:
+            raise GroupDamaged(msg)
+        raise LinkDropped(msg)
+
+    def offer(self, job, manifest_json):
+        manifest = json.loads(manifest_json) if isinstance(manifest_json, str) else manifest_json
+        try:
+            resp = self.target_call(
+                "replicate-offer",
+                job_id=job,
+                site_id=self.site_id,
+                manifest=manifest,
+            )
+        except Exception as exc:
+            self._classify_error(exc)
+        if resp.get("status") == "already_present":
+            return ("already_present",)
+        have = {}
+        for gid, entry in (resp.get("have") or {}).items():
+            state = entry.get("state")
+            if state == HAVE_COMPLETE:
+                have[gid] = (HAVE_COMPLETE,)
+            elif state == HAVE_PARTIAL:
+                have[gid] = (HAVE_PARTIAL, int(entry.get("staged_bytes") or 0))
+            else:
+                have[gid] = (HAVE_ABSENT,)
+        return ("proceed", have)
+
+    def send(self, job, manifest, wants):
+        lengths = {g["id"]: int(g["length"]) for g in manifest["groups"]}
+        seals = {g["id"]: (g.get("seal") or "") for g in manifest["groups"]}
+        total_sent = 0
+        for group_id, start in wants:
+            total_len = lengths[group_id]
+            source_id = self.source_ids.get(group_id) or group_id.split("~", 1)[0]
+            rem_len = total_len - int(start)
+            try:
+                exported = self.source_call(
+                    "replicate-export",
+                    egroup_id=source_id,
+                    start=int(start),
+                    length=rem_len,
+                )
+            except Exception as exc:
+                self._classify_error(exc)
+            try:
+                params = {
+                    "job_id": job,
+                    "group_id": group_id,
+                    "total_length": total_len,
+                    "start": int(start),
+                    "data_b64": exported["data_b64"],
+                    "sha256": exported["sha256"],
+                }
+                if seals.get(group_id):
+                    params["expected_seal"] = seals[group_id]
+                self.target_call("replicate-receive", **params)
+            except Exception as exc:
+                self._classify_error(exc)
+            total_sent += int(exported.get("length") or rem_len)
+        return total_sent
+
+    def publish(self, job, manifest_json):
+        manifest = json.loads(manifest_json) if isinstance(manifest_json, str) else manifest_json
+        params = {
+            "job_id": job,
+            "site_id": self.site_id,
+            "manifest": manifest,
+        }
+        if self.container:
+            params["container"] = self.container
+        try:
+            resp = self.target_call("replicate-publish", **params)
+        except Exception as exc:
+            self._classify_error(exc)
+        return resp.get("status") or "published"
+

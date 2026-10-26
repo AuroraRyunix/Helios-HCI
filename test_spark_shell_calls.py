@@ -65,9 +65,13 @@ NETWORK_COMMAND_RE = re.compile(
     r"|\bip\s+(?:-\S+\s+)*(?:route|addr|link|neigh)\b"
     r"|/sys/class/net")
 
+# Raw unix-socket piping to Sidon's control socket bypasses `/api/v1/dfs/vdisk` (R-8).
+SIDON_CONTROL_SOCKET_RE = re.compile(r"\bnc\s+-U\s+/run/sidon")
+
 FAMILIES = (
     ("systemd unit control", UNIT_COMMAND_RE),
     ("network probing", NETWORK_COMMAND_RE),
+    ("sidon control socket", SIDON_CONTROL_SOCKET_RE),
 )
 
 # Commands in these two families that are deliberately still written as shell text. Each

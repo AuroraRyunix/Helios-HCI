@@ -1053,6 +1053,44 @@ MIGRATIONS = [
             ");",
         ],
     },
+    {
+        "id": "0059-helios-horizon-vdi",
+        "description": "Helios Horizon VDI desktop pools and brokered streaming sessions backed by Sidon linked clones.",
+        "statements": [
+            "CREATE TABLE IF NOT EXISTS hydra.horizon_pools ("
+            "pool_name text PRIMARY KEY, "
+            "template_vm text, "
+            "pool_type text, "
+            "protocol text, "
+            "desktop_port int, "
+            "min_desktops int, "
+            "max_desktops int, "
+            "vcpu int, "
+            "memory_mb int, "
+            "network_name text, "
+            "domain_join text, "
+            "entitled_groups text, "
+            "power_policy text, "
+            "idle_timeout_min int, "
+            "state text, "
+            "created_at_ms bigint, "
+            "updated_at_ms bigint"
+            ");",
+            "CREATE TABLE IF NOT EXISTS hydra.horizon_sessions ("
+            "session_id text PRIMARY KEY, "
+            "pool_name text, "
+            "vm_name text, "
+            "username text, "
+            "protocol text, "
+            "host_ip text, "
+            "guacd_port int, "
+            "client_ip text, "
+            "state text, "
+            "connected_at_ms bigint, "
+            "last_active_ms bigint"
+            ");",
+        ],
+    },
 ]
 
 

@@ -92,7 +92,7 @@ const VH: u64 = 0x8000_0000_0000_00AB; // the top bit set, the case that wraps i
 
 /// Site A: real extent groups.
 struct SiteA {
-    dir: PathBuf,
+    _dir: PathBuf,
     store: EgroupStore,
     /// target id -> source id
     source_ids: HashMap<String, String>,
@@ -101,7 +101,7 @@ struct SiteA {
 impl SiteA {
     fn new(name: &str) -> SiteA {
         let dir = scratch(&format!("{name}-a"));
-        SiteA { store: EgroupStore::new(&dir.join("egroups"), 1 << 30).unwrap(), dir, source_ids: HashMap::new() }
+        SiteA { store: EgroupStore::new(&dir.join("egroups"), 1 << 30).unwrap(), _dir: dir, source_ids: HashMap::new() }
     }
 
     /// Write one extent group holding the given extents; returns its rows (source ids) and size.

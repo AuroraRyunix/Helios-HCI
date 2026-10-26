@@ -6109,6 +6109,188 @@ def cmd_files_status():
         print("No local share directories mounted on this node.")
 
 
+def cmd_vdi_pool_list():
+    """List all Helios Horizon VDI desktop pools."""
+    import helios_horizon
+    pools, err = helios_horizon.list_db_pools(run_cql_query)
+    if err:
+        print(f"Error: {err}")
+        sys.exit(1)
+    if not pools:
+        print("No Helios Horizon VDI desktop pools configured.")
+        return
+    sessions, _ = helios_horizon.list_db_sessions(run_query=run_cql_query)
+    rows = []
+    for p in pools:
+        pname = p.get("pool_name", "")
+        vms, _ = helios_horizon.list_pool_desktop_vms(pname, run_query=run_cql_query)
+        active = sum(
+            1 for s in (sessions or [])
+            if s.get("pool_name") == pname and s.get("state") == "CONNECTED"
+        )
+        rows.append([
+            pname,
+            p.get("template_vm", ""),
+            p.get("pool_type", "instant_clone"),
+            str(p.get("protocol", "rdp")).upper(),
+            f"{len(vms or [])} ({p.get('min_desktops', 0)}..{p.get('max_desktops', 0)})",
+            str(active),
+            p.get("entitled_groups", "*"),
+            p.get("state", "READY"),
+        ])
+    print_table(
+        ["Pool", "Template VM", "Type", "Proto", "Desktops (min..max)", "Sessions", "Entitled", "State"],
+        rows,
+    )
+
+
+def cmd_vdi_pool_create(sub_args):
+    """Create a Helios Horizon VDI desktop pool backed by Sidon linked clones."""
+    import helios_horizon
+    if len(sub_args) < 2:
+        print(
+            "Usage: valcli vdi.pool.create <pool_name> <template_vm> "
+            "[--type instant_clone|persistent] [--protocol rdp|vnc|spice] "
+            "[--min N] [--max N] [--vcpu N] [--memory-mb N] [--groups g1,g2]"
+        )
+        sys.exit(1)
+    params = {
+        "pool_name": sub_args[0],
+        "template_vm": sub_args[1],
+    }
+    i = 2
+    while i < len(sub_args):
+        flag = sub_args[i]
+        if flag == "--type" and i + 1 < len(sub_args):
+            params["pool_type"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--protocol" and i + 1 < len(sub_args):
+            params["protocol"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--min" and i + 1 < len(sub_args):
+            params["min_desktops"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--max" and i + 1 < len(sub_args):
+            params["max_desktops"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--vcpu" and i + 1 < len(sub_args):
+            params["vcpu"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--memory-mb" and i + 1 < len(sub_args):
+            params["memory_mb"] = sub_args[i + 1]
+            i += 2
+        elif flag == "--groups" and i + 1 < len(sub_args):
+            params["entitled_groups"] = sub_args[i + 1]
+            i += 2
+        else:
+            print(f"Unknown option: {flag}")
+            sys.exit(1)
+    pool, err = helios_horizon.create_pool_record(params, run_query=run_cql_query)
+    if err:
+        print(f"Error: {err}")
+        sys.exit(1)
+    for idx in range(1, int(pool.get("min_desktops") or 0) + 1):
+        helios_horizon.provision_desktop_clone(pool, idx, host_ip=LOCAL_IP, run_query=run_cql_query)
+    print(f"Created Helios Horizon VDI pool '{pool['pool_name']}' from template '{pool['template_vm']}'.")
+
+
+def cmd_vdi_pool_delete(sub_args):
+    """Delete a Helios Horizon VDI desktop pool."""
+    import helios_horizon
+    if not sub_args:
+        print("Usage: valcli vdi.pool.delete <pool_name> [--force]")
+        sys.exit(1)
+    force = "--force" in sub_args
+    pool_name = [a for a in sub_args if a != "--force"][0]
+    ok, err = helios_horizon.delete_pool_record(pool_name, force=force, run_query=run_cql_query)
+    if not ok:
+        print(f"Error: {err}")
+        sys.exit(1)
+    print(f"Deleted Helios Horizon VDI pool '{pool_name}'.")
+
+
+def cmd_vdi_session_list(sub_args):
+    """List active and recent Helios Horizon VDI sessions."""
+    import helios_horizon
+    pool_filter = sub_args[0] if sub_args else None
+    sessions, err = helios_horizon.list_db_sessions(pool_name=pool_filter, run_query=run_cql_query)
+    if err:
+        print(f"Error: {err}")
+        sys.exit(1)
+    if not sessions:
+        print("No Helios Horizon VDI sessions found.")
+        return
+    rows = [
+        [
+            s.get("session_id", ""),
+            s.get("pool_name", ""),
+            s.get("vm_name", ""),
+            s.get("username", ""),
+            str(s.get("protocol", "rdp")).upper(),
+            s.get("host_ip", ""),
+            s.get("state", ""),
+        ]
+        for s in sessions
+    ]
+    print_table(["Session ID", "Pool", "Desktop VM", "User", "Proto", "Host", "State"], rows)
+
+
+def cmd_vdi_session_launch(sub_args):
+    """Broker a Helios Horizon VDI desktop session and print its signed ticket."""
+    import helios_horizon
+    if len(sub_args) < 2:
+        print("Usage: valcli vdi.session.launch <pool_name> <username> [--groups g1,g2]")
+        sys.exit(1)
+    pool_name = sub_args[0]
+    username = sub_args[1]
+    groups = []
+    if len(sub_args) >= 4 and sub_args[2] == "--groups":
+        groups = [g.strip() for g in sub_args[3].split(",") if g.strip()]
+    res, err = helios_horizon.broker_desktop_session(
+        pool_name=pool_name,
+        username=username,
+        user_groups=groups,
+        default_host_ip=LOCAL_IP,
+        run_query=run_cql_query,
+    )
+    if err:
+        print(f"Error: {err}")
+        sys.exit(1)
+    sess = res["session"]
+    print(f"Session ID     : {sess['session_id']}")
+    print(f"Desktop VM     : {sess['vm_name']} ({sess['host_ip']})")
+    print(f"Protocol       : {sess['protocol'].upper()}")
+    print(f"WebSocket Path : {res['websocket_path']}")
+
+
+def cmd_vdi_session_disconnect(sub_args):
+    """Disconnect a Helios Horizon VDI session."""
+    import helios_horizon
+    if not sub_args:
+        print("Usage: valcli vdi.session.disconnect <session_id> [--reclaim]")
+        sys.exit(1)
+    reclaim = "--reclaim" in sub_args
+    sid = [a for a in sub_args if a != "--reclaim"][0]
+    ok, err = helios_horizon.disconnect_session(
+        sid, delete_instant_clone=reclaim, run_query=run_cql_query
+    )
+    if not ok:
+        print(f"Error: {err}")
+        sys.exit(1)
+    print(f"Disconnected VDI session '{sid}'.")
+
+
+def cmd_vdi_status():
+    """Show local Apache Guacamole (`guacd`) and Horizon VDI broker status."""
+    rc, res, err = run_mtls_spark_api("127.0.0.1", "/api/v1/host/horizon", None, method="GET")
+    if rc != 0 or not isinstance(res, dict):
+        print(f"Error querying host Horizon VDI status: {err}")
+        sys.exit(1)
+    print(f"Guacamole Daemon (guacd) : {str(res.get('guacd_service') or 'inactive').upper()}")
+    print(f"Guacd Socket (:{res.get('guacd_port', 4822)})    : {'LISTENING' if res.get('guacd_listening') else 'CLOSED'}")
+    print(f"Agahnim WS Proxy (:8081) : {'LISTENING' if res.get('agahnim_listening') else 'CLOSED'}")
+
+
 VALCLI_COMMANDS = {
     "vm.list", "vm.create", "vm.delete", "vm.edit", "vm.live", "vm.on", "vm.off",
     "vm.migrate", "vm.balance", "vm.annotate", "vm.tag", "vm.clone",
@@ -6119,6 +6301,8 @@ VALCLI_COMMANDS = {
     "disk.list", "disk.delete",
     "sdn.bgp.status", "sdn.bgp.configure", "sdn.bgp.peer.add", "sdn.bgp.peer.delete",
     "files.share.list", "files.share.create", "files.share.delete", "files.share.failover", "files.status",
+    "vdi.pool.list", "vdi.pool.create", "vdi.pool.delete",
+    "vdi.session.list", "vdi.session.launch", "vdi.session.disconnect", "vdi.status",
 }
 
 NCLI_COMMANDS = {
@@ -6130,6 +6314,8 @@ NCLI_COMMANDS = {
     "central.status", "central.deploy", "central.cluster.list", "central.cluster.add", "central.cluster.remove",
     "sdn.bgp.status", "sdn.bgp.configure", "sdn.bgp.peer.add", "sdn.bgp.peer.delete",
     "files.share.list", "files.share.create", "files.share.delete", "files.share.failover", "files.status",
+    "vdi.pool.list", "vdi.pool.create", "vdi.pool.delete",
+    "vdi.session.list", "vdi.session.launch", "vdi.session.disconnect", "vdi.status",
     "storage.list", "storage.container.create", "storage.container.update", "storage.container.delete",
     "storage.benchmark", "storage.cleanup_orphaned", "storage.snapshot", "storage.clone",
     "storage.children", "storage.snapshots", "storage.snapshot-policy", "storage.snapshot-policy.set",
@@ -6423,6 +6609,20 @@ def execute_command(args, prog_name="valcli"):
             cmd_files_share_failover(args[1:])
         elif cmd == "files.status":
             cmd_files_status()
+        elif cmd == "vdi.pool.list":
+            cmd_vdi_pool_list()
+        elif cmd == "vdi.pool.create":
+            cmd_vdi_pool_create(args[1:])
+        elif cmd == "vdi.pool.delete":
+            cmd_vdi_pool_delete(args[1:])
+        elif cmd == "vdi.session.list":
+            cmd_vdi_session_list(args[1:])
+        elif cmd == "vdi.session.launch":
+            cmd_vdi_session_launch(args[1:])
+        elif cmd == "vdi.session.disconnect":
+            cmd_vdi_session_disconnect(args[1:])
+        elif cmd == "vdi.status":
+            cmd_vdi_status()
         elif cmd == "host.maintenance.enter":
             sub_args = args[1:]
             flags = {"--force-stop", "--preserve-vms", "--storage-only"}

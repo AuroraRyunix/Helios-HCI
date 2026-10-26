@@ -1,11 +1,6 @@
-//! The production [`MapSink`]: a snapshot's map written to Hydra through Daruk, in the order that
-//! keeps a half-published snapshot invisible.
-//!
-//! **Status: exercised only against an in-memory stand-in for Hydra.** Nothing in the daemon
-//! constructs this yet; there is no listener and no second site. The statements it issues are
-//! the ones the rest of Sidon already issues (`block_map_batches`, `/v1/dfs/vdisk-create`,
-//! `/v1/dfs/vdisk-class`), which is why a stand-in can be honest about them, but a real Scylla
-//! has not seen this module.
+//! The production [`MapSink`] and [`GroupStore`]: a snapshot's map and extent groups written to
+//! Hydra through Daruk and the local [`EgroupStore`], in the order that keeps a half-published
+//! snapshot invisible.
 //!
 //! The order is the whole point:
 //!
@@ -23,9 +18,10 @@
 use serde_json::{json, Value};
 
 use crate::err::{Error, Result};
+use crate::extent::{disk_space, EgroupStore};
 use crate::meta::{block_map_batches, cql_str, now_ms, Cas, Daruk, MAP_BATCH};
 
-use super::import::MapSink;
+use super::import::{GroupStore, InstalledMeta, MapSink};
 use super::{Manifest, MapRow};
 
 /// The class a replica is in while its map is being written, and the one it is flipped to.
@@ -190,6 +186,105 @@ impl<H: Hydra> MapSink for HydraMapSink<H> {
         }
         Err(Error::meta(format!(
             "{snapshot} could not be made visible: it is in class {}", flip.current_str("class"))))
+    }
+}
+
+/// Production [`GroupStore`] backed by this node's [`EgroupStore`] and Hydra (`dfs_egroups`).
+pub struct HydraGroupStore<H: Hydra> {
+    pub store: EgroupStore,
+    pub hydra: H,
+    pub node: String,
+    pub vdisk_hint: String,
+}
+
+impl<H: Hydra> HydraGroupStore<H> {
+    pub fn new(store: EgroupStore, hydra: H, node: &str, vdisk_hint: &str) -> Self {
+        HydraGroupStore {
+            store,
+            hydra,
+            node: node.to_string(),
+            vdisk_hint: vdisk_hint.to_string(),
+        }
+    }
+}
+
+impl<H: Hydra> GroupStore for HydraGroupStore<H> {
+    fn installed(&self, id: &str) -> Option<InstalledMeta> {
+        let path = self.store.path_for(id);
+        let file_len = std::fs::metadata(&path).ok()?.len();
+        let rows = self
+            .hydra
+            .query(&format!(
+                "SELECT state, size, seal_hash FROM hydra.dfs_egroups WHERE egroup_id = {};",
+                cql_str(id)
+            ))
+            .ok()?;
+        let row = rows.first()?;
+        if row.get("state").and_then(Value::as_str) != Some("sealed") {
+            return None;
+        }
+        let recorded_size = row.get("size").and_then(Value::as_i64).unwrap_or(-1);
+        if recorded_size < 0 || recorded_size as u64 != file_len {
+            return None;
+        }
+        let seal = row
+            .get("seal_hash")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Some(InstalledMeta {
+            length: file_len,
+            sha256: String::new(),
+            seal,
+        })
+    }
+
+    fn free_bytes(&self) -> u64 {
+        let mut avail = 0u64;
+        for d in self.store.disks() {
+            if d.present() {
+                if let Some((_, a)) = disk_space(&d.root) {
+                    avail = avail.saturating_add(a);
+                }
+            }
+        }
+        if avail == 0 {
+            u64::MAX / 4
+        } else {
+            avail
+        }
+    }
+
+    fn install(&mut self, id: &str, part: & std::path::Path, meta: &InstalledMeta) -> Result<()> {
+        let bytes = std::fs::read(part)?;
+        if self.store.copies(id).is_empty() {
+            let slot = self.store.slot_preferring(None);
+            let (temp, _crc) = self.store.stage_new(id, slot, &bytes)?;
+            self.store.stage_publish(id, slot, &temp)?;
+            self.store.stage_switch(id, slot);
+        }
+        let _ = std::fs::remove_file(part);
+        let path_str = self.store.path_for(id).to_string_lossy().to_string();
+        let cas = self.hydra.cas(
+            "/v1/dfs/egroup-create",
+            json!({
+                "egroup_id": id,
+                "state": "sealed",
+                "node": self.node,
+                "path": path_str,
+                "size": meta.length as i64,
+                "seal_hash": meta.seal,
+                "vdisk_hint": self.vdisk_hint,
+                "created_at_ms": now_ms(),
+            }),
+        )?;
+        if !cas.applied && cas.current_str("state") != "sealed" {
+            return Err(Error::refused(format!(
+                "extent group {id} already exists in state {}",
+                cas.current_str("state")
+            )));
+        }
+        Ok(())
     }
 }
 
