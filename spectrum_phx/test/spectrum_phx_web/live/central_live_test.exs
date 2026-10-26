@@ -30,6 +30,8 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     html = render_click(view, "open_deploy_modal")
     assert html =~ "Deploy Helios Central Appliance"
     assert has_element?(view, "#deploy-modal")
+    assert has_element?(view, "select[name='container']")
+    refute html =~ "rocket"
 
     # Select standard preset
     html = render_click(view, "select_preset", %{"preset" => "standard"})
