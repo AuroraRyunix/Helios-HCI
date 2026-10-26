@@ -65,5 +65,18 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     # Trigger deploy with missing required parameters (empty ip/gateway)
     html = render_click(view, "trigger_deploy")
     assert html =~ "Failed to deploy Central Appliance"
+
+    # Open modal, verify form elements
+    _html = render_click(view, "open_deploy_modal")
+    assert has_element?(view, "#deploy-appliance-form")
+
+    # Change form fields
+    html = render_change(view, "update_deploy_form", %{
+      "name" => "central-test-01",
+      "ip" => "10.10.102.75/24",
+      "gateway" => "10.10.102.1",
+      "admin_password" => "TestPass123!"
+    })
+    assert html =~ "10.10.102.75/24"
   end
 end

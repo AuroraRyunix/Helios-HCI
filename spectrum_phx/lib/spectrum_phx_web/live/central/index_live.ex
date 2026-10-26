@@ -28,7 +28,11 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
      |> assign(:active_tab, :fleet)
      |> assign(:selected_preset, "tiny")
      |> assign(:deploy_modal_open?, false)
+     |> assign(:deploy_error, nil)
+     |> assign(:deploying?, false)
      |> assign(:enroll_modal_open?, false)
+     |> assign(:enroll_error, nil)
+     |> assign(:enrolling?, false)
      |> assign(:search_query, "")
      |> assign(:enroll_form, %{
        "cluster_id" => "",
@@ -78,47 +82,72 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   end
 
   def handle_event("open_deploy_modal", _params, socket) do
-    {:noreply, assign(socket, :deploy_modal_open?, true)}
+    {:noreply, assign(socket, deploy_modal_open?: true, deploy_error: nil, deploying?: false)}
   end
 
   def handle_event("close_deploy_modal", _params, socket) do
-    {:noreply, assign(socket, :deploy_modal_open?, false)}
+    {:noreply, assign(socket, deploy_modal_open?: false, deploy_error: nil, deploying?: false)}
   end
 
   def handle_event("open_enroll_modal", _params, socket) do
-    {:noreply, assign(socket, :enroll_modal_open?, true)}
+    {:noreply, assign(socket, enroll_modal_open?: true, enroll_error: nil, enrolling?: false)}
   end
 
   def handle_event("close_enroll_modal", _params, socket) do
-    {:noreply, assign(socket, :enroll_modal_open?, false)}
+    {:noreply, assign(socket, enroll_modal_open?: false, enroll_error: nil, enrolling?: false)}
+  end
+
+  def handle_event("update_deploy_form", params, socket) do
+    new_form = Map.merge(socket.assigns.deploy_form, params)
+    {:noreply, assign(socket, deploy_form: new_form, deploy_error: nil)}
   end
 
   def handle_event("update_deploy_field", %{"field" => field, "value" => value}, socket) do
     new_form = Map.put(socket.assigns.deploy_form, field, value)
-    {:noreply, assign(socket, :deploy_form, new_form)}
+    {:noreply, assign(socket, deploy_form: new_form, deploy_error: nil)}
+  end
+
+  def handle_event("update_enroll_form", params, socket) do
+    new_form = Map.merge(socket.assigns.enroll_form, params)
+    {:noreply, assign(socket, enroll_form: new_form, enroll_error: nil)}
   end
 
   def handle_event("update_enroll_field", %{"field" => field, "value" => value}, socket) do
     new_form = Map.put(socket.assigns.enroll_form, field, value)
-    {:noreply, assign(socket, :enroll_form, new_form)}
+    {:noreply, assign(socket, enroll_form: new_form, enroll_error: nil)}
   end
 
-  def handle_event("submit_enroll", _params, socket) do
-    form = socket.assigns.enroll_form
+  def handle_event("submit_enroll", params, socket) do
+    form =
+      socket.assigns.enroll_form
+      |> Map.merge(params)
 
-    if form["vip"] == "" do
-      {:noreply, put_flash(socket, :error, "VIP address is required to enroll a member cluster.")}
+    vip = String.trim(form["vip"] || "")
+
+    if vip == "" do
+      {:noreply, assign(socket, enroll_error: "VIP address is required to enroll a member cluster.", enrolling?: false)}
     else
+      socket = assign(socket, enrolling?: true, enroll_error: nil)
+
       case Central.enroll_cluster(form) do
         {:ok, _id} ->
           {:noreply,
            socket
-           |> assign(:enroll_modal_open?, false)
+           |> assign(enroll_modal_open?: false, enroll_error: nil, enrolling?: false)
            |> put_flash(:info, "Cluster #{form["name"] || form["vip"]} successfully enrolled into Central.")
            |> load_central_state()}
 
         {:error, reason} ->
-          {:noreply, put_flash(socket, :error, "Failed to enroll cluster: #{inspect(reason)}")}
+          error_msg =
+            case reason do
+              err when is_binary(err) -> err
+              err -> inspect(err)
+            end
+
+          {:noreply,
+           socket
+           |> assign(enroll_error: error_msg, enrolling?: false)
+           |> put_flash(:error, "Failed to enroll cluster: #{error_msg}")}
       end
     end
   end
@@ -131,23 +160,72 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
      |> load_central_state()}
   end
 
-  def handle_event("trigger_deploy", _params, socket) do
-    params =
+  def handle_event("trigger_deploy", params, socket) do
+    form_params =
       socket.assigns.deploy_form
+      |> Map.merge(params)
       |> Map.put("preset", socket.assigns.selected_preset)
 
-    case Central.deploy_appliance(params) do
-      {:ok, deployment} ->
-        {:noreply,
-         socket
-         |> assign(:deploy_modal_open?, false)
-         |> put_flash(:info, "Helios Central Appliance '#{deployment["name"]}' deployed successfully.")
-         |> load_central_state()}
+    name = String.trim(form_params["name"] || "helios-central")
+    ip = String.trim(form_params["ip"] || "")
+    gateway = String.trim(form_params["gateway"] || "")
+    dns = String.trim(form_params["dns"] || "")
+    admin_password = String.trim(form_params["admin_password"] || "")
+    container = String.trim(form_params["container"] || "default-pool")
 
-      {:error, reason} ->
+    cond do
+      ip == "" ->
         {:noreply,
          socket
-         |> put_flash(:error, "Failed to deploy Central Appliance: #{inspect(reason)}")}
+         |> assign(deploy_error: "Appliance IPv4 address with CIDR prefix is required (e.g. 10.10.102.75/24).", deploying?: false)
+         |> put_flash(:error, "Failed to deploy Central Appliance: Appliance IPv4 address with CIDR prefix is required.")}
+
+      gateway == "" ->
+        {:noreply,
+         socket
+         |> assign(deploy_error: "Default gateway address is required (e.g. 10.10.102.1).", deploying?: false)
+         |> put_flash(:error, "Failed to deploy Central Appliance: Default gateway address is required.")}
+
+      admin_password == "" ->
+        {:noreply,
+         socket
+         |> assign(deploy_error: "Admin password is required.", deploying?: false)
+         |> put_flash(:error, "Failed to deploy Central Appliance: Admin password is required.")}
+
+      true ->
+        deploy_payload = %{
+          "name" => if(name == "", do: "helios-central", else: name),
+          "ip" => ip,
+          "gateway" => gateway,
+          "dns" => if(dns == "", do: gateway, else: dns),
+          "admin_password" => admin_password,
+          "container" => container,
+          "preset" => socket.assigns.selected_preset
+        }
+
+        socket = assign(socket, deploying?: true, deploy_error: nil)
+
+        case Central.deploy_appliance(deploy_payload) do
+          {:ok, deployment} ->
+            {:noreply,
+             socket
+             |> assign(deploy_modal_open?: false, deploy_error: nil, deploying?: false)
+             |> put_flash(:info, "Helios Central Appliance '#{deployment["name"]}' deployed successfully.")
+             |> load_central_state()}
+
+          {:error, reason} ->
+            error_msg =
+              case reason do
+                {:storage, msg} -> "Storage error: #{msg}"
+                err when is_binary(err) -> err
+                err -> inspect(err)
+              end
+
+            {:noreply,
+             socket
+             |> assign(deploy_error: error_msg, deploying?: false)
+             |> put_flash(:error, "Failed to deploy Central Appliance: #{error_msg}")}
+        end
     end
   end
 
@@ -750,111 +828,121 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               <.icon name="hero-server-stack" class="size-5 text-primary" />
               <span>Deploy Helios Central Appliance</span>
             </h3>
-            <button phx-click="close_deploy_modal" class="btn btn-sm btn-circle btn-ghost">✕</button>
+            <button type="button" phx-click="close_deploy_modal" class="btn btn-sm btn-circle btn-ghost">✕</button>
           </div>
 
-          <div class="space-y-4 py-4">
-            <div>
-              <label class="label text-xs font-semibold">Select Sizing Preset</label>
-              <div class="grid grid-cols-3 gap-2">
-                <button
-                  :for={p <- @presets}
-                  type="button"
-                  phx-click="select_preset"
-                  phx-value-preset={p.id}
-                  class={["btn btn-sm flex flex-col h-auto py-2", if(@selected_preset == p.id, do: "btn-primary", else: "btn-outline")]}
-                >
-                  <span class="font-bold">{p.name |> String.split(" ") |> hd()}</span>
-                  <span class="text-[10px] font-mono opacity-80">{p.vcpus} vCPU · {round(p.memory_mb / 1024)}G</span>
-                </button>
+          <form id="deploy-appliance-form" phx-change="update_deploy_form" phx-submit="trigger_deploy">
+            <div class="space-y-4 py-4">
+              <div :if={@deploy_error} class="alert alert-error text-xs py-2 px-3 rounded-lg shadow-sm" id="deploy-error-alert">
+                <.icon name="hero-exclamation-triangle" class="size-4 shrink-0" />
+                <span>{@deploy_error}</span>
+              </div>
+
+              <div>
+                <label class="label text-xs font-semibold">Select Sizing Preset</label>
+                <div class="grid grid-cols-3 gap-2">
+                  <button
+                    :for={p <- @presets}
+                    type="button"
+                    phx-click="select_preset"
+                    phx-value-preset={p.id}
+                    class={["btn btn-sm flex flex-col h-auto py-2", if(@selected_preset == p.id, do: "btn-primary", else: "btn-outline")]}
+                  >
+                    <span class="font-bold">{p.name |> String.split(" ") |> hd()}</span>
+                    <span class="text-[10px] font-mono opacity-80">{p.vcpus} vCPU · {round(p.memory_mb / 1024)}G</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="label text-xs font-semibold">Appliance VM Name</label>
+                  <input
+                    type="text"
+                    name="name"
+                    placeholder="helios-central"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@deploy_form["name"]}
+                  />
+                </div>
+                <div>
+                  <label class="label text-xs font-semibold">Storage Container</label>
+                  <select
+                    class="select select-sm select-bordered w-full font-mono"
+                    name="container"
+                  >
+                    <option :if={@containers == []} value="" disabled selected>No storage containers found</option>
+                    <option :for={c <- @containers} value={c.name} selected={@deploy_form["container"] == c.name}>
+                      {c.name} ({c.tier}, FTT={c.ftt})
+                    </option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="label text-xs font-semibold">Static IPv4 &amp; Prefix <span class="text-error">*</span></label>
+                  <input
+                    type="text"
+                    name="ip"
+                    placeholder="e.g. 10.10.102.75/24"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@deploy_form["ip"]}
+                    required
+                  />
+                </div>
+                <div>
+                  <label class="label text-xs font-semibold">Default Gateway <span class="text-error">*</span></label>
+                  <input
+                    type="text"
+                    name="gateway"
+                    placeholder="e.g. 10.10.102.1"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@deploy_form["gateway"]}
+                    required
+                  />
+                </div>
+              </div>
+
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="label text-xs font-semibold">DNS Nameserver</label>
+                  <input
+                    type="text"
+                    name="dns"
+                    placeholder="e.g. 10.10.102.1"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@deploy_form["dns"]}
+                  />
+                </div>
+                <div>
+                  <label class="label text-xs font-semibold">Admin Password <span class="text-error">*</span></label>
+                  <input
+                    type="password"
+                    name="admin_password"
+                    placeholder="Enter initial appliance password"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@deploy_form["admin_password"]}
+                    required
+                  />
+                </div>
               </div>
             </div>
 
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="label text-xs font-semibold">Appliance VM Name</label>
-                <input
-                  type="text"
-                  placeholder="helios-central"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["name"]}
-                  phx-change="update_deploy_field"
-                  phx-value-field="name"
-                />
-              </div>
-              <div>
-                <label class="label text-xs font-semibold">Storage Container</label>
-                <select
-                  class="select select-sm select-bordered w-full font-mono"
-                  phx-change="update_deploy_field"
-                  phx-value-field="container"
-                  name="container"
-                >
-                  <option :if={@containers == []} value="" disabled selected>No storage containers found</option>
-                  <option :for={c <- @containers} value={c.name} selected={@deploy_form["container"] == c.name}>
-                    {c.name} ({c.tier}, FTT={c.ftt})
-                  </option>
-                </select>
-              </div>
+            <div class="modal-action border-t border-base-content/10 pt-4">
+              <button type="button" phx-click="close_deploy_modal" class="btn btn-sm btn-ghost" disabled={@deploying?}>Cancel</button>
+              <button
+                type="submit"
+                class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/20"
+                id="confirm-deploy-btn"
+                disabled={@deploying?}
+              >
+                <span :if={@deploying?} class="loading loading-spinner loading-xs"></span>
+                <.icon :if={!@deploying?} name="hero-check" class="size-4" />
+                {if @deploying?, do: "Deploying Appliance...", else: "Deploy Appliance Now"}
+              </button>
             </div>
-
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="label text-xs font-semibold">Static IPv4 &amp; Prefix</label>
-                <input
-                  type="text"
-                  placeholder="e.g. 10.10.102.50/24"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["ip"]}
-                  phx-change="update_deploy_field"
-                  phx-value-field="ip"
-                />
-              </div>
-              <div>
-                <label class="label text-xs font-semibold">Default Gateway</label>
-                <input
-                  type="text"
-                  placeholder="e.g. 10.10.102.1"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["gateway"]}
-                  phx-change="update_deploy_field"
-                  phx-value-field="gateway"
-                />
-              </div>
-            </div>
-
-            <div class="grid grid-cols-2 gap-4">
-              <div>
-                <label class="label text-xs font-semibold">DNS Nameserver</label>
-                <input
-                  type="text"
-                  placeholder="e.g. 10.10.102.1"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["dns"]}
-                  phx-change="update_deploy_field"
-                  phx-value-field="dns"
-                />
-              </div>
-              <div>
-                <label class="label text-xs font-semibold">Admin Password</label>
-                <input
-                  type="password"
-                  placeholder="Enter initial appliance password"
-                  class="input input-sm input-bordered w-full font-mono"
-                  value={@deploy_form["admin_password"]}
-                  phx-change="update_deploy_field"
-                  phx-value-field="admin_password"
-                />
-              </div>
-            </div>
-          </div>
-
-          <div class="modal-action border-t border-base-content/10 pt-4">
-            <button phx-click="close_deploy_modal" class="btn btn-sm btn-ghost">Cancel</button>
-            <button phx-click="trigger_deploy" class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/20" id="confirm-deploy-btn">
-              <.icon name="hero-check" class="size-4" /> Deploy Appliance Now
-            </button>
-          </div>
+          </form>
         </div>
       </div>
 
@@ -866,78 +954,83 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               <.icon name="hero-link" class="size-5 text-accent" />
               <span>Connect External Helios Cluster</span>
             </h3>
-            <button phx-click="close_enroll_modal" class="btn btn-sm btn-circle btn-ghost">✕</button>
+            <button type="button" phx-click="close_enroll_modal" class="btn btn-sm btn-circle btn-ghost">✕</button>
           </div>
 
-          <div class="space-y-4 py-4">
-            <div>
-              <label class="label text-xs font-semibold">Cluster Identifier</label>
-              <input
-                type="text"
-                placeholder="e.g. cluster-beta-02"
-                class="input input-sm input-bordered w-full font-mono"
-                value={@enroll_form["cluster_id"]}
-                phx-change="update_enroll_field"
-                phx-value-field="cluster_id"
-              />
-            </div>
+          <form id="enroll-cluster-form" phx-change="update_enroll_form" phx-submit="submit_enroll">
+            <div class="space-y-4 py-4">
+              <div :if={@enroll_error} class="alert alert-error text-xs py-2 px-3 rounded-lg shadow-sm" id="enroll-error-alert">
+                <.icon name="hero-exclamation-triangle" class="size-4 shrink-0" />
+                <span>{@enroll_error}</span>
+              </div>
 
-            <div>
-              <label class="label text-xs font-semibold">Cluster Display Name</label>
-              <input
-                type="text"
-                placeholder="e.g. Beta Datacenter Edge"
-                class="input input-sm input-bordered w-full"
-                value={@enroll_form["name"]}
-                phx-change="update_enroll_field"
-                phx-value-field="name"
-              />
-            </div>
-
-            <div class="grid grid-cols-3 gap-2">
-              <div class="col-span-2">
-                <label class="label text-xs font-semibold">Virtual IP (VIP)</label>
+              <div>
+                <label class="label text-xs font-semibold">Cluster Identifier</label>
                 <input
                   type="text"
-                  placeholder="e.g. 10.10.103.45"
+                  name="cluster_id"
+                  placeholder="e.g. cluster-beta-02"
                   class="input input-sm input-bordered w-full font-mono"
-                  value={@enroll_form["vip"]}
-                  phx-change="update_enroll_field"
-                  phx-value-field="vip"
+                  value={@enroll_form["cluster_id"]}
                 />
               </div>
+
               <div>
-                <label class="label text-xs font-semibold">API Port</label>
+                <label class="label text-xs font-semibold">Cluster Display Name</label>
                 <input
-                  type="number"
-                  placeholder="8443"
+                  type="text"
+                  name="name"
+                  placeholder="e.g. Beta Datacenter Edge"
+                  class="input input-sm input-bordered w-full"
+                  value={@enroll_form["name"]}
+                />
+              </div>
+
+              <div class="grid grid-cols-3 gap-2">
+                <div class="col-span-2">
+                  <label class="label text-xs font-semibold">Virtual IP (VIP) <span class="text-error">*</span></label>
+                  <input
+                    type="text"
+                    name="vip"
+                    placeholder="e.g. 10.10.103.45"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@enroll_form["vip"]}
+                    required
+                  />
+                </div>
+                <div>
+                  <label class="label text-xs font-semibold">API Port</label>
+                  <input
+                    type="number"
+                    name="port"
+                    placeholder="8443"
+                    class="input input-sm input-bordered w-full font-mono"
+                    value={@enroll_form["port"]}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label class="label text-xs font-semibold">Cluster mTLS Auth Token</label>
+                <input
+                  type="password"
+                  name="auth_token"
+                  placeholder="Secret cluster federation token"
                   class="input input-sm input-bordered w-full font-mono"
-                  value={@enroll_form["port"]}
-                  phx-change="update_enroll_field"
-                  phx-value-field="port"
+                  value={@enroll_form["auth_token"]}
                 />
               </div>
             </div>
 
-            <div>
-              <label class="label text-xs font-semibold">Cluster mTLS Auth Token</label>
-              <input
-                type="password"
-                placeholder="Secret cluster federation token"
-                class="input input-sm input-bordered w-full font-mono"
-                value={@enroll_form["auth_token"]}
-                phx-change="update_enroll_field"
-                phx-value-field="auth_token"
-              />
+            <div class="modal-action border-t border-base-content/10 pt-4">
+              <button type="button" phx-click="close_enroll_modal" class="btn btn-sm btn-ghost" disabled={@enrolling?}>Cancel</button>
+              <button type="submit" class="btn btn-sm btn-accent gap-1.5" id="confirm-enroll-btn" disabled={@enrolling?}>
+                <span :if={@enrolling?} class="loading loading-spinner loading-xs"></span>
+                <.icon :if={!@enrolling?} name="hero-check" class="size-4" />
+                {if @enrolling?, do: "Connecting...", else: "Enroll Cluster"}
+              </button>
             </div>
-          </div>
-
-          <div class="modal-action border-t border-base-content/10 pt-4">
-            <button phx-click="close_enroll_modal" class="btn btn-sm btn-ghost">Cancel</button>
-            <button phx-click="submit_enroll" class="btn btn-sm btn-accent gap-1.5" id="confirm-enroll-btn">
-              <.icon name="hero-check" class="size-4" /> Enroll Cluster
-            </button>
-          </div>
+          </form>
         </div>
       </div>
     </Layouts.app>

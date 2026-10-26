@@ -288,7 +288,10 @@ defmodule SpectrumPhx.Central do
         case Hydra.query("SELECT name, state FROM hydra.vms WHERE name = ?;", [name]) do
           {:ok, [%{"name" => _} | _]} ->
             Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
-            SpectrumPhx.Vms.power_on(name)
+            case SpectrumPhx.Vms.power_on(name) do
+              {:ok, _} -> {:ok, :started}
+              {:error, _} -> {:ok, :updated}
+            end
 
           _ ->
             vm_params = %{
@@ -296,6 +299,7 @@ defmodule SpectrumPhx.Central do
               "vcpu" => preset.vcpus,
               "memory" => preset.memory_mb,
               "firmware" => "uefi",
+              "disks" => "#{preset.disk_gb}G:#{container}",
               "disks_list" => "#{preset.disk_gb}G:#{container}",
               "cpu_model" => "host-passthrough",
               "cloud_init_userdata" => userdata_yaml,
@@ -305,7 +309,10 @@ defmodule SpectrumPhx.Central do
             case SpectrumPhx.Vms.create_vm(vm_params) do
               {:ok, _vm} ->
                 Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
-                SpectrumPhx.Vms.power_on(name)
+                case SpectrumPhx.Vms.power_on(name) do
+                  {:ok, _} -> {:ok, :started}
+                  {:error, _} -> {:ok, :created}
+                end
 
               {:error, reason} ->
                 {:error, reason}
