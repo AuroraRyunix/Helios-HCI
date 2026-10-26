@@ -20,7 +20,7 @@ This directory holds the architecture references, per-daemon documentation, and 
 | [backup_restore.md](./backup_restore.md) | What the cluster cannot rebuild, how `saga` captures it, the restore sequence, retention — and, explicitly, what is *not* backed up (guest data is not). |
 | [master_flowchart.md](./master_flowchart.md) | System-wide Mermaid flowchart (database boundaries, mTLS calls, socket loops). |
 | [master_technical_mindmap.md](./master_technical_mindmap.md) | High-level taxonomy map of all components. |
-| [add_ons_design.md](./add_ons_design.md) | Forward-looking design blueprint for four scale-out add-ons (Helios Portal, Helios Files, Helios Horizon, Scale-Out Urbosa) — none implemented yet. |
+| [add_ons_design.md](./add_ons_design.md) | Technical architecture and implementation guide for the four scale-out add-ons: Helios Central (fleet federation), Helios Files (scale-out HA NFSv4/SMB3), Helios Horizon (VDI & application broker), and Scale-Out Urbosa (FRRouting BGP EVPN). |
 | [service_review.md](./service_review.md) | A review of every service: purpose, entry points, endpoints and their callers, state in Hydra and ZooKeeper, leadership, failure behaviour, tests, and the dead code, duplication and risks found (with evidence and greps). Written by a read-only pass; the Logos question and the shell-string audit are answered there. |
 | [host_states.md](./host_states.md) | Every host state (NORMAL, DEGRADED, FENCED, DOWN, RECOVERING, maintenance): what sets it, what it stops, what clears it, the thresholds, how split brain is avoided and how a returning host is reconciled, with the transition table. |
 | [maintenance.md](./maintenance.md) | Host maintenance: what a host in maintenance keeps running and why, every step of entering and leaving, what each failure leaves behind, the lock, and what happens on a reboot. |
@@ -52,8 +52,12 @@ Each pair is `<name>.md` (narrative overview) + `<name>_technical.md` (internals
 | Urbosa Bootstrap (`urbosa_bootstrap.py`) | — | [urbosa_bootstrap_technical.md](./urbosa_bootstrap_technical.md) |
 | Vali (`vali.py`) | [vali.md](./vali.md) | [vali_technical.md](./vali_technical.md) |
 | Valcli (`valcli.py`) | — | [valcli_technical.md](./valcli_technical.md) |
-| Impa (`impa.py`, cluster certificate lifecycle) | [mtls_lifecycle.md](./mtls_lifecycle.md) | — |
+| Impa (`impa.py`, cluster certificate lifecycle) | [mtls_lifecycle.md](./mtls_lifecycle.md) | Site pairing (`site-init`, `site-pair`) and SPKI SHA-256 fingerprinting |
 | Saga (`saga.py`) | [backup_restore.md](./backup_restore.md) | — (the narrative doc covers the internals too) |
+| Helios Central (`SpectrumPhx.Central`) | [add_ons_design.md](./add_ons_design.md#1-helios-central-multi-cluster-fleet-federation) | Fleet orchestration, NoCloud appliance, zero-mock hardware views |
+| Helios Files (`helios_files.py`) | [add_ons_design.md](./add_ons_design.md#2-helios-files-scale-out-file-server) | Replicated Sidon NFSv4/SMB3 exports, Mipha epoch failover |
+| Helios Horizon (`helios_horizon.py`) | [add_ons_design.md](./add_ons_design.md#3-helios-horizon-vdi-system) | Guacamole VDI desktop pools, AD/LDAP entitlement, CoW linked clones |
+| Rauru Replication (`rauru_replication.py`) | [dfs/replication.md](./dfs/replication.md) | Cross-site DFS snapshot sets, `HydraStateStore`, mTLS transport |
 | Provision (`provision.py`) | — | [provision_technical.md](./provision_technical.md) |
 | Sync Provision (`sync_provision.py`) | — | [sync_provision_technical.md](./sync_provision_technical.md) |
 | Check Updates (`check_updates.py`) | — | [check_updates_technical.md](./check_updates_technical.md) |
@@ -93,7 +97,7 @@ The reasoning behind the storage layer. Sidon, Purah and Ganon are built and run
 | [dfs/multi_disk.md](./dfs/multi_disk.md) | Using more than one disk per node, why pooling them is wrong, and how sidon mounts them (sibling mounts by UUID, none in fstab). |
 | [dfs/snapshots.md](./dfs/snapshots.md) | Scheduled snapshots (run by Rauru), the retention policy and how it never prunes what something depends on, and in-place rollback of a detached vdisk. |
 | [dfs/protection_domains.md](./dfs/protection_domains.md) | Protection domains: VMs and vdisks snapshotted together under one policy, the crash-consistency story (and what it is not), set retention and restore, and the interface for the Rauru daemon. |
-| [dfs/replication.md](./dfs/replication.md) | Replicating snapshot sets to another site: how sites trust each other, what is shipped and verified, how a transfer resumes and never shows half a snapshot, failure modes. Designed; the data plane is built and tested only against a local simulation of a second site. |
+| [dfs/replication.md](./dfs/replication.md) | Cross-site DFS snapshot replication: mutual TLS site pairing with SPKI SHA-256 fingerprinting, replication sets, persistent `HydraStateStore` (`0060-dfs-cross-site-replication`), and transfer lifecycle. |
 | [dfs/rollback_attached.md](./dfs/rollback_attached.md) | Design only: the ownership and epoch reasoning for rolling back a vdisk a guest is reading. |
 | [dfs/technical_guide.md](./dfs/technical_guide.md) | Comprehensive technical deep dive: storage architecture, NBD Unix sockets, write-all journal replication, group commit, epoch fencing, live migration handover, and Purah curation. |
 | [dfs/vhost_user_blk.md](./dfs/vhost_user_blk.md) | `vhost-user-blk` beside NBD: per-request cost today, invariants at risk, qemu/libvirt requirements, the benchmark plan. |

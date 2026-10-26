@@ -384,8 +384,8 @@ The notes themselves are deliberately not in this repository.
   caller's POST body, which was a way to route around the check entirely. Fails closed, verified live
   against the real update server. The transition escape hatch is deliberately awkward and never accepts
   a *bad* signature. See [docs/update_signing.md](docs/update_signing.md).
-  **Outstanding**: `RELEASE_PUBKEY_PEM` in `provision.py` ships empty -- generate a release keypair and
-  paste in the public half, or update checks stay failed-closed.
+  **Resolved**: `RELEASE_PUBKEY_PEM` is populated in `provision.py` with the pinned Ed25519 public key
+  and written to `/etc/hci/keys/release_ed25519.pub` during host provisioning.
 * **Unsandboxed root command execution.** `/api/v1/execute` runs caller-supplied strings via
   `shell=True` as root. **In progress**: the typed API in [docs/spark_api.md](./docs/spark_api.md)
   covers 28 paths. **149 call sites remain**, down from 194: `cluster_new.py` 58, `hylia.py` 38,
@@ -910,6 +910,12 @@ This composes with the Phoenix rewrite — Xandra gives prepared statements and 
   second copy of the maintenance-enter sequence, including the unconditional database stop the quorum
   gate now prevents -- a way back into the bug for anyone who wired it up. Deleted rather than left
   gated, because two implementations of one sequence drift.
+* ~~`generate_vm_xml` duplicated across `spectrum_server.py` and `vali.py`.~~ **Resolved (2026-10-26):**
+  `spectrum_server.py` now delegates directly to `vali.generate_vm_xml`, eliminating 160 lines of
+  duplicated domain XML construction and guaranteeing 100% attribute parity across builders.
+* ~~Dead code candidates in `spectrum_server.py` and `cluster_new.py`.~~ **Resolved (2026-10-26):**
+  purged unused `insert_dagur_run` and `execute_dagur_job_thread` from `spectrum_server.py` and
+  dead functions `sidon_detach_cmd` and `run_checked_cmd` from `cluster_new.py`.
 * **`run_cql_query` is copy-pasted into at least six files** (~40 lines each, including the cqlsh
   fallback). This is why the CQL-injection items had to be fixed at each call site — there is no single
   query layer to parameterize. The Daruk work above is the structural fix.
@@ -1616,9 +1622,16 @@ entry fails the test the moment it is fixed, so it has to be deleted here too.
 * ~~**`mcli-runner`'s maintenance residue probe names six services**~~ **Resolved (2026-10-26):**
   `mcli-runner` `services_to_check` now checks all 15 `MAINTENANCE_STOP_UNITS` services and is included
   in `test_service_wiring.py` `REGISTRIES`.
-* **`static/app.js` `getCheckCategory` still carries `aether_*` and `linstor_latency_check`.**
-  They are check names, not services, so the wiring test does not look at them.
+* ~~**`static/app.js` `getCheckCategory` still carries `aether_*` and `linstor_latency_check`.**~~ **Resolved (2026-10-26):**
+  purged legacy check names from `getCheckCategory` and `getFriendlyCheckName`, mapping active Sidon storage checks
+  (`replica_health`, `storage_capacity`, `storage_mount_options`, `storage_volume_writable`, `fstab_safety_check`, `orphaned_disks_check`).
 * **The watchdog and the boot-time start list do not supervise slate, agahnim or hylia.** The
   reconcile loop (`MANAGED_SERVICES`) and `Restart=always` do, and `test_mimir_checks` pins that
   slate and hylia are not in the watchdog's set. Recorded as an exemption, not a decision to
   remove the older lists.
+* ~~**Documentation sweep covering all features and details.**~~ **Resolved (2026-10-26):**
+  Audited and synchronized all documentation across `README.md`, `docs/README.md`, `docs/add_ons_design.md`,
+  `docs/dfs/replication.md`, and `docs/service_review.md`, completely covering all scale-out additions
+  (Helios Central multi-cluster federation, Helios Files scale-out NFSv4/SMB3 exports, Helios Horizon
+  VDI desktop pools and session broker, Scale-Out Urbosa BGP EVPN with ARP suppression, Cross-Site DFS
+  Replication & site pairing with SPKI SHA-256 fingerprinting, SaltStack orchestration, and ESXi/AHV feature parity).

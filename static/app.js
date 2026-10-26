@@ -5776,10 +5776,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // ----------------------------------------------------
     function getCheckCategory(checkName) {
         const storageChecks = [
-            'aether_storage_pools', 'aether_storage_pools_space', 'aether_volume', 'aether_peers', 
-            'aether_heal_pending', 'aether_split_brain', 'storage_capacity', 
+            'replica_health', 'storage_capacity', 
             'storage_mount_options', 'storage_volume_writable', 'fstab_safety_check',
-            'orphaned_disks_check', 'linstor_latency_check'
+            'orphaned_disks_check', 'drs_storage_capacity_check'
         ];
         const hardwareChecks = [
             'cpu_load', 'disk_space', 'ram_usage', 'host_virtualization', 
@@ -6146,8 +6145,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function getFriendlyCheckName(checkName) {
         const friendly = {
-            'aether_heal_pending': 'Sidon Heal Pending',
-            'aether_split_brain': 'Sidon Split Brain',
+            'replica_health': 'Sidon Replica Health',
             'storage_capacity': 'Storage Capacity Check',
             'storage_mount_options': 'Storage Mount Options',
             'storage_volume_writable': 'Storage Volume Writable Check',

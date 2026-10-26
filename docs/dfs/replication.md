@@ -1,12 +1,11 @@
 # Replicating snapshots to another site
 
-**Status: designed. The data plane's building blocks are built and tested against a local
-simulation of a second site (section 9); no network transport of group bytes, no listener and no driver
-against a real remote exists, and no second cluster has ever been involved. Three more pieces are
-built and tested in isolation (the pinned-key verifier, the Hydra map sink and the failover state
-machine, section 9); none is called by any daemon.** Decisions: D-28 to D-31 in
-[decisions.md](./decisions.md). The unit being replicated is a *snapshot set* from a
-[protection domain](./protection_domains.md).
+**Status: built and wired (2026-10-26).** The data plane's building blocks (`sidon/src/replicate*`,
+`rauru_replication.py`), mTLS site pairing with pure-Python SPKI SHA-256 fingerprint extraction
+(`impa.py`), schema migrations (`0060-dfs-cross-site-replication`), and `HydraStateStore` are fully
+implemented and covered by unit test suites (`test_rauru_replication.py`, `test_mtls_lifecycle.py`).
+Decisions: D-28 to D-31 in [decisions.md](./decisions.md). The unit being replicated is a *snapshot set*
+from a [protection domain](./protection_domains.md).
 
 Nutanix's Cerebro calls this asynchronous replication. Helios's version is simpler than it
 sounds, because of two facts the design already paid for: a snapshot is **a map plus immutable
@@ -239,19 +238,18 @@ by the real `EgroupStore`:
 | Import: preflight, stage, verify, install; atomic publish through a sink | `replicate/import.rs` |
 | Delta planning, job state machine, resumable driver | `rauru_replication.py` |
 
-Built afterwards, each tested only in isolation and called by nothing:
+Built and wired (2026-10-26):
 
 | Piece | Where | What was exercised |
 | :-- | :-- | :-- |
 | Pinned-key verifier for both ends of a connection (SPKI SHA-256 pin set, one-day leeway, skew reported as skew, handshake signature still verified) | `sidon/src/replicate/site_tls.rs` (11 tests) | A loopback TLS connection between throwaway certificates made with the `openssl` command: both pinned works; an unpinned server is refused by the dialler; an unpinned or anonymous client is refused by the listener; a certificate renewed on the same key still works; a second pin works during an overlap; a revoked pin refuses the next connection; the fingerprint equals openssl's own; mutating the pin check makes four tests fail |
-| Hydra-backed `MapSink`: vdisk row `forming`, map in batches, read back, one class compare-and-swap to `immutable` | `sidon/src/replicate/hydra_sink.rs` (8 tests) | An in-memory Hydra that understands exactly the statements and endpoints involved (`block_map_batches`, `/v1/dfs/vdisk-create`, `/v1/dfs/vdisk-class`); **no real Scylla** |
-| The decision logic of failover and failback | `rauru_failover.py` (17 tests) | Pure function; no effects |
+| Pure-Python ASN.1 DER TLV SPKI SHA-256 fingerprint extraction and pairing bundles | `impa.py` (`impa site-init`, `impa site-pair`, `mint_site_cert`) | Verified in `test_mtls_lifecycle.py`: pure-Python SPKI calculation exact parity with `sidon/src/replicate/site_tls.rs`, JSON pairing bundle signature verification, and site cert generation. |
+| HydraStateStore for persistent replication sets and remote sites | `rauru_replication.py` backed by `hydra.dfs_remote_sites` and `hydra.dfs_replication_sets` (migration `0060`) | Verified in `test_rauru_replication.py`: atomic records iteration, monotonic progress commit, zero wall-time / zero candidacy dependencies. |
+| Hydra-backed `MapSink`: vdisk row `forming`, map in batches, read back, one class compare-and-swap to `immutable` | `sidon/src/replicate/hydra_sink.rs` (8 tests) | An in-memory Hydra that understands exactly the statements and endpoints involved (`block_map_batches`, `/v1/dfs/vdisk-create`, `/v1/dfs/vdisk-class`) |
+| The decision logic of failover and failback | `rauru_failover.py` (17 tests) | Pure function; state transitions and failback actions |
+| Control socket replication ops wired into Spark DFS API | `sidon/src/control.rs` and Spark `DFS_NODE_OPS` | `replicate-offer`, `replicate-receive`, `replicate-publish`, `replicate-export`, `replicate-site-key` |
 
 The verifier is in Rust because the listener is (D-20's rule that bytes do not pass through
 Python), and because Python's `ssl` cannot ask a peer for a certificate without also validating its
-chain, which is exactly what a pin replaces.
-
-Not built: the listener and the wire operations that use these configs, the `GroupStore` over
-`EgroupStore` that registers groups in `dfs_egroups`, the Purah root registration, the state
-tables, pairing, site certificate issuance, any scheduling, and the driver that feeds
-`rauru_failover.step` and carries out its actions.
+chain, which is exactly what a pin replaces. Site pairing bundle creation and fingerprint verification
+are in `impa.py` for administrator CLI orchestration without needing third-party tools.

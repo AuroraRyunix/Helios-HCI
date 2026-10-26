@@ -9317,44 +9317,6 @@ def get_catalyst_target_ip():
     return leader_ip
 
 
-def insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, output):
-    clean_output = output.replace("'", "''").replace("\\", "\\\\")
-    cql = f"""
-    INSERT INTO hydra.dagur_runs (job_name, start_time, run_id, end_time, status, exit_code, output)
-    VALUES ('{job_name}', {start_time}, {run_id}, {end_time}, '{status}', {exit_code}, '{clean_output}');
-    """
-    run_cql_query(cql)
-
-def execute_dagur_job_thread(job_name, command):
-    import uuid
-    run_id = str(uuid.uuid4())
-    start_time = int(time.time() * 1000)
-    
-    # Insert initial running record
-    cql_start = f"""
-    INSERT INTO hydra.dagur_runs (job_name, start_time, run_id, status, exit_code, output)
-    VALUES ('{job_name}', {start_time}, {run_id}, 'RUNNING', -1, 'Job started...');
-    """
-    run_cql_query(cql_start)
-    
-    try:
-        exit_code, stdout, stderr = run_remote_spark("127.0.0.1", command)
-        out_str = stdout + stderr
-        status = 'SUCCESS' if exit_code == 0 else 'FAILED'
-    except Exception as e:
-        exit_code = -1
-        out_str = f"Execution failed: {str(e)}"
-        status = 'FAILED'
-        
-    end_time = int(time.time() * 1000)
-    insert_dagur_run(job_name, start_time, run_id, end_time, status, exit_code, out_str)
-    
-    EVENT_LOGS.append({
-        "desc": f"Scheduled job '{job_name}' completed with status {status}.",
-        "time": "Just now"
-    })
-
-
 VERIFIER_SECRET_PATH = "/etc/hci/spectrum/verifier.secret"
 _CONSOLE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_.-]{1,128}\Z")
 

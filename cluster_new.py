@@ -714,10 +714,6 @@ def sidon_cmd(payload):
         shlex.quote(json.dumps(payload) + "\n"), SIDON_SOCKET)
 
 
-def sidon_detach_cmd(vdisk_id):
-    return sidon_cmd({"op": "detach", "vdisk_id": vdisk_id})
-
-
 SIDON_CAPACITY_CMD = sidon_cmd({"op": "capacity"})
 SIDON_PEERS_CMD = sidon_cmd({"op": "peers"})
 SIDON_LIST_CMD = sidon_cmd({"op": "list"})
@@ -1164,33 +1160,6 @@ def get_scylla_bootstrap_progress(ip):
         return line
     return None
 
-def run_checked_cmd(ip, command, allow_already_exists=False):
-    print(f"[{ip}] Running command: {command}")
-    rc, stdout, stderr = run_remote_spark(ip, command)
-    stdout = stdout.strip() if stdout else ""
-    stderr = stderr.strip() if stderr else ""
-    if stdout:
-        print(f"[{ip}] stdout:\n{stdout}")
-    if stderr:
-        print(f"[{ip}] stderr:\n{stderr}")
-    if rc != 0:
-        harmless = False
-        if allow_already_exists:
-            combined = (stdout + "\n" + stderr).lower()
-            if any(msg in combined for msg in [
-                "already exists",
-                "already defined",
-                "already created",
-                "already registered",
-                "already configured",
-                "is already",
-                "already has"
-            ]):
-                harmless = True
-        if not harmless:
-            print(f"[ERROR] Command failed on {ip} with exit code {rc}. Command: {command}")
-            sys.exit(1)
-    return rc, stdout, stderr
 
 def run_parallel_checked(ips, command, allow_already_exists=False, timeout=None, label=None):
     if label is None:
