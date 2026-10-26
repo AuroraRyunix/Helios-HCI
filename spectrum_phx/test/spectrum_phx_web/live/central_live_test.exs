@@ -9,11 +9,10 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     {:ok, view, html} = live(conn, ~p"/central")
 
     assert html =~ "Helios Central"
-    assert html =~ "Fleet Federation"
     assert html =~ "Not Deployed"
     assert html =~ "Helios Central is Not Deployed"
-    assert html =~ "Option 1: Deploy New Central Virtual Appliance"
-    assert html =~ "Option 2: Connect to Existing Helios Central"
+    assert html =~ "Option 1: Deploy New Central Appliance"
+    assert html =~ "Option 2: Connect to Existing Central"
 
     # Action buttons exist
     assert has_element?(view, "#deploy-appliance-btn")

@@ -223,40 +223,31 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   def render(assigns) do
     ~H"""
     <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:central}>
-      <%!-- Top Hero Header --%>
-      <div class="relative overflow-hidden rounded-2xl bg-gradient-to-r from-base-200/90 via-base-200/50 to-base-300/80 p-6 border border-primary/20 shadow-2xl backdrop-blur-md mb-6">
-        <div class="absolute -top-24 -right-24 size-72 rounded-full bg-primary/10 blur-3xl pointer-events-none"></div>
-        <div class="absolute -bottom-24 -left-24 size-72 rounded-full bg-accent/10 blur-3xl pointer-events-none"></div>
-
-        <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6 relative z-10">
-          <div>
-            <div class="flex items-center gap-3">
-              <div class="size-10 rounded-xl bg-gradient-to-br from-primary to-accent flex items-center justify-center shadow-lg shadow-primary/30">
-                <.icon name="hero-globe-alt" class="size-6 text-primary-content" />
+      <%!-- Top Header --%>
+      <div class="relative overflow-hidden rounded-2xl bg-base-200/80 p-6 border border-base-content/10 shadow-lg mb-6">
+        <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+              <.icon name="hero-globe-alt" class="size-6" />
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h1 class="text-xl font-bold tracking-tight">Helios Central</h1>
+                <span :if={@central_deployed? and @appliance_ip} class="badge badge-sm badge-success gap-1">
+                  <span class="size-1.5 rounded-full bg-success animate-ping"></span>
+                  Appliance Online
+                </span>
+                <span :if={!@central_deployed?} class="badge badge-sm badge-ghost border border-base-content/20 text-base-content/60 font-mono">
+                  Not Deployed
+                </span>
               </div>
-              <div>
-                <div class="flex items-center gap-2">
-                  <h1 class="text-2xl font-bold tracking-tight bg-gradient-to-r from-base-content via-primary-content to-accent bg-clip-text text-transparent">
-                    Helios Central
-                  </h1>
-                  <span class="badge badge-sm badge-primary badge-outline font-mono">Fleet Federation</span>
-                  <span :if={@central_deployed? and @appliance_ip} class="badge badge-sm badge-success gap-1">
-                    <span class="size-1.5 rounded-full bg-success animate-ping"></span>
-                    Appliance Online
-                  </span>
-                  <span :if={!@central_deployed?} class="badge badge-sm badge-ghost border border-base-content/20 gap-1 text-base-content/70">
-                    <span class="size-1.5 rounded-full bg-base-content/40"></span>
-                    Not Deployed
-                  </span>
-                </div>
-                <p class="text-xs text-base-content/70 mt-0.5">
-                  Multi-cluster federation, fleet-wide orchestration, global VM inventory &amp; appliance lifecycle.
-                </p>
-              </div>
+              <p class="text-xs text-base-content/70 mt-0.5">
+                Multi-cluster federation and fleet orchestration.
+              </p>
             </div>
           </div>
 
-          <div class="flex flex-wrap items-center gap-2.5">
+          <div class="flex items-center gap-2">
             <a
               :if={@central_deployed? and @appliance_ip}
               href={"https://#{@appliance_ip}:8443/"}
@@ -264,23 +255,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/25"
               id="launch-central-btn"
             >
-              <.icon name="hero-arrow-top-right-on-square" class="size-4" /> Launch Helios Central
+              <.icon name="hero-arrow-top-right-on-square" class="size-4" /> Open Central Console &nearr;
             </a>
-            <button
-              :if={!@central_deployed?}
-              phx-click="open_deploy_modal"
-              class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/25"
-              id="deploy-appliance-btn"
-            >
-              <.icon name="hero-server-stack" class="size-4" /> Deploy Central Appliance
-            </button>
-            <button
-              phx-click="open_enroll_modal"
-              class="btn btn-sm btn-outline btn-accent gap-1.5 shadow-sm"
-              id="enroll-cluster-btn"
-            >
-              <.icon name="hero-plus-circle" class="size-4" /> Connect Cluster
-            </button>
             <button
               phx-click="refresh"
               class="btn btn-sm btn-ghost gap-1.5"
@@ -291,9 +267,9 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           </div>
         </div>
 
-        <%!-- Fleet Metrics Deck (Shown only when Central is active and managing clusters) --%>
+        <%!-- Fleet Metrics Deck (Rendered only when Central is deployed and managing clusters) --%>
         <div :if={@central_deployed?} class="grid grid-cols-2 lg:grid-cols-4 gap-4 mt-6 pt-6 border-t border-base-content/10">
-          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5 relative overflow-hidden group hover:border-primary/30 transition-all">
+          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5">
             <div class="flex items-center justify-between text-xs text-base-content/70 mb-1">
               <span>Managed Clusters</span>
               <span class="size-2 rounded-full bg-success"></span>
@@ -307,7 +283,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
             </div>
           </div>
 
-          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5 relative overflow-hidden group hover:border-primary/30 transition-all">
+          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5">
             <div class="flex items-center justify-between text-xs text-base-content/70 mb-1">
               <span>Fleet vCPU Allocation</span>
               <.icon name="hero-cpu-chip" class="size-4 text-primary" />
@@ -320,9 +296,9 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
             </div>
           </div>
 
-          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5 relative overflow-hidden group hover:border-accent/30 transition-all">
+          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5">
             <div class="flex items-center justify-between text-xs text-base-content/70 mb-1">
-              <span>Fleet Memory Distribution</span>
+              <span>Fleet Memory</span>
               <span class="text-[11px] font-mono text-accent">{@summary.ram_percent}%</span>
             </div>
             <div class="text-2xl font-bold font-mono">
@@ -333,9 +309,9 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
             </div>
           </div>
 
-          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5 relative overflow-hidden group hover:border-secondary/30 transition-all">
+          <div class="rounded-xl bg-base-100/60 p-4 border border-base-content/5">
             <div class="flex items-center justify-between text-xs text-base-content/70 mb-1">
-              <span>Sidon Storage Fabric</span>
+              <span>Sidon Storage</span>
               <span class="text-[11px] font-mono text-secondary">{@summary.storage_percent}%</span>
             </div>
             <div class="text-2xl font-bold font-mono">
@@ -348,161 +324,92 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         </div>
       </div>
 
-      <%!-- Central Appliance Connected Banner (if deployed) --%>
-      <div :if={@central_deployed? and @appliance_ip} class="alert bg-base-200 border border-primary/30 shadow-lg rounded-2xl mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-        <div class="flex items-center gap-3">
-          <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
-            <.icon name="hero-shield-check" class="size-6" />
-          </div>
-          <div>
-            <div class="flex items-center gap-2">
-              <span class="font-bold text-sm">Helios Central Fleet Control Active</span>
-              <span class="badge badge-xs badge-success font-mono">{@appliance_ip}:8443</span>
-            </div>
-            <p class="text-xs text-base-content/70">
-              This cluster is federated into the standalone Helios Central appliance. Cross-cluster management, global VM inventory, and fleet DRS are enabled.
+      <%!-- STATE A: HELIOS CENTRAL NOT DEPLOYED --%>
+      <div :if={!@central_deployed?} class="space-y-6" id="central-not-deployed-view">
+        <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-lg">
+          <div class="pb-6 border-b border-base-content/10">
+            <h2 class="text-lg font-bold tracking-tight">Helios Central is Not Deployed</h2>
+            <p class="text-xs text-base-content/70 mt-1">
+              This cluster is operating in standalone cluster mode (Element tier). Deploy the Helios Central virtual appliance
+              to enable multi-cluster management, or connect this cluster to an existing Central instance.
             </p>
           </div>
-        </div>
-        <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
-          <a
-            href={"https://#{@appliance_ip}:8443/"}
-            target="_blank"
-            class="btn btn-sm btn-primary gap-1.5 rounded-xl shadow-md"
-          >
-            <.icon name="hero-arrow-top-right-on-square" class="size-4" /> Open Central Console &nearr;
-          </a>
-        </div>
-      </div>
 
-      <%!-- STATE A: HELIOS CENTRAL NOT DEPLOYED (Authentic Onboarding View) --%>
-      <div :if={!@central_deployed?} class="space-y-6" id="central-not-deployed-view">
-        <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-xl">
-          <div class="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 pb-6 border-b border-base-content/10">
-            <div class="flex items-center gap-4">
-              <div class="size-12 rounded-2xl bg-base-300 border border-base-content/10 flex items-center justify-center text-primary shrink-0">
-                <.icon name="hero-server-stack" class="size-7" />
-              </div>
-              <div>
-                <h2 class="text-xl font-bold tracking-tight">Helios Central is Not Deployed</h2>
-                <p class="text-xs text-base-content/70 mt-1">
-                  This cluster is operating in standalone cluster mode (Element tier). Deploy the Helios Central virtual appliance
-                  to enable multi-cluster federation, cross-cluster DRS, and fleet-wide governance, or connect to an existing Central instance.
-                </p>
-              </div>
-            </div>
-            <div class="flex items-center gap-2 shrink-0">
-              <button
-                phx-click="open_deploy_modal"
-                class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
-              >
-                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
-              </button>
-              <button
-                phx-click="open_enroll_modal"
-                class="btn btn-outline btn-accent gap-1.5"
-              >
-                <.icon name="hero-plus-circle" class="size-4" /> Connect to Central
-              </button>
-            </div>
-          </div>
-
-          <%!-- Deployment Options Breakdown --%>
           <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
-            <div class="rounded-xl bg-base-100/60 p-5 border border-base-content/5 space-y-3">
-              <div class="flex items-center justify-between">
-                <h3 class="font-bold text-sm flex items-center gap-2">
-                  <.icon name="hero-cpu-chip" class="size-4 text-primary" />
-                  Option 1: Deploy New Central Virtual Appliance
-                </h3>
-                <span class="badge badge-xs badge-primary font-mono">1-Click Provision</span>
-              </div>
-              <p class="text-xs text-base-content/70">
-                Spawns a dedicated, self-contained Rocky Linux 10 virtual appliance on this cluster.
-                Automates Sidon CoW rootfs cloning, pure Cloud-Init NoCloud configuration, vTPM 2.0 emulator, and auto-pairing as Member 01.
-              </p>
-              <div class="grid grid-cols-3 gap-2 pt-2">
-                <div :for={p <- @presets} class="bg-base-200/60 p-2.5 rounded-lg border border-base-content/5 text-center">
-                  <div class="font-bold text-xs">{p.name |> String.split(" ") |> hd()}</div>
-                  <div class="text-[11px] font-mono text-base-content/60 mt-0.5">{p.vcpus}C / {round(p.memory_mb / 1024)}G</div>
-                  <div class="text-[10px] text-base-content/40 font-mono">{p.disk_gb}G CoW</div>
+            <%!-- Option 1: Deploy New Central Appliance --%>
+            <div class="rounded-xl bg-base-100/50 p-5 border border-base-content/10 flex flex-col justify-between">
+              <div>
+                <div class="flex items-center justify-between mb-2">
+                  <h3 class="font-bold text-sm flex items-center gap-2">
+                    <.icon name="hero-server-stack" class="size-4 text-primary" />
+                    Option 1: Deploy New Central Appliance
+                  </h3>
+                  <span class="badge badge-xs badge-primary font-mono">Virtual Appliance</span>
+                </div>
+                <p class="text-xs text-base-content/70 mb-4">
+                  Deploys a dedicated Helios Central virtual machine on this cluster with automated Cloud-Init bootstrap.
+                </p>
+
+                <div class="grid grid-cols-3 gap-2 mb-4">
+                  <div
+                    :for={p <- @presets}
+                    phx-click="select_preset"
+                    phx-value-preset={p.id}
+                    class={["p-2.5 rounded-lg border text-center cursor-pointer transition-all",
+                      if(@selected_preset == p.id, do: "border-primary bg-primary/10", else: "border-base-content/10 bg-base-200/50 hover:border-base-content/30")]}
+                  >
+                    <div class="font-bold text-xs">{p.name |> String.split(" ") |> hd()}</div>
+                    <div class="text-[11px] font-mono text-base-content/60 mt-0.5">{p.vcpus}C / {round(p.memory_mb / 1024)}G</div>
+                    <div class="text-[10px] text-base-content/40 font-mono">{p.disk_gb}G Disk</div>
+                  </div>
                 </div>
               </div>
-              <div class="pt-2">
-                <button phx-click="open_deploy_modal" class="btn btn-xs btn-primary gap-1 w-full">
-                  Configure &amp; Deploy Appliance Now
-                </button>
-              </div>
+
+              <button phx-click="open_deploy_modal" class="btn btn-sm btn-primary gap-1.5 w-full shadow-sm" id="deploy-appliance-btn">
+                <.icon name="hero-rocket-launch" class="size-4" /> Deploy Central Appliance
+              </button>
             </div>
 
-            <div class="rounded-xl bg-base-100/60 p-5 border border-base-content/5 space-y-3">
-              <div class="flex items-center justify-between">
-                <h3 class="font-bold text-sm flex items-center gap-2">
-                  <.icon name="hero-link" class="size-4 text-accent" />
-                  Option 2: Connect to Existing Helios Central
-                </h3>
-                <span class="badge badge-xs badge-accent font-mono">Fleet Registration</span>
-              </div>
-              <p class="text-xs text-base-content/70">
-                If your datacenter environment already has an active Helios Central instance running, register this cluster
-                using its target Virtual IP (VIP), API port, and mutual TLS federation token.
-              </p>
-              <div class="bg-base-200/60 p-3 rounded-lg border border-base-content/5 space-y-1.5 text-xs font-mono">
-                <div class="flex justify-between">
-                  <span class="text-base-content/60">Local Cluster VIP:</span>
-                  <span class="font-bold">{Config.vip() || "Configured via keepalived"}</span>
+            <%!-- Option 2: Connect to Existing Central --%>
+            <div class="rounded-xl bg-base-100/50 p-5 border border-base-content/10 flex flex-col justify-between">
+              <div>
+                <div class="flex items-center justify-between mb-2">
+                  <h3 class="font-bold text-sm flex items-center gap-2">
+                    <.icon name="hero-link" class="size-4 text-accent" />
+                    Option 2: Connect to Existing Central
+                  </h3>
+                  <span class="badge badge-xs badge-accent font-mono">Federate</span>
                 </div>
-                <div class="flex justify-between">
-                  <span class="text-base-content/60">Local Hypervisor Nodes:</span>
-                  <span class="font-bold">{length(SpectrumPhx.Settings.cluster_nodes())} nodes</span>
-                </div>
-                <div class="flex justify-between">
-                  <span class="text-base-content/60">Federation Protocol:</span>
-                  <span class="font-bold">mTLS TLSv1.3 on :8443</span>
-                </div>
-              </div>
-              <div class="pt-2">
-                <button phx-click="open_enroll_modal" class="btn btn-xs btn-outline btn-accent gap-1 w-full">
-                  Connect This Cluster to Central
-                </button>
-              </div>
-            </div>
-          </div>
+                <p class="text-xs text-base-content/70 mb-4">
+                  Register this cluster into an existing Helios Central instance via its Virtual IP and federation token.
+                </p>
 
-          <%!-- Architecture & Boot Flow Steps --%>
-          <div class="mt-8 pt-6 border-t border-base-content/10">
-            <h3 class="text-xs font-semibold uppercase tracking-wider text-base-content/60 mb-3">
-              Automated First-Boot Provisioning Sequence
-            </h3>
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                <div class="text-primary font-mono text-xs mb-1">01 / STORAGE</div>
-                <div class="font-bold text-sm">Sidon CoW Clone</div>
-                <p class="text-xs text-base-content/60 mt-1">Zero-copy map clone from golden appliance base image onto local extent store.</p>
+                <div class="bg-base-200/50 p-3 rounded-lg border border-base-content/5 space-y-2 text-xs font-mono mb-4">
+                  <div class="flex justify-between">
+                    <span class="text-base-content/60">Local Cluster VIP:</span>
+                    <span class="font-bold">{Config.vip() || "Not configured"}</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-base-content/60">Local Hypervisor Nodes:</span>
+                    <span class="font-bold">{length(SpectrumPhx.Settings.cluster_nodes())} nodes</span>
+                  </div>
+                  <div class="flex justify-between">
+                    <span class="text-base-content/60">Federation Port:</span>
+                    <span class="font-bold">8443 (mTLS)</span>
+                  </div>
+                </div>
               </div>
-              <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                <div class="text-accent font-mono text-xs mb-1">02 / CLOUD-INIT</div>
-                <div class="font-bold text-sm">NoCloud Injection</div>
-                <p class="text-xs text-base-content/60 mt-1">ISO9660 generation injecting static IP, gateway, DNS &amp; initial credentials.</p>
-              </div>
-              <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                <div class="text-secondary font-mono text-xs mb-1">03 / SECURITY</div>
-                <div class="font-bold text-sm">vTPM 2.0 &amp; Secure Boot</div>
-                <p class="text-xs text-base-content/60 mt-1">Cryptographic hardware emulator and UEFI OVMF Secure Boot signature verification.</p>
-              </div>
-              <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                <div class="text-success font-mono text-xs mb-1">04 / ENROLLMENT</div>
-                <div class="font-bold text-sm">Cluster Auto-Pairing</div>
-                <p class="text-xs text-base-content/60 mt-1">Mutual TLS cluster trust exchange registering the deploying cluster as Member 01.</p>
-              </div>
+
+              <button phx-click="open_enroll_modal" class="btn btn-sm btn-outline btn-accent gap-1.5 w-full" id="enroll-cluster-btn">
+                <.icon name="hero-plus-circle" class="size-4" /> Connect to Existing Central
+              </button>
             </div>
           </div>
         </div>
       </div>
 
-      <%!-- STATE B: HELIOS CENTRAL DEPLOYED (Active Fleet Management Dashboard) --%>
+      <%!-- STATE B: HELIOS CENTRAL DEPLOYED --%>
       <div :if={@central_deployed?} class="space-y-6" id="central-deployed-view">
-        <%!-- View Switcher Tabs --%>
         <div class="flex items-center gap-2 border-b border-base-content/10 pb-3 mb-6">
           <button
             phx-click="switch_tab"
@@ -764,7 +671,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 </h2>
                 <p class="text-xs text-base-content/70 mt-1">
                   The autonomous fleet management virtual appliance for multi-cluster orchestration, DRS, and lifecycle operations.
-                  Deploys as a self-contained virtual machine with automated Cloud-Init NoCloud boot.
                 </p>
               </div>
               <button
@@ -806,34 +712,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                       <span class="font-bold">{p.disk_gb} GiB Sidon CoW</span>
                     </div>
                   </div>
-                </div>
-              </div>
-            </div>
-
-            <div class="mt-8 pt-6 border-t border-base-content/10">
-              <h3 class="text-sm font-semibold uppercase tracking-wider text-base-content/60 mb-3">
-                Automated First-Boot Provisioning Sequence
-              </h3>
-              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                  <div class="text-primary font-mono text-xs mb-1">01 / STORAGE</div>
-                  <div class="font-bold text-sm">Sidon CoW Clone</div>
-                  <p class="text-xs text-base-content/60 mt-1">Zero-copy map clone from golden appliance base image onto local extent store.</p>
-                </div>
-                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                  <div class="text-accent font-mono text-xs mb-1">02 / CLOUD-INIT</div>
-                  <div class="font-bold text-sm">NoCloud Injection</div>
-                  <p class="text-xs text-base-content/60 mt-1">ISO9660 generation injecting static IP, gateway, DNS &amp; initial credentials.</p>
-                </div>
-                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                  <div class="text-secondary font-mono text-xs mb-1">03 / SECURITY</div>
-                  <div class="font-bold text-sm">vTPM 2.0 &amp; Secure Boot</div>
-                  <p class="text-xs text-base-content/60 mt-1">Cryptographic hardware emulator and UEFI OVMF Secure Boot signature verification.</p>
-                </div>
-                <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
-                  <div class="text-success font-mono text-xs mb-1">04 / ENROLLMENT</div>
-                  <div class="font-bold text-sm">Cluster Auto-Pairing</div>
-                  <p class="text-xs text-base-content/60 mt-1">Mutual TLS cluster trust exchange registering the deploying cluster as Member 01.</p>
                 </div>
               </div>
             </div>
@@ -942,13 +820,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                   phx-value-field="admin_password"
                 />
               </div>
-            </div>
-
-            <div class="alert alert-info alert-soft text-xs">
-              <.icon name="hero-information-circle" class="size-4 shrink-0" />
-              <span>
-                Vali will clone the Helios Central golden image into a dedicated Sidon vdisk, synthesize the Cloud-Init NoCloud ISO, and power on the VM.
-              </span>
             </div>
           </div>
 
