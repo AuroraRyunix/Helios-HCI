@@ -50,7 +50,7 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
 
     # Open deploy modal
     html = render_click(view, "open_deploy_modal")
-    assert html =~ "1-Click Deploy Helios Central Appliance"
+    assert html =~ "Deploy Helios Central Appliance"
     assert has_element?(view, "#deploy-modal")
 
     # Select standard preset
@@ -66,12 +66,11 @@ defmodule SpectrumPhxWeb.CentralLiveTest do
     refute has_element?(view, "#deploy-modal")
   end
 
-  test "simulates 1-click appliance deployment pipeline", %{conn: conn} do
+  test "handles appliance deployment trigger and validation", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/central")
 
-    # Trigger deploy
+    # Trigger deploy with missing required parameters (empty ip/gateway)
     html = render_click(view, "trigger_deploy")
-    assert html =~ "Deploying Helios Central Virtual Appliance"
-    assert has_element?(view, "#deploy-progress-banner")
+    assert html =~ "Failed to deploy Central Appliance"
   end
 end

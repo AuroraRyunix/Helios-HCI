@@ -52,8 +52,8 @@ defmodule SpectrumPhx.Central do
     case Hydra.query("SELECT value FROM hydra.central_config WHERE key = 'deployment';") do
       {:ok, [%{"value" => val}]} when is_binary(val) ->
         case Jason.decode(val) do
-          {:ok, map} -> {:ok, map}
-          _ -> {:ok, %{"status" => "DEPLOYED", "name" => "helios-central", "ip" => "10.10.102.50/24"}}
+          {:ok, map} when is_map(map) -> {:ok, map}
+          _ -> {:not_deployed, nil}
         end
 
       _ ->
@@ -91,7 +91,13 @@ defmodule SpectrumPhx.Central do
       end
 
     storage_used = Enum.reduce(vdisks, 0, fn row, acc -> acc + (row["size_bytes"] || 0) end)
-    storage_total = max(storage_used, node_count * 482_947_891_200)
+    storage_snap = SpectrumPhx.Storage.snapshot()
+    storage_total =
+      case storage_snap do
+        %{capacity: %{usable_total_bytes: usable}} when is_integer(usable) and usable > 0 -> usable
+        %{capacity: %{raw_total_bytes: raw}} when is_integer(raw) and raw > 0 -> raw
+        _ -> storage_used
+      end
 
     {total_cpu, total_ram_mb, used_ram_mb} =
       case Hydra.query("SELECT node_ip, cpu_cores, mem_total_kb, mem_pct FROM hydra.logos_metrics;") do
@@ -103,23 +109,26 @@ defmodule SpectrumPhx.Central do
             end)
             |> Map.values()
 
-          cpu = Enum.sum(Enum.map(latest_per_node, fn r -> r["cpu_cores"] || 4 end))
-          ram = Enum.sum(Enum.map(latest_per_node, fn r -> div(r["mem_total_kb"] || 7_862_404, 1024) end))
+          cpu = Enum.sum(Enum.map(latest_per_node, fn r -> r["cpu_cores"] || 0 end))
+          ram = Enum.sum(Enum.map(latest_per_node, fn r -> div(r["mem_total_kb"] || 0, 1024) end))
           used = Enum.sum(Enum.map(latest_per_node, fn r ->
-            tot_kb = r["mem_total_kb"] || 7_862_404
-            pct = r["mem_pct"] || 40.0
+            tot_kb = r["mem_total_kb"] || 0
+            pct = r["mem_pct"] || 0.0
             div(trunc(tot_kb * pct / 100.0), 1024)
           end))
-          {max(cpu, node_count * 4), max(ram, node_count * 7680), used}
+          {cpu, ram, used}
 
         _ ->
-          {node_count * 4, node_count * 7680, div(node_count * 7680 * 45, 100)}
+          {0, 0, 0}
       end
 
+    vip = Config.vip() || (case hosts do [%{ip: ip} | _] -> ip; _ -> "127.0.0.1" end)
+    cluster_name = Map.get(config, :cluster_name, "hci-01")
+
     %{
-      cluster_id: Map.get(config, :cluster_name, "hci-01"),
-      name: Map.get(config, :cluster_name, "hci-01"),
-      vip: Config.vip() || "10.10.102.45",
+      cluster_id: cluster_name,
+      name: cluster_name,
+      vip: vip,
       port: 8443,
       status: "CONNECTED",
       node_count: node_count,
@@ -129,25 +138,26 @@ defmodule SpectrumPhx.Central do
       memory_used_mb: used_ram_mb,
       storage_total_bytes: storage_total,
       storage_used_bytes: storage_used,
-      auth_token: "cluster-mtls-token-active",
+      auth_token: "",
       last_seen_ms: System.system_time(:millisecond),
-      enrolled_at_ms: System.system_time(:millisecond) - 86_400_000,
-      metadata: "{\"role\": \"primary\", \"region\": \"dc-01\", \"rack\": \"rack-a\"}",
+      enrolled_at_ms: 0,
+      metadata: Jason.encode!(%{role: "primary", cluster_name: cluster_name}),
       is_local?: true
     }
   end
 
   def normalize_cluster(row) do
+    vip = row["vip"] || ""
     %{
       cluster_id: row["cluster_id"],
       name: row["name"] || row["cluster_id"],
-      vip: row["vip"] || "127.0.0.1",
+      vip: vip,
       port: row["port"] || 8443,
       status: row["status"] || "CONNECTED",
-      node_count: row["node_count"] || 1,
+      node_count: row["node_count"] || 0,
       vm_count: row["vm_count"] || 0,
-      cpu_cores: row["cpu_cores"] || 8,
-      memory_total_mb: row["memory_total_mb"] || 16384,
+      cpu_cores: row["cpu_cores"] || 0,
+      memory_total_mb: row["memory_total_mb"] || 0,
       memory_used_mb: row["memory_used_mb"] || 0,
       storage_total_bytes: row["storage_total_bytes"] || 0,
       storage_used_bytes: row["storage_used_bytes"] || 0,
@@ -155,7 +165,7 @@ defmodule SpectrumPhx.Central do
       last_seen_ms: row["last_seen_ms"] || 0,
       enrolled_at_ms: row["enrolled_at_ms"] || 0,
       metadata: row["metadata"] || "{}",
-      is_local?: row["cluster_id"] == "cluster-local" or row["vip"] == Config.vip()
+      is_local?: row["cluster_id"] == "cluster-local" or (vip != "" and vip == Config.vip())
     }
   end
 
@@ -234,104 +244,97 @@ defmodule SpectrumPhx.Central do
     Hydra.query("DELETE FROM hydra.central_clusters WHERE cluster_id = ?;", [cluster_id])
   end
 
-  @doc "Trigger 1-Click Deployment of the Helios Central Appliance"
+  @doc "Trigger Deployment of the Helios Central Appliance"
   def deploy_appliance(params) do
     now = System.system_time(:millisecond)
     preset_id = Map.get(params, "preset", "tiny")
     preset = get_preset(preset_id)
     name = Map.get(params, "name", "helios-central")
-    ip = Map.get(params, "ip", "10.10.102.50/24")
-    gateway = Map.get(params, "gateway", "10.10.102.1")
-    dns = Map.get(params, "dns", "10.10.102.1")
-    admin_password = Map.get(params, "admin_password", "HeliosAdmin2026!")
+    ip = Map.get(params, "ip", "")
+    gateway = Map.get(params, "gateway", "")
+    dns = Map.get(params, "dns", "")
+    admin_password = Map.get(params, "admin_password", "")
 
-    userdata_yaml = """
-    #cloud-config
-    system_info:
-      default_user:
-        name: admin
-    chpasswd:
-      list: |
-        admin:#{admin_password}
-      expire: False
-    hostname: #{name}
-    manage_etc_hosts: true
-    """
+    if ip == "" or gateway == "" or admin_password == "" do
+      {:error, "Appliance IP, gateway, and admin password are required."}
+    else
+      userdata_yaml = """
+      #cloud-config
+      system_info:
+        default_user:
+          name: admin
+      chpasswd:
+        list: |
+          admin:#{admin_password}
+        expire: False
+      hostname: #{name}
+      manage_etc_hosts: true
+      """
 
-    network_yaml = """
-    version: 2
-    ethernets:
-      eth0:
-        dhcp4: false
-        addresses:
-          - #{ip}
-        gateway4: #{gateway}
-        nameservers:
+      network_yaml = """
+      version: 2
+      ethernets:
+        eth0:
+          dhcp4: false
           addresses:
-            - #{dns}
-    """
+            - #{ip}
+          gateway4: #{gateway}
+          nameservers:
+            addresses:
+              - #{dns}
+      """
 
-    # Check if VM already exists in Hydra
-    case Hydra.query("SELECT name, state FROM hydra.vms WHERE name = ?;", [name]) do
-      {:ok, [%{"name" => _} | _]} ->
-        # VM already exists; ensure cloud_init is set and power it on
-        Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
-        SpectrumPhx.Vms.power_on(name)
+      # Check if VM already exists in Hydra
+      vm_result =
+        case Hydra.query("SELECT name, state FROM hydra.vms WHERE name = ?;", [name]) do
+          {:ok, [%{"name" => _} | _]} ->
+            Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
+            SpectrumPhx.Vms.power_on(name)
 
-      _ ->
-        vm_params = %{
-          "name" => name,
-          "vcpu" => preset.vcpus,
-          "memory" => preset.memory_mb,
-          "firmware" => "uefi",
-          "disks_list" => "#{preset.disk_gb}G:default-pool",
-          "cpu_model" => "host-passthrough",
-          "cloud_init_userdata" => userdata_yaml,
-          "cloud_init_network" => network_yaml
-        }
+          _ ->
+            vm_params = %{
+              "name" => name,
+              "vcpu" => preset.vcpus,
+              "memory" => preset.memory_mb,
+              "firmware" => "uefi",
+              "disks_list" => "#{preset.disk_gb}G:default-pool",
+              "cpu_model" => "host-passthrough",
+              "cloud_init_userdata" => userdata_yaml,
+              "cloud_init_network" => network_yaml
+            }
 
-        with {:ok, _vm} <- SpectrumPhx.Vms.create_vm(vm_params) do
-          Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
-          SpectrumPhx.Vms.power_on(name)
+            case SpectrumPhx.Vms.create_vm(vm_params) do
+              {:ok, _vm} ->
+                Hydra.query("UPDATE hydra.vms SET cloud_init_userdata = ?, cloud_init_network = ? WHERE name = ?;", [userdata_yaml, network_yaml, name])
+                SpectrumPhx.Vms.power_on(name)
+
+              {:error, reason} ->
+                {:error, reason}
+            end
         end
+
+      case vm_result do
+        {:ok, _} ->
+          deployment_data = %{
+            "name" => name,
+            "ip" => ip,
+            "gateway" => gateway,
+            "dns" => dns,
+            "preset" => preset_id,
+            "vcpus" => preset.vcpus,
+            "memory_mb" => preset.memory_mb,
+            "disk_gb" => preset.disk_gb,
+            "status" => "DEPLOYED",
+            "deployed_at" => now
+          }
+
+          json_val = Jason.encode!(deployment_data)
+          Hydra.query("INSERT INTO hydra.central_config (key, value, updated_at_ms) VALUES ('deployment', ?, ?);", [json_val, now])
+          {:ok, deployment_data}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
-
-    deployment_data = %{
-      "name" => name,
-      "ip" => ip,
-      "gateway" => gateway,
-      "dns" => dns,
-      "preset" => preset_id,
-      "vcpus" => preset.vcpus,
-      "memory_mb" => preset.memory_mb,
-      "disk_gb" => preset.disk_gb,
-      "status" => "DEPLOYED",
-      "deployed_at" => now
-    }
-
-    json_val = Jason.encode!(deployment_data)
-
-    Hydra.query("INSERT INTO hydra.central_config (key, value, updated_at_ms) VALUES ('deployment', ?, ?);", [json_val, now])
-
-    # Ensure local cluster is recorded
-    local = local_cluster_record()
-    Hydra.query("""
-    INSERT INTO hydra.central_clusters (
-      cluster_id, name, vip, port, status, node_count, vm_count,
-      cpu_cores, memory_total_mb, memory_used_mb, storage_total_bytes, storage_used_bytes,
-      auth_token, last_seen_ms, enrolled_at_ms, metadata
-    ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?,
-      ?, ?, ?, ?
-    );
-    """, [
-      local.cluster_id, local.name, local.vip, local.port, local.status,
-      local.node_count, local.vm_count, local.cpu_cores, local.memory_total_mb,
-      local.memory_used_mb, local.storage_total_bytes, local.storage_used_bytes,
-      local.auth_token, local.last_seen_ms, local.enrolled_at_ms, local.metadata
-    ])
-
-    {:ok, deployment_data}
   end
 end

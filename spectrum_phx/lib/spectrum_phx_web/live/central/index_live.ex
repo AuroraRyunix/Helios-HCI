@@ -1,15 +1,17 @@
 defmodule SpectrumPhxWeb.Central.IndexLive do
   @moduledoc """
   Helios Central Fleet Control:
-  Multi-cluster management, global VM inventory, cross-cluster content library,
-  and 1-click Central virtual appliance auto-deployment.
+  Multi-cluster federation, global VM inventory, central content library,
+  and Helios Central virtual appliance deployment.
   """
   use SpectrumPhxWeb, :live_view
 
+  import SpectrumPhxWeb.Storage.Components, only: [bytes: 1]
+
   alias SpectrumPhx.Central
   alias SpectrumPhx.Cluster.Config
-  alias SpectrumPhx.Horizon
   alias SpectrumPhx.Hydra
+  alias SpectrumPhx.Images
 
   @refresh_interval_ms 15_000
 
@@ -26,8 +28,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
      |> assign(:selected_preset, "tiny")
      |> assign(:deploy_modal_open?, false)
      |> assign(:enroll_modal_open?, false)
-     |> assign(:deploying?, false)
-     |> assign(:deploy_step, 0)
      |> assign(:search_query, "")
      |> assign(:enroll_form, %{
        "cluster_id" => "",
@@ -38,10 +38,10 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
      })
      |> assign(:deploy_form, %{
        "name" => "helios-central",
-       "ip" => "10.10.102.50/24",
-       "gateway" => "10.10.102.1",
-       "dns" => "10.10.102.1",
-       "admin_password" => "helios123",
+       "ip" => "",
+       "gateway" => "",
+       "dns" => "",
+       "admin_password" => "",
        "container" => "default-pool"
      })
      |> load_central_state()}
@@ -52,20 +52,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     {:noreply, load_central_state(socket)}
   end
 
-  def handle_info({:deploy_progress, step}, socket) do
-    if step >= 5 do
-      {:noreply,
-       socket
-       |> assign(:deploying?, false)
-       |> assign(:deploy_step, 5)
-       |> put_flash(:info, "Helios Central Appliance successfully provisioned and enrolled into the fleet!")
-       |> load_central_state()}
-    else
-      Process.send_after(self(), {:deploy_progress, step + 1}, 1200)
-      {:noreply, assign(socket, :deploy_step, step)}
-    end
-  end
-
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl true
@@ -74,7 +60,16 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   end
 
   def handle_event("switch_tab", %{"tab" => tab}, socket) do
-    {:noreply, assign(socket, :active_tab, String.to_existing_atom(tab))}
+    tab_atom =
+      case tab do
+        "fleet" -> :fleet
+        "vms" -> :vms
+        "library" -> :library
+        "setup" -> :setup
+        _ -> :fleet
+      end
+
+    {:noreply, assign(socket, :active_tab, tab_atom)}
   end
 
   def handle_event("select_preset", %{"preset" => preset}, socket) do
@@ -118,7 +113,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           {:noreply,
            socket
            |> assign(:enroll_modal_open?, false)
-           |> put_flash(:info, "Cluster #{form["name"] || form["vip"]} successfully enrolled into Central!")
+           |> put_flash(:info, "Cluster #{form["name"] || form["vip"]} successfully enrolled into Central.")
            |> load_central_state()}
 
         {:error, reason} ->
@@ -140,37 +135,23 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
       socket.assigns.deploy_form
       |> Map.put("preset", socket.assigns.selected_preset)
 
-    Central.deploy_appliance(params)
+    case Central.deploy_appliance(params) do
+      {:ok, deployment} ->
+        {:noreply,
+         socket
+         |> assign(:deploy_modal_open?, false)
+         |> put_flash(:info, "Helios Central Appliance '#{deployment["name"]}' deployed successfully.")
+         |> load_central_state()}
 
-    # Start animated deployment simulation pipeline
-    Process.send_after(self(), {:deploy_progress, 1}, 800)
-
-    {:noreply,
-     socket
-     |> assign(:deploying?, true)
-     |> assign(:deploy_step, 1)
-     |> assign(:deploy_modal_open?, false)
-     |> assign(:active_tab, :setup)}
+      {:error, reason} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, "Failed to deploy Central Appliance: #{inspect(reason)}")}
+    end
   end
 
   def handle_event("search_vms", %{"query" => query}, socket) do
     {:noreply, assign(socket, :search_query, String.trim(query))}
-  end
-
-  def handle_event("delete_horizon_pool", %{"pool" => pool_name}, socket) do
-    Horizon.delete_pool(pool_name)
-    {:noreply,
-     socket
-     |> put_flash(:info, "Horizon desktop pool '#{pool_name}' deleted.")
-     |> load_central_state()}
-  end
-
-  def handle_event("disconnect_horizon_session", %{"session" => session_id}, socket) do
-    Horizon.disconnect_session(session_id)
-    {:noreply,
-     socket
-     |> put_flash(:info, "Horizon session '#{session_id}' disconnected.")
-     |> load_central_state()}
   end
 
   defp load_central_state(socket) do
@@ -179,14 +160,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     presets = Central.sizing_presets()
     {status_type, appliance} = Central.deployment_status()
 
-    horizon_pools =
-      case Horizon.list_pools() do
-        {:ok, list} -> list
-        _ -> []
-      end
-
-    horizon_sessions =
-      case Horizon.list_sessions() do
+    images =
+      case Images.list_images() do
         {:ok, list} -> list
         _ -> []
       end
@@ -194,16 +169,16 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     # Load local VMs for cross-cluster inventory view
     local_vms =
       case Hydra.query("SELECT name, state, vcpu, memory, host_ip, affinity_group FROM hydra.vms;") do
-        {:ok, list} ->
+        {:ok, list} when is_list(list) ->
           Enum.map(list, fn v ->
             %{
-              name: v["name"],
+              name: v["name"] || "unknown",
               cluster_name: Config.all()[:cluster_name] || "hci-01",
-              cluster_vip: Config.vip() || "10.10.102.45",
-              state: v["state"] || "stopped",
-              vcpu: v["vcpu"] || 2,
-              memory: v["memory"] || 4096,
-              host_ip: v["host_ip"] || "10.10.102.41",
+              cluster_vip: Config.vip() || "",
+              state: v["state"] || "unknown",
+              vcpu: v["vcpu"] || 0,
+              memory: v["memory"] || 0,
+              host_ip: v["host_ip"] || "",
               affinity: v["affinity_group"]
             }
           end)
@@ -212,7 +187,20 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           []
       end
 
-    all_vms = local_vms
+    allocated_vcpus = Enum.sum(Enum.map(local_vms, & &1.vcpu))
+    vcpu_percent =
+      if summary.total_cpu > 0 do
+        min(100, round(allocated_vcpus * 100 / summary.total_cpu))
+      else
+        0
+      end
+
+    appliance_ip =
+      if is_map(appliance) and is_binary(appliance["ip"]) do
+        String.split(appliance["ip"], "/") |> hd()
+      else
+        nil
+      end
 
     socket
     |> assign(:clusters, clusters)
@@ -220,9 +208,11 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     |> assign(:presets, presets)
     |> assign(:appliance_status, status_type)
     |> assign(:appliance, appliance)
-    |> assign(:vms, all_vms)
-    |> assign(:horizon_pools, horizon_pools)
-    |> assign(:horizon_sessions, horizon_sessions)
+    |> assign(:appliance_ip, appliance_ip)
+    |> assign(:vms, local_vms)
+    |> assign(:allocated_vcpus, allocated_vcpus)
+    |> assign(:vcpu_percent, vcpu_percent)
+    |> assign(:images, images)
     |> assign(:read_at, DateTime.utc_now())
   end
 
@@ -230,7 +220,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   def render(assigns) do
     ~H"""
     <Layouts.app socket={@socket} flash={@flash} current_username={@current_username} active={:central}>
-      <%!-- Hero Glassmorphic Header with animated status beacons --%>
+      <%!-- Hero Header with Status Indicators --%>
       <div class="relative overflow-hidden rounded-2xl bg-gradient-to-r from-base-200/90 via-base-200/50 to-base-300/80 p-6 border border-primary/20 shadow-2xl backdrop-blur-md mb-6">
         <div class="absolute -top-24 -right-24 size-72 rounded-full bg-primary/10 blur-3xl pointer-events-none"></div>
         <div class="absolute -bottom-24 -left-24 size-72 rounded-full bg-accent/10 blur-3xl pointer-events-none"></div>
@@ -247,13 +237,13 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                     Helios Central
                   </h1>
                   <span class="badge badge-sm badge-primary badge-outline font-mono">Fleet Federation</span>
-                  <span :if={@appliance_status == :ok} class="badge badge-sm badge-success gap-1">
+                  <span :if={@appliance_status == :ok and @appliance_ip} class="badge badge-sm badge-success gap-1">
                     <span class="size-1.5 rounded-full bg-success animate-ping"></span>
                     Appliance Online
                   </span>
                 </div>
                 <p class="text-xs text-base-content/70 mt-0.5">
-                  Multi-cluster federation, fleet-wide orchestration, global VM inventory &amp; 1-click appliance deploy.
+                  Multi-cluster federation, fleet-wide orchestration, global VM inventory &amp; appliance lifecycle.
                 </p>
               </div>
             </div>
@@ -261,8 +251,8 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
           <div class="flex flex-wrap items-center gap-2.5">
             <a
-              :if={@appliance_status == :ok}
-              href="https://10.10.102.50:8443/"
+              :if={@appliance_status == :ok and @appliance_ip}
+              href={"https://#{@appliance_ip}:8443/"}
               target="_blank"
               class="btn btn-sm btn-primary gap-1.5 shadow-md shadow-primary/25"
               id="launch-central-btn"
@@ -316,10 +306,10 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               <.icon name="hero-cpu-chip" class="size-4 text-primary" />
             </div>
             <div class="text-2xl font-bold font-mono">
-              {@summary.total_cpu} <span class="text-xs font-normal text-base-content/60 font-sans">cores</span>
+              {@allocated_vcpus} <span class="text-xs font-normal text-base-content/60 font-sans">/ {@summary.total_cpu} cores</span>
             </div>
             <div class="w-full bg-base-content/10 rounded-full h-1.5 mt-2 overflow-hidden">
-              <div class="bg-gradient-to-r from-primary to-accent h-1.5 rounded-full" style={"width: #{min(100, @summary.total_vms * 12)}%"}></div>
+              <div class="bg-gradient-to-r from-primary to-accent h-1.5 rounded-full" style={"width: #{@vcpu_percent}%"}></div>
             </div>
           </div>
 
@@ -352,7 +342,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
       </div>
 
       <%!-- Central Appliance Connected Banner --%>
-      <div :if={@appliance_status == :ok} class="alert bg-base-200 border border-primary/30 shadow-lg rounded-2xl mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+      <div :if={@appliance_status == :ok and @appliance_ip} class="alert bg-base-200 border border-primary/30 shadow-lg rounded-2xl mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div class="flex items-center gap-3">
           <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
             <.icon name="hero-shield-check" class="size-6" />
@@ -360,16 +350,16 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           <div>
             <div class="flex items-center gap-2">
               <span class="font-bold text-sm">Helios Central Fleet Control Active</span>
-              <span class="badge badge-xs badge-success font-mono">10.10.102.50:8443</span>
+              <span class="badge badge-xs badge-success font-mono">{@appliance_ip}:8443</span>
             </div>
             <p class="text-xs text-base-content/70">
-              This cluster is federated into the standalone Rocky Linux 10 Central appliance. Cross-cluster management, global VM inventory, and fleet DRS are enabled.
+              This cluster is federated into the standalone Helios Central appliance. Cross-cluster management, global VM inventory, and fleet DRS are enabled.
             </p>
           </div>
         </div>
         <div class="flex items-center gap-2 w-full sm:w-auto justify-end">
           <a
-            href="https://10.10.102.50:8443/"
+            href={"https://#{@appliance_ip}:8443/"}
             target="_blank"
             class="btn btn-sm btn-primary gap-1.5 rounded-xl shadow-md"
           >
@@ -402,7 +392,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           class={["btn btn-sm gap-2", if(@active_tab == :library, do: "btn-primary", else: "btn-ghost")]}
           id="tab-library"
         >
-          <.icon name="hero-rectangle-stack" class="size-4" /> Central Content Library
+          <.icon name="hero-rectangle-stack" class="size-4" /> Central Content Library ({length(@images)})
         </button>
         <button
           phx-click="switch_tab"
@@ -412,37 +402,6 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         >
           <.icon name="hero-cpu-chip" class="size-4" /> Central Appliance Setup
         </button>
-        <button
-          phx-click="switch_tab"
-          phx-value-tab="horizon"
-          class={["btn btn-sm gap-2", if(@active_tab == :horizon, do: "btn-primary", else: "btn-ghost")]}
-          id="tab-horizon"
-        >
-          <.icon name="hero-tv" class="size-4" /> Horizon VDI ({length(@horizon_pools)})
-        </button>
-      </div>
-
-      <%!-- Live Deployment Progress Banner (if active) --%>
-      <div :if={@deploying?} class="alert alert-info border border-info/30 bg-info/10 backdrop-blur-md mb-6" id="deploy-progress-banner">
-        <.icon name="hero-arrow-path" class="size-6 animate-spin text-info shrink-0" />
-        <div class="flex-1">
-          <div class="font-bold flex items-center gap-2">
-            <span>Deploying Helios Central Virtual Appliance</span>
-            <span class="badge badge-sm badge-info font-mono">Step {@deploy_step} of 5</span>
-          </div>
-          <div class="text-xs opacity-80 mt-1">
-            {case @deploy_step do
-              1 -> "CoW vDisk Allocation: Cloning Sidon extent groups from golden base image..."
-              2 -> "Cloud-Init NoCloud ISO: Injected network-config and cloud-config credentials into cidata.iso..."
-              3 -> "Virtual Enclave: Configuring VirtIO-SCSI, vTPM 2.0 emulator, and Secure Boot..."
-              4 -> "Hypervisor Boot: Powering on Helios Central VM and awaiting cloud-init firstboot..."
-              _ -> "Fleet Synchronization: Completing mTLS handshake and auto-enrolling cluster..."
-            end}
-          </div>
-          <div class="w-full bg-base-100/50 rounded-full h-2 mt-2 overflow-hidden">
-            <div class="bg-info h-2 rounded-full transition-all duration-500" style={"width: #{@deploy_step * 20}%"}></div>
-          </div>
-        </div>
       </div>
 
       <%!-- TAB 1: FLEET CLUSTERS MATRIX --%>
@@ -552,7 +511,12 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
           </div>
         </div>
 
-        <div class="overflow-x-auto rounded-xl border border-base-content/10 bg-base-200">
+        <div :if={@vms == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
+          <.icon name="hero-computer-desktop" class="size-8 mx-auto mb-2 opacity-40" />
+          No virtual machines provisioned on this cluster yet.
+        </div>
+
+        <div :if={@vms != []} class="overflow-x-auto rounded-xl border border-base-content/10 bg-base-200">
           <table class="table table-sm">
             <thead>
               <tr class="border-b border-base-content/10 bg-base-300/50">
@@ -585,7 +549,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 </td>
                 <td class="font-mono">{vm.vcpu} vCPU</td>
                 <td class="font-mono">{vm.memory} MiB</td>
-                <td class="font-mono text-xs">{vm.host_ip}</td>
+                <td class="font-mono text-xs">{if vm.host_ip != "", do: vm.host_ip, else: "—"}</td>
                 <td>
                   <span :if={vm.affinity} class="badge badge-xs badge-info font-mono">{vm.affinity}</span>
                   <span :if={!vm.affinity} class="text-xs text-base-content/40">—</span>
@@ -609,67 +573,42 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         <div class="flex items-center justify-between">
           <div>
             <h2 class="text-lg font-bold">Central Golden Images &amp; Templates</h2>
-            <p class="text-xs text-base-content/70">Replicated storage catalog synchronized across all member cluster Sidon fabrics.</p>
+            <p class="text-xs text-base-content/70">Replicated storage catalog registered in Sidon DFS and hydra.valhalla_images.</p>
           </div>
-          <button class="btn btn-sm btn-outline btn-primary gap-1">
-            <.icon name="hero-arrow-up-tray" class="size-4" /> Publish Image to Fleet
-          </button>
+          <a href={~p"/images"} class="btn btn-sm btn-outline btn-primary gap-1">
+            <.icon name="hero-arrow-up-tray" class="size-4" /> Manage Images Catalogue
+          </a>
         </div>
 
-        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
-            <div class="flex items-center justify-between mb-2">
-              <span class="badge badge-sm badge-info font-mono">OS Template</span>
-              <span class="badge badge-xs badge-success">Synced (3/3)</span>
-            </div>
-            <h4 class="font-bold text-sm">Rocky-Linux-9-GenericCloud</h4>
-            <div class="text-xs text-base-content/60 font-mono mt-1">rocky9-cloud.qcow2 (2.1 GiB)</div>
-            <div class="text-[11px] text-base-content/50 mt-2">Cloud-Init NoCloud, VirtIO, UEFI Secure Boot</div>
-            <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
-              <span class="text-xs font-mono text-success">Verified</span>
-              <button class="btn btn-xs btn-ghost text-primary">Deploy to Cluster</button>
-            </div>
+        <div :if={@images == []} class="p-12 text-center text-base-content/50 text-sm bg-base-200 rounded-xl border border-base-content/10">
+          <.icon name="hero-rectangle-stack" class="size-8 mx-auto mb-2 opacity-40" />
+          No golden images or ISO templates registered in the Content Library.
+          <div class="mt-2">
+            <a href={~p"/images"} class="btn btn-xs btn-primary gap-1">
+              <.icon name="hero-plus" class="size-3" /> Upload an Image
+            </a>
           </div>
+        </div>
 
-          <div class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
+        <div :if={@images != []} class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div :for={img <- @images} class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
             <div class="flex items-center justify-between mb-2">
-              <span class="badge badge-sm badge-secondary font-mono">Installer ISO</span>
-              <span class="badge badge-xs badge-success">Synced (3/3)</span>
+              <span class="badge badge-sm badge-info font-mono uppercase">{img.type}</span>
+              <span :if={img.on_vdisk?} class="badge badge-xs badge-success font-mono">vDisk</span>
+              <span :if={!img.on_vdisk?} class="badge badge-xs badge-ghost font-mono">File</span>
             </div>
-            <h4 class="font-bold text-sm">Windows-Server-2022-Standard</h4>
-            <div class="text-xs text-base-content/60 font-mono mt-1">win2022-eval.iso (4.7 GiB)</div>
-            <div class="text-[11px] text-base-content/50 mt-2">VirtIO Win-Drivers, UEFI OVMF, vTPM 2.0</div>
+            <h4 class="font-bold text-sm truncate" title={img.name}>{img.name}</h4>
+            <div class="text-xs text-base-content/60 font-mono mt-1 truncate" title={img.filename}>
+              {img.filename} ({bytes(img.size_bytes)})
+            </div>
+            <div class="text-[11px] text-base-content/50 mt-2 font-mono truncate" title={img.path}>
+              {img.path}
+            </div>
             <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
-              <span class="text-xs font-mono text-success">Verified</span>
-              <button class="btn btn-xs btn-ghost text-primary">Deploy to Cluster</button>
-            </div>
-          </div>
-
-          <div class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
-            <div class="flex items-center justify-between mb-2">
-              <span class="badge badge-sm badge-info font-mono">OS Template</span>
-              <span class="badge badge-xs badge-success">Synced (3/3)</span>
-            </div>
-            <h4 class="font-bold text-sm">Debian-12-Minimal-x86_64</h4>
-            <div class="text-xs text-base-content/60 font-mono mt-1">debian-12-cloud.raw (1.4 GiB)</div>
-            <div class="text-[11px] text-base-content/50 mt-2">Cloud-Init, Serial Console, Minimal footprint</div>
-            <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
-              <span class="text-xs font-mono text-success">Verified</span>
-              <button class="btn btn-xs btn-ghost text-primary">Deploy to Cluster</button>
-            </div>
-          </div>
-
-          <div class="card bg-base-200 border border-base-content/10 p-4 rounded-xl">
-            <div class="flex items-center justify-between mb-2">
-              <span class="badge badge-sm badge-primary font-mono">Appliance Base</span>
-              <span class="badge badge-xs badge-success">Synced (3/3)</span>
-            </div>
-            <h4 class="font-bold text-sm">Helios-Central-Appliance-v1</h4>
-            <div class="text-xs text-base-content/60 font-mono mt-1">helios-central-base.qcow2 (3.2 GiB)</div>
-            <div class="text-[11px] text-base-content/50 mt-2">Dedicated Central control plane virtual appliance</div>
-            <div class="mt-4 pt-3 border-t border-base-content/10 flex justify-between items-center">
-              <span class="text-xs font-mono text-success">Ready</span>
-              <button phx-click="open_deploy_modal" class="btn btn-xs btn-primary">1-Click Deploy</button>
+              <span class="text-xs font-mono text-base-content/60">
+                {if img.created_at, do: Calendar.strftime(img.created_at, "%Y-%m-%d %H:%M"), else: "—"}
+              </span>
+              <a href={~p"/images"} class="btn btn-xs btn-ghost text-primary">View in Catalogue</a>
             </div>
           </div>
         </div>
@@ -693,7 +632,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               phx-click="open_deploy_modal"
               class="btn btn-primary gap-1.5 shadow-md shadow-primary/20"
             >
-              <.icon name="hero-rocket-launch" class="size-4" /> Start 1-Click Deployment
+              <.icon name="hero-rocket-launch" class="size-4" /> Deploy Appliance
             </button>
           </div>
 
@@ -745,7 +684,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
               <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
                 <div class="text-accent font-mono text-xs mb-1">02 / CLOUD-INIT</div>
                 <div class="font-bold text-sm">NoCloud Injection</div>
-                <p class="text-xs text-base-content/60 mt-1">Pure-Python ISO9660 + Rock Ridge generation injecting static IP, gateway &amp; secrets.</p>
+                <p class="text-xs text-base-content/60 mt-1">ISO9660 generation injecting static IP, gateway, DNS &amp; initial credentials.</p>
               </div>
               <div class="bg-base-100 p-4 rounded-xl border border-base-content/5">
                 <div class="text-secondary font-mono text-xs mb-1">03 / SECURITY</div>
@@ -762,160 +701,13 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         </div>
       </div>
 
-      <%!-- TAB 5: HELIOS HORIZON VDI (DESKTOP POOLS & SESSIONS) --%>
-      <div :if={@active_tab == :horizon} class="space-y-6" id="horizon-tab-content">
-        <%!-- Desktop Pools Deck --%>
-        <div class="card bg-base-200 border border-base-content/10 shadow-lg rounded-2xl overflow-hidden">
-          <div class="card-body p-6">
-            <div class="flex items-center justify-between pb-4 border-b border-base-content/10">
-              <div class="flex items-center gap-3">
-                <div class="size-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
-                  <.icon name="hero-tv" class="size-6" />
-                </div>
-                <div>
-                  <h2 class="text-lg font-bold">Horizon Virtual Desktop Pools</h2>
-                  <p class="text-xs text-base-content/70">
-                    Automated VDI desktop pool orchestration, linked clone CoW provisioning, and session broker.
-                  </p>
-                </div>
-              </div>
-              <span class="badge badge-primary font-mono">{length(@horizon_pools)} configured</span>
-            </div>
-
-            <div :if={@horizon_pools == []} class="py-12 text-center text-base-content/50 text-sm">
-              <.icon name="hero-computer-desktop" class="size-8 mx-auto mb-2 opacity-40" />
-              No Horizon desktop pools found in hydra.horizon_pools.
-            </div>
-
-            <div :if={@horizon_pools != []} class="overflow-x-auto mt-4">
-              <table class="table table-sm">
-                <thead>
-                  <tr class="text-xs text-base-content/60 border-b border-base-content/10">
-                    <th>Pool Name</th>
-                    <th>Type</th>
-                    <th>Protocol / Port</th>
-                    <th>Template VM</th>
-                    <th>Desktops (Min/Max)</th>
-                    <th>Sizing (vCPU/RAM)</th>
-                    <th>Entitled Groups</th>
-                    <th>Status</th>
-                    <th class="text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={p <- @horizon_pools} class="hover:bg-base-300/40 border-b border-base-content/5">
-                    <td class="font-bold font-mono text-sm">{p.pool_name}</td>
-                    <td>
-                      <span class="badge badge-xs badge-outline font-mono">{p.pool_type}</span>
-                    </td>
-                    <td>
-                      <span class="font-mono text-xs">{p.protocol}:{p.desktop_port}</span>
-                    </td>
-                    <td class="font-mono text-xs">{p.template_vm}</td>
-                    <td class="font-mono text-xs">{p.min_desktops} / {p.max_desktops}</td>
-                    <td class="font-mono text-xs">{p.vcpu} vCPU · {round(p.memory_mb / 1024)}G</td>
-                    <td class="text-xs">{p.entitled_groups}</td>
-                    <td>
-                      <span class={["badge badge-xs gap-1 font-mono", if(p.state == "active", do: "badge-success", else: "badge-warning")]}>
-                        {p.state}
-                      </span>
-                    </td>
-                    <td class="text-right">
-                      <button
-                        phx-click="delete_horizon_pool"
-                        phx-value-pool={p.pool_name}
-                        data-confirm={"Are you sure you want to delete pool #{p.pool_name}?"}
-                        class="btn btn-ghost btn-xs text-error gap-1"
-                      >
-                        <.icon name="hero-trash" class="size-3.5" /> Delete
-                      </button>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        <%!-- Active VDI Sessions Deck --%>
-        <div class="card bg-base-200 border border-base-content/10 shadow-lg rounded-2xl overflow-hidden">
-          <div class="card-body p-6">
-            <div class="flex items-center justify-between pb-4 border-b border-base-content/10">
-              <div class="flex items-center gap-3">
-                <div class="size-10 rounded-xl bg-accent/10 border border-accent/20 flex items-center justify-center text-accent">
-                  <.icon name="hero-user-group" class="size-6" />
-                </div>
-                <div>
-                  <h2 class="text-lg font-bold">Active User VDI Sessions</h2>
-                  <p class="text-xs text-base-content/70">
-                    Live client connections authenticated through Guacamole proxy and guest Horizon agent.
-                  </p>
-                </div>
-              </div>
-              <span class="badge badge-accent font-mono">{length(@horizon_sessions)} active</span>
-            </div>
-
-            <div :if={@horizon_sessions == []} class="py-12 text-center text-base-content/50 text-sm">
-              <.icon name="hero-users" class="size-8 mx-auto mb-2 opacity-40" />
-              No active user VDI sessions connected.
-            </div>
-
-            <div :if={@horizon_sessions != []} class="overflow-x-auto mt-4">
-              <table class="table table-sm">
-                <thead>
-                  <tr class="text-xs text-base-content/60 border-b border-base-content/10">
-                    <th>Session ID</th>
-                    <th>User</th>
-                    <th>Desktop Pool</th>
-                    <th>Assigned VM</th>
-                    <th>Protocol</th>
-                    <th>Host IP</th>
-                    <th>Client IP</th>
-                    <th>Status</th>
-                    <th class="text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr :for={s <- @horizon_sessions} class="hover:bg-base-300/40 border-b border-base-content/5">
-                    <td class="font-mono text-xs">{s.session_id}</td>
-                    <td class="font-bold text-xs">{s.username}</td>
-                    <td class="font-mono text-xs">{s.pool_name}</td>
-                    <td class="font-mono text-xs">{s.vm_name}</td>
-                    <td>
-                      <span class="badge badge-xs badge-outline font-mono">{s.protocol}</span>
-                    </td>
-                    <td class="font-mono text-xs">{s.host_ip}</td>
-                    <td class="font-mono text-xs">{s.client_ip}</td>
-                    <td>
-                      <span class="badge badge-xs badge-success gap-1 font-mono">
-                        <span class="size-1.5 rounded-full bg-success animate-ping"></span>
-                        {s.state}
-                      </span>
-                    </td>
-                    <td class="text-right">
-                      <button
-                        phx-click="disconnect_horizon_session"
-                        phx-value-session={s.session_id}
-                        class="btn btn-ghost btn-xs text-warning gap-1"
-                      >
-                        <.icon name="hero-arrow-right-on-rectangle" class="size-3.5" /> Disconnect
-                      </button>
-                    </td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <%!-- 1-CLICK DEPLOY MODAL --%>
+      <%!-- DEPLOY MODAL --%>
       <div :if={@deploy_modal_open?} class="modal modal-open backdrop-blur-sm" id="deploy-modal">
         <div class="modal-box max-w-2xl bg-base-200 border border-primary/30 shadow-2xl rounded-2xl">
           <div class="flex items-center justify-between pb-4 border-b border-base-content/10">
             <h3 class="font-bold text-lg flex items-center gap-2">
               <.icon name="hero-server-stack" class="size-5 text-primary" />
-              <span>1-Click Deploy Helios Central Appliance</span>
+              <span>Deploy Helios Central Appliance</span>
             </h3>
             <button phx-click="close_deploy_modal" class="btn btn-sm btn-circle btn-ghost">✕</button>
           </div>
@@ -942,6 +734,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">Appliance VM Name</label>
                 <input
                   type="text"
+                  placeholder="helios-central"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["name"]}
                   phx-change="update_deploy_field"
@@ -952,6 +745,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">Storage Container</label>
                 <input
                   type="text"
+                  placeholder="default-pool"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["container"]}
                   phx-change="update_deploy_field"
@@ -965,6 +759,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">Static IPv4 &amp; Prefix</label>
                 <input
                   type="text"
+                  placeholder="e.g. 10.10.102.50/24"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["ip"]}
                   phx-change="update_deploy_field"
@@ -975,6 +770,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">Default Gateway</label>
                 <input
                   type="text"
+                  placeholder="e.g. 10.10.102.1"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["gateway"]}
                   phx-change="update_deploy_field"
@@ -988,6 +784,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">DNS Nameserver</label>
                 <input
                   type="text"
+                  placeholder="e.g. 10.10.102.1"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["dns"]}
                   phx-change="update_deploy_field"
@@ -995,9 +792,10 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 />
               </div>
               <div>
-                <label class="label text-xs font-semibold">Admin Credentials</label>
+                <label class="label text-xs font-semibold">Admin Password</label>
                 <input
                   type="password"
+                  placeholder="Enter initial appliance password"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@deploy_form["admin_password"]}
                   phx-change="update_deploy_field"
@@ -1064,7 +862,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">Virtual IP (VIP)</label>
                 <input
                   type="text"
-                  placeholder="10.10.103.45"
+                  placeholder="e.g. 10.10.103.45"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@enroll_form["vip"]}
                   phx-change="update_enroll_field"
@@ -1075,6 +873,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
                 <label class="label text-xs font-semibold">API Port</label>
                 <input
                   type="number"
+                  placeholder="8443"
                   class="input input-sm input-bordered w-full font-mono"
                   value={@enroll_form["port"]}
                   phx-change="update_enroll_field"

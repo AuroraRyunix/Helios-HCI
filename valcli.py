@@ -5337,10 +5337,10 @@ def cmd_central_status():
     print("================================================================================")
     if deployment:
         print(f"  Appliance Status:    {deployment.get('status', 'DEPLOYED')}")
-        print(f"  VM Name:             {deployment.get('name', 'helios-central')}")
-        print(f"  Static IPv4:         {deployment.get('ip', '10.10.102.50/24')}")
-        print(f"  Gateway / DNS:       {deployment.get('gateway', '10.10.102.1')} / {deployment.get('dns', '10.10.102.1')}")
-        print(f"  Sizing Preset:       {deployment.get('preset', 'tiny')} ({deployment.get('vcpus', 2)} vCPUs, {deployment.get('memory_mb', 4096)} MiB RAM, {deployment.get('disk_gb', 32)} GiB Sidon CoW Disk)")
+        print(f"  VM Name:             {deployment.get('name', 'N/A')}")
+        print(f"  Static IPv4:         {deployment.get('ip', 'N/A')}")
+        print(f"  Gateway / DNS:       {deployment.get('gateway', 'N/A')} / {deployment.get('dns', 'N/A')}")
+        print(f"  Sizing Preset:       {deployment.get('preset', 'tiny')} ({deployment.get('vcpus', 0)} vCPUs, {deployment.get('memory_mb', 0)} MiB RAM, {deployment.get('disk_gb', 0)} GiB Sidon CoW Disk)")
     else:
         print("  Appliance Status:    NOT DEPLOYED (Use 'ncli central.deploy' to 1-click provision)")
         print("  Available Presets:   tiny (2 vCPU, 4GB RAM), standard (4 vCPU, 8GB RAM), enterprise (8 vCPU, 16GB RAM)")
