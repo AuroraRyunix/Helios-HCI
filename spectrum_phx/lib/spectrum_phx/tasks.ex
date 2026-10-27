@@ -296,6 +296,9 @@ defmodule SpectrumPhx.Tasks do
     action = string(get(row, "action")) || "task"
 
     case payload do
+      %{"appliance_name" => name} when is_binary(name) and name != "" ->
+        "Central Appliance '" <> name <> "' - " <> action
+
       %{"vm_name" => name} when is_binary(name) and name != "" ->
         "VM '" <> name <> "' - " <> action
 

@@ -7289,10 +7289,12 @@ def build():
         initramfs = next((f for f in boot_files if f.startswith("initramfs-") and not f.endswith(".rescue") and not "debug" in f and not "kdump" in f), None)
         if not vmlinuz or not initramfs:
             # Fallback to copy from host
-            vmlinuz = "vmlinuz-6.12.0-211.47.1.el10_2.x86_64"
-            initramfs = "initramfs-6.12.0-211.47.1.el10_2.x86_64.img"
-            run(["cp", f"/boot/{vmlinuz}", f"{MOUNT_DIR}/boot/{vmlinuz}"])
-            run(["cp", f"/boot/{initramfs}", f"{MOUNT_DIR}/boot/{initramfs}"])
+            host_boot = os.listdir("/boot")
+            vmlinuz = next((f for f in host_boot if f.startswith("vmlinuz-") and not f.endswith(".rescue")), None)
+            initramfs = next((f for f in host_boot if f.startswith("initramfs-") and not f.endswith(".rescue") and not "debug" in f and not "kdump" in f), None)
+            if vmlinuz and initramfs:
+                run(["cp", f"/boot/{vmlinuz}", f"{MOUNT_DIR}/boot/{vmlinuz}"])
+                run(["cp", f"/boot/{initramfs}", f"{MOUNT_DIR}/boot/{initramfs}"])
 
         grub_main_cfg = (
             "set default=\"0\"\n"

@@ -13,6 +13,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   alias SpectrumPhx.Hydra
   alias SpectrumPhx.Images
   alias SpectrumPhx.Storage.Containers
+  alias SpectrumPhx.Tasks
 
   @refresh_interval_ms 15_000
 
@@ -20,6 +21,7 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
   def mount(_params, _session, socket) do
     if connected?(socket) do
       :timer.send_interval(@refresh_interval_ms, self(), :refresh)
+      Tasks.subscribe()
     end
 
     {:ok,
@@ -30,6 +32,10 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
      |> assign(:deploy_modal_open?, false)
      |> assign(:deploy_error, nil)
      |> assign(:deploying?, false)
+     |> assign(:deploying_task_id, nil)
+     |> assign(:active_deployment, nil)
+     |> assign(:failed_deployment, nil)
+     |> assign(:deployment_subtasks, [])
      |> assign(:enroll_modal_open?, false)
      |> assign(:enroll_error, nil)
      |> assign(:enrolling?, false)
@@ -54,6 +60,10 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
   @impl true
   def handle_info(:refresh, socket) do
+    {:noreply, load_central_state(socket)}
+  end
+
+  def handle_info({:tasks, _snapshot}, socket) do
     {:noreply, load_central_state(socket)}
   end
 
@@ -205,21 +215,16 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
         socket = assign(socket, deploying?: true, deploy_error: nil)
 
-        case Central.deploy_appliance(deploy_payload) do
-          {:ok, deployment} ->
+        case Central.start_deploy_workflow(deploy_payload) do
+          {:ok, %{"task_id" => task_id}} ->
             {:noreply,
              socket
-             |> assign(deploy_modal_open?: false, deploy_error: nil, deploying?: false)
-             |> put_flash(:info, "Helios Central Appliance '#{deployment["name"]}' deployed successfully.")
+             |> assign(deploy_modal_open?: false, deploy_error: nil, deploying?: false, deploying_task_id: task_id)
+             |> put_flash(:info, "Helios Central deployment task queued (Task ID: #{String.slice(task_id, 0, 8)}). Initiating multi-step provisioning workflow...")
              |> load_central_state()}
 
           {:error, reason} ->
-            error_msg =
-              case reason do
-                {:storage, msg} -> "Storage error: #{msg}"
-                err when is_binary(err) -> err
-                err -> inspect(err)
-              end
+            error_msg = reason
 
             {:noreply,
              socket
@@ -301,6 +306,31 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
         nil
       end
 
+    tasks_snap = Tasks.fetch(limit: 50)
+
+    active_deployment =
+      Enum.find(tasks_snap.tasks, fn t ->
+        t.component == "central" and t.action == "deploy" and Tasks.active?(t)
+      end)
+
+    failed_deployment =
+      if is_nil(active_deployment) do
+        Enum.find(tasks_snap.tasks, fn t ->
+          t.component == "central" and t.action == "deploy" and t.state == :failed
+        end)
+      else
+        nil
+      end
+
+    subtasks =
+      if active_deployment do
+        tasks_snap.tasks
+        |> Enum.filter(fn t -> t.parent_id == active_deployment.id end)
+        |> Enum.sort_by(& &1.created_at, {:asc, DateTime})
+      else
+        []
+      end
+
     central_deployed? = status_type == :ok or length(clusters) > 0
 
     socket
@@ -311,6 +341,9 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
     |> assign(:appliance, appliance)
     |> assign(:appliance_ip, appliance_ip)
     |> assign(:central_deployed?, central_deployed?)
+    |> assign(:active_deployment, active_deployment)
+    |> assign(:failed_deployment, failed_deployment)
+    |> assign(:deployment_subtasks, subtasks)
     |> assign(:vms, local_vms)
     |> assign(:allocated_vcpus, allocated_vcpus)
     |> assign(:vcpu_percent, vcpu_percent)
@@ -427,7 +460,81 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
 
       <%!-- STATE A: HELIOS CENTRAL NOT DEPLOYED --%>
       <div :if={!@central_deployed?} class="space-y-6" id="central-not-deployed-view">
-        <div class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-lg">
+        <%!-- Failure banner from recent attempt --%>
+        <div :if={@failed_deployment && is_nil(@active_deployment)} class="alert alert-error text-xs shadow-md rounded-xl" id="central-failed-alert">
+          <.icon name="hero-exclamation-triangle" class="size-5 shrink-0" />
+          <div class="space-y-0.5">
+            <div class="font-bold">Appliance Deployment Failed</div>
+            <div class="opacity-90">{@failed_deployment.error || "Provisioning interrupted."}</div>
+          </div>
+          <.link navigate={~p"/tasks"} class="btn btn-xs btn-outline ml-auto">View Task in Console &rarr;</.link>
+        </div>
+
+        <%!-- IN-PROGRESS CATALYST DEPLOYMENT WORKFLOW --%>
+        <div :if={@active_deployment} class="card bg-base-200 border border-primary/30 p-6 rounded-2xl shadow-xl space-y-6" id="central-deploying-view">
+          <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-4 border-b border-base-content/10">
+            <div class="flex items-center gap-3">
+              <div class="size-11 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+                <span class="loading loading-bars loading-sm"></span>
+              </div>
+              <div>
+                <div class="flex items-center gap-2">
+                  <h2 class="text-base font-bold tracking-tight">Deploying Helios Central Virtual Appliance</h2>
+                  <span class="badge badge-sm badge-primary font-mono gap-1">
+                    <span class="size-1.5 rounded-full bg-current animate-ping"></span>
+                    Workflow Active
+                  </span>
+                </div>
+                <p class="text-xs text-base-content/60 mt-0.5 font-mono">
+                  Catalyst Task: {@active_deployment.short_id} &middot; {@active_deployment.label}
+                </p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <.link navigate={~p"/tasks"} class="btn btn-sm btn-outline btn-primary gap-1.5 shadow-sm" id="view-catalyst-tasks-btn">
+                <.icon name="hero-queue-list" class="size-4" /> View in Tasks Console &rarr;
+              </.link>
+            </div>
+          </div>
+
+          <div>
+            <div class="flex justify-between items-center text-xs font-mono mb-2">
+              <span class="text-base-content/70">Multi-Step Provisioning Progress</span>
+              <span class="font-bold text-primary text-sm">{@active_deployment.progress}%</span>
+            </div>
+            <div class="w-full bg-base-content/10 rounded-full h-3 overflow-hidden">
+              <div
+                class="bg-gradient-to-r from-primary via-accent to-primary h-3 rounded-full transition-all duration-500"
+                style={"width: #{@active_deployment.progress}%"}
+              ></div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            <div
+              :for={{action, title, desc} <- deploy_steps()}
+              class={[
+                "p-3.5 rounded-xl border transition-all text-xs flex flex-col justify-between",
+                step_class(@deployment_subtasks, action)
+              ]}
+            >
+              <div>
+                <div class="flex items-center justify-between mb-1.5">
+                  <span class="font-mono font-bold text-xs">{title}</span>
+                  <.step_badge subtasks={@deployment_subtasks} action={action} />
+                </div>
+                <p class="text-[11px] text-base-content/60 leading-relaxed">{desc}</p>
+              </div>
+
+              <div :if={step_error(@deployment_subtasks, action)} class="mt-2 text-[10px] text-error font-mono truncate" title={step_error(@deployment_subtasks, action)}>
+                {step_error(@deployment_subtasks, action)}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <%!-- OPTION CARDS (Rendered when no active deployment workflow) --%>
+        <div :if={is_nil(@active_deployment)} class="card bg-base-200 border border-base-content/10 p-6 rounded-2xl shadow-lg">
           <div class="pb-6 border-b border-base-content/10">
             <h2 class="text-lg font-bold tracking-tight">Helios Central is Not Deployed</h2>
             <p class="text-xs text-base-content/70 mt-1">
@@ -1046,5 +1153,61 @@ defmodule SpectrumPhxWeb.Central.IndexLive do
       String.contains?(String.downcase(v.state), q) or
       String.contains?(String.downcase(v.host_ip), q)
     end)
+  end
+
+  defp deploy_steps do
+    [
+      {"allocate_storage", "01 / Storage Allocation", "Sidon vdisk allocation on storage container"},
+      {"stage_image", "02 / Golden Image Staging", "Writing Rocky Linux 10 OS image into Sidon extent store"},
+      {"inject_cloud_init", "03 / Cloud-Init Synthesis", "Injecting static IP, gateway & credentials"},
+      {"register_domain", "04 / Domain Registration", "Registering UEFI OVMF domain in Hydra"},
+      {"power_on", "05 / Hypervisor Power-On", "Vali host placement & VM boot"},
+      {"verify_services", "06 / Fleet Auto-Pairing", "Health check & mutual cluster federation trust"}
+    ]
+  end
+
+  defp step_task(subtasks, action), do: Enum.find(subtasks, fn s -> s.action == action end)
+
+  defp step_state(subtasks, action) do
+    case step_task(subtasks, action) do
+      %{state: state} -> state
+      _ -> :pending
+    end
+  end
+
+  defp step_error(subtasks, action) do
+    case step_task(subtasks, action) do
+      %{error: err} when is_binary(err) and err != "" -> err
+      _ -> nil
+    end
+  end
+
+  defp step_class(subtasks, action) do
+    case step_state(subtasks, action) do
+      :completed -> "border-success/30 bg-success/5"
+      :processing -> "border-primary/40 bg-primary/10 ring-1 ring-primary/30"
+      :failed -> "border-error/40 bg-error/10"
+      _ -> "border-base-content/10 bg-base-100/40 opacity-70"
+    end
+  end
+
+  defp step_badge(assigns) do
+    state = step_state(assigns.subtasks, assigns.action)
+    assigns = assign(assigns, :state, state)
+
+    ~H"""
+    <span :if={@state == :completed} class="badge badge-xs badge-success gap-1 font-mono">
+      <.icon name="hero-check" class="size-3" /> Done
+    </span>
+    <span :if={@state == :processing} class="badge badge-xs badge-primary gap-1 font-mono">
+      <span class="loading loading-spinner loading-[10px]"></span> Running
+    </span>
+    <span :if={@state == :failed} class="badge badge-xs badge-error gap-1 font-mono">
+      <.icon name="hero-x-mark" class="size-3" /> Failed
+    </span>
+    <span :if={@state == :pending} class="badge badge-xs badge-ghost font-mono opacity-50">
+      Pending
+    </span>
+    """
   end
 end
